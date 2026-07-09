@@ -1,0 +1,767 @@
+/**
+ * The agentic tool-calling loop.
+ *
+ * Mirrors how Claude Code itself works: send the conversation (plus the
+ * available tool definitions) to the model, stream its reply into the chat,
+ * and whenever the model asks for tool calls, execute them through Tauri's
+ * sandboxed + permission-gated commands (see src-tauri/src/tools.rs), feed
+ * the results back as `tool` messages, and repeat. The loop ends as soon as
+ * a turn produces a plain answer with no tool calls, or after MAX_ITERATIONS
+ * round trips as a safety cap against runaway/looping models.
+ *
+ * On top of that base loop, this module also owns three client-side
+ * reliability behaviors (see the plan this was built from — no server-side
+ * gateway involved, this app is single-user/local):
+ *  - Auto-failover across configured cloud providers when one errors before
+ *    any content streams back (never mid-stream — see `attemptStream`).
+ *  - Vision-aware auto-switch: if an image is attached and the active model
+ *    can't see, switch to one that can before the turn starts.
+ *  - Adaptive context compaction once history crosses a configured
+ *    percentage of the active model's context window (see
+ *    `contextTrimmer.ts`).
+ * Both switches reuse the existing `modelStore` active-target setters, so
+ * "session affinity" (keep using whatever just worked) falls out of the
+ * same mechanism a manual model switch uses — no separate sticky field.
+ */
+import { invoke } from '@tauri-apps/api/core';
+import { streamChat } from './llamaClient';
+import type { ChatContentPart, ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
+import { streamProviderChat } from './providerClient';
+import { TOOLS } from './tools';
+import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
+import { recordRequest } from './rateLimitTracker';
+import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
+import {
+  composeReferencedText,
+  extractMentionPaths,
+  formatDirListing,
+  type DirEntry,
+  type ResolvedTextReference,
+} from './mentions';
+import { currentSystemPrompt } from './systemPrompt';
+import { useSessionStore } from '../store/sessionStore';
+import { getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { useUsageStore } from '../store/usageStore';
+import { useSettingsStore } from '../store/settingsStore';
+
+/** Hard cap on model/tool round trips for a single call to runAgentTurn. */
+const MAX_ITERATIONS = 25;
+
+/** Mirrors `LlamaState::default()` in src-tauri/src/llama.rs. */
+const DEFAULT_LLAMA_PORT = 8090;
+
+/** Prefix identifying a synthetic model-switch notice (auto-failover or
+ * vision auto-switch) inserted into the transcript — mirrors
+ * `contextTrimmer.ts`'s `COMPACTION_MARKER_PREFIX` pattern so `MessageList`
+ * can recognize and render both kinds of system-role notice distinctly from
+ * a real (currently nonexistent, but defensively still hidden) system
+ * message. */
+export const SWITCH_NOTE_PREFIX = '[Model switch]';
+
+export function isSwitchNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SWITCH_NOTE_PREFIX);
+}
+
+/** Prefix identifying a synthetic notice listing "@"-mentions that failed to
+ * resolve this turn (typo'd path, unreadable file — see `resolveReferences`)
+ * — same pattern as `SWITCH_NOTE_PREFIX`, so the user learns why the model
+ * never saw the file instead of the failure being swallowed silently. */
+export const MENTION_NOTE_PREFIX = '[Mentions]';
+
+export function isMentionNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MENTION_NOTE_PREFIX);
+}
+
+/** Prefix identifying a synthetic per-turn checkpoint notice inserted into
+ * the transcript after a turn that mutated files — same pattern as
+ * `SWITCH_NOTE_PREFIX`. The rest of the content is a JSON payload (see
+ * `CheckpointNotice`), so `MessageList` can render a Revert button for it. */
+export const CHECKPOINT_NOTE_PREFIX = '[Checkpoint]';
+
+/** Payload embedded in a checkpoint notice message. */
+export interface CheckpointNotice {
+  id: string;
+  /** Absolute paths of every file the turn mutated. */
+  files: string[];
+  /** Set once the user has reverted this checkpoint. */
+  reverted?: boolean;
+}
+
+export function isCheckpointNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(CHECKPOINT_NOTE_PREFIX);
+}
+
+/** Parses a checkpoint notice's JSON payload; `null` for anything malformed. */
+export function parseCheckpointNotice(message: ChatMessage): CheckpointNotice | null {
+  if (!isCheckpointNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(CHECKPOINT_NOTE_PREFIX.length));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as CheckpointNotice).id === 'string' &&
+      Array.isArray((parsed as CheckpointNotice).files)
+    ) {
+      return parsed as CheckpointNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a checkpoint notice".
+  }
+  return null;
+}
+
+/** Serializes a checkpoint notice back into message content — used both when
+ * the notice is first added and when the Revert button marks it reverted. */
+export function formatCheckpointNotice(notice: CheckpointNotice): string {
+  return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/** Shape returned by the `llama_status` Tauri command. */
+interface LlamaStatusPayload {
+  status: 'stopped' | 'starting' | 'ready' | 'error';
+  port: number;
+  model_path: string | null;
+}
+
+/**
+ * Resolves the base URL of the locally running llama-server by asking the
+ * Rust backend for its current status, which is the source of truth for the
+ * port it actually bound to. Falls back to the documented default port if
+ * the status can't be read for any reason (e.g. server not started yet),
+ * so a subsequent request simply fails with a clear connection error rather
+ * than this function throwing before the user ever sees why.
+ */
+async function resolveBaseUrl(): Promise<string> {
+  try {
+    const status = await invoke<LlamaStatusPayload>('llama_status');
+    const port =
+      typeof status?.port === 'number' && Number.isFinite(status.port) && status.port > 0
+        ? status.port
+        : DEFAULT_LLAMA_PORT;
+    return `http://127.0.0.1:${port}`;
+  } catch {
+    return `http://127.0.0.1:${DEFAULT_LLAMA_PORT}`;
+  }
+}
+
+/** Where a turn's requests should go. Local llama.cpp and Ollama are kept
+ * distinct (rather than a single generic "direct fetch" kind) so
+ * failover/vision-switch logic can tell exactly which store setter
+ * (`useOllamaModel` vs `useProviderModel`) to call when it picks a
+ * different target — both still stream via the same `streamChat` transport. */
+export type ResolvedTarget =
+  | { kind: 'local'; baseUrl: string }
+  | { kind: 'ollama'; baseUrl: string; model: string }
+  | { kind: 'provider'; providerId: string; model: string };
+
+/**
+ * Resolves the active chat target into exactly what's needed to stream a
+ * turn. Cloud providers go through the Rust-proxied `streamProviderChat`
+ * (its API key lives in the OS keychain, never here); local llama.cpp and
+ * the unauthenticated local Ollama daemon both use the direct-`fetch`
+ * `streamChat` path.
+ */
+async function resolveTarget(): Promise<ResolvedTarget> {
+  const target = getActiveChatTarget();
+
+  if (target.kind === 'provider') {
+    if (!target.providerId || !target.model) {
+      throw new Error('No AI provider model selected');
+    }
+    return { kind: 'provider', providerId: target.providerId, model: target.model };
+  }
+
+  if (target.kind === 'ollama') {
+    if (!target.model) {
+      throw new Error('No Ollama model selected');
+    }
+    return { kind: 'ollama', baseUrl: target.baseUrl, model: target.model };
+  }
+
+  const baseUrl = await resolveBaseUrl();
+  return { kind: 'local', baseUrl };
+}
+
+/** Human-readable label for a switch notice. */
+function targetLabel(target: ResolvedTarget): string {
+  if (target.kind === 'provider') return `${target.providerId} (${target.model})`;
+  if (target.kind === 'ollama') return `Ollama (${target.model})`;
+  return 'the local model';
+}
+
+/** Applies `target` as the app's active chat target — the same store setters a manual switch in the UI would call, which is exactly what makes the switch "sticky" across subsequent turns (session affinity) with no separate mechanism needed. */
+function applyTargetSwitch(target: ResolvedTarget): void {
+  if (target.kind === 'provider') {
+    useModelStore.getState().useProviderModel(target.providerId, target.model);
+  } else if (target.kind === 'ollama') {
+    useModelStore.getState().useOllamaModel(target.model);
+  }
+  // 'local' is never produced as a switch target — see buildFailoverChain/findVisionCandidate.
+}
+
+/** Whether the currently active target satisfies `requireVision` (always `true` when vision isn't required). Local llama.cpp models are never vision-capable — see `visionModels.ts`. */
+function activeTargetSatisfiesVision(requireVision: boolean): boolean {
+  if (!requireVision) return true;
+  const state = useModelStore.getState();
+  if (state.activeProvider === 'provider') {
+    if (!state.activeProviderId || !state.activeProviderModel) return false;
+    return isVisionCapableProviderModel(state.activeProviderId, state.activeProviderModel);
+  }
+  if (state.activeProvider === 'ollama') {
+    const model = state.ollamaModels.find((m) => m.name === state.activeOllamaModel);
+    return model ? isVisionCapableOllamaModel(model) : false;
+  }
+  return false;
+}
+
+/**
+ * Builds the cloud-provider failover/vision-switch chain: the currently
+ * active provider target first (if it qualifies), then every other
+ * has-key provider with a cached model list, each represented by its
+ * `lastModelForProvider` pick (or first cached model) — filtered to a
+ * vision-capable model of that provider when `requireVision` is set.
+ * Local llama.cpp and Ollama deliberately never appear here: "try another
+ * free-tier provider" doesn't apply to a single local machine, so only
+ * cloud providers participate in this chain (Ollama can still be the
+ * *primary* target, and still participates in vision-switch search — see
+ * `findVisionCandidate` — just not in this error-driven chain).
+ */
+function buildFailoverChain(requireVision: boolean): ResolvedTarget[] {
+  const state = useModelStore.getState();
+  const chain: ResolvedTarget[] = [];
+
+  if (state.activeProvider === 'provider' && state.activeProviderId && state.activeProviderModel) {
+    if (!requireVision || isVisionCapableProviderModel(state.activeProviderId, state.activeProviderModel)) {
+      chain.push({ kind: 'provider', providerId: state.activeProviderId, model: state.activeProviderModel });
+    }
+  }
+
+  for (const provider of state.providers) {
+    if (!provider.has_key) continue;
+    if (chain.some((c) => c.kind === 'provider' && c.providerId === provider.id)) continue;
+
+    const models = state.providerModels[provider.id] ?? [];
+    if (models.length === 0) continue;
+
+    if (!requireVision) {
+      const preferred = state.lastModelForProvider[provider.id];
+      const modelId = preferred && models.some((m) => m.id === preferred) ? preferred : models[0].id;
+      chain.push({ kind: 'provider', providerId: provider.id, model: modelId });
+      continue;
+    }
+
+    const preferred = state.lastModelForProvider[provider.id];
+    const preferredIsVision = preferred && isVisionCapableProviderModel(provider.id, preferred);
+    const visionModel = preferredIsVision ? preferred : models.find((m) => isVisionCapableProviderModel(provider.id, m.id))?.id;
+    if (visionModel) chain.push({ kind: 'provider', providerId: provider.id, model: visionModel });
+  }
+
+  return chain;
+}
+
+/** Searches every configured target (cloud providers first, then Ollama) for one that can see images, for the pre-turn vision auto-switch. Returns `null` if nothing qualifies. */
+function findVisionCandidate(): ResolvedTarget | null {
+  const chain = buildFailoverChain(true);
+  if (chain.length > 0) return chain[0];
+
+  const visionOllama = useModelStore.getState().ollamaModels.find(isVisionCapableOllamaModel);
+  if (visionOllama) return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: visionOllama.name };
+
+  return null;
+}
+
+/** Stringifies a tool invocation's result (or error) for use as tool-message content. */
+function stringifyToolResult(result: unknown): string {
+  if (typeof result === 'string') return result;
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return String(result);
+  }
+}
+
+function stringifyToolError(err: unknown): string {
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
+  return JSON.stringify({ error: message });
+}
+
+/** An explicit attachment (from the "+" attach menu), as opposed to a text-derived "@"-mention. */
+export interface AttachmentRef {
+  path: string;
+  isDir: boolean;
+  /** Set at pick-time in `ChatWindow.tsx` for image files — its presence (alongside `dataUrl`) is what routes this attachment to the vision content-part path instead of the text-inlining path below. */
+  kind?: 'image';
+  /** The already-base64-encoded `data:` URL for an image attachment, read once at pick-time (see `imageAttachment.ts`) so this module never re-reads the file. */
+  dataUrl?: string;
+}
+
+/** A single resolved image attachment, ready to become a `ChatContentPart`. */
+interface ResolvedImage {
+  path: string;
+  dataUrl: string;
+}
+
+/**
+ * Resolves every "@"-mentioned path in `text`, merged with any explicit
+ * non-image `attachments` (deduplicated by path — an attachment's `isDir`
+ * flag wins over a text mention for the same path), into file content or a
+ * directory listing via `tool_list_dir`/`tool_read_file`. Image attachments
+ * are split off separately: they already carry a pre-encoded `dataUrl` from
+ * `ChatWindow.tsx`'s pick-time read, so they never touch these Tauri
+ * commands. A text reference that fails to resolve (doesn't exist,
+ * permission error, etc.) is skipped — left as plain text in what the model
+ * sees — but its path is collected into `unresolved` so the caller can
+ * surface a notice instead of the failure staying invisible. Resolution
+ * failure never fails the turn.
+ */
+async function resolveReferences(
+  text: string,
+  attachments: AttachmentRef[]
+): Promise<{ textRefs: ResolvedTextReference[]; images: ResolvedImage[]; unresolved: string[] }> {
+  const images: ResolvedImage[] = [];
+  const textAttachments: AttachmentRef[] = [];
+
+  for (const attachment of attachments) {
+    if (attachment.kind === 'image') {
+      if (attachment.dataUrl) images.push({ path: attachment.path, dataUrl: attachment.dataUrl });
+      continue;
+    }
+    textAttachments.push(attachment);
+  }
+
+  const merged = new Map<string, boolean>();
+  for (const path of extractMentionPaths(text)) {
+    if (!merged.has(path)) merged.set(path, false);
+  }
+  for (const attachment of textAttachments) {
+    merged.set(attachment.path, attachment.isDir);
+  }
+
+  const textRefs: ResolvedTextReference[] = [];
+  const unresolved: string[] = [];
+
+  for (const [path, isDir] of merged) {
+    if (isDir) {
+      try {
+        const entries = await invoke<DirEntry[]>('tool_list_dir', { path });
+        textRefs.push({ path, isDir: true, content: formatDirListing(entries) });
+      } catch {
+        // Not a directory, doesn't exist, or unreadable — skip it.
+        unresolved.push(path);
+      }
+    } else {
+      try {
+        const content = await invoke<string>('tool_read_file', { path });
+        textRefs.push({ path, isDir: false, content });
+      } catch {
+        // Not a file, doesn't exist, or unreadable — skip this mention.
+        unresolved.push(path);
+      }
+    }
+  }
+
+  return { textRefs, images, unresolved };
+}
+
+/**
+ * Combines `text` with any resolved images into the shape a `ChatMessage`'s
+ * `content` should actually be: a plain string when there are no images
+ * (the overwhelming majority of messages), or a `ChatContentPart[]` (one
+ * `text` part followed by one `image_url` part per image) when there's at
+ * least one. Used for both what gets *stored* in the session (so the chat
+ * UI can render the attached image(s), not just send them) and, when text
+ * references also need expanding, what gets substituted into the *wire*
+ * payload — see `runAgentTurn`.
+ */
+function toMessageContent(text: string, images: ResolvedImage[]): string | ChatContentPart[] {
+  if (images.length === 0) return text;
+  const parts: ChatContentPart[] = [{ type: 'text', text }];
+  for (const image of images) parts.push({ type: 'image_url', image_url: { url: image.dataUrl } });
+  return parts;
+}
+
+/** The tool-message content used for a call the user's Stop button cancelled
+ * (either mid-execution, or before it ever started). A result message is
+ * still recorded for every requested call so the persisted transcript never
+ * contains an assistant `tool_calls` entry without its matching results —
+ * several providers reject such a history outright on the next turn. */
+const CANCELLED_TOOL_RESULT = JSON.stringify({ error: 'Cancelled by the user' });
+
+/** Resolves when `signal` aborts (never resolves for an undefined signal). */
+function abortedPromise(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    signal.addEventListener('abort', () => resolve(), { once: true });
+  });
+}
+
+/**
+ * Executes a single model-requested tool call via the corresponding
+ * `tool_<name>` Tauri command and returns the string to use as the content
+ * of the resulting `tool` message. Never throws — invocation errors (bad
+ * JSON arguments, permission denial, sandbox violations, command failures)
+ * are captured and returned as a JSON error payload so the model can see
+ * what went wrong and try to recover instead of the whole loop crashing.
+ *
+ * If `signal` aborts while the command is in flight, the Rust side is told
+ * to cancel everything cancellable (`tools_cancel_running` kills any running
+ * shell child and denies any pending permission prompt) and a cancelled
+ * result is returned immediately rather than waiting the command out.
+ */
+async function executeToolCall(toolCall: ToolCall, signal?: AbortSignal): Promise<string> {
+  const { name, arguments: rawArguments } = toolCall.function;
+
+  let args: Record<string, unknown> = {};
+  if (rawArguments && rawArguments.trim().length > 0) {
+    try {
+      const parsed: unknown = JSON.parse(rawArguments);
+      if (parsed && typeof parsed === 'object') {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch (err) {
+      return stringifyToolError(new Error(`Invalid tool call arguments JSON for "${name}": ${(err as Error).message}`));
+    }
+  }
+
+  const invocation = invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+  if (!signal) return invocation;
+
+  const raced = await Promise.race([invocation, abortedPromise(signal).then(() => null)]);
+  if (raced !== null) return raced;
+
+  // Aborted mid-invocation: kill what can be killed on the Rust side. The
+  // original invocation promise already has handlers attached (never an
+  // unhandled rejection) and its eventual result is simply discarded.
+  void invoke('tools_cancel_running').catch(() => {});
+  return CANCELLED_TOOL_RESULT;
+}
+
+/** Result of a single streaming attempt against one target. */
+interface AttemptResult {
+  content: string;
+  toolCalls: ToolCall[];
+  streamError: string | null;
+  /** Whether any content/tool-call fragment arrived before `streamError` (if any) — the failover safety rule below only ever retries a *different* target when this is `false`, since a mid-stream error has already shown the user partial output that a retry could duplicate or contradict. */
+  contentStarted: boolean;
+}
+
+/**
+ * Streams one chat-completion attempt against `target` and reports what
+ * happened, without touching the session transcript itself — the caller
+ * (`runAgentTurn`) owns writing content into the active session as it
+ * streams in via `onDelta`, and owns deciding what a failure means (retry a
+ * different target vs. surface the error).
+ *
+ * Every attempt through here — main turn or the one-shot summarization call
+ * `contextTrimmer.ts` triggers — is recorded via `rateLimitTracker` when
+ * `target.kind === 'provider'`, so a single tracking call site covers both.
+ */
+async function attemptStream(
+  target: ResolvedTarget,
+  wireHistory: ChatMessage[],
+  tools: ToolDef[],
+  signal: AbortSignal | undefined,
+  effort: string | undefined,
+  onDelta?: (content: string) => void
+): Promise<AttemptResult> {
+  if (target.kind === 'provider') recordRequest(target.providerId);
+
+  let content = '';
+  const toolCalls: ToolCall[] = [];
+  let streamError: string | null = null;
+  let contentStarted = false;
+
+  const events: AsyncGenerator<StreamEvent> =
+    target.kind === 'provider'
+      ? streamProviderChat(target.providerId, target.model, wireHistory, tools, signal, target.providerId === 'anthropic' ? effort : undefined)
+      : streamChat(target.baseUrl, wireHistory, tools, target.kind === 'ollama' ? target.model : undefined, signal);
+
+  try {
+    for await (const event of events) {
+      if (event.type === 'delta') {
+        contentStarted = true;
+        content += event.content;
+        onDelta?.(content);
+      } else if (event.type === 'tool_call') {
+        contentStarted = true;
+        toolCalls.push(event.toolCall);
+      } else if (event.type === 'usage') {
+        useUsageStore.getState().setUsage({
+          promptTokens: event.usage.prompt_tokens,
+          completionTokens: event.usage.completion_tokens,
+          totalTokens: event.usage.total_tokens,
+        });
+      }
+      // 'done' carries no data; the generator simply returns after it.
+    }
+  } catch (err) {
+    streamError = err instanceof Error ? err.message : String(err);
+  }
+
+  return { content, toolCalls, streamError, contentStarted };
+}
+
+/**
+ * Runs one full agentic turn for `userText`: appends it to the session as a
+ * user message, then repeatedly calls the active model with the full
+ * history and the available tools, streaming its reply into the chat and
+ * executing any requested tool calls, until the model answers without
+ * requesting further tools or the safety cap is reached.
+ *
+ * Before the first network attempt, this also (in order): checks whether an
+ * attached image needs a vision-capable model and switches to one if so
+ * (see `findVisionCandidate`), and builds the ordered attempt sequence used
+ * for auto-failover (see `buildFailoverChain`) — both governed by
+ * `settingsStore` toggles. Each iteration of the tool-calling loop also
+ * checks whether history has crossed the configured context-trim threshold
+ * and compacts it in place if so (see `contextTrimmer.ts`).
+ */
+export async function runAgentTurn(
+  userText: string,
+  attachments: AttachmentRef[] = [],
+  signal?: AbortSignal
+): Promise<void> {
+  // Added as plain text first for instant feedback (resolving references
+  // in the turn body does async file/image reads) — if there's at least one
+  // image, it's promoted in place, right after, to a `ChatContentPart[]` so
+  // the chat UI actually shows what was attached, not just what was typed.
+  useSessionStore.getState().addMessage({ role: 'user', content: userText });
+
+  // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
+  // every write_file/edit_file this turn makes can be reverted in one click.
+  // Failure to open one (e.g. app-data dir unavailable) must never block the
+  // turn itself — the turn just runs without a revert affordance.
+  const checkpointOpened = await invoke<string>('checkpoint_begin')
+    .then(() => true)
+    .catch(() => false);
+  try {
+    await runAgentTurnBody(userText, attachments, signal);
+  } finally {
+    if (checkpointOpened) {
+      const summary = await invoke<CheckpointNotice>('checkpoint_end').catch(() => null);
+      if (summary && summary.files.length > 0) {
+        useSessionStore.getState().addMessage({
+          role: 'system',
+          content: formatCheckpointNotice({ id: summary.id, files: summary.files }),
+        });
+      }
+    }
+  }
+}
+
+/** The actual turn logic — split out so `runAgentTurn` can wrap it in the
+ * per-turn checkpoint lifecycle with a single try/finally around every early
+ * return this loop has. */
+async function runAgentTurnBody(
+  userText: string,
+  attachments: AttachmentRef[],
+  signal?: AbortSignal
+): Promise<void> {
+  const { addMessage, updateLastMessage, removeLastMessage, replaceMessages } = useSessionStore.getState();
+
+  // Resolve any "@"-mentions and explicit attachments in the raw user text
+  // *once*, up front, for this turn. Text references only ever expand the
+  // *wire* payload (sessionStore keeps the unexpanded text the user typed),
+  // but images are promoted into the stored message itself, right below.
+  const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+
+  if (images.length > 0) {
+    updateLastMessage({ content: toMessageContent(userText, images) });
+  }
+  // Re-read rather than reuse the object passed to `addMessage` above: the
+  // `updateLastMessage` call just now (if it ran) replaced it with a new
+  // object in the store, and this is the reference every later `===` match
+  // against "this turn's user message" (for the wire-payload substitution
+  // below, across every tool-calling round trip) needs to stay accurate.
+  const storedMessages = useSessionStore.getState().messages;
+  const storedUserMessage = storedMessages[storedMessages.length - 1];
+
+  // Surface any "@"-mentions that failed to resolve — the model only sees
+  // them as plain text, and without this the user never learns why. Added
+  // only after `storedUserMessage` is captured above, so the notice can't
+  // become the "last message" the image promotion patches.
+  if (unresolved.length > 0) {
+    addMessage({
+      role: 'system',
+      content: `${MENTION_NOTE_PREFIX} Couldn't read ${unresolved.map((p) => `@${p}`).join(', ')} — check the path${unresolved.length > 1 ? 's exist and are' : ' exists and is'} readable. The mention was sent as plain text only.`,
+    });
+  }
+
+  const composedText = composeReferencedText(userText, textRefs);
+  const wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
+  const requireVision = images.length > 0;
+
+  const settings = useSettingsStore.getState();
+
+  if (!activeTargetSatisfiesVision(requireVision)) {
+    if (settings.autoVisionSwitchEnabled) {
+      const candidate = findVisionCandidate();
+      if (candidate) {
+        applyTargetSwitch(candidate);
+        addMessage({ role: 'system', content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(candidate)} — it can see images.` });
+      } else {
+        addMessage({
+          role: 'system',
+          content: `${SWITCH_NOTE_PREFIX} No vision-capable model is configured — the attached image may not be understood.`,
+        });
+      }
+    } else {
+      addMessage({
+        role: 'system',
+        content: `${SWITCH_NOTE_PREFIX} The active model can't see images and auto-switch is off — the attached image may not be understood.`,
+      });
+    }
+  }
+
+  // The ordered attempt sequence for this turn: the (possibly just-switched)
+  // active target first, then — only when auto-failover is on and that
+  // target is a cloud provider — the rest of `buildFailoverChain`. Computed
+  // once per turn and only advanced (never rebuilt) on a pre-first-token
+  // failure, so a target that succeeds stays in use for every subsequent
+  // tool round trip within this same turn.
+  const primaryTarget = await resolveTarget();
+  const sequence: ResolvedTarget[] =
+    settings.autoFailoverEnabled && primaryTarget.kind === 'provider'
+      ? [primaryTarget, ...buildFailoverChain(requireVision).filter((c) => !(c.kind === 'provider' && c.providerId === primaryTarget.providerId && c.model === primaryTarget.model))]
+      : [primaryTarget];
+  let sequenceIndex = 0;
+  let target = sequence[0];
+
+  const effort = useModelStore.getState().effort;
+
+  // The system prompt (identity, workspace roots, OS, tool guidance — see
+  // systemPrompt.ts) is injected at the head of the OUTGOING payload only,
+  // never stored in the session transcript, so it always reflects the
+  // current workspace instead of a snapshot. Computed once per turn.
+  const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
+
+  const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
+    const summaryMessages: ChatMessage[] = [
+      {
+        role: 'system',
+        content:
+          'Summarize the following earlier conversation concisely for another AI assistant to continue from. Preserve key facts, decisions, file paths, and code context. Reply with only the summary text.',
+      },
+      { role: 'user', content: renderForSummary(dropped) },
+    ];
+    const result = await attemptStream(target, summaryMessages, [], signal, effort);
+    if (result.streamError) throw new Error(result.streamError);
+    return result.content.trim() || '(summary unavailable)';
+  };
+
+  for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+    // Stop button fired while a tool call was executing (between model
+    // round trips, where there's no stream to abort) — don't start another.
+    if (signal?.aborted) return;
+
+    if (settings.contextTrimEnabled) {
+      const current = useSessionStore.getState().messages;
+      if (shouldTrim(current, useUsageStore.getState().contextLimit, settings.contextTrimThreshold)) {
+        const result = await applyContextCompaction(current, {
+          strategy: settings.contextTrimStrategy,
+          contextLimit: useUsageStore.getState().contextLimit,
+          thresholdPercent: settings.contextTrimThreshold,
+          sendForSummary,
+        });
+        if (result.changed) replaceMessages(result.messages);
+      }
+    }
+
+    // Snapshot the history to send *before* appending this turn's in-progress
+    // assistant placeholder, so the placeholder's (currently empty) content
+    // never gets sent back to the model as part of its own history.
+    const history: ChatMessage[] = useSessionStore.getState().messages;
+
+    // Build the wire payload for this request: the system prompt first, then
+    // `history` — identical to the stored transcript unless this turn's user
+    // message had text references to expand, in which case that one message
+    // (matched by reference) is swapped for its expanded content — `history`
+    // itself (and what's stored/rendered) is left untouched. No substitution
+    // is needed when there were no text references (`wireContent === null`):
+    // `storedUserMessage` already carries any images directly.
+    const wireHistory: ChatMessage[] = [
+      systemMessage,
+      ...(wireContent !== null
+        ? history.map((message) => (message === storedUserMessage ? { ...message, content: wireContent } : message))
+        : history),
+    ];
+
+    const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
+    addMessage(assistantPlaceholder);
+
+    let attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, (content) => updateLastMessage({ content }));
+
+    // Failover: only ever retry a *different* target when nothing streamed
+    // back yet for this attempt — once tokens have started arriving, a
+    // stream error is terminal (never silently retry mid-answer). The
+    // (still-empty, since nothing streamed) assistant placeholder from the
+    // failed attempt is dropped and re-added *after* the switch notice, so
+    // `updateLastMessage` below keeps targeting the placeholder rather than
+    // clobbering the notice that was just inserted after it.
+    while (attempt.streamError !== null && !attempt.contentStarted && sequenceIndex + 1 < sequence.length) {
+      sequenceIndex += 1;
+      target = sequence[sequenceIndex];
+      applyTargetSwitch(target);
+      removeLastMessage();
+      addMessage({
+        role: 'system',
+        content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
+      });
+      addMessage({ role: 'assistant', content: '' });
+      attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, (content) => updateLastMessage({ content }));
+    }
+
+    const { content, toolCalls, streamError } = attempt;
+
+    if (streamError !== null) {
+      updateLastMessage({
+        content: content.length > 0 ? `${content}\n\n[Error: ${streamError}]` : `[Error: ${streamError}]`,
+      });
+      return;
+    }
+
+    if (toolCalls.length === 0) {
+      if (signal?.aborted && content.length === 0) {
+        // Stop button fired before any content streamed in — drop the empty
+        // placeholder instead of leaving a stuck "typing" bubble behind.
+        removeLastMessage();
+        return;
+      }
+      // The model gave a plain answer with no further tool requests — done.
+      return;
+    }
+
+    // Record the tool calls on the assistant message that requested them
+    // before executing them and feeding results back.
+    updateLastMessage({ content, tool_calls: toolCalls });
+
+    for (const toolCall of toolCalls) {
+      // Once the Stop button has fired, remaining calls are not executed —
+      // but every one still gets a (cancelled) result message, so the
+      // transcript never carries a tool_calls entry without its results
+      // (several providers reject such a history on the next turn).
+      const resultContent = signal?.aborted ? CANCELLED_TOOL_RESULT : await executeToolCall(toolCall, signal);
+      const toolMessage: ChatMessage = {
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: resultContent,
+      };
+      addMessage(toolMessage);
+    }
+
+    if (signal?.aborted) return;
+
+    // Loop again: the model gets the tool results appended to its history.
+  }
+
+  // Safety cap reached: the model kept requesting tools without ever
+  // settling on a final answer. Surface this clearly instead of looping
+  // forever or silently truncating.
+  addMessage({
+    role: 'assistant',
+    content: `Stopped after reaching the safety limit of ${MAX_ITERATIONS} tool-calling iterations without a final answer.`,
+  });
+}
