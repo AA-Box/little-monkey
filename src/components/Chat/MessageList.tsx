@@ -1,0 +1,396 @@
+import { memo, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  ChevronRight,
+  FilePenLine,
+  FileSearch,
+  FileText,
+  Folder,
+  RefreshCw,
+  Search,
+  TerminalSquare,
+  Undo2,
+  Wrench,
+  type LucideIcon,
+} from "lucide-react";
+
+import { textContent, type ChatMessage } from "../../lib/llamaClient";
+import {
+  formatCheckpointNotice,
+  isCheckpointNotice,
+  isMentionNotice,
+  isSwitchNotice,
+  parseCheckpointNotice,
+  type CheckpointNotice,
+} from "../../lib/agentLoop";
+import { isCompactionMarker } from "../../lib/contextTrimmer";
+import { useSessionStore } from "../../store/sessionStore";
+import MessageBubble from "./MessageBubble";
+import { useT } from "../../lib/i18n";
+
+export interface MessageListProps {
+  messages: ChatMessage[];
+  /** Called with a past user message's index and its edited text when the
+   * user saves an edit — omit to disable the edit affordance entirely. */
+  onEditUserMessage?: (index: number, newText: string) => void;
+  /** Disables editing while a turn is in flight. */
+  editingDisabled?: boolean;
+  /** Called when the user asks to regenerate the last turn — omit to hide
+   * the affordance. */
+  onRetry?: () => void;
+}
+
+type TimelineItem =
+  | { kind: "bubble"; key: string; message: ChatMessage; index: number }
+  | { kind: "tool"; key: string; name: string; args: string; result?: string }
+  | { kind: "notice"; key: string; text: string }
+  | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
+  | { kind: "typing"; key: string };
+
+/**
+ * Flattens the raw `ChatMessage[]` history into a render-friendly timeline:
+ * - user / assistant text messages render as chat bubbles.
+ * - each assistant `tool_call` is paired with its matching `role: 'tool'`
+ *   result (correlated via `tool_call_id`) into a single compact,
+ *   collapsible "used tool" entry.
+ * - a trailing empty assistant message (no content, no tool calls yet)
+ *   renders as a typing indicator.
+ * - `system` messages are never shown in the transcript, except our own
+ *   synthetic notices (compaction, model switch, per-turn checkpoint).
+ */
+function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
+  const resultByCallId = new Map<string, string>();
+  for (const msg of messages) {
+    if (msg.role === "tool" && msg.tool_call_id) {
+      resultByCallId.set(msg.tool_call_id, textContent(msg.content));
+    }
+  }
+
+  const renderedCallIds = new Set<string>();
+  const items: TimelineItem[] = [];
+
+  messages.forEach((msg, index) => {
+    if (msg.role === "user") {
+      items.push({ kind: "bubble", key: `msg-${index}`, message: msg, index });
+      return;
+    }
+
+    if (msg.role === "assistant") {
+      const hasContent = textContent(msg.content).trim().length > 0;
+      const toolCalls = msg.tool_calls ?? [];
+
+      if (hasContent) {
+        items.push({ kind: "bubble", key: `msg-${index}`, message: msg, index });
+      } else if (toolCalls.length === 0 && index === messages.length - 1) {
+        items.push({ kind: "typing", key: `typing-${index}` });
+      }
+
+      for (const toolCall of toolCalls) {
+        renderedCallIds.add(toolCall.id);
+        items.push({
+          kind: "tool",
+          key: `tool-${toolCall.id}`,
+          name: toolCall.function.name,
+          args: toolCall.function.arguments,
+          result: resultByCallId.get(toolCall.id),
+        });
+      }
+      return;
+    }
+
+    if (msg.role === "tool") {
+      // Already rendered alongside its originating assistant tool_call.
+      if (msg.tool_call_id && renderedCallIds.has(msg.tool_call_id)) return;
+      // Orphaned result (e.g. history was truncated) — still show something.
+      items.push({
+        kind: "tool",
+        key: `tool-orphan-${index}`,
+        name: "tool",
+        args: "",
+        result: textContent(msg.content),
+      });
+    }
+
+    if (msg.role === "system") {
+      // Only our own synthetic notices (context compaction, model
+      // auto-switch, unresolved mentions, per-turn checkpoint) are ever
+      // rendered — any other system message stays hidden, same as before
+      // this app ever produced these.
+      if (isCheckpointNotice(msg)) {
+        const notice = parseCheckpointNotice(msg);
+        if (notice) {
+          items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex: index });
+        }
+        return;
+      }
+      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg)) {
+        items.push({ kind: "notice", key: `notice-${index}`, text: textContent(msg.content) });
+      }
+    }
+  });
+
+  return items;
+}
+
+function formatJson(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+function resultLooksLikeError(raw: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null && "error" in parsed;
+  } catch {
+    return false;
+  }
+}
+
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  run_shell: TerminalSquare,
+  write_file: FilePenLine,
+  edit_file: FilePenLine,
+  read_file: FileText,
+  list_dir: Folder,
+  grep: Search,
+  glob: FileSearch,
+};
+
+function toolIcon(name: string): LucideIcon {
+  return TOOL_ICONS[name] ?? Wrench;
+}
+
+/** Memoized like `MessageBubble`: props are plain strings (stable for every
+ * settled call), so streaming deltas to the transcript's last message don't
+ * re-render the (potentially long) tool-call history. */
+const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
+  const { t } = useT();
+  const [open, setOpen] = useState(false);
+  const pending = result === undefined;
+  const failed = !pending && resultLooksLikeError(result);
+  const Icon = toolIcon(name);
+  const preview = args ? formatJson(args).replace(/\s+/g, " ").trim() : "";
+
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+        <button
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left font-mono text-xs text-muted transition-colors duration-150 hover:text-foreground"
+        >
+          <ChevronRight
+            size={12}
+            className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+          />
+          <Icon size={13} className="shrink-0 text-faint" />
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+              pending ? "animate-pulse bg-warning" : failed ? "bg-danger" : "bg-success"
+            }`}
+          />
+          <span className="truncate">
+            {name}
+            {preview ? `(${preview})` : "()"}
+          </span>
+        </button>
+        {open && (
+          <div className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
+            {args && (
+              <div>
+                <div className="mb-1 text-faint">{t("MessageList.argumentsLabel")}</div>
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{formatJson(args)}</pre>
+              </div>
+            )}
+            {result !== undefined && (
+              <div>
+                <div className="mb-1 text-faint">{t("MessageList.resultLabel")}</div>
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{formatJson(result)}</pre>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
+/** Renders a compaction/model-switch notice: a small, centered, muted line — visually distinct from a chat bubble, since it's app-generated commentary rather than something either party "said". */
+const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
+  return (
+    <div className="flex justify-center">
+      <div className="max-w-[85%] rounded-md bg-surface-2 px-3 py-1 text-center text-xs text-faint">{text}</div>
+    </div>
+  );
+});
+
+/**
+ * Renders a per-turn checkpoint notice: how many files the turn changed,
+ * with a one-click Revert that restores every one of them to its pre-turn
+ * state (see src-tauri/src/checkpoints.rs). After a successful revert the
+ * notice's message content is rewritten in place with `reverted: true`, so
+ * the state survives re-renders and app restarts.
+ */
+const CheckpointRow = memo(function CheckpointRow({
+  notice,
+  messageIndex,
+}: {
+  notice: CheckpointNotice;
+  messageIndex: number;
+}) {
+  const { t } = useT();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fileNames = notice.files.map((path) => path.split(/[\\/]/).filter(Boolean).pop() ?? path);
+
+  const handleRevert = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("checkpoint_revert", { id: notice.id });
+      useSessionStore.getState().updateMessageAt(messageIndex, {
+        content: formatCheckpointNotice({ ...notice, reverted: true }),
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] flex-col items-center gap-1 rounded-md bg-surface-2 px-3 py-1.5 text-center text-xs text-faint">
+        <div className="flex items-center gap-2">
+          <FilePenLine size={12} className="shrink-0" />
+          <span title={notice.files.join("\n")}>
+            {t("MessageList.checkpointFilesChanged", { count: notice.files.length, files: fileNames.join(", ") })}
+          </span>
+          {notice.reverted ? (
+            <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void handleRevert()}
+              disabled={busy}
+              className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Undo2 size={11} />
+              {busy ? t("MessageList.checkpointReverting") : t("MessageList.checkpointRevertButton")}
+            </button>
+          )}
+        </div>
+        {error && <div className="text-danger">{t("MessageList.checkpointRevertFailed", { error })}</div>}
+      </div>
+    </div>
+  );
+});
+
+function TypingIndicator() {
+  return (
+    <div className="flex justify-start">
+      <div className="flex items-center gap-1 rounded-2xl border border-border bg-surface px-4 py-3">
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-faint [animation-delay:-0.15s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-faint" />
+      </div>
+    </div>
+  );
+}
+
+function EmptyState() {
+  const { t } = useT();
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
+      <p className="text-lg font-medium text-foreground">{t("MessageList.emptyStateTitle")}</p>
+      <p className="max-w-xs text-sm text-faint">
+        {t("MessageList.emptyStateDescription")}
+      </p>
+    </div>
+  );
+}
+
+/** Whether the transcript is in a state where "regenerate the last turn"
+ * makes sense: there's a user message to re-run, and the turn isn't still
+ * streaming (the caller also gates on that via `editingDisabled`). */
+function canRetry(messages: ChatMessage[]): boolean {
+  return messages.some((m) => m.role === "user");
+}
+
+export default function MessageList({ messages, onEditUserMessage, editingDisabled, onRetry }: MessageListProps) {
+  const { t } = useT();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [messages]);
+
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 96;
+  };
+
+  const items = buildTimeline(messages);
+  const showRetry = Boolean(onRetry) && !editingDisabled && canRetry(messages);
+
+  return (
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      className="min-h-0 flex-1 overflow-y-auto bg-background px-4 py-6"
+    >
+      {items.length === 0 ? (
+        <EmptyState />
+      ) : (
+        <div className="mx-auto flex max-w-3xl flex-col gap-6">
+          {items.map((item) => {
+            if (item.kind === "bubble") {
+              const editable = item.message.role === "user" && onEditUserMessage;
+              return (
+                <MessageBubble
+                  key={item.key}
+                  message={item.message}
+                  index={item.index}
+                  onEditMessage={editable ? onEditUserMessage : undefined}
+                  editDisabled={editingDisabled}
+                />
+              );
+            }
+            if (item.kind === "tool") {
+              return <ToolCallRow key={item.key} name={item.name} args={item.args} result={item.result} />;
+            }
+            if (item.kind === "notice") {
+              return <NoticeRow key={item.key} text={item.text} />;
+            }
+            if (item.kind === "checkpoint") {
+              return <CheckpointRow key={item.key} notice={item.notice} messageIndex={item.messageIndex} />;
+            }
+            return <TypingIndicator key={item.key} />;
+          })}
+          {showRetry && (
+            <div className="flex justify-start">
+              <button
+                type="button"
+                onClick={onRetry}
+                className="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
+              >
+                <RefreshCw size={12} />
+                {t("MessageList.regenerateButton")}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
