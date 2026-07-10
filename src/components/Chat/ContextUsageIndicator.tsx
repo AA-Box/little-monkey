@@ -68,14 +68,15 @@ function UsageRing({ percent }: { percent: number | null }) {
 }
 
 /**
- * Small trigger button + popover showing context-window token usage for the
- * most recently completed turn, read from `usageStore`. Deliberately shows
- * ONLY context-window usage (tokens used vs. the active model's context
- * size) — there is no subscription/rate-limit concept for a locally-run
- * model, so no such data is fabricated or displayed here.
+ * Small trigger button + popover showing context-window token usage for
+ * `sessionId`'s most recently completed turn, read from `usageStore` — each
+ * pane shows its own session's numbers, not whichever turn reported last.
+ * Deliberately shows ONLY context-window usage (tokens used vs. the active
+ * model's context size) — there is no subscription/rate-limit concept for a
+ * locally-run model, so no such data is fabricated or displayed here.
  */
-export function ContextUsageIndicator() {
-  const lastUsage = useUsageStore((s) => s.lastUsage);
+export function ContextUsageIndicator({ sessionId }: { sessionId: string }) {
+  const lastUsage = useUsageStore((s) => s.usageBySession[sessionId] ?? null);
   const contextLimit = useUsageStore((s) => s.contextLimit);
   const { t } = useT();
 

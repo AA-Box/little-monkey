@@ -27,13 +27,15 @@ pub struct PermissionRequestPayload {
 /// Shared state tracking in-flight permission requests and tools that have
 /// been granted "allow for session" status.
 pub struct PermissionState {
-    /// `id -> (tool the request was actually made for, response channel)`.
-    /// The tool name is stored here (not just the sender) so
-    /// [`permission_respond`] can use it as the *authoritative* source of
-    /// truth for `session_allow` bookkeeping instead of trusting whatever
-    /// tool name the IPC caller claims — see [`permission_respond`] for why
-    /// that distinction matters.
-    pub pending: Mutex<HashMap<String, (String, oneshot::Sender<bool>)>>,
+    /// `id -> (tool the request was actually made for, owning turn id,
+    /// response channel)`. The tool name is stored here (not just the
+    /// sender) so [`permission_respond`] can use it as the *authoritative*
+    /// source of truth for `session_allow` bookkeeping instead of trusting
+    /// whatever tool name the IPC caller claims — see [`permission_respond`]
+    /// for why that distinction matters. The turn id lets Stop deny only the
+    /// aborted turn's prompts — with the split pane, another turn's prompt
+    /// may be pending concurrently.
+    pub pending: Mutex<HashMap<String, (String, Option<String>, oneshot::Sender<bool>)>>,
     pub session_allow: Mutex<HashSet<String>>,
     /// Current permission mode — one of "manual"/"acceptEdits"/"plan"/"auto"/
     /// "bypass". See [`request_permission`] for what each mode does. Always
@@ -119,11 +121,12 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
 /// session", resolves `Ok(())` immediately without prompting; otherwise emits
 /// a `permission://request` event and awaits the user's decision (or the
 /// timeout, which counts as a denial).
-pub async fn request_permission(
-    app: &tauri::AppHandle,
+pub async fn request_permission<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &AppState,
     tool: &str,
     detail: String,
+    turn: Option<&str>,
 ) -> Result<(), String> {
     let mode = state.permissions.mode.lock().unwrap().clone();
 
@@ -149,7 +152,7 @@ pub async fn request_permission(
         .pending
         .lock()
         .unwrap()
-        .insert(id.clone(), (tool.to_string(), tx));
+        .insert(id.clone(), (tool.to_string(), turn.map(str::to_string), tx));
 
     let payload = PermissionRequestPayload {
         id: id.clone(),
@@ -240,7 +243,7 @@ pub fn permission_respond(
 fn respond_impl(state: &AppState, id: String, allow: bool, remember: bool) -> Result<(), String> {
     let entry = state.permissions.pending.lock().unwrap().remove(&id);
 
-    let (tool, sender) = match entry {
+    let (tool, _turn, sender) = match entry {
         Some(entry) => entry,
         None => return Err(format!("No pending permission request with id {id}")),
     };
@@ -256,20 +259,27 @@ fn respond_impl(state: &AppState, id: String, allow: bool, remember: bool) -> Re
     Ok(())
 }
 
-/// Denies every still-in-flight permission prompt WITHOUT touching
-/// "allow for session" grants. Used by the Stop button's tool-cancellation
-/// path (see `tools::tools_cancel_running`): a prompt belonging to a turn the
-/// user just aborted must not sit on screen waiting for an answer, but
-/// stopping one turn is not a reason to revoke grants the user made earlier.
-pub fn deny_pending(state: &AppState) {
-    let pending: Vec<oneshot::Sender<bool>> = state
-        .permissions
-        .pending
-        .lock()
-        .unwrap()
-        .drain()
-        .map(|(_, (_, sender))| sender)
+/// Denies still-in-flight permission prompts WITHOUT touching "allow for
+/// session" grants. `turn` of `Some` denies only that turn's prompts — used
+/// by the Stop button's tool-cancellation path (see
+/// `tools::tools_cancel_running`): a prompt belonging to a turn the user
+/// just aborted must not sit on screen waiting for an answer, but with the
+/// split pane the *other* pane's turn may have its own prompt pending, and
+/// stopping one turn must not answer the other's. `None` denies everything
+/// (workspace switch, legacy Stop path).
+pub fn deny_pending(state: &AppState, turn: Option<&str>) {
+    let mut guard = state.permissions.pending.lock().unwrap();
+    let matching: Vec<String> = guard
+        .iter()
+        .filter(|(_, (_, owner, _))| turn.is_none() || owner.as_deref() == turn)
+        .map(|(id, _)| id.clone())
         .collect();
+    let pending: Vec<oneshot::Sender<bool>> = matching
+        .iter()
+        .filter_map(|id| guard.remove(id))
+        .map(|(_, _, sender)| sender)
+        .collect();
+    drop(guard);
 
     for sender in pending {
         let _ = sender.send(false);
@@ -282,7 +292,7 @@ pub fn deny_pending(state: &AppState) {
 /// never silently carry over and apply to a different one.
 pub fn reset_for_new_workspace(state: &AppState) {
     state.permissions.session_allow.lock().unwrap().clear();
-    deny_pending(state);
+    deny_pending(state, None);
 }
 
 #[cfg(test)]
@@ -292,14 +302,51 @@ mod tests {
     /// Directly inserts a pending request the way [`request_permission`]
     /// would, without needing a running app/window to emit an event through.
     fn insert_pending(state: &AppState, id: &str, tool: &str) -> oneshot::Receiver<bool> {
+        insert_pending_for_turn(state, id, tool, None)
+    }
+
+    fn insert_pending_for_turn(
+        state: &AppState,
+        id: &str,
+        tool: &str,
+        turn: Option<&str>,
+    ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel::<bool>();
         state
             .permissions
             .pending
             .lock()
             .unwrap()
-            .insert(id.to_string(), (tool.to_string(), tx));
+            .insert(id.to_string(), (tool.to_string(), turn.map(str::to_string), tx));
         rx
+    }
+
+    #[test]
+    fn deny_pending_scoped_to_a_turn_leaves_other_turns_prompts_alone() {
+        let state = AppState::default();
+        let mut rx_a = insert_pending_for_turn(&state, "req-a", "run_shell", Some("turn-a"));
+        let mut rx_b = insert_pending_for_turn(&state, "req-b", "write_file", Some("turn-b"));
+
+        deny_pending(&state, Some("turn-a"));
+
+        // Turn A's prompt was denied…
+        assert_eq!(rx_a.try_recv(), Ok(false));
+        // …turn B's is still pending, unanswered.
+        assert!(rx_b.try_recv().is_err());
+        assert!(state.permissions.pending.lock().unwrap().contains_key("req-b"));
+    }
+
+    #[test]
+    fn deny_pending_unscoped_denies_everything() {
+        let state = AppState::default();
+        let mut rx_a = insert_pending_for_turn(&state, "req-a", "run_shell", Some("turn-a"));
+        let mut rx_b = insert_pending(&state, "req-b", "write_file");
+
+        deny_pending(&state, None);
+
+        assert_eq!(rx_a.try_recv(), Ok(false));
+        assert_eq!(rx_b.try_recv(), Ok(false));
+        assert!(state.permissions.pending.lock().unwrap().is_empty());
     }
 
     #[test]

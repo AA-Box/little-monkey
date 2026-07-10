@@ -13,14 +13,20 @@ export interface UsageInfo {
 }
 
 export interface UsageStore {
-  /** Usage for the most recent completed turn, or `null` before any turn has reported usage. */
-  lastUsage: UsageInfo | null;
+  /**
+   * Usage for each session's most recent completed turn, keyed by session
+   * id — with the split pane, two sessions can stream turns concurrently
+   * and each pane's indicator must show its own session's numbers, not
+   * whichever turn reported last.
+   */
+  usageBySession: Record<string, UsageInfo>;
   /**
    * The active model's context window size in tokens, or `null` when it
    * isn't known (e.g. a remote model/provider that doesn't expose one).
+   * Model-global, unlike usage — both panes chat with the active model.
    */
   contextLimit: number | null;
-  setUsage: (usage: UsageInfo) => void;
+  setUsage: (sessionId: string, usage: UsageInfo) => void;
   setContextLimit: (limit: number | null) => void;
 }
 
@@ -31,10 +37,11 @@ export interface UsageStore {
  * pushes values into.
  */
 export const useUsageStore = create<UsageStore>((set) => ({
-  lastUsage: null,
+  usageBySession: {},
   contextLimit: null,
 
-  setUsage: (usage) => set({ lastUsage: usage }),
+  setUsage: (sessionId, usage) =>
+    set((state) => ({ usageBySession: { ...state.usageBySession, [sessionId]: usage } })),
   setContextLimit: (limit) => set({ contextLimit: limit }),
 }));
 

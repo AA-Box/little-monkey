@@ -6,6 +6,7 @@ export const hi: Record<string, string> = {
   "AppMenu.getHelp": "सहायता प्राप्त करें",
   "AppMenu.version": "Little Monkey v{{version}}",
   "App.workspacePanelTitle": "वर्कस्पेस",
+  "App.closeSplitPane": "स्प्लिट व्यू बंद करें",
   "App.collapseWorkspacePanel": "वर्कस्पेस पैनल संक्षिप्त करें",
   "App.expandWorkspacePanel": "वर्कस्पेस पैनल विस्तृत करें",
   "App.diffPanelTitle": "डिफ़",

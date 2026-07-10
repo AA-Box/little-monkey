@@ -267,19 +267,29 @@ fn glob_impl(
 }
 
 /// Write (overwrite/create) a text file in the workspace. Permission-gated.
-#[tauri::command]
+/// `checkpoint_id` is injected by the frontend agent loop (not the model) so
+/// the pre-mutation backup lands in the calling turn's own checkpoint.
+///
+/// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
+/// snake_case keys (as declared in the frontend tool schema) and are passed
+/// through verbatim, so the invoke payload must be matched by snake_case
+/// names rather than the macro's camelCase default.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_write_file(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     content: String,
+    checkpoint_id: Option<String>,
+    turn_id: Option<String>,
 ) -> Result<String, String> {
     let detail = format!("Write {} bytes to {}", content.len(), path);
-    permissions::request_permission(&app, state.inner(), "write_file", detail).await?;
+    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref())
+        .await?;
 
     let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
 
-    checkpoints::record_original(state.inner(), &resolved)?;
+    checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent)
@@ -330,14 +340,23 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
 
 /// Replace a single, unique occurrence of `old_string` with `new_string` in a
 /// workspace file. Permission-gated; errors if `old_string` isn't found, or
-/// is found more than once (to avoid ambiguous edits).
-#[tauri::command]
-pub async fn tool_edit_file(
-    app: tauri::AppHandle,
+/// is found more than once (to avoid ambiguous edits). `checkpoint_id` is
+/// injected by the frontend agent loop (not the model) so the pre-mutation
+/// backup lands in the calling turn's own checkpoint.
+///
+/// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
+/// snake_case keys (as declared in the frontend tool schema) and are passed
+/// through verbatim, so the invoke payload must be matched by snake_case
+/// names rather than the macro's camelCase default.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tool_edit_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
     path: String,
     old_string: String,
     new_string: String,
+    checkpoint_id: Option<String>,
+    turn_id: Option<String>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
@@ -366,9 +385,10 @@ pub async fn tool_edit_file(
     let preview = build_diff_preview(&old_string, &new_string);
     let detail = format!("Edit {}\n{}", path, preview);
 
-    permissions::request_permission(&app, state.inner(), "edit_file", detail).await?;
+    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref())
+        .await?;
 
-    checkpoints::record_original(state.inner(), &resolved)?;
+    checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
     let updated = current.replacen(old_string.as_str(), new_string.as_str(), 1);
     std::fs::write(&resolved, &updated).map_err(|e| format!("Failed to write '{}': {}", path, e))?;
@@ -384,8 +404,10 @@ pub async fn tool_run_shell(
     state: tauri::State<'_, AppState>,
     command: String,
     cwd: Option<String>,
+    turn_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    permissions::request_permission(&app, state.inner(), "run_shell", command.clone()).await?;
+    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref())
+        .await?;
 
     let cwd_path = match cwd {
         Some(ref c) => workspace::resolve_path_and_root(state.inner(), c)?.0,
@@ -417,21 +439,48 @@ pub async fn tool_run_shell(
         .spawn()
         .map_err(|e| format!("Failed to spawn shell: {}", e))?;
 
-    let output = tokio::select! {
+    // Each turn gets its own cancellation channel so Stop in one pane never
+    // kills a command the other pane's turn is still running. Callers that
+    // don't thread a turn id share the "" channel.
+    let cancel_key = turn_id.unwrap_or_default();
+    let cancel = state
+        .tool_cancel
+        .lock()
+        .map_err(|_| "Tool-cancel lock poisoned".to_string())?
+        .entry(cancel_key.clone())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+        .clone();
+
+    let outcome = tokio::select! {
         result = child.wait_with_output() => {
-            result.map_err(|e| format!("Failed to run command: {}", e))?
+            result.map_err(|e| format!("Failed to run command: {}", e))
         }
-        _ = state.tool_cancel.notified() => {
-            return Err("Command cancelled by the user".to_string());
+        _ = cancel.notified() => {
+            Err("Command cancelled by the user".to_string())
         }
         _ = tokio::time::sleep(SHELL_TIMEOUT) => {
-            return Err(format!(
+            Err(format!(
                 "Command timed out after {} seconds",
                 SHELL_TIMEOUT.as_secs()
-            ));
+            ))
         }
     };
 
+    // Drop this turn's channel once no other shell of the same turn still
+    // holds it (strong count 2 = the map's Arc + our clone), so the map
+    // doesn't accumulate one entry per turn forever. A racing new shell for
+    // the same turn simply recreates the entry.
+    {
+        let mut guard = state
+            .tool_cancel
+            .lock()
+            .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
+        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+            guard.remove(&cancel_key);
+        }
+    }
+
+    let output = outcome?;
     Ok(serde_json::json!({
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
@@ -439,14 +488,32 @@ pub async fn tool_run_shell(
     }))
 }
 
-/// Cancel every in-flight tool invocation: kills any running `tool_run_shell`
-/// child process (via the `tool_cancel` notification each one selects on)
-/// and denies any permission prompt still awaiting an answer. Invoked by the
+/// Cancel in-flight tool invocations: kills running `tool_run_shell` child
+/// processes (via the per-turn cancel notification each one selects on) and
+/// denies permission prompts still awaiting an answer. Invoked by the
 /// frontend when the user hits Stop while a tool call is executing.
+/// `turn_id` of `Some` scopes the cancellation to that turn — with the split
+/// pane, the other pane's turn may have its own shell command or prompt in
+/// flight that this Stop must not touch. `None` cancels everything.
 #[tauri::command]
-pub fn tools_cancel_running(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.tool_cancel.notify_waiters();
-    permissions::deny_pending(state.inner());
+pub fn tools_cancel_running(
+    state: tauri::State<'_, AppState>,
+    turn_id: Option<String>,
+) -> Result<(), String> {
+    let notifies: Vec<std::sync::Arc<tokio::sync::Notify>> = {
+        let guard = state
+            .tool_cancel
+            .lock()
+            .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
+        match turn_id.as_deref() {
+            Some(turn) => guard.get(turn).cloned().into_iter().collect(),
+            None => guard.values().cloned().collect(),
+        }
+    };
+    for notify in notifies {
+        notify.notify_waiters();
+    }
+    permissions::deny_pending(state.inner(), turn_id.as_deref());
     Ok(())
 }
 
@@ -626,5 +693,126 @@ mod tests {
         let results = glob_impl("*.md", &tree.path, &tree.path, "other/").unwrap();
 
         assert_eq!(results, vec!["other/notes.md".to_string()]);
+    }
+
+    /// Builds a mock Tauri app whose workspace root is `root`, with the
+    /// permission mode preset so `edit_file`/`write_file` auto-approve
+    /// instead of hanging on a prompt no one can answer in a test.
+    fn mock_app_with_workspace(root: &std::path::Path) -> tauri::App<tauri::test::MockRuntime> {
+        let canonical = root.canonicalize().unwrap();
+        let checkpoint_dir = canonical.join(".checkpoint");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+
+        let state = crate::AppState::default();
+        *state.permissions.mode.lock().unwrap() = "acceptEdits".to_string();
+        state.workspace_roots.lock().unwrap().push(workspace::WorkspaceRoot {
+            id: canonical.to_string_lossy().to_string(),
+            label: "test".to_string(),
+            path: canonical,
+        });
+        state.checkpoints.lock().unwrap().insert(
+            "test-checkpoint".to_string(),
+            checkpoints::ActiveCheckpoint {
+                dir: checkpoint_dir,
+                entries: Vec::new(),
+            },
+        );
+
+        tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![tool_edit_file])
+            .manage(state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    fn edit_file_invoke_request(args: serde_json::Value) -> tauri::webview::InvokeRequest {
+        tauri::webview::InvokeRequest {
+            cmd: "tool_edit_file".to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .unwrap(),
+            body: tauri::ipc::InvokeBody::Json(args),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        }
+    }
+
+    /// The model emits snake_case argument keys (as declared in the frontend
+    /// tool schema) and the agent loop forwards them verbatim, so the IPC
+    /// layer must accept them — this pins `rename_all = "snake_case"` on the
+    /// command, without which the macro only matches camelCase keys and every
+    /// edit_file call fails with "missing required key oldString".
+    #[test]
+    fn edit_file_ipc_accepts_snake_case_argument_keys() {
+        let tree = TempTree::new();
+        std::fs::write(tree.path.join("hello.txt"), "hello old world").unwrap();
+
+        let app = mock_app_with_workspace(&tree.path);
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        let response = tauri::test::get_ipc_response(
+            &webview,
+            edit_file_invoke_request(serde_json::json!({
+                "path": "hello.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "checkpoint_id": "test-checkpoint",
+            })),
+        );
+
+        assert!(response.is_ok(), "snake_case invoke failed: {response:?}");
+        assert_eq!(
+            std::fs::read_to_string(tree.path.join("hello.txt")).unwrap(),
+            "hello new world"
+        );
+
+        // The snake_case `checkpoint_id` key must reach the command too (the
+        // agent loop injects it in that form) — proven by the pre-edit backup
+        // recorded in the matching active checkpoint.
+        use tauri::Manager;
+        let state = app.state::<crate::AppState>();
+        let checkpoints = state.checkpoints.lock().unwrap();
+        let entries = &checkpoints["test-checkpoint"].entries;
+        assert_eq!(entries.len(), 1, "expected one checkpoint entry");
+        assert!(entries[0].path.ends_with("hello.txt"));
+        assert!(entries[0].backup.is_some(), "pre-edit backup missing");
+    }
+
+    /// Companion to the test above: camelCase keys must NOT match, proving
+    /// the rename is actually in effect (nothing in the app sends camelCase
+    /// to this command anymore — the agent loop's checkpoint_id injection is
+    /// snake_case too).
+    #[test]
+    fn edit_file_ipc_rejects_camel_case_argument_keys() {
+        let tree = TempTree::new();
+        std::fs::write(tree.path.join("hello.txt"), "hello old world").unwrap();
+
+        let app = mock_app_with_workspace(&tree.path);
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        let response = tauri::test::get_ipc_response(
+            &webview,
+            edit_file_invoke_request(serde_json::json!({
+                "path": "hello.txt",
+                "oldString": "old",
+                "newString": "new",
+            })),
+        );
+
+        assert!(response.is_err(), "camelCase keys unexpectedly accepted");
+        assert_eq!(
+            std::fs::read_to_string(tree.path.join("hello.txt")).unwrap(),
+            "hello old world"
+        );
     }
 }
