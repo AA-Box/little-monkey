@@ -235,6 +235,18 @@ export function formatMemoryNotice(notice: MemoryNotice): string {
   return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
+/**
+ * Filters `remember` out of the tool list offered to the model this turn
+ * when the settingsStore `memoryEnabled` toggle is off. This is the ONLY
+ * effect of that toggle — rules and previously-saved facts are still
+ * injected into the system prompt unconditionally (see `runAgentTurnBody`'s
+ * `useRulesStore.getState().refresh()` call); turning it off stops the agent
+ * from saving *new* facts on its own, it is not amnesia.
+ */
+export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean): ToolDef[] {
+  return memoryEnabled ? tools : tools.filter((tool) => tool.function.name !== 'remember');
+}
+
 /** Shape of a successful `tool_remember` result (the created/deduplicated
  * fact) — checked structurally against the tool's stringified result so an
  * error payload (`{ error: string }`) never gets misread as one. */
@@ -889,6 +901,8 @@ async function runAgentTurnBody(
   // local-file reads per turn is negligible and needs no file watcher.
   await useRulesStore.getState().refresh();
 
+  const toolsForTurn: ToolDef[] = toolsForSettings(TOOLS, settings.memoryEnabled);
+
   // The system prompt (identity, workspace roots, OS, tool guidance, and
   // MONKEY.md rules — see systemPrompt.ts) is injected at the head of the
   // OUTGOING payload only, never stored in the session transcript, so it
@@ -950,7 +964,7 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
-    let attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+    let attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
 
     // Failover: only ever retry a *different* target when nothing streamed
     // back yet for this attempt — once tokens have started arriving, a
@@ -969,7 +983,7 @@ async function runAgentTurnBody(
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
     }
 
     const { content, toolCalls, streamError } = attempt;
