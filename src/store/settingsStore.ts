@@ -31,6 +31,8 @@ export interface SettingsState {
   providerRateLimits: Record<string, ProviderRateLimit>;
   /** "providerId:modelId" -> manual correction of the built-in vision-capability heuristic (see `visionModels.ts`). */
   visionOverrides: Record<string, boolean>;
+  /** Provider id -> user-curated model allowlist for that provider's model list (e.g. the OpenRouter tab's picker). Absent/`showAll: true` means unfiltered. */
+  providerModelFilters: Record<string, ProviderModelFilter>;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -42,7 +44,27 @@ export interface SettingsState {
   clearProviderRateLimit: (providerId: string) => void;
   setVisionOverride: (key: string, value: boolean) => void;
   clearVisionOverride: (key: string) => void;
+  setProviderModelShowAll: (providerId: string, showAll: boolean) => void;
+  toggleProviderModelSelected: (providerId: string, modelId: string) => void;
+  clearProviderModelSelection: (providerId: string) => void;
 }
+
+/** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
+export interface ProviderModelFilter {
+  /** When true, every model for this provider is shown regardless of `selectedModelIds` — lets a user keep favorites checked while still browsing the full list. */
+  showAll: boolean;
+  /** Model ids the user has explicitly checked. Ignored while `showAll` is true, and also ignored (i.e. treated as "show everything") when empty, so a freshly-connected provider isn't curated down to nothing before the user has picked anything. */
+  selectedModelIds: string[];
+}
+
+/**
+ * Stable "no curation yet" fallback — must be a module-level constant, not a
+ * fresh object literal inlined in a selector, for the same reason
+ * `ProviderCard.tsx`'s `EMPTY_MODELS` is: a new object every render makes
+ * Zustand see a "changed" snapshot on every render and spin into an infinite
+ * re-render loop.
+ */
+export const DEFAULT_PROVIDER_MODEL_FILTER: ProviderModelFilter = { showAll: true, selectedModelIds: [] };
 
 const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
 
@@ -55,6 +77,7 @@ interface PersistedShape {
   rateLimitWarningsEnabled: boolean;
   providerRateLimits: Record<string, ProviderRateLimit>;
   visionOverrides: Record<string, boolean>;
+  providerModelFilters: Record<string, ProviderModelFilter>;
 }
 
 function defaults(): PersistedShape {
@@ -67,7 +90,25 @@ function defaults(): PersistedShape {
     rateLimitWarningsEnabled: true,
     providerRateLimits: {},
     visionOverrides: {},
+    providerModelFilters: {},
   };
+}
+
+/** Defensive per-entry validation for a persisted `providerModelFilters` blob — one malformed entry (e.g. hand-edited localStorage) must not corrupt the rest. */
+function sanitizeProviderModelFilters(raw: unknown): Record<string, ProviderModelFilter> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, ProviderModelFilter> = {};
+  for (const [providerId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Partial<ProviderModelFilter>;
+    out[providerId] = {
+      showAll: typeof entry.showAll === "boolean" ? entry.showAll : true,
+      selectedModelIds: Array.isArray(entry.selectedModelIds)
+        ? entry.selectedModelIds.filter((id): id is string => typeof id === "string")
+        : [],
+    };
+  }
+  return out;
 }
 
 /** Loads the persisted settings blob, falling back to defaults for anything absent, corrupt, or malformed. */
@@ -95,6 +136,7 @@ function hydrate(): PersistedShape {
       providerRateLimits:
         parsed.providerRateLimits && typeof parsed.providerRateLimits === "object" ? parsed.providerRateLimits : fallback.providerRateLimits,
       visionOverrides: parsed.visionOverrides && typeof parsed.visionOverrides === "object" ? parsed.visionOverrides : fallback.visionOverrides,
+      providerModelFilters: sanitizeProviderModelFilters(parsed.providerModelFilters),
     };
   } catch {
     return fallback;
@@ -168,6 +210,33 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set((state) => {
       const { [key]: _discard, ...rest } = state.visionOverrides;
       return { visionOverrides: rest };
+    });
+    persist({ ...get() });
+  },
+
+  setProviderModelShowAll: (providerId, showAll) => {
+    set((state) => {
+      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, showAll } } };
+    });
+    persist({ ...get() });
+  },
+
+  toggleProviderModelSelected: (providerId, modelId) => {
+    set((state) => {
+      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+      const selectedModelIds = existing.selectedModelIds.includes(modelId)
+        ? existing.selectedModelIds.filter((id) => id !== modelId)
+        : [...existing.selectedModelIds, modelId];
+      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds } } };
+    });
+    persist({ ...get() });
+  },
+
+  clearProviderModelSelection: (providerId) => {
+    set((state) => {
+      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds: [] } } };
     });
     persist({ ...get() });
   },
