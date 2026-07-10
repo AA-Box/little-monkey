@@ -9,6 +9,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::AppState;
 use rustyline::error::ReadlineError;
 
@@ -93,6 +94,7 @@ pub async fn run(
     state: &AppState,
     mode: PermissionMode,
     mut options: chat::ChatOptions,
+    mcp_entries: &[McpServerEntry],
 ) {
     let mut reader = Reader::new();
     if reader.interactive() {
@@ -148,7 +150,7 @@ pub async fn run(
             truncate_to_system(&mut history);
         }
         if let Err(e) =
-            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, &text).await
+            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, &text, mcp_entries).await
         {
             eprintln!("\nError: {e}");
         }
