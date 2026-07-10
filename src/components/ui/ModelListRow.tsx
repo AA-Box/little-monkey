@@ -19,9 +19,9 @@ export interface ModelListRowProps {
 
 /**
  * A single "model you can switch to" row: title + optional badge/subtitle
- * on the left, an Active/Use button on the right. Shared by every model
- * list in the sidebar (`OllamaModelList`, `ProviderModelList`) so they stay
- * visually and behaviorally identical.
+ * on the left, an Active/Use button on the right. Shared by `OllamaModelList`
+ * and `ProviderCard`'s per-provider model list so they stay visually and
+ * behaviorally identical.
  */
 export function ModelListRow({ title, subtitle, badge, isActive, onUse, onRemove }: ModelListRowProps) {
   const { t } = useT();

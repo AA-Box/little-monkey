@@ -5,6 +5,7 @@ import { useModelStore } from "../../store/modelStore";
 import { ProviderCard } from "./ProviderCard";
 import { AddCustomProviderForm } from "./AddCustomProviderForm";
 import { AutomationPanel } from "./AutomationPanel";
+import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -14,9 +15,9 @@ interface SettingsModalProps {
   onClose: () => void;
 }
 
-type SettingsTab = "local" | "ollama" | "providers" | "automation";
+type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation";
 
-const TAB_KEYS: { id: SettingsTab; labelKey: string }[] = [
+const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
   { id: "local", labelKey: "SettingsModal.tabLocalModels" },
   { id: "ollama", labelKey: "SettingsModal.tabOllama" },
   { id: "providers", labelKey: "SettingsModal.tabAiProviders" },
@@ -36,12 +37,31 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
   const [tab, setTab] = useState<SettingsTab>("local");
   const { t } = useT();
-  const TABS = TAB_KEYS.map(({ id, labelKey }) => ({ id, label: t(labelKey) }));
+
+  const openrouterProvider = providers.find((p) => p.id === "openrouter");
+  const openrouterConnected = openrouterProvider?.has_key ?? false;
+
+  // A dedicated tab named after the provider, inserted right before "AI
+  // Providers" — only while OpenRouter is connected. OpenRouter alone
+  // returns 400+ models (see `ProviderCard.tsx`'s `FILTER_THRESHOLD`), so it
+  // gets its own curation surface instead of dumping everything into the
+  // chat toolbar's model switcher unfiltered.
+  const TABS: { id: SettingsTab; label: string }[] = [];
+  for (const { id, labelKey } of TAB_KEYS) {
+    if (id === "providers" && openrouterConnected) {
+      TABS.push({ id: "openrouter", label: openrouterProvider?.label ?? "OpenRouter" });
+    }
+    TABS.push({ id, label: t(labelKey) });
+  }
 
   useEffect(() => {
     if (!open) return;
     void refreshProviders();
   }, [open, refreshProviders]);
+
+  useEffect(() => {
+    if (tab === "openrouter" && !openrouterConnected) setTab("providers");
+  }, [tab, openrouterConnected]);
 
   useEffect(() => {
     if (!open) return;
@@ -82,6 +102,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
           {tab === "local" && <ModelManager />}
           {tab === "ollama" && <OllamaPanel />}
+          {tab === "openrouter" && <OpenRouterModelsPanel />}
           {tab === "providers" && (
             <div className="flex flex-col gap-2 p-2">
               {providers.map((provider) => (

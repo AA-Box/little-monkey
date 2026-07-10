@@ -2,8 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
 
 import { useModelStore } from "../../store/modelStore";
-import type { ModelInfo, OllamaModelInfo } from "../../store/modelStore";
+import type { ModelInfo, OllamaModelInfo, ProviderModelInfo } from "../../store/modelStore";
+import { useSettingsStore, DEFAULT_PROVIDER_MODEL_FILTER } from "../../store/settingsStore";
 import { useT } from "../../lib/i18n";
+
+/** Narrows `models` to a provider's curated allowlist — unfiltered while `showAll` is on, or until the user has actually checked something (an empty selection means "nothing curated yet", not "hide everything"). */
+function visibleProviderModels(models: ProviderModelInfo[], filter: { showAll: boolean; selectedModelIds: string[] }) {
+  if (filter.showAll || filter.selectedModelIds.length === 0) return models;
+  return models.filter((model) => filter.selectedModelIds.includes(model.id));
+}
 
 /**
  * Small pill + dropdown for switching the active chat model between an
@@ -19,7 +26,15 @@ export function ModelSwitcher() {
   const activeOllamaModel = useModelStore((s) => s.activeOllamaModel);
   const start = useModelStore((s) => s.start);
   const useOllamaModel = useModelStore((s) => s.useOllamaModel);
+  const providers = useModelStore((s) => s.providers);
+  const providerModels = useModelStore((s) => s.providerModels);
+  const activeProviderId = useModelStore((s) => s.activeProviderId);
+  const activeProviderModel = useModelStore((s) => s.activeProviderModel);
+  const useProviderModel = useModelStore((s) => s.useProviderModel);
+  const providerModelFilters = useSettingsStore((s) => s.providerModelFilters);
   const { t } = useT();
+
+  const connectedProviders = providers.filter((provider) => provider.has_key);
 
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -40,6 +55,8 @@ export function ModelSwitcher() {
     label = active.name;
   } else if (activeProvider === "ollama" && activeOllamaModel) {
     label = activeOllamaModel;
+  } else if (activeProvider === "provider" && activeProviderModel) {
+    label = activeProviderModel;
   }
 
   function handleSelectLocal(model: ModelInfo) {
@@ -51,6 +68,11 @@ export function ModelSwitcher() {
 
   function handleSelectOllama(model: OllamaModelInfo) {
     useOllamaModel(model.name);
+    setOpen(false);
+  }
+
+  function handleSelectProvider(providerId: string, modelId: string) {
+    useProviderModel(providerId, modelId);
     setOpen(false);
   }
 
@@ -68,7 +90,7 @@ export function ModelSwitcher() {
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 z-20 mb-1 max-h-72 w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg">
+        <div className="absolute bottom-full right-0 z-20 mb-1 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg">
           <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.localSectionLabel")}</p>
           {installed.length === 0 ? (
             <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noLocalModelsInstalled")}</p>
@@ -85,6 +107,42 @@ export function ModelSwitcher() {
                   <span className="truncate">{model.name}</span>
                   {isActive && <Check size={14} className="shrink-0 text-accent" />}
                 </button>
+              );
+            })
+          )}
+
+          {connectedProviders.length === 0 ? (
+            <>
+              <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.cloudSectionLabel")}</p>
+              <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noCloudModelsConfigured")}</p>
+            </>
+          ) : (
+            connectedProviders.map((provider) => {
+              const filter = providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+              const models = visibleProviderModels(providerModels[provider.id] ?? [], filter);
+              return (
+                <div key={provider.id}>
+                  <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{provider.label}</p>
+                  {models.length === 0 ? (
+                    <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noCloudModelsConfigured")}</p>
+                  ) : (
+                    models.map((model) => {
+                      const isActive =
+                        activeProvider === "provider" && activeProviderId === provider.id && activeProviderModel === model.id;
+                      return (
+                        <button
+                          key={`${provider.id}/${model.id}`}
+                          type="button"
+                          onClick={() => handleSelectProvider(provider.id, model.id)}
+                          className="flex w-full cursor-pointer items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-surface-2"
+                        >
+                          <span className="truncate">{model.id}</span>
+                          {isActive && <Check size={14} className="shrink-0 text-accent" />}
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
               );
             })
           )}

@@ -25,8 +25,9 @@ interface ProviderCardProps {
  * One provider's connection card in the Settings modal: label + base URL,
  * an API key input (or a "saved" indicator + refresh/remove actions once
  * connected), and — once connected — a filterable list of its models that
- * can be switched to right from here (same `ModelListRow` the sidebar's
- * `ProviderModelList` uses, so switching works identically in both places).
+ * can be switched to right from here (same `ModelListRow` the chat toolbar's
+ * `ModelSwitcher` cloud section uses, so switching works identically in both
+ * places).
  */
 export function ProviderCard({ provider }: ProviderCardProps) {
   const providerModels = useModelStore((s) => s.providerModels[provider.id] ?? EMPTY_MODELS);
