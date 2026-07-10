@@ -43,6 +43,7 @@ import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
@@ -817,10 +818,16 @@ async function runAgentTurnBody(
 
   const effort = useModelStore.getState().effort;
 
-  // The system prompt (identity, workspace roots, OS, tool guidance — see
-  // systemPrompt.ts) is injected at the head of the OUTGOING payload only,
-  // never stored in the session transcript, so it always reflects the
-  // current workspace instead of a snapshot. Computed once per turn.
+  // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
+  // newly remembered facts) before building the system prompt below — two
+  // local-file reads per turn is negligible and needs no file watcher.
+  await useRulesStore.getState().refresh();
+
+  // The system prompt (identity, workspace roots, OS, tool guidance, and
+  // MONKEY.md rules — see systemPrompt.ts) is injected at the head of the
+  // OUTGOING payload only, never stored in the session transcript, so it
+  // always reflects the current workspace instead of a snapshot. Computed
+  // once per turn.
   const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {

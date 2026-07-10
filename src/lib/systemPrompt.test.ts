@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { buildSystemPrompt, detectOsLabel } from './systemPrompt';
+import type { MemoryFact, RuleFile } from '../store/rulesStore';
 
 describe('detectOsLabel', () => {
   it('maps navigator platforms to friendly names', () => {
@@ -43,5 +44,50 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('glob');
     expect(prompt).toContain('grep');
     expect(prompt).toContain('permission');
+  });
+
+  it('omits the MONKEY.md section entirely when there are no rules', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('Project instructions (MONKEY.md)');
+  });
+
+  it('appends each rule file with a "From <scope/label>:" provenance header, global first', () => {
+    const globalRule: RuleFile = {
+      scope: 'global',
+      label: 'global',
+      path: '/app-data/MONKEY.md',
+      content: 'Always write tests.',
+      truncated: false,
+    };
+    const projectRule: RuleFile = {
+      scope: 'project',
+      label: 'notes',
+      path: '/home/me/notes/MONKEY.md',
+      content: 'Notes are markdown only.',
+      truncated: false,
+    };
+
+    const prompt = buildSystemPrompt([primary, secondary], 'macOS', [globalRule, projectRule]);
+
+    expect(prompt).toContain('## Project instructions (MONKEY.md)');
+    expect(prompt).toContain('From global:');
+    expect(prompt).toContain('Always write tests.');
+    expect(prompt).toContain('From project (notes):');
+    expect(prompt).toContain('Notes are markdown only.');
+    // Global must precede the project-scoped entry.
+    expect(prompt.indexOf('From global:')).toBeLessThan(prompt.indexOf('From project (notes):'));
+  });
+
+  it('lists remembered facts as bullets when present, and omits the section when empty', () => {
+    const facts: MemoryFact[] = [
+      { id: '1', text: 'Uses pnpm, not npm.', source: 'user', created_at: '2026-01-01T00:00:00Z' },
+    ];
+
+    const withFacts = buildSystemPrompt([primary], 'macOS', [], facts);
+    expect(withFacts).toContain('## Remembered facts');
+    expect(withFacts).toContain('- Uses pnpm, not npm.');
+
+    const withoutFacts = buildSystemPrompt([primary], 'macOS', [], []);
+    expect(withoutFacts).not.toContain('Remembered facts');
   });
 });
