@@ -114,6 +114,62 @@ pub fn rules_read(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> R
     Ok(read_rules_impl(&global_path, &roots))
 }
 
+/// Core logic behind [`rules_write`], parameterized by plain `AppState` +
+/// global path (no `AppHandle`) so it's directly unit-testable, mirroring
+/// the `*_impl` split used throughout `checkpoints.rs`/`workspace.rs`.
+///
+/// `scope: "global"` writes `global_path` (`<app_data>/MONKEY.md`),
+/// ignoring `root_path`. `scope: "project"` requires `root_path` — the same
+/// resolvable path a tool call would use (e.g. `"MONKEY.md"` for the
+/// primary root, or `"<label>/MONKEY.md"` for an attached secondary root's
+/// label) — and resolves it through `workspace::resolve_path_and_root` so a
+/// caller can never write outside an attached root.
+fn write_rules_impl(
+    state: &AppState,
+    global_path: &Path,
+    scope: &str,
+    root_path: Option<&str>,
+    content: &str,
+) -> Result<(), String> {
+    let target = match scope {
+        "global" => global_path.to_path_buf(),
+        "project" => {
+            let root_path =
+                root_path.ok_or_else(|| "root_path is required when scope is \"project\"".to_string())?;
+            let (resolved, _root_canon) = workspace::resolve_path_and_root(state, root_path)?;
+            resolved
+        }
+        other => return Err(format!("Unknown rules scope '{}' (expected \"global\" or \"project\")", other)),
+    };
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directories for '{}': {}", target.display(), e))?;
+    }
+    std::fs::write(&target, content).map_err(|e| format!("Failed to write '{}': {}", target.display(), e))
+}
+
+/// Save a MONKEY.md file from the Settings "Rules" editor. A direct,
+/// human-initiated UI action — like `git_commit`/`checkpoint_revert`,
+/// intentionally NOT routed through `permissions::request_permission`; the
+/// user is editing their own instructions file by hand, not asking the agent
+/// to write it.
+#[tauri::command]
+pub fn rules_write(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    scope: String,
+    root_path: Option<String>,
+    content: String,
+) -> Result<(), String> {
+    let global_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+    let global_path = global_dir.join(RULE_FILE_NAME);
+    write_rules_impl(state.inner(), &global_path, &scope, root_path.as_deref(), &content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +270,97 @@ mod tests {
         assert_eq!(files[0].content, "Primary rules.");
         assert_eq!(files[1].label, "libs");
         assert_eq!(files[1].content, "Secondary A rules.");
+    }
+
+    /// Builds an `AppState` with `root` attached as the primary workspace
+    /// root (and any `secondaries` attached after it), without going through
+    /// `workspace::set_primary_workspace_root_impl` (private to that
+    /// module) — `WorkspaceRoot`'s fields are `pub`, so constructing entries
+    /// directly is simplest here.
+    fn state_with_roots(root: &Path, secondaries: &[(&Path, &str)]) -> AppState {
+        let state = AppState::default();
+        {
+            let mut roots = state.workspace_roots.lock().unwrap();
+            roots.push(workspace::WorkspaceRoot {
+                id: root.to_string_lossy().to_string(),
+                path: root.to_path_buf(),
+                label: "project".to_string(),
+            });
+            for (path, label) in secondaries {
+                roots.push(workspace::WorkspaceRoot {
+                    id: path.to_string_lossy().to_string(),
+                    path: path.to_path_buf(),
+                    label: label.to_string(),
+                });
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn write_global_scope_writes_the_global_path_and_creates_parent_dirs() {
+        let dir = TempDir::new();
+        // Nested, not-yet-existing app-data dir, like a fresh install.
+        let global_path = dir.path.join("nested").join("MONKEY.md");
+        let state = AppState::default();
+
+        write_rules_impl(&state, &global_path, "global", None, "Global rules.").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&global_path).unwrap(), "Global rules.");
+    }
+
+    #[test]
+    fn write_project_scope_writes_the_primary_root_file() {
+        let global_path = TempDir::new().path.join("MONKEY.md"); // unused by this branch
+        let ws = TempDir::new();
+        let state = state_with_roots(&ws.path, &[]);
+
+        write_rules_impl(&state, &global_path, "project", Some(RULE_FILE_NAME), "Primary project rules.").unwrap();
+
+        let written = ws.path.canonicalize().unwrap().join(RULE_FILE_NAME);
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "Primary project rules.");
+    }
+
+    #[test]
+    fn write_project_scope_writes_a_secondary_root_file_via_its_label() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let primary = TempDir::new();
+        let secondary = TempDir::new();
+        let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
+
+        let root_path = format!("libs/{}", RULE_FILE_NAME);
+        write_rules_impl(&state, &global_path, "project", Some(&root_path), "Secondary rules.").unwrap();
+
+        let written = secondary.path.canonicalize().unwrap().join(RULE_FILE_NAME);
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "Secondary rules.");
+    }
+
+    #[test]
+    fn write_project_scope_without_root_path_errors() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let ws = TempDir::new();
+        let state = state_with_roots(&ws.path, &[]);
+
+        let err = write_rules_impl(&state, &global_path, "project", None, "content").unwrap_err();
+        assert!(err.contains("root_path"), "expected a root_path error, got: {err}");
+    }
+
+    #[test]
+    fn write_project_scope_cannot_escape_the_workspace_root() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let ws = TempDir::new();
+        let state = state_with_roots(&ws.path, &[]);
+
+        let err = write_rules_impl(&state, &global_path, "project", Some("../escape/MONKEY.md"), "evil").unwrap_err();
+        assert!(err.contains("escapes"), "expected an escape error, got: {err}");
+    }
+
+    #[test]
+    fn write_unknown_scope_errors() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let state = AppState::default();
+
+        let err = write_rules_impl(&state, &global_path, "bogus", None, "content").unwrap_err();
+        assert!(err.contains("Unknown rules scope"), "expected an unknown-scope error, got: {err}");
     }
 }
