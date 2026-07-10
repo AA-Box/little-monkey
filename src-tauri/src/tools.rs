@@ -715,6 +715,11 @@ mod tests {
             checkpoints::ActiveCheckpoint {
                 dir: checkpoint_dir,
                 entries: Vec::new(),
+                created_at_ms: 0,
+                session_id: String::new(),
+                anchor_index: 0,
+                label: String::new(),
+                shell_ran: false,
             },
         );
 

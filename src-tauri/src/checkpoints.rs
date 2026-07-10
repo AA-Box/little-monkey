@@ -30,10 +30,14 @@ use tauri::Manager;
 
 use crate::AppState;
 
-/// How many finished checkpoints to keep on disk before pruning the oldest.
+/// How many finished checkpoints to keep on disk before pruning the oldest,
+/// when the caller doesn't pass an explicit `max_keep`.
 const MAX_CHECKPOINTS: usize = 20;
 
 const MANIFEST_FILE: &str = "manifest.json";
+
+/// Current on-disk manifest schema version — see [`CheckpointManifest`].
+const MANIFEST_VERSION: u8 = 2;
 
 /// One file recorded in a checkpoint.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -46,20 +50,61 @@ pub struct CheckpointEntry {
     pub backup: Option<String>,
 }
 
+/// The versioned on-disk `manifest.json` (v2). v1 manifests were a bare
+/// `Vec<CheckpointEntry>` with no metadata — [`parse_manifest`] falls back
+/// to them and synthesizes defaults, so checkpoints written before the
+/// upgrade stay revertable without any migration pass.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct CheckpointManifest {
+    pub version: u8,
+    /// Unix millis when the checkpoint's turn began.
+    pub created_at_ms: u64,
+    /// The session whose turn this checkpoint belongs to.
+    pub session_id: String,
+    /// Index of the turn's user message in the transcript — the target for
+    /// conversation rewind.
+    pub anchor_index: usize,
+    /// First ~120 chars of the user prompt, for timeline labels and for
+    /// validating that `anchor_index` still points at the same message.
+    pub label: String,
+    /// True if `tool_run_shell` executed during this turn — revert coverage
+    /// is then only partial (shell side effects are not snapshotted).
+    pub shell_ran: bool,
+    /// Set on revert so list/timeline UIs can show state and offer Re-apply.
+    pub reverted: bool,
+    pub entries: Vec<CheckpointEntry>,
+}
+
 /// An open checkpoint for one in-flight turn. Lives in `AppState::checkpoints`
 /// keyed by its id until the turn's `checkpoint_end` removes it.
 pub struct ActiveCheckpoint {
     pub dir: PathBuf,
     pub entries: Vec<CheckpointEntry>,
+    /// Manifest metadata captured at `checkpoint_begin` time — written out
+    /// (and echoed back to the frontend) by `checkpoint_end`.
+    pub created_at_ms: u64,
+    pub session_id: String,
+    pub anchor_index: usize,
+    pub label: String,
+    /// Flipped by `record_shell` (future slice) when `tool_run_shell` runs
+    /// during the turn. Always `false` until then.
+    pub shell_ran: bool,
 }
 
-/// Summary returned to the frontend by `checkpoint_end`.
+/// Summary returned to the frontend by `checkpoint_end`. The renamed fields
+/// mirror the camelCase `CheckpointNotice` payload in `src/lib/agentLoop.ts`,
+/// which stores this verbatim inside the transcript's checkpoint notice.
 #[derive(serde::Serialize)]
 pub struct CheckpointSummary {
     pub id: String,
     /// Absolute paths of every file the turn mutated. Empty means nothing
     /// was recorded and the checkpoint was discarded.
     pub files: Vec<String>,
+    #[serde(rename = "anchorIndex")]
+    pub anchor_index: usize,
+    pub label: String,
+    #[serde(rename = "shellRan")]
+    pub shell_ran: bool,
 }
 
 fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -82,9 +127,9 @@ fn validate_id(id: &str) -> Result<(), String> {
     }
 }
 
-/// Delete the oldest checkpoint directories beyond [`MAX_CHECKPOINTS`].
+/// Delete the oldest checkpoint directories beyond `max_keep`.
 /// Best-effort: pruning failures never fail the turn that triggered them.
-fn prune_old(base_dir: &Path) {
+fn prune_old(base_dir: &Path, max_keep: usize) {
     let Ok(read_dir) = std::fs::read_dir(base_dir) else {
         return;
     };
@@ -98,20 +143,38 @@ fn prune_old(base_dir: &Path) {
         })
         .collect();
 
-    if dirs.len() <= MAX_CHECKPOINTS {
+    if dirs.len() <= max_keep {
         return;
     }
 
     dirs.sort_by_key(|(modified, _)| *modified);
-    let excess = dirs.len() - MAX_CHECKPOINTS;
+    let excess = dirs.len() - max_keep;
     for (_, path) in dirs.into_iter().take(excess) {
         let _ = std::fs::remove_dir_all(path);
     }
 }
 
-/// Core begin logic, parameterized by base dir for testability.
-pub fn begin_impl(state: &AppState, base_dir: &Path) -> Result<String, String> {
-    prune_old(base_dir);
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Core begin logic, parameterized by base dir for testability. The metadata
+/// (session, transcript anchor, prompt label) is frontend-supplied and rides
+/// along in the [`ActiveCheckpoint`] until `checkpoint_end` persists it into
+/// the manifest; `max_keep` feeds retention pruning (defaults to
+/// [`MAX_CHECKPOINTS`]) so a settings-driven value needs no backend state.
+pub fn begin_impl(
+    state: &AppState,
+    base_dir: &Path,
+    session_id: String,
+    anchor_index: usize,
+    label: String,
+    max_keep: Option<usize>,
+) -> Result<String, String> {
+    prune_old(base_dir, max_keep.unwrap_or(MAX_CHECKPOINTS).max(1));
 
     let id = uuid::Uuid::new_v4().to_string();
     let dir = base_dir.join(&id);
@@ -125,7 +188,18 @@ pub fn begin_impl(state: &AppState, base_dir: &Path) -> Result<String, String> {
         .checkpoints
         .lock()
         .map_err(|_| "Checkpoint lock poisoned".to_string())?
-        .insert(id.clone(), ActiveCheckpoint { dir, entries: Vec::new() });
+        .insert(
+            id.clone(),
+            ActiveCheckpoint {
+                dir,
+                entries: Vec::new(),
+                created_at_ms: now_ms(),
+                session_id,
+                anchor_index,
+                label,
+                shell_ran: false,
+            },
+        );
 
     Ok(id)
 }
@@ -167,8 +241,60 @@ pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> R
     Ok(())
 }
 
+/// Parses a raw `manifest.json`, falling back from the versioned v2 struct
+/// to the bare v1 `Vec<CheckpointEntry>` shape and synthesizing defaults
+/// (creation time from the checkpoint dir's mtime, empty session/label) so
+/// pre-upgrade checkpoints keep working with no migration pass.
+fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest, String> {
+    if let Ok(manifest) = serde_json::from_str::<CheckpointManifest>(raw) {
+        return Ok(manifest);
+    }
+
+    let entries: Vec<CheckpointEntry> = serde_json::from_str(raw)
+        .map_err(|e| format!("Checkpoint '{}' manifest is corrupt: {}", id, e))?;
+    let created_at_ms = std::fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Ok(CheckpointManifest {
+        version: 1,
+        created_at_ms,
+        session_id: String::new(),
+        anchor_index: 0,
+        label: String::new(),
+        shell_ran: false,
+        reverted: false,
+        entries,
+    })
+}
+
+/// Reads and parses checkpoint `id`'s manifest from its directory.
+fn read_manifest(base_dir: &Path, id: &str) -> Result<CheckpointManifest, String> {
+    let dir = base_dir.join(id);
+    let raw = std::fs::read_to_string(dir.join(MANIFEST_FILE))
+        .map_err(|e| format!("Checkpoint '{}' not found or unreadable: {}", id, e))?;
+    parse_manifest(&raw, &dir, id)
+}
+
+/// Atomic manifest write: sibling temp file + rename, same idiom as
+/// `sessions.rs`, so a crash mid-write can never leave a truncated manifest
+/// that would make the checkpoint unrevertable.
+fn write_manifest(dir: &Path, manifest: &CheckpointManifest) -> Result<(), String> {
+    let payload = serde_json::to_string_pretty(manifest)
+        .map_err(|e| format!("Failed to serialize checkpoint manifest: {}", e))?;
+    let path = dir.join(MANIFEST_FILE);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, payload).map_err(|e| format!("Failed to write checkpoint manifest: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize checkpoint manifest: {}", e))?;
+    Ok(())
+}
+
 /// Core end logic: close checkpoint `id`, persist its manifest (or discard
-/// the empty directory), and report what was touched.
+/// the empty directory), and report what was touched plus the metadata the
+/// frontend embeds in the transcript's checkpoint notice.
 pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String> {
     let taken = state
         .checkpoints
@@ -177,22 +303,44 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         .remove(id);
 
     let Some(active) = taken else {
-        return Ok(CheckpointSummary { id: String::new(), files: Vec::new() });
+        return Ok(CheckpointSummary {
+            id: String::new(),
+            files: Vec::new(),
+            anchor_index: 0,
+            label: String::new(),
+            shell_ran: false,
+        });
     };
 
     if active.entries.is_empty() {
         let _ = std::fs::remove_dir_all(&active.dir);
-        return Ok(CheckpointSummary { id: id.to_string(), files: Vec::new() });
+        return Ok(CheckpointSummary {
+            id: id.to_string(),
+            files: Vec::new(),
+            anchor_index: active.anchor_index,
+            label: active.label,
+            shell_ran: active.shell_ran,
+        });
     }
 
-    let manifest = serde_json::to_string_pretty(&active.entries)
-        .map_err(|e| format!("Failed to serialize checkpoint manifest: {}", e))?;
-    std::fs::write(active.dir.join(MANIFEST_FILE), manifest)
-        .map_err(|e| format!("Failed to write checkpoint manifest: {}", e))?;
+    let manifest = CheckpointManifest {
+        version: MANIFEST_VERSION,
+        created_at_ms: active.created_at_ms,
+        session_id: active.session_id,
+        anchor_index: active.anchor_index,
+        label: active.label.clone(),
+        shell_ran: active.shell_ran,
+        reverted: false,
+        entries: active.entries.clone(),
+    };
+    write_manifest(&active.dir, &manifest)?;
 
     Ok(CheckpointSummary {
         id: id.to_string(),
         files: active.entries.iter().map(|e| e.path.clone()).collect(),
+        anchor_index: active.anchor_index,
+        label: active.label,
+        shell_ran: active.shell_ran,
     })
 }
 
@@ -202,10 +350,7 @@ pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     validate_id(id)?;
 
     let dir = base_dir.join(id);
-    let manifest_raw = std::fs::read_to_string(dir.join(MANIFEST_FILE))
-        .map_err(|e| format!("Checkpoint '{}' not found or unreadable: {}", id, e))?;
-    let entries: Vec<CheckpointEntry> = serde_json::from_str(&manifest_raw)
-        .map_err(|e| format!("Checkpoint '{}' manifest is corrupt: {}", id, e))?;
+    let entries = read_manifest(base_dir, id)?.entries;
 
     let mut reverted = 0u32;
     let mut errors: Vec<String> = Vec::new();
@@ -238,10 +383,20 @@ pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     Ok(reverted)
 }
 
-/// Open a new per-turn checkpoint and return its id.
+/// Open a new per-turn checkpoint and return its id. `session_id`,
+/// `anchor_index` (the turn's user-message index in the transcript) and
+/// `label` (prompt prefix) are supplied by the frontend agent loop and end
+/// up in the manifest; `max_keep` overrides the default retention cap.
 #[tauri::command]
-pub fn checkpoint_begin(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    begin_impl(state.inner(), &checkpoints_base_dir(&app)?)
+pub fn checkpoint_begin(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    anchor_index: usize,
+    label: String,
+    max_keep: Option<usize>,
+) -> Result<String, String> {
+    begin_impl(state.inner(), &checkpoints_base_dir(&app)?, session_id, anchor_index, label, max_keep)
 }
 
 /// Close checkpoint `id`; returns the touched files (empty = nothing was
@@ -295,6 +450,11 @@ mod tests {
         }
     }
 
+    /// `begin_impl` with default metadata, for tests that don't care about it.
+    fn begin(state: &AppState, base_dir: &Path) -> String {
+        begin_impl(state, base_dir, "test-session".to_string(), 0, "test prompt".to_string(), None).unwrap()
+    }
+
     #[test]
     fn record_is_a_noop_without_a_checkpoint_id() {
         let state = AppState::default();
@@ -313,7 +473,7 @@ mod tests {
         let state = AppState::default();
         let base = TempDir::new("base");
 
-        let id = begin_impl(&state, &base.path).unwrap();
+        let id = begin(&state, &base.path);
         let summary = end_impl(&state, &id).unwrap();
 
         assert_eq!(summary.id, id);
@@ -331,7 +491,7 @@ mod tests {
         std::fs::write(&existing, "original").unwrap();
         let created = ws.path.join("created.txt");
 
-        let id = begin_impl(&state, &base.path).unwrap();
+        let id = begin(&state, &base.path);
         record_original(&state, Some(&id), &existing).unwrap();
         std::fs::write(&existing, "mutated").unwrap();
         record_original(&state, Some(&id), &created).unwrap();
@@ -359,8 +519,8 @@ mod tests {
 
         // Two turns in flight at once (split pane): each records its own
         // file under its own checkpoint id, in interleaved order.
-        let id_a = begin_impl(&state, &base.path).unwrap();
-        let id_b = begin_impl(&state, &base.path).unwrap();
+        let id_a = begin(&state, &base.path);
+        let id_b = begin(&state, &base.path);
         record_original(&state, Some(&id_a), &file_a).unwrap();
         std::fs::write(&file_a, "a-mutated").unwrap();
         record_original(&state, Some(&id_b), &file_b).unwrap();
@@ -392,7 +552,7 @@ mod tests {
         let file = ws.path.join("a.txt");
         std::fs::write(&file, "v1").unwrap();
 
-        let id = begin_impl(&state, &base.path).unwrap();
+        let id = begin(&state, &base.path);
         record_original(&state, Some(&id), &file).unwrap();
         std::fs::write(&file, "v2").unwrap();
         record_original(&state, Some(&id), &file).unwrap(); // second write same turn
@@ -419,5 +579,121 @@ mod tests {
         let base = TempDir::new("base");
         let err = revert_impl(&base.path, "0000-does-not-exist").unwrap_err();
         assert!(err.contains("not found"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn end_writes_a_v2_manifest_with_metadata_and_echoes_it() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("a.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let before_ms = now_ms();
+        let id = begin_impl(
+            &state,
+            &base.path,
+            "session-42".to_string(),
+            7,
+            "fix the login bug".to_string(),
+            None,
+        )
+        .unwrap();
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "mutated").unwrap();
+        let summary = end_impl(&state, &id).unwrap();
+
+        // The summary echoes the metadata the frontend embeds in its notice.
+        assert_eq!(summary.anchor_index, 7);
+        assert_eq!(summary.label, "fix the login bug");
+        assert!(!summary.shell_ran);
+
+        let manifest = read_manifest(&base.path, &id).unwrap();
+        assert_eq!(manifest.version, MANIFEST_VERSION);
+        assert_eq!(manifest.session_id, "session-42");
+        assert_eq!(manifest.anchor_index, 7);
+        assert_eq!(manifest.label, "fix the login bug");
+        assert!(!manifest.shell_ran);
+        assert!(!manifest.reverted);
+        assert!(manifest.created_at_ms >= before_ms, "created_at_ms must be set at begin time");
+        assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn v1_manifest_on_disk_still_reverts() {
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let existing = ws.path.join("existing.txt");
+        std::fs::write(&existing, "mutated").unwrap();
+        let created = ws.path.join("created.txt");
+        std::fs::write(&created, "brand new").unwrap();
+
+        // A real pre-upgrade checkpoint: a bare entry array, exactly as the
+        // old `end_impl` serialized it.
+        let id = "00000000-0000-4000-8000-00000000v1ok";
+        let dir = base.path.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0.bak"), "original").unwrap();
+        let v1_entries = vec![
+            CheckpointEntry { path: existing.to_string_lossy().to_string(), backup: Some("0.bak".to_string()) },
+            CheckpointEntry { path: created.to_string_lossy().to_string(), backup: None },
+        ];
+        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_string_pretty(&v1_entries).unwrap()).unwrap();
+
+        let reverted = revert_impl(&base.path, id).unwrap();
+        assert_eq!(reverted, 2);
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "original");
+        assert!(!created.exists(), "file created during the v1 turn must be deleted on revert");
+    }
+
+    #[test]
+    fn v1_manifest_reads_with_synthesized_defaults() {
+        let base = TempDir::new("base");
+
+        let id = "00000000-0000-4000-8000-0000000v1meta";
+        let dir = base.path.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v1_entries = vec![CheckpointEntry { path: "/tmp/a.txt".to_string(), backup: Some("0.bak".to_string()) }];
+        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_string(&v1_entries).unwrap()).unwrap();
+
+        let manifest = read_manifest(&base.path, id).unwrap();
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.session_id.is_empty());
+        assert_eq!(manifest.anchor_index, 0);
+        assert!(manifest.label.is_empty());
+        assert!(!manifest.shell_ran);
+        assert!(!manifest.reverted);
+        assert!(manifest.created_at_ms > 0, "created_at_ms must be synthesized from the dir mtime");
+        assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn begin_prunes_to_the_supplied_max_keep() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+
+        // Four finished checkpoints, oldest first (distinct mtimes).
+        for n in 0..4 {
+            let dir = base.path.join(format!("00000000-0000-4000-8000-00000000000{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), Some(2)).unwrap();
+
+        let remaining: Vec<String> = std::fs::read_dir(&base.path)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        // The two oldest were pruned; the two newest plus the just-opened
+        // checkpoint remain.
+        assert_eq!(remaining.len(), 3, "remaining: {remaining:?}");
+        assert!(!remaining.contains(&"00000000-0000-4000-8000-000000000000".to_string()));
+        assert!(!remaining.contains(&"00000000-0000-4000-8000-000000000001".to_string()));
+        assert!(remaining.contains(&id));
     }
 }

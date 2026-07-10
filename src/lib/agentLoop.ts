@@ -24,7 +24,7 @@
  * same mechanism a manual model switch uses — no separate sticky field.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { streamChat } from './llamaClient';
+import { streamChat, textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { TOOLS } from './tools';
@@ -78,13 +78,46 @@ export function isMentionNotice(message: ChatMessage): boolean {
  * `CheckpointNotice`), so `MessageList` can render a Revert button for it. */
 export const CHECKPOINT_NOTE_PREFIX = '[Checkpoint]';
 
+/** How much of the user prompt is kept as the checkpoint's label — used for
+ * timeline display and for validating the rewind anchor (see
+ * `checkpointAnchorValid`). Mirrors the manifest's `label` field cap. */
+export const CHECKPOINT_LABEL_MAX_CHARS = 120;
+
 /** Payload embedded in a checkpoint notice message. */
 export interface CheckpointNotice {
   id: string;
   /** Absolute paths of every file the turn mutated. */
   files: string[];
+  /** Index of the turn's user message in the transcript — the target for
+   * "Rewind conversation". Absent on notices recorded before manifest v2
+   * (those degrade to file-only restore). */
+  anchorIndex?: number;
+  /** First ~120 chars of the prompt that started the turn — validates that
+   * `anchorIndex` still points at the same message after compaction or
+   * edit-and-resubmit shifted indices. */
+  label?: string;
+  /** True if a shell command ran during the turn, meaning file restore may
+   * not undo everything. Always false until `record_shell` lands. */
+  shellRan?: boolean;
   /** Set once the user has reverted this checkpoint. */
   reverted?: boolean;
+}
+
+/**
+ * Whether `notice`'s conversation-rewind anchor still points at the user
+ * message that started its turn. Context compaction and edit-and-resubmit
+ * both shift transcript indices, so before offering "Rewind conversation"
+ * the anchored message must still be a user message whose text starts with
+ * the notice's label — otherwise the UI degrades to file-only restore.
+ */
+export function checkpointAnchorValid(messages: ChatMessage[], notice: CheckpointNotice): boolean {
+  if (typeof notice.anchorIndex !== 'number' || !Number.isInteger(notice.anchorIndex) || notice.anchorIndex < 0) {
+    return false;
+  }
+  if (typeof notice.label !== 'string') return false;
+  const anchored = messages[notice.anchorIndex];
+  if (!anchored || anchored.role !== 'user') return false;
+  return textContent(anchored.content).startsWith(notice.label);
 }
 
 export function isCheckpointNotice(message: ChatMessage): boolean {
@@ -596,6 +629,11 @@ async function runTurnGuarded(
   attachments: AttachmentRef[],
   signal: AbortSignal
 ): Promise<void> {
+  // The index this turn's user message will land at — captured before
+  // `addMessage` so it can anchor a later "Rewind conversation" back to the
+  // state just before this turn.
+  const anchorIndex = sessionMessages(sessionId).length;
+
   // Added as plain text first for instant feedback (resolving references
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
@@ -606,10 +644,18 @@ async function runTurnGuarded(
   // every write_file/edit_file this turn makes can be reverted in one click.
   // Checkpoints are keyed by id — with the split pane, the other pane's turn
   // may hold its own concurrent checkpoint — so this turn's id is threaded
-  // through to every file-mutating tool call and to checkpoint_end. Failure
-  // to open one (e.g. app-data dir unavailable) must never block the turn
-  // itself — the turn just runs without a revert affordance.
-  const checkpointId = await invoke<string>('checkpoint_begin').catch(() => null);
+  // through to every file-mutating tool call and to checkpoint_end. The
+  // session/anchor/label metadata ends up in the manifest for conversation
+  // rewind and (future) timeline labels; maxKeep is the retention cap
+  // (hardcoded until it becomes a setting). Failure to open one (e.g.
+  // app-data dir unavailable) must never block the turn itself — the turn
+  // just runs without a revert affordance.
+  const checkpointId = await invoke<string>('checkpoint_begin', {
+    sessionId,
+    anchorIndex,
+    label: userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS),
+    maxKeep: 20,
+  }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell
   // cancellation and permission prompts to this turn on the Rust side.
   const turnId = crypto.randomUUID();
@@ -621,7 +667,13 @@ async function runTurnGuarded(
       if (summary && summary.files.length > 0) {
         useSessionStore.getState().addMessage(sessionId, {
           role: 'system',
-          content: formatCheckpointNotice({ id: summary.id, files: summary.files }),
+          content: formatCheckpointNotice({
+            id: summary.id,
+            files: summary.files,
+            anchorIndex: summary.anchorIndex,
+            label: summary.label,
+            shellRan: summary.shellRan,
+          }),
         });
       }
     }

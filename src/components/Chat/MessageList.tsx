@@ -6,6 +6,7 @@ import {
   FileSearch,
   FileText,
   Folder,
+  MessageSquareX,
   RefreshCw,
   Search,
   TerminalSquare,
@@ -16,6 +17,7 @@ import {
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import {
+  checkpointAnchorValid,
   formatCheckpointNotice,
   isCheckpointNotice,
   isMentionNotice,
@@ -24,7 +26,7 @@ import {
   type CheckpointNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
-import { useSessionStore } from "../../store/sessionStore";
+import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import MessageBubble from "./MessageBubble";
 import { useT } from "../../lib/i18n";
 
@@ -231,38 +233,93 @@ const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
   );
 });
 
+/** The three restore scopes a checkpoint notice offers — Claude Code
+ * /rewind semantics: code only / conversation only / both. */
+type RestoreScope = "files" | "conversation" | "both";
+
 /**
  * Renders a per-turn checkpoint notice: how many files the turn changed,
- * with a one-click Revert that restores every one of them to its pre-turn
- * state (see src-tauri/src/checkpoints.rs). After a successful revert the
- * notice's message content is rewritten in place with `reverted: true`, so
- * the state survives re-renders and app restarts.
+ * with a Restore menu offering three scopes (see src-tauri/src/checkpoints.rs):
+ * - "Restore files" copies every touched file back to its pre-turn state and
+ *   rewrites the notice in place with `reverted: true`, so the state survives
+ *   re-renders and app restarts.
+ * - "Rewind conversation" truncates the transcript back to just before the
+ *   turn's user message (`anchorIndex`). Offered only while `anchorValid`
+ *   (the anchored message still matches the turn's prompt — compaction and
+ *   edit-resubmit shift indices) and hard-blocked while a turn is running in
+ *   this session, whose `addMessage` calls would resurrect truncated state.
+ * - "Restore both" does both, files first (a failed file restore must not
+ *   still rewind the conversation).
  */
 const CheckpointRow = memo(function CheckpointRow({
   sessionId,
   notice,
   messageIndex,
+  anchorValid,
 }: {
   sessionId: string;
   notice: CheckpointNotice;
   messageIndex: number;
+  anchorValid: boolean;
 }) {
   const { t } = useT();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const turnRunning = useSessionStore(selectTurnRunning(sessionId));
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [menuOpen]);
 
   const fileNames = notice.files.map((path) => path.split(/[\\/]/).filter(Boolean).pop() ?? path);
+  const canRewind = anchorValid && !turnRunning;
+  const rewindBlockedReason = turnRunning
+    ? t("MessageList.checkpointRewindBlockedTurnRunning")
+    : !anchorValid
+      ? t("MessageList.checkpointRewindUnavailable")
+      : undefined;
 
-  const handleRevert = async () => {
-    setBusy(true);
-    setError(null);
+  const restoreFiles = async (): Promise<boolean> => {
     try {
       await invoke("checkpoint_revert", { id: notice.id });
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: true }),
       });
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
+    }
+  };
+
+  /** Truncating at the anchor drops the turn's user message and everything
+   * after it — including this notice itself, so no in-place rewrite needed. */
+  const rewindConversation = () => {
+    if (!canRewind || typeof notice.anchorIndex !== "number") return;
+    useSessionStore.getState().truncateFromIndex(sessionId, notice.anchorIndex);
+  };
+
+  const handleRestore = async (scope: RestoreScope) => {
+    setMenuOpen(false);
+    setBusy(true);
+    setError(null);
+    try {
+      if (scope === "files") {
+        await restoreFiles();
+      } else if (scope === "conversation") {
+        rewindConversation();
+      } else if (await restoreFiles()) {
+        rewindConversation();
+      }
     } finally {
       setBusy(false);
     }
@@ -279,15 +336,51 @@ const CheckpointRow = memo(function CheckpointRow({
           {notice.reverted ? (
             <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
           ) : (
-            <button
-              type="button"
-              onClick={() => void handleRevert()}
-              disabled={busy}
-              className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Undo2 size={11} />
-              {busy ? t("MessageList.checkpointReverting") : t("MessageList.checkpointRevertButton")}
-            </button>
+            <div ref={menuRef} className="relative inline-block">
+              <button
+                type="button"
+                onClick={() => setMenuOpen((prev) => !prev)}
+                disabled={busy}
+                aria-haspopup="true"
+                aria-expanded={menuOpen}
+                className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Undo2 size={11} />
+                {busy ? t("MessageList.checkpointReverting") : t("MessageList.checkpointRestoreButton")}
+              </button>
+              {menuOpen && (
+                <div className="absolute left-1/2 top-full z-20 mt-1 w-52 -translate-x-1/2 rounded-lg border border-border bg-background py-1 shadow-lg">
+                  <button
+                    type="button"
+                    onClick={() => void handleRestore("files")}
+                    className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm hover:bg-surface-2"
+                  >
+                    <FilePenLine size={14} className="shrink-0 text-faint" />
+                    {t("MessageList.checkpointRestoreFiles")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleRestore("conversation")}
+                    disabled={!canRewind}
+                    title={rewindBlockedReason}
+                    className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                  >
+                    <MessageSquareX size={14} className="shrink-0 text-faint" />
+                    {t("MessageList.checkpointRewindConversation")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleRestore("both")}
+                    disabled={!canRewind}
+                    title={rewindBlockedReason}
+                    className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                  >
+                    <Undo2 size={14} className="shrink-0 text-faint" />
+                    {t("MessageList.checkpointRestoreBoth")}
+                  </button>
+                </div>
+              )}
+            </div>
           )}
         </div>
         {error && <div className="text-danger">{t("MessageList.checkpointRevertFailed", { error })}</div>}
@@ -380,7 +473,13 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "checkpoint") {
               return (
-                <CheckpointRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
+                <CheckpointRow
+                  key={item.key}
+                  sessionId={sessionId}
+                  notice={item.notice}
+                  messageIndex={item.messageIndex}
+                  anchorValid={checkpointAnchorValid(messages, item.notice)}
+                />
               );
             }
             return <TypingIndicator key={item.key} />;
