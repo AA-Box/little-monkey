@@ -101,13 +101,43 @@ fn apply_system_prompt(history: &mut Vec<serde_json::Value>, system: &str) {
     }
 }
 
+/// True when a native target's model reports the "vision" capability via
+/// `/api/show`. A failed lookup counts as no vision — the prompt then passes
+/// through untouched, and the chat call right after surfaces any daemon
+/// problem itself.
+async fn supports_vision(client: &reqwest::Client, target: &Target) -> bool {
+    let Target::Local { model, native_ollama: true, .. } = target else {
+        return false;
+    };
+    let model = model.clone().unwrap_or_default();
+    crate::ollama_api::show(client, &model)
+        .await
+        .map(|resp| resp.capabilities.iter().any(|c| c == "vision"))
+        .unwrap_or(false)
+}
+
 /// Builds the user message, attaching any images referenced by path in the
-/// prompt using the target's wire format: native Ollama takes a sibling
-/// base64 `images` array, OpenAI-compat multi-part content with data: URLs.
-fn build_user_message(target: &Target, user_text: &str) -> Result<serde_json::Value, String> {
+/// prompt only when the target can actually use them — native Ollama models
+/// that report the "vision" capability (a sibling base64 `images` array), or
+/// OpenAI-compat targets with `--attach-images` passed (multi-part content
+/// with data: URLs). Otherwise the prompt passes through verbatim: nothing
+/// is stripped from the text and no file bytes are uploaded.
+async fn build_user_message(
+    client: &reqwest::Client,
+    target: &Target,
+    options: &chat::ChatOptions,
+    user_text: &str,
+) -> Result<serde_json::Value, String> {
+    let plain = serde_json::json!({ "role": "user", "content": user_text });
+    if !target.is_native() && !options.attach_images {
+        return Ok(plain);
+    }
     let (clean, images) = chat::extract_image_paths(user_text);
     if images.is_empty() {
-        return Ok(serde_json::json!({ "role": "user", "content": user_text }));
+        return Ok(plain);
+    }
+    if target.is_native() && !supports_vision(client, target).await {
+        return Ok(plain);
     }
     for path in &images {
         eprintln!("Added image '{}'", path.display());
@@ -147,7 +177,7 @@ pub async fn run_turn(
     if let Some(system) = &options.system {
         apply_system_prompt(history, system);
     }
-    history.push(build_user_message(target, user_text)?);
+    history.push(build_user_message(client, target, options, user_text).await?);
 
     let tools = tool_definitions();
     let tools_vec: Vec<serde_json::Value> = tools.as_array().cloned().unwrap_or_default();

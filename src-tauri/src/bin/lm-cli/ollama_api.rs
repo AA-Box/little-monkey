@@ -34,8 +34,15 @@ fn parse_host(raw: &str) -> String {
     if rest.is_empty() {
         return DEFAULT_HOST.to_string();
     }
-    // Treat a trailing `:digits` as an explicit port; anything else (including
-    // bare IPv6 colons) gets the default port appended.
+    // A bare (unbracketed) IPv6 address contains two or more colons; bracket
+    // it before appending the default port so the URL stays unambiguous
+    // (matching Ollama's own net.JoinHostPort handling). Specifying a port
+    // with an IPv6 host requires the bracketed form.
+    if !rest.starts_with('[') && rest.matches(':').count() >= 2 {
+        return format!("{scheme}://[{rest}]:11434");
+    }
+    // Treat a trailing `:digits` as an explicit port; anything else gets the
+    // default port appended.
     let has_port = match rest.rsplit_once(':') {
         Some((_, p)) => !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()),
         None => false,
@@ -511,6 +518,15 @@ mod tests {
             ("http://localhost:11434/", "http://localhost:11434"),
             ("example.com:8080/", "http://example.com:8080"),
             ("http://", DEFAULT_HOST),
+            // Bare IPv6 hosts get bracketed so the default port can attach.
+            ("::1", "http://[::1]:11434"),
+            ("http://::1", "http://[::1]:11434"),
+            ("fe80::ab", "http://[fe80::ab]:11434"),
+            ("https://2001:db8::1", "https://[2001:db8::1]:11434"),
+            // Already-bracketed forms keep working, with or without a port.
+            ("[::1]", "http://[::1]:11434"),
+            ("[::1]:8080", "http://[::1]:8080"),
+            ("http://[fe80::ab]:9999", "http://[fe80::ab]:9999"),
         ];
         for (input, expected) in cases {
             assert_eq!(parse_host(input), expected, "input: {input:?}");

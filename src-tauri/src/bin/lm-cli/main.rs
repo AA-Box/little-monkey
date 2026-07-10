@@ -131,6 +131,13 @@ struct ChatFlags {
     /// Print timing/token metrics after each response
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// Attach image files (png/jpg/jpeg/webp paths in the prompt) on
+    /// OpenAI-compatible targets. Ollama targets attach automatically when
+    /// the model reports vision support; without this flag, other targets
+    /// receive the prompt verbatim.
+    #[arg(long = "attach-images", global = true)]
+    attach_images: bool,
 }
 
 impl ChatFlags {
@@ -149,6 +156,7 @@ impl ChatFlags {
             hide_thinking: self.hidethinking,
             keep_alive: self.keepalive.clone(),
             verbose: self.verbose,
+            attach_images: self.attach_images,
         })
     }
 }
