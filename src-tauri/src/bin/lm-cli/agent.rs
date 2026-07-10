@@ -92,6 +92,9 @@ async fn execute_tool_call(
             )
             .await
         }
+        "remember" => tools_cli::remember(state, perms, args["text"].as_str().unwrap_or_default())
+            .await
+            .and_then(|fact| serde_json::to_value(fact).map_err(|e| e.to_string())),
         other => Err(format!("Unknown tool \"{other}\"")),
     };
 
