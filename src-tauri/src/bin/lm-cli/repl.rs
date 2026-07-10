@@ -213,7 +213,7 @@ async fn handle_command(
             println!("Cleared session context");
             Ok(())
         }
-        "/set" => handle_set(options, keep_history, rest),
+        "/set" => handle_set(options, keep_history, target.is_native(), rest),
         "/show" => handle_show(client, target, options, rest).await,
         "/save" => handle_save(client, target, options, rest).await,
         "/load" => handle_load(client, target, rest).await,
@@ -221,10 +221,19 @@ async fn handle_command(
     }
 }
 
+/// Warns (stderr) that an Ollama-only option was set on a target whose wire
+/// protocol has no equivalent — it is stored but never sent.
+fn warn_native_only(name: &str) {
+    eprintln!("Warning: '{name}' only applies to Ollama targets; ignoring.");
+}
+
 /// `/set ...`: mutates the live `ChatOptions` (and the history toggle).
+/// `is_native` gates the warning for Ollama-only options that OpenAI-compat
+/// requests silently drop.
 fn handle_set(
     options: &mut chat::ChatOptions,
     keep_history: &mut bool,
+    is_native: bool,
     args: &str,
 ) -> Result<(), String> {
     let (sub, rest) = split_first_word(args);
@@ -239,7 +248,7 @@ fn handle_set(
                 print_parameter_help();
                 return Ok(());
             }
-            let message = set_parameter(options, tokens[0], &tokens[1..])?;
+            let message = set_parameter(options, is_native, tokens[0], &tokens[1..])?;
             println!("{message}");
             Ok(())
         }
@@ -273,11 +282,17 @@ fn handle_set(
         "think" => {
             let value = if rest.is_empty() { "true" } else { rest.trim() };
             options.think = Some(chat::parse_think_flag(value)?);
+            if !is_native {
+                warn_native_only("think");
+            }
             println!("Set 'think' mode.");
             Ok(())
         }
         "nothink" => {
             options.think = Some(serde_json::Value::Bool(false));
+            if !is_native {
+                warn_native_only("think");
+            }
             println!("Set 'nothink' mode.");
             Ok(())
         }
@@ -308,6 +323,7 @@ fn handle_set(
 /// `/set parameter <name> <value...>` — returns the confirmation line.
 fn set_parameter(
     options: &mut chat::ChatOptions,
+    is_native: bool,
     name: &str,
     values: &[&str],
 ) -> Result<String, String> {
@@ -326,7 +342,12 @@ fn set_parameter(
         "temperature" => options.temperature = Some(as_f64(first)?),
         "top_p" => options.top_p = Some(as_f64(first)?),
         "seed" => options.seed = Some(as_i64(first)?),
-        "num_ctx" => options.num_ctx = Some(as_i64(first)?),
+        "num_ctx" => {
+            options.num_ctx = Some(as_i64(first)?);
+            if !is_native {
+                warn_native_only("num_ctx");
+            }
+        }
         "num_predict" => options.num_predict = Some(as_i64(first)?),
         "stop" => {
             options.stop = values.iter().map(|v| strip_wrapping_quotes(v).to_string()).collect()
@@ -578,14 +599,14 @@ mod tests {
     fn set_parameter_updates_options() {
         let mut options = chat::ChatOptions::default();
         assert_eq!(
-            set_parameter(&mut options, "temperature", &["0.5"]).unwrap(),
+            set_parameter(&mut options, true, "temperature", &["0.5"]).unwrap(),
             "Set parameter 'temperature' to '0.5'"
         );
-        set_parameter(&mut options, "top_p", &["0.9"]).unwrap();
-        set_parameter(&mut options, "seed", &["7"]).unwrap();
-        set_parameter(&mut options, "num_ctx", &["8192"]).unwrap();
-        set_parameter(&mut options, "num_predict", &["128"]).unwrap();
-        set_parameter(&mut options, "stop", &["\"END\"", "STOP"]).unwrap();
+        set_parameter(&mut options, true, "top_p", &["0.9"]).unwrap();
+        set_parameter(&mut options, true, "seed", &["7"]).unwrap();
+        set_parameter(&mut options, true, "num_ctx", &["8192"]).unwrap();
+        set_parameter(&mut options, true, "num_predict", &["128"]).unwrap();
+        set_parameter(&mut options, true, "stop", &["\"END\"", "STOP"]).unwrap();
         assert_eq!(options.temperature, Some(0.5));
         assert_eq!(options.top_p, Some(0.9));
         assert_eq!(options.seed, Some(7));
@@ -597,11 +618,20 @@ mod tests {
     #[test]
     fn set_parameter_rejects_bad_input() {
         let mut options = chat::ChatOptions::default();
-        assert!(set_parameter(&mut options, "temperature", &[]).is_err());
-        assert!(set_parameter(&mut options, "temperature", &["hot"]).is_err());
-        assert!(set_parameter(&mut options, "seed", &["1.5"]).is_err());
-        assert!(set_parameter(&mut options, "nope", &["1"]).is_err());
+        assert!(set_parameter(&mut options, true, "temperature", &[]).is_err());
+        assert!(set_parameter(&mut options, true, "temperature", &["hot"]).is_err());
+        assert!(set_parameter(&mut options, true, "seed", &["1.5"]).is_err());
+        assert!(set_parameter(&mut options, true, "nope", &["1"]).is_err());
         assert_eq!(options.temperature, None);
+    }
+
+    #[test]
+    fn set_parameter_still_sets_ollama_only_values_on_non_native_targets() {
+        // The value is stored (and a stderr warning printed, not asserted
+        // here) — matching the startup flags' warn-and-ignore behavior.
+        let mut options = chat::ChatOptions::default();
+        set_parameter(&mut options, false, "num_ctx", &["8192"]).unwrap();
+        assert_eq!(options.num_ctx, Some(8192));
     }
 
     #[test]
@@ -609,33 +639,33 @@ mod tests {
         let mut options = chat::ChatOptions::default();
         let mut keep_history = true;
 
-        handle_set(&mut options, &mut keep_history, "verbose").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "verbose").unwrap();
         assert!(options.verbose);
-        handle_set(&mut options, &mut keep_history, "quiet").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "quiet").unwrap();
         assert!(!options.verbose);
 
-        handle_set(&mut options, &mut keep_history, "nohistory").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "nohistory").unwrap();
         assert!(!keep_history);
-        handle_set(&mut options, &mut keep_history, "history").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "history").unwrap();
         assert!(keep_history);
 
-        handle_set(&mut options, &mut keep_history, "think low").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "think low").unwrap();
         assert_eq!(options.think, Some(serde_json::json!("low")));
-        handle_set(&mut options, &mut keep_history, "think").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "think").unwrap();
         assert_eq!(options.think, Some(serde_json::json!(true)));
-        handle_set(&mut options, &mut keep_history, "nothink").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "nothink").unwrap();
         assert_eq!(options.think, Some(serde_json::json!(false)));
 
-        handle_set(&mut options, &mut keep_history, "format json").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "format json").unwrap();
         assert_eq!(options.format, Some(serde_json::json!("json")));
-        handle_set(&mut options, &mut keep_history, "noformat").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "noformat").unwrap();
         assert_eq!(options.format, None);
 
-        handle_set(&mut options, &mut keep_history, "system \"You are terse.\"").unwrap();
+        handle_set(&mut options, &mut keep_history, true, "system \"You are terse.\"").unwrap();
         assert_eq!(options.system.as_deref(), Some("You are terse."));
 
-        assert!(handle_set(&mut options, &mut keep_history, "bogus on").is_err());
-        assert!(handle_set(&mut options, &mut keep_history, "system").is_err());
+        assert!(handle_set(&mut options, &mut keep_history, true, "bogus on").is_err());
+        assert!(handle_set(&mut options, &mut keep_history, true, "system").is_err());
     }
 
     #[test]

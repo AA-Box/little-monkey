@@ -46,6 +46,11 @@ pub struct ChatOptions {
     pub hide_thinking: bool,
     pub keep_alive: Option<String>,
     pub verbose: bool,
+    /// Opt-in for attaching prompt-referenced image files on OpenAI-compat
+    /// targets (native Ollama targets auto-detect the model's vision
+    /// capability instead; without this, non-native prompts pass through
+    /// verbatim).
+    pub attach_images: bool,
 }
 
 /// Parses a `--format` value: `json`, an inline JSON schema, or `@path` to a
@@ -297,6 +302,14 @@ async fn stream_turn_native(
     let mut tool_calls: Vec<ToolCallEvent> = Vec::new();
     let mut metrics: Option<ChatMetrics> = None;
     let mut thinking_open = false;
+    // Print-side state for the leaked-tool-call fallback below: while the
+    // reply's opening characters could still turn out to be a raw
+    // `<tool_call>`/`<function=` block (which the daemon's parser sometimes
+    // misses for qwen3-coder), hold streamed content back instead of
+    // printing it. `None` = undecided, `Some(true)` = suppress (looks like
+    // a leaked block), `Some(false)` = normal streaming.
+    let mut suppress: Option<bool> = None;
+    let mut pending = String::new();
 
     ollama_api::chat_stream(client, &req, |event| match event {
         ChatEvent::Thinking(text) => {
@@ -314,9 +327,30 @@ async fn stream_turn_native(
                 print!("\n...done thinking.\n\n");
                 thinking_open = false;
             }
-            print!("{text}");
-            std::io::stdout().flush().ok();
             content.push_str(&text);
+            match suppress {
+                Some(false) => {
+                    print!("{text}");
+                    std::io::stdout().flush().ok();
+                }
+                Some(true) => {}
+                None => {
+                    pending.push_str(&text);
+                    let seen = pending.trim_start();
+                    let candidate = ["<tool_call>", "<function="]
+                        .iter()
+                        .any(|p| p.starts_with(seen) || seen.starts_with(p));
+                    if !candidate {
+                        suppress = Some(false);
+                        print!("{pending}");
+                        std::io::stdout().flush().ok();
+                        pending.clear();
+                    } else if ["<tool_call>", "<function="].iter().any(|p| seen.starts_with(p)) {
+                        suppress = Some(true);
+                        pending.clear();
+                    }
+                }
+            }
         }
         ChatEvent::ToolCall(call) => {
             let id = format!("call_{}", tool_calls.len() + 1);
@@ -330,12 +364,116 @@ async fn stream_turn_native(
         std::io::stdout().flush().ok();
     }
 
+    // Every successful native turn ends with a `done: true` line. A stream
+    // that closes without one means the runner died mid-turn (e.g. a GPU
+    // out-of-memory compute error) — the daemon reports HTTP 200 and an
+    // empty `done: false` line in that case, so silence here would look
+    // like success.
+    if metrics.is_none() {
+        return Err(format!(
+            "chat stream for '{model}' ended without completing{} — the model runner likely \
+             failed mid-turn (check the Ollama server log, e.g. out of memory)",
+            if content.is_empty() { " (no output)" } else { "" }
+        ));
+    }
+
+    // Fallback for a daemon parser miss: qwen3-coder sometimes emits its
+    // XML-ish function-call block in a way Ollama's parser doesn't catch
+    // (observed on 0.31.1 with some tool lists), so the whole call leaks
+    // into `content`. When the reply is exactly such a block and no
+    // structured calls arrived, parse it ourselves; the withheld text is
+    // never printed, matching a properly parsed call. Anything else that
+    // was held back gets flushed here so no output is lost.
+    if suppress == Some(true) && tool_calls.is_empty() {
+        if let Some(leaked) = parse_leaked_tool_calls(&content) {
+            for call in leaked {
+                let id = format!("call_{}", tool_calls.len() + 1);
+                tool_calls.push(ToolCallEvent { id, name: call.name, arguments: call.arguments.to_string() });
+            }
+            content.clear();
+        }
+    }
+    if !content.is_empty() && suppress != Some(false) {
+        // Undecided (reply shorter than the marker) or suppressed-but-not-
+        // parseable: print what was withheld.
+        print!("{content}");
+        std::io::stdout().flush().ok();
+    }
+
     let usage = metrics.as_ref().map(|m| {
         let prompt_tokens = m.prompt_eval_count.unwrap_or(0);
         let completion_tokens = m.eval_count.unwrap_or(0);
         TurnUsage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens }
     });
     Ok(TurnResult { content, tool_calls, usage, metrics, elapsed_secs: started.elapsed().as_secs_f64() })
+}
+
+/// Parses a reply that is exactly a raw qwen3-coder-style tool-call block —
+/// `<function=NAME><parameter=KEY>value</parameter>…</function>` with
+/// optional `<tool_call>`/`</tool_call>` wrappers — into tool calls, for
+/// when Ollama's own parser misses it and the block leaks into `content`.
+/// Returns `None` (parse nothing, print verbatim) unless the entire text is
+/// such a block; parameter values stay strings (all of lm-cli's own tools
+/// take strings).
+fn parse_leaked_tool_calls(content: &str) -> Option<Vec<ollama_api::NativeToolCall>> {
+    let text = content.trim();
+    if !(text.starts_with("<tool_call>") || text.starts_with("<function=")) {
+        return None;
+    }
+    let mut calls = Vec::new();
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("<tool_call>") {
+            rest = r.trim_start();
+        }
+        if let Some(r) = rest.strip_prefix("</tool_call>") {
+            rest = r;
+            continue;
+        }
+        if rest.is_empty() {
+            break;
+        }
+        let after_name = rest.strip_prefix("<function=")?;
+        let name_end = after_name.find('>')?;
+        let name = after_name[..name_end].trim();
+        let body_and_rest = &after_name[name_end + 1..];
+        let body_end = body_and_rest.find("</function>")?;
+        let mut body = &body_and_rest[..body_end];
+        rest = &body_and_rest[body_end + "</function>".len()..];
+
+        let mut arguments = serde_json::Map::new();
+        loop {
+            body = body.trim_start();
+            if body.is_empty() {
+                break;
+            }
+            let after_key = body.strip_prefix("<parameter=")?;
+            let key_end = after_key.find('>')?;
+            let key = after_key[..key_end].trim();
+            let value_and_rest = &after_key[key_end + 1..];
+            let value_end = value_and_rest.find("</parameter>")?;
+            let mut value = &value_and_rest[..value_end];
+            // The wire format puts the value on its own line; strip exactly
+            // that framing, preserving interior/intentional whitespace.
+            value = value.strip_prefix('\n').unwrap_or(value);
+            value = value.strip_suffix('\n').unwrap_or(value);
+            arguments.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+            body = &value_and_rest[value_end + "</parameter>".len()..];
+        }
+        if name.is_empty() {
+            return None;
+        }
+        calls.push(ollama_api::NativeToolCall {
+            name: name.to_string(),
+            arguments: serde_json::Value::Object(arguments),
+        });
+    }
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
 }
 
 /// Adds the OpenAI-schema equivalents of the set chat options to a
@@ -520,6 +658,37 @@ mod tests {
         let mut body = serde_json::json!({ "stream": true });
         apply_openai_options(&mut body, &ChatOptions::default());
         assert_eq!(body, serde_json::json!({ "stream": true }));
+    }
+
+    #[test]
+    fn parse_leaked_tool_calls_recovers_daemon_parser_misses() {
+        // The observed leak shape: no opening <tool_call>, but a trailing
+        // closer (Ollama 0.31.1 with qwen3-coder and some tool lists).
+        let leaked = "<function=write_file>\n<parameter=path>\nhello.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_leaked_tool_calls(leaked).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], "hello.txt");
+        assert_eq!(calls[0].arguments["content"], "hi");
+
+        // Fully wrapped block, and two calls back to back.
+        let wrapped = "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=list_dir>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_leaked_tool_calls(wrapped).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[1].name, "list_dir");
+
+        // Multiline values keep interior newlines; only the framing ones go.
+        let multiline = "<function=write_file>\n<parameter=path>\nf.txt\n</parameter>\n<parameter=content>\nline1\nline2\n</parameter>\n</function>";
+        let calls = parse_leaked_tool_calls(multiline).unwrap();
+        assert_eq!(calls[0].arguments["content"], "line1\nline2");
+
+        // Ordinary prose, prose before a block, and truncated blocks parse
+        // as nothing (printed verbatim instead).
+        assert!(parse_leaked_tool_calls("just a normal reply").is_none());
+        assert!(parse_leaked_tool_calls("Sure! <function=write_file>...</function>").is_none());
+        assert!(parse_leaked_tool_calls("<function=write_file>\n<parameter=path>\nx").is_none());
+        assert!(parse_leaked_tool_calls("<tool_call>\n</tool_call>").is_none());
     }
 
     #[test]
