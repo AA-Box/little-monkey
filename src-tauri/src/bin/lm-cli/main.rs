@@ -7,6 +7,7 @@
 
 mod agent;
 mod chat;
+mod checkpoints_cli;
 mod cmds;
 mod modelfile;
 mod ollama_api;
@@ -234,6 +235,12 @@ enum Cmd {
         #[arg(long)]
         system: Option<String>,
     },
+    /// Revert a checkpoint's file changes (defaults to the most recent one
+    /// from this CLI). Prints the restored-file count.
+    Revert {
+        /// Checkpoint id to revert; omit for the most recent CLI checkpoint.
+        id: Option<String>,
+    },
 }
 
 fn resolve_target(cli: &Cli) -> Result<chat::Target, String> {
@@ -363,6 +370,13 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             chat_loop(client, target, &state, mode, options, prompt.as_deref()).await;
             return;
         }
+        Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
+            Ok(count) => {
+                println!("Restored {count} file(s).");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
     };
     if let Err(e) = result {
         fail(&e);

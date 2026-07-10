@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Search,
   TerminalSquare,
+  TriangleAlert,
   Undo2,
   Wrench,
   type LucideIcon,
@@ -417,6 +418,12 @@ const CheckpointRow = memo(function CheckpointRow({
             </div>
           )}
         </div>
+        {notice.shellRan && (
+          <div className="flex items-center gap-1 text-warning">
+            <TriangleAlert size={11} className="shrink-0" />
+            <span>{t("MessageList.checkpointShellRanCaveat")}</span>
+          </div>
+        )}
         {error && <div className="text-danger">{error}</div>}
       </div>
     </div>

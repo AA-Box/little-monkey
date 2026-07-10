@@ -103,6 +103,7 @@ export const ja: Record<string, string> = {
   "MessageList.checkpointRestoreBoth": "両方を復元",
   "MessageList.checkpointRewindBlockedTurnRunning": "応答の生成中は利用できません",
   "MessageList.checkpointRewindUnavailable": "会話が変更されたため、復元できるのはファイルのみです",
+  "MessageList.checkpointShellRanCaveat": "シェルコマンドが実行されました。ファイルを復元してもすべて元に戻せない場合があります",
   "MessageList.emptyStateTitle": "まだ何もありません",
   "MessageList.emptyStateDescription": "Little Monkeyにワークスペース内の説明・作成・修正を依頼して始めましょう。",
   "ModeSelector.modeManualLabel": "手動",

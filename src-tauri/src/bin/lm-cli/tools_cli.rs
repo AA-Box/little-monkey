@@ -9,7 +9,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use little_monkey_lib::{workspace, AppState};
+use little_monkey_lib::{checkpoints, workspace, AppState};
 use regex::Regex;
 use walkdir::WalkDir;
 
@@ -95,16 +95,21 @@ pub fn grep(state: &AppState, pattern: &str, path: Option<&str>) -> Result<Vec<s
     Ok(matches)
 }
 
+/// `checkpoint_id` is the current turn's checkpoint (opened by
+/// `agent::run_turn`), so the pre-mutation backup lands there — same
+/// `record_original` hook the GUI's `tool_write_file` uses.
 pub async fn write_file(
     state: &AppState,
     perms: &mut TerminalPermissions,
     path: &str,
     content: &str,
+    checkpoint_id: Option<&str>,
 ) -> Result<String, String> {
     let detail = format!("Write {} bytes to {}", content.len(), path);
     perms.request("write_file", &detail).await?;
 
     let (resolved, _) = workspace::resolve_path_and_root(state, path)?;
+    checkpoints::record_original(state, checkpoint_id, &resolved)?;
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create parent directories for '{path}': {e}"))?;
@@ -150,12 +155,14 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
     preview.join("\n")
 }
 
+/// `checkpoint_id`: see `write_file` above.
 pub async fn edit_file(
     state: &AppState,
     perms: &mut TerminalPermissions,
     path: &str,
     old_string: &str,
     new_string: &str,
+    checkpoint_id: Option<&str>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
@@ -181,18 +188,26 @@ pub async fn edit_file(
     let detail = format!("Edit {path}\n{preview}");
     perms.request("edit_file", &detail).await?;
 
+    checkpoints::record_original(state, checkpoint_id, &resolved)?;
+
     let updated = current.replacen(old_string, new_string, 1);
     std::fs::write(&resolved, &updated).map_err(|e| format!("Failed to write '{path}': {e}"))?;
     Ok(format!("Edited {path}"))
 }
 
+/// `checkpoint_id`: no snapshotting happens for shell commands (side effects
+/// aren't captured), but it flags the owning checkpoint's `shell_ran` so
+/// `/revert` and the manifest are honest about partial coverage — same
+/// `record_shell` hook the GUI's `tool_run_shell` uses.
 pub async fn run_shell(
     state: &AppState,
     perms: &mut TerminalPermissions,
     command: &str,
     cwd: Option<&str>,
+    checkpoint_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     perms.request("run_shell", command).await?;
+    checkpoints::record_shell(state, checkpoint_id)?;
 
     let cwd_path = match cwd {
         Some(c) => workspace::resolve_path_and_root(state, c)?.0,
