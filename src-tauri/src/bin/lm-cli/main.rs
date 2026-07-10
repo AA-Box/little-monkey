@@ -9,6 +9,7 @@ mod agent;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
+mod mcp_cli;
 mod modelfile;
 mod ollama_api;
 mod permission;
@@ -21,6 +22,7 @@ mod tools_def;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::workspace::{self, WorkspaceRoot};
 use little_monkey_lib::{memory, rules, AppState};
 
@@ -76,6 +78,15 @@ struct Cli {
     /// appended after that section rather than replacing it.
     #[arg(long, global = true)]
     no_rules: bool,
+
+    /// Skip loading MCP servers from `mcp_servers.json` (the same config
+    /// file the desktop app's Settings > MCP tab writes). Without this
+    /// flag, every server with `enabled: true` there is connected at
+    /// startup and its tools merged into the model's tool set, namespaced
+    /// `mcp__<serverId>__<toolName>` — same default-on-if-configured
+    /// behavior as rules/facts (see `--no-rules`), just for MCP instead.
+    #[arg(long, global = true)]
+    no_mcp: bool,
 
     #[command(flatten)]
     chat: ChatFlags,
@@ -414,6 +425,20 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// `--no-mcp` short-circuits to no servers at all; otherwise loads
+/// `mcp_servers.json` (the same hardcoded-identifier app-data path
+/// `mcp_cli.rs` resolves) and connects every `enabled: true` entry,
+/// dropping (with a `Warning:` on stderr) any that fails to connect. Called
+/// once per process — both the classic flat invocation and `run`/the REPL
+/// share the resulting connections via `state.mcp`.
+async fn resolve_mcp_entries(cli: &Cli, state: &AppState) -> Vec<McpServerEntry> {
+    if cli.no_mcp {
+        return Vec::new();
+    }
+    let entries = mcp_cli::load_enabled_servers();
+    mcp_cli::connect_all(state, &entries).await
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -436,7 +461,8 @@ async fn main() {
         Ok(v) => v,
         Err(e) => fail(&e),
     };
-    chat_loop(&client, target, &state, mode, options, cli.prompt.as_deref()).await;
+    let mcp_entries = resolve_mcp_entries(&cli, &state).await;
+    chat_loop(&client, target, &state, mode, options, cli.prompt.as_deref(), &mcp_entries).await;
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -478,7 +504,8 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 model: Some(model.clone()),
                 native_ollama: true,
             };
-            chat_loop(client, target, &state, mode, options, prompt.as_deref()).await;
+            let mcp_entries = resolve_mcp_entries(cli, &state).await;
+            chat_loop(client, target, &state, mode, options, prompt.as_deref(), &mcp_entries).await;
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -505,6 +532,7 @@ async fn chat_loop(
     mode: PermissionMode,
     options: chat::ChatOptions,
     prompt: Option<&str>,
+    mcp_entries: &[McpServerEntry],
 ) {
     if !target.is_native()
         && (options.num_ctx.is_some() || options.keep_alive.is_some() || options.think.is_some())
@@ -516,7 +544,7 @@ async fn chat_loop(
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
         if let Err(e) =
-            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, prompt).await
+            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, prompt, mcp_entries).await
         {
             eprintln!("\nError: {e}");
             std::process::exit(1);
@@ -524,7 +552,7 @@ async fn chat_loop(
         return;
     }
 
-    repl::run(client, target, state, mode, options).await;
+    repl::run(client, target, state, mode, options, mcp_entries).await;
 }
 
 #[cfg(test)]
@@ -657,6 +685,7 @@ mod tests {
             local_url: None,
             permission_mode: "manual".to_string(),
             no_rules: true,
+            no_mcp: false,
             chat: ChatFlags {
                 temperature: None,
                 top_p: None,
