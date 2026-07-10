@@ -8,6 +8,7 @@ mod sessions;
 mod system;
 mod tools;
 mod permissions;
+mod rules;
 pub mod workspace;
 
 /// Shared application state, managed by Tauri and accessed from every
@@ -91,6 +92,7 @@ pub fn run() {
             tools::tool_run_shell,
             tools::tools_cancel_running,
             tools::list_workspace_paths,
+            rules::rules_read,
             sessions::sessions_load,
             sessions::sessions_save,
             checkpoints::checkpoint_begin,
