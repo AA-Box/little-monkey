@@ -66,6 +66,7 @@ export const ko: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "여기까지 복원",
   "CheckpointTimeline.restoringToHere": "복원 중…",
   "CheckpointTimeline.restoreToHereBlockedShell": "사용할 수 없음 — 이 턴들 중 하나에서 셸 명령이 실행되어 파일 복원만으로는 완전히 되돌릴 수 없습니다",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "사용할 수 없음 — 중간 체크포인트가 디스크에서 삭제되어 파일 복원만으로는 이 구간을 완전히 커버할 수 없습니다",
   "CheckpointTimeline.restoreToHereFailed": "여기까지 복원 실패: {{error}}",
   "CheckpointTimeline.justNow": "방금",
   "CheckpointTimeline.minutesAgo": "{{count}}분 전",

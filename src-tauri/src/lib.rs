@@ -27,6 +27,15 @@ pub struct AppState {
     /// With the split pane open, two turns (and thus two checkpoints) can be
     /// active concurrently — see `checkpoints.rs`.
     pub checkpoints: std::sync::Mutex<std::collections::HashMap<String, checkpoints::ActiveCheckpoint>>,
+    /// Checkpoint ids with a `checkpoint_revert`/`checkpoint_reapply` call
+    /// currently in progress. `MessageList.tsx`'s `CheckpointRow` and
+    /// `CheckpointTimeline.tsx`'s `TimelineRow` can both render controls for
+    /// the same checkpoint at once, and both call these commands with only a
+    /// component-local `busy` flag guarding each — nothing shared prevents
+    /// two concurrent revert/reapply calls for the same id from racing on
+    /// the same `redo/<n>.bak` files. Membership here is that lock — see
+    /// `checkpoints::acquire_revert_lock`.
+    pub checkpoint_locks: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Per-turn cancellation channels used by `tools::tools_cancel_running`
     /// to kill in-flight `tool_run_shell` child processes when the user hits
     /// Stop — keyed by the owning turn's id (empty string for callers that

@@ -3,7 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { Ban, FilePenLine, History, MessageSquareX, RefreshCw, TerminalSquare, Undo2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
-import { checkpointAnchorValid, formatCheckpointNotice, isCheckpointNotice, parseCheckpointNotice } from "../../lib/agentLoop";
+import {
+  checkpointAnchorValid,
+  checkpointChainBlockReason,
+  formatCheckpointNotice,
+  isCheckpointNotice,
+  parseCheckpointNotice,
+} from "../../lib/agentLoop";
 import { selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore, type CheckpointInfo } from "../../store/checkpointStore";
 
@@ -62,7 +68,8 @@ function TimelineRow({
   info: CheckpointInfo;
   /** Non-null (a translated warning) when "Restore to here" should be
    * disabled for this row — a shell command ran during this checkpoint's
-   * turn or an earlier one in the newest→here chain, so file restore alone
+   * turn or an earlier one in the newest→here chain, or an intermediate
+   * checkpoint in that chain was pruned off disk, so file restore alone
    * can't guarantee full coverage across that span. */
   chainBlockedReason: string | null;
   onChanged: () => void;
@@ -236,8 +243,9 @@ function TimelineRow({
  * originals make each individual revert exact, and reverting newest-first is
  * order-correct even when two turns touched overlapping files (see the
  * design note in checkpoints.rs). Disabled (with a tooltip) when the chain
- * crosses a checkpoint whose turn ran a shell command — file restore alone
- * can't promise full coverage there. */
+ * crosses a checkpoint whose turn ran a shell command, or an intermediate
+ * checkpoint was pruned off disk — file restore alone can't promise full
+ * coverage there. */
 function RestoreToHereButton({
   sessionId,
   info,
@@ -345,13 +353,19 @@ export function CheckpointTimeline({ sessionId }: { sessionId: string }) {
             <p className="px-3 py-4 text-center text-xs text-faint">{t("CheckpointTimeline.emptyState")}</p>
           ) : (
             checkpoints.map((info, index) => {
-              const chainHasShellRan = checkpoints.slice(0, index + 1).some((c) => c.shellRan);
+              const blockReason = checkpointChainBlockReason(checkpoints, index);
+              const chainBlockedReason =
+                blockReason === "prunedGap"
+                  ? t("CheckpointTimeline.restoreToHereBlockedPruned")
+                  : blockReason === "shellRan"
+                    ? t("CheckpointTimeline.restoreToHereBlockedShell")
+                    : null;
               return (
                 <TimelineRow
                   key={info.id}
                   sessionId={sessionId}
                   info={info}
-                  chainBlockedReason={chainHasShellRan ? t("CheckpointTimeline.restoreToHereBlockedShell") : null}
+                  chainBlockedReason={chainBlockedReason}
                   onChanged={() => void refresh(sessionId)}
                 />
               );

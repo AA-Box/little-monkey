@@ -1,7 +1,10 @@
 import { create } from "zustand";
 
-/** localStorage key the full settings blob is persisted under after every mutation. */
-const STORAGE_KEY = "little-monkey-automation-settings";
+/** localStorage key the full settings blob is persisted under after every mutation.
+ * Exported so tests can clear it and re-import the module to genuinely
+ * exercise `hydrate()`'s default-fallback path, rather than asserting
+ * against a store state a test set up by hand. */
+export const STORAGE_KEY = "little-monkey-automation-settings";
 
 /** How aggressively to reclaim context-window space once `contextTrimThreshold` is crossed. */
 export type ContextTrimStrategy = "trim" | "summarize";

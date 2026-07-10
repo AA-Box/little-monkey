@@ -66,6 +66,7 @@ export const hi: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "यहां तक पुनर्स्थापित करें",
   "CheckpointTimeline.restoringToHere": "पुनर्स्थापित हो रहा है…",
   "CheckpointTimeline.restoreToHereBlockedShell": "उपलब्ध नहीं — इनमें से किसी एक टर्न के दौरान एक शेल कमांड चला था, इसलिए फ़ाइल पुनर्स्थापना इसे पूरी तरह से पूर्ववत नहीं कर सकती",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "उपलब्ध नहीं — बीच का एक चेकपॉइंट डिस्क से हटा दिया गया था, इसलिए फ़ाइल पुनर्स्थापना इस अवधि को पूरी तरह से कवर नहीं कर सकती",
   "CheckpointTimeline.restoreToHereFailed": "यहां तक पुनर्स्थापित करना विफल: {{error}}",
   "CheckpointTimeline.justNow": "अभी अभी",
   "CheckpointTimeline.minutesAgo": "{{count}} मिनट पहले",

@@ -728,6 +728,7 @@ mod tests {
                 anchor_index: 0,
                 label: String::new(),
                 shell_ran: false,
+                prev_id: None,
             },
         );
 

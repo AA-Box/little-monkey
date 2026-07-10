@@ -66,6 +66,7 @@ export const fr: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "Restaurer jusqu'ici",
   "CheckpointTimeline.restoringToHere": "Restauration…",
   "CheckpointTimeline.restoreToHereBlockedShell": "Indisponible — une commande shell a été exécutée pendant l'un de ces tours, la restauration des fichiers ne peut donc pas tout annuler",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "Indisponible — un point de contrôle intermédiaire a été supprimé du disque, la restauration des fichiers ne peut donc pas couvrir entièrement cette période",
   "CheckpointTimeline.restoreToHereFailed": "Échec de la restauration jusqu'ici : {{error}}",
   "CheckpointTimeline.justNow": "À l'instant",
   "CheckpointTimeline.minutesAgo": "il y a {{count}} minute(s)",

@@ -66,6 +66,7 @@ export const de: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "Bis hierher wiederherstellen",
   "CheckpointTimeline.restoringToHere": "Wird wiederhergestellt…",
   "CheckpointTimeline.restoreToHereBlockedShell": "Nicht verfügbar – während eines dieser Durchgänge wurde ein Shell-Befehl ausgeführt, daher kann die Dateiwiederherstellung dies nicht vollständig rückgängig machen",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "Nicht verfügbar – ein dazwischenliegender Checkpoint wurde von der Festplatte entfernt, daher kann die Dateiwiederherstellung diesen Zeitraum nicht vollständig abdecken",
   "CheckpointTimeline.restoreToHereFailed": "Wiederherstellung bis hierher fehlgeschlagen: {{error}}",
   "CheckpointTimeline.justNow": "Gerade eben",
   "CheckpointTimeline.minutesAgo": "vor {{count}} Minute(n)",
