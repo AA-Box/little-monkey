@@ -93,6 +93,7 @@ pub fn run() {
             tools::tools_cancel_running,
             tools::list_workspace_paths,
             rules::rules_read,
+            rules::rules_write,
             sessions::sessions_load,
             sessions::sessions_save,
             checkpoints::checkpoint_begin,

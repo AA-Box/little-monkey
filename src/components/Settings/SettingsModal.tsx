@@ -6,6 +6,7 @@ import { ProviderCard } from "./ProviderCard";
 import { AddCustomProviderForm } from "./AddCustomProviderForm";
 import { AutomationPanel } from "./AutomationPanel";
 import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
+import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -15,13 +16,14 @@ interface SettingsModalProps {
   onClose: () => void;
 }
 
-type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation";
+type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules";
 
 const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
   { id: "local", labelKey: "SettingsModal.tabLocalModels" },
   { id: "ollama", labelKey: "SettingsModal.tabOllama" },
   { id: "providers", labelKey: "SettingsModal.tabAiProviders" },
   { id: "automation", labelKey: "SettingsModal.tabAutomation" },
+  { id: "rules", labelKey: "SettingsModal.tabRules" },
 ];
 
 /**
@@ -112,6 +114,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
             </div>
           )}
           {tab === "automation" && <AutomationPanel />}
+          {tab === "rules" && <RulesMemoryPanel />}
         </div>
       </div>
     </div>
