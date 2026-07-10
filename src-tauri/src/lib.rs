@@ -8,8 +8,11 @@ mod sessions;
 mod system;
 mod tools;
 mod permissions;
-mod rules;
-mod memory;
+// `pub` (not `mod`, like `permissions`/`sessions`/`tools`) so `lm-cli`
+// (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
+// from `little_monkey_lib`, the same way it already reuses `checkpoints`.
+pub mod rules;
+pub mod memory;
 pub mod workspace;
 
 /// Shared application state, managed by Tauri and accessed from every
@@ -105,6 +108,8 @@ pub fn run() {
             memory::memory_list,
             memory::memory_add,
             memory::memory_delete,
+            memory::memory_update,
+            memory::memory_clear,
             sessions::sessions_load,
             sessions::sessions_save,
             checkpoints::checkpoint_begin,
