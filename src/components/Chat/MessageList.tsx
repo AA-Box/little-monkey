@@ -1,6 +1,8 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  BookmarkX,
+  Brain,
   ChevronRight,
   FilePenLine,
   FileSearch,
@@ -20,15 +22,20 @@ import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import {
   checkpointAnchorValid,
   formatCheckpointNotice,
+  formatMemoryNotice,
   isCheckpointNotice,
+  isMemoryNotice,
   isMentionNotice,
   isSwitchNotice,
   parseCheckpointNotice,
+  parseMemoryNotice,
   type CheckpointNotice,
+  type MemoryNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore } from "../../store/checkpointStore";
+import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
 import { useT } from "../../lib/i18n";
 
@@ -53,6 +60,7 @@ type TimelineItem =
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
+  | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "typing"; key: string };
 
 /**
@@ -64,7 +72,8 @@ type TimelineItem =
  * - a trailing empty assistant message (no content, no tool calls yet)
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
- *   synthetic notices (compaction, model switch, per-turn checkpoint).
+ *   synthetic notices (compaction, model switch, per-turn checkpoint,
+ *   remembered fact).
  */
 function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
@@ -121,13 +130,20 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
 
     if (msg.role === "system") {
       // Only our own synthetic notices (context compaction, model
-      // auto-switch, unresolved mentions, per-turn checkpoint) are ever
-      // rendered — any other system message stays hidden, same as before
-      // this app ever produced these.
+      // auto-switch, unresolved mentions, per-turn checkpoint, remembered
+      // fact) are ever rendered — any other system message stays hidden,
+      // same as before this app ever produced these.
       if (isCheckpointNotice(msg)) {
         const notice = parseCheckpointNotice(msg);
         if (notice) {
           items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex: index });
+        }
+        return;
+      }
+      if (isMemoryNotice(msg)) {
+        const notice = parseMemoryNotice(msg);
+        if (notice) {
+          items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex: index });
         }
         return;
       }
@@ -165,6 +181,7 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   list_dir: Folder,
   grep: Search,
   glob: FileSearch,
+  remember: Brain,
 };
 
 function toolIcon(name: string): LucideIcon {
@@ -430,6 +447,69 @@ const CheckpointRow = memo(function CheckpointRow({
   );
 });
 
+/**
+ * Renders a "remembered fact" notice inserted right after a successful
+ * `remember` tool call: the fact's text plus a one-click Forget button that
+ * calls `memory_delete` and rewrites the notice in place with
+ * `forgotten: true` (exact `CheckpointRow` "Restore files" pattern, minus the
+ * restore-scope menu — there's only one thing to undo here).
+ */
+const MemoryRow = memo(function MemoryRow({
+  sessionId,
+  notice,
+  messageIndex,
+}: {
+  sessionId: string;
+  notice: MemoryNotice;
+  messageIndex: number;
+}) {
+  const { t } = useT();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const forget = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("memory_delete", { id: notice.id });
+      useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
+        content: formatMemoryNotice({ ...notice, forgotten: true }),
+      });
+      void useRulesStore.getState().refresh();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(t("MessageList.memoryForgetFailed", { error: message }));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] flex-col items-center gap-1 rounded-md bg-surface-2 px-3 py-1.5 text-center text-xs text-faint">
+        <div className="flex items-center gap-2">
+          <Brain size={12} className="shrink-0" />
+          <span>{t("MessageList.memoryRemembered", { text: notice.text })}</span>
+          {notice.forgotten ? (
+            <span className="font-medium text-muted">{t("MessageList.memoryForgottenLabel")}</span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void forget()}
+              disabled={busy}
+              className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <BookmarkX size={11} />
+              {busy ? t("MessageList.memoryForgetting") : t("MessageList.memoryForgetButton")}
+            </button>
+          )}
+        </div>
+        {error && <div className="text-danger">{error}</div>}
+      </div>
+    </div>
+  );
+});
+
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
@@ -521,6 +601,11 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
                   messageIndex={item.messageIndex}
                   anchorValid={checkpointAnchorValid(messages, item.notice)}
                 />
+              );
+            }
+            if (item.kind === "memory") {
+              return (
+                <MemoryRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
               );
             }
             return <TypingIndicator key={item.key} />;
