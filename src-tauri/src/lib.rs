@@ -88,6 +88,7 @@ pub fn run() {
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,
             checkpoints::checkpoint_reapply,
+            checkpoints::checkpoint_list,
             workspace::set_primary_workspace_root,
             workspace::add_secondary_workspace_root,
             workspace::remove_secondary_workspace_root,

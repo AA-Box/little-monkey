@@ -17,6 +17,7 @@ import { ModeSelector } from "./ModeSelector";
 import { EffortSelector } from "./EffortSelector";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
+import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
 import { WorkspaceBar } from "../Workspace";
@@ -473,6 +474,7 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
           <div className="flex items-center gap-3">
             <ModelSwitcher />
             <EffortSelector />
+            <CheckpointTimeline sessionId={sessionId} />
             <ContextUsageIndicator sessionId={sessionId} />
           </div>
         </div>

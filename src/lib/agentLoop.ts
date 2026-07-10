@@ -43,6 +43,7 @@ import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useCheckpointStore } from '../store/checkpointStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -646,15 +647,15 @@ async function runTurnGuarded(
   // may hold its own concurrent checkpoint — so this turn's id is threaded
   // through to every file-mutating tool call and to checkpoint_end. The
   // session/anchor/label metadata ends up in the manifest for conversation
-  // rewind and (future) timeline labels; maxKeep is the retention cap
-  // (hardcoded until it becomes a setting). Failure to open one (e.g.
-  // app-data dir unavailable) must never block the turn itself — the turn
-  // just runs without a revert affordance.
+  // rewind and timeline labels; maxKeep is the retention cap, user-configurable
+  // via AutomationPanel's "Keep last N checkpoints" setting (settingsStore).
+  // Failure to open one (e.g. app-data dir unavailable) must never block the
+  // turn itself — the turn just runs without a revert affordance.
   const checkpointId = await invoke<string>('checkpoint_begin', {
     sessionId,
     anchorIndex,
     label: userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS),
-    maxKeep: 20,
+    maxKeep: useSettingsStore.getState().checkpointRetention,
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell
   // cancellation and permission prompts to this turn on the Rust side.
@@ -676,6 +677,11 @@ async function runTurnGuarded(
           }),
         });
       }
+      // Invalidate the timeline's cache for this session — whether or not
+      // this particular turn produced a checkpoint, retention pruning at the
+      // next `checkpoint_begin` can also change what's on disk. Safe to fire
+      // and forget: a panel that isn't open just gets a fresher cache.
+      void useCheckpointStore.getState().refresh(sessionId);
     }
   }
 }
