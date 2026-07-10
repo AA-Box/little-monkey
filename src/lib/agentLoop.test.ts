@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { checkpointChainBlockReason, type CheckpointChainLink } from "./agentLoop";
+import {
+  checkpointChainBlockReason,
+  formatMemoryNotice,
+  isMemoryNotice,
+  parseMemoryNotice,
+  type CheckpointChainLink,
+  type MemoryNotice,
+} from "./agentLoop";
+import type { ChatMessage } from "./llamaClient";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -56,5 +64,40 @@ describe("checkpointChainBlockReason", () => {
   it("does not flag a session's first checkpoint (null prevId) as a gap", () => {
     const checkpoints = [link({ id: "a", prevId: null })];
     expect(checkpointChainBlockReason(checkpoints, 0)).toBeNull();
+  });
+});
+
+describe("memory notices", () => {
+  const notice: MemoryNotice = { id: "fact-1", text: "Uses pnpm, not npm." };
+
+  it("formats a notice as a [Memory]-prefixed JSON payload and round-trips it back", () => {
+    const formatted = formatMemoryNotice(notice);
+    expect(formatted.startsWith("[Memory]")).toBe(true);
+
+    const message: ChatMessage = { role: "system", content: formatted };
+    expect(isMemoryNotice(message)).toBe(true);
+    expect(parseMemoryNotice(message)).toEqual(notice);
+  });
+
+  it("round-trips the forgotten flag once the Forget button has been used", () => {
+    const forgotten = formatMemoryNotice({ ...notice, forgotten: true });
+    const message: ChatMessage = { role: "system", content: forgotten };
+    expect(parseMemoryNotice(message)).toEqual({ ...notice, forgotten: true });
+  });
+
+  it("is not misidentified as a memory notice for other message shapes", () => {
+    expect(isMemoryNotice({ role: "system", content: "[Checkpoint]{}" })).toBe(false);
+    expect(isMemoryNotice({ role: "user", content: "[Memory]{}" })).toBe(false);
+    expect(parseMemoryNotice({ role: "assistant", content: "hello" })).toBeNull();
+  });
+
+  it("returns null for a malformed JSON payload instead of throwing", () => {
+    const message: ChatMessage = { role: "system", content: "[Memory]not-json" };
+    expect(parseMemoryNotice(message)).toBeNull();
+  });
+
+  it("returns null when the payload is missing required fields", () => {
+    const message: ChatMessage = { role: "system", content: `[Memory]${JSON.stringify({ id: "only-id" })}` };
+    expect(parseMemoryNotice(message)).toBeNull();
   });
 });

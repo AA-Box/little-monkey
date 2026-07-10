@@ -9,6 +9,7 @@ mod system;
 mod tools;
 mod permissions;
 mod rules;
+mod memory;
 pub mod workspace;
 
 /// Shared application state, managed by Tauri and accessed from every
@@ -43,6 +44,12 @@ pub struct AppState {
     /// don't thread one) so stopping one pane's turn never kills a command
     /// the other pane's turn is still running.
     pub tool_cancel: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// Serializes `memories.json` read-modify-write cycles (see `memory.rs`)
+    /// so two concurrent split-pane `tool_remember` calls can never race and
+    /// clobber each other's fact — the whole file is rewritten on every add
+    /// or delete, so unsynchronized concurrent writers could silently drop
+    /// one of them.
+    pub memory_lock: std::sync::Mutex<()>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -92,8 +99,12 @@ pub fn run() {
             tools::tool_run_shell,
             tools::tools_cancel_running,
             tools::list_workspace_paths,
+            tools::tool_remember,
             rules::rules_read,
             rules::rules_write,
+            memory::memory_list,
+            memory::memory_add,
+            memory::memory_delete,
             sessions::sessions_load,
             sessions::sessions_save,
             checkpoints::checkpoint_begin,

@@ -192,6 +192,69 @@ export function formatCheckpointNotice(notice: CheckpointNotice): string {
   return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
+/** Prefix identifying a synthetic notice inserted right after a successful
+ * `remember` tool call — cloned from the `CHECKPOINT_NOTE_PREFIX` pattern
+ * above. The rest of the content is a JSON payload (see `MemoryNotice`), so
+ * `MessageList` can render a Forget button for it. */
+export const MEMORY_NOTE_PREFIX = '[Memory]';
+
+/** Payload embedded in a memory notice message. */
+export interface MemoryNotice {
+  id: string;
+  text: string;
+  /** Set once the user has forgotten this fact via the notice's Forget button. */
+  forgotten?: boolean;
+}
+
+export function isMemoryNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MEMORY_NOTE_PREFIX);
+}
+
+/** Parses a memory notice's JSON payload; `null` for anything malformed. */
+export function parseMemoryNotice(message: ChatMessage): MemoryNotice | null {
+  if (!isMemoryNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(MEMORY_NOTE_PREFIX.length));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as MemoryNotice).id === 'string' &&
+      typeof (parsed as MemoryNotice).text === 'string'
+    ) {
+      return parsed as MemoryNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a memory notice".
+  }
+  return null;
+}
+
+/** Serializes a memory notice back into message content — used both when the
+ * notice is first added and when the Forget button marks it forgotten. */
+export function formatMemoryNotice(notice: MemoryNotice): string {
+  return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/** Shape of a successful `tool_remember` result (the created/deduplicated
+ * fact) — checked structurally against the tool's stringified result so an
+ * error payload (`{ error: string }`) never gets misread as one. */
+function parseRememberedFact(resultContent: string): { id: string; text: string } | null {
+  try {
+    const parsed: unknown = JSON.parse(resultContent);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as { id?: unknown }).id === 'string' &&
+      typeof (parsed as { text?: unknown }).text === 'string'
+    ) {
+      return parsed as { id: string; text: string };
+    }
+  } catch {
+    // Not JSON — can't be a successful remember result either.
+  }
+  return null;
+}
+
 /** Shape returned by the `llama_status` Tauri command. */
 interface LlamaStatusPayload {
   status: 'stopped' | 'starting' | 'ready' | 'error';
@@ -522,9 +585,12 @@ async function executeToolCall(
   }
   // The turn id scopes permission prompts and shell cancellation to THIS
   // turn — Stop in one pane must not kill the other pane's command or deny
-  // its prompt. Injected like checkpoint_id (never model-supplied). All three
+  // its prompt. Injected like checkpoint_id (never model-supplied). All four
   // commands use `rename_all = "snake_case"`, so all take the snake_case key.
-  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell') {
+  // `remember` doesn't take a checkpoint_id (see tool_remember's doc comment
+  // in tools.rs — there's no workspace file for a checkpoint to snapshot),
+  // but it's still permission-gated and needs the turn id for that prompt.
+  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell' || name === 'remember') {
     args.turn_id = turnId;
   }
 
@@ -942,6 +1008,19 @@ async function runAgentTurnBody(
         content: resultContent,
       };
       addMessage(toolMessage);
+
+      // A successful `remember` gets its own transcript notice (with a
+      // Forget button — see MessageList.tsx's MemoryRow), cloned from how
+      // checkpoint_end's summary becomes a checkpoint notice. rulesStore is
+      // refreshed right after so later iterations of THIS turn already see
+      // the new fact in the system prompt, not just the next turn.
+      if (toolCall.function.name === 'remember') {
+        const fact = parseRememberedFact(resultContent);
+        if (fact) {
+          addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
+          await useRulesStore.getState().refresh();
+        }
+      }
     }
 
     if (signal?.aborted) return;

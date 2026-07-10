@@ -74,9 +74,9 @@ export function buildSystemPrompt(
         ]
       : [];
 
-  // Always empty in this slice — memory.rs/tool_remember land in slice 3.
-  // Kept here (rather than added later) so this function's shape doesn't
-  // change again once facts are real.
+  // Facts remembered via the `remember` tool (see memory.rs/tool_remember),
+  // scoped to the current primary workspace root — refreshed alongside
+  // `rules` once per turn (see rulesStore.ts).
   const factsLines =
     facts.length > 0 ? ['', '## Remembered facts', ...facts.map((fact) => `- ${fact.text}`)] : [];
 

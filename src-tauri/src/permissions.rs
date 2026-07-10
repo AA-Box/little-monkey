@@ -1,6 +1,6 @@
 //! Permission request/response system.
 //!
-//! Every mutating agent tool (write_file, edit_file, run_shell — see tools.rs) must
+//! Every mutating agent tool (write_file, edit_file, run_shell, remember — see tools.rs) must
 //! call [`request_permission`] before doing anything destructive. This emits a
 //! `permission://request` event to the frontend, which renders a modal
 //! (Allow Once / Allow for Session / Deny). The frontend responds via the
@@ -88,7 +88,7 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
             "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - ask the user to switch out of Plan Mode before making changes."
         ))),
         "acceptEdits" | "auto" => {
-            if tool == "write_file" || tool == "edit_file" {
+            if tool == "write_file" || tool == "edit_file" || tool == "remember" {
                 Some(Ok(()))
             } else {
                 None
@@ -108,10 +108,11 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
 /// - `"plan"`: always `Err(..)` — every caller of this function is already a
 ///   mutating tool (read-only tools never call it), so plan mode blocks all
 ///   of them unconditionally.
-/// - `"acceptEdits"`: `write_file`/`edit_file` are auto-approved; anything
-///   else (i.e. `run_shell`) falls through to the normal prompting logic.
-/// - `"auto"`: same as `"acceptEdits"` — `write_file`/`edit_file` are
-///   auto-approved, and `run_shell` ALWAYS falls through to the normal
+/// - `"acceptEdits"`: `write_file`/`edit_file`/`remember` are auto-approved;
+///   anything else (i.e. `run_shell`) falls through to the normal prompting
+///   logic.
+/// - `"auto"`: same as `"acceptEdits"` — `write_file`/`edit_file`/`remember`
+///   are auto-approved, and `run_shell` ALWAYS falls through to the normal
 ///   prompting logic (see [`mode_short_circuit`] for why it is never
 ///   auto-approved).
 /// - `"manual"`, or any unrecognized value (as a safe default): always falls
@@ -506,10 +507,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_accept_edits_short_circuit_only_file_edits() {
+    fn auto_and_accept_edits_short_circuit_only_file_edits_and_remember() {
         for mode in ["auto", "acceptEdits"] {
             assert_eq!(mode_short_circuit(mode, "write_file"), Some(Ok(())));
             assert_eq!(mode_short_circuit(mode, "edit_file"), Some(Ok(())));
+            assert_eq!(mode_short_circuit(mode, "remember"), Some(Ok(())));
             assert!(mode_short_circuit(mode, "run_shell").is_none());
         }
     }
@@ -525,6 +527,7 @@ mod tests {
         for mode in ["manual", "yolo"] {
             assert!(mode_short_circuit(mode, "write_file").is_none());
             assert!(mode_short_circuit(mode, "run_shell").is_none());
+            assert!(mode_short_circuit(mode, "remember").is_none());
         }
     }
 
@@ -532,5 +535,18 @@ mod tests {
     fn plan_mode_short_circuits_to_an_error() {
         let decision = mode_short_circuit("plan", "run_shell").unwrap();
         assert!(decision.unwrap_err().contains("Plan Mode"));
+    }
+
+    #[test]
+    fn plan_mode_blocks_remember_too() {
+        // Plan mode blocks every mutating tool unconditionally — remember
+        // (writes to app-data, not the workspace) is no exception.
+        let decision = mode_short_circuit("plan", "remember").unwrap();
+        assert!(decision.unwrap_err().contains("Plan Mode"));
+    }
+
+    #[test]
+    fn bypass_mode_short_circuits_remember() {
+        assert_eq!(mode_short_circuit("bypass", "remember"), Some(Ok(())));
     }
 }
