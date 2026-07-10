@@ -100,7 +100,7 @@ function App() {
       </aside>
 
       {/* Center: chat, with a drag-region strip standing in for the title bar */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div data-tauri-drag-region className="h-11 shrink-0" />
         <SessionGrantBanner />
         <ChatWindow sessionId={activeSessionId} />
@@ -111,7 +111,7 @@ function App() {
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
       {splitSessionId !== null && (
-        <div className="flex min-w-0 flex-1 flex-col border-l border-border">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
               {splitTitle}
