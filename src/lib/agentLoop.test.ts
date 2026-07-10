@@ -5,10 +5,11 @@ import {
   formatMemoryNotice,
   isMemoryNotice,
   parseMemoryNotice,
+  toolsForSettings,
   type CheckpointChainLink,
   type MemoryNotice,
 } from "./agentLoop";
-import type { ChatMessage } from "./llamaClient";
+import type { ChatMessage, ToolDef } from "./llamaClient";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -99,5 +100,26 @@ describe("memory notices", () => {
   it("returns null when the payload is missing required fields", () => {
     const message: ChatMessage = { role: "system", content: `[Memory]${JSON.stringify({ id: "only-id" })}` };
     expect(parseMemoryNotice(message)).toBeNull();
+  });
+});
+
+describe("toolsForSettings", () => {
+  function toolDef(name: string): ToolDef {
+    return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
+  }
+
+  const tools = [toolDef("write_file"), toolDef("remember"), toolDef("run_shell")];
+
+  it("keeps every tool, including remember, when memoryEnabled is true", () => {
+    expect(toolsForSettings(tools, true).map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell"]);
+  });
+
+  it("filters remember out when memoryEnabled is false, leaving every other tool untouched", () => {
+    expect(toolsForSettings(tools, false).map((t) => t.function.name)).toEqual(["write_file", "run_shell"]);
+  });
+
+  it("is a no-op on a tool list that never had remember in it", () => {
+    const noRemember = [toolDef("write_file"), toolDef("run_shell")];
+    expect(toolsForSettings(noRemember, false)).toEqual(noRemember);
   });
 });

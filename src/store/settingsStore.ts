@@ -38,6 +38,8 @@ export interface SettingsState {
   providerModelFilters: Record<string, ProviderModelFilter>;
   /** How many finished checkpoints (see checkpoints.rs) to keep on disk before the oldest are pruned — passed as `checkpoint_begin`'s `max_keep` param. Range 5-100, default 20 (mirrors the backend's own `MAX_CHECKPOINTS` fallback). */
   checkpointRetention: number;
+  /** Whether the `remember` tool is offered to the model this turn (see `agentLoop.ts`'s `TOOLS` filter). Default true. Turning this off is not amnesia: rules and previously-saved facts are still injected into every system prompt regardless — it only stops the agent from saving *new* facts on its own. Facts remain manually addable/editable/deletable in the Rules tab either way. */
+  memoryEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -53,6 +55,7 @@ export interface SettingsState {
   toggleProviderModelSelected: (providerId: string, modelId: string) => void;
   clearProviderModelSelection: (providerId: string) => void;
   setCheckpointRetention: (value: number) => void;
+  setMemoryEnabled: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -91,6 +94,7 @@ interface PersistedShape {
   visionOverrides: Record<string, boolean>;
   providerModelFilters: Record<string, ProviderModelFilter>;
   checkpointRetention: number;
+  memoryEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -105,6 +109,7 @@ function defaults(): PersistedShape {
     visionOverrides: {},
     providerModelFilters: {},
     checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
+    memoryEnabled: true,
   };
 }
 
@@ -157,6 +162,7 @@ function hydrate(): PersistedShape {
         parsed.checkpointRetention <= MAX_CHECKPOINT_RETENTION
           ? Math.round(parsed.checkpointRetention)
           : fallback.checkpointRetention,
+      memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
     };
   } catch {
     return fallback;
@@ -264,6 +270,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   setCheckpointRetention: (value) => {
     const clamped = Math.min(MAX_CHECKPOINT_RETENTION, Math.max(MIN_CHECKPOINT_RETENTION, Math.round(value)));
     set({ checkpointRetention: clamped });
+    persist({ ...get() });
+  },
+
+  setMemoryEnabled: (value) => {
+    set({ memoryEnabled: value });
     persist({ ...get() });
   },
 }));

@@ -193,6 +193,55 @@ pub fn add_fact_impl(path: &Path, root: &str, text: &str, source: &str) -> Resul
     Ok(fact)
 }
 
+/// Core update-fact logic behind `memory_update` — the Settings fact list's
+/// inline edit (slice 4). Validated the same way as [`add_fact_impl`]
+/// (non-empty, [`MAX_FACT_CHARS`] cap); unlike `add_fact_impl` there is no
+/// duplicate-text short-circuit here — editing fact A's text to match fact
+/// B's is a legitimate (if odd) user action, not a retried remember.
+pub fn update_fact_impl(path: &Path, root: &str, id: &str, text: &str) -> Result<Fact, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Fact text must not be empty".to_string());
+    }
+    if trimmed.chars().count() > MAX_FACT_CHARS {
+        return Err(format!(
+            "Fact text is {} characters, over the {}-character limit — shorten it.",
+            trimmed.chars().count(),
+            MAX_FACT_CHARS
+        ));
+    }
+
+    let mut memories = load_impl(path)?;
+    let updated = {
+        let project = memories
+            .projects
+            .get_mut(root)
+            .ok_or_else(|| "Fact not found — it may have already been forgotten.".to_string())?;
+        let fact = project
+            .facts
+            .iter_mut()
+            .find(|f| f.id == id)
+            .ok_or_else(|| "Fact not found — it may have already been forgotten.".to_string())?;
+        fact.text = trimmed.to_string();
+        fact.clone()
+    };
+    save_impl(path, &memories)?;
+    Ok(updated)
+}
+
+/// Core clear-all logic behind `memory_clear` — the Settings "Clear all"
+/// button (slice 4). Drops every fact for `root` in one write; a project
+/// with no facts yet (or already cleared) is a no-op success, mirroring
+/// `delete_fact_impl`'s "already gone" tolerance. Other projects' facts are
+/// untouched.
+pub fn clear_impl(path: &Path, root: &str) -> Result<(), String> {
+    let mut memories = load_impl(path)?;
+    if memories.projects.remove(root).is_some() {
+        save_impl(path, &memories)?;
+    }
+    Ok(())
+}
+
 /// Core delete-fact logic behind `memory_delete`. Removing an id that isn't
 /// present (already forgotten, or from a different project) is a no-op
 /// success rather than an error — the caller's desired end state (the fact
@@ -248,6 +297,27 @@ pub fn memory_delete(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
     let root = workspace::primary_root_canon(state.inner())?;
     let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
     delete_fact_impl(&memories_file_path(&app)?, &root.to_string_lossy(), &id)
+}
+
+/// Edit a fact's text in place for the current primary root — the Settings
+/// fact list's inline edit (slice 4). Preserves the fact's `id`, `source`,
+/// and `created_at`; only `text` changes.
+#[tauri::command]
+pub fn memory_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, text: String) -> Result<Fact, String> {
+    let root = workspace::primary_root_canon(state.inner())?;
+    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    update_fact_impl(&memories_file_path(&app)?, &root.to_string_lossy(), &id, &text)
+}
+
+/// Delete every remembered fact for the current primary root — the Settings
+/// "Clear all" button (slice 4), gated behind a confirm step in the UI since
+/// it's destructive (though app-local and non-catastrophic: nothing else
+/// depends on facts persisting, and re-remembering is one tool call away).
+#[tauri::command]
+pub fn memory_clear(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let root = workspace::primary_root_canon(state.inner())?;
+    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    clear_impl(&memories_file_path(&app)?, &root.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -380,6 +450,76 @@ mod tests {
         assert_eq!(load_impl(&path).unwrap().projects["/ws/project"].facts.len(), 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_changes_text_but_preserves_id_source_and_created_at() {
+        let path = temp_path();
+        let original = add_fact_impl(&path, "/ws/project", "uses npm", "agent").unwrap();
+
+        let updated = update_fact_impl(&path, "/ws/project", &original.id, "uses pnpm, not npm").unwrap();
+
+        assert_eq!(updated.id, original.id);
+        assert_eq!(updated.source, original.source);
+        assert_eq!(updated.created_at, original.created_at);
+        assert_eq!(updated.text, "uses pnpm, not npm");
+
+        let reloaded = load_impl(&path).unwrap();
+        assert_eq!(reloaded.projects["/ws/project"].facts[0].text, "uses pnpm, not npm");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_of_unknown_id_is_an_error() {
+        let path = temp_path();
+        add_fact_impl(&path, "/ws/project", "stays put", "agent").unwrap();
+
+        let err = update_fact_impl(&path, "/ws/project", "00000000-0000-0000-0000-000000000000", "new text").unwrap_err();
+        assert!(err.contains("not found"), "unexpected error: {err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_rejects_empty_text_and_over_cap_text() {
+        let path = temp_path();
+        let fact = add_fact_impl(&path, "/ws/project", "original", "agent").unwrap();
+
+        let empty_err = update_fact_impl(&path, "/ws/project", &fact.id, "   ").unwrap_err();
+        assert!(empty_err.contains("must not be empty"), "unexpected error: {empty_err}");
+
+        let huge = "a".repeat(MAX_FACT_CHARS + 1);
+        let cap_err = update_fact_impl(&path, "/ws/project", &fact.id, &huge).unwrap_err();
+        assert!(cap_err.contains("character limit"), "unexpected error: {cap_err}");
+
+        // Neither rejected edit should have changed the stored text.
+        assert_eq!(load_impl(&path).unwrap().projects["/ws/project"].facts[0].text, "original");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_removes_all_facts_for_the_project_only() {
+        let path = temp_path();
+        add_fact_impl(&path, "/ws/a", "fact for a, one", "agent").unwrap();
+        add_fact_impl(&path, "/ws/a", "fact for a, two", "user").unwrap();
+        add_fact_impl(&path, "/ws/b", "fact for b", "agent").unwrap();
+
+        clear_impl(&path, "/ws/a").unwrap();
+
+        let memories = load_impl(&path).unwrap();
+        assert!(!memories.projects.contains_key("/ws/a") || memories.projects["/ws/a"].facts.is_empty());
+        assert_eq!(memories.projects["/ws/b"].facts.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_of_project_with_no_facts_is_a_no_op_success() {
+        let path = temp_path();
+        clear_impl(&path, "/ws/never-had-facts").unwrap();
+        assert!(load_impl(&path).unwrap().projects.is_empty());
     }
 
     #[test]

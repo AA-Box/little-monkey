@@ -46,3 +46,49 @@ describe("settingsStore.checkpointRetention", () => {
     expect(useSettingsStore.getState().checkpointRetention).toBe(50);
   });
 });
+
+describe("settingsStore.memoryEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ memoryEnabled: true });
+  });
+
+  it("defaults to true when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as the
+    // checkpointRetention default test above — `beforeEach` forces `true`
+    // regardless, so only a fresh module import actually covers `defaults()`.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().memoryEnabled).toBe(true);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setMemoryEnabled(false);
+    expect(useSettingsStore.getState().memoryEnabled).toBe(false);
+    useSettingsStore.getState().setMemoryEnabled(true);
+    expect(useSettingsStore.getState().memoryEnabled).toBe(true);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    // Guarded like the sibling tests above/below — this suite runs under
+    // vitest's `node` environment, which has no `localStorage` global, so
+    // `persist()`'s best-effort write silently no-ops there.
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setMemoryEnabled(false);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().memoryEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ memoryEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().memoryEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
