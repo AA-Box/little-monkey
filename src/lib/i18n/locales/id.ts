@@ -66,6 +66,7 @@ export const id: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "Pulihkan hingga di sini",
   "CheckpointTimeline.restoringToHere": "Memulihkan…",
   "CheckpointTimeline.restoreToHereBlockedShell": "Tidak tersedia — perintah shell dijalankan selama salah satu giliran ini, sehingga pemulihan berkas tidak bisa membatalkannya sepenuhnya",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "Tidak tersedia — checkpoint di antaranya telah dihapus dari disk, sehingga pemulihan berkas tidak bisa mencakup seluruh rentang ini",
   "CheckpointTimeline.restoreToHereFailed": "Gagal memulihkan hingga di sini: {{error}}",
   "CheckpointTimeline.justNow": "Baru saja",
   "CheckpointTimeline.minutesAgo": "{{count}} menit yang lalu",

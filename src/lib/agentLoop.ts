@@ -122,6 +122,46 @@ export function checkpointAnchorValid(messages: ChatMessage[], notice: Checkpoin
   return textContent(anchored.content).startsWith(notice.label);
 }
 
+/** Minimal shape `checkpointChainBlockReason` needs from a `CheckpointInfo`
+ * (see `src/store/checkpointStore.ts`) — kept local rather than imported to
+ * avoid a store <-> lib import cycle. */
+export interface CheckpointChainLink {
+  id: string;
+  shellRan: boolean;
+  prevId?: string | null;
+}
+
+/** Why (if at all) `CheckpointTimeline.tsx`'s "Restore to here" should be
+ * disabled for the checkpoint at `targetIndex`, or `null` if the newest→
+ * target chain is safe to revert in full. */
+export type CheckpointChainBlockReason = 'shellRan' | 'prunedGap' | null;
+
+/**
+ * Scans `checkpoints` (newest-first, as returned by `checkpoint_list`) from
+ * index 0 through `targetIndex` inclusive for anything that makes "Restore
+ * to here" unsafe across that span:
+ * - `'prunedGap'`: a checkpoint's recorded `prevId` doesn't match the id of
+ *   the next-older entry in the chain, meaning something in between was
+ *   pruned off disk and its changes can no longer be reverted.
+ * - `'shellRan'`: a shell command ran during one of these turns, so file
+ *   restore alone can't guarantee full coverage.
+ * A pruned gap is checked first since it's the harder guarantee failure —
+ * shell coverage is merely partial, a pruned checkpoint's changes are gone
+ * entirely.
+ */
+export function checkpointChainBlockReason(checkpoints: CheckpointChainLink[], targetIndex: number): CheckpointChainBlockReason {
+  const hasPrunedGap = checkpoints.slice(0, targetIndex).some((c, i) => {
+    const next = checkpoints[i + 1];
+    return Boolean(c.prevId) && Boolean(next) && next.id !== c.prevId;
+  });
+  if (hasPrunedGap) return 'prunedGap';
+
+  const hasShellRan = checkpoints.slice(0, targetIndex + 1).some((c) => c.shellRan);
+  if (hasShellRan) return 'shellRan';
+
+  return null;
+}
+
 export function isCheckpointNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(CHECKPOINT_NOTE_PREFIX);
 }

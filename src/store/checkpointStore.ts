@@ -17,6 +17,13 @@ export interface CheckpointInfo {
   /** True once a revert on this checkpoint actually recorded a redo backup —
    * gates whether "Re-apply" is worth offering at all. */
   reapplyable: boolean;
+  /** Id of whatever was this session's newest surviving checkpoint at the
+   * moment this one's turn began (a backward link, like a git parent commit)
+   * — `null`/`undefined` for a session's first checkpoint or a pre-upgrade
+   * manifest. `CheckpointTimeline.tsx` compares this against the next-older
+   * surviving checkpoint's id to detect a pruned gap in "Restore to here"'s
+   * chain. */
+  prevId?: string | null;
 }
 
 interface CheckpointStoreState {

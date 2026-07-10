@@ -27,9 +27,22 @@
 //!    reverted) is the inverse: it plays the `redo/` backups back over the
 //!    files revert touched and flips `reverted` back to `false`.
 //!
+//! Revert and reapply are both idempotent (a repeat call on an
+//! already-reverted/-reapplied checkpoint is a no-op) and serialized per id
+//! via `AppState::checkpoint_locks` — see `revert_impl`/`reapply_impl` and
+//! `acquire_revert_lock`. Without both of those, a checkpoint reachable from
+//! two UI surfaces at once (the transcript's `CheckpointRow` and the
+//! timeline's `TimelineRow`), or re-reverted via "Restore to here" after an
+//! individual revert, would silently corrupt its `redo/` backup with the
+//! wrong content.
+//!
 //! Checkpoints live under `<app_data>/checkpoints/<uuid>/` and the newest
-//! [`MAX_CHECKPOINTS`] are kept, so old turns remain revertable across app
-//! restarts without growing unboundedly.
+//! [`MAX_CHECKPOINTS`] (ranked by manifest `created_at_ms`, never filesystem
+//! mtime — see `prune_old`) are kept, so old turns remain revertable across
+//! app restarts without growing unboundedly. A checkpoint whose turn is
+//! still in flight (no manifest yet) is never counted against that cap —
+//! only swept separately once it's old enough to be certain it was
+//! abandoned by a crash rather than genuinely still running.
 
 use std::path::{Path, PathBuf};
 
@@ -88,6 +101,17 @@ pub struct CheckpointManifest {
     pub shell_ran: bool,
     /// Set on revert so list/timeline UIs can show state and offer Re-apply.
     pub reverted: bool,
+    /// Id of whatever was this session's newest surviving checkpoint at the
+    /// moment this one's turn began — a backward link (like a git parent
+    /// commit) that lets the timeline detect a pruned gap in "Restore to
+    /// here"'s newest-to-target chain: if a checkpoint's `prev_id` doesn't
+    /// match the id of the next-older surviving checkpoint in that session,
+    /// something in between was pruned. `None` for a session's first
+    /// checkpoint, and for manifests written before this field existed
+    /// (`serde(default)`) — those simply can't report a gap, which is a safe
+    /// (if less informative) fallback, not a false positive.
+    #[serde(default)]
+    pub prev_id: Option<String>,
     pub entries: Vec<CheckpointEntry>,
 }
 
@@ -105,6 +129,8 @@ pub struct ActiveCheckpoint {
     /// Flipped by `record_shell` (future slice) when `tool_run_shell` runs
     /// during the turn. Always `false` until then.
     pub shell_ran: bool,
+    /// Captured at `checkpoint_begin` time — see `CheckpointManifest::prev_id`.
+    pub prev_id: Option<String>,
 }
 
 /// Summary returned to the frontend by `checkpoint_end`. The renamed fields
@@ -145,6 +171,10 @@ pub struct CheckpointInfo {
     /// `redo` backup. Lets the timeline hide a "Re-apply" that would be a
     /// silent no-op (e.g. a reverted v1 checkpoint predating redo support).
     pub reapplyable: bool,
+    /// Mirrors `CheckpointManifest::prev_id` — lets the timeline detect a
+    /// pruned gap in a session's chain (see that field's doc comment).
+    #[serde(rename = "prevId")]
+    pub prev_id: Option<String>,
 }
 
 impl CheckpointInfo {
@@ -160,6 +190,7 @@ impl CheckpointInfo {
             shell_ran: manifest.shell_ran,
             reverted: manifest.reverted,
             reapplyable,
+            prev_id: manifest.prev_id.clone(),
         }
     }
 }
@@ -184,29 +215,65 @@ fn validate_id(id: &str) -> Result<(), String> {
     }
 }
 
-/// Delete the oldest checkpoint directories beyond `max_keep`.
+/// A manifest-less directory older than this is treated as abandoned by a
+/// crashed/killed turn rather than genuinely in flight — no legitimate turn
+/// plausibly stays open this long — and becomes eligible for cleanup so a
+/// crash doesn't leak its checkpoint directory forever.
+const ABANDONED_IN_FLIGHT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Delete the oldest *finished* checkpoint directories beyond `max_keep`,
+/// ranked by the immutable `created_at_ms` recorded in each one's manifest —
+/// never by filesystem mtime, which `revert_impl`/`reapply_impl` bump every
+/// time they rewrite the manifest (a revert of an old checkpoint must not
+/// make it look newer than one that was never touched).
+///
+/// A directory with no readable manifest is never counted against
+/// `max_keep` — that's a checkpoint whose turn is still in flight
+/// (`checkpoint_end` hasn't written `manifest.json` yet), so deleting it out
+/// from under the turn would corrupt or abort it. This mirrors `list_impl`'s
+/// own "no manifest = skip" treatment of in-flight checkpoints, just applied
+/// to pruning instead of listing. It's only ever removed separately, and
+/// only once [`ABANDONED_IN_FLIGHT_MAX_AGE_MS`] has passed with no
+/// `checkpoint_end` — i.e. once it can no longer plausibly be a real
+/// in-flight turn, just a crash's leftovers.
+///
 /// Best-effort: pruning failures never fail the turn that triggered them.
 fn prune_old(base_dir: &Path, max_keep: usize) {
     let Ok(read_dir) = std::fs::read_dir(base_dir) else {
         return;
     };
 
-    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = read_dir
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| {
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, entry.path()))
-        })
-        .collect();
+    let now = now_ms();
+    let mut finished: Vec<(u64, PathBuf)> = Vec::new();
 
-    if dirs.len() <= max_keep {
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        if let Ok(manifest) = read_manifest(base_dir, &id) {
+            finished.push((manifest.created_at_ms, path));
+            continue;
+        }
+
+        let age_ms = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| now.saturating_sub(d.as_millis() as u64));
+        if age_ms.is_some_and(|age| age > ABANDONED_IN_FLIGHT_MAX_AGE_MS) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
+    if finished.len() <= max_keep {
         return;
     }
 
-    dirs.sort_by_key(|(modified, _)| *modified);
-    let excess = dirs.len() - max_keep;
-    for (_, path) in dirs.into_iter().take(excess) {
+    finished.sort_by_key(|(created_at_ms, _)| *created_at_ms);
+    let excess = finished.len() - max_keep;
+    for (_, path) in finished.into_iter().take(excess) {
         let _ = std::fs::remove_dir_all(path);
     }
 }
@@ -233,14 +300,23 @@ pub fn begin_impl(
 ) -> Result<String, String> {
     prune_old(base_dir, max_keep.unwrap_or(MAX_CHECKPOINTS).max(1));
 
+    // The current head of this session's chain, if any — recorded as this
+    // checkpoint's `prev_id` so the timeline can later detect a pruned gap
+    // (see `CheckpointManifest::prev_id`). Best-effort: an unreadable
+    // checkpoints dir just means no known predecessor, not a hard failure.
+    let prev_id = list_impl(base_dir, Some(&session_id))
+        .ok()
+        .and_then(|list| list.into_iter().next())
+        .map(|info| info.id);
+
     let id = uuid::Uuid::new_v4().to_string();
     let dir = base_dir.join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create checkpoint dir: {}", e))?;
 
     // A checkpoint whose turn crashed mid-flight (its `checkpoint_end` never
     // arrives) stays in the map until app restart — a few stray entries at
-    // most, and its manifest-less directory on disk is inert and gets pruned
-    // eventually.
+    // most, and its manifest-less directory on disk is swept by `prune_old`
+    // once it's old enough to no longer look like a real in-flight turn.
     state
         .checkpoints
         .lock()
@@ -255,6 +331,7 @@ pub fn begin_impl(
                 anchor_index,
                 label,
                 shell_ran: false,
+                prev_id,
             },
         );
 
@@ -346,6 +423,7 @@ fn parse_manifest(raw: &str, dir: &Path, id: &str) -> Result<CheckpointManifest,
         label: String::new(),
         shell_ran: false,
         reverted: false,
+        prev_id: None,
         entries,
     })
 }
@@ -410,6 +488,7 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         label: active.label.clone(),
         shell_ran: active.shell_ran,
         reverted: false,
+        prev_id: active.prev_id,
         entries: active.entries.clone(),
     };
     write_manifest(&active.dir, &manifest)?;
@@ -438,11 +517,26 @@ const REDO_DIR: &str = "redo";
 /// the redo backups are persisted via an atomic manifest rewrite; that write
 /// is likewise best-effort so a read-only app-data dir (or any other
 /// persistence failure) never prevents the revert from actually happening.
+///
+/// Idempotent: if `id` is already reverted, this is a no-op that returns
+/// `Ok(0)` rather than re-running the snapshot-then-restore steps. Without
+/// this guard, a second revert of an already-reverted checkpoint would
+/// snapshot the file's *current* (already-restored, pre-turn) content into
+/// `redo/<n>.bak`, clobbering the true post-turn content the first revert
+/// recorded there and permanently losing the turn's real changes out from
+/// under a later `checkpoint_reapply`. Two independent, ordinary-usage call
+/// sites can otherwise reach this: `CheckpointTimeline.tsx`'s "Restore to
+/// here" re-reverts every checkpoint newest→target unconditionally
+/// (including ones the user already reverted individually earlier), and the
+/// CLI's `/revert`/`lm revert` can simply be invoked twice on the same id.
 pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     validate_id(id)?;
 
     let dir = base_dir.join(id);
     let mut manifest = read_manifest(base_dir, id)?;
+    if manifest.reverted {
+        return Ok(0);
+    }
     let redo_dir = dir.join(REDO_DIR);
 
     let mut reverted = 0u32;
@@ -505,11 +599,18 @@ pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
 /// pre-existing file (`backup: Some`) with no redo backup is left untouched:
 /// that's an anomaly (the file should have existed at revert time), and
 /// deleting a restored original would be strictly worse than a no-op.
+///
+/// Idempotent, mirroring `revert_impl`: if `id` isn't currently reverted,
+/// this is a no-op returning `Ok(0)` rather than replaying redo backups over
+/// files that were never touched by a revert.
 pub fn reapply_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     validate_id(id)?;
 
     let dir = base_dir.join(id);
     let mut manifest = read_manifest(base_dir, id)?;
+    if !manifest.reverted {
+        return Ok(0);
+    }
     let redo_dir = dir.join(REDO_DIR);
 
     let mut reapplied = 0u32;
@@ -610,11 +711,42 @@ pub fn checkpoint_end(state: tauri::State<'_, AppState>, id: String) -> Result<C
     end_impl(state.inner(), &id)
 }
 
+/// RAII guard for one entry in `AppState::checkpoint_locks`: removes `id`
+/// from the in-progress set on drop (including on early return via `?`), so
+/// a lock can never get stuck if revert/reapply errors out or panics.
+struct RevertLockGuard<'a> {
+    state: &'a AppState,
+    id: String,
+}
+
+impl Drop for RevertLockGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut locks) = self.state.checkpoint_locks.lock() {
+            locks.remove(&self.id);
+        }
+    }
+}
+
+/// Claims the revert/reapply lock for checkpoint `id`, erroring if another
+/// revert or reapply for the same id is already in progress — see
+/// `AppState::checkpoint_locks`'s doc comment for why this is needed.
+fn acquire_revert_lock<'a>(state: &'a AppState, id: &str) -> Result<RevertLockGuard<'a>, String> {
+    let mut locks = state
+        .checkpoint_locks
+        .lock()
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
+    if !locks.insert(id.to_string()) {
+        return Err(format!("Checkpoint '{}' is already being restored", id));
+    }
+    Ok(RevertLockGuard { state, id: id.to_string() })
+}
+
 /// Restore every file recorded in checkpoint `id` to its pre-turn state.
 /// A direct, human-initiated UI action (the transcript's "Revert" button) —
 /// like `git_commit`, intentionally NOT routed through the permission system.
 #[tauri::command]
-pub fn checkpoint_revert(app: tauri::AppHandle, id: String) -> Result<u32, String> {
+pub fn checkpoint_revert(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<u32, String> {
+    let _lock = acquire_revert_lock(state.inner(), &id)?;
     revert_impl(&checkpoints_base_dir(&app)?, &id)
 }
 
@@ -622,7 +754,8 @@ pub fn checkpoint_revert(app: tauri::AppHandle, id: String) -> Result<u32, Strin
 /// over the files revert touched, restoring the turn's own changes. Like
 /// `checkpoint_revert`, a direct human-initiated UI action, not permission-gated.
 #[tauri::command]
-pub fn checkpoint_reapply(app: tauri::AppHandle, id: String) -> Result<u32, String> {
+pub fn checkpoint_reapply(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<u32, String> {
+    let _lock = acquire_revert_lock(state.inner(), &id)?;
     reapply_impl(&checkpoints_base_dir(&app)?, &id)
 }
 
@@ -914,11 +1047,19 @@ mod tests {
     fn begin_prunes_to_the_supplied_max_keep() {
         let state = AppState::default();
         let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
 
-        // Four finished checkpoints, oldest first (distinct mtimes).
+        // Four *finished* checkpoints (each with a real manifest.json),
+        // oldest first by created_at_ms.
+        let mut ids = Vec::new();
         for n in 0..4 {
-            let dir = base.path.join(format!("00000000-0000-4000-8000-00000000000{n}"));
-            std::fs::create_dir_all(&dir).unwrap();
+            let file = ws.path.join(format!("f{n}.txt"));
+            std::fs::write(&file, "x").unwrap();
+            let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), None).unwrap();
+            record_original(&state, Some(&id), &file).unwrap();
+            std::fs::write(&file, "y").unwrap();
+            end_impl(&state, &id).unwrap();
+            ids.push(id);
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
 
@@ -933,9 +1074,102 @@ mod tests {
         // The two oldest were pruned; the two newest plus the just-opened
         // checkpoint remain.
         assert_eq!(remaining.len(), 3, "remaining: {remaining:?}");
-        assert!(!remaining.contains(&"00000000-0000-4000-8000-000000000000".to_string()));
-        assert!(!remaining.contains(&"00000000-0000-4000-8000-000000000001".to_string()));
+        assert!(!remaining.contains(&ids[0]), "oldest checkpoint must be pruned");
+        assert!(!remaining.contains(&ids[1]), "second-oldest checkpoint must be pruned");
+        assert!(remaining.contains(&ids[2]));
+        assert!(remaining.contains(&ids[3]));
         assert!(remaining.contains(&id));
+    }
+
+    #[test]
+    fn prune_never_deletes_an_in_flight_checkpoint_regardless_of_age() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        // Turn A begins and stays open (no checkpoint_end) — its directory
+        // has no manifest.json yet.
+        let id_a = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), None).unwrap();
+        assert!(base.path.join(&id_a).is_dir());
+
+        // Several other turns finish afterwards, each bumping the total
+        // count of on-disk directories past a very small max_keep.
+        for n in 0..5 {
+            let file = ws.path.join(format!("f{n}.txt"));
+            std::fs::write(&file, "x").unwrap();
+            let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), Some(1)).unwrap();
+            record_original(&state, Some(&id), &file).unwrap();
+            end_impl(&state, &id).unwrap();
+        }
+
+        // Turn A's directory must have survived every intervening prune_old
+        // call, since it never got a manifest and is still open.
+        assert!(base.path.join(&id_a).is_dir(), "in-flight checkpoint dir must never be pruned");
+        assert!(state.checkpoints.lock().unwrap().contains_key(&id_a));
+
+        // And a mutation recorded against it afterwards must still succeed.
+        let file_a = ws.path.join("a.txt");
+        std::fs::write(&file_a, "original").unwrap();
+        record_original(&state, Some(&id_a), &file_a).unwrap();
+    }
+
+    #[test]
+    fn prune_sweeps_an_abandoned_in_flight_checkpoint_once_old_enough() {
+        let base = TempDir::new("base");
+
+        // A manifest-less directory whose mtime is far older than the
+        // abandoned-in-flight cutoff — simulating a turn that crashed before
+        // ever calling checkpoint_end.
+        let stale_id = "00000000-0000-4000-8000-0000000stale1";
+        let stale_dir = base.path.join(stale_id);
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_millis(ABANDONED_IN_FLIGHT_MAX_AGE_MS + 60_000);
+        set_dir_mtime(&stale_dir, ancient);
+
+        prune_old(&base.path, 20);
+
+        assert!(!stale_dir.exists(), "an old-enough manifest-less directory must be swept as abandoned");
+    }
+
+    /// Backdates `dir`'s mtime for the abandoned-in-flight sweep test above.
+    fn set_dir_mtime(dir: &Path, t: std::time::SystemTime) {
+        let file = std::fs::File::open(dir).expect("open dir for mtime update");
+        let times = std::fs::FileTimes::new().set_modified(t);
+        file.set_times(times).expect("set directory mtime");
+    }
+
+    #[test]
+    fn prune_ranks_by_manifest_created_at_ms_not_filesystem_mtime() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        // A (oldest), B, C (newest) by created_at_ms.
+        let make = |n: u64| {
+            let file = ws.path.join(format!("f{n}.txt"));
+            std::fs::write(&file, "x").unwrap();
+            let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), None).unwrap();
+            record_original(&state, Some(&id), &file).unwrap();
+            end_impl(&state, &id).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            id
+        };
+        let id_a = make(0);
+        let id_b = make(1);
+        let id_c = make(2);
+
+        // Reverting A rewrites its manifest.json, which would bump its
+        // directory's mtime — but must NOT make it look newer than B.
+        revert_impl(&base.path, &id_a).unwrap();
+
+        // With max_keep=2, the correct "keep newest 2 by created_at_ms" is
+        // {B, C}; a mtime-based ranking would instead keep {A, C} since A
+        // was just touched by revert.
+        let _ = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), Some(2)).unwrap();
+
+        assert!(!base.path.join(&id_a).exists(), "reverted-but-genuinely-oldest checkpoint must still be pruned");
+        assert!(base.path.join(&id_b).exists(), "genuinely newer checkpoint must survive pruning");
+        assert!(base.path.join(&id_c).exists());
     }
 
     #[test]
@@ -989,6 +1223,156 @@ mod tests {
             "mutated",
             "reapply must restore the turn's mutated content"
         );
+    }
+
+    #[test]
+    fn revert_is_idempotent_and_does_not_corrupt_the_redo_backup() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        // First revert: file goes back to "v1", redo/0.bak correctly holds "v2".
+        let first = revert_impl(&base.path, &id).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
+
+        // A second revert of the SAME (already-reverted) checkpoint — e.g.
+        // CheckpointTimeline's "Restore to here" re-reverting a checkpoint
+        // the user already reverted individually, or `/revert` run twice —
+        // must be a no-op, not re-snapshot the current ("v1") content over
+        // the true post-turn ("v2") redo backup.
+        let second = revert_impl(&base.path, &id).unwrap();
+        assert_eq!(second, 0, "a repeat revert of an already-reverted checkpoint must be a no-op");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1", "the file itself must be unaffected");
+
+        let reapplied = reapply_impl(&base.path, &id).unwrap();
+        assert_eq!(reapplied, 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v2",
+            "reapply after a redundant revert must still restore the turn's true post-turn content"
+        );
+    }
+
+    #[test]
+    fn reapply_is_idempotent() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        // Reapply before any revert has ever happened: nothing to redo yet.
+        let noop = reapply_impl(&base.path, &id).unwrap();
+        assert_eq!(noop, 0, "reapply on a never-reverted checkpoint must be a no-op");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2", "must not touch the file");
+
+        revert_impl(&base.path, &id).unwrap();
+        reapply_impl(&base.path, &id).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+
+        // A second reapply after the checkpoint is already re-applied
+        // (reverted: false) must likewise be a no-op.
+        let second = reapply_impl(&base.path, &id).unwrap();
+        assert_eq!(second, 0, "a repeat reapply must be a no-op");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+    }
+
+    #[test]
+    fn begin_records_prev_id_as_the_sessions_current_head() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let make = |n: u64| {
+            let file = ws.path.join(format!("f{n}.txt"));
+            std::fs::write(&file, "x").unwrap();
+            let id = begin_impl(&state, &base.path, "s1".to_string(), 0, "p".to_string(), None).unwrap();
+            record_original(&state, Some(&id), &file).unwrap();
+            end_impl(&state, &id).unwrap();
+            id
+        };
+        let id_a = make(0);
+        let id_b = make(1);
+
+        let manifest_a = read_manifest(&base.path, &id_a).unwrap();
+        assert_eq!(manifest_a.prev_id, None, "the session's first checkpoint has no predecessor");
+
+        let manifest_b = read_manifest(&base.path, &id_b).unwrap();
+        assert_eq!(manifest_b.prev_id, Some(id_a.clone()), "must link to the session's previous checkpoint");
+
+        // A checkpoint in a different session must not be treated as a
+        // predecessor.
+        let file_c = ws.path.join("c.txt");
+        std::fs::write(&file_c, "x").unwrap();
+        let id_other_session = begin_impl(&state, &base.path, "s2".to_string(), 0, "p".to_string(), None).unwrap();
+        record_original(&state, Some(&id_other_session), &file_c).unwrap();
+        end_impl(&state, &id_other_session).unwrap();
+        assert_eq!(read_manifest(&base.path, &id_other_session).unwrap().prev_id, None);
+    }
+
+    #[test]
+    fn list_exposes_prev_id_so_the_timeline_can_detect_a_pruned_gap() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let make = |n: u64| {
+            let file = ws.path.join(format!("f{n}.txt"));
+            std::fs::write(&file, "x").unwrap();
+            let id = begin_impl(&state, &base.path, "s1".to_string(), 0, "p".to_string(), None).unwrap();
+            record_original(&state, Some(&id), &file).unwrap();
+            end_impl(&state, &id).unwrap();
+            id
+        };
+        let id_a = make(0);
+        let id_b = make(1);
+        let id_c = make(2);
+
+        // Simulate B being pruned (or otherwise removed) independently of A/C.
+        std::fs::remove_dir_all(base.path.join(&id_b)).unwrap();
+
+        let infos = list_impl(&base.path, Some("s1")).unwrap();
+        assert_eq!(infos.len(), 2, "B must no longer be listed");
+        // Newest-first: C, then A.
+        assert_eq!(infos[0].id, id_c);
+        assert_eq!(infos[1].id, id_a);
+        // C's recorded predecessor (B) doesn't match the next surviving
+        // entry (A) — that mismatch is exactly the pruned-gap signal the
+        // timeline's "Restore to here" must key off of.
+        assert_eq!(infos[0].prev_id, Some(id_b), "C's prev_id still points at the pruned B");
+        assert_ne!(infos[0].prev_id, Some(infos[1].id.clone()), "mismatch signals a gap");
+    }
+
+    #[test]
+    fn acquire_revert_lock_rejects_a_second_concurrent_claim() {
+        let state = AppState::default();
+        let id = "some-checkpoint-id";
+
+        let guard = acquire_revert_lock(&state, id).unwrap();
+        let err = match acquire_revert_lock(&state, id) {
+            Ok(_) => panic!("a second concurrent claim on the same id must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("already being restored"), "unexpected error: {err}");
+
+        drop(guard);
+        // Once released, a new claim must succeed.
+        assert!(acquire_revert_lock(&state, id).is_ok());
     }
 
     #[test]

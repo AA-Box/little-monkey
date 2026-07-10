@@ -66,6 +66,7 @@ export const en: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "Restore to here",
   "CheckpointTimeline.restoringToHere": "Restoring…",
   "CheckpointTimeline.restoreToHereBlockedShell": "Unavailable — a shell command ran during one of these turns, so file restore can't fully undo it",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "Unavailable — an in-between checkpoint was pruned from disk, so file restore can't fully cover this span",
   "CheckpointTimeline.restoreToHereFailed": "Restore to here failed: {{error}}",
   "CheckpointTimeline.justNow": "Just now",
   "CheckpointTimeline.minutesAgo": "{{count}} minute(s) ago",

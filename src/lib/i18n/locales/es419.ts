@@ -66,6 +66,7 @@ export const es419: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "Restaurar hasta aquí",
   "CheckpointTimeline.restoringToHere": "Restaurando…",
   "CheckpointTimeline.restoreToHereBlockedShell": "No disponible: se ejecutó un comando de shell durante uno de estos turnos, así que restaurar archivos no puede deshacerlo por completo",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "No disponible: se eliminó un punto de control intermedio del disco, así que restaurar archivos no puede cubrir todo este período",
   "CheckpointTimeline.restoreToHereFailed": "Error al restaurar hasta aquí: {{error}}",
   "CheckpointTimeline.justNow": "Ahora mismo",
   "CheckpointTimeline.minutesAgo": "hace {{count}} minuto(s)",

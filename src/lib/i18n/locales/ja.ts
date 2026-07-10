@@ -66,6 +66,7 @@ export const ja: Record<string, string> = {
   "CheckpointTimeline.restoreToHereButton": "ここまで復元",
   "CheckpointTimeline.restoringToHere": "復元中…",
   "CheckpointTimeline.restoreToHereBlockedShell": "利用できません — これらのターンのいずれかでシェルコマンドが実行されたため、ファイルの復元だけでは完全には元に戻せません",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "利用できません — 途中のチェックポイントがディスクから削除されたため、ファイルの復元だけではこの範囲を完全にはカバーできません",
   "CheckpointTimeline.restoreToHereFailed": "ここまでの復元に失敗しました: {{error}}",
   "CheckpointTimeline.justNow": "たった今",
   "CheckpointTimeline.minutesAgo": "{{count}}分前",
