@@ -27,6 +27,7 @@ import {
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
+import { useCheckpointStore } from "../../store/checkpointStore";
 import MessageBubble from "./MessageBubble";
 import { useT } from "../../lib/i18n";
 
@@ -294,6 +295,7 @@ const CheckpointRow = memo(function CheckpointRow({
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: true }),
       });
+      void useCheckpointStore.getState().refresh(sessionId);
       return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -313,6 +315,7 @@ const CheckpointRow = memo(function CheckpointRow({
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: false }),
       });
+      void useCheckpointStore.getState().refresh(sessionId);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(t("MessageList.checkpointReapplyFailed", { error: message }));

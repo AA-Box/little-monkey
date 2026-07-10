@@ -9,6 +9,7 @@ export { default as ModeSelector } from "./ModeSelector";
 export { default as EffortSelector } from "./EffortSelector";
 export { default as ModelSwitcher } from "./ModelSwitcher";
 export { default as ContextUsageIndicator } from "./ContextUsageIndicator";
+export { default as CheckpointTimeline } from "./CheckpointTimeline";
 export { default as AttachMenu } from "./AttachMenu";
 export type { AttachMenuProps } from "./AttachMenu";
 export { default as AttachmentChip } from "./AttachmentChip";

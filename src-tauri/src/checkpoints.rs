@@ -123,6 +123,47 @@ pub struct CheckpointSummary {
     pub shell_ran: bool,
 }
 
+/// Summary of one checkpoint on disk, returned by `checkpoint_list` for the
+/// timeline UI. Lighter than [`CheckpointManifest`] (no per-file paths) —
+/// `files` is just a count, which is all "N files changed" rows need.
+#[derive(serde::Serialize, Clone)]
+pub struct CheckpointInfo {
+    pub id: String,
+    #[serde(rename = "createdAtMs")]
+    pub created_at_ms: u64,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "anchorIndex")]
+    pub anchor_index: usize,
+    pub label: String,
+    pub files: usize,
+    #[serde(rename = "shellRan")]
+    pub shell_ran: bool,
+    pub reverted: bool,
+    /// True once `checkpoint_reapply` actually has something to play back —
+    /// the checkpoint has been reverted AND at least one entry recorded a
+    /// `redo` backup. Lets the timeline hide a "Re-apply" that would be a
+    /// silent no-op (e.g. a reverted v1 checkpoint predating redo support).
+    pub reapplyable: bool,
+}
+
+impl CheckpointInfo {
+    fn from_manifest(id: String, manifest: &CheckpointManifest) -> Self {
+        let reapplyable = manifest.reverted && manifest.entries.iter().any(|e| e.redo.is_some());
+        CheckpointInfo {
+            id,
+            created_at_ms: manifest.created_at_ms,
+            session_id: manifest.session_id.clone(),
+            anchor_index: manifest.anchor_index,
+            label: manifest.label.clone(),
+            files: manifest.entries.len(),
+            shell_ran: manifest.shell_ran,
+            reverted: manifest.reverted,
+            reapplyable,
+        }
+    }
+}
+
 fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -481,6 +522,47 @@ pub fn reapply_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     }
 
     Ok(reapplied)
+}
+
+/// Core list logic, parameterized by base dir for testability: scans every
+/// checkpoint directory under `base_dir`, reads its manifest (v2, or the v1
+/// fallback via [`parse_manifest`]), and returns a [`CheckpointInfo`] per
+/// finished checkpoint, newest-first. A directory with no manifest yet (a
+/// turn still in flight — `checkpoint_end` hasn't run) or an unreadable/
+/// corrupt one is silently skipped rather than failing the whole list.
+/// `session_id` optionally restricts the result to one session's checkpoints
+/// (used by the timeline's "Restore to here" chain, which is only
+/// well-defined within a single session).
+pub fn list_impl(base_dir: &Path, session_id: Option<&str>) -> Result<Vec<CheckpointInfo>, String> {
+    let read_dir = std::fs::read_dir(base_dir).map_err(|e| format!("Failed to read checkpoints dir: {}", e))?;
+
+    let mut infos: Vec<CheckpointInfo> = Vec::new();
+    for entry in read_dir.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        let Ok(manifest) = read_manifest(base_dir, &id) else {
+            continue;
+        };
+        if let Some(filter) = session_id {
+            if manifest.session_id != filter {
+                continue;
+            }
+        }
+        infos.push(CheckpointInfo::from_manifest(id, &manifest));
+    }
+
+    infos.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    Ok(infos)
+}
+
+/// Lists checkpoints newest-first for the timeline UI, optionally filtered to
+/// one session. Read-only UI plumbing — like `checkpoint_revert`,
+/// intentionally NOT routed through the permission system.
+#[tauri::command]
+pub fn checkpoint_list(app: tauri::AppHandle, session_id: Option<String>) -> Result<Vec<CheckpointInfo>, String> {
+    list_impl(&checkpoints_base_dir(&app)?, session_id.as_deref())
 }
 
 /// Open a new per-turn checkpoint and return its id. `session_id`,
@@ -874,5 +956,96 @@ mod tests {
         let base = TempDir::new("base");
         let err = reapply_impl(&base.path, "0000-does-not-exist").unwrap_err();
         assert!(err.contains("not found"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn list_returns_newest_first_and_skips_in_flight_checkpoints() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file_a = ws.path.join("a.txt");
+        std::fs::write(&file_a, "a").unwrap();
+        let id_older = begin_impl(&state, &base.path, "s1".to_string(), 0, "older turn".to_string(), None).unwrap();
+        record_original(&state, Some(&id_older), &file_a).unwrap();
+        end_impl(&state, &id_older).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let file_b = ws.path.join("b.txt");
+        std::fs::write(&file_b, "b").unwrap();
+        let id_newer = begin_impl(&state, &base.path, "s1".to_string(), 1, "newer turn".to_string(), None).unwrap();
+        record_original(&state, Some(&id_newer), &file_b).unwrap();
+        end_impl(&state, &id_newer).unwrap();
+
+        // A checkpoint whose turn is still running (no `checkpoint_end` yet,
+        // so no manifest.json on disk) must not appear in the list.
+        let _in_flight = begin_impl(&state, &base.path, "s1".to_string(), 2, "still running".to_string(), None).unwrap();
+
+        let infos = list_impl(&base.path, None).unwrap();
+        assert_eq!(infos.len(), 2, "in-flight checkpoint must be skipped: {:?}", infos.iter().map(|i| &i.id).collect::<Vec<_>>());
+        assert_eq!(infos[0].id, id_newer, "newest checkpoint must sort first");
+        assert_eq!(infos[1].id, id_older);
+        assert_eq!(infos[0].files, 1);
+        assert_eq!(infos[0].label, "newer turn");
+        assert!(!infos[0].reverted);
+        assert!(!infos[0].reapplyable);
+    }
+
+    #[test]
+    fn list_filters_by_session_id() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file_a = ws.path.join("a.txt");
+        std::fs::write(&file_a, "a").unwrap();
+        let id_s1 = begin_impl(&state, &base.path, "session-1".to_string(), 0, "s1 turn".to_string(), None).unwrap();
+        record_original(&state, Some(&id_s1), &file_a).unwrap();
+        end_impl(&state, &id_s1).unwrap();
+
+        let file_b = ws.path.join("b.txt");
+        std::fs::write(&file_b, "b").unwrap();
+        let id_s2 = begin_impl(&state, &base.path, "session-2".to_string(), 0, "s2 turn".to_string(), None).unwrap();
+        record_original(&state, Some(&id_s2), &file_b).unwrap();
+        end_impl(&state, &id_s2).unwrap();
+
+        let all = list_impl(&base.path, None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let filtered = list_impl(&base.path, Some("session-1")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, id_s1);
+        assert_eq!(filtered[0].session_id, "session-1");
+    }
+
+    #[test]
+    fn list_includes_v1_manifests_and_marks_reapplyable_after_revert() {
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let existing = ws.path.join("existing.txt");
+        std::fs::write(&existing, "mutated").unwrap();
+
+        // A v1 (bare-array) manifest on disk, same as `v1_manifest_on_disk_still_reverts`.
+        let v1_id = "00000000-0000-4000-8000-00000000v1lst";
+        let v1_dir = base.path.join(v1_id);
+        std::fs::create_dir_all(&v1_dir).unwrap();
+        std::fs::write(v1_dir.join("0.bak"), "original").unwrap();
+        let raw = format!(r#"[{{"path":{:?},"backup":"0.bak"}}]"#, existing.to_string_lossy());
+        std::fs::write(v1_dir.join(MANIFEST_FILE), raw).unwrap();
+
+        let before_revert = list_impl(&base.path, None).unwrap();
+        assert_eq!(before_revert.len(), 1);
+        assert_eq!(before_revert[0].session_id, "", "v1 manifests synthesize an empty session id");
+        assert!(!before_revert[0].reverted);
+        assert!(!before_revert[0].reapplyable, "not reverted yet, so nothing to re-apply");
+
+        revert_impl(&base.path, v1_id).unwrap();
+
+        let after_revert = list_impl(&base.path, None).unwrap();
+        assert_eq!(after_revert.len(), 1);
+        assert!(after_revert[0].reverted);
+        assert!(after_revert[0].reapplyable, "revert_impl recorded a redo backup, so re-apply is now meaningful");
     }
 }
