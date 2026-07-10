@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Search, TerminalSquare } from "lucide-react";
+import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Plug, Search, TerminalSquare } from "lucide-react";
 import { usePermissionStore } from "../../store/permissionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 
-/** Maps a tool name to the icon shown in the dialog's tinted circle. */
+/** Maps a tool name to the icon shown in the dialog's tinted circle. An MCP
+ * tool call's permission-request name (`mcp:<serverId>:<toolName>`, see
+ * `src-tauri/src/mcp.rs::mcp_call_tool`) isn't a fixed key here — it's
+ * matched by prefix below instead, since the server/tool half varies. */
 const TOOL_ICONS: Record<string, typeof AlertTriangle> = {
   run_shell: TerminalSquare,
   write_file: FilePenLine,
@@ -54,7 +57,12 @@ export function PermissionModal() {
   // call always prompts. See src-tauri/src/permissions.rs::NO_SESSION_REMEMBER
   // for the backend-enforced (authoritative) side of this restriction.
   const canRememberForSession = pending.tool !== "run_shell";
-  const ToolIcon = TOOL_ICONS[pending.tool] ?? AlertTriangle;
+  const isMcpTool = pending.tool.startsWith("mcp:");
+  const ToolIcon = isMcpTool ? Plug : TOOL_ICONS[pending.tool] ?? AlertTriangle;
+  // `detail`'s first line is exactly "<server label> → <tool name>" (see
+  // `mcp_call_tool`'s `detail` construction) — friendlier than the raw
+  // `mcp:<serverId>:<toolName>` permission-request string.
+  const displayTool = isMcpTool ? pending.detail.split("\n", 1)[0] : pending.tool;
 
   return (
     <div
@@ -77,7 +85,7 @@ export function PermissionModal() {
               {t("PermissionModal.title")}
             </h2>
             <p className="mt-0.5 text-xs text-muted">
-              {t("PermissionModal.wantsToRunTool")} <span className="font-mono text-foreground">{pending.tool}</span>
+              {t("PermissionModal.wantsToRunTool")} <span className="font-mono text-foreground">{displayTool}</span>
             </p>
           </div>
         </div>
