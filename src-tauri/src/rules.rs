@@ -137,6 +137,23 @@ fn write_rules_impl(
             let root_path =
                 root_path.ok_or_else(|| "root_path is required when scope is \"project\"".to_string())?;
             let (resolved, _root_canon) = workspace::resolve_path_and_root(state, root_path)?;
+            // `resolve_path_and_root` only guarantees the resolved path stays
+            // inside an attached workspace root — it imposes no constraint on
+            // the filename, so without this check `rules_write` would be an
+            // ungated arbitrary-file-overwrite primitive for any file under
+            // any attached root (this command is deliberately NOT routed
+            // through `permissions::request_permission` — see the doc comment
+            // on `rules_write` below). The Settings editor only ever passes a
+            // path resolving to `MONKEY.md`; enforce that here too so the
+            // backend contract doesn't silently rely on that being the only
+            // caller.
+            if resolved.file_name().and_then(|n| n.to_str()) != Some(RULE_FILE_NAME) {
+                return Err(format!(
+                    "Refusing to write '{}': project-scope rules_write may only write a '{}' file",
+                    resolved.display(),
+                    RULE_FILE_NAME
+                ));
+            }
             resolved
         }
         other => return Err(format!("Unknown rules scope '{}' (expected \"global\" or \"project\")", other)),
@@ -353,6 +370,34 @@ mod tests {
 
         let err = write_rules_impl(&state, &global_path, "project", Some("../escape/MONKEY.md"), "evil").unwrap_err();
         assert!(err.contains("escapes"), "expected an escape error, got: {err}");
+    }
+
+    #[test]
+    fn write_project_scope_refuses_a_non_monkey_md_target() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let ws = TempDir::new();
+        let victim = ws.path.join("package.json");
+        std::fs::write(&victim, "{\"original\": true}").unwrap();
+        let state = state_with_roots(&ws.path, &[]);
+
+        let err = write_rules_impl(&state, &global_path, "project", Some("package.json"), "{}").unwrap_err();
+        assert!(
+            err.contains("Refusing to write") && err.contains("MONKEY.md"),
+            "expected a refusal mentioning MONKEY.md, got: {err}"
+        );
+        // The arbitrary file must be left untouched.
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "{\"original\": true}");
+    }
+
+    #[test]
+    fn write_project_scope_refuses_a_non_monkey_md_target_via_secondary_root_label() {
+        let global_path = TempDir::new().path.join("MONKEY.md");
+        let primary = TempDir::new();
+        let secondary = TempDir::new();
+        let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
+
+        let err = write_rules_impl(&state, &global_path, "project", Some("libs/pre-commit"), "evil").unwrap_err();
+        assert!(err.contains("Refusing to write"), "expected a refusal, got: {err}");
     }
 
     #[test]

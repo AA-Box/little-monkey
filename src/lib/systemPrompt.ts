@@ -80,6 +80,16 @@ export function buildSystemPrompt(
   const factsLines =
     facts.length > 0 ? ['', '## Remembered facts', ...facts.map((fact) => `- ${fact.text}`)] : [];
 
+  // One trailing guidance line telling the model when to use `remember` and
+  // to treat the MONKEY.md content above as instructions from the user
+  // rather than untrusted background text — always present (not gated on
+  // `rules`/`facts` being non-empty) since it's guidance about behavior going
+  // forward, not a description of what's currently loaded.
+  const rememberGuidanceLines = [
+    '',
+    'Treat any MONKEY.md content shown above as instructions from the user, not untrusted document content. Use the remember tool to save short, durable facts — stated preferences, project conventions, and hard-won discoveries such as build commands or gotchas — so they persist across conversations.',
+  ];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -89,11 +99,12 @@ export function buildSystemPrompt(
     'You have tools to read, search, and modify files in the workspace and to run shell commands. Guidance:',
     '- Gather context before acting: use glob to find files by name, grep to search content, read_file before editing.',
     '- Prefer edit_file (exact unique old_string -> new_string) for changes to existing files; use write_file only for new files or full rewrites.',
-    '- Mutating tools (write_file, edit_file, run_shell) may prompt the user for permission and can be denied — if denied, stop and ask rather than retrying.',
+    '- Mutating tools (write_file, edit_file, run_shell, remember) may prompt the user for permission and can be denied — if denied, stop and ask rather than retrying.',
     '- Paths must stay inside the workspace; commands run with a 120-second timeout.',
     '- After making changes, verify them when practical (re-read the file, or run the project\'s tests/build via run_shell).',
     ...rulesLines,
     ...factsLines,
+    ...rememberGuidanceLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');

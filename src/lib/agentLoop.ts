@@ -247,6 +247,20 @@ export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean): Tool
   return memoryEnabled ? tools : tools.filter((tool) => tool.function.name !== 'remember');
 }
 
+/**
+ * Whether `toolCall` was actually among the tools offered to the model this
+ * turn. `toolsForSettings` only shapes the *schema* sent to the model (e.g.
+ * dropping `remember` when `memoryEnabled` is off) — nothing downstream of
+ * that used to check it, so a model that still emitted a disabled or
+ * hallucinated tool call (a real risk with local/quantized models that don't
+ * strictly respect the offered tool schema) would have it executed anyway.
+ * The tool-calling loop calls this before dispatch and rejects (without
+ * executing) anything that fails it.
+ */
+export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
+  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
+}
+
 /** Shape of a successful `tool_remember` result (the created/deduplicated
  * fact) — checked structurally against the tool's stringified result so an
  * error payload (`{ error: string }`) never gets misread as one. */
@@ -903,13 +917,6 @@ async function runAgentTurnBody(
 
   const toolsForTurn: ToolDef[] = toolsForSettings(TOOLS, settings.memoryEnabled);
 
-  // The system prompt (identity, workspace roots, OS, tool guidance, and
-  // MONKEY.md rules — see systemPrompt.ts) is injected at the head of the
-  // OUTGOING payload only, never stored in the session transcript, so it
-  // always reflects the current workspace instead of a snapshot. Computed
-  // once per turn.
-  const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
-
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [
       {
@@ -946,6 +953,15 @@ async function runAgentTurnBody(
     // assistant placeholder, so the placeholder's (currently empty) content
     // never gets sent back to the model as part of its own history.
     const history: ChatMessage[] = sessionMessages(sessionId);
+
+    // The system prompt (identity, workspace roots, OS, tool guidance, and
+    // MONKEY.md rules/facts — see systemPrompt.ts) is injected at the head of
+    // the OUTGOING payload only, never stored in the session transcript.
+    // Rebuilt every iteration (not just once before the loop) so a `remember`
+    // call earlier in *this* turn — which refreshes rulesStore right below —
+    // actually shows up in the system prompt sent for the next round trip,
+    // instead of only from the next user turn onward.
+    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user
@@ -1011,6 +1027,23 @@ async function runAgentTurnBody(
     updateLastMessage({ content, tool_calls: toolCalls });
 
     for (const toolCall of toolCalls) {
+      // Reject (without executing) any call whose name wasn't actually
+      // offered to the model this turn — e.g. `remember` after
+      // `memoryEnabled` was turned off, or any other tool a local/quantized
+      // model hallucinates outside the schema it was given. `toolsForSettings`
+      // only shapes what's *offered*; this is the enforcement point that
+      // makes that toggle an actual authorization boundary rather than a
+      // polite suggestion the model can ignore. Still gets a result message,
+      // same invariant as the cancelled-call path below.
+      if (!isToolCallAllowed(toolCall, toolsForTurn)) {
+        addMessage({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
+        });
+        continue;
+      }
+
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results

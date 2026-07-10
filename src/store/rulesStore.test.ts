@@ -88,4 +88,52 @@ describe("rulesStore.refresh", () => {
     expect(useRulesStore.getState().facts).toEqual([]);
     expect(useRulesStore.getState().rules).toEqual([rule]);
   });
+
+  it("drops a stale refresh that resolves after a newer one, instead of overwriting fresher state", async () => {
+    // Mirrors two concurrent refreshes racing (e.g. a turn's post-remember
+    // refresh vs. a Forget button's refresh in another split pane): the
+    // first call started earlier but its backend reads resolve *later* than
+    // the second, newer call's — IPC gives no ordering guarantee. The
+    // earlier-started call must not be allowed to clobber the later one's
+    // result once it finally resolves.
+    const staleFact = makeFact({ id: "stale", text: "about to be forgotten" });
+    const freshFact = makeFact({ id: "fresh", text: "the current truth" });
+
+    let resolveStaleRulesRead!: (v: RuleFile[]) => void;
+    let resolveStaleMemoryList!: (v: MemoryFact[]) => void;
+    let callCount = 0;
+
+    invokeMock.mockImplementation((cmd: string) => {
+      callCount += 1;
+      const isFirstCall = callCount <= 2; // the stale refresh's two invokes
+      if (cmd === "rules_read") {
+        return isFirstCall
+          ? new Promise<RuleFile[]>((resolve) => {
+              resolveStaleRulesRead = resolve;
+            })
+          : Promise.resolve([]);
+      }
+      if (cmd === "memory_list") {
+        return isFirstCall
+          ? new Promise<MemoryFact[]>((resolve) => {
+              resolveStaleMemoryList = resolve;
+            })
+          : Promise.resolve([freshFact]);
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    });
+
+    const stalePromise = useRulesStore.getState().refresh(); // starts first, hangs
+    await useRulesStore.getState().refresh(); // starts second, resolves immediately
+
+    expect(useRulesStore.getState().facts).toEqual([freshFact]);
+
+    // Now let the stale (earlier-started) refresh finally resolve.
+    resolveStaleRulesRead([]);
+    resolveStaleMemoryList([staleFact]);
+    await stalePromise;
+
+    // The stale result must not have overwritten the fresher state.
+    expect(useRulesStore.getState().facts).toEqual([freshFact]);
+  });
 });
