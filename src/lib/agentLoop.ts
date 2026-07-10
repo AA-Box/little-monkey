@@ -28,6 +28,7 @@ import { streamChat, textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { TOOLS } from './tools';
+import { formatMcpCallToolResult, mcpToolDefs, resolveMcpToolName, type McpCallToolResult } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { recordRequest } from './rateLimitTracker';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -564,12 +565,40 @@ function abortedPromise(signal: AbortSignal): Promise<void> {
 }
 
 /**
+ * Dispatches a `mcp__<serverId>__<toolName>`-named tool call to the Rust
+ * `mcp_call_tool` command. `serverId`/`toolName` are resolved via
+ * `resolveMcpToolName` (a side table `mcpToolDefs()` populates) rather than
+ * re-parsed out of `name` itself — see `mcpTools.ts`'s doc comment for why a
+ * naive split on `__` isn't reliably reversible.
+ *
+ * No `checkpoint_id` is injected here (unlike write_file/edit_file/run_shell
+ * below): MCP side effects are explicitly outside the checkpoint revert
+ * guarantee, same documented gap as `run_shell`'s shell commands (see
+ * `CheckpointNotice.shellRan`'s doc comment). `turn_id` still is, though —
+ * it scopes this call's permission prompt and Stop-button cancellation to
+ * this turn, via the same `AppState.tool_cancel` mechanism `run_shell` uses.
+ */
+function invokeMcpTool(name: string, args: Record<string, unknown>, turnId: string): Promise<string> {
+  const resolved = resolveMcpToolName(name);
+  if (!resolved) {
+    return Promise.resolve(stringifyToolError(new Error(`MCP tool "${name}" was not offered this turn.`)));
+  }
+  return invoke<McpCallToolResult>('mcp_call_tool', {
+    server_id: resolved.serverId,
+    tool_name: resolved.toolName,
+    arguments: args,
+    turn_id: turnId,
+  }).then(formatMcpCallToolResult, stringifyToolError);
+}
+
+/**
  * Executes a single model-requested tool call via the corresponding
- * `tool_<name>` Tauri command and returns the string to use as the content
- * of the resulting `tool` message. Never throws — invocation errors (bad
- * JSON arguments, permission denial, sandbox violations, command failures)
- * are captured and returned as a JSON error payload so the model can see
- * what went wrong and try to recover instead of the whole loop crashing.
+ * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
+ * `invokeMcpTool` above) and returns the string to use as the content of the
+ * resulting `tool` message. Never throws — invocation errors (bad JSON
+ * arguments, permission denial, sandbox violations, command failures) are
+ * captured and returned as a JSON error payload so the model can see what
+ * went wrong and try to recover instead of the whole loop crashing.
  *
  * If `signal` aborts while the command is in flight, the Rust side is told
  * to cancel everything cancellable (`tools_cancel_running` kills any running
@@ -620,7 +649,9 @@ async function executeToolCall(
     args.turn_id = turnId;
   }
 
-  const invocation = invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+  const invocation = name.startsWith('mcp__')
+    ? invokeMcpTool(name, args, turnId)
+    : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
   if (!signal) return invocation;
 
   const raced = await Promise.race([invocation, abortedPromise(signal).then(() => null)]);
@@ -915,7 +946,11 @@ async function runAgentTurnBody(
   // local-file reads per turn is negligible and needs no file watcher.
   await useRulesStore.getState().refresh();
 
-  const toolsForTurn: ToolDef[] = toolsForSettings(TOOLS, settings.memoryEnabled);
+  // Computed once per turn (not re-derived on every tool-calling round trip)
+  // so a server that connects/disconnects mid-turn doesn't change what's on
+  // offer between one model round trip and the next within the same turn —
+  // mirrors how `sequence`/`target` above are also fixed for the turn.
+  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpToolDefs()], settings.memoryEnabled);
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [

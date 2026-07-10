@@ -9,6 +9,7 @@ import {
   FileText,
   Folder,
   MessageSquareX,
+  Plug,
   RefreshCw,
   Search,
   TerminalSquare,
@@ -185,6 +186,10 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
 };
 
 function toolIcon(name: string): LucideIcon {
+  // An MCP tool call's name is `mcp__<serverId>__<toolName>` (see
+  // `mcpTools.ts::mcpToolDefs`) — never a fixed key in `TOOL_ICONS` above,
+  // since the server/tool half varies, so it's matched by prefix instead.
+  if (name.startsWith("mcp__")) return Plug;
   return TOOL_ICONS[name] ?? Wrench;
 }
 
