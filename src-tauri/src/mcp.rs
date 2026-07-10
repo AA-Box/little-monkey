@@ -37,8 +37,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, CallToolResult};
-use rmcp::service::RunningService;
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientRequest, ServerResult,
+};
+use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::RoleClient;
 use tauri::{Emitter, Manager};
 
@@ -53,6 +55,17 @@ const SCHEMA_VERSION: u8 = 1;
 /// Default per-call timeout when a server entry doesn't override it via
 /// `timeout_secs`.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// Bound on how long connecting to (spawning/dialing, handshaking, and
+/// listing tools for) a single MCP server may take before both
+/// [`mcp_connect`] and lm-cli's `connect_all` give up and report an
+/// error/timeout — `connect_impl` itself has no internal timeout (see its
+/// own doc comment), so a server whose process spawns (or whose HTTP
+/// endpoint accepts the connection) but never completes the `initialize`
+/// handshake would otherwise hang the caller forever: a stuck spinner with
+/// no cancel affordance in the GUI, or a stalled startup in the CLI. Mirrors
+/// `DEFAULT_TIMEOUT_SECS`'s analogous role for [`call_tool_with_cancel_impl`].
+pub const CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// Keychain service name for HTTP servers' bearer tokens — same string
 /// `providers.rs` uses for provider API keys (a separate private constant
@@ -310,6 +323,14 @@ pub struct McpConnection {
 ///
 /// AppHandle-free and directly unit-testable: see the tests at the bottom
 /// of this file, which spawn a real (trivial) MCP server over stdio.
+///
+/// Deliberately does NOT itself apply a timeout — a server whose process
+/// spawns (or endpoint accepts the connection) but never completes the
+/// `initialize` handshake would otherwise hang this `await` forever. See
+/// [`mcp_connect`] (and lm-cli's `connect_all`) for that, which wrap this
+/// call in [`CONNECT_TIMEOUT_SECS`] — the same division of labor
+/// [`call_tool_with_cancel_impl`] documents for permission/timeout/
+/// cancellation around a tool call.
 pub async fn connect_impl(
     state: &AppState,
     entry: &McpServerEntry,
@@ -398,24 +419,50 @@ pub async fn disconnect_impl(state: &AppState, server_id: &str) {
     }
 }
 
-/// Validates that `tool_name` is both currently offered by the connected
-/// server AND permitted by `entry.tool_allowlist` (when set), then calls it
-/// with `arguments`. Returns the server's `CallToolResult` verbatim — mapping
-/// its content blocks into a string for the model is the frontend's job
-/// (phase 2), same division of labor as `tool_run_shell` returning raw
-/// stdout/stderr.
+/// Disconnects every currently-connected MCP server, best-effort. Called
+/// from `lib.rs`'s `RunEvent::Exit` handler on app quit — see that call
+/// site's own comment for why this is the *only* chance a connected stdio
+/// server's child process gets to actually die before the app process
+/// itself exits (Tauri's event loop calls `std::process::exit` right after,
+/// which skips Rust's Drop-based cleanup entirely).
 ///
-/// Deliberately does NOT itself gate permission, apply a timeout, or watch
-/// for turn cancellation — see `mcp_call_tool` for all three, mirroring how
-/// `tool_run_shell` layers those around its own core logic. Kept separate so
-/// this dispatch-and-validate core is directly unit-testable without a
-/// running Tauri app.
-pub async fn call_tool_impl(
+/// Bounded by a short per-server timeout so one unresponsive server can
+/// never hang application shutdown. Note this is still best-effort even
+/// within that bound: `RunningService::cancel()` awaits until this
+/// connection's own run loop task finishes — which is when its transport
+/// (and, for stdio, `rmcp`'s `TokioChildProcess`/`ChildWithCleanup`) gets
+/// dropped and *schedules* (via `tokio::spawn`) the actual `child.kill()`,
+/// rather than performing it synchronously — so this also waits a brief
+/// grace period afterward to give that spawned kill task a chance to
+/// actually run before returning control to a caller that's about to let
+/// the process exit.
+pub async fn disconnect_all(state: &AppState) {
+    let connections: Vec<McpConnection> = {
+        let mut guard = state.mcp.lock().await;
+        guard.drain().map(|(_, connection)| connection).collect()
+    };
+    if connections.is_empty() {
+        return;
+    }
+    for connection in connections {
+        let _ = tokio::time::timeout(Duration::from_secs(3), connection.service.cancel()).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// Resolves and validates the live connection for `entry`/`tool_name` (must
+/// be connected, in the allowlist if one is set, and in the server's cached
+/// tool list) and builds the `CallToolRequestParams` to send. Shared setup
+/// for [`call_tool_with_cancel_impl`], factored out so that function's own
+/// body reads as just "dispatch the (cancellable) request" — dropping the
+/// `state.mcp` lock before returning, per module docs, since everything past
+/// this point awaits.
+async fn resolve_call_tool(
     state: &AppState,
     entry: &McpServerEntry,
     tool_name: &str,
     arguments: serde_json::Value,
-) -> Result<CallToolResult, String> {
+) -> Result<(rmcp::Peer<RoleClient>, CallToolRequestParams), String> {
     let peer = {
         let guard = state.mcp.lock().await;
         let connection = guard
@@ -454,9 +501,93 @@ pub async fn call_tool_impl(
     let mut params = CallToolRequestParams::new(tool_name.to_string());
     params.arguments = arguments_obj;
 
-    peer.call_tool(params)
+    Ok((peer, params))
+}
+
+/// Validates that `tool_name` is both currently offered by the connected
+/// server AND permitted by `entry.tool_allowlist` (when set), then calls it
+/// with `arguments` — genuinely cancellably: if `cancel` resolves with a
+/// reason string before the server responds, this sends the server a real
+/// `notifications/cancelled` for the in-flight request id (via
+/// `Peer::notify_cancelled`) and returns `Err(reason)` immediately.
+///
+/// This matters because dispatching the request through
+/// `Peer::call_tool`/`Peer::send_request` (the non-cancellable path
+/// `call_tool_impl` used before this function existed) and then merely
+/// racing that future against a timeout/cancel signal in a `tokio::select!`
+/// only ever abandons the *client's* wait for a response — the JSON-RPC
+/// request was already sent, and the server keeps executing the tool call
+/// (and any side effects it performs) to completion regardless, with no way
+/// for the user or the model to know that happened. Using
+/// `Peer::send_cancellable_request` instead gets us a `RequestHandle` whose
+/// request id we can (and, on cancellation, do) actually tell the server to
+/// stop.
+///
+/// Returns the server's `CallToolResult` verbatim — mapping its content
+/// blocks into a string for the model is the frontend's job, same division
+/// of labor as `tool_run_shell` returning raw stdout/stderr.
+///
+/// Deliberately does NOT itself gate permission — see `mcp_call_tool` for
+/// that, mirroring how `tool_run_shell` layers permission around its own
+/// core logic.
+pub async fn call_tool_with_cancel_impl(
+    state: &AppState,
+    entry: &McpServerEntry,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    cancel: impl std::future::Future<Output = String>,
+) -> Result<CallToolResult, String> {
+    let (peer, params) = resolve_call_tool(state, entry, tool_name, arguments).await?;
+
+    let handle = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
         .await
-        .map_err(|e| format!("MCP tool call to '{}' on '{}' failed: {}", tool_name, entry.id, e))
+        .map_err(|e| format!("MCP tool call to '{}' on '{}' failed: {}", tool_name, entry.id, e))?;
+
+    // Captured before `handle` is moved into `handle.await_response()` below
+    // — everything `notify_cancelled` needs to tell the server to stop this
+    // exact in-flight request, without needing the (about-to-be-consumed)
+    // handle itself.
+    let cancel_peer = handle.peer.clone();
+    let cancel_request_id = handle.id.clone();
+
+    tokio::pin!(cancel);
+
+    tokio::select! {
+        response = handle.await_response() => response
+            .map_err(|e| format!("MCP tool call to '{}' on '{}' failed: {}", tool_name, entry.id, e))
+            .and_then(|result| match result {
+                ServerResult::CallToolResult(result) => Ok(result),
+                _ => Err(format!(
+                    "MCP server '{}' returned an unexpected response type for tool '{}'",
+                    entry.id, tool_name
+                )),
+            }),
+        reason = &mut cancel => {
+            let _ = cancel_peer
+                .notify_cancelled(CancelledNotificationParam::new(Some(cancel_request_id), Some(reason.clone())))
+                .await;
+            Err(reason)
+        }
+    }
+}
+
+/// [`call_tool_with_cancel_impl`] with a `cancel` that never resolves — the
+/// entry point for callers that don't need real mid-call cancellation: this
+/// module's own tests (below) and lm-cli's `mcp_cli::call`, which only ever
+/// wraps this in a plain `tokio::time::timeout` (see that function's own doc
+/// comment on why the CLI, unlike the GUI, has no concurrent "Stop"
+/// affordance to wire a genuine cancel signal from).
+pub async fn call_tool_impl(
+    state: &AppState,
+    entry: &McpServerEntry,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<CallToolResult, String> {
+    call_tool_with_cancel_impl(state, entry, tool_name, arguments, std::future::pending()).await
 }
 
 /// A configured server plus its live status, for `mcp_list_servers`.
@@ -550,19 +681,99 @@ pub async fn mcp_list_servers(
         .collect())
 }
 
+/// Core logic behind [`mcp_add_server`]: serializes against every other
+/// config-mutating call via `state.mcp_config_lock` (see its doc comment on
+/// `AppState`) so two concurrent calls can never race on the same
+/// load-then-save cycle and silently drop one another's change, then revokes
+/// any stale "allow for session" grant for the (possibly just-freed,
+/// possibly-about-to-be-reused) id — see
+/// `permissions::revoke_session_allow_for_mcp_server`. AppHandle-free and
+/// directly unit-testable, same `*_impl` split as `add_server_impl` itself
+/// (which this wraps); factored out from the `#[tauri::command]` itself
+/// because that command's `app: tauri::AppHandle` is the concrete
+/// default-runtime type alias, which can't be constructed against
+/// `tauri::test::MockRuntime` for a unit test.
+fn add_server_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    entry: McpServerEntry,
+) -> Result<McpServerEntry, String> {
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP config lock poisoned".to_string())?;
+    let saved = add_server_impl(path, entry)?;
+    // Defensive: `add_server_impl` only succeeds for an id that isn't
+    // currently configured, but if this id was just freed up by a
+    // `mcp_remove_server` call, any "allow for session" grant approved for
+    // whatever *previously* answered to it must never silently apply to
+    // this new, unrelated server.
+    permissions::revoke_session_allow_for_mcp_server(state, &saved.id);
+    Ok(saved)
+}
+
 /// Add a new MCP server to the config. Does not connect it — call
 /// `mcp_connect` separately (the Settings UI does this right after adding).
 #[tauri::command(rename_all = "snake_case")]
-pub fn mcp_add_server(app: tauri::AppHandle, entry: McpServerEntry) -> Result<McpServerEntry, String> {
-    add_server_impl(&config_file_path(&app)?, entry)
+pub fn mcp_add_server(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    entry: McpServerEntry,
+) -> Result<McpServerEntry, String> {
+    add_server_with_state_impl(state.inner(), &config_file_path(&app)?, entry)
+}
+
+/// Core logic behind [`mcp_update_server`] — see
+/// [`add_server_with_state_impl`]'s doc comment for why this exists as an
+/// AppHandle-free, directly unit-testable wrapper around `update_server_impl`.
+fn update_server_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    entry: McpServerEntry,
+) -> Result<McpServerEntry, String> {
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP config lock poisoned".to_string())?;
+    let saved = update_server_impl(path, entry)?;
+    // The transport this id points at may have just changed — any existing
+    // "allow for session" grant for it was approved against whatever the
+    // OLD prompt showed, which may no longer describe what this id now
+    // does. See `revoke_session_allow_for_mcp_server`'s doc comment.
+    permissions::revoke_session_allow_for_mcp_server(state, &saved.id);
+    Ok(saved)
 }
 
 /// Replace an existing MCP server's config by id. Does not reconnect —
 /// callers that changed connection-affecting fields (command/args/env/url)
 /// should follow up with `mcp_disconnect` + `mcp_connect`.
 #[tauri::command(rename_all = "snake_case")]
-pub fn mcp_update_server(app: tauri::AppHandle, entry: McpServerEntry) -> Result<McpServerEntry, String> {
-    update_server_impl(&config_file_path(&app)?, entry)
+pub fn mcp_update_server(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    entry: McpServerEntry,
+) -> Result<McpServerEntry, String> {
+    update_server_with_state_impl(state.inner(), &config_file_path(&app)?, entry)
+}
+
+/// Core logic behind [`mcp_remove_server`]'s config mutation — see
+/// [`add_server_with_state_impl`]'s doc comment for why this exists as an
+/// AppHandle-free, directly unit-testable wrapper around `remove_server_impl`.
+/// Deliberately doesn't disconnect the live connection or clear the keychain
+/// token itself — those need an `AppState`/`await` and an `AppHandle`
+/// respectively, so stay in the `#[tauri::command]` wrapper.
+fn remove_server_with_state_impl(state: &AppState, path: &Path, server_id: &str) -> Result<(), String> {
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP config lock poisoned".to_string())?;
+    remove_server_impl(path, server_id)?;
+    // This id may be reused by a completely different server later (see
+    // `AddMcpServerForm`'s label-to-id slugify) — any "allow for session"
+    // grant approved for the server that just got removed must not silently
+    // apply to whatever answers to the same id next.
+    permissions::revoke_session_allow_for_mcp_server(state, server_id);
+    Ok(())
 }
 
 /// Remove an MCP server from the config, disconnecting it first if it's
@@ -576,7 +787,7 @@ pub async fn mcp_remove_server(
     validate_id(&server_id)?;
     disconnect_impl(state.inner(), &server_id).await;
     emit_status(&app, &server_id, "disconnected", None, None);
-    remove_server_impl(&config_file_path(&app)?, &server_id)?;
+    remove_server_with_state_impl(state.inner(), &config_file_path(&app)?, &server_id)?;
     // Best-effort: an HTTP server that never had a token saved (or a stdio
     // server, which never has one) hits the `NoEntry` no-op path — never
     // fails the removal itself over keychain cleanup.
@@ -587,6 +798,9 @@ pub async fn mcp_remove_server(
 /// Enable or disable a configured server. Disabling a currently-connected
 /// server also disconnects it — a disabled server must not keep a child
 /// process (or its tools) alive.
+///
+/// Serialized against every other config-mutating command via
+/// `AppState::mcp_config_lock` (see its doc comment).
 #[tauri::command(rename_all = "snake_case")]
 pub async fn mcp_set_enabled(
     app: tauri::AppHandle,
@@ -595,7 +809,13 @@ pub async fn mcp_set_enabled(
     enabled: bool,
 ) -> Result<McpServerEntry, String> {
     validate_id(&server_id)?;
-    let updated = set_enabled_impl(&config_file_path(&app)?, &server_id, enabled)?;
+    let updated = {
+        let _guard = state
+            .mcp_config_lock
+            .lock()
+            .map_err(|_| "MCP config lock poisoned".to_string())?;
+        set_enabled_impl(&config_file_path(&app)?, &server_id, enabled)?
+    };
     if !enabled {
         disconnect_impl(state.inner(), &server_id).await;
         emit_status(&app, &server_id, "disconnected", None, None);
@@ -605,7 +825,11 @@ pub async fn mcp_set_enabled(
 
 /// Connect to a configured MCP server (stdio only in this phase), caching
 /// its tool list. Emits `mcp://status` transitions through `"connecting"`
-/// and then `"connected"`/`"error"`.
+/// and then `"connected"`/`"error"`. Bounded by [`CONNECT_TIMEOUT_SECS`] —
+/// `connect_impl` itself has no internal timeout (see its doc comment), so
+/// without this a server whose process spawns (or endpoint accepts the
+/// connection) but never completes the `initialize` handshake would leave
+/// the Settings UI's reconnect spinner stuck forever with no way to cancel.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn mcp_connect(
     app: tauri::AppHandle,
@@ -623,7 +847,19 @@ pub async fn mcp_connect(
 
     emit_status(&app, &server_id, "connecting", None, None);
 
-    match connect_impl(state.inner(), &entry).await {
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        connect_impl(state.inner(), &entry),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| {
+        Err(format!(
+            "Connecting to MCP server '{}' timed out after {} seconds",
+            server_id, CONNECT_TIMEOUT_SECS
+        ))
+    });
+
+    match outcome {
         Ok((tools, instructions)) => {
             emit_status(&app, &server_id, "connected", None, Some(tools.len()));
             Ok(build_info(&entry, "connected", None, tools, instructions))
@@ -730,7 +966,11 @@ pub async fn mcp_list_tools(
 /// pretty-printed arguments — same convention as `tool_run_shell`'s command
 /// preview), turn-scoped cancellable via the same `AppState::tool_cancel`
 /// mechanism `tool_run_shell` uses, and bounded by a timeout (per-server
-/// `timeout_secs`, default 60s).
+/// `timeout_secs`, default 60s). Both the Stop-button cancellation and the
+/// timeout are real, protocol-level cancellations (a `notifications/cancelled`
+/// sent to the server via [`call_tool_with_cancel_impl`]), not just the
+/// client abandoning its own wait for a response the server keeps executing
+/// regardless.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn mcp_call_tool(
     app: tauri::AppHandle,
@@ -781,14 +1021,21 @@ pub async fn mcp_call_tool(
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
         .clone();
 
-    let outcome = tokio::select! {
-        result = call_tool_impl(state.inner(), &entry, &tool_name, arguments) => result,
-        _ = cancel.notified() => Err("MCP tool call cancelled by the user".to_string()),
-        _ = tokio::time::sleep(timeout) => Err(format!(
-            "MCP tool '{}' on server '{}' timed out after {} seconds",
-            tool_name, server_id, timeout.as_secs()
-        )),
+    // Resolves with the reason to report — and, inside
+    // `call_tool_with_cancel_impl`, the reason actually sent to the server
+    // in a `notifications/cancelled` — the moment either the Stop button or
+    // the per-server timeout fires, whichever comes first.
+    let cancel_reason = async {
+        tokio::select! {
+            _ = cancel.notified() => "MCP tool call cancelled by the user".to_string(),
+            _ = tokio::time::sleep(timeout) => format!(
+                "MCP tool '{}' on server '{}' timed out after {} seconds",
+                tool_name, server_id, timeout.as_secs()
+            ),
+        }
     };
+
+    let outcome = call_tool_with_cancel_impl(state.inner(), &entry, &tool_name, arguments, cancel_reason).await;
 
     // Drop this turn's cancel channel once no other MCP/shell call for the
     // same turn still holds it — same bookkeeping as `tool_run_shell`.
@@ -1014,5 +1261,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("is not connected"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn disconnect_all_with_no_connections_is_a_no_op() {
+        let state = AppState::default();
+        disconnect_all(&state).await; // must not panic or hang
+        assert!(state.mcp.lock().await.is_empty());
+    }
+
+    #[test]
+    fn concurrent_add_server_calls_under_the_config_lock_do_not_lose_updates() {
+        // Regression test for the mcp_servers.json race: `mcp_add_server` is
+        // a synchronous `#[tauri::command]`, which Tauri can dispatch onto
+        // genuinely concurrent OS threads for real Settings actions. This
+        // calls the exact same AppHandle-free core `mcp_add_server` now
+        // delegates to (`add_server_with_state_impl`) across real parallel
+        // threads sharing one `AppState`. Without `AppState::mcp_config_lock`
+        // serializing the load-mutate-save cycle, two threads that both load
+        // the same "before" config and save one after another would silently
+        // drop one of their two new servers.
+        let path = temp_path("concurrent_add.json");
+        let state = AppState::default();
+
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = &path;
+                let state = &state;
+                scope.spawn(move || {
+                    add_server_with_state_impl(state, path, stdio_entry(&format!("concurrent-{i}"), "echo", &[]))
+                        .unwrap();
+                });
+            }
+        });
+
+        let config = load_config_impl(&path).unwrap();
+        assert_eq!(config.servers.len(), 8, "a concurrent mcp_add_server call's entry was lost");
+    }
+
+    #[test]
+    fn update_server_revokes_stale_session_allow_grants_for_that_id() {
+        let path = temp_path("update_revokes.json");
+        let state = AppState::default();
+
+        add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v1"])).unwrap();
+        state.permissions.session_allow.lock().unwrap().insert("mcp:docs:search".to_string());
+
+        update_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v2"])).unwrap();
+
+        assert!(
+            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            "a grant approved against the old transport must not survive an update"
+        );
+    }
+
+    #[test]
+    fn remove_then_add_with_the_same_id_revokes_the_old_grant() {
+        let path = temp_path("remove_readd_revokes.json");
+        let state = AppState::default();
+
+        add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &[])).unwrap();
+        state.permissions.session_allow.lock().unwrap().insert("mcp:docs:search".to_string());
+
+        remove_server_with_state_impl(&state, &path, "docs").unwrap();
+        assert!(
+            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            "removing a server must revoke its grants"
+        );
+
+        // Reuse the id for a genuinely different server — a leftover grant
+        // must never silently apply to it.
+        add_server_with_state_impl(&state, &path, stdio_entry("docs", "curl", &["https://evil.example"])).unwrap();
+        assert!(
+            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            "an id reused by a different server must not inherit the old server's grants"
+        );
     }
 }

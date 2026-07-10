@@ -28,7 +28,7 @@ import { streamChat, textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { TOOLS } from './tools';
-import { formatMcpCallToolResult, mcpToolDefs, resolveMcpToolName, type McpCallToolResult } from './mcpTools';
+import { formatMcpCallToolResult, mcpToolDefs, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { recordRequest } from './rateLimitTracker';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -567,9 +567,14 @@ function abortedPromise(signal: AbortSignal): Promise<void> {
 /**
  * Dispatches a `mcp__<serverId>__<toolName>`-named tool call to the Rust
  * `mcp_call_tool` command. `serverId`/`toolName` are resolved via
- * `resolveMcpToolName` (a side table `mcpToolDefs()` populates) rather than
- * re-parsed out of `name` itself — see `mcpTools.ts`'s doc comment for why a
- * naive split on `__` isn't reliably reversible.
+ * `resolveMcpToolName` against `mcpRegistry` — THIS turn's own
+ * `mcpToolDefs()` result, passed in by the caller rather than read from any
+ * shared/module-level state — rather than re-parsed out of `name` itself;
+ * see `mcpTools.ts`'s doc comment for why a naive split on `__` isn't
+ * reliably reversible, and for why the registry must be turn-scoped rather
+ * than a shared singleton (a concurrent split-pane turn's own
+ * `mcpToolDefs()` call must never be able to invalidate or repoint a name
+ * THIS turn's model was already offered).
  *
  * No `checkpoint_id` is injected here (unlike write_file/edit_file/run_shell
  * below): MCP side effects are explicitly outside the checkpoint revert
@@ -578,8 +583,13 @@ function abortedPromise(signal: AbortSignal): Promise<void> {
  * it scopes this call's permission prompt and Stop-button cancellation to
  * this turn, via the same `AppState.tool_cancel` mechanism `run_shell` uses.
  */
-function invokeMcpTool(name: string, args: Record<string, unknown>, turnId: string): Promise<string> {
-  const resolved = resolveMcpToolName(name);
+function invokeMcpTool(
+  name: string,
+  args: Record<string, unknown>,
+  turnId: string,
+  mcpRegistry: McpToolRegistry
+): Promise<string> {
+  const resolved = resolveMcpToolName(mcpRegistry, name);
   if (!resolved) {
     return Promise.resolve(stringifyToolError(new Error(`MCP tool "${name}" was not offered this turn.`)));
   }
@@ -609,6 +619,7 @@ async function executeToolCall(
   toolCall: ToolCall,
   checkpointId: string | null,
   turnId: string,
+  mcpRegistry: McpToolRegistry,
   signal?: AbortSignal
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
@@ -650,7 +661,7 @@ async function executeToolCall(
   }
 
   const invocation = name.startsWith('mcp__')
-    ? invokeMcpTool(name, args, turnId)
+    ? invokeMcpTool(name, args, turnId, mcpRegistry)
     : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
   if (!signal) return invocation;
 
@@ -950,7 +961,13 @@ async function runAgentTurnBody(
   // so a server that connects/disconnects mid-turn doesn't change what's on
   // offer between one model round trip and the next within the same turn —
   // mirrors how `sequence`/`target` above are also fixed for the turn.
-  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpToolDefs()], settings.memoryEnabled);
+  // `mcpRegistry` is THIS turn's own resolution table (see `mcpTools.ts`'s
+  // doc comment) — with the split pane, another turn's concurrent
+  // `mcpToolDefs()` call must never be able to invalidate or repoint a name
+  // this turn's model was already offered, so it's threaded through to
+  // `executeToolCall` explicitly rather than read back out of shared state.
+  const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
+  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpDefs], settings.memoryEnabled);
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [
@@ -1083,7 +1100,9 @@ async function runAgentTurnBody(
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
-      const resultContent = signal?.aborted ? CANCELLED_TOOL_RESULT : await executeToolCall(toolCall, checkpointId, turnId, signal);
+      const resultContent = signal?.aborted
+        ? CANCELLED_TOOL_RESULT
+        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
