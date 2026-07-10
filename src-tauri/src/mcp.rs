@@ -1,12 +1,15 @@
-//! MCP (Model Context Protocol) client support — Phase 1 (stdio only).
+//! MCP (Model Context Protocol) client support — stdio + streamable-HTTP.
 //!
 //! Users configure external MCP servers, persisted at
 //! `<app_data>/mcp_servers.json` (atomic temp+rename writes, exactly like
 //! `sessions.rs`/`memory.rs`). Each server is either a `Stdio` child process
-//! (spawned via `rmcp`'s `TokioChildProcess`) or an `Http` remote endpoint —
-//! the `Http` variant is a stub for now (phase 4); calling it returns a
-//! clear "not yet supported" error rather than panicking or silently
-//! dropping the config.
+//! (spawned via `rmcp`'s `TokioChildProcess`) or an `Http` remote endpoint
+//! (via `rmcp`'s streamable-HTTP client transport, over `reqwest`). An HTTP
+//! server's optional bearer token never lives in `mcp_servers.json` — it's
+//! saved to the OS keychain via `mcp_set_http_token`/`mcp_remove_http_token`,
+//! same `keyring::Entry::new(KEYCHAIN_SERVICE, ...)` convention as
+//! `providers.rs`, and attached as an `Authorization: Bearer <token>` header
+//! (via `StreamableHttpClientTransportConfig::auth_header`) when connecting.
 //!
 //! Runtime connections live in `AppState::mcp`, a `tokio::sync::Mutex` (not
 //! `std::sync::Mutex`, unlike every other map in `AppState`) because
@@ -51,10 +54,48 @@ const SCHEMA_VERSION: u8 = 1;
 /// `timeout_secs`.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
-/// How a configured MCP server is reached. `Http` is a phase-4 stub: the
-/// variant exists so config shapes/UI can be built against it now, but
-/// [`connect_impl`]/[`call_tool_impl`] refuse to act on it with a clear
-/// error rather than attempting an unsupported connection.
+/// Keychain service name for HTTP servers' bearer tokens — same string
+/// `providers.rs` uses for provider API keys (a separate private constant
+/// there; keychain entries are disambiguated by *account*, not service, so
+/// this file's `mcp:<id>` account prefix is what keeps the two features'
+/// entries apart within the one service namespace).
+const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+
+/// The keychain *account* name under which server `id`'s HTTP bearer token
+/// is stored — `mcp:<id>`, distinguishing it from `providers.rs`'s
+/// `<provider_id>`-only accounts in the same keychain service.
+fn keychain_account(server_id: &str) -> String {
+    format!("mcp:{}", server_id)
+}
+
+/// Reads the bearer token saved for `server_id`'s HTTP transport, if any.
+/// Absence is normal (no token configured, or the server doesn't require
+/// one) — `None`, not an error, mirroring `providers::has_key`'s stance.
+fn read_http_token(server_id: &str) -> Option<String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+        .ok()?
+        .get_password()
+        .ok()
+}
+
+/// Core remove-token logic behind `mcp_remove_http_token`, also called
+/// (best-effort) by `mcp_remove_server` so deleting a server doesn't leave
+/// an orphaned credential behind. A missing entry is a no-op success, same
+/// as `providers.rs::remove_key_impl`.
+fn remove_http_token_impl(server_id: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(server_id))
+        .map_err(|e| format!("Failed to access keychain: {}", e))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Failed to remove saved token: {}", e)),
+    }
+}
+
+/// How a configured MCP server is reached. `Stdio` spawns a local child
+/// process; `Http` connects to a remote streamable-HTTP MCP endpoint (see
+/// [`connect_impl`]), optionally authenticating with a bearer token read
+/// from the OS keychain (never persisted in this struct/on disk).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpTransport {
@@ -259,9 +300,13 @@ pub struct McpConnection {
     pub instructions: Option<String>,
 }
 
-/// Connect to `entry` (stdio only in this phase — `Http` returns an error),
-/// caching its tool list and `initialize`-result instructions. Replaces
-/// (and gracefully closes) any previous connection for the same id.
+/// Connect to `entry` — stdio spawns a child process via `TokioChildProcess`,
+/// HTTP connects to a remote streamable-HTTP endpoint via `rmcp`'s
+/// `StreamableHttpClientTransport` (reqwest-backed), attaching a bearer
+/// token from the keychain (see [`read_http_token`]) as the `Authorization`
+/// header when one is saved for this server id. Either way, caches the
+/// resulting tool list and `initialize`-result instructions, and replaces
+/// (gracefully closing) any previous connection for the same id.
 ///
 /// AppHandle-free and directly unit-testable: see the tests at the bottom
 /// of this file, which spawn a real (trivial) MCP server over stdio.
@@ -269,29 +314,45 @@ pub async fn connect_impl(
     state: &AppState,
     entry: &McpServerEntry,
 ) -> Result<(Vec<CachedMcpTool>, Option<String>), String> {
-    let (command, args, env) = match &entry.transport {
-        McpTransport::Stdio { command, args, env } => (command, args, env),
-        McpTransport::Http { .. } => {
-            return Err(
-                "HTTP MCP servers are not supported yet — coming in a later update. Use a stdio server for now."
-                    .to_string(),
+    let service = match &entry.transport {
+        McpTransport::Stdio { command, args, env } => {
+            if command.trim().is_empty() {
+                return Err(format!("MCP server '{}' has no command configured", entry.id));
+            }
+
+            let mut command_builder = tokio::process::Command::new(command);
+            command_builder.args(args).envs(env);
+
+            let child = rmcp::transport::TokioChildProcess::new(command_builder)
+                .map_err(|e| format!("Failed to spawn MCP server '{}': {}", entry.id, e))?;
+
+            rmcp::serve_client((), child)
+                .await
+                .map_err(|e| format!("Failed to initialize MCP server '{}': {}", entry.id, e))?
+        }
+        McpTransport::Http { url } => {
+            if url.trim().is_empty() {
+                return Err(format!("MCP server '{}' has no URL configured", entry.id));
+            }
+
+            let mut config =
+                rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                    url.clone(),
+                );
+            if let Some(token) = read_http_token(&entry.id) {
+                config = config.auth_header(token);
+            }
+
+            let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
+                reqwest::Client::new(),
+                config,
             );
+
+            rmcp::serve_client((), transport)
+                .await
+                .map_err(|e| format!("Failed to initialize MCP server '{}': {}", entry.id, e))?
         }
     };
-
-    if command.trim().is_empty() {
-        return Err(format!("MCP server '{}' has no command configured", entry.id));
-    }
-
-    let mut command_builder = tokio::process::Command::new(command);
-    command_builder.args(args).envs(env);
-
-    let child = rmcp::transport::TokioChildProcess::new(command_builder)
-        .map_err(|e| format!("Failed to spawn MCP server '{}': {}", entry.id, e))?;
-
-    let service = rmcp::serve_client((), child)
-        .await
-        .map_err(|e| format!("Failed to initialize MCP server '{}': {}", entry.id, e))?;
 
     let tools: Vec<CachedMcpTool> = service
         .peer()
@@ -415,6 +476,11 @@ pub struct McpServerInfo {
     pub error: Option<String>,
     pub tools: Vec<CachedMcpTool>,
     pub instructions: Option<String>,
+    /// Whether a bearer token is currently saved in the keychain for this
+    /// server — never the token itself. Always `false` for `Stdio` servers
+    /// (they have no keychain entry); lets the Settings UI show a "token
+    /// saved" state without ever reading the secret back out.
+    pub has_http_token: bool,
 }
 
 fn build_info(
@@ -435,6 +501,8 @@ fn build_info(
         error,
         tools,
         instructions,
+        has_http_token: matches!(entry.transport, McpTransport::Http { .. })
+            && read_http_token(&entry.id).is_some(),
     }
 }
 
@@ -508,7 +576,12 @@ pub async fn mcp_remove_server(
     validate_id(&server_id)?;
     disconnect_impl(state.inner(), &server_id).await;
     emit_status(&app, &server_id, "disconnected", None, None);
-    remove_server_impl(&config_file_path(&app)?, &server_id)
+    remove_server_impl(&config_file_path(&app)?, &server_id)?;
+    // Best-effort: an HTTP server that never had a token saved (or a stdio
+    // server, which never has one) hits the `NoEntry` no-op path — never
+    // fails the removal itself over keychain cleanup.
+    let _ = remove_http_token_impl(&server_id);
+    Ok(())
 }
 
 /// Enable or disable a configured server. Disabling a currently-connected
@@ -574,6 +647,31 @@ pub async fn mcp_disconnect(
     disconnect_impl(state.inner(), &server_id).await;
     emit_status(&app, &server_id, "disconnected", None, None);
     Ok(())
+}
+
+/// Save (or overwrite) the bearer token used to authenticate an HTTP MCP
+/// server's connection — kept in the OS keychain only, never in
+/// `mcp_servers.json`. Takes effect on the next `mcp_connect` (reconnect an
+/// already-connected server to pick up a newly-saved/changed token).
+#[tauri::command(rename_all = "snake_case")]
+pub fn mcp_set_http_token(server_id: String, token: String) -> Result<(), String> {
+    validate_id(&server_id)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Bearer token must not be empty".to_string());
+    }
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&server_id))
+        .map_err(|e| format!("Failed to access keychain: {}", e))?;
+    entry
+        .set_password(token)
+        .map_err(|e| format!("Failed to save token to keychain: {}", e))
+}
+
+/// Remove a saved HTTP bearer token. A no-op success if none was saved.
+#[tauri::command(rename_all = "snake_case")]
+pub fn mcp_remove_http_token(server_id: String) -> Result<(), String> {
+    validate_id(&server_id)?;
+    remove_http_token_impl(&server_id)
 }
 
 /// One connected server's (allowlist-filtered) cached tools — what the
@@ -863,25 +961,42 @@ mod tests {
     }
 
     // Tests that connect/call a *real* stdio MCP server (spawning the
-    // trivial `mcp_test_server` bin) live in `tests/mcp_stdio.rs` instead of
-    // here: `CARGO_BIN_EXE_<name>` (needed to find that bin's compiled path)
-    // is only defined for integration tests, not `--lib` unit tests — see
-    // that file's module doc for details.
+    // trivial `mcp_test_server` bin) live in `tests/mcp_stdio.rs`, and tests
+    // that connect/call a *real* streamable-HTTP MCP server (a hand-rolled
+    // raw-TCP responder speaking `rmcp`'s own JSON-RPC model types) live in
+    // `tests/mcp_http.rs` — both integration tests rather than unit tests
+    // here, since `tests/mcp_stdio.rs` needs `CARGO_BIN_EXE_<name>` (only
+    // defined for integration tests, not `--lib` unit tests) and it's
+    // simplest to keep the two real-server suites together.
 
     #[tokio::test]
-    async fn connect_rejects_http_transport_for_now() {
+    async fn connect_rejects_empty_http_url() {
         let state = AppState::default();
         let entry = McpServerEntry {
             id: "http-srv".to_string(),
             label: "HTTP server".to_string(),
-            transport: McpTransport::Http { url: "https://example.com/mcp".to_string() },
+            transport: McpTransport::Http { url: "   ".to_string() },
             enabled: true,
             tool_allowlist: None,
             timeout_secs: None,
         };
 
         let err = connect_impl(&state, &entry).await.unwrap_err();
-        assert!(err.contains("not supported yet"), "unexpected error: {err}");
+        assert!(err.contains("no URL configured"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn keychain_account_namespaces_by_mcp_prefix() {
+        assert_eq!(keychain_account("my-server"), "mcp:my-server");
+    }
+
+    #[test]
+    fn read_http_token_is_none_when_nothing_is_saved() {
+        // A random, never-configured id: no keychain entry exists for it, so
+        // this must return `None` rather than erroring — same "absence is
+        // normal" stance as `providers::has_key`. Doesn't touch the keychain
+        // beyond a single read of a nonexistent entry.
+        assert_eq!(read_http_token("never-configured-mcp-server-id-xyz"), None);
     }
 
     #[tokio::test]

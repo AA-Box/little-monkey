@@ -83,11 +83,18 @@ function ServerRow({ server }: { server: McpServerInfo }) {
   const updateServer = useMcpStore((s) => s.updateServer);
   const connect = useMcpStore((s) => s.connect);
   const removeServer = useMcpStore((s) => s.removeServer);
+  const setHttpToken = useMcpStore((s) => s.setHttpToken);
+  const removeHttpToken = useMcpStore((s) => s.removeHttpToken);
 
   const [reconnecting, setReconnecting] = useState(false);
   const [confirmingRemove, setConfirmingRemove] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [timeoutText, setTimeoutText] = useState(String(server.timeoutSecs ?? ""));
+  const [savingTimeout, setSavingTimeout] = useState(false);
+  const [tokenInput, setTokenInput] = useState("");
+  const [savingToken, setSavingToken] = useState(false);
+  const [removingToken, setRemovingToken] = useState(false);
 
   async function handleReconnect() {
     setReconnecting(true);
@@ -109,6 +116,47 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
       setRemoving(false);
+    }
+  }
+
+  async function handleSaveTimeout() {
+    const trimmed = timeoutText.trim();
+    const parsed = trimmed.length === 0 ? null : Number(trimmed);
+    const nextTimeout = parsed !== null && Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+    setSavingTimeout(true);
+    setActionError(null);
+    try {
+      await updateServer(toEntry(server, { timeout_secs: nextTimeout }));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingTimeout(false);
+    }
+  }
+
+  async function handleSaveToken() {
+    if (!tokenInput.trim()) return;
+    setSavingToken(true);
+    setActionError(null);
+    try {
+      await setHttpToken(server.id, tokenInput.trim());
+      setTokenInput("");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingToken(false);
+    }
+  }
+
+  async function handleRemoveToken() {
+    setRemovingToken(true);
+    setActionError(null);
+    try {
+      await removeHttpToken(server.id);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRemovingToken(false);
     }
   }
 
@@ -163,6 +211,62 @@ function ServerRow({ server }: { server: McpServerInfo }) {
         <p className="mt-1.5 text-xs text-danger">{lastErrorLine(server.error)}</p>
       )}
       {actionError && <p className="mt-1.5 text-xs text-danger">{actionError}</p>}
+
+      <details className="group mt-2">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-muted [&::-webkit-details-marker]:hidden">
+          <ChevronDown size={13} className="transition-transform group-open:rotate-180" />
+          {t("McpPanel.connectionSettingsDisclosure")}
+        </summary>
+        <div className="mt-1.5 flex flex-col gap-2 border-t border-border pt-1.5">
+          <div className="flex items-center gap-1.5">
+            <span className="shrink-0 text-xs text-muted">{t("McpPanel.timeoutLabel")}</span>
+            <input
+              type="number"
+              min={1}
+              value={timeoutText}
+              onChange={(event) => setTimeoutText(event.target.value)}
+              placeholder={t("McpPanel.timeoutPlaceholder")}
+              className="h-7 w-20 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            <Button variant="ghost" size="sm" onClick={() => void handleSaveTimeout()} disabled={savingTimeout}>
+              {savingTimeout ? t("McpPanel.timeoutSavingButton") : t("McpPanel.timeoutSaveButton")}
+            </Button>
+          </div>
+
+          {server.transport.type === "http" && (
+            <div className="flex flex-col gap-1">
+              {server.hasHttpToken ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="font-mono text-xs text-muted">{t("McpPanel.tokenSaved")}</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void handleRemoveToken()}
+                    disabled={removingToken}
+                    className="text-danger hover:bg-danger-soft"
+                  >
+                    {removingToken ? t("McpPanel.tokenRemovingButton") : t("McpPanel.tokenRemoveButton")}
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="password"
+                    value={tokenInput}
+                    onChange={(event) => setTokenInput(event.target.value)}
+                    placeholder={t("McpPanel.tokenPlaceholder")}
+                    autoComplete="off"
+                    className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+                  />
+                  <Button variant="ghost" size="sm" onClick={() => void handleSaveToken()} disabled={savingToken || !tokenInput.trim()}>
+                    {savingToken ? t("McpPanel.tokenSavingButton") : t("McpPanel.tokenSaveButton")}
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </details>
 
       <details className="group mt-2">
         <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-muted [&::-webkit-details-marker]:hidden">
