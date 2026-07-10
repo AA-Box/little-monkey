@@ -18,7 +18,14 @@
 //!    something changed.
 //! 4. `checkpoint_revert` (user-initiated UI action, like `git_commit` — not
 //!    permission-gated) restores every recorded file: originals are copied
-//!    back, files that didn't exist before the turn are deleted.
+//!    back, files that didn't exist before the turn are deleted. Before each
+//!    file is touched, its current (post-turn) content is snapshotted into
+//!    `<dir>/redo/<n>.bak`, and the manifest's `reverted` flag flips to
+//!    `true` (persisted via an atomic rewrite, best-effort so revert still
+//!    succeeds even if that write fails).
+//! 5. `checkpoint_reapply` (the "Re-apply" button shown once a checkpoint is
+//!    reverted) is the inverse: it plays the `redo/` backups back over the
+//!    files revert touched and flips `reverted` back to `false`.
 //!
 //! Checkpoints live under `<app_data>/checkpoints/<uuid>/` and the newest
 //! [`MAX_CHECKPOINTS`] are kept, so old turns remain revertable across app
@@ -48,6 +55,15 @@ pub struct CheckpointEntry {
     /// existed before the turn. `None` means the file was newly created by
     /// the turn, so reverting deletes it.
     pub backup: Option<String>,
+    /// Backup file name inside `<dir>/redo/`, snapshotting this file's
+    /// post-turn (pre-revert) content — written by `revert_impl` right
+    /// before it overwrites/deletes the file, so `checkpoint_reapply` can
+    /// play the turn's changes back. `None` before the first revert, or if
+    /// the file was unexpectedly already missing at revert time (nothing to
+    /// snapshot). Absent from manifests written before this field existed,
+    /// hence `serde(default)` for read-compatibility.
+    #[serde(default)]
+    pub redo: Option<String>,
 }
 
 /// The versioned on-disk `manifest.json` (v2). v1 manifests were a bare
@@ -237,7 +253,7 @@ pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> R
         None
     };
 
-    active.entries.push(CheckpointEntry { path: path_str, backup });
+    active.entries.push(CheckpointEntry { path: path_str, backup, redo: None });
     Ok(())
 }
 
@@ -344,19 +360,43 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
     })
 }
 
+/// Subdirectory (inside a checkpoint's own dir) holding redo backups —
+/// snapshots of each file's post-turn content taken right before `revert`
+/// overwrites/deletes it, so `checkpoint_reapply` can play the turn back.
+const REDO_DIR: &str = "redo";
+
 /// Core revert logic: restore every file recorded in checkpoint `id`.
 /// Returns how many files were restored/removed.
+///
+/// Before mutating each file, snapshots its current (post-turn) content into
+/// `redo/<n>.bak` — best-effort: a failed snapshot leaves `entry.redo` as
+/// `None`, which degrades that file to a no-op on a later `checkpoint_reapply`
+/// rather than blocking the revert itself. The flipped `reverted` flag and
+/// the redo backups are persisted via an atomic manifest rewrite; that write
+/// is likewise best-effort so a read-only app-data dir (or any other
+/// persistence failure) never prevents the revert from actually happening.
 pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     validate_id(id)?;
 
     let dir = base_dir.join(id);
-    let entries = read_manifest(base_dir, id)?.entries;
+    let mut manifest = read_manifest(base_dir, id)?;
+    let redo_dir = dir.join(REDO_DIR);
 
     let mut reverted = 0u32;
     let mut errors: Vec<String> = Vec::new();
 
-    for entry in &entries {
+    for (i, entry) in manifest.entries.iter_mut().enumerate() {
         let target = Path::new(&entry.path);
+
+        // Snapshot the post-turn content before it's overwritten/deleted.
+        // Best-effort: a snapshot failure must not block the revert.
+        if target.is_file() && std::fs::create_dir_all(&redo_dir).is_ok() {
+            let redo_name = format!("{}.bak", i);
+            if std::fs::copy(target, redo_dir.join(&redo_name)).is_ok() {
+                entry.redo = Some(redo_name);
+            }
+        }
+
         let result = match &entry.backup {
             Some(backup_name) => std::fs::copy(dir.join(backup_name), target).map(|_| ()),
             None => match std::fs::remove_file(target) {
@@ -371,16 +411,76 @@ pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
         }
     }
 
+    manifest.reverted = true;
+    let _ = write_manifest(&dir, &manifest);
+
     if !errors.is_empty() {
         return Err(format!(
             "Reverted {} of {} files; failures: {}",
             reverted,
-            entries.len(),
+            manifest.entries.len(),
             errors.join("; ")
         ));
     }
 
     Ok(reverted)
+}
+
+/// Core reapply ("redo") logic: undoes a previous `revert_impl` on checkpoint
+/// `id` by playing its `redo/` backups back over the files revert touched —
+/// the inverse operation, restoring the turn's own changes. Returns how many
+/// files were reapplied. Persists `reverted: false` the same best-effort way
+/// `revert_impl` persists `reverted: true`.
+///
+/// Per entry: if a redo backup was recorded, it always wins — copying it
+/// back over the target recreates a turn-created file exactly as `revert`
+/// left it, or re-mutates a turn-modified file back to its post-turn state.
+/// Only when there is no redo backup *and* the file was newly created by the
+/// turn (`backup: None`) does reapply fall back to deleting the target — a
+/// file that never existed before the turn and had nothing to snapshot at
+/// revert time (i.e. was already gone) has nothing to recreate. A
+/// pre-existing file (`backup: Some`) with no redo backup is left untouched:
+/// that's an anomaly (the file should have existed at revert time), and
+/// deleting a restored original would be strictly worse than a no-op.
+pub fn reapply_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
+    validate_id(id)?;
+
+    let dir = base_dir.join(id);
+    let mut manifest = read_manifest(base_dir, id)?;
+    let redo_dir = dir.join(REDO_DIR);
+
+    let mut reapplied = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+
+    for entry in &manifest.entries {
+        let target = Path::new(&entry.path);
+        let result = match (&entry.redo, &entry.backup) {
+            (Some(redo_name), _) => std::fs::copy(redo_dir.join(redo_name), target).map(|_| ()),
+            (None, None) => match std::fs::remove_file(target) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+            (None, Some(_)) => Ok(()),
+        };
+        match result {
+            Ok(()) => reapplied += 1,
+            Err(e) => errors.push(format!("{}: {}", entry.path, e)),
+        }
+    }
+
+    manifest.reverted = false;
+    let _ = write_manifest(&dir, &manifest);
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "Re-applied {} of {} files; failures: {}",
+            reapplied,
+            manifest.entries.len(),
+            errors.join("; ")
+        ));
+    }
+
+    Ok(reapplied)
 }
 
 /// Open a new per-turn checkpoint and return its id. `session_id`,
@@ -412,6 +512,14 @@ pub fn checkpoint_end(state: tauri::State<'_, AppState>, id: String) -> Result<C
 #[tauri::command]
 pub fn checkpoint_revert(app: tauri::AppHandle, id: String) -> Result<u32, String> {
     revert_impl(&checkpoints_base_dir(&app)?, &id)
+}
+
+/// Undo a previous revert of checkpoint `id`: plays its `redo/` backups back
+/// over the files revert touched, restoring the turn's own changes. Like
+/// `checkpoint_revert`, a direct human-initiated UI action, not permission-gated.
+#[tauri::command]
+pub fn checkpoint_reapply(app: tauri::AppHandle, id: String) -> Result<u32, String> {
+    reapply_impl(&checkpoints_base_dir(&app)?, &id)
 }
 
 #[cfg(test)]
@@ -636,11 +744,15 @@ mod tests {
         let dir = base.path.join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("0.bak"), "original").unwrap();
-        let v1_entries = vec![
-            CheckpointEntry { path: existing.to_string_lossy().to_string(), backup: Some("0.bak".to_string()) },
-            CheckpointEntry { path: created.to_string_lossy().to_string(), backup: None },
-        ];
-        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_string_pretty(&v1_entries).unwrap()).unwrap();
+        // Hand-written JSON (no "redo" key at all, unlike anything this
+        // version of the code would serialize) so the fallback path is
+        // genuinely exercised, not just an equivalent Rust struct.
+        let raw = format!(
+            r#"[{{"path":{:?},"backup":"0.bak"}},{{"path":{:?},"backup":null}}]"#,
+            existing.to_string_lossy(),
+            created.to_string_lossy()
+        );
+        std::fs::write(dir.join(MANIFEST_FILE), raw).unwrap();
 
         let reverted = revert_impl(&base.path, id).unwrap();
         assert_eq!(reverted, 2);
@@ -655,8 +767,8 @@ mod tests {
         let id = "00000000-0000-4000-8000-0000000v1meta";
         let dir = base.path.join(id);
         std::fs::create_dir_all(&dir).unwrap();
-        let v1_entries = vec![CheckpointEntry { path: "/tmp/a.txt".to_string(), backup: Some("0.bak".to_string()) }];
-        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_string(&v1_entries).unwrap()).unwrap();
+        let raw = r#"[{"path":"/tmp/a.txt","backup":"0.bak"}]"#;
+        std::fs::write(dir.join(MANIFEST_FILE), raw).unwrap();
 
         let manifest = read_manifest(&base.path, id).unwrap();
         assert_eq!(manifest.version, 1);
@@ -695,5 +807,72 @@ mod tests {
         assert!(!remaining.contains(&"00000000-0000-4000-8000-000000000000".to_string()));
         assert!(!remaining.contains(&"00000000-0000-4000-8000-000000000001".to_string()));
         assert!(remaining.contains(&id));
+    }
+
+    #[test]
+    fn revert_then_reapply_roundtrips_a_turn_created_file() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let created = ws.path.join("created.txt");
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &created).unwrap();
+        std::fs::write(&created, "brand new").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        revert_impl(&base.path, &id).unwrap();
+        assert!(!created.exists(), "revert must delete the turn-created file");
+        assert!(read_manifest(&base.path, &id).unwrap().reverted, "revert must persist reverted: true");
+
+        let reapplied = reapply_impl(&base.path, &id).unwrap();
+        assert_eq!(reapplied, 1);
+        assert_eq!(
+            std::fs::read_to_string(&created).unwrap(),
+            "brand new",
+            "reapply must recreate the turn-created file with its post-turn content"
+        );
+        assert!(!read_manifest(&base.path, &id).unwrap().reverted, "reapply must persist reverted: false");
+    }
+
+    #[test]
+    fn revert_then_reapply_roundtrips_a_turn_modified_file() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let existing = ws.path.join("existing.txt");
+        std::fs::write(&existing, "original").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &existing).unwrap();
+        std::fs::write(&existing, "mutated").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        revert_impl(&base.path, &id).unwrap();
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "original");
+
+        let reapplied = reapply_impl(&base.path, &id).unwrap();
+        assert_eq!(reapplied, 1);
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "mutated",
+            "reapply must restore the turn's mutated content"
+        );
+    }
+
+    #[test]
+    fn reapply_rejects_traversal_ids() {
+        let base = TempDir::new("base");
+        let err = reapply_impl(&base.path, "../outside").unwrap_err();
+        assert!(err.contains("Invalid checkpoint id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reapply_errors_for_unknown_id() {
+        let base = TempDir::new("base");
+        let err = reapply_impl(&base.path, "0000-does-not-exist").unwrap_err();
+        assert!(err.contains("not found"), "unexpected error: {err}");
     }
 }

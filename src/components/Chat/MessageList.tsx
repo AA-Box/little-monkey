@@ -296,8 +296,28 @@ const CheckpointRow = memo(function CheckpointRow({
       });
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(t("MessageList.checkpointRevertFailed", { error: message }));
       return false;
+    }
+  };
+
+  /** Undoes a previous "Restore files": plays the checkpoint's redo backups
+   * back over the files revert touched (see `checkpoint_reapply` in
+   * checkpoints.rs) and flips the notice back to not-reverted. */
+  const reapplyFiles = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("checkpoint_reapply", { id: notice.id });
+      useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
+        content: formatCheckpointNotice({ ...notice, reverted: false }),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(t("MessageList.checkpointReapplyFailed", { error: message }));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -334,7 +354,18 @@ const CheckpointRow = memo(function CheckpointRow({
             {t("MessageList.checkpointFilesChanged", { count: notice.files.length, files: fileNames.join(", ") })}
           </span>
           {notice.reverted ? (
-            <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
+            <>
+              <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
+              <button
+                type="button"
+                onClick={() => void reapplyFiles()}
+                disabled={busy}
+                className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RefreshCw size={11} />
+                {busy ? t("MessageList.checkpointReapplying") : t("MessageList.checkpointReapplyButton")}
+              </button>
+            </>
           ) : (
             <div ref={menuRef} className="relative inline-block">
               <button
@@ -383,7 +414,7 @@ const CheckpointRow = memo(function CheckpointRow({
             </div>
           )}
         </div>
-        {error && <div className="text-danger">{t("MessageList.checkpointRevertFailed", { error })}</div>}
+        {error && <div className="text-danger">{error}</div>}
       </div>
     </div>
   );
