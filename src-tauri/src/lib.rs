@@ -1,6 +1,7 @@
 pub mod checkpoints;
 mod git;
 mod llama;
+pub mod mcp;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -53,6 +54,14 @@ pub struct AppState {
     /// or delete, so unsynchronized concurrent writers could silently drop
     /// one of them.
     pub memory_lock: std::sync::Mutex<()>,
+    /// Live MCP server connections, keyed by server id (see `mcp.rs`). A
+    /// `tokio::sync::Mutex` — unlike every other map here — because
+    /// connecting and calling a tool are both `.await`-ing operations; every
+    /// caller clones the cheap `Peer` handle out (or swaps the whole
+    /// connection in/out) and drops the guard before awaiting anything on
+    /// the connection itself, so this lock is never held across a
+    /// `call_tool`/`connect`/`disconnect` await.
+    pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -124,6 +133,15 @@ pub fn run() {
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
+            mcp::mcp_list_servers,
+            mcp::mcp_add_server,
+            mcp::mcp_update_server,
+            mcp::mcp_remove_server,
+            mcp::mcp_set_enabled,
+            mcp::mcp_connect,
+            mcp::mcp_disconnect,
+            mcp::mcp_list_tools,
+            mcp::mcp_call_tool,
             system::reveal_in_finder,
             system::open_in_terminal,
             system::open_in_editor,
