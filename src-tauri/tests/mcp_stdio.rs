@@ -11,7 +11,10 @@
 
 use std::collections::BTreeMap;
 
-use little_monkey_lib::mcp::{call_tool_impl, connect_impl, disconnect_impl, McpServerEntry, McpTransport};
+use little_monkey_lib::mcp::{
+    call_tool_impl, call_tool_with_cancel_impl, connect_impl, disconnect_all, disconnect_impl, McpServerEntry,
+    McpTransport,
+};
 use little_monkey_lib::AppState;
 
 fn stdio_entry(id: &str, command: &str, args: &[&str]) -> McpServerEntry {
@@ -131,6 +134,129 @@ async fn reconnect_replaces_the_previous_connection() {
     connect_impl(&state, &entry).await.unwrap();
 
     assert_eq!(state.mcp.lock().await.len(), 1);
+
+    disconnect_impl(&state, &entry.id).await;
+}
+
+/// Regression test for the app-quit zombie-process bug: `disconnect_all`
+/// (called from `lib.rs`'s `RunEvent::Exit` handler) must actually clear
+/// every live connection, not just the one `disconnect_impl` targets.
+#[tokio::test]
+async fn disconnect_all_clears_every_connected_server() {
+    let state = AppState::default();
+    connect_impl(&state, &stdio_entry("d1", test_server_binary(), &[])).await.unwrap();
+    connect_impl(&state, &stdio_entry("d2", test_server_binary(), &[])).await.unwrap();
+    assert_eq!(state.mcp.lock().await.len(), 2);
+
+    disconnect_all(&state).await;
+
+    assert!(state.mcp.lock().await.is_empty());
+}
+
+/// `connect_impl` itself has no internal timeout (see its own doc comment) —
+/// `mcp_connect`/lm-cli's `connect_all` are responsible for bounding it. This
+/// proves the mechanism they use (wrapping the call in an external
+/// `tokio::time::timeout`) actually works against a real child process that
+/// spawns successfully but never speaks the MCP protocol at all (a stand-in
+/// for a wrong-binary/hung-handshake server) — it doesn't itself deadlock,
+/// and doesn't leave anything registered under the id once it gives up.
+#[tokio::test]
+async fn connect_impl_can_be_bounded_by_an_external_timeout_against_a_hung_server() {
+    let state = AppState::default();
+    let entry = stdio_entry("hangs-forever", "sleep", &["30"]);
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), connect_impl(&state, &entry)).await;
+    assert!(
+        result.is_err(),
+        "connect_impl unexpectedly completed against a server that never speaks MCP"
+    );
+    assert!(!state.mcp.lock().await.contains_key("hangs-forever"));
+}
+
+/// Regression test for the cancellation-doesn't-reach-the-server bug: a
+/// client-side cancel (Stop button, or a per-server timeout) must actually
+/// send the MCP server a real `notifications/cancelled`, not just abandon
+/// the client's own wait while the server keeps working. Proven end to end
+/// against a real child process: `wait_for_cancel` (see
+/// `mcp_test_server.rs`) only writes its marker file if it observes an
+/// actual protocol-level cancellation for its own request id.
+#[tokio::test]
+async fn call_tool_cancellation_sends_a_real_cancelled_notification_to_the_server() {
+    let marker = std::env::temp_dir().join(format!(
+        "lm_mcp_cancel_marker_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let _ = std::fs::remove_file(&marker);
+
+    let state = AppState::default();
+    let entry = McpServerEntry {
+        id: "cancel-me".to_string(),
+        label: "Cancel test server".to_string(),
+        transport: McpTransport::Stdio {
+            command: test_server_binary().to_string(),
+            args: Vec::new(),
+            env: BTreeMap::from([(
+                "MCP_TEST_CANCEL_MARKER".to_string(),
+                marker.to_string_lossy().to_string(),
+            )]),
+        },
+        enabled: true,
+        tool_allowlist: None,
+        timeout_secs: None,
+    };
+    connect_impl(&state, &entry).await.unwrap();
+
+    // A cancel signal that fires almost immediately — well before the
+    // tool's own 30s fallback — simulating a Stop click or a short
+    // per-server timeout while `wait_for_cancel` is in flight.
+    let cancel = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        "test cancel".to_string()
+    };
+
+    let err = call_tool_with_cancel_impl(&state, &entry, "wait_for_cancel", serde_json::json!({}), cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "test cancel");
+
+    // Give the (separate) server process a moment to receive the
+    // notification and write the marker before asserting on it.
+    let mut seen = false;
+    for _ in 0..50 {
+        if marker.exists() {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        seen,
+        "server never observed a notifications/cancelled for the cancelled call"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "cancelled");
+
+    let _ = std::fs::remove_file(&marker);
+    disconnect_impl(&state, &entry.id).await;
+}
+
+/// `call_tool_impl` (the non-cancellable entry point CLI's `mcp_cli::call`
+/// used before `call_tool_with_cancel_impl` existed, and this module's own
+/// unit tests still use) must keep behaving exactly as before: it's just
+/// `call_tool_with_cancel_impl` with a `cancel` that never resolves.
+#[tokio::test]
+async fn call_tool_impl_still_works_with_no_cancellation_wired_up() {
+    let state = AppState::default();
+    let entry = stdio_entry("plain-call", test_server_binary(), &[]);
+    connect_impl(&state, &entry).await.unwrap();
+
+    let result = call_tool_impl(&state, &entry, "echo", serde_json::json!({"text": "still works"}))
+        .await
+        .unwrap();
+    let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+        panic!("expected a text content block, got {:?}", result.content[0]);
+    };
+    assert_eq!(text.text, "still works");
 
     disconnect_impl(&state, &entry.id).await;
 }

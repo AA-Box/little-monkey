@@ -2,10 +2,14 @@
 //! `mcp_servers.json` the GUI writes (no `tauri::AppHandle` to resolve its
 //! path through — the same hardcoded-identifier app-data convention as
 //! `providers_cli.rs`/`checkpoints_cli.rs`), eagerly connects every enabled
-//! server (mirroring the GUI's `mcp_connect_all`-on-mount), and layers
-//! permission-gating + a per-server timeout around
-//! `little_monkey_lib::mcp::call_tool_impl` the same way `tools_cli.rs`
-//! layers those around `run_shell`/`write_file`.
+//! server (mirroring the GUI's `mcp_connect_all`-on-mount, and bounded the
+//! same way by `mcp::CONNECT_TIMEOUT_SECS`), and layers permission-gating +
+//! a per-server timeout around
+//! `little_monkey_lib::mcp::call_tool_with_cancel_impl` the same way
+//! `tools_cli.rs` layers those around `run_shell`/`write_file` — a timeout
+//! here genuinely cancels the in-flight request at the protocol level (a
+//! real `notifications/cancelled` sent to the server), not just the
+//! client's own abandoned wait.
 //!
 //! Deliberately does NOT wire turn-scoped cancellation via
 //! `AppState::tool_cancel` — unlike the GUI's split-pane turns, the CLI has
@@ -53,18 +57,30 @@ pub fn load_enabled_servers() -> Vec<McpServerEntry> {
     }
 }
 
-/// Connects every entry, one at a time. A server that fails to connect
-/// prints a `Warning:` line to stderr (same "not found"/pull-error UX
-/// precedent as `llama.rs`/`cmds.rs`) and is simply dropped from the
-/// returned list — its tools are never offered to the model and its name
-/// never dispatches, rather than aborting the whole CLI invocation over one
-/// misconfigured or unreachable server.
+/// Connects every entry, one at a time. A server that fails to connect (or
+/// times out — see `mcp::CONNECT_TIMEOUT_SECS`; `connect_impl` itself has no
+/// internal timeout, so a hung handshake would otherwise stall the whole
+/// CLI's startup indefinitely) prints a `Warning:` line to stderr (same
+/// "not found"/pull-error UX precedent as `llama.rs`/`cmds.rs`) and is
+/// simply dropped from the returned list — its tools are never offered to
+/// the model and its name never dispatches, rather than aborting the whole
+/// CLI invocation over one misconfigured or unreachable server.
 pub async fn connect_all(state: &AppState, entries: &[McpServerEntry]) -> Vec<McpServerEntry> {
     let mut connected = Vec::new();
     for entry in entries {
-        match mcp::connect_impl(state, entry).await {
-            Ok(_) => connected.push(entry.clone()),
-            Err(e) => eprintln!("Warning: MCP server '{}' failed to connect: {e}", entry.label),
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(mcp::CONNECT_TIMEOUT_SECS),
+            mcp::connect_impl(state, entry),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(_)) => connected.push(entry.clone()),
+            Ok(Err(e)) => eprintln!("Warning: MCP server '{}' failed to connect: {e}", entry.label),
+            Err(_elapsed) => eprintln!(
+                "Warning: MCP server '{}' timed out while connecting (>{}s)",
+                entry.label,
+                mcp::CONNECT_TIMEOUT_SECS
+            ),
         }
     }
     connected
@@ -74,7 +90,11 @@ pub async fn connect_all(state: &AppState, entries: &[McpServerEntry]) -> Vec<Mc
 /// with the same `mcp:<server_id>:<tool_name>` naming convention the GUI's
 /// `mcp_call_tool` uses (preview = server label + tool name + pretty-printed
 /// arguments, matching `run_shell`'s command-preview style), bounds it with
-/// the entry's `timeout_secs` (default 60s), and flattens the resulting
+/// the entry's `timeout_secs` (default 60s) — genuinely: a timeout here
+/// sends the server a real `notifications/cancelled` via
+/// `mcp::call_tool_with_cancel_impl`, the same as the GUI's `mcp_call_tool`,
+/// rather than merely abandoning the client's own wait for a response the
+/// server keeps executing regardless — and flattens the resulting
 /// `CallToolResult` into a string — mirroring
 /// `src/lib/mcpTools.ts::formatMcpCallToolResult` exactly, content block for
 /// content block, so the model sees the same shape of tool output on both
@@ -91,17 +111,16 @@ pub async fn call(
     perms.request(&format!("mcp:{}:{}", entry.id, tool_name), &detail).await?;
 
     let timeout = std::time::Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let result = match tokio::time::timeout(timeout, mcp::call_tool_impl(state, entry, tool_name, arguments)).await {
-        Ok(outcome) => outcome?,
-        Err(_) => {
-            return Err(format!(
-                "MCP tool '{}' on server '{}' timed out after {} seconds",
-                tool_name,
-                entry.id,
-                timeout.as_secs()
-            ))
-        }
+    let timeout_reason = async move {
+        tokio::time::sleep(timeout).await;
+        format!(
+            "MCP tool '{}' on server '{}' timed out after {} seconds",
+            tool_name,
+            entry.id,
+            timeout.as_secs()
+        )
     };
+    let result = mcp::call_tool_with_cancel_impl(state, entry, tool_name, arguments, timeout_reason).await?;
     Ok(format_call_tool_result(&result))
 }
 

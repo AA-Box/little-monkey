@@ -287,6 +287,30 @@ pub fn deny_pending(state: &AppState, turn: Option<&str>) {
     }
 }
 
+/// Clears every "allow for session" grant scoped to MCP server `server_id`
+/// (i.e. every `mcp:<server_id>:<tool>` entry in `session_allow`), without
+/// touching grants for any other tool/server or denying in-flight prompts.
+///
+/// MCP grants are keyed only by the mutable `server_id`/tool-name strings
+/// (see `mcp.rs::mcp_call_tool`'s `mcp:<server_id>:<tool_name>` format), with
+/// no binding to what that id's transport (command/args/env/url) actually
+/// points at. So this must be called whenever `server_id`'s config could
+/// have just changed out from under an existing grant — `mcp_update_server`
+/// (the transport a grant was approved against may no longer be what this
+/// id now does) and `mcp_remove_server`/`mcp_add_server` (the id may be
+/// about to be, or was just, reused by a completely different server) — so a
+/// grant approved for one server can never silently keep applying to
+/// whatever now answers to the same id.
+pub fn revoke_session_allow_for_mcp_server(state: &AppState, server_id: &str) {
+    let prefix = format!("mcp:{}:", server_id);
+    state
+        .permissions
+        .session_allow
+        .lock()
+        .unwrap()
+        .retain(|tool| !tool.starts_with(&prefix));
+}
+
 /// Clears every "allow for session" grant and denies any still-in-flight
 /// permission prompts. Must be called whenever the workspace root changes:
 /// a grant approved (or a prompt shown) in the context of one workspace must
@@ -397,6 +421,33 @@ mod tests {
         respond_impl(&state, "req-1".to_string(), false, false).unwrap();
 
         assert_eq!(rx.blocking_recv(), Ok(false));
+    }
+
+    #[test]
+    fn revoke_session_allow_for_mcp_server_clears_only_that_servers_grants() {
+        let state = AppState::default();
+        {
+            let mut allowed = state.permissions.session_allow.lock().unwrap();
+            allowed.insert("mcp:docs:search".to_string());
+            allowed.insert("mcp:docs:write".to_string());
+            allowed.insert("mcp:other:search".to_string());
+            allowed.insert("write_file".to_string());
+        }
+
+        revoke_session_allow_for_mcp_server(&state, "docs");
+
+        let allowed = state.permissions.session_allow.lock().unwrap();
+        assert!(!allowed.contains("mcp:docs:search"));
+        assert!(!allowed.contains("mcp:docs:write"));
+        assert!(allowed.contains("mcp:other:search"), "a different server's grant must survive");
+        assert!(allowed.contains("write_file"), "a non-MCP tool's grant must survive");
+    }
+
+    #[test]
+    fn revoke_session_allow_for_mcp_server_is_a_no_op_when_nothing_is_granted() {
+        let state = AppState::default();
+        revoke_session_allow_for_mcp_server(&state, "never-granted"); // must not panic
+        assert!(state.permissions.session_allow.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -28,7 +28,7 @@ describe("mcpToolDefs", () => {
   it("maps a connected, enabled server's tools into namespaced ToolDefs", () => {
     useMcpStore.setState({ servers: [makeServer()] });
 
-    const defs = mcpToolDefs();
+    const { defs } = mcpToolDefs();
 
     expect(defs).toHaveLength(1);
     expect(defs[0].function.name).toBe("mcp__srv__greet");
@@ -45,7 +45,7 @@ describe("mcpToolDefs", () => {
       ],
     });
 
-    expect(mcpToolDefs()).toHaveLength(0);
+    expect(mcpToolDefs().defs).toHaveLength(0);
   });
 
   it("honors a per-server tool_allowlist", () => {
@@ -61,7 +61,7 @@ describe("mcpToolDefs", () => {
       ],
     });
 
-    const defs = mcpToolDefs();
+    const { defs } = mcpToolDefs();
     expect(defs.map((d) => d.function.name)).toEqual(["mcp__srv__other_tool"]);
   });
 
@@ -75,7 +75,7 @@ describe("mcpToolDefs", () => {
       ],
     });
 
-    const defs = mcpToolDefs();
+    const { defs } = mcpToolDefs();
     expect(defs[0].function.name).toMatch(/^[a-zA-Z0-9_-]+$/);
     expect(defs[0].function.name).toBe("mcp__srv__weird_tool_name_");
   });
@@ -88,24 +88,35 @@ describe("mcpToolDefs", () => {
       ],
     });
 
-    const names = mcpToolDefs().map((d) => d.function.name);
+    const names = mcpToolDefs().defs.map((d) => d.function.name);
     expect(names).toEqual(["mcp__srv___greet", "mcp__srv___greet_2"]);
   });
 
-  it("rebuilds its registry from scratch on every call", () => {
+  it("returns a fresh, independent registry on every call instead of sharing module state", () => {
+    // Regression test: the registry used to be a shared module-level Map,
+    // so a later call (e.g. from a concurrent split-pane turn) would
+    // silently invalidate an earlier call's resolutions. Now each
+    // `mcpToolDefs()` call owns its own registry — an older one must keep
+    // resolving correctly even after a newer call with a different server
+    // set has happened.
     useMcpStore.setState({ servers: [makeServer()] });
-    mcpToolDefs();
-    expect(resolveMcpToolName("mcp__srv__greet")).toEqual({ serverId: "srv", toolName: "greet" });
+    const first = mcpToolDefs();
+    expect(resolveMcpToolName(first.registry, "mcp__srv__greet")).toEqual({ serverId: "srv", toolName: "greet" });
 
     useMcpStore.setState({ servers: [] });
-    mcpToolDefs();
-    expect(resolveMcpToolName("mcp__srv__greet")).toBeNull();
+    const second = mcpToolDefs();
+    expect(resolveMcpToolName(second.registry, "mcp__srv__greet")).toBeNull();
+
+    // The first call's own registry must be unaffected by the second call.
+    expect(resolveMcpToolName(first.registry, "mcp__srv__greet")).toEqual({ serverId: "srv", toolName: "greet" });
   });
 });
 
 describe("resolveMcpToolName", () => {
   it("returns null for a name mcpToolDefs never produced", () => {
-    expect(resolveMcpToolName("mcp__unknown__tool")).toBeNull();
+    useMcpStore.setState({ servers: [makeServer()] });
+    const { registry } = mcpToolDefs();
+    expect(resolveMcpToolName(registry, "mcp__unknown__tool")).toBeNull();
   });
 });
 

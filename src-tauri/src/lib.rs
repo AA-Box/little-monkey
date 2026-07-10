@@ -16,6 +16,11 @@ pub mod rules;
 pub mod memory;
 pub mod workspace;
 
+// `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
+// `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
+// `mcp::disconnect_all`.
+use tauri::Manager;
+
 /// Shared application state, managed by Tauri and accessed from every
 /// #[tauri::command] via `tauri::State<'_, AppState>`.
 #[derive(Default)]
@@ -54,6 +59,20 @@ pub struct AppState {
     /// or delete, so unsynchronized concurrent writers could silently drop
     /// one of them.
     pub memory_lock: std::sync::Mutex<()>,
+    /// Serializes `mcp_servers.json` read-modify-write cycles (see `mcp.rs`)
+    /// — same reasoning as `memory_lock` above protects `memories.json`.
+    /// `mcp_add_server`/`mcp_update_server` are synchronous commands (Tauri
+    /// can dispatch those on genuinely concurrent OS threads) and
+    /// `mcp_remove_server`/`mcp_set_enabled` are async commands (the tokio
+    /// runtime can run those in parallel too), so without a shared lock two
+    /// concurrent config-mutating calls (e.g. two Settings toggles fired
+    /// close together) can both load the same "before" config and the
+    /// later save silently clobbers the earlier one's change. A plain
+    /// `std::sync::Mutex`, not `tokio::sync::Mutex` like `AppState::mcp`:
+    /// every critical section this guards is the synchronous
+    /// `load_config_impl`/`save_config_impl` pair with no `.await` in
+    /// between, so there's nothing async to ever hold it across.
+    pub mcp_config_lock: std::sync::Mutex<()>,
     /// Live MCP server connections, keyed by server id (see `mcp.rs`). A
     /// `tokio::sync::Mutex` — unlike every other map here — because
     /// connecting and calling a tool are both `.await`-ing operations; every
@@ -66,7 +85,7 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -149,6 +168,24 @@ pub fn run() {
             system::open_in_editor,
             system::open_session_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // `App::run` never returns — once the event loop is done, the
+        // underlying `tao` runtime calls `std::process::exit` directly
+        // (see its own doc comment), which skips Rust's Drop-based cleanup
+        // entirely. That means any live MCP stdio child process (held in
+        // `AppState::mcp`, cleaned up only via `McpConnection::service`'s
+        // `Drop`/`.cancel()`) would otherwise be silently orphaned on every
+        // normal app quit. `RunEvent::Exit` fires synchronously on the main
+        // thread right before that happens, so blocking here on
+        // `mcp::disconnect_all` (bounded and best-effort — see its own doc
+        // comment) is the only chance those child processes get to actually
+        // be killed before the process itself exits.
+        if let tauri::RunEvent::Exit = event {
+            let state = app_handle.state::<AppState>();
+            tauri::async_runtime::block_on(mcp::disconnect_all(state.inner()));
+        }
+    });
 }

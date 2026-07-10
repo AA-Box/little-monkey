@@ -18,8 +18,18 @@
  * or tool name, and even without sanitization an id or tool name containing
  * `__` itself would make a naive split ambiguous. So instead of re-parsing
  * the string, `agentLoop.ts`'s dispatch branch looks the exact
- * `{ serverId, toolName }` up via `resolveMcpToolName`, backed by a side
- * table this module rebuilds on every `mcpToolDefs()` call.
+ * `{ serverId, toolName }` up via `resolveMcpToolName`, against the
+ * `McpToolRegistry` `mcpToolDefs()` returns alongside the defs themselves —
+ * mirrors `lm-cli`'s `merged_tool_definitions`/`McpToolRegistry`, which
+ * returns its own resolution table as a plain local value for exactly the
+ * same reason: with the split pane, two turns (in different sessions) can
+ * call `mcpToolDefs()` concurrently, and a *shared* module-level table would
+ * let one turn's rebuild silently invalidate or repoint a name another
+ * turn's model was already offered and is mid-call dispatching. Returning a
+ * fresh table from every call and threading it through the one turn that
+ * built it keeps each turn's tool-name resolution isolated from any other
+ * turn's or Settings action's concurrent `mcpToolDefs()` call, the same way
+ * `checkpointId`/`turnId` are freshly minted per turn rather than shared.
  */
 import type { ToolDef } from './llamaClient';
 import { useMcpStore } from '../store/mcpStore';
@@ -44,19 +54,24 @@ function uniqueName(base: string, used: Set<string>): string {
 }
 
 /** Composite tool name -> the exact server id + tool name it was built
- * from. Rebuilt from scratch at the top of every `mcpToolDefs()` call, so
- * it always reflects the defs most recently offered to the model. */
-const registry = new Map<string, { serverId: string; toolName: string }>();
+ * from — one `mcpToolDefs()` call's worth, and only ever that call's. See
+ * this module's doc comment for why this is a fresh value per call rather
+ * than shared module state. */
+export type McpToolRegistry = Map<string, { serverId: string; toolName: string }>;
 
 /**
  * Builds the `ToolDef[]` for every connected, enabled server's cached tools,
  * honoring each server's `toolAllowlist` (when set) — servers that are
  * disabled, not currently connected, or configured but never connected are
- * silently skipped (their tools simply aren't offered, not an error).
+ * silently skipped (their tools simply aren't offered, not an error). Also
+ * returns the `McpToolRegistry` needed to resolve any of those composite
+ * names back to `{ serverId, toolName }` (via `resolveMcpToolName`) — the
+ * caller (`agentLoop.ts`, once per turn) is responsible for holding on to
+ * both together for the lifetime of that turn.
  */
-export function mcpToolDefs(): ToolDef[] {
+export function mcpToolDefs(): { defs: ToolDef[]; registry: McpToolRegistry } {
   const { servers } = useMcpStore.getState();
-  registry.clear();
+  const registry: McpToolRegistry = new Map();
   const used = new Set<string>();
   const defs: ToolDef[] = [];
 
@@ -82,17 +97,17 @@ export function mcpToolDefs(): ToolDef[] {
     }
   }
 
-  return defs;
+  return { defs, registry };
 }
 
 /**
  * Looks up the exact `{ serverId, toolName }` a `mcpToolDefs()`-produced
- * composite tool name came from — `null` if `name` wasn't one of them (a
- * hallucinated call, or the server set changed since the defs offering it
- * were built). Used by `agentLoop.ts`'s dispatch branch instead of
+ * composite tool name came from, against the `registry` that SAME
+ * `mcpToolDefs()` call returned — `null` if `name` wasn't one of them (a
+ * hallucinated call). Used by `agentLoop.ts`'s dispatch branch instead of
  * re-parsing the composite string — see this module's doc comment.
  */
-export function resolveMcpToolName(name: string): { serverId: string; toolName: string } | null {
+export function resolveMcpToolName(registry: McpToolRegistry, name: string): { serverId: string; toolName: string } | null {
   return registry.get(name) ?? null;
 }
 

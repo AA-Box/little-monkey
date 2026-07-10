@@ -49,6 +49,14 @@ rmcp = { version = "2.2.0", features = ["client", "transport-child-process", "tr
 # re-export), so it must be a direct dependency here too. Version-matched to
 # rmcp's own `schemars = "1.0"` requirement so only one copy resolves.
 schemars = "1"
+# Only needed by the `mcp_test_server` bin, same reasoning as `schemars`
+# above: its `wait_for_cancel` test tool (used by mcp.rs's cancellation-
+# propagation test) takes a `tokio_util::sync::CancellationToken` argument,
+# rmcp's own server-side extractor type for "cancelled when this request's
+# `notifications/cancelled` arrives" — rmcp depends on tokio-util itself but
+# doesn't re-export it. Version-matched to the copy already in Cargo.lock via
+# rmcp's own dependency so only one copy resolves.
+tokio-util = "0.7"
 
 [dev-dependencies]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
