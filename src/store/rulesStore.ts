@@ -39,11 +39,29 @@ export interface RulesStore {
   refresh: () => Promise<void>;
 }
 
+// Module-scoped (not store state) since it's purely an internal sequencing
+// counter, never rendered or persisted — see `refresh`'s doc comment.
+let latestRefreshRequest = 0;
+
 export const useRulesStore = create<RulesStore>((set) => ({
   rules: [],
   facts: [],
 
   refresh: async () => {
+    // Two `refresh()` calls can be in flight at once — e.g. a turn's own
+    // post-`remember` refresh (agentLoop.ts) racing a Forget button's refresh
+    // in another split pane (MessageList.tsx/RulesMemoryPanel.tsx), both
+    // hitting the same unkeyed store for the same primary workspace root.
+    // Backend IPC gives no ordering guarantee between concurrent invokes, so
+    // an earlier-*started* call can resolve after a later one. Without a
+    // sequence guard, whichever resolves last always wins the `set()` below,
+    // even if it started first and is carrying a staler snapshot — silently
+    // reintroducing a just-forgotten fact, for instance. Only the
+    // most-recently-*started* call is allowed to commit its result; anything
+    // that was superseded by a newer `refresh()` before it resolved is
+    // dropped instead of overwriting fresher state.
+    const requestId = ++latestRefreshRequest;
+
     // A broken MONKEY.md/memories.json (or, transiently, no workspace open
     // yet) must never block a turn from proceeding — same "never a hard
     // error" philosophy as `rules.rs`/`memory.rs`'s own reads. Falling back to
@@ -54,6 +72,8 @@ export const useRulesStore = create<RulesStore>((set) => ({
       invoke<RuleFile[]>("rules_read").catch(() => [] as RuleFile[]),
       invoke<MemoryFact[]>("memory_list").catch(() => [] as MemoryFact[]),
     ]);
+
+    if (requestId !== latestRefreshRequest) return;
     set({ rules, facts });
   },
 }));

@@ -19,6 +19,19 @@ const MAX_RULE_CHARS = 16_000;
 /** Must match `MAX_FACT_CHARS` in `src-tauri/src/memory.rs`. */
 const MAX_FACT_CHARS = 500;
 
+/**
+ * Counts Unicode scalar values (code points), matching Rust's
+ * `str::chars().count()` — which is what `rules.rs`/`memory.rs` actually cap
+ * against. JS's `.length` counts UTF-16 code *units* instead, so text with
+ * astral-plane characters (e.g. many emoji) reports roughly double the
+ * backend's count — enough to wrongly trip these client-side "over limit"
+ * checks (and disable Save/Add) for content the backend would accept fine.
+ * `Array.from` iterates by code point, same as Rust's `chars()`.
+ */
+function charCount(text: string): number {
+  return Array.from(text).length;
+}
+
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` rather than promoted prematurely. */
 function Toggle({
@@ -86,7 +99,7 @@ function RuleEditor({ heading, description, placeholder, initialContent, truncat
     if (!dirty) setContent(initialContent);
   }, [initialContent, dirty]);
 
-  const overLimit = content.length > MAX_RULE_CHARS;
+  const overLimit = charCount(content) > MAX_RULE_CHARS;
 
   async function handleSave() {
     setSaving(true);
@@ -107,7 +120,7 @@ function RuleEditor({ heading, description, placeholder, initialContent, truncat
       <div className="mb-1 flex items-center justify-between gap-2">
         <h4 className="truncate text-sm font-medium text-foreground">{heading}</h4>
         <span className={`shrink-0 text-xs ${overLimit ? "text-danger" : "text-faint"}`}>
-          {t("RulesMemoryPanel.charCount", { count: content.length, max: MAX_RULE_CHARS })}
+          {t("RulesMemoryPanel.charCount", { count: charCount(content), max: MAX_RULE_CHARS })}
         </span>
       </div>
       <p className="mb-2 text-xs text-muted">{description}</p>
@@ -160,7 +173,7 @@ function FactRow({ fact, onChanged }: { fact: MemoryFact; onChanged: () => Promi
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const overLimit = text.length > MAX_FACT_CHARS;
+  const overLimit = charCount(text) > MAX_FACT_CHARS;
 
   async function handleSave() {
     setSaving(true);
@@ -237,7 +250,7 @@ function FactRow({ fact, onChanged }: { fact: MemoryFact; onChanged: () => Promi
           />
           <div className="flex items-center justify-between gap-2">
             <span className={`text-xs ${overLimit ? "text-danger" : "text-faint"}`}>
-              {t("RulesMemoryPanel.charCount", { count: text.length, max: MAX_FACT_CHARS })}
+              {t("RulesMemoryPanel.charCount", { count: charCount(text), max: MAX_FACT_CHARS })}
             </span>
             <div className="flex gap-1.5">
               <Button size="sm" variant="ghost" onClick={() => setEditing(false)} disabled={saving}>
@@ -305,7 +318,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
     }
   }
 
-  const overLimit = newFactText.length > MAX_FACT_CHARS;
+  const overLimit = charCount(newFactText) > MAX_FACT_CHARS;
 
   return (
     <section>
@@ -367,7 +380,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
             />
             <div className="flex items-center justify-between gap-2">
               <span className={`text-xs ${overLimit ? "text-danger" : "text-faint"}`}>
-                {t("RulesMemoryPanel.charCount", { count: newFactText.length, max: MAX_FACT_CHARS })}
+                {t("RulesMemoryPanel.charCount", { count: charCount(newFactText), max: MAX_FACT_CHARS })}
               </span>
               <Button
                 size="sm"

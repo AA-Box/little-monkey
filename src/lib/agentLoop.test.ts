@@ -4,12 +4,13 @@ import {
   checkpointChainBlockReason,
   formatMemoryNotice,
   isMemoryNotice,
+  isToolCallAllowed,
   parseMemoryNotice,
   toolsForSettings,
   type CheckpointChainLink,
   type MemoryNotice,
 } from "./agentLoop";
-import type { ChatMessage, ToolDef } from "./llamaClient";
+import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -121,5 +122,34 @@ describe("toolsForSettings", () => {
   it("is a no-op on a tool list that never had remember in it", () => {
     const noRemember = [toolDef("write_file"), toolDef("run_shell")];
     expect(toolsForSettings(noRemember, false)).toEqual(noRemember);
+  });
+});
+
+describe("isToolCallAllowed", () => {
+  function toolDef(name: string): ToolDef {
+    return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
+  }
+
+  function call(name: string): ToolCall {
+    return { id: "call-1", type: "function", function: { name, arguments: "{}" } };
+  }
+
+  const toolsForTurn = [toolDef("write_file"), toolDef("run_shell")];
+
+  it("allows a call whose name was offered this turn", () => {
+    expect(isToolCallAllowed(call("write_file"), toolsForTurn)).toBe(true);
+  });
+
+  it("rejects a call for a tool that was filtered out this turn (e.g. remember with memoryEnabled off)", () => {
+    expect(isToolCallAllowed(call("remember"), toolsForTurn)).toBe(false);
+  });
+
+  it("allows remember once it's actually part of the offered tools", () => {
+    const withRemember = [...toolsForTurn, toolDef("remember")];
+    expect(isToolCallAllowed(call("remember"), withRemember)).toBe(true);
+  });
+
+  it("rejects a hallucinated tool name that was never offered at all", () => {
+    expect(isToolCallAllowed(call("delete_everything"), toolsForTurn)).toBe(false);
   });
 });

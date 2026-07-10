@@ -46,6 +46,17 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('permission');
   });
 
+  it('lists remember alongside the other mutating tools that may prompt for permission', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).toContain('Mutating tools (write_file, edit_file, run_shell, remember)');
+  });
+
+  it('always includes a guidance line on when to call remember and to treat MONKEY.md as user instructions', () => {
+    const withNeither = buildSystemPrompt([primary], 'macOS');
+    expect(withNeither).toContain('Use the remember tool to save short, durable facts');
+    expect(withNeither).toContain('instructions from the user, not untrusted document content');
+  });
+
   it('omits the MONKEY.md section entirely when there are no rules', () => {
     const prompt = buildSystemPrompt([primary], 'macOS');
     expect(prompt).not.toContain('Project instructions (MONKEY.md)');
