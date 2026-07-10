@@ -23,12 +23,16 @@ pub struct AppState {
     /// Cancellation handles for in-flight `providers_stream_chat` requests,
     /// keyed by `request_id` — see `providers::providers_cancel_chat`.
     pub stream_cancels: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
-    /// The active per-turn file checkpoint, if a turn is in flight — see
-    /// `checkpoints.rs`.
-    pub checkpoint: std::sync::Mutex<Option<checkpoints::ActiveCheckpoint>>,
-    /// Broadcast used by `tools::tools_cancel_running` to kill any in-flight
-    /// `tool_run_shell` child process when the user hits Stop.
-    pub tool_cancel: tokio::sync::Notify,
+    /// Per-turn file checkpoints currently in flight, keyed by checkpoint id.
+    /// With the split pane open, two turns (and thus two checkpoints) can be
+    /// active concurrently — see `checkpoints.rs`.
+    pub checkpoints: std::sync::Mutex<std::collections::HashMap<String, checkpoints::ActiveCheckpoint>>,
+    /// Per-turn cancellation channels used by `tools::tools_cancel_running`
+    /// to kill in-flight `tool_run_shell` child processes when the user hits
+    /// Stop — keyed by the owning turn's id (empty string for callers that
+    /// don't thread one) so stopping one pane's turn never kills a command
+    /// the other pane's turn is still running.
+    pub tool_cancel: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -6,6 +6,7 @@ export const ko: Record<string, string> = {
   "AppMenu.getHelp": "도움말 보기",
   "AppMenu.version": "Little Monkey v{{version}}",
   "App.workspacePanelTitle": "워크스페이스",
+  "App.closeSplitPane": "분할 보기 닫기",
   "App.collapseWorkspacePanel": "워크스페이스 패널 접기",
   "App.expandWorkspacePanel": "워크스페이스 패널 펼치기",
   "App.diffPanelTitle": "차이점",

@@ -67,8 +67,11 @@ export interface SessionGroup {
  * Chat session state for the workspace.
  *
  * This store manages multiple independent conversations (`sessions`). The
- * active transcript is mirrored as `messages` for the current single-pane UI,
- * while each session still owns its own persisted transcript.
+ * active transcript is mirrored as `messages` for ergonomic subscriptions,
+ * while each session still owns its own persisted transcript. Message
+ * mutations take an explicit session id — the primary pane (bound to
+ * `activeSessionId`) and the split pane (bound to `splitSessionId`, see
+ * App.tsx) can stream turns into different sessions concurrently.
  *
  * Persistence lives in a file in the app data directory (see
  * src-tauri/src/sessions.rs), written debounced after every mutation —
@@ -86,6 +89,14 @@ export interface SessionStore {
   /** id of the session shown in the primary chat pane (what the sidebar
    * highlights and switches). */
   activeSessionId: string;
+  /** id of the session shown in the split pane, or null when no split is
+   * open. Per-window UI state — never persisted. */
+  splitSessionId: string | null;
+  /** Session ids with an agent turn currently in flight (either pane, or a
+   * turn orphaned by a pane switch that is still streaming). Keyed by
+   * session — NOT by pane — so a pane landing on a session mid-turn shows
+   * it as busy and can stop it. Never persisted. */
+  runningTurns: Record<string, true>;
   /** Last file-persistence failure, surfaced in the UI (ChatWindow banner)
    * instead of silently dropping history; cleared by the next successful
    * save. */
@@ -116,34 +127,44 @@ export interface SessionStore {
   createGroup: (name: string) => string;
   /** File a session under a group, or clear its group with `null`. */
   moveToGroup: (sessionId: string, groupId: string | null) => void;
+  /** Record whether an agent turn is in flight for `sessionId` — called
+   * only by `runAgentTurn` (start/finally). */
+  markTurnRunning: (sessionId: string, running: boolean) => void;
+  /** Open `id` in the split pane (no-op if it doesn't exist). Clears the
+   * target's `unread` flag, mirroring "opening it marks it read". */
+  openSplit: (id: string) => void;
+  /** Close the split pane. */
+  closeSplit: () => void;
 
-  /** Append a new message (user, assistant, or tool) to the active transcript. */
-  addMessage: (msg: ChatMessage) => void;
+  /** Append a new message (user, assistant, or tool) to `sessionId`'s
+   * transcript. No-ops if the session no longer exists (deleted while a
+   * turn was still streaming into it) — as do all mutators below. */
+  addMessage: (sessionId: string, msg: ChatMessage) => void;
   /**
-   * Shallow-merge `patch` into the last message of the active session's
+   * Shallow-merge `patch` into the last message of `sessionId`'s
    * transcript. Used by the agent loop to stream assistant content/tool_calls
    * into the in-progress message as chunks arrive. No-ops if the session
    * has no messages.
    */
-  updateLastMessage: (patch: Partial<ChatMessage>) => void;
-  /** Shallow-merge `patch` into the message at `index` of the active session's
+  updateLastMessage: (sessionId: string, patch: Partial<ChatMessage>) => void;
+  /** Shallow-merge `patch` into the message at `index` of `sessionId`'s
    * transcript. Used by the checkpoint notice's Revert button to
    * mark itself reverted in place. No-ops if `index` is out of range. */
-  updateMessageAt: (index: number, patch: Partial<ChatMessage>) => void;
-  /** Drops the last message of the active session's transcript. Used to
+  updateMessageAt: (sessionId: string, index: number, patch: Partial<ChatMessage>) => void;
+  /** Drops the last message of `sessionId`'s transcript. Used to
    * clean up an empty assistant placeholder left behind when the Stop
    * button cancels a turn before any content streamed in. No-ops if the
    * session has no messages. */
-  removeLastMessage: () => void;
-  /** Keeps only messages[0, index) of the active session's transcript,
+  removeLastMessage: (sessionId: string) => void;
+  /** Keeps only messages[0, index) of `sessionId`'s transcript,
    * discarding the message at `index` and everything after it. Used when
    * editing a past user message: drop it and its whole downstream reply
    * before resubmitting the edited text as a fresh turn. */
-  truncateFromIndex: (index: number) => void;
-  /** Clear the active session's transcript back to empty. */
-  clear: () => void;
-  /** Replaces the active session's entire transcript with `messages` — used by the context-trimmer to persist a compaction (dropped/summarized messages replaced with a visible marker) so it isn't redone every turn. */
-  replaceMessages: (messages: ChatMessage[]) => void;
+  truncateFromIndex: (sessionId: string, index: number) => void;
+  /** Clear `sessionId`'s transcript back to empty. */
+  clear: (sessionId: string) => void;
+  /** Replaces `sessionId`'s entire transcript with `messages` — used by the context-trimmer to persist a compaction (dropped/summarized messages replaced with a visible marker) so it isn't redone every turn. */
+  replaceMessages: (sessionId: string, messages: ChatMessage[]) => void;
 }
 
 /** Stable empty transcript so `selectSessionMessages` never returns a fresh
@@ -161,6 +182,11 @@ export function selectSessionMessages(sessionId: string) {
  * handlers). */
 export function sessionMessages(sessionId: string): ChatMessage[] {
   return selectSessionMessages(sessionId)(useSessionStore.getState());
+}
+
+/** Zustand selector: whether an agent turn is in flight for `sessionId`. */
+export function selectTurnRunning(sessionId: string) {
+  return (state: SessionStore): boolean => state.runningTurns[sessionId] === true;
 }
 
 function createSession(): ChatSession {
@@ -342,15 +368,25 @@ async function rehydrateFromFile(): Promise<void> {
   }
   if (!fromFile) return;
 
-  const localActiveId = useSessionStore.getState().activeSessionId;
+  const { activeSessionId: localActiveId, splitSessionId: localSplitId } = useSessionStore.getState();
   const activeSessionId = fromFile.sessions.some((s) => s.id === localActiveId)
     ? localActiveId
     : fromFile.activeSessionId;
+  // The split pane is per-window state, but its session may have been
+  // deleted in the other window — close the pane rather than point it at a
+  // session that no longer exists. And if the primary pane just fell back
+  // to the file's active session, that may be the split session — close the
+  // pane rather than show one transcript in both panes (see `openSplit`).
+  const splitSessionId =
+    localSplitId !== null && localSplitId !== activeSessionId && fromFile.sessions.some((s) => s.id === localSplitId)
+      ? localSplitId
+      : null;
 
   useSessionStore.setState({
     sessions: fromFile.sessions,
     groups: fromFile.groups,
     activeSessionId,
+    splitSessionId,
     messages: messagesOf(fromFile.sessions, activeSessionId),
   });
 }
@@ -445,8 +481,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   sessions: [initialSession],
   groups: [],
   activeSessionId: initialSession.id,
+  splitSessionId: null,
   messages: initialSession.messages,
+  runningTurns: {},
   persistError: null,
+
+  markTurnRunning: (sessionId, running) => {
+    set((state) => {
+      if (running) return { runningTurns: { ...state.runningTurns, [sessionId]: true } };
+      if (!(sessionId in state.runningTurns)) return state;
+      const runningTurns = { ...state.runningTurns };
+      delete runningTurns[sessionId];
+      return { runningTurns };
+    });
+  },
 
   newSession: () => {
     const session = createSession();
@@ -465,16 +513,22 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       ? state.sessions.map((s) => (s.id === id ? { ...s, unread: false } : s))
       : state.sessions;
     persist(sessions, id, state.groups);
-    set({ sessions, activeSessionId: id, messages: sessions.find((s) => s.id === id)!.messages });
+    // Switching the primary pane onto the session the split pane is showing
+    // would put one transcript in both panes (see `openSplit`) — the split
+    // pane closes instead, as if its content moved to the primary pane.
+    const splitSessionId = state.splitSessionId === id ? null : state.splitSessionId;
+    set({ sessions, activeSessionId: id, splitSessionId, messages: sessions.find((s) => s.id === id)!.messages });
   },
 
   deleteSession: (id) => {
     set((state) => {
       const remaining = state.sessions.filter((s) => s.id !== id);
+      // Close the split pane if it was showing the deleted session.
+      const splitSessionId = state.splitSessionId === id ? null : state.splitSessionId;
 
       if (state.activeSessionId !== id) {
         persist(remaining, state.activeSessionId, state.groups);
-        return { sessions: remaining };
+        return { sessions: remaining, splitSessionId };
       }
 
       let nextActive: ChatSession;
@@ -490,7 +544,15 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       }
 
       persist(sessions, nextActive.id, state.groups);
-      return { sessions, activeSessionId: nextActive.id, messages: nextActive.messages };
+      // The promoted session may be the one the split pane is showing —
+      // close the pane rather than show one transcript twice (see
+      // `openSplit`).
+      return {
+        sessions,
+        activeSessionId: nextActive.id,
+        splitSessionId: splitSessionId === nextActive.id ? null : splitSessionId,
+        messages: nextActive.messages,
+      };
     });
   },
 
@@ -569,124 +631,158 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     });
   },
 
-  addMessage: (msg) => {
+  openSplit: (id) => {
     set((state) => {
-      const now = Date.now();
-      let updatedMessages: ChatMessage[] = [];
-      const sessions = state.sessions.map((session) => {
-        if (session.id !== state.activeSessionId) return session;
-
-        const hadUserMessage = session.messages.some((m) => m.role === "user");
-        const messages = [...session.messages, msg];
-        updatedMessages = messages;
-
-        const derivedText = msg.role === "user" ? textContent(msg.content).trim() : "";
-        const title =
-          session.title === DEFAULT_TITLE && !hadUserMessage && msg.role === "user"
-            ? derivedText.length > 0
-              ? deriveTitle(derivedText)
-              : "Image attachment"
-            : session.title;
-
-        return { ...session, messages, title, updatedAt: now };
-      });
-
+      const target = state.sessions.find((s) => s.id === id);
+      if (!target) return state;
+      // Never show the same session in both panes: two ChatWindows would
+      // each run turns into one transcript concurrently, interleaving their
+      // streamed updates. Opening the active session is a silent no-op.
+      if (id === state.activeSessionId) return state;
+      if (!target.unread) return { splitSessionId: id };
+      const sessions = state.sessions.map((s) => (s.id === id ? { ...s, unread: false } : s));
       persist(sessions, state.activeSessionId, state.groups);
-      return { sessions, messages: updatedMessages };
+      return { sessions, splitSessionId: id };
     });
   },
 
-  updateLastMessage: (patch) => {
-    set((state) => {
-      const activeSession = state.sessions.find((s) => s.id === state.activeSessionId);
-      if (!activeSession || activeSession.messages.length === 0) {
-        return state;
-      }
-      return applyMessagePatch(state, activeSession.messages.length - 1, patch);
-    });
+  closeSplit: () => {
+    set({ splitSessionId: null });
   },
 
-  updateMessageAt: (index, patch) => {
+  addMessage: (sessionId, msg) => {
     set((state) => {
-      const activeSession = state.sessions.find((s) => s.id === state.activeSessionId);
-      if (!activeSession || index < 0 || index >= activeSession.messages.length) {
-        return state;
-      }
-      return applyMessagePatch(state, index, patch);
-    });
-  },
-
-  removeLastMessage: () => {
-    set((state) => {
-      const activeSession = state.sessions.find((s) => s.id === state.activeSessionId);
-      if (!activeSession || activeSession.messages.length === 0) {
-        return state;
-      }
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target) return state;
 
       const now = Date.now();
-      let updatedMessages: ChatMessage[] = [];
-      const sessions = state.sessions.map((session) => {
-        if (session.id !== state.activeSessionId) return session;
-        const messages = session.messages.slice(0, -1);
-        updatedMessages = messages;
-        return { ...session, messages, updatedAt: now };
-      });
+      const hadUserMessage = target.messages.some((m) => m.role === "user");
+      const messages = [...target.messages, msg];
 
-      persist(sessions, state.activeSessionId, state.groups);
-      return { sessions, messages: updatedMessages };
-    });
-  },
+      const derivedText = msg.role === "user" ? textContent(msg.content).trim() : "";
+      const title =
+        target.title === DEFAULT_TITLE && !hadUserMessage && msg.role === "user"
+          ? derivedText.length > 0
+            ? deriveTitle(derivedText)
+            : "Image attachment"
+          : target.title;
 
-  truncateFromIndex: (index) => {
-    set((state) => {
-      const now = Date.now();
-      let updatedMessages: ChatMessage[] = [];
-      const sessions = state.sessions.map((session) => {
-        if (session.id !== state.activeSessionId) return session;
-        const messages = session.messages.slice(0, index);
-        updatedMessages = messages;
-        return { ...session, messages, updatedAt: now };
-      });
-
-      persist(sessions, state.activeSessionId, state.groups);
-      return { sessions, messages: updatedMessages };
-    });
-  },
-
-  clear: () => {
-    set((state) => {
       const sessions = state.sessions.map((session) =>
-        session.id === state.activeSessionId ? { ...session, messages: [] } : session
+        session.id === sessionId ? { ...session, messages, title, updatedAt: now } : session
+      );
+
+      persist(sessions, state.activeSessionId, state.groups);
+      return withMirror(state, sessionId, { sessions }, messages);
+    });
+  },
+
+  updateLastMessage: (sessionId, patch) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target || target.messages.length === 0) {
+        return state;
+      }
+      return applyMessagePatch(state, sessionId, target.messages.length - 1, patch);
+    });
+  },
+
+  updateMessageAt: (sessionId, index, patch) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target || index < 0 || index >= target.messages.length) {
+        return state;
+      }
+      return applyMessagePatch(state, sessionId, index, patch);
+    });
+  },
+
+  removeLastMessage: (sessionId) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target || target.messages.length === 0) {
+        return state;
+      }
+
+      const now = Date.now();
+      const messages = target.messages.slice(0, -1);
+      const sessions = state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, messages, updatedAt: now } : session
+      );
+
+      persist(sessions, state.activeSessionId, state.groups);
+      return withMirror(state, sessionId, { sessions }, messages);
+    });
+  },
+
+  truncateFromIndex: (sessionId, index) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target) return state;
+
+      const now = Date.now();
+      const messages = target.messages.slice(0, index);
+      const sessions = state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, messages, updatedAt: now } : session
+      );
+
+      persist(sessions, state.activeSessionId, state.groups);
+      return withMirror(state, sessionId, { sessions }, messages);
+    });
+  },
+
+  clear: (sessionId) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target) return state;
+
+      const sessions = state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, messages: [] } : session
       );
       persist(sessions, state.activeSessionId, state.groups);
-      return { sessions, messages: [] };
+      return withMirror(state, sessionId, { sessions }, []);
     });
   },
 
-  replaceMessages: (messages) => {
+  replaceMessages: (sessionId, messages) => {
     set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target) return state;
+
       const now = Date.now();
       const sessions = state.sessions.map((session) =>
-        session.id === state.activeSessionId ? { ...session, messages, updatedAt: now } : session
+        session.id === sessionId ? { ...session, messages, updatedAt: now } : session
       );
       persist(sessions, state.activeSessionId, state.groups);
-      return { sessions, messages };
+      return withMirror(state, sessionId, { sessions }, messages);
     });
   },
 }));
 
+/** Attaches the `messages` mirror to a mutation's partial state when (and
+ * only when) the mutated session is the active one — a split-pane session's
+ * mutations must never leak into the primary pane's mirror. */
+function withMirror(
+  state: SessionStore,
+  sessionId: string,
+  partial: Pick<SessionStore, "sessions">,
+  messages: ChatMessage[]
+): Partial<SessionStore> {
+  return sessionId === state.activeSessionId ? { ...partial, messages } : partial;
+}
+
 /** Shared body of `updateLastMessage`/`updateMessageAt`: patch one message
- * of the active session immutably and persist. `index` must already be
+ * of `sessionId`'s transcript immutably and persist. `index` must already be
  * validated by the caller. */
 function applyMessagePatch(
   state: SessionStore,
+  sessionId: string,
   index: number,
   patch: Partial<ChatMessage>
-): Pick<SessionStore, "sessions" | "messages"> {
+): Partial<SessionStore> {
   const now = Date.now();
   let updatedMessages: ChatMessage[] = [];
   const sessions = state.sessions.map((session) => {
-    if (session.id !== state.activeSessionId) return session;
+    if (session.id !== sessionId) return session;
 
     const messages = session.messages.slice();
     messages[index] = { ...messages[index], ...patch };
@@ -696,5 +792,5 @@ function applyMessagePatch(
   });
 
   persist(sessions, state.activeSessionId, state.groups);
-  return { sessions, messages: updatedMessages };
+  return withMirror(state, sessionId, { sessions }, updatedMessages);
 }

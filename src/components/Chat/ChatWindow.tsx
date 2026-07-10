@@ -4,11 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CornerDownLeft, Square } from "lucide-react";
 
-import { runAgentTurn } from "../../lib/agentLoop";
+import { runAgentTurn, stopTurn } from "../../lib/agentLoop";
 import type { AttachmentRef } from "../../lib/agentLoop";
 import { isImagePath, readImageAsDataUrl } from "../../lib/imageAttachment";
 import { textContent } from "../../lib/llamaClient";
-import { useSessionStore } from "../../store/sessionStore";
+import { selectSessionMessages, selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
 import MessageList from "./MessageList";
 import { MentionAutocomplete } from "./MentionAutocomplete";
@@ -86,20 +86,27 @@ function filterMentionEntries(all: MentionEntry[], query: string): MentionEntry[
   return ranked.slice(0, MAX_MENTION_RESULTS).map((r) => r.entry);
 }
 
-export default function ChatWindow() {
-  const messages = useSessionStore((state) => state.messages);
+interface ChatWindowProps {
+  /** The session this pane renders and sends turns into. Each pane (primary
+   * and split — see App.tsx) owns one; they operate independently. */
+  sessionId: string;
+}
+
+export default function ChatWindow({ sessionId }: ChatWindowProps) {
+  const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
   const { t } = useT();
 
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
+  // Whether THIS pane's session has a turn in flight — session-scoped store
+  // state, not component state: the turn survives pane switches (keeping
+  // its Stop affordance wherever its session is shown), and a session
+  // already running a turn stays locked in whichever pane displays it.
+  const sending = useSessionStore(selectTurnRunning(sessionId));
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // The in-flight turn's abort handle, so the Stop button can cancel
-  // whichever transport (local fetch or Tauri-proxied provider) is active.
-  const abortControllerRef = useRef<AbortController | null>(null);
 
   // "@"-mention autocomplete state. `mentionQuery` being non-null is what
   // controls whether the popup is rendered at all.
@@ -208,21 +215,18 @@ export default function ChatWindow() {
 
   const sendTurn = useCallback((text: string, pendingAttachments: AttachmentRef[]) => {
     setError(null);
-    setSending(true);
 
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    void runAgentTurn(text, pendingAttachments, controller.signal)
+    // The agent loop owns the turn's abort handle (keyed by session — see
+    // stopTurn) and flips the per-session running flag `sending` above
+    // subscribes to, so nothing pane-local tracks the turn.
+    void runAgentTurn(sessionId, text, pendingAttachments)
       .catch((err: unknown) => {
         setError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        abortControllerRef.current = null;
-        setSending(false);
         textareaRef.current?.focus();
       });
-  }, []);
+  }, [sessionId]);
 
   const handleSend = useCallback(() => {
     const text = input.trim();
@@ -236,16 +240,16 @@ export default function ChatWindow() {
   }, [input, sending, attachments, resizeTextarea, sendTurn]);
 
   const handleStop = useCallback(() => {
-    abortControllerRef.current?.abort();
-  }, []);
+    stopTurn(sessionId);
+  }, [sessionId]);
 
   const handleEditMessage = useCallback(
     (index: number, newText: string) => {
       if (sending) return;
-      useSessionStore.getState().truncateFromIndex(index);
+      useSessionStore.getState().truncateFromIndex(sessionId, index);
       sendTurn(newText, []);
     },
-    [sending, sendTurn]
+    [sending, sendTurn, sessionId]
   );
 
   // Regenerate the last turn: drop everything from the last user message
@@ -256,7 +260,7 @@ export default function ChatWindow() {
   // its images.
   const handleRetry = useCallback(() => {
     if (sending) return;
-    const currentMessages = useSessionStore.getState().messages;
+    const currentMessages = sessionMessages(sessionId);
     let lastUserIndex = -1;
     for (let i = currentMessages.length - 1; i >= 0; i--) {
       if (currentMessages[i].role === "user") {
@@ -276,9 +280,9 @@ export default function ChatWindow() {
             .map((part, i) => ({ path: `retried-image-${i}`, isDir: false, kind: "image" as const, dataUrl: part.image_url.url }));
     if (!text.trim() && imageAttachments.length === 0) return;
 
-    useSessionStore.getState().truncateFromIndex(lastUserIndex);
+    useSessionStore.getState().truncateFromIndex(sessionId, lastUserIndex);
     sendTurn(text, imageAttachments);
-  }, [sending, sendTurn]);
+  }, [sending, sendTurn, sessionId]);
 
   const closeMentionPopup = useCallback(() => {
     setMentionQuery(null);
@@ -378,6 +382,7 @@ export default function ChatWindow() {
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col bg-background">
       <MessageList
+        sessionId={sessionId}
         messages={messages}
         onEditUserMessage={handleEditMessage}
         editingDisabled={sending}
@@ -409,7 +414,7 @@ export default function ChatWindow() {
       )}
 
       <div className="shrink-0 border-t border-border bg-background px-4 py-3">
-        <WorkspaceBar />
+        <WorkspaceBar sessionId={sessionId} />
         <div className="relative mx-auto max-w-3xl">
           {mentionQuery !== null && (
             <MentionAutocomplete
@@ -468,7 +473,7 @@ export default function ChatWindow() {
           <div className="flex items-center gap-3">
             <ModelSwitcher />
             <EffortSelector />
-            <ContextUsageIndicator />
+            <ContextUsageIndicator sessionId={sessionId} />
           </div>
         </div>
       </div>

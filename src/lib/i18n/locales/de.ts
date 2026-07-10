@@ -6,6 +6,7 @@ export const de: Record<string, string> = {
   "AppMenu.getHelp": "Hilfe erhalten",
   "AppMenu.version": "Little Monkey v{{version}}",
   "App.workspacePanelTitle": "Arbeitsbereich",
+  "App.closeSplitPane": "Geteilte Ansicht schließen",
   "App.collapseWorkspacePanel": "Arbeitsbereich-Panel einklappen",
   "App.expandWorkspacePanel": "Arbeitsbereich-Panel ausklappen",
   "App.diffPanelTitle": "Diff",

@@ -29,6 +29,10 @@ import MessageBubble from "./MessageBubble";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
+  /** The session whose transcript `messages` is — checkpoint notices mutate
+   * their own message in place and must target the right session when two
+   * panes are open. */
+  sessionId: string;
   messages: ChatMessage[];
   /** Called with a past user message's index and its edited text when the
    * user saves an edit — omit to disable the edit affordance entirely. */
@@ -235,9 +239,11 @@ const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
  * the state survives re-renders and app restarts.
  */
 const CheckpointRow = memo(function CheckpointRow({
+  sessionId,
   notice,
   messageIndex,
 }: {
+  sessionId: string;
   notice: CheckpointNotice;
   messageIndex: number;
 }) {
@@ -252,7 +258,7 @@ const CheckpointRow = memo(function CheckpointRow({
     setError(null);
     try {
       await invoke("checkpoint_revert", { id: notice.id });
-      useSessionStore.getState().updateMessageAt(messageIndex, {
+      useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: true }),
       });
     } catch (err) {
@@ -321,7 +327,7 @@ function canRetry(messages: ChatMessage[]): boolean {
   return messages.some((m) => m.role === "user");
 }
 
-export default function MessageList({ messages, onEditUserMessage, editingDisabled, onRetry }: MessageListProps) {
+export default function MessageList({ sessionId, messages, onEditUserMessage, editingDisabled, onRetry }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -373,7 +379,9 @@ export default function MessageList({ messages, onEditUserMessage, editingDisabl
               return <NoticeRow key={item.key} text={item.text} />;
             }
             if (item.kind === "checkpoint") {
-              return <CheckpointRow key={item.key} notice={item.notice} messageIndex={item.messageIndex} />;
+              return (
+                <CheckpointRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
+              );
             }
             return <TypingIndicator key={item.key} />;
           })}

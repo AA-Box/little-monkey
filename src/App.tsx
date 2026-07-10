@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { PanelRight, PanelRightClose } from "lucide-react";
+import { PanelRight, PanelRightClose, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { SettingsModal } from "./components/Settings";
 import { FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
+import { useSessionStore } from "./store/sessionStore";
 import { useWorkspaceStore } from "./store/workspaceStore";
 import { useModelStore } from "./store/modelStore";
 import { useT } from "./lib/i18n";
@@ -32,6 +33,12 @@ function formatError(err: unknown): string {
 
 function App() {
   const { t } = useT();
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const splitSessionId = useSessionStore((s) => s.splitSessionId);
+  const splitTitle = useSessionStore((s) =>
+    s.splitSessionId === null ? null : s.sessions.find((x) => x.id === s.splitSessionId)?.title ?? null
+  );
+  const closeSplit = useSessionStore((s) => s.closeSplit);
   const rootsVersion = useWorkspaceStore((s) => s.rootsVersion);
   const refreshRoots = useWorkspaceStore((s) => s.refreshRoots);
   const refreshRecent = useWorkspaceStore((s) => s.refreshRecent);
@@ -96,8 +103,26 @@ function App() {
       <div className="flex min-w-0 flex-1 flex-col">
         <div data-tauri-drag-region className="h-11 shrink-0" />
         <SessionGrantBanner />
-        <ChatWindow />
+        <ChatWindow sessionId={activeSessionId} />
       </div>
+
+      {/* Split pane: a second, fully independent chat opened via the session
+          menu's "Open in > Split view" — Claude-Desktop-style, inside the
+          same window. Its top strip doubles as the pane header: session
+          title + close, still draggable like the other title-bar strips. */}
+      {splitSessionId !== null && (
+        <div className="flex min-w-0 flex-1 flex-col border-l border-border">
+          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
+            <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
+              {splitTitle}
+            </span>
+            <IconButton size="sm" onClick={closeSplit} aria-label={t("App.closeSplitPane")}>
+              <X size={16} />
+            </IconButton>
+          </div>
+          <ChatWindow sessionId={splitSessionId} />
+        </div>
+      )}
 
       {/* Right: collapsible workspace panel (file tree + diff preview),
           also extending to the top of the window */}

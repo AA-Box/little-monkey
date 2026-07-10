@@ -39,7 +39,7 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt } from './systemPrompt';
-import { useSessionStore } from '../store/sessionStore';
+import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -411,7 +411,12 @@ function abortedPromise(signal: AbortSignal): Promise<void> {
  * shell child and denies any pending permission prompt) and a cancelled
  * result is returned immediately rather than waiting the command out.
  */
-async function executeToolCall(toolCall: ToolCall, signal?: AbortSignal): Promise<string> {
+async function executeToolCall(
+  toolCall: ToolCall,
+  checkpointId: string | null,
+  turnId: string,
+  signal?: AbortSignal
+): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
 
   let args: Record<string, unknown> = {};
@@ -426,6 +431,27 @@ async function executeToolCall(toolCall: ToolCall, signal?: AbortSignal): Promis
     }
   }
 
+  // File-mutating tools record a pre-mutation backup into this turn's own
+  // checkpoint — with the split pane, another turn (with its own checkpoint)
+  // may be running concurrently, so the id pins the backup to the right one.
+  // Injected here rather than exposed in the tool schema: the model must
+  // never pick (or fabricate) a checkpoint id. snake_case key — these
+  // commands use `rename_all = "snake_case"` so the model's snake_case tool
+  // arguments (old_string, new_string) match without translation.
+  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file')) {
+    args.checkpoint_id = checkpointId;
+  }
+  // The turn id scopes permission prompts and shell cancellation to THIS
+  // turn — Stop in one pane must not kill the other pane's command or deny
+  // its prompt. Injected like checkpoint_id (never model-supplied). Casing
+  // follows each command's macro: write/edit match snake_case keys,
+  // run_shell (no rename_all) matches the camelCase form.
+  if (name === 'write_file' || name === 'edit_file') {
+    args.turn_id = turnId;
+  } else if (name === 'run_shell') {
+    args.turnId = turnId;
+  }
+
   const invocation = invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
   if (!signal) return invocation;
 
@@ -435,7 +461,7 @@ async function executeToolCall(toolCall: ToolCall, signal?: AbortSignal): Promis
   // Aborted mid-invocation: kill what can be killed on the Rust side. The
   // original invocation promise already has handlers attached (never an
   // unhandled rejection) and its eventual result is simply discarded.
-  void invoke('tools_cancel_running').catch(() => {});
+  void invoke('tools_cancel_running', { turnId }).catch(() => {});
   return CANCELLED_TOOL_RESULT;
 }
 
@@ -465,6 +491,7 @@ async function attemptStream(
   tools: ToolDef[],
   signal: AbortSignal | undefined,
   effort: string | undefined,
+  sessionId: string,
   onDelta?: (content: string) => void
 ): Promise<AttemptResult> {
   if (target.kind === 'provider') recordRequest(target.providerId);
@@ -489,7 +516,7 @@ async function attemptStream(
         contentStarted = true;
         toolCalls.push(event.toolCall);
       } else if (event.type === 'usage') {
-        useUsageStore.getState().setUsage({
+        useUsageStore.getState().setUsage(sessionId, {
           promptTokens: event.usage.prompt_tokens,
           completionTokens: event.usage.completion_tokens,
           totalTokens: event.usage.total_tokens,
@@ -505,7 +532,9 @@ async function attemptStream(
 }
 
 /**
- * Runs one full agentic turn for `userText`: appends it to the session as a
+ * Runs one full agentic turn for `userText` in session `sessionId` (the
+ * chat pane that submitted it — with the split pane open, two turns can run
+ * concurrently in different sessions): appends it to that session as a
  * user message, then repeatedly calls the active model with the full
  * history and the available tools, streaming its reply into the chat and
  * executing any requested tool calls, until the model answers without
@@ -519,31 +548,78 @@ async function attemptStream(
  * checks whether history has crossed the configured context-trim threshold
  * and compacts it in place if so (see `contextTrimmer.ts`).
  */
+/** In-flight turns' abort handles, keyed by session id. The turn — not the
+ * pane — owns its controller: a pane switch mid-turn must leave the turn
+ * stoppable from whichever pane shows its session later. */
+const turnControllers = new Map<string, AbortController>();
+
+/** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
+ * buttons call this instead of holding their own AbortController — see
+ * `turnControllers`. */
+export function stopTurn(sessionId: string): void {
+  turnControllers.get(sessionId)?.abort();
+}
+
 export async function runAgentTurn(
+  sessionId: string,
   userText: string,
   attachments: AttachmentRef[] = [],
   signal?: AbortSignal
+): Promise<void> {
+  // Hard invariant: at most one turn per session, ever. Two turns streaming
+  // into one transcript interleave their `updateLastMessage` patches and
+  // corrupt it — the store's pane guards make this unreachable through the
+  // UI, but the loop enforces it regardless of caller.
+  if (turnControllers.has(sessionId)) {
+    throw new Error('A turn is already running in this session.');
+  }
+  const controller = new AbortController();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  turnControllers.set(sessionId, controller);
+  useSessionStore.getState().markTurnRunning(sessionId, true);
+  try {
+    await runTurnGuarded(sessionId, userText, attachments, controller.signal);
+  } finally {
+    turnControllers.delete(sessionId);
+    useSessionStore.getState().markTurnRunning(sessionId, false);
+  }
+}
+
+/** `runAgentTurn` minus the per-session turn registration — the checkpoint
+ * lifecycle half of the wrapper. */
+async function runTurnGuarded(
+  sessionId: string,
+  userText: string,
+  attachments: AttachmentRef[],
+  signal: AbortSignal
 ): Promise<void> {
   // Added as plain text first for instant feedback (resolving references
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
   // the chat UI actually shows what was attached, not just what was typed.
-  useSessionStore.getState().addMessage({ role: 'user', content: userText });
+  useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
 
   // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
   // every write_file/edit_file this turn makes can be reverted in one click.
-  // Failure to open one (e.g. app-data dir unavailable) must never block the
-  // turn itself — the turn just runs without a revert affordance.
-  const checkpointOpened = await invoke<string>('checkpoint_begin')
-    .then(() => true)
-    .catch(() => false);
+  // Checkpoints are keyed by id — with the split pane, the other pane's turn
+  // may hold its own concurrent checkpoint — so this turn's id is threaded
+  // through to every file-mutating tool call and to checkpoint_end. Failure
+  // to open one (e.g. app-data dir unavailable) must never block the turn
+  // itself — the turn just runs without a revert affordance.
+  const checkpointId = await invoke<string>('checkpoint_begin').catch(() => null);
+  // Distinct from checkpointId (which can be null): scopes shell
+  // cancellation and permission prompts to this turn on the Rust side.
+  const turnId = crypto.randomUUID();
   try {
-    await runAgentTurnBody(userText, attachments, signal);
+    await runAgentTurnBody(sessionId, userText, attachments, checkpointId, turnId, signal);
   } finally {
-    if (checkpointOpened) {
-      const summary = await invoke<CheckpointNotice>('checkpoint_end').catch(() => null);
+    if (checkpointId !== null) {
+      const summary = await invoke<CheckpointNotice>('checkpoint_end', { id: checkpointId }).catch(() => null);
       if (summary && summary.files.length > 0) {
-        useSessionStore.getState().addMessage({
+        useSessionStore.getState().addMessage(sessionId, {
           role: 'system',
           content: formatCheckpointNotice({ id: summary.id, files: summary.files }),
         });
@@ -556,11 +632,21 @@ export async function runAgentTurn(
  * per-turn checkpoint lifecycle with a single try/finally around every early
  * return this loop has. */
 async function runAgentTurnBody(
+  sessionId: string,
   userText: string,
   attachments: AttachmentRef[],
+  checkpointId: string | null,
+  turnId: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const { addMessage, updateLastMessage, removeLastMessage, replaceMessages } = useSessionStore.getState();
+  // Every transcript mutation this turn makes is pinned to the session the
+  // turn was submitted from — the user may be running another turn in the
+  // other pane (or reading a different session) meanwhile.
+  const store = useSessionStore.getState();
+  const addMessage = (msg: ChatMessage) => store.addMessage(sessionId, msg);
+  const updateLastMessage = (patch: Partial<ChatMessage>) => store.updateLastMessage(sessionId, patch);
+  const removeLastMessage = () => store.removeLastMessage(sessionId);
+  const replaceMessages = (messages: ChatMessage[]) => store.replaceMessages(sessionId, messages);
 
   // Resolve any "@"-mentions and explicit attachments in the raw user text
   // *once*, up front, for this turn. Text references only ever expand the
@@ -576,7 +662,7 @@ async function runAgentTurnBody(
   // object in the store, and this is the reference every later `===` match
   // against "this turn's user message" (for the wire-payload substitution
   // below, across every tool-calling round trip) needs to stay accurate.
-  const storedMessages = useSessionStore.getState().messages;
+  const storedMessages = sessionMessages(sessionId);
   const storedUserMessage = storedMessages[storedMessages.length - 1];
 
   // Surface any "@"-mentions that failed to resolve — the model only sees
@@ -647,7 +733,7 @@ async function runAgentTurnBody(
       },
       { role: 'user', content: renderForSummary(dropped) },
     ];
-    const result = await attemptStream(target, summaryMessages, [], signal, effort);
+    const result = await attemptStream(target, summaryMessages, [], signal, effort, sessionId);
     if (result.streamError) throw new Error(result.streamError);
     return result.content.trim() || '(summary unavailable)';
   };
@@ -658,7 +744,7 @@ async function runAgentTurnBody(
     if (signal?.aborted) return;
 
     if (settings.contextTrimEnabled) {
-      const current = useSessionStore.getState().messages;
+      const current = sessionMessages(sessionId);
       if (shouldTrim(current, useUsageStore.getState().contextLimit, settings.contextTrimThreshold)) {
         const result = await applyContextCompaction(current, {
           strategy: settings.contextTrimStrategy,
@@ -673,7 +759,7 @@ async function runAgentTurnBody(
     // Snapshot the history to send *before* appending this turn's in-progress
     // assistant placeholder, so the placeholder's (currently empty) content
     // never gets sent back to the model as part of its own history.
-    const history: ChatMessage[] = useSessionStore.getState().messages;
+    const history: ChatMessage[] = sessionMessages(sessionId);
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user
@@ -692,7 +778,7 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
-    let attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, (content) => updateLastMessage({ content }));
+    let attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, sessionId, (content) => updateLastMessage({ content }));
 
     // Failover: only ever retry a *different* target when nothing streamed
     // back yet for this attempt — once tokens have started arriving, a
@@ -711,7 +797,7 @@ async function runAgentTurnBody(
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, sessionId, (content) => updateLastMessage({ content }));
     }
 
     const { content, toolCalls, streamError } = attempt;
@@ -743,7 +829,7 @@ async function runAgentTurnBody(
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
-      const resultContent = signal?.aborted ? CANCELLED_TOOL_RESULT : await executeToolCall(toolCall, signal);
+      const resultContent = signal?.aborted ? CANCELLED_TOOL_RESULT : await executeToolCall(toolCall, checkpointId, turnId, signal);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,

@@ -54,8 +54,11 @@ export function ProviderCard({ provider }: ProviderCardProps) {
     if (!apiKey.trim() || saving) return;
     setSaving(true);
     try {
+      // Deliberately NOT cleared on success: the field stays filled while the
+      // card flips to its connected state, so a save never reads as "my key
+      // vanished". It is cleared in `handleRemoveKey` instead, so the secret
+      // can't silently repopulate the input after a later key removal.
       await setProviderKey(provider.id, apiKey);
-      setApiKey("");
     } catch {
       // Failure message is captured in `providerKeyError[provider.id]` by the store.
     } finally {
@@ -66,6 +69,7 @@ export function ProviderCard({ provider }: ProviderCardProps) {
   const handleRemoveKey = useCallback(async () => {
     if (!window.confirm(t("ProviderCard.confirmRemoveKey", { label: provider.label }))) return;
     await removeProviderKey(provider.id);
+    setApiKey("");
   }, [provider.id, provider.label, removeProviderKey, t]);
 
   const handleRefresh = useCallback(async () => {

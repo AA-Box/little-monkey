@@ -6,6 +6,7 @@ export const ja: Record<string, string> = {
   "AppMenu.getHelp": "ヘルプを表示",
   "AppMenu.version": "Little Monkey v{{version}}",
   "App.workspacePanelTitle": "ワークスペース",
+  "App.closeSplitPane": "分割表示を閉じる",
   "App.collapseWorkspacePanel": "ワークスペースパネルを折りたたむ",
   "App.expandWorkspacePanel": "ワークスペースパネルを展開",
   "App.diffPanelTitle": "差分",

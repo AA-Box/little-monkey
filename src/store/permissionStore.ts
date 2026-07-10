@@ -56,8 +56,19 @@ function readInitialMode(): PermissionMode {
 }
 
 export interface PermissionStore {
-  /** The currently pending permission request, or null if none is awaiting a decision. */
+  /**
+   * The permission request currently shown to the user (head of `queue`),
+   * or null if none is awaiting a decision.
+   */
   pending: PermissionRequest | null;
+  /**
+   * All unanswered requests in arrival order — with the split pane, two
+   * concurrent turns can each be waiting on a prompt at once, and a newly
+   * arriving request must queue behind the one on screen rather than
+   * silently replace it (the replaced turn would hang until the backend's
+   * timeout denies it, without the user ever seeing its prompt).
+   */
+  queue: PermissionRequest[];
   /**
    * Tool names currently granted "allow for session" status, purely for
    * display (e.g. a persistent banner warning the user unattended grants
@@ -97,6 +108,7 @@ export interface PermissionStore {
 
 export const usePermissionStore = create<PermissionStore>((set, get) => ({
   pending: null,
+  queue: [],
   sessionGrants: [],
   mode: readInitialMode(),
 
@@ -123,7 +135,12 @@ export const usePermissionStore = create<PermissionStore>((set, get) => ({
         );
       }
     } finally {
-      set({ pending: null });
+      // Show the next queued request (another turn's prompt that arrived
+      // while this one was on screen), if any.
+      set((state) => {
+        const queue = state.queue.filter((r) => r.id !== pending.id);
+        return { queue, pending: queue[0] ?? null };
+      });
     }
   },
 
@@ -143,7 +160,12 @@ export const usePermissionStore = create<PermissionStore>((set, get) => ({
 }));
 
 void listen<PermissionRequest>("permission://request", (event) => {
-  usePermissionStore.setState({ pending: event.payload });
+  usePermissionStore.setState((state) => {
+    // Duplicate delivery of an id already queued — keep state as is.
+    if (state.queue.some((r) => r.id === event.payload.id)) return state;
+    const queue = [...state.queue, event.payload];
+    return { queue, pending: state.pending ?? event.payload };
+  });
 }).catch((error) => {
   console.error("Failed to listen for permission://request events", error);
 });

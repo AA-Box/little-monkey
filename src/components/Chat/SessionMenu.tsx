@@ -92,8 +92,13 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
   const resolveWorkspacePath = () =>
     session.workspacePath ?? primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null;
 
-  const openWindow = (tile: boolean) => {
-    void invoke("open_session_window", { sessionId: session.id, tile }).catch((err) => console.error(err));
+  // In-window split pane (Claude-Desktop-style) — see App.tsx.
+  const openSplit = () => {
+    useSessionStore.getState().openSplit(session.id);
+  };
+
+  const openWindow = () => {
+    void invoke("open_session_window", { sessionId: session.id }).catch((err) => console.error(err));
   };
 
   const openEditor = (editor: "cursor" | "vscode") => {
@@ -127,11 +132,11 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
           onClose();
           break;
         case "1":
-          openWindow(true);
+          openSplit();
           onClose();
           break;
         case "2":
-          openWindow(false);
+          openWindow();
           onClose();
           break;
         case "3":
@@ -209,14 +214,14 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
           <ChevronRight size={14} className="text-faint" />
         </button>
         <div className={`${submenuClass} group-hover/openin:visible group-hover/openin:opacity-100`}>
-          <button type="button" onClick={() => { openWindow(true); onClose(); }} className={itemClass}>
+          <button type="button" onClick={() => { openSplit(); onClose(); }} className={itemClass}>
             <span className="flex items-center gap-2">
               <Columns2 size={14} className="text-faint" />
               {t("SessionMenu.splitView")}
             </span>
             <kbd className="text-xs text-faint">1</kbd>
           </button>
-          <button type="button" onClick={() => { openWindow(false); onClose(); }} className={itemClass}>
+          <button type="button" onClick={() => { openWindow(); onClose(); }} className={itemClass}>
             <span className="flex items-center gap-2">
               <AppWindow size={14} className="text-faint" />
               {t("SessionMenu.newWindow")}

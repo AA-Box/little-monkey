@@ -5,7 +5,7 @@ import { FolderOpen, FolderPlus, GitBranch, GitFork, RefreshCw, SquareTerminal }
 
 import { Button, ContextMenu, IconButton } from "../ui";
 import { AttachmentChip } from "../Chat";
-import { useSessionStore } from "../../store/sessionStore";
+import { selectSessionMessages, useSessionStore } from "../../store/sessionStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { useT } from "../../lib/i18n";
 
@@ -65,7 +65,7 @@ const ACTION_MESSAGE_MS = 2000;
  * actions (Show in Finder / Copy path / Open in terminal / copy branch or
  * worktree name) stay available since they don't mutate anything.
  */
-export function WorkspaceBar() {
+export function WorkspaceBar({ sessionId }: { sessionId: string }) {
   const { t } = useT();
   const roots = useWorkspaceStore((s) => s.roots);
   const recent = useWorkspaceStore((s) => s.recent);
@@ -73,7 +73,7 @@ export function WorkspaceBar() {
   const openPrimary = useWorkspaceStore((s) => s.openPrimary);
   const addSecondary = useWorkspaceStore((s) => s.addSecondary);
   const removeSecondary = useWorkspaceStore((s) => s.removeSecondary);
-  const locked = useSessionStore((s) => s.messages.length > 0);
+  const locked = useSessionStore((s) => selectSessionMessages(sessionId)(s).length > 0);
 
   const primary = primaryRoot(roots);
   const secondaries = roots.filter((r) => !r.is_primary);

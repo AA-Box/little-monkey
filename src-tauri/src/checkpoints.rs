@@ -3,16 +3,19 @@
 //! file changes can be reverted with one click.
 //!
 //! Lifecycle (driven by the frontend agent loop in `src/lib/agentLoop.ts`):
-//! 1. `checkpoint_begin` at turn start — opens an "active" checkpoint.
-//! 2. While active, every `tool_write_file`/`tool_edit_file` calls
-//!    [`record_original`] *before* touching the file, which copies the
-//!    pre-mutation content (or records "did not exist") into the checkpoint
-//!    directory. Only the first mutation of a given path per turn is
-//!    recorded — later writes in the same turn would otherwise clobber the
-//!    true original.
-//! 3. `checkpoint_end` at turn end — writes a manifest and reports which
-//!    files were touched (empty = checkpoint discarded), so the frontend can
-//!    show a "revert this turn" affordance only when something changed.
+//! 1. `checkpoint_begin` at turn start — opens a checkpoint and returns its
+//!    id. Multiple checkpoints can be open at once (the split pane runs two
+//!    turns concurrently), so all per-turn state is keyed by that id.
+//! 2. While open, every `tool_write_file`/`tool_edit_file` calls
+//!    [`record_original`] with the owning turn's checkpoint id *before*
+//!    touching the file, which copies the pre-mutation content (or records
+//!    "did not exist") into that checkpoint's directory. Only the first
+//!    mutation of a given path per turn is recorded — later writes in the
+//!    same turn would otherwise clobber the true original.
+//! 3. `checkpoint_end` (with the id) at turn end — writes a manifest and
+//!    reports which files were touched (empty = checkpoint discarded), so
+//!    the frontend can show a "revert this turn" affordance only when
+//!    something changed.
 //! 4. `checkpoint_revert` (user-initiated UI action, like `git_commit` — not
 //!    permission-gated) restores every recorded file: originals are copied
 //!    back, files that didn't exist before the turn are deleted.
@@ -43,9 +46,9 @@ pub struct CheckpointEntry {
     pub backup: Option<String>,
 }
 
-/// The currently-open checkpoint, if a turn is in flight.
+/// An open checkpoint for one in-flight turn. Lives in `AppState::checkpoints`
+/// keyed by its id until the turn's `checkpoint_end` removes it.
 pub struct ActiveCheckpoint {
-    pub id: String,
     pub dir: PathBuf,
     pub entries: Vec<CheckpointEntry>,
 }
@@ -114,33 +117,35 @@ pub fn begin_impl(state: &AppState, base_dir: &Path) -> Result<String, String> {
     let dir = base_dir.join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create checkpoint dir: {}", e))?;
 
-    let mut active = state
-        .checkpoint
+    // A checkpoint whose turn crashed mid-flight (its `checkpoint_end` never
+    // arrives) stays in the map until app restart — a few stray entries at
+    // most, and its manifest-less directory on disk is inert and gets pruned
+    // eventually.
+    state
+        .checkpoints
         .lock()
-        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
-    // A leftover active checkpoint (previous turn crashed mid-flight) is
-    // finalized implicitly by being replaced — its directory stays on disk
-    // but without a manifest it is inert and gets pruned eventually.
-    *active = Some(ActiveCheckpoint {
-        id: id.clone(),
-        dir,
-        entries: Vec::new(),
-    });
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?
+        .insert(id.clone(), ActiveCheckpoint { dir, entries: Vec::new() });
 
     Ok(id)
 }
 
-/// Snapshot `resolved`'s current content into the active checkpoint (no-op
-/// if no checkpoint is active, or this path was already recorded this turn).
-/// Called by `tool_write_file`/`tool_edit_file` BEFORE mutating the file. A
-/// backup failure aborts the mutation — writing without a recoverable
-/// original would silently break the revert guarantee.
-pub fn record_original(state: &AppState, resolved: &Path) -> Result<(), String> {
+/// Snapshot `resolved`'s current content into checkpoint `id` (no-op if `id`
+/// is `None` — the turn runs without a checkpoint — or unknown, or this path
+/// was already recorded this turn). Called by `tool_write_file`/
+/// `tool_edit_file` BEFORE mutating the file. A backup failure aborts the
+/// mutation — writing without a recoverable original would silently break
+/// the revert guarantee.
+pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> Result<(), String> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+
     let mut guard = state
-        .checkpoint
+        .checkpoints
         .lock()
         .map_err(|_| "Checkpoint lock poisoned".to_string())?;
-    let Some(active) = guard.as_mut() else {
+    let Some(active) = guard.get_mut(id) else {
         return Ok(());
     };
 
@@ -162,14 +167,14 @@ pub fn record_original(state: &AppState, resolved: &Path) -> Result<(), String> 
     Ok(())
 }
 
-/// Core end logic: close the active checkpoint, persist its manifest (or
-/// discard the empty directory), and report what was touched.
-pub fn end_impl(state: &AppState) -> Result<CheckpointSummary, String> {
+/// Core end logic: close checkpoint `id`, persist its manifest (or discard
+/// the empty directory), and report what was touched.
+pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String> {
     let taken = state
-        .checkpoint
+        .checkpoints
         .lock()
         .map_err(|_| "Checkpoint lock poisoned".to_string())?
-        .take();
+        .remove(id);
 
     let Some(active) = taken else {
         return Ok(CheckpointSummary { id: String::new(), files: Vec::new() });
@@ -177,7 +182,7 @@ pub fn end_impl(state: &AppState) -> Result<CheckpointSummary, String> {
 
     if active.entries.is_empty() {
         let _ = std::fs::remove_dir_all(&active.dir);
-        return Ok(CheckpointSummary { id: active.id, files: Vec::new() });
+        return Ok(CheckpointSummary { id: id.to_string(), files: Vec::new() });
     }
 
     let manifest = serde_json::to_string_pretty(&active.entries)
@@ -186,7 +191,7 @@ pub fn end_impl(state: &AppState) -> Result<CheckpointSummary, String> {
         .map_err(|e| format!("Failed to write checkpoint manifest: {}", e))?;
 
     Ok(CheckpointSummary {
-        id: active.id,
+        id: id.to_string(),
         files: active.entries.iter().map(|e| e.path.clone()).collect(),
     })
 }
@@ -239,11 +244,11 @@ pub fn checkpoint_begin(app: tauri::AppHandle, state: tauri::State<'_, AppState>
     begin_impl(state.inner(), &checkpoints_base_dir(&app)?)
 }
 
-/// Close the active checkpoint; returns the touched files (empty = nothing
-/// was mutated this turn and the checkpoint was discarded).
+/// Close checkpoint `id`; returns the touched files (empty = nothing was
+/// mutated this turn and the checkpoint was discarded).
 #[tauri::command]
-pub fn checkpoint_end(state: tauri::State<'_, AppState>) -> Result<CheckpointSummary, String> {
-    end_impl(state.inner())
+pub fn checkpoint_end(state: tauri::State<'_, AppState>, id: String) -> Result<CheckpointSummary, String> {
+    end_impl(state.inner(), &id)
 }
 
 /// Restore every file recorded in checkpoint `id` to its pre-turn state.
@@ -291,15 +296,16 @@ mod tests {
     }
 
     #[test]
-    fn record_is_a_noop_without_an_active_checkpoint() {
+    fn record_is_a_noop_without_a_checkpoint_id() {
         let state = AppState::default();
         let ws = TempDir::new("ws");
         let file = ws.path.join("a.txt");
         std::fs::write(&file, "hello").unwrap();
 
-        record_original(&state, &file).unwrap();
+        record_original(&state, None, &file).unwrap();
+        record_original(&state, Some("0000-unknown-id"), &file).unwrap();
 
-        assert!(state.checkpoint.lock().unwrap().is_none());
+        assert!(state.checkpoints.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -308,7 +314,7 @@ mod tests {
         let base = TempDir::new("base");
 
         let id = begin_impl(&state, &base.path).unwrap();
-        let summary = end_impl(&state).unwrap();
+        let summary = end_impl(&state, &id).unwrap();
 
         assert_eq!(summary.id, id);
         assert!(summary.files.is_empty());
@@ -326,11 +332,11 @@ mod tests {
         let created = ws.path.join("created.txt");
 
         let id = begin_impl(&state, &base.path).unwrap();
-        record_original(&state, &existing).unwrap();
+        record_original(&state, Some(&id), &existing).unwrap();
         std::fs::write(&existing, "mutated").unwrap();
-        record_original(&state, &created).unwrap();
+        record_original(&state, Some(&id), &created).unwrap();
         std::fs::write(&created, "brand new").unwrap();
-        let summary = end_impl(&state).unwrap();
+        let summary = end_impl(&state, &id).unwrap();
 
         assert_eq!(summary.files.len(), 2);
 
@@ -338,6 +344,43 @@ mod tests {
         assert_eq!(reverted, 2);
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), "original");
         assert!(!created.exists(), "file created during the turn must be deleted on revert");
+    }
+
+    #[test]
+    fn concurrent_checkpoints_record_and_end_independently() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file_a = ws.path.join("a.txt");
+        std::fs::write(&file_a, "a-original").unwrap();
+        let file_b = ws.path.join("b.txt");
+        std::fs::write(&file_b, "b-original").unwrap();
+
+        // Two turns in flight at once (split pane): each records its own
+        // file under its own checkpoint id, in interleaved order.
+        let id_a = begin_impl(&state, &base.path).unwrap();
+        let id_b = begin_impl(&state, &base.path).unwrap();
+        record_original(&state, Some(&id_a), &file_a).unwrap();
+        std::fs::write(&file_a, "a-mutated").unwrap();
+        record_original(&state, Some(&id_b), &file_b).unwrap();
+        std::fs::write(&file_b, "b-mutated").unwrap();
+
+        // Ending turn A must not close or steal turn B's checkpoint.
+        let summary_a = end_impl(&state, &id_a).unwrap();
+        assert_eq!(summary_a.id, id_a);
+        assert_eq!(summary_a.files, vec![file_a.to_string_lossy().to_string()]);
+
+        let summary_b = end_impl(&state, &id_b).unwrap();
+        assert_eq!(summary_b.id, id_b);
+        assert_eq!(summary_b.files, vec![file_b.to_string_lossy().to_string()]);
+
+        // Each revert restores only its own turn's file.
+        revert_impl(&base.path, &id_a).unwrap();
+        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "a-original");
+        assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "b-mutated");
+        revert_impl(&base.path, &id_b).unwrap();
+        assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "b-original");
     }
 
     #[test]
@@ -350,11 +393,11 @@ mod tests {
         std::fs::write(&file, "v1").unwrap();
 
         let id = begin_impl(&state, &base.path).unwrap();
-        record_original(&state, &file).unwrap();
+        record_original(&state, Some(&id), &file).unwrap();
         std::fs::write(&file, "v2").unwrap();
-        record_original(&state, &file).unwrap(); // second write same turn
+        record_original(&state, Some(&id), &file).unwrap(); // second write same turn
         std::fs::write(&file, "v3").unwrap();
-        end_impl(&state).unwrap();
+        end_impl(&state, &id).unwrap();
 
         revert_impl(&base.path, &id).unwrap();
         assert_eq!(
