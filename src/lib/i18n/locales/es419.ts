@@ -103,6 +103,7 @@ export const es419: Record<string, string> = {
   "MessageList.checkpointRestoreBoth": "Restaurar ambos",
   "MessageList.checkpointRewindBlockedTurnRunning": "No disponible mientras se genera una respuesta",
   "MessageList.checkpointRewindUnavailable": "La conversación cambió: solo se pueden restaurar los archivos",
+  "MessageList.checkpointShellRanCaveat": "Se ejecutó un comando de shell; restaurar los archivos podría no deshacer todo",
   "MessageList.emptyStateTitle": "Todavía no hay nada aquí",
   "MessageList.emptyStateDescription": "Pídele a Little Monkey que explique, escriba o corrija algo en tu espacio de trabajo para comenzar.",
   "ModeSelector.modeManualLabel": "Manual",

@@ -398,16 +398,24 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 
 /// Run a shell command (via `sh -c`, or `cmd /C` on Windows) rooted at `cwd`
 /// (defaults to the workspace root), with a hard timeout. Permission-gated.
-#[tauri::command]
+/// `checkpoint_id` is injected by the frontend agent loop (not the model), the
+/// same as `tool_write_file`/`tool_edit_file` — but here it isn't used to
+/// snapshot anything (shell side effects aren't captured); it only flags the
+/// owning turn's checkpoint as `shell_ran` so the UI can show a revert-coverage
+/// caveat.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     command: String,
     cwd: Option<String>,
+    checkpoint_id: Option<String>,
     turn_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref())
         .await?;
+
+    checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
 
     let cwd_path = match cwd {
         Some(ref c) => workspace::resolve_path_and_root(state.inner(), c)?.0,

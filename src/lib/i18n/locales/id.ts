@@ -103,6 +103,7 @@ export const id: Record<string, string> = {
   "MessageList.checkpointRestoreBoth": "Pulihkan keduanya",
   "MessageList.checkpointRewindBlockedTurnRunning": "Tidak tersedia saat balasan sedang berlangsung",
   "MessageList.checkpointRewindUnavailable": "Percakapan telah berubah — hanya berkas yang dapat dipulihkan",
+  "MessageList.checkpointShellRanCaveat": "Perintah shell telah dijalankan; pemulihan berkas mungkin tidak membatalkan semuanya",
   "MessageList.emptyStateTitle": "Belum ada apa pun di sini",
   "MessageList.emptyStateDescription": "Minta Little Monkey menjelaskan, menulis, atau memperbaiki sesuatu di ruang kerja Anda untuk memulai.",
   "ModeSelector.modeManualLabel": "Manual",

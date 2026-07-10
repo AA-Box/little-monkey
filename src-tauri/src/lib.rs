@@ -1,4 +1,4 @@
-mod checkpoints;
+pub mod checkpoints;
 mod git;
 mod llama;
 mod models;

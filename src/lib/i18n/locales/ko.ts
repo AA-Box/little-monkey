@@ -103,6 +103,7 @@ export const ko: Record<string, string> = {
   "MessageList.checkpointRestoreBoth": "둘 다 복원",
   "MessageList.checkpointRewindBlockedTurnRunning": "응답이 진행 중일 때는 사용할 수 없습니다",
   "MessageList.checkpointRewindUnavailable": "대화가 변경되어 파일만 복원할 수 있습니다",
+  "MessageList.checkpointShellRanCaveat": "셸 명령이 실행되었습니다. 파일 복원으로 모든 것을 되돌리지 못할 수 있습니다",
   "MessageList.emptyStateTitle": "아직 표시할 내용이 없습니다",
   "MessageList.emptyStateDescription": "Little Monkey에게 워크스페이스에서 설명, 작성 또는 수정할 작업을 요청해 시작해 보세요.",
   "ModeSelector.modeManualLabel": "수동",

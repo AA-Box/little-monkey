@@ -97,8 +97,9 @@ export interface CheckpointNotice {
    * `anchorIndex` still points at the same message after compaction or
    * edit-and-resubmit shifted indices. */
   label?: string;
-  /** True if a shell command ran during the turn, meaning file restore may
-   * not undo everything. Always false until `record_shell` lands. */
+  /** True if `run_shell` executed during the turn (see `record_shell` in
+   * checkpoints.rs) — file restore may not undo everything, since shell side
+   * effects are never snapshotted. */
   shellRan?: boolean;
   /** Set once the user has reverted this checkpoint. */
   reverted?: boolean;
@@ -468,22 +469,22 @@ async function executeToolCall(
   // File-mutating tools record a pre-mutation backup into this turn's own
   // checkpoint — with the split pane, another turn (with its own checkpoint)
   // may be running concurrently, so the id pins the backup to the right one.
-  // Injected here rather than exposed in the tool schema: the model must
-  // never pick (or fabricate) a checkpoint id. snake_case key — these
-  // commands use `rename_all = "snake_case"` so the model's snake_case tool
-  // arguments (old_string, new_string) match without translation.
-  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file')) {
+  // run_shell doesn't snapshot anything, but gets the same injected id so
+  // `record_shell` can flag the owning checkpoint's `shell_ran` — the
+  // revert-coverage caveat the UI shows. Injected here rather than exposed in
+  // the tool schema: the model must never pick (or fabricate) a checkpoint
+  // id. snake_case key — write_file/edit_file/run_shell all use
+  // `rename_all = "snake_case"` so the model's snake_case tool arguments
+  // (old_string, new_string) match without translation.
+  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
     args.checkpoint_id = checkpointId;
   }
   // The turn id scopes permission prompts and shell cancellation to THIS
   // turn — Stop in one pane must not kill the other pane's command or deny
-  // its prompt. Injected like checkpoint_id (never model-supplied). Casing
-  // follows each command's macro: write/edit match snake_case keys,
-  // run_shell (no rename_all) matches the camelCase form.
-  if (name === 'write_file' || name === 'edit_file') {
+  // its prompt. Injected like checkpoint_id (never model-supplied). All three
+  // commands use `rename_all = "snake_case"`, so all take the snake_case key.
+  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell') {
     args.turn_id = turnId;
-  } else if (name === 'run_shell') {
-    args.turnId = turnId;
   }
 
   const invocation = invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);

@@ -103,6 +103,7 @@ export const it: Record<string, string> = {
   "MessageList.checkpointRestoreBoth": "Ripristina entrambi",
   "MessageList.checkpointRewindBlockedTurnRunning": "Non disponibile mentre è in corso una risposta",
   "MessageList.checkpointRewindUnavailable": "La conversazione è cambiata — è possibile ripristinare solo i file",
+  "MessageList.checkpointShellRanCaveat": "È stato eseguito un comando shell; il ripristino dei file potrebbe non annullare tutto",
   "MessageList.emptyStateTitle": "Non c'è ancora nulla qui",
   "MessageList.emptyStateDescription": "Chiedi a Little Monkey di spiegare, scrivere o correggere qualcosa nella tua area di lavoro per iniziare.",
   "ModeSelector.modeManualLabel": "Manuale",

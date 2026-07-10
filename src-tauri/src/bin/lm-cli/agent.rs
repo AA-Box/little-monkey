@@ -7,8 +7,10 @@
 //! produces a plain answer with no tool calls, or after MAX_ITERATIONS round
 //! trips as a safety cap against a runaway/looping model.
 
+use little_monkey_lib::checkpoints;
 use little_monkey_lib::AppState;
 
+use crate::checkpoints_cli;
 use crate::chat::{self, Target};
 use crate::permission::TerminalPermissions;
 use crate::tools_cli;
@@ -34,6 +36,7 @@ async fn execute_tool_call(
     perms: &mut TerminalPermissions,
     name: &str,
     raw_arguments: &str,
+    checkpoint_id: Option<&str>,
 ) -> String {
     let args: serde_json::Value = if raw_arguments.trim().is_empty() {
         serde_json::json!({})
@@ -62,6 +65,7 @@ async fn execute_tool_call(
                 perms,
                 args["path"].as_str().unwrap_or_default(),
                 args["content"].as_str().unwrap_or_default(),
+                checkpoint_id,
             )
             .await
             .map(serde_json::Value::String)
@@ -73,13 +77,20 @@ async fn execute_tool_call(
                 args["path"].as_str().unwrap_or_default(),
                 args["old_string"].as_str().unwrap_or_default(),
                 args["new_string"].as_str().unwrap_or_default(),
+                checkpoint_id,
             )
             .await
             .map(serde_json::Value::String)
         }
         "run_shell" => {
-            tools_cli::run_shell(state, perms, args["command"].as_str().unwrap_or_default(), args["cwd"].as_str())
-                .await
+            tools_cli::run_shell(
+                state,
+                perms,
+                args["command"].as_str().unwrap_or_default(),
+                args["cwd"].as_str(),
+                checkpoint_id,
+            )
+            .await
         }
         other => Err(format!("Unknown tool \"{other}\"")),
     };
@@ -165,6 +176,11 @@ async fn build_user_message(
 /// repeatedly calls the model with the full history and available tools,
 /// printing its reply as it streams and executing any requested tool calls,
 /// until it answers without requesting further tools or the safety cap hits.
+///
+/// Opens a per-turn checkpoint (see `checkpoints_cli.rs`) before the
+/// tool-calling loop and always closes it afterward — success or error alike
+/// — the same finally-equivalent shape `agentLoop.ts`'s `runTurnGuarded` uses,
+/// just without a session/timeline (CLI history is in-memory only).
 pub async fn run_turn(
     client: &reqwest::Client,
     target: &Target,
@@ -179,6 +195,37 @@ pub async fn run_turn(
     }
     history.push(build_user_message(client, target, options, user_text).await?);
 
+    // `None` (no app-data dir resolvable, or it couldn't be created) just
+    // means this turn runs without a checkpoint — same tolerance
+    // `record_original`/`record_shell` already have for a missing id.
+    let anchor_index = history.len() - 1;
+    let label: String = user_text.chars().take(120).collect();
+    let checkpoint_id = checkpoints_cli::base_dir().and_then(|base| {
+        checkpoints::begin_impl(state, &base, checkpoints_cli::CLI_SESSION_ID.to_string(), anchor_index, label, None)
+            .ok()
+    });
+
+    let result = run_tool_loop(client, target, state, perms, history, options, checkpoint_id.as_deref()).await;
+
+    if let Some(id) = &checkpoint_id {
+        let _ = checkpoints::end_impl(state, id);
+    }
+
+    result
+}
+
+/// The tool-calling loop itself, factored out of `run_turn` so the
+/// checkpoint's `end_impl` above can run unconditionally regardless of how
+/// this returns (a model error via `?`, the safety cap, or a plain answer).
+async fn run_tool_loop(
+    client: &reqwest::Client,
+    target: &Target,
+    state: &AppState,
+    perms: &mut TerminalPermissions,
+    history: &mut Vec<serde_json::Value>,
+    options: &chat::ChatOptions,
+    checkpoint_id: Option<&str>,
+) -> Result<(), String> {
     let tools = tool_definitions();
     let tools_vec: Vec<serde_json::Value> = tools.as_array().cloned().unwrap_or_default();
     let native = target.is_native();
@@ -229,7 +276,7 @@ pub async fn run_turn(
 
         for call in &result.tool_calls {
             println!("\n[tool] {}({})", call.name, call.arguments);
-            let content = execute_tool_call(state, perms, &call.name, &call.arguments).await;
+            let content = execute_tool_call(state, perms, &call.name, &call.arguments, checkpoint_id).await;
             println!("[tool result] {}", preview(&content, 300));
             history.push(if native {
                 serde_json::json!({ "role": "tool", "tool_name": call.name, "content": content })

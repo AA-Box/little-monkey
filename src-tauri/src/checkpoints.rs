@@ -298,6 +298,28 @@ pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> R
     Ok(())
 }
 
+/// Marks checkpoint `id`'s turn as having run `tool_run_shell` (no-op if `id`
+/// is `None` or unknown — mirrors [`record_original`]'s tolerance). Called by
+/// `tool_run_shell` BEFORE spawning the command. No snapshotting happens here:
+/// shell side effects are never captured, so this only makes the manifest's
+/// `shell_ran` flag (and therefore the UI's revert-coverage caveat) honest.
+pub fn record_shell(state: &AppState, id: Option<&str>) -> Result<(), String> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+
+    let mut guard = state
+        .checkpoints
+        .lock()
+        .map_err(|_| "Checkpoint lock poisoned".to_string())?;
+    let Some(active) = guard.get_mut(id) else {
+        return Ok(());
+    };
+
+    active.shell_ran = true;
+    Ok(())
+}
+
 /// Parses a raw `manifest.json`, falling back from the versioned v2 struct
 /// to the bare v1 `Vec<CheckpointEntry>` shape and synthesizing defaults
 /// (creation time from the checkpoint dir's mtime, empty session/label) so
@@ -656,6 +678,31 @@ mod tests {
         record_original(&state, Some("0000-unknown-id"), &file).unwrap();
 
         assert!(state.checkpoints.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_shell_sets_the_flag_and_is_a_noop_without_a_checkpoint_id() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+
+        // No-op cases: no id, or an id with no active checkpoint.
+        record_shell(&state, None).unwrap();
+        record_shell(&state, Some("0000-unknown-id")).unwrap();
+
+        let id = begin(&state, &base.path);
+        assert!(!state.checkpoints.lock().unwrap()[&id].shell_ran);
+
+        record_shell(&state, Some(&id)).unwrap();
+        assert!(state.checkpoints.lock().unwrap()[&id].shell_ran, "shell_ran must flip to true");
+
+        // The flag must survive into the persisted manifest via checkpoint_end.
+        let ws = TempDir::new("ws");
+        let file = ws.path.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        record_original(&state, Some(&id), &file).unwrap();
+        let summary = end_impl(&state, &id).unwrap();
+        assert!(summary.shell_ran);
+        assert!(read_manifest(&base.path, &id).unwrap().shell_ran);
     }
 
     #[test]

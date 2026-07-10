@@ -103,6 +103,7 @@ export const hi: Record<string, string> = {
   "MessageList.checkpointRestoreBoth": "दोनों पुनर्स्थापित करें",
   "MessageList.checkpointRewindBlockedTurnRunning": "जवाब तैयार होते समय उपलब्ध नहीं",
   "MessageList.checkpointRewindUnavailable": "बातचीत बदल गई है — केवल फ़ाइलें ही पुनर्स्थापित की जा सकती हैं",
+  "MessageList.checkpointShellRanCaveat": "शेल कमांड चलाया गया; फ़ाइल पुनर्स्थापना से सब कुछ पूर्ववत नहीं हो सकता",
   "MessageList.emptyStateTitle": "अभी यहां कुछ नहीं है",
   "MessageList.emptyStateDescription": "शुरू करने के लिए Little Monkey से अपने वर्कस्पेस में कुछ समझाने, लिखने या ठीक करने के लिए कहें।",
   "ModeSelector.modeManualLabel": "मैनुअल",
