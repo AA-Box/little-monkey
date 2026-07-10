@@ -140,6 +140,8 @@ pub fn run() {
             mcp::mcp_set_enabled,
             mcp::mcp_connect,
             mcp::mcp_disconnect,
+            mcp::mcp_set_http_token,
+            mcp::mcp_remove_http_token,
             mcp::mcp_list_tools,
             mcp::mcp_call_tool,
             system::reveal_in_finder,

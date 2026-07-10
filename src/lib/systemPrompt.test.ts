@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSystemPrompt, detectOsLabel } from './systemPrompt';
+import { buildSystemPrompt, detectOsLabel, type McpServerPromptInfo } from './systemPrompt';
 import type { MemoryFact, RuleFile } from '../store/rulesStore';
 
 describe('detectOsLabel', () => {
@@ -100,5 +100,26 @@ describe('buildSystemPrompt', () => {
 
     const withoutFacts = buildSystemPrompt([primary], 'macOS', [], []);
     expect(withoutFacts).not.toContain('Remembered facts');
+  });
+
+  it('appends each connected MCP server\'s instructions, and omits the section when there are none', () => {
+    const mcpServers: McpServerPromptInfo[] = [{ label: 'GitHub', instructions: 'Use search_repositories before cloning.' }];
+
+    const withMcp = buildSystemPrompt([primary], 'macOS', [], [], mcpServers);
+    expect(withMcp).toContain('## Connected MCP servers');
+    expect(withMcp).toContain("MCP server 'GitHub': Use search_repositories before cloning.");
+
+    const withoutMcp = buildSystemPrompt([primary], 'macOS', [], [], []);
+    expect(withoutMcp).not.toContain('Connected MCP servers');
+  });
+
+  it('caps a connected MCP server\'s instructions at 1000 characters', () => {
+    const longInstructions = 'x'.repeat(1500);
+    const mcpServers: McpServerPromptInfo[] = [{ label: 'Verbose', instructions: longInstructions }];
+
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], mcpServers);
+
+    expect(prompt).toContain(`MCP server 'Verbose': ${'x'.repeat(1000)}…`);
+    expect(prompt).not.toContain('x'.repeat(1001));
   });
 });

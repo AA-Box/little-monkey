@@ -60,6 +60,9 @@ export interface McpServerInfo {
   error: string | null;
   tools: CachedMcpTool[];
   instructions: string | null;
+  /** Whether a bearer token is currently saved in the keychain for this
+   * server (never the token itself) — always `false` for `stdio` servers. */
+  hasHttpToken: boolean;
 }
 
 /**
@@ -89,10 +92,14 @@ export interface McpStore {
   removeServer: (id: string) => Promise<void>;
   /** Enable or disable a configured server; disabling a connected one also disconnects it. */
   setEnabled: (id: string, enabled: boolean) => Promise<void>;
-  /** Connect to a configured server (stdio only for now), caching its tool list. */
+  /** Connect to a configured server (stdio or HTTP), caching its tool list. */
   connect: (id: string) => Promise<void>;
   /** Disconnect a currently-connected server. */
   disconnect: (id: string) => Promise<void>;
+  /** Save (or overwrite) an HTTP server's bearer token in the OS keychain — never sent to `mcp_servers.json`. Takes effect on the next `connect`. */
+  setHttpToken: (id: string, token: string) => Promise<void>;
+  /** Remove an HTTP server's saved bearer token from the OS keychain. */
+  removeHttpToken: (id: string) => Promise<void>;
 }
 
 export const useMcpStore = create<McpStore>((set, get) => ({
@@ -130,6 +137,16 @@ export const useMcpStore = create<McpStore>((set, get) => ({
 
   disconnect: async (id) => {
     await invoke("mcp_disconnect", { server_id: id });
+    await get().refresh();
+  },
+
+  setHttpToken: async (id, token) => {
+    await invoke("mcp_set_http_token", { server_id: id, token });
+    await get().refresh();
+  },
+
+  removeHttpToken: async (id) => {
+    await invoke("mcp_remove_http_token", { server_id: id });
     await get().refresh();
   },
 }));

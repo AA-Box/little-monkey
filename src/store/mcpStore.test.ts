@@ -30,6 +30,7 @@ function makeInfo(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
     error: null,
     tools: [],
     instructions: null,
+    hasHttpToken: false,
     ...overrides,
   };
 }
@@ -100,6 +101,25 @@ describe("mcpStore CRUD actions", () => {
     await useMcpStore.getState().disconnect("srv");
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_disconnect", { server_id: "srv" });
+  });
+
+  it("setHttpToken invokes mcp_set_http_token with server_id and token then refreshes", async () => {
+    invokeMock.mockResolvedValueOnce(undefined).mockResolvedValueOnce([makeInfo({ hasHttpToken: true })]);
+
+    await useMcpStore.getState().setHttpToken("srv", "secret-token");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_set_http_token", { server_id: "srv", token: "secret-token" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_list_servers");
+    expect(useMcpStore.getState().servers[0].hasHttpToken).toBe(true);
+  });
+
+  it("removeHttpToken invokes mcp_remove_http_token with server_id then refreshes", async () => {
+    invokeMock.mockResolvedValueOnce(undefined).mockResolvedValueOnce([makeInfo({ hasHttpToken: false })]);
+
+    await useMcpStore.getState().removeHttpToken("srv");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_remove_http_token", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_list_servers");
   });
 });
 

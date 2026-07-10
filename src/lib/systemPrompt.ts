@@ -11,6 +11,27 @@
  */
 import { useWorkspaceStore } from '../store/workspaceStore';
 import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesStore';
+import { useMcpStore } from '../store/mcpStore';
+
+/** A connected MCP server's label + `initialize`-result instructions —
+ * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
+ * `buildSystemPrompt` actually needs, already filtered to servers that are
+ * connected and have non-empty instructions (see `currentSystemPrompt`). */
+export interface McpServerPromptInfo {
+  label: string;
+  instructions: string;
+}
+
+/** Per-server cap on how much of a connected MCP server's `instructions`
+ * gets injected into the prompt — a single misbehaving/verbose server
+ * shouldn't be able to blow out the system prompt for every turn. */
+const MCP_INSTRUCTIONS_CHAR_CAP = 1000;
+
+function capMcpInstructions(text: string): string {
+  return text.length > MCP_INSTRUCTIONS_CHAR_CAP
+    ? `${text.slice(0, MCP_INSTRUCTIONS_CHAR_CAP)}…`
+    : text;
+}
 
 /** Workspace facts the prompt is built from — mirrors the fields of
  * `WorkspaceRootInfo` the prompt actually needs. */
@@ -41,7 +62,8 @@ export function buildSystemPrompt(
   roots: PromptWorkspaceRoot[],
   osLabel: string,
   rules: RuleFile[] = [],
-  facts: MemoryFact[] = []
+  facts: MemoryFact[] = [],
+  mcpServers: McpServerPromptInfo[] = []
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -80,6 +102,21 @@ export function buildSystemPrompt(
   const factsLines =
     facts.length > 0 ? ['', '## Remembered facts', ...facts.map((fact) => `- ${fact.text}`)] : [];
 
+  // Each connected MCP server's own `initialize`-result `instructions` field
+  // (spec-correct use of it — see mcp.rs's module doc) — the only prompt
+  // change MCP support needs, since tool schemas are otherwise
+  // self-describing. Capped per server so one verbose server can't dominate
+  // the prompt; servers with no instructions (or not connected) contribute
+  // nothing here, same "absence is fine" stance as rules/facts above.
+  const mcpLines =
+    mcpServers.length > 0
+      ? [
+          '',
+          '## Connected MCP servers',
+          ...mcpServers.map((server) => `MCP server '${server.label}': ${capMcpInstructions(server.instructions)}`),
+        ]
+      : [];
+
   // One trailing guidance line telling the model when to use `remember` and
   // to treat the MONKEY.md content above as instructions from the user
   // rather than untrusted background text — always present (not gated on
@@ -104,6 +141,7 @@ export function buildSystemPrompt(
     '- After making changes, verify them when practical (re-read the file, or run the project\'s tests/build via run_shell).',
     ...rulesLines,
     ...factsLines,
+    ...mcpLines,
     ...rememberGuidanceLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
@@ -115,5 +153,13 @@ export function currentSystemPrompt(): string {
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
   const { rules, facts } = useRulesStore.getState();
-  return buildSystemPrompt(roots, osLabel, rules, facts);
+  // Unlike rules/facts, this needs no explicit per-turn `refresh()` call:
+  // `mcpStore` is already kept live by its `mcp://status` event subscription
+  // and by `connect`/`disconnect` awaiting `refresh()` themselves, so reading
+  // its current snapshot here is always up to date.
+  const mcpServers: McpServerPromptInfo[] = useMcpStore
+    .getState()
+    .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
+    .map((server) => ({ label: server.label, instructions: server.instructions as string }));
+  return buildSystemPrompt(roots, osLabel, rules, facts, mcpServers);
 }
