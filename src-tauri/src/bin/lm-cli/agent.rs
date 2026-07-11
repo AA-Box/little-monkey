@@ -7,20 +7,173 @@
 //! produces a plain answer with no tool calls, or after MAX_ITERATIONS round
 //! trips as a safety cap against a runaway/looping model.
 
+use std::io::Write;
+
 use little_monkey_lib::checkpoints;
 use little_monkey_lib::mcp::McpServerEntry;
+use little_monkey_lib::verify::{self, VerifyResult};
 use little_monkey_lib::web;
+use little_monkey_lib::workspace;
 use little_monkey_lib::AppState;
 
 use crate::checkpoints_cli;
 use crate::chat::{self, Target};
 use crate::mcp_cli;
-use crate::permission::TerminalPermissions;
+use crate::permission::{self, PermissionMode, TerminalPermissions};
 use crate::tools_cli;
 use crate::tools_def::{self, McpToolRegistry};
+use crate::verify_cli;
 use crate::web_cli;
 
 const MAX_ITERATIONS: usize = 25;
+
+/// Prefix identifying a synthetic `[Verify]` notice pushed into `history` —
+/// a Rust port of `agentLoop.ts`'s `VERIFY_NOTE_PREFIX`/`formatVerifyNotice`.
+/// Unlike the desktop app there's no `MessageList` to render these as a
+/// pretty collapsible row; the raw `[Verify]{...json...}` text becomes part
+/// of the model's own context on the next round trip exactly like the GUI
+/// (the CLI's `println!`s right next to it are the human-readable side of
+/// the same event, not what's stored in `history`).
+const VERIFY_NOTE_PREFIX: &str = "[Verify]";
+
+/// Cap on how many times a failed verification round feeds a fix instruction
+/// back to the model within a single turn — mirrors the desktop app's
+/// `verifyMaxRounds` setting (default 1, clamp 0-3; see `settingsStore.ts`).
+/// Not exposed as its own CLI flag (only on/off via `--verify`/`--no-verify`):
+/// there is no persisted CLI settings store for a numeric override to live
+/// in, so this just takes the GUI's own default.
+const DEFAULT_VERIFY_MAX_ROUNDS: u32 = 1;
+
+/// Each verify notice's `output` field is capped at this many chars — a
+/// second, wire/context-facing cap on top of `verify.rs`'s own ~20k-char cap
+/// on each of stdout/stderr individually. Mirrors `agentLoop.ts`'s
+/// `VERIFY_NOTICE_OUTPUT_CAP`.
+const VERIFY_NOTICE_OUTPUT_CAP: usize = 8000;
+
+/// The tool-message content returned for a `present_plan` call — a Rust port
+/// of `turnEngine.ts`'s `PRESENT_PLAN_RESULT`. Deliberately a fixed literal,
+/// not anything derived from the model's own arguments: it only needs to end
+/// the model's turn cleanly, since the plan itself was already printed to
+/// the terminal (and the approve/keep-planning decision already made) by
+/// `present_plan` below before this is returned.
+const PRESENT_PLAN_RESULT: &str =
+    r#"{"status":"plan_presented","note":"Wait for the user to approve before doing anything else."}"#;
+
+/// The first failed command from a [`run_verification_phase`] pass — enough
+/// detail to build the feed-back-to-the-model fix instruction. Mirrors
+/// `agentLoop.ts`'s `VerifyFailure`.
+struct VerifyFailure {
+    label: String,
+    code: Option<i32>,
+    output: String,
+}
+
+/// Combines a verify command's stdout/stderr into the single `output` string
+/// a notice carries, tail-capping the combination (a failure's most useful
+/// detail is almost always printed last) at [`VERIFY_NOTICE_OUTPUT_CAP`]
+/// chars. Splits on a UTF-8 char boundary so it never panics on a truncation
+/// point that lands mid-codepoint. A Rust port of `agentLoop.ts`'s
+/// `buildVerifyOutput`.
+fn build_verify_output(result: &VerifyResult) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if result.timed_out {
+        parts.push("Command timed out.");
+    }
+    let stdout = result.stdout.trim();
+    if !stdout.is_empty() {
+        parts.push(stdout);
+    }
+    let stderr = result.stderr.trim();
+    if !stderr.is_empty() {
+        parts.push(stderr);
+    }
+    let combined = parts.join("\n\n");
+    if combined.len() <= VERIFY_NOTICE_OUTPUT_CAP {
+        return combined;
+    }
+    let mut start = combined.len() - VERIFY_NOTICE_OUTPUT_CAP;
+    while start < combined.len() && !combined.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… (truncated)\n{}", &combined[start..])
+}
+
+/// Whether `resultContent` (a `write_file`/`edit_file` tool result string)
+/// represents success rather than the `{"error": ...}` shape a failed tool
+/// call produces — a Rust port of `agentLoop.ts`'s
+/// `isSuccessfulMutationResult`, used only to decide whether to add the
+/// call's path to `mutated_files`.
+fn is_successful_mutation_result(result_content: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(result_content) {
+        Ok(serde_json::Value::Object(map)) => !map.contains_key("error"),
+        Ok(_) => true,
+        // Not JSON at all — the plain "Wrote N bytes to …"/"Edited …" success string.
+        Err(_) => true,
+    }
+}
+
+/// Extracts the `path` argument from a `write_file`/`edit_file` tool call's
+/// raw arguments JSON — used only to populate `mutated_files`. A Rust port
+/// of `agentLoop.ts`'s `toolCallPathArg`; never panics on malformed
+/// arguments, just degrades to "no path known".
+fn tool_call_path_arg(raw_arguments: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw_arguments).ok()?;
+    parsed.get("path")?.as_str().map(str::to_string)
+}
+
+/// Runs every ENABLED verification command configured for the current
+/// workspace (see `verify_cli.rs`), in order, appending one `[Verify]`
+/// notice per command to `history` (so it flows to the model on the next
+/// round trip exactly like every other synthetic notice) and printing a
+/// human-readable pass/fail line for the terminal. Returns the first failed
+/// command, if any, so [`run_tool_loop`] can decide whether to spend a
+/// feed-back round — a Rust port of `agentLoop.ts`'s `runVerificationPhase`,
+/// minus the `sessionId`/`runningVerifyLabel` "running…" UI bookkeeping the
+/// CLI has no timeline to show (the `println!` right before each command
+/// serves the same "don't look hung" purpose here). No-ops (returning
+/// `None`) when the workspace root can't be resolved or nothing is enabled.
+async fn run_verification_phase(state: &AppState, history: &mut Vec<serde_json::Value>) -> Option<VerifyFailure> {
+    let root = workspace::primary_root_canon(state).ok()?;
+    let commands = verify_cli::enabled_commands(&root);
+    if commands.is_empty() {
+        return None;
+    }
+
+    let mut first_failure: Option<VerifyFailure> = None;
+    for cmd in &commands {
+        println!("\n[verify] running \"{}\"…", cmd.label);
+        let result = verify::run_command_impl(state, &root, cmd, None).await;
+        let ok = !result.timed_out && result.code == Some(0);
+        let output = build_verify_output(&result);
+        println!(
+            "[verify] {} — {} ({} ms)",
+            result.label,
+            if ok { "PASS" } else { "FAIL" },
+            result.duration_ms
+        );
+        if !ok && !output.is_empty() {
+            println!("{output}");
+        }
+
+        let notice = serde_json::json!({
+            "label": result.label,
+            "kind": result.kind,
+            "ok": ok,
+            "code": result.code,
+            "output": output,
+            "durationMs": result.duration_ms,
+        });
+        history.push(serde_json::json!({
+            "role": "system",
+            "content": format!("{VERIFY_NOTE_PREFIX}{notice}"),
+        }));
+
+        if !ok && first_failure.is_none() {
+            first_failure = Some(VerifyFailure { label: result.label.clone(), code: result.code, output });
+        }
+    }
+    first_failure
+}
 
 fn preview(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -28,6 +181,45 @@ fn preview(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max).collect();
         format!("{truncated}… ({} more chars)", s.chars().count() - max)
+    }
+}
+
+/// Prints the model's proposed plan to the terminal and prompts to approve
+/// switching from Plan Mode to Act mode — the terminal-side counterpart of
+/// the desktop app's `PlanCard` "Approve & start acting" button (see
+/// `src/components/Chat/PlanCard.tsx` and `agentLoop.ts`'s `PLAN_NOTE_PREFIX`
+/// notice/`lastActMode`). There is no persisted transcript notice or
+/// `lastActMode` setting here — the CLI's `history` is in-memory only and has
+/// no settings store to remember a preferred act mode in — so an approval
+/// always switches to `PermissionMode::AcceptEdits`, the same mode the
+/// desktop app's `lastActMode` itself defaults to before a user ever manually
+/// picks a different one. Anything other than y/yes leaves the mode at
+/// `Plan`, exactly like the GUI's "Keep planning" button.
+async fn present_plan(perms: &mut TerminalPermissions, args: &serde_json::Value) {
+    let title = args["title"].as_str().unwrap_or("(untitled plan)");
+    let plan = args["plan"].as_str().unwrap_or_default();
+    let open_questions: Vec<&str> = args["open_questions"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    println!("\n=== Plan: {title} ===\n{plan}");
+    if !open_questions.is_empty() {
+        println!("\nOpen questions:");
+        for question in &open_questions {
+            println!("  - {question}");
+        }
+    }
+
+    print!("\nApprove plan and switch to act mode? [y/N]: ");
+    std::io::stdout().flush().ok();
+    let answer = permission::read_line_blocking().await.trim().to_lowercase();
+
+    if answer == "y" || answer == "yes" {
+        perms.set_mode(PermissionMode::AcceptEdits);
+        println!("Switched to acceptEdits mode — mutating tools will now run without a plan-mode block.");
+    } else {
+        println!("Still in Plan Mode.");
     }
 }
 
@@ -57,6 +249,25 @@ async fn execute_tool_call(
             }
         }
     };
+
+    // `present_plan` is a frontend/terminal-only tool (see `tools_def.rs`'s
+    // `present_plan_tool_def` doc comment): it never dispatches to any
+    // `tool_<name>` command, checked BEFORE the mcp__/tool_<name> dispatch
+    // below just like `turnEngine.ts`'s `executeToolCall` checks it before
+    // its own `invoke` dispatch. Guarded on the CURRENT mode (not just
+    // whether it happened to be offered this turn) so a model that
+    // hallucinates the name outside Plan Mode can't flip it — the same
+    // "only offered while mode==='plan'" boundary the GUI enforces via
+    // `isToolCallAllowed`, just checked here at dispatch time instead of a
+    // separate offered-tools allowlist.
+    if name == "present_plan" {
+        return if perms.mode() != PermissionMode::Plan {
+            serde_json::json!({ "error": "present_plan is only available in Plan Mode." }).to_string()
+        } else {
+            present_plan(perms, &args).await;
+            PRESENT_PLAN_RESULT.to_string()
+        };
+    }
 
     // `mcp__<serverId>__<toolName>`-named calls dispatch to the connected
     // MCP server via `mcp_cli::call` instead of the `tool_<name>` switch
@@ -312,8 +523,29 @@ async fn run_tool_loop(
     // attempt within it): the connected server set doesn't change mid-turn,
     // so there's no need to re-read `state.mcp` on every iteration below.
     let (tools, mcp_registry) = tools_def::merged_tool_definitions(state, mcp_entries).await;
-    let tools_vec: Vec<serde_json::Value> = tools.as_array().cloned().unwrap_or_default();
+    let mut tools_vec: Vec<serde_json::Value> = tools.as_array().cloned().unwrap_or_default();
+    // `present_plan` is offered only in Plan Mode — read once per turn (like
+    // `agentLoop.ts`'s own `toolsForTurn(mode)` snapshot), not re-checked on
+    // every iteration below, so an approval mid-turn simply leaves it listed
+    // (but dispatch-blocked, see `execute_tool_call`) for the rest of this
+    // turn rather than disappearing out from under an in-flight model reply.
+    if perms.mode() == PermissionMode::Plan {
+        tools_vec.push(tools_def::present_plan_tool_def());
+    }
     let native = target.is_native();
+
+    // Absolute (or workspace-relative, as given by the model) paths this
+    // turn's `write_file`/`edit_file` calls have successfully mutated so far,
+    // across every tool-calling round trip below — read by
+    // `run_verification_phase` at the loop's natural exit to decide whether
+    // there's anything worth verifying. Mirrors `agentLoop.ts`'s
+    // `mutatedFiles`.
+    let mut mutated_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // How many verification feed-back rounds have been consumed so far this
+    // turn — bounded by `DEFAULT_VERIFY_MAX_ROUNDS`, mirroring
+    // `agentLoop.ts`'s `verifyRound`/`settings.verifyMaxRounds`.
+    let mut verify_round: u32 = 0;
 
     for _ in 0..MAX_ITERATIONS {
         let result = chat::stream_turn(client, target, history.as_slice(), &tools_vec, options).await?;
@@ -336,6 +568,32 @@ async fn run_tool_loop(
 
         if result.tool_calls.is_empty() {
             history.push(assistant_message);
+
+            // The model gave a plain answer with no further tool requests —
+            // this turn's natural exit point. Run the workspace's configured
+            // verification commands (if `--verify` is on and any files were
+            // mutated) before returning, exactly like `agentLoop.ts`'s
+            // `runAgentTurnBody` does at its own `toolCalls.length === 0`
+            // exit.
+            if options.verify && !mutated_files.is_empty() {
+                if let Some(failure) = run_verification_phase(state, history).await {
+                    if verify_round < DEFAULT_VERIFY_MAX_ROUNDS {
+                        verify_round += 1;
+                        // Cleared so only edits made in response to *this*
+                        // failure trigger the next verification pass.
+                        mutated_files.clear();
+                        let code_display = failure.code.map(|c| c.to_string()).unwrap_or_else(|| "timeout".to_string());
+                        let message = format!(
+                            "{VERIFY_NOTE_PREFIX} The verification command \"{}\" failed (exit {code_display}). Fix the reported problems, then stop.\n{}",
+                            failure.label, failure.output
+                        );
+                        println!("\n{message}");
+                        history.push(serde_json::json!({ "role": "system", "content": message }));
+                        continue;
+                    }
+                }
+            }
+
             return Ok(());
         }
 
@@ -365,6 +623,18 @@ async fn run_tool_loop(
                 execute_tool_call(state, perms, &call.name, &call.arguments, checkpoint_id, mcp_entries, &mcp_registry)
                     .await;
             println!("[tool result] {}", preview(&content, 300));
+
+            // Track this turn's file mutations for `run_verification_phase`
+            // at the loop's eventual exit — only for calls that actually
+            // succeeded (the "Wrote…"/"Edited…" string shape, not
+            // `{"error": ...}`). Mirrors `agentLoop.ts`'s equivalent check
+            // right after `executeToolCall`.
+            if (call.name == "write_file" || call.name == "edit_file") && is_successful_mutation_result(&content) {
+                if let Some(path) = tool_call_path_arg(&call.arguments) {
+                    mutated_files.insert(path);
+                }
+            }
+
             history.push(if native {
                 serde_json::json!({ "role": "tool", "tool_name": call.name, "content": content })
             } else {
@@ -380,4 +650,101 @@ async fn run_tool_loop(
     println!("\n{message}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(stdout: &str, stderr: &str, timed_out: bool) -> VerifyResult {
+        VerifyResult {
+            command_id: "c1".to_string(),
+            label: "lint".to_string(),
+            kind: "lint".to_string(),
+            code: Some(1),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            duration_ms: 42,
+            timed_out,
+        }
+    }
+
+    /// `present_plan` must refuse to run (and, crucially, never touch stdin)
+    /// outside Plan Mode — otherwise a model that hallucinates the tool name
+    /// in, say, `"auto"` mode could pop an unexpected "switch to act mode?"
+    /// prompt. Every other mode used here is asserted, not just `"manual"`,
+    /// so a future mode addition can't silently widen the guard by accident.
+    #[tokio::test]
+    async fn present_plan_is_rejected_outside_plan_mode() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let args = r#"{"title":"t","plan":"p"}"#;
+
+        for mode in [
+            PermissionMode::Manual,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Smart,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            let mut perms = TerminalPermissions::new(mode);
+            let content = execute_tool_call(&state, &mut perms, "present_plan", args, None, &[], &registry).await;
+            let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(parsed["error"].as_str().unwrap().contains("Plan Mode"), "mode {mode:?} should reject present_plan");
+            // The guard must reject BEFORE flipping anything — mode stays
+            // exactly what it was.
+            assert_eq!(perms.mode(), mode);
+        }
+    }
+
+    #[test]
+    fn is_successful_mutation_result_accepts_plain_success_strings() {
+        assert!(is_successful_mutation_result("Wrote 12 bytes to foo.txt"));
+        assert!(is_successful_mutation_result("Edited foo.txt"));
+    }
+
+    #[test]
+    fn is_successful_mutation_result_rejects_error_json() {
+        assert!(!is_successful_mutation_result(r#"{"error":"not a file"}"#));
+    }
+
+    #[test]
+    fn is_successful_mutation_result_accepts_non_error_json() {
+        // Not the actual write_file/edit_file shape, but structurally
+        // confirms only the presence of an "error" key matters.
+        assert!(is_successful_mutation_result(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn tool_call_path_arg_extracts_the_path_field() {
+        assert_eq!(tool_call_path_arg(r#"{"path":"src/lib.rs","content":"x"}"#), Some("src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn tool_call_path_arg_is_none_for_malformed_or_missing_path() {
+        assert_eq!(tool_call_path_arg("not json"), None);
+        assert_eq!(tool_call_path_arg(r#"{"content":"x"}"#), None);
+    }
+
+    #[test]
+    fn build_verify_output_combines_stdout_and_stderr() {
+        let output = build_verify_output(&result("out line", "err line", false));
+        assert!(output.contains("out line"));
+        assert!(output.contains("err line"));
+    }
+
+    #[test]
+    fn build_verify_output_notes_timeout() {
+        let output = build_verify_output(&result("", "", true));
+        assert_eq!(output, "Command timed out.");
+    }
+
+    #[test]
+    fn build_verify_output_caps_and_keeps_the_tail() {
+        let long_stdout = "y".repeat(VERIFY_NOTICE_OUTPUT_CAP + 500);
+        let output = build_verify_output(&result(&long_stdout, "", false));
+        assert!(output.starts_with("… (truncated)"));
+        assert!(output.ends_with('y'));
+        assert!(output.len() < long_stdout.len());
+    }
 }

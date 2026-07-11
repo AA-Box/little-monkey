@@ -135,6 +135,46 @@ describe('buildSystemPrompt', () => {
     expect(prompt).not.toContain('web_fetch');
     expect(prompt).not.toContain('web_search');
   });
+
+  it('omits the verification guidance line by default (verifyGuidanceAvailable defaults to false)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('Configured verification commands');
+  });
+
+  it('includes the verification guidance line only when verifyGuidanceAvailable is true', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, true);
+    expect(prompt).toContain('Configured verification commands run automatically after your edits; fix any failures they report.');
+  });
+
+  it('omits the Plan Mode section when mode is omitted (defaults to "manual")', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('## Plan Mode');
+    expect(prompt).not.toContain('present_plan');
+  });
+
+  it('omits the Plan Mode section for every non-"plan" mode', () => {
+    for (const mode of ['manual', 'acceptEdits', 'smart', 'auto', 'bypass'] as const) {
+      const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, mode);
+      expect(prompt).not.toContain('## Plan Mode');
+    }
+  });
+
+  it('includes the Plan Mode section, steering the model toward present_plan and away from mutating tools, only when mode is "plan"', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'plan');
+    expect(prompt).toContain('## Plan Mode');
+    expect(prompt).toContain('present_plan');
+    expect(prompt).toContain('every mutating tool (write_file, edit_file, run_shell, remember) is blocked');
+  });
+
+  it('nudges the model to tag html/svg/mermaid fences by default (artifactGuidanceAvailable defaults to true)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).toContain('tagged html/svg/mermaid so it can be previewed');
+  });
+
+  it('omits the artifact guidance line when artifactGuidanceAvailable is false', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', false);
+    expect(prompt).not.toContain('tagged html/svg/mermaid');
+  });
 });
 
 describe('composeSystemPrompt', () => {

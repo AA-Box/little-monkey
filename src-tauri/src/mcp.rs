@@ -1004,6 +1004,7 @@ pub async fn mcp_call_tool(
         &format!("mcp:{}:{}", server_id, tool_name),
         detail,
         turn_id.as_deref(),
+        None,
     )
     .await?;
 

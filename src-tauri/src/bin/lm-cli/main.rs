@@ -18,6 +18,7 @@ mod repl;
 mod sse;
 mod tools_cli;
 mod tools_def;
+mod verify_cli;
 mod web_cli;
 
 use std::path::{Path, PathBuf};
@@ -69,7 +70,11 @@ struct Cli {
     local_url: Option<String>,
 
     /// Permission mode: manual (default, prompts every mutation),
-    /// acceptEdits, auto, or bypass. Matches the desktop app's modes.
+    /// acceptEdits, smart (auto-approves write_file/edit_file unless the
+    /// path is sensitive — see permissions::path_risk_floor — run_shell
+    /// always prompts), plan (read-only; call present_plan and approve at
+    /// its prompt to switch to acceptEdits), auto, or bypass. Matches the
+    /// desktop app's modes.
     #[arg(long, default_value = "manual", global = true)]
     permission_mode: String,
 
@@ -173,6 +178,24 @@ struct ChatFlags {
     /// receive the prompt verbatim.
     #[arg(long = "attach-images", global = true)]
     attach_images: bool,
+
+    /// Run the current workspace's configured verification commands (see
+    /// the desktop app's Settings > Verification tab, or `/verify` in the
+    /// REPL) automatically after any turn that writes files, feeding the
+    /// first failure back to the model as a fix instruction for up to
+    /// `agent::DEFAULT_VERIFY_MAX_ROUNDS` rounds — a Rust port of the
+    /// desktop app's `verifyEnabled` setting/`runVerificationPhase`
+    /// (`src/lib/agentLoop.ts`). Off by default: running arbitrary
+    /// configured shell automatically should be opt-in, same posture as the
+    /// GUI's `verifyEnabled` default.
+    #[arg(long, global = true)]
+    verify: bool,
+
+    /// Explicitly disable verification for this invocation — mostly useful
+    /// to override a `--verify` given earlier on the command line (e.g. a
+    /// shell alias); redundant with the default otherwise.
+    #[arg(long = "no-verify", global = true)]
+    no_verify: bool,
 }
 
 impl ChatFlags {
@@ -192,6 +215,7 @@ impl ChatFlags {
             keep_alive: self.keepalive.clone(),
             verbose: self.verbose,
             attach_images: self.attach_images,
+            verify: self.verify && !self.no_verify,
         })
     }
 }
@@ -857,6 +881,8 @@ mod tests {
                 keepalive: None,
                 verbose: false,
                 attach_images: false,
+                verify: false,
+                no_verify: false,
             },
         };
 
@@ -1068,6 +1094,8 @@ mod tests {
                 keepalive: None,
                 verbose: false,
                 attach_images: false,
+                verify: false,
+                no_verify: false,
             },
         };
         match chat_setup(&cli) {

@@ -552,7 +552,7 @@ pub async fn models_delete(
     }
 
     let detail = format!("Delete downloaded model weights at {}", p.display());
-    permissions::request_permission(&app, state.inner(), "delete_model", detail, None).await?;
+    permissions::request_permission(&app, state.inner(), "delete_model", detail, None, None).await?;
 
     std::fs::remove_file(&p).map_err(|e| format!("Failed to delete {path}: {e}"))
 }

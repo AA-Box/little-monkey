@@ -1,15 +1,26 @@
-import { memo, useState } from "react";
+import { Children, isValidElement, memo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { Pencil } from "lucide-react";
+import { Eye, Pencil } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
+import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
+import { useArtifactStore } from "../../store/artifactStore";
 import { useT } from "../../lib/i18n";
 
 export interface MessageBubbleProps {
   message: ChatMessage;
-  /** This message's index in the transcript, passed back to `onEditMessage`. */
+  /** This message's index in the transcript, passed back to `onEditMessage`
+   * and used to build an assistant message's fenced-code-block `ArtifactRef`s
+   * (see `buildAssistantMarkdownComponents` below) — must be the message's
+   * real position in `sessionMessages(sessionId)`, not its position among
+   * assistant messages only, since `extractArtifacts` indexes the same way. */
   index: number;
+  /** Which session this bubble belongs to — threaded through only so the
+   * `pre` override's Preview button can call
+   * `useArtifactStore.getState().open(sessionId, ref)`; with the split pane,
+   * two panes render bubbles from two different sessions at once. */
+  sessionId: string;
   /** Present only when user messages can be edited-and-resubmitted;
    * omitted entirely hides the edit affordance. Kept as a stable
    * `(index, text)` callback (rather than a per-row closure) so the
@@ -25,7 +36,7 @@ export interface MessageBubbleProps {
  * below — these overrides only adjust behavior (external links open in a new
  * tab) rather than appearance.
  */
-const markdownComponents: Components = {
+export const markdownComponents: Components = {
   a: ({ children, href }) => (
     <a href={href} target="_blank" rel="noreferrer">
       {children}
@@ -33,8 +44,118 @@ const markdownComponents: Components = {
   ),
 };
 
-const PROSE_CLASSES =
+// Exported so `PlanCard.tsx` can render a plan's Markdown body with the exact
+// same typography as an assistant message — see this app's Plan/Act design
+// doc's explicit instruction to match `MessageBubble`'s prose classes.
+export const PROSE_CLASSES =
   "prose prose-sm max-w-none prose-headings:font-sans prose-p:text-foreground prose-headings:text-foreground prose-strong:text-foreground prose-code:font-mono prose-code:text-foreground prose-code:before:content-none prose-code:after:content-none prose-pre:bg-surface-2 prose-pre:border prose-pre:border-border prose-pre:rounded-lg prose-a:text-accent prose-blockquote:border-l-border prose-blockquote:text-muted";
+
+/** Flattens a `<code>` element's React children back into the plain text it
+ * was rendered from — react-markdown gives a fenced code block's body as a
+ * single string child in the overwhelming majority of cases, but this walks
+ * arrays/nested elements defensively rather than assuming that shape. Used
+ * only to recover the fence's raw body so `detectFenceKind` can inspect it
+ * (the `xml`-vs-`svg` check needs to see the actual content, not just the
+ * language tag). */
+function flattenToString(node: ReactNode): string {
+  if (typeof node === "string") return node;
+  if (typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(flattenToString).join("");
+  if (isValidElement(node)) return flattenToString((node.props as { children?: ReactNode }).children);
+  return "";
+}
+
+/**
+ * Builds a per-assistant-message `markdownComponents` override extending the
+ * shared base above with a `pre` override that renders a slim header bar
+ * (language + Preview button) on html/svg/mermaid fences — see the design
+ * doc's "UI SURFACE" section. Deliberately NOT merged into the shared
+ * `markdownComponents` constant: `PlanCard.tsx` reuses that constant as-is
+ * for plan bodies, which never need a Preview button (a proposed plan isn't
+ * an artifact), so extending it here keeps that call site untouched.
+ *
+ * Rebuilt fresh on every `AssistantMessage` render rather than memoized:
+ * streaming already forces a full re-parse of the Markdown string on every
+ * token (a new `content` string is a new AST regardless), so memoizing this
+ * object would save nothing — see `MessageBubble`'s own doc comment on why
+ * memoization happens one level up (the whole bubble) instead.
+ *
+ * `previewableIndex` is a closure-local counter — not React state — since it
+ * only needs to count up once per render pass of this single
+ * `<ReactMarkdown>` call, in document order, across the fences the `pre`
+ * override actually gets invoked for. This numbering MUST match
+ * `artifacts.ts`'s `extractArtifacts` `blockIndex` scheme exactly (previewable
+ * fences only, in document order) so a click here resolves to the same block
+ * that module would extract for the same message — hence `detectFenceKind`
+ * is imported and reused unchanged rather than reimplemented here. That
+ * alone isn't sufficient, though: `detectFenceKind` only agrees at both call
+ * sites because each derives `lang` the same way — react-markdown's `<code>`
+ * className only ever holds the FIRST word of a fence's info string (the
+ * CommonMark/remark "meta" split), so `artifacts.ts`'s own fence scanner
+ * normalizes to that same first token rather than using the whole trimmed
+ * info string (see that module's doc comment on `scanFencedBlocks`) — a
+ * fence like "```html title=\"x\"" would otherwise be previewable here but
+ * invisible to `extractArtifacts`, corrupting both counters relative to each
+ * other. Belt-and-suspenders beyond the numbering agreeing: the constructed
+ * `ArtifactRef` also carries a `fingerprint` of this exact fence's kind+body
+ * (`fingerprintArtifact`, the same function `extractArtifacts` uses), so
+ * even a transcript change that coincidentally reuses this exact
+ * `{messageIndex, blockIndex}` slot for different content makes
+ * `findArtifact` report "no longer available" instead of resolving to the
+ * wrong artifact (see `ArtifactRef`'s doc comment in `artifacts.ts`). An
+ * unterminated fence never reaches this component at all: react-markdown
+ * itself doesn't parse an unclosed ``` block as a `pre`/`code` element
+ * (CommonMark treats it as ordinary paragraph text), so during streaming the
+ * Preview button simply doesn't exist yet — it appears the moment the
+ * closing fence arrives and the message re-parses, exactly the "purely
+ * additive, streaming-safe" behavior the design doc calls for.
+ */
+function buildAssistantMarkdownComponents(
+  sessionId: string,
+  messageIndex: number,
+  t: (key: string) => string
+): Components {
+  let previewableIndex = 0;
+
+  return {
+    ...markdownComponents,
+    pre: ({ children }) => {
+      const onlyChild = Children.count(children) === 1 ? Children.only(children) : null;
+      const codeProps = isValidElement(onlyChild)
+        ? (onlyChild.props as { className?: string; children?: ReactNode })
+        : null;
+      const lang = /language-(\S+)/.exec(codeProps?.className ?? "")?.[1] ?? "";
+      const body = codeProps ? flattenToString(codeProps.children).replace(/\n$/, "") : "";
+      const kind = codeProps ? detectFenceKind(lang, body) : null;
+
+      if (!kind) return <pre>{children}</pre>;
+
+      const ref: ArtifactRef = {
+        messageIndex,
+        blockIndex: previewableIndex,
+        fingerprint: fingerprintArtifact(kind, body),
+      };
+      previewableIndex += 1;
+
+      return (
+        <div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="font-mono text-[11px] uppercase tracking-wide text-faint">{lang}</span>
+            <button
+              type="button"
+              onClick={() => useArtifactStore.getState().open(sessionId, ref)}
+              className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-muted transition-colors hover:bg-surface-2 hover:text-foreground"
+            >
+              <Eye size={12} />
+              {t("MessageBubble.previewButton")}
+            </button>
+          </div>
+          <pre>{children}</pre>
+        </div>
+      );
+    },
+  };
+}
 
 function UserBubble({
   content,
@@ -144,13 +265,14 @@ function UserBubble({
   );
 }
 
-function AssistantMessage({ content }: { content: string }) {
+function AssistantMessage({ content, sessionId, index }: { content: string; sessionId: string; index: number }) {
   const { t } = useT();
+  const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
     <div className="w-full min-w-0">
       <div className="mb-1.5 text-xs font-medium text-muted">{t("MessageBubble.assistantName")}</div>
       <div className={PROSE_CLASSES}>
-        <ReactMarkdown components={markdownComponents}>{content}</ReactMarkdown>
+        <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
     </div>
   );
@@ -169,7 +291,7 @@ function AssistantMessage({ content }: { content: string }) {
  * expensive enough that re-rendering the whole transcript per token visibly
  * stutters on long conversations).
  */
-function MessageBubble({ message, index, onEditMessage, editDisabled }: MessageBubbleProps) {
+function MessageBubble({ message, index, sessionId, onEditMessage, editDisabled }: MessageBubbleProps) {
   if (message.role === "user") {
     return (
       <UserBubble
@@ -181,7 +303,7 @@ function MessageBubble({ message, index, onEditMessage, editDisabled }: MessageB
   }
 
   if (message.role === "assistant") {
-    return <AssistantMessage content={textContent(message.content)} />;
+    return <AssistantMessage content={textContent(message.content)} sessionId={sessionId} index={index} />;
   }
 
   return null;

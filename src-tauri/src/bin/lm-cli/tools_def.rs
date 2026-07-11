@@ -156,6 +156,45 @@ pub fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// The Plan Mode "present a plan" tool — a Rust port of `src/lib/tools.ts`'s
+/// `PRESENT_PLAN_TOOL`. Deliberately excluded from [`tool_definitions`]'s
+/// base array (and from [`merged_tool_definitions`]'s output): it is only
+/// appended to the per-turn tool list by `agent.rs::run_tool_loop`, and only
+/// while the active `PermissionMode` is `Plan` — the same offer-only-in-
+/// plan-mode rule as the desktop app's `toolsForMode`. Like its TS
+/// counterpart, this has NO Rust `tool_present_plan` command anywhere:
+/// `agent.rs`'s `execute_tool_call` handles the name directly (printing the
+/// plan to the terminal and prompting to switch to Act mode) rather than
+/// dispatching into the `tool_<name>` Tauri-command world this binary
+/// doesn't have. An intentional three-way-registry-drift exception —
+/// `src/lib/tools.ts`'s doc comment calls out the identical exception for
+/// the desktop app; a reader scanning this file's `tool_definitions()` for a
+/// `present_plan` Rust command elsewhere and finding nothing should look at
+/// `agent.rs` instead of assuming a missing command.
+pub fn present_plan_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "present_plan",
+            "description": "Present a structured plan to the user for approval. Call this exactly once, after investigating with read-only tools, then stop and wait — do not call it more than once per turn, and do not attempt to make changes until the user approves.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "A short (few words) title summarizing the plan." },
+                    "plan": { "type": "string", "description": "The full plan, written as Markdown, describing the changes you intend to make and why." },
+                    "open_questions": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of questions to ask the user before proceeding, if anything is ambiguous."
+                    }
+                },
+                "required": ["title", "plan"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// Composite `mcp__<serverId>__<toolName>` tool name mapped to the exact
 /// server id and tool name it was built from, returned by
 /// [`merged_tool_definitions`] alongside the tool defs themselves. Mirrors
@@ -276,6 +315,24 @@ mod tests {
         assert_eq!(unique_name("mcp__a__b".to_string(), &mut used), "mcp__a__b");
         assert_eq!(unique_name("mcp__a__b".to_string(), &mut used), "mcp__a__b_2");
         assert_eq!(unique_name("mcp__a__b".to_string(), &mut used), "mcp__a__b_3");
+    }
+
+    #[test]
+    fn present_plan_tool_def_is_a_well_formed_function_def_excluded_from_the_base_list() {
+        let def = present_plan_tool_def();
+        assert_eq!(def["type"], "function");
+        assert_eq!(def["function"]["name"], "present_plan");
+        let required = def["function"]["parameters"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "title"));
+        assert!(required.iter().any(|v| v == "plan"));
+
+        // Not part of the base list (or merged_tool_definitions' output) —
+        // only agent.rs::run_tool_loop appends it, and only in Plan Mode.
+        assert!(!tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "present_plan"));
     }
 
     #[tokio::test]

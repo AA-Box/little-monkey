@@ -8,6 +8,7 @@
 //! `request_permission` is awaiting on.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -22,6 +23,178 @@ pub struct PermissionRequestPayload {
     pub id: String,
     pub tool: String,
     pub detail: String,
+    /// Advisory risk annotation (Phase 2 of the Plan/Act + risk-adaptive
+    /// permissions design — docs/roadmap/p2-plan-act-safety.md). `None` when
+    /// risk annotations are off, the tool isn't classified, or the judge
+    /// produced nothing usable. Purely informative in every mode as of this
+    /// phase: it changes what the modal *shows*, never what gets
+    /// auto-approved (that's Phase 3's "smart" mode, and even then
+    /// `run_shell` never short-circuits on it — see [`RiskAssessment`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_reason: Option<String>,
+    /// Whether `risk_level`/`risk_reason` came from the authoritative
+    /// [`path_risk_floor`] rather than the LLM judge — lets the modal show a
+    /// stronger "sensitive path" warning instead of an ordinary risk badge.
+    /// Always `false` when `risk_level` is `None`.
+    pub risk_floored: bool,
+}
+
+/// A risk annotation attached to a permission prompt — either computed
+/// deterministically by [`path_risk_floor`] (`floored: true`, always wins) or
+/// filled in by the frontend's LLM risk judge (`floored: false`). See
+/// [`request_permission`]'s `risk` parameter.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RiskAssessment {
+    pub level: String,
+    pub reason: String,
+    pub floored: bool,
+}
+
+/// Shell startup/rc files: sourced automatically by every new interactive
+/// shell, so an edit here runs attacker-controlled code on the user's next
+/// terminal session, not just inside this workspace.
+const SHELL_RC_FILES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zlogin",
+    ".zshenv",
+    ".cshrc",
+    ".kshrc",
+    ".inputrc",
+];
+
+/// Package manifests/lockfiles whose declared scripts (npm `postinstall`,
+/// Cargo `build.rs`, etc.) can execute arbitrary code the next time someone
+/// installs/builds the project — editing them is a supply-chain-shaped
+/// mutation, not an ordinary source-code change.
+///
+/// Kept all-lowercase deliberately: [`path_risk_floor`] lowercases the
+/// candidate file name before comparing against this list (case-insensitive
+/// match — see that function's doc comment for why), so these literals must
+/// already be lowercase or the comparison would never match, even though
+/// some of these files' canonical on-disk spelling is mixed-case (e.g.
+/// `Cargo.toml`, `Gemfile`).
+const SCRIPT_EXECUTING_MANIFESTS: &[&str] = &[
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "cargo.toml",
+    "cargo.lock",
+    "gemfile",
+    "gemfile.lock",
+    "requirements.txt",
+    "pipfile",
+    "pipfile.lock",
+    "pyproject.toml",
+    "composer.json",
+    "composer.lock",
+];
+
+/// Deterministic, pure-`std` floor over sensitive workspace paths — the
+/// authoritative Layer 1 of the risk-annotation design (Layer 2 is the
+/// frontend LLM judge in `src/lib/riskJudge.ts`). Returns `Some(reason)` for
+/// dotfiles/dot-dirs that hold secrets or CI config (`.env*`, inside `.git/`,
+/// inside `.github/workflows/`), script-executing package
+/// manifests/lockfiles, and shell rc files — `None` otherwise.
+///
+/// This floor can NEVER be overridden or relaxed by the LLM judge: a floored
+/// path always prompts in every mode below `"bypass"`, no matter what any
+/// judge classification says (see [`RiskAssessment::floored`] and this
+/// module's top doc comment on why `run_shell` — and, by the same reasoning,
+/// any heuristic-driven relaxation of a floor — must never be gated on
+/// judge-supplied text). `path` is expected already resolved/canonicalized
+/// (as `workspace::resolve_path_and_root` returns), `root` is that same
+/// call's canonical workspace root, so a path outside the workspace can never
+/// reach here in the first place (the sandbox already rejects it upstream).
+///
+/// All comparisons here are case-insensitive (via `.to_ascii_lowercase()` on
+/// each path component/file name before matching against the — already
+/// lowercase — literals above). macOS's default APFS and Windows' default
+/// NTFS are both case-insensitive-but-case-preserving: a model-supplied path
+/// like `.ZSHRC` or `PACKAGE.JSON` for a not-yet-existing file resolves
+/// (`workspace::resolve_against_root`) with that exact casing preserved on
+/// disk, yet is the *same file* `.zshrc`/`package.json` would be to the
+/// filesystem, the shell, and every other tool. A case-sensitive comparison
+/// here would let a case-variant filename sail past the floor entirely on
+/// exactly the platforms this app ships on — folding case before comparing
+/// keeps the floor authoritative regardless of the casing the model chose.
+pub fn path_risk_floor(path: &Path, root: &Path) -> Option<&'static str> {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+
+    let components: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => part.to_str().map(|s| s.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+
+    if components.iter().any(|part| part == ".git") {
+        return Some("inside .git/ — version-control metadata");
+    }
+
+    if components.windows(2).any(|w| w[0] == ".github" && w[1] == "workflows") {
+        return Some("inside .github/workflows/ — CI pipeline definition, runs with repo permissions");
+    }
+
+    let file_name = path.file_name().and_then(|n| n.to_str())?.to_ascii_lowercase();
+
+    if file_name.starts_with(".env") {
+        return Some("environment/secrets file (.env*)");
+    }
+
+    if SHELL_RC_FILES.contains(&file_name.as_str()) {
+        return Some("shell startup/rc file — runs on every new shell");
+    }
+
+    if SCRIPT_EXECUTING_MANIFESTS.contains(&file_name.as_str()) {
+        return Some("package manifest/lockfile that can execute scripts on install/build");
+    }
+
+    None
+}
+
+/// Combines the deterministic floor with the (optional, frontend-supplied)
+/// LLM judge result into the single [`RiskAssessment`] a permission prompt
+/// carries. `path` is `Some((resolved_path, canonical_root))` for
+/// `write_file`/`edit_file` (which have a filesystem target to floor-check)
+/// and `None` for `run_shell` (no path — judge-only, display purposes only,
+/// see this module's top doc comment). The floor always wins when it fires;
+/// `judge_level` is defensively re-validated against the three known levels
+/// here too (never trusted blindly from the IPC boundary, even though
+/// `riskJudge.ts` already only ever sends one of the three) — anything else
+/// (including a model-supplied value that slipped past the frontend's own
+/// scrub, belt-and-braces) is discarded, resulting in no risk annotation at
+/// all rather than a fabricated one.
+pub fn compute_risk(
+    path: Option<(&Path, &Path)>,
+    judge_level: Option<String>,
+    judge_reason: Option<String>,
+) -> Option<RiskAssessment> {
+    if let Some((resolved, root)) = path {
+        if let Some(reason) = path_risk_floor(resolved, root) {
+            return Some(RiskAssessment {
+                level: "high".to_string(),
+                reason: reason.to_string(),
+                floored: true,
+            });
+        }
+    }
+
+    let level = judge_level.filter(|l| l == "low" || l == "medium" || l == "high")?;
+    Some(RiskAssessment {
+        level,
+        reason: judge_reason.unwrap_or_default(),
+        floored: false,
+    })
 }
 
 /// Shared state tracking in-flight permission requests and tools that have
@@ -68,7 +241,7 @@ const NO_SESSION_REMEMBER: &[&str] = &["run_shell"];
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Every valid permission mode identifier, shared verbatim with the frontend.
-const VALID_MODES: &[&str] = &["manual", "acceptEdits", "plan", "auto", "bypass"];
+const VALID_MODES: &[&str] = &["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
 
 /// Mode-based short-circuit decision for [`request_permission`]:
 /// `Some(result)` means the mode decides on its own without prompting;
@@ -80,15 +253,37 @@ const VALID_MODES: &[&str] = &["manual", "acceptEdits", "plan", "auto", "bypass"
 /// the agent reads untrusted workspace content, so any heuristic gate on
 /// shell commands (a substring blacklist used to live here) is a prompt-
 /// injection-shaped exfiltration path. Users who truly want promptless shell
-/// have "bypass" mode.
-fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
+/// have "bypass" mode. This is the same invariant "smart" mode must uphold —
+/// see the `"smart"` arm below, and the `smart_mode_never_short_circuits_run_shell`
+/// regression test.
+///
+/// `risk` is the same [`RiskAssessment`] [`request_permission`] will go on to
+/// show in the prompt payload if this falls through — passed in here (rather
+/// than computed inside this function) so this stays a pure decision table
+/// over already-known inputs, exercisable in tests without needing a
+/// filesystem or a judge call. Only `"smart"` ever looks at it; every other
+/// mode's decision is unchanged by whatever `risk` says (Phase 2's invariant
+/// that risk annotations are purely advisory outside "smart" mode).
+fn mode_short_circuit(mode: &str, tool: &str, risk: Option<&RiskAssessment>) -> Option<Result<(), String>> {
     match mode {
         "bypass" => Some(Ok(())),
         "plan" => Some(Err(format!(
-            "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - ask the user to switch out of Plan Mode before making changes."
+            "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - call the present_plan tool with your proposed plan, then ask the user to approve it and switch out of Plan Mode before making changes."
         ))),
         "acceptEdits" | "auto" => {
             if tool == "write_file" || tool == "edit_file" || tool == "remember" {
+                Some(Ok(()))
+            } else {
+                None
+            }
+        }
+        "smart" => {
+            // Only write_file/edit_file are ever eligible — run_shell (and
+            // anything else) always falls through to `None` here, no matter
+            // what `risk` claims, exactly like "auto"/"acceptEdits" above.
+            if (tool == "write_file" || tool == "edit_file")
+                && matches!(risk, Some(r) if r.level == "low" && !r.floored)
+            {
                 Some(Ok(()))
             } else {
                 None
@@ -115,8 +310,24 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
 ///   are auto-approved, and `run_shell` ALWAYS falls through to the normal
 ///   prompting logic (see [`mode_short_circuit`] for why it is never
 ///   auto-approved).
+/// - `"smart"` (Phase 3): `write_file`/`edit_file` are auto-approved ONLY
+///   when `risk` is `Some` with `level == "low"` and `floored == false`;
+///   every other case for those two tools, `remember`, and — critically —
+///   `run_shell` in every case, falls through to the normal prompting logic.
+///   `run_shell` NEVER short-circuits in `"smart"`, identical to `"auto"`/
+///   `"acceptEdits"` above and for the same reason (see [`mode_short_circuit`]'s
+///   doc comment).
 /// - `"manual"`, or any unrecognized value (as a safe default): always falls
 ///   through to the normal prompting logic, unchanged.
+///
+/// `risk` (see [`RiskAssessment`]/[`compute_risk`]) is purely advisory in
+/// every mode except `"smart"`: outside `"smart"` it only ever changes what
+/// [`PermissionRequestPayload`] shows the user, never anything above — those
+/// modes' short-circuit decisions are made with no knowledge of it
+/// whatsoever, so a mis-classified "low risk" judge result can never itself
+/// approve anything under them. `"smart"` is the sole, narrow exception, and
+/// even there it can only ever affect `write_file`/`edit_file` — never
+/// `run_shell` (see [`mode_short_circuit`]).
 ///
 /// The normal prompting logic: if `tool` has already been granted "allow for
 /// session", resolves `Ok(())` immediately without prompting; otherwise emits
@@ -128,10 +339,11 @@ pub async fn request_permission<R: tauri::Runtime>(
     tool: &str,
     detail: String,
     turn: Option<&str>,
+    risk: Option<RiskAssessment>,
 ) -> Result<(), String> {
     let mode = state.permissions.mode.lock().unwrap().clone();
 
-    if let Some(decision) = mode_short_circuit(&mode, tool) {
+    if let Some(decision) = mode_short_circuit(&mode, tool, risk.as_ref()) {
         return decision;
     }
 
@@ -159,6 +371,9 @@ pub async fn request_permission<R: tauri::Runtime>(
         id: id.clone(),
         tool: tool.to_string(),
         detail,
+        risk_level: risk.as_ref().map(|r| r.level.clone()),
+        risk_reason: risk.as_ref().map(|r| r.reason.clone()),
+        risk_floored: risk.as_ref().map(|r| r.floored).unwrap_or(false),
     };
 
     if app.emit("permission://request", payload).is_err() {
@@ -542,6 +757,52 @@ mod tests {
     }
 
     #[test]
+    fn set_permission_mode_keeps_session_allow_when_switching_to_smart() {
+        // "smart" counts as neither tightening nor loosening — same
+        // treatment as "acceptEdits"/"auto": switching into it must not wipe
+        // out grants a stricter earlier mode never had reason to clear.
+        let state = AppState::default();
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("write_file".to_string());
+
+        set_permission_mode_impl(&state, "smart".to_string()).unwrap();
+
+        assert!(state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains("write_file"));
+    }
+
+    #[test]
+    fn set_permission_mode_does_not_treat_smart_as_tightening() {
+        // Mirrors `set_permission_mode_clears_session_allow_when_tightening_to_*`
+        // but asserts the opposite for "smart" — it must NOT be in the
+        // tightening set alongside "manual"/"plan".
+        let state = AppState::default();
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("edit_file".to_string());
+
+        set_permission_mode_impl(&state, "smart".to_string()).unwrap();
+
+        assert!(!state.permissions.session_allow.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_modes_includes_smart() {
+        assert!(VALID_MODES.contains(&"smart"));
+    }
+
+    #[test]
     fn get_permission_mode_returns_current_mode() {
         let state = AppState::default();
         *state.permissions.mode.lock().unwrap() = "auto".to_string();
@@ -554,37 +815,97 @@ mod tests {
         // a substring blacklist. run_shell must always fall through to the
         // normal permission prompt (None), no matter how harmless the
         // command looks.
-        assert!(mode_short_circuit("auto", "run_shell").is_none());
+        assert!(mode_short_circuit("auto", "run_shell", None).is_none());
+    }
+
+    #[test]
+    fn smart_mode_never_short_circuits_run_shell() {
+        // Twin of `auto_mode_never_short_circuits_run_shell` for Phase 3's
+        // "smart" mode — the load-bearing invariant restated in the design
+        // doc: the LLM risk judge must NEVER be allowed to influence
+        // run_shell, in any mode, no matter how confidently it (or a
+        // fabricated assessment) claims "low" risk.
+        assert!(mode_short_circuit("smart", "run_shell", None).is_none());
+        let low = RiskAssessment { level: "low".to_string(), reason: "looks harmless".to_string(), floored: false };
+        assert!(mode_short_circuit("smart", "run_shell", Some(&low)).is_none());
     }
 
     #[test]
     fn auto_and_accept_edits_short_circuit_only_file_edits_and_remember() {
         for mode in ["auto", "acceptEdits"] {
-            assert_eq!(mode_short_circuit(mode, "write_file"), Some(Ok(())));
-            assert_eq!(mode_short_circuit(mode, "edit_file"), Some(Ok(())));
-            assert_eq!(mode_short_circuit(mode, "remember"), Some(Ok(())));
-            assert!(mode_short_circuit(mode, "run_shell").is_none());
+            assert_eq!(mode_short_circuit(mode, "write_file", None), Some(Ok(())));
+            assert_eq!(mode_short_circuit(mode, "edit_file", None), Some(Ok(())));
+            assert_eq!(mode_short_circuit(mode, "remember", None), Some(Ok(())));
+            assert!(mode_short_circuit(mode, "run_shell", None).is_none());
         }
     }
 
     #[test]
+    fn smart_mode_auto_approves_write_and_edit_only_when_risk_is_low_and_unfloored() {
+        let low = RiskAssessment { level: "low".to_string(), reason: "trivial rename".to_string(), floored: false };
+        assert_eq!(mode_short_circuit("smart", "write_file", Some(&low)), Some(Ok(())));
+        assert_eq!(mode_short_circuit("smart", "edit_file", Some(&low)), Some(Ok(())));
+    }
+
+    #[test]
+    fn smart_mode_falls_through_for_write_and_edit_when_risk_is_medium_or_high() {
+        for level in ["medium", "high"] {
+            let risk = RiskAssessment { level: level.to_string(), reason: "reason".to_string(), floored: false };
+            assert!(mode_short_circuit("smart", "write_file", Some(&risk)).is_none());
+            assert!(mode_short_circuit("smart", "edit_file", Some(&risk)).is_none());
+        }
+    }
+
+    #[test]
+    fn smart_mode_falls_through_for_write_and_edit_when_risk_is_none() {
+        // No classification available (judge disabled/timed out/unparseable)
+        // — fails closed to a normal prompt, exactly like every other
+        // "unknown" case in this design.
+        assert!(mode_short_circuit("smart", "write_file", None).is_none());
+        assert!(mode_short_circuit("smart", "edit_file", None).is_none());
+    }
+
+    #[test]
+    fn smart_mode_never_auto_approves_a_floored_low_risk_path() {
+        // The deterministic path floor is authoritative and can never be
+        // relaxed by the judge — a floored path stays "low" only because
+        // `compute_risk` never actually emits `floored: true` with a level
+        // other than "high" in practice, but this pins the short-circuit
+        // table's own defense-in-depth: `floored: true` always falls through
+        // no matter what `level` says.
+        let floored_low = RiskAssessment { level: "low".to_string(), reason: "floored anyway".to_string(), floored: true };
+        assert!(mode_short_circuit("smart", "write_file", Some(&floored_low)).is_none());
+        assert!(mode_short_circuit("smart", "edit_file", Some(&floored_low)).is_none());
+    }
+
+    #[test]
+    fn smart_mode_never_short_circuits_remember() {
+        // `remember` is not write_file/edit_file — "smart" only ever
+        // auto-approves those two tools, unlike "auto"/"acceptEdits" which
+        // also cover `remember`.
+        let low = RiskAssessment { level: "low".to_string(), reason: "reason".to_string(), floored: false };
+        assert!(mode_short_circuit("smart", "remember", Some(&low)).is_none());
+        assert!(mode_short_circuit("smart", "remember", None).is_none());
+    }
+
+    #[test]
     fn bypass_mode_short_circuits_everything() {
-        assert_eq!(mode_short_circuit("bypass", "run_shell"), Some(Ok(())));
-        assert_eq!(mode_short_circuit("bypass", "write_file"), Some(Ok(())));
+        assert_eq!(mode_short_circuit("bypass", "run_shell", None), Some(Ok(())));
+        assert_eq!(mode_short_circuit("bypass", "write_file", None), Some(Ok(())));
     }
 
     #[test]
     fn manual_and_unknown_modes_never_short_circuit() {
         for mode in ["manual", "yolo"] {
-            assert!(mode_short_circuit(mode, "write_file").is_none());
-            assert!(mode_short_circuit(mode, "run_shell").is_none());
-            assert!(mode_short_circuit(mode, "remember").is_none());
+            assert!(mode_short_circuit(mode, "write_file", None).is_none());
+            assert!(mode_short_circuit(mode, "run_shell", None).is_none());
+            assert!(mode_short_circuit(mode, "remember", None).is_none());
         }
     }
 
     #[test]
     fn plan_mode_short_circuits_to_an_error() {
-        let decision = mode_short_circuit("plan", "run_shell").unwrap();
+        let decision = mode_short_circuit("plan", "run_shell", None).unwrap();
         assert!(decision.unwrap_err().contains("Plan Mode"));
     }
 
@@ -592,12 +913,139 @@ mod tests {
     fn plan_mode_blocks_remember_too() {
         // Plan mode blocks every mutating tool unconditionally — remember
         // (writes to app-data, not the workspace) is no exception.
-        let decision = mode_short_circuit("plan", "remember").unwrap();
+        let decision = mode_short_circuit("plan", "remember", None).unwrap();
         assert!(decision.unwrap_err().contains("Plan Mode"));
     }
 
     #[test]
     fn bypass_mode_short_circuits_remember() {
-        assert_eq!(mode_short_circuit("bypass", "remember"), Some(Ok(())));
+        assert_eq!(mode_short_circuit("bypass", "remember", None), Some(Ok(())));
+    }
+
+    // --- path_risk_floor / compute_risk (Phase 2 risk annotations) ---
+
+    #[test]
+    fn floor_flags_env_files() {
+        let root = Path::new("/ws");
+        assert!(path_risk_floor(Path::new("/ws/.env"), root).is_some());
+        assert!(path_risk_floor(Path::new("/ws/.env.local"), root).is_some());
+        assert!(path_risk_floor(Path::new("/ws/.env.production"), root).is_some());
+    }
+
+    #[test]
+    fn floor_flags_inside_git_dir() {
+        let root = Path::new("/ws");
+        assert!(path_risk_floor(Path::new("/ws/.git/config"), root).is_some());
+        assert!(path_risk_floor(Path::new("/ws/.git/hooks/pre-commit"), root).is_some());
+    }
+
+    #[test]
+    fn floor_flags_github_workflows() {
+        let root = Path::new("/ws");
+        assert!(path_risk_floor(Path::new("/ws/.github/workflows/ci.yml"), root).is_some());
+        // A file directly under .github (not workflows/) is not flagged by
+        // this rule — only the workflows subtree runs with repo permissions.
+        assert!(path_risk_floor(Path::new("/ws/.github/ISSUE_TEMPLATE.md"), root).is_none());
+    }
+
+    #[test]
+    fn floor_flags_shell_rc_files() {
+        let root = Path::new("/ws");
+        for name in [".bashrc", ".zshrc", ".profile", ".zshenv"] {
+            assert!(
+                path_risk_floor(&root.join(name), root).is_some(),
+                "{name} should be floored"
+            );
+        }
+    }
+
+    #[test]
+    fn floor_flags_script_executing_manifests() {
+        let root = Path::new("/ws");
+        for name in ["package.json", "package-lock.json", "Cargo.toml", "Cargo.lock", "Gemfile"] {
+            assert!(
+                path_risk_floor(&root.join(name), root).is_some(),
+                "{name} should be floored"
+            );
+        }
+    }
+
+    #[test]
+    fn floor_flags_case_variant_filenames() {
+        // Case-insensitive-but-case-preserving filesystems (default on both
+        // macOS/APFS and Windows/NTFS) treat ".ZSHRC" and ".zshrc" as the
+        // same on-disk file — the floor must fire on the case variant too,
+        // or "smart" mode could silently auto-approve writing what is
+        // effectively a shell rc file / .env / script-executing manifest.
+        let root = Path::new("/ws");
+        assert!(path_risk_floor(&root.join(".ZSHRC"), root).is_some());
+        assert!(path_risk_floor(&root.join(".Env"), root).is_some());
+        assert!(path_risk_floor(&root.join(".ENV.LOCAL"), root).is_some());
+        assert!(path_risk_floor(&root.join("PACKAGE.JSON"), root).is_some());
+        assert!(path_risk_floor(&root.join("Cargo.TOML"), root).is_some());
+        assert!(path_risk_floor(&root.join(".Git").join("config"), root).is_some());
+        assert!(path_risk_floor(&root.join(".GitHub").join("Workflows").join("ci.yml"), root).is_some());
+    }
+
+    #[test]
+    fn floor_does_not_flag_ordinary_source_files() {
+        let root = Path::new("/ws");
+        assert!(path_risk_floor(Path::new("/ws/src/main.rs"), root).is_none());
+        assert!(path_risk_floor(Path::new("/ws/README.md"), root).is_none());
+        // An ordinary dotfile that isn't in any of the documented categories
+        // (e.g. editor/lint config) must NOT be swept up by an overbroad
+        // "any dotfile" rule — only the specific documented categories flag.
+        assert!(path_risk_floor(Path::new("/ws/.eslintrc"), root).is_none());
+        assert!(path_risk_floor(Path::new("/ws/.prettierrc"), root).is_none());
+    }
+
+    #[test]
+    fn compute_risk_floor_always_overrides_a_judge_result_even_when_judge_says_low() {
+        // The central invariant: the deterministic floor is authoritative and
+        // can never be relaxed by the LLM judge, no matter how confidently
+        // the judge (which only ever sees untrusted-content-derived text)
+        // claims a floored path is actually low risk.
+        let root = Path::new("/ws");
+        let path = Path::new("/ws/.env");
+        let assessment = compute_risk(
+            Some((path, root)),
+            Some("low".to_string()),
+            Some("looks like a harmless template".to_string()),
+        )
+        .unwrap();
+        assert_eq!(assessment.level, "high");
+        assert!(assessment.floored);
+        assert!(assessment.reason.contains("environment/secrets"));
+    }
+
+    #[test]
+    fn compute_risk_falls_back_to_the_judge_when_the_path_is_not_floored() {
+        let root = Path::new("/ws");
+        let path = Path::new("/ws/src/main.rs");
+        let assessment = compute_risk(Some((path, root)), Some("medium".to_string()), Some("touches parsing logic".to_string()))
+            .unwrap();
+        assert_eq!(assessment.level, "medium");
+        assert!(!assessment.floored);
+        assert_eq!(assessment.reason, "touches parsing logic");
+    }
+
+    #[test]
+    fn compute_risk_is_none_when_unfloored_and_judge_gave_nothing_usable() {
+        let root = Path::new("/ws");
+        let path = Path::new("/ws/src/main.rs");
+        assert!(compute_risk(Some((path, root)), None, None).is_none());
+        // A malformed/out-of-enum level (should never happen once riskJudge.ts
+        // has already validated it, but defensively re-checked here too) is
+        // discarded rather than trusted — fails closed to "no annotation".
+        assert!(compute_risk(Some((path, root)), Some("critical".to_string()), Some("x".to_string())).is_none());
+    }
+
+    #[test]
+    fn compute_risk_with_no_path_is_judge_only_never_floored() {
+        // run_shell has no path to floor-check — a judge result is used
+        // as-is (still purely advisory, never floored).
+        let assessment = compute_risk(None, Some("high".to_string()), Some("deletes files".to_string())).unwrap();
+        assert_eq!(assessment.level, "high");
+        assert!(!assessment.floored);
     }
 }

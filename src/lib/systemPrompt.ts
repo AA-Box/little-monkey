@@ -14,6 +14,8 @@ import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesSto
 import { useMcpStore } from '../store/mcpStore';
 import { usePromptStore, type PromptEntry } from '../store/promptStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useVerifyStore } from '../store/verifyStore';
+import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -113,7 +115,33 @@ export function buildSystemPrompt(
   // filter this guidance line is just describing in prose). Defaults to
   // `true` here only so existing tests/call sites that don't care about the
   // toggle don't have to pass it.
-  webToolsAvailable: boolean = true
+  webToolsAvailable: boolean = true,
+  // Whether `runVerificationPhase` (agentLoop.ts) will actually auto-run
+  // verification commands after this turn — true only when
+  // `settings.verifyEnabled` is on AND the current workspace has at least
+  // one enabled command configured. A plain boolean rather than reaching
+  // into `settingsStore`/`verifyStore` from inside this function keeps
+  // `buildSystemPrompt` pure and unit-testable; `currentSystemPrompt`
+  // computes it. Defaults to `false` so existing call sites/tests are
+  // unaffected.
+  verifyGuidanceAvailable: boolean = false,
+  // The active permission mode (see `permissionStore.ts`) — only ever
+  // changes this prompt's output when it's `'plan'` (see `planModeLines`
+  // below); every other mode produces byte-identical output to omitting
+  // this parameter entirely, which is what every pre-existing call site
+  // (and test) that doesn't pass it still gets via the default. Read once
+  // per turn by `currentSystemPrompt`, same as every other store snapshot
+  // in this module.
+  mode: PermissionMode = 'manual',
+  // Whether to nudge the model toward tagging previewable code fences (see
+  // `src/lib/artifacts.ts`'s fence-detection scheme). Defaults to `true`
+  // since there's no settings toggle gating this in phase 1 — kept as a
+  // parameter anyway (rather than an unconditional line) purely to match
+  // this module's established "conditional guidance line" pattern
+  // (`webToolsLines`/`verifyGuidanceLines` below), so a later phase can wire
+  // in a real toggle (or turn it off in plan mode, say) without changing
+  // this function's shape again.
+  artifactGuidanceAvailable: boolean = true
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -184,6 +212,44 @@ export function buildSystemPrompt(
     ? ['', 'You can research with web_search and read pages with web_fetch (Markdown, paginated via start_index/max_chars for long pages); cite source URLs.']
     : [];
 
+  // One conditional line telling the model that configured verification
+  // commands (see AutomationPanel's "Verification" section) run
+  // automatically after edits — set only when there's actually something
+  // that will run (see the `verifyGuidanceAvailable` param doc).
+  const verifyGuidanceLines = verifyGuidanceAvailable
+    ? ['', 'Configured verification commands run automatically after your edits; fix any failures they report.']
+    : [];
+
+  // One conditional line telling the model that a complete HTML page, SVG
+  // image, or Mermaid diagram gets a live preview when tagged appropriately
+  // — model-agnostic nudging, not a protocol requirement: small local models
+  // that ignore this still just render as an ordinary code block (see
+  // `artifacts.ts`'s module doc comment for why this is fence-detection
+  // rather than a bespoke tag protocol).
+  const artifactGuidanceLines = artifactGuidanceAvailable
+    ? [
+        '',
+        'When producing a complete HTML page, SVG image, or Mermaid diagram, put it in a single fenced code block tagged html/svg/mermaid so it can be previewed.',
+      ]
+    : [];
+
+  // Plan Mode instructs the model to investigate read-only and present a
+  // structured plan instead of acting — the actual enforcement is the
+  // backend hard block (mode_short_circuit in permissions.rs), this is just
+  // steering so a well-behaved model doesn't bother trying a mutating tool
+  // (or a plain prose "plan") in the first place. `present_plan` is only
+  // ever offered to the model while `mode === 'plan'` (see `toolsForMode` in
+  // agentLoop.ts), so this section and that tool's availability are always
+  // in sync.
+  const planModeLines =
+    mode === 'plan'
+      ? [
+          '',
+          '## Plan Mode',
+          "You are in Plan Mode: read-only tools (read_file, glob, grep, list_dir, web_fetch, web_search) work normally, but every mutating tool (write_file, edit_file, run_shell, remember) is blocked and will return an error if you try. Investigate first, then call present_plan exactly once with your proposed plan (a short title, the plan itself as Markdown, and any open_questions worth asking) — then stop and wait for the user to approve it.",
+        ]
+      : [];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -201,6 +267,9 @@ export function buildSystemPrompt(
     ...mcpLines,
     ...rememberGuidanceLines,
     ...webToolsLines,
+    ...verifyGuidanceLines,
+    ...artifactGuidanceLines,
+    ...planModeLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');
@@ -224,7 +293,18 @@ export function currentSystemPrompt(personaId: string | null = null): string {
     .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
     .map((server) => ({ label: server.label, instructions: server.instructions as string }));
   const webToolsAvailable = useSettingsStore.getState().webToolsEnabled;
-  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable);
+  // Mirrors `runVerificationPhase`'s own gate (verifyEnabled + >=1 enabled
+  // command for the current workspace) so the guidance line only appears
+  // when verification will actually run — see the `verifyGuidanceAvailable`
+  // param doc on `buildSystemPrompt`. Note this does NOT check permission
+  // mode (`runVerificationPhase` also skips plan mode) since the prompt is
+  // built once per turn before that mode is necessarily settled here; a
+  // stale "verification runs automatically" line in plan mode is harmless
+  // prose, not a behavior change.
+  const verifyGuidanceAvailable =
+    useSettingsStore.getState().verifyEnabled && useVerifyStore.getState().config.commands.some((c) => c.enabled);
+  const mode = usePermissionStore.getState().mode;
+  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable, verifyGuidanceAvailable, mode);
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
 }
