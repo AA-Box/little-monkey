@@ -90,6 +90,123 @@ export interface PromptStore {
   /** Remove an entry by id; no-ops if it doesn't exist. Clears
    * `defaultPersonaId` if it pointed at the removed entry. */
   removeEntry: (id: string) => void;
+  /** Merge externally-sourced entries (parsed by `parseImportPayload`) into
+   * the library. Matches by `command`: a colliding command is renamed
+   * (`"review"` -> `"review-2"`) rather than overwriting the existing entry,
+   * so Import only ever adds rows — it can never silently clobber a saved
+   * prompt. Every imported entry gets a fresh `id`/timestamps, ignoring
+   * whatever the source file had. Returns the number of entries added. */
+  importEntries: (incoming: PromptEntry[]) => number;
+  /** Serializes the current library to the portable JSON shape written by
+   * `prompts_write_external` — the Settings "Prompts" tab's Export button.
+   * Deliberately omits `defaultPersonaId`: it's a local preference, not
+   * something that should travel into a teammate's imported copy. */
+  exportPayload: () => string;
+}
+
+/** Derives a candidate command slug from a display name — lowercased,
+ * non-alphanumerics collapsed to single hyphens, trimmed of leading/
+ * trailing hyphens, capped at the `command` field's 32-character limit.
+ * Shared by `PromptLibraryPanel.tsx`'s auto-slug-as-you-type behavior and
+ * the Cherry Studio import adapter below, so both derive commands the same
+ * way. */
+export function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+}
+
+/** Appends `-2`, `-3`, ... to `command` until it no longer collides with
+ * anything in `taken`, so a batch import never silently overwrites an
+ * existing entry's command. Truncates back to 32 characters (the
+ * `command` field's limit) after appending the suffix. Returns `command`
+ * unchanged if it doesn't collide. */
+function uniqueCommand(command: string, taken: Set<string>): string {
+  const base = command.length > 0 ? command : "prompt";
+  if (!taken.has(base)) return base;
+  let n = 2;
+  let candidate = `${base}-${n}`.slice(0, 32);
+  while (taken.has(candidate)) {
+    n += 1;
+    candidate = `${base}-${n}`.slice(0, 32);
+  }
+  return candidate;
+}
+
+/** Raised by `parseImportPayload` for a file that is either invalid JSON or
+ * doesn't match any recognized shape (this app's own export, or Cherry
+ * Studio's agents export) — a distinct type so the Settings UI can show a
+ * clear "couldn't read that file" message instead of an unhandled crash. */
+export class ImportParseError extends Error {}
+
+/** Cherry Studio's exported "agents" JSON is a bare array of
+ * `{ name, prompt, description }` objects — no `version`/`entries`
+ * wrapper. Recognized structurally (every element has string `name` and
+ * `prompt` fields) rather than by a format flag, since the file carries no
+ * such flag itself. Every agent becomes a persona: Cherry Studio's
+ * `prompt` is exactly a system-prompt extension, which is what
+ * `kind: "persona"` means here. Returns `null` (not an error) when `raw`
+ * doesn't match, so the caller can fall through to "unrecognized format".
+ */
+function adaptCherryStudioAgents(raw: unknown[]): PromptEntry[] | null {
+  if (raw.length === 0) return null;
+  const isCherryShape = raw.every(
+    (item): item is { name: string; prompt: string; description?: unknown } =>
+      !!item &&
+      typeof item === "object" &&
+      typeof (item as Record<string, unknown>).name === "string" &&
+      typeof (item as Record<string, unknown>).prompt === "string",
+  );
+  if (!isCherryShape) return null;
+
+  const now = Date.now();
+  return raw.map((item) => {
+    const agent = item as { name: string; prompt: string; description?: unknown };
+    return {
+      id: crypto.randomUUID(),
+      kind: "persona" as const,
+      name: agent.name,
+      command: slugify(agent.name),
+      content: agent.prompt,
+      description: typeof agent.description === "string" && agent.description.length > 0 ? agent.description : undefined,
+      createdAt: now,
+      updatedAt: now,
+    };
+  });
+}
+
+/** Parses a file picked via the Import button into normalized entries,
+ * without touching the store — the Settings UI shows a count preview
+ * (`entries.length`) and asks for confirmation before calling
+ * `importEntries` with the result. Recognizes two shapes: this app's own
+ * export (`{ version, entries }`, reusing `normalizeEntry`'s leniency) and
+ * Cherry Studio's exported agents array (see `adaptCherryStudioAgents`).
+ * Throws `ImportParseError` with a user-facing message for invalid JSON or
+ * an unrecognized shape — callers should catch this specifically rather
+ * than let a malformed file crash the import flow. */
+export function parseImportPayload(raw: string): PromptEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ImportParseError("That file isn't valid JSON.");
+  }
+
+  if (parsed && typeof parsed === "object" && Array.isArray((parsed as { entries?: unknown }).entries)) {
+    return ((parsed as { entries: unknown[] }).entries)
+      .filter((e): e is Partial<PromptEntry> => !!e && typeof e === "object")
+      .map(normalizeEntry);
+  }
+
+  if (Array.isArray(parsed)) {
+    const adapted = adaptCherryStudioAgents(parsed);
+    if (adapted) return adapted;
+  }
+
+  throw new ImportParseError("Unrecognized prompt library file format.");
 }
 
 /** Fills in defaults for a possibly hand-edited or partially malformed
@@ -247,7 +364,7 @@ export async function hydratePrompts(): Promise<void> {
   // this feature never persisted anywhere before this file existed.
 }
 
-export const usePromptStore = create<PromptStore>((set) => ({
+export const usePromptStore = create<PromptStore>((set, get) => ({
   entries: [],
   defaultPersonaId: null,
   persistError: null,
@@ -291,6 +408,26 @@ export const usePromptStore = create<PromptStore>((set) => ({
       return { entries, defaultPersonaId };
     });
   },
+
+  importEntries: (incoming) => {
+    let added = 0;
+    set((state) => {
+      const taken = new Set(state.entries.map((e) => e.command));
+      const now = Date.now();
+      const imported = incoming.map((item) => {
+        const command = uniqueCommand(item.command, taken);
+        taken.add(command);
+        return { ...item, id: crypto.randomUUID(), command, createdAt: now, updatedAt: now };
+      });
+      added = imported.length;
+      const entries = [...state.entries, ...imported];
+      persist(entries, state.defaultPersonaId);
+      return { entries };
+    });
+    return added;
+  },
+
+  exportPayload: () => JSON.stringify({ version: 1, entries: get().entries }, null, 2),
 }));
 
 /** Zustand selector: every saved persona, in library order. */

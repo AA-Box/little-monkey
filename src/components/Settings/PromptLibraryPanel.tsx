@@ -1,25 +1,24 @@
 import { useMemo, useState } from "react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { Download, Pencil, Plus, Trash2, Upload } from "lucide-react";
 import { Button } from "../ui";
-import { findByCommand, usePromptStore, type PromptEntry, type PromptKind } from "../../store/promptStore";
+import {
+  findByCommand,
+  parseImportPayload,
+  slugify,
+  usePromptStore,
+  type PromptEntry,
+  type PromptKind,
+} from "../../store/promptStore";
 import { useT } from "../../lib/i18n";
 
 /** Same slash-trigger slug shape the design doc pins for `PromptEntry.command`. */
 const COMMAND_PATTERN = /^[a-z0-9-]{1,32}$/;
 
-/** Derives a candidate command slug from a display name — lowercased,
- * non-alphanumerics collapsed to single hyphens, trimmed of leading/
- * trailing hyphens, capped at the pattern's 32-character limit. Used to
- * auto-fill the command field as the user types a name, until they hand-edit
- * it (see `DraftState.commandTouched`). */
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32);
-}
+/** `@tauri-apps/plugin-dialog` file-type filter shared by the Import/Export
+ * pickers — the library only ever round-trips JSON. */
+const JSON_FILTERS = [{ name: "JSON", extensions: ["json"] }];
 
 /** First non-blank line of `content`, truncated for the list row's preview —
  * the create/edit form shows the full text. */
@@ -67,10 +66,19 @@ export function PromptLibraryPanel() {
   const addEntry = usePromptStore((s) => s.addEntry);
   const updateEntry = usePromptStore((s) => s.updateEntry);
   const removeEntry = usePromptStore((s) => s.removeEntry);
+  const importEntries = usePromptStore((s) => s.importEntries);
+  const exportPayload = usePromptStore((s) => s.exportPayload);
 
   const [draft, setDraft] = useState<DraftState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmingRemoveId, setConfirmingRemoveId] = useState<string | null>(null);
+
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importPreview, setImportPreview] = useState<PromptEntry[] | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [importedCount, setImportedCount] = useState<number | null>(null);
 
   const commandError = useMemo(() => {
     if (!draft) return null;
@@ -145,9 +153,88 @@ export function PromptLibraryPanel() {
     setError(null);
   }
 
+  async function handleExport() {
+    setExportError(null);
+    setExportBusy(true);
+    try {
+      const path = await save({ defaultPath: "prompts.json", filters: JSON_FILTERS });
+      if (!path) return;
+      await invoke("prompts_write_external", { path, payload: exportPayload() });
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function handlePickImport() {
+    setImportError(null);
+    setImportPreview(null);
+    setImportedCount(null);
+    setImportBusy(true);
+    try {
+      const path = await open({ multiple: false, filters: JSON_FILTERS });
+      if (!path || Array.isArray(path)) return;
+      const raw = await invoke<string>("prompts_read_external", { path });
+      const parsed = parseImportPayload(raw);
+      if (parsed.length === 0) {
+        setImportError(t("PromptLibraryPanel.importEmptyError"));
+        return;
+      }
+      setImportPreview(parsed);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  function confirmImport() {
+    if (!importPreview) return;
+    const count = importEntries(importPreview);
+    setImportPreview(null);
+    setImportedCount(count);
+  }
+
+  function cancelImport() {
+    setImportPreview(null);
+  }
+
   return (
     <div className="flex flex-col gap-3 p-2">
       <p className="text-xs text-muted">{t("PromptLibraryPanel.description")}</p>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="secondary" size="sm" onClick={() => void handleExport()} disabled={exportBusy || entries.length === 0}>
+          <Download size={12} />
+          {t("PromptLibraryPanel.exportButton")}
+        </Button>
+        <Button variant="secondary" size="sm" onClick={() => void handlePickImport()} disabled={importBusy}>
+          <Upload size={12} />
+          {t("PromptLibraryPanel.importButton")}
+        </Button>
+      </div>
+      {exportError && <p className="text-xs text-danger">{exportError}</p>}
+      {importError && <p className="text-xs text-danger">{importError}</p>}
+      {importedCount !== null && (
+        <p className="text-xs text-muted">{t("PromptLibraryPanel.importSuccess", { count: importedCount })}</p>
+      )}
+
+      {importPreview && (
+        <div className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-3">
+          <p className="text-xs text-foreground">
+            {t("PromptLibraryPanel.importPreviewMessage", { count: importPreview.length })}
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={cancelImport}>
+              {t("PromptLibraryPanel.cancelButton")}
+            </Button>
+            <Button variant="secondary" size="sm" onClick={confirmImport}>
+              {t("PromptLibraryPanel.importConfirmButton")}
+            </Button>
+          </div>
+        </div>
+      )}
 
       {entries.length === 0 ? (
         <p className="px-1 text-xs text-faint">{t("PromptLibraryPanel.emptyState")}</p>
