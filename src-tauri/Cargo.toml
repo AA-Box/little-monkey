@@ -30,7 +30,10 @@ tokio = { version = "1.52.3", features = ["full"] }
 # "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
 # `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
 # to POST the DuckDuckGo query as `application/x-www-form-urlencoded`.
-reqwest = { version = "0.13.4", features = ["json", "stream", "form"] }
+# "query" added in phase 3 for the same reason: `RequestBuilder::query` (used
+# by the Brave/SearXNG branches to attach `?q=&count=`/`?q=&format=json`) is
+# also feature-gated in reqwest 0.13, separately from "form".
+reqwest = { version = "0.13.4", features = ["json", "stream", "form", "query"] }
 futures-util = "0.3.32"
 uuid = { version = "1.23.4", features = ["v4"] }
 regex = "1.12.4"
