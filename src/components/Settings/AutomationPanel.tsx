@@ -3,7 +3,9 @@ import { Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
+  MAX_VERIFY_MAX_ROUNDS,
   MIN_CHECKPOINT_RETENTION,
+  MIN_VERIFY_MAX_ROUNDS,
   useSettingsStore,
   type ContextTrimStrategy,
 } from "../../store/settingsStore";
@@ -167,6 +169,8 @@ export function AutomationPanel() {
   const clearVisionOverride = useSettingsStore((s) => s.clearVisionOverride);
   const verifyEnabled = useSettingsStore((s) => s.verifyEnabled);
   const setVerifyEnabled = useSettingsStore((s) => s.setVerifyEnabled);
+  const verifyMaxRounds = useSettingsStore((s) => s.verifyMaxRounds);
+  const setVerifyMaxRounds = useSettingsStore((s) => s.setVerifyMaxRounds);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
@@ -269,6 +273,20 @@ export function AutomationPanel() {
             label={t("AutomationPanel.verifyEnabledLabel")}
             description={t("AutomationPanel.verifyEnabledDescription")}
           />
+          <label className="flex items-center justify-between gap-3 border-t border-border py-2.5 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.verifyMaxRoundsLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.verifyMaxRoundsDescription")}</span>
+            </span>
+            <input
+              type="number"
+              min={MIN_VERIFY_MAX_ROUNDS}
+              max={MAX_VERIFY_MAX_ROUNDS}
+              value={verifyMaxRounds}
+              onChange={(event) => setVerifyMaxRounds(Number(event.target.value))}
+              className="h-8 w-16 shrink-0 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+          </label>
           <div className="border-t border-border py-2.5">
             {!hasWorkspace ? (
               <p className="text-xs text-faint">{t("AutomationPanel.verifyNoWorkspaceOpen")}</p>

@@ -180,3 +180,59 @@ describe("settingsStore.verifyEnabled", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+describe("settingsStore.verifyMaxRounds", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ verifyMaxRounds: 1 });
+  });
+
+  it("defaults to 1 when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as checkpointRetention's
+    // own default test above — `beforeEach` forces `1` regardless, so only a
+    // fresh module import actually covers `defaults()`.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().verifyMaxRounds).toBe(1);
+  });
+
+  it("clamps below the 0-round floor", () => {
+    useSettingsStore.getState().setVerifyMaxRounds(-1);
+    expect(useSettingsStore.getState().verifyMaxRounds).toBe(0);
+  });
+
+  it("clamps above the 3-round ceiling", () => {
+    useSettingsStore.getState().setVerifyMaxRounds(10);
+    expect(useSettingsStore.getState().verifyMaxRounds).toBe(3);
+  });
+
+  it("rounds fractional input", () => {
+    useSettingsStore.getState().setVerifyMaxRounds(2.4);
+    expect(useSettingsStore.getState().verifyMaxRounds).toBe(2);
+  });
+
+  it("accepts an in-range value unchanged", () => {
+    useSettingsStore.getState().setVerifyMaxRounds(2);
+    expect(useSettingsStore.getState().verifyMaxRounds).toBe(2);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setVerifyMaxRounds(3);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().verifyMaxRounds).toBe(3);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores an out-of-range persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ verifyMaxRounds: 99 }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().verifyMaxRounds).toBe(1);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});

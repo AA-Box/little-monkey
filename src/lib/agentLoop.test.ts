@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const invokeMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
 import {
   checkpointChainBlockReason,
@@ -10,13 +13,18 @@ import {
   isVerifyNotice,
   parseMemoryNotice,
   parseVerifyNotice,
+  runVerificationPhase,
+  shouldFeedBackVerifyFailure,
   toolCallPathArg,
   toolsForSettings,
   type CheckpointChainLink,
   type MemoryNotice,
+  type VerifyFailure,
   type VerifyNotice,
 } from "./agentLoop";
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
+import { useSettingsStore } from "../store/settingsStore";
+import { usePermissionStore } from "../store/permissionStore";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -252,5 +260,117 @@ describe("isToolCallAllowed", () => {
 
   it("rejects a hallucinated tool name that was never offered at all", () => {
     expect(isToolCallAllowed(call("delete_everything"), toolsForTurn)).toBe(false);
+  });
+});
+
+describe("runVerificationPhase", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    useSettingsStore.setState({ verifyEnabled: true });
+    usePermissionStore.setState({ mode: "manual" });
+  });
+
+  it("no-ops without any IPC calls when verifyEnabled is off (report-only posture stays off by default)", async () => {
+    useSettingsStore.setState({ verifyEnabled: false });
+    const addMessage = vi.fn();
+
+    const failure = await runVerificationPhase("turn-1", addMessage);
+
+    expect(failure).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(addMessage).not.toHaveBeenCalled();
+  });
+
+  it("never runs verification in plan mode, even with mutated files and verifyEnabled on", async () => {
+    usePermissionStore.setState({ mode: "plan" });
+    const addMessage = vi.fn();
+
+    const failure = await runVerificationPhase("turn-1", addMessage);
+
+    expect(failure).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(addMessage).not.toHaveBeenCalled();
+  });
+
+  it("returns null and appends a passing notice when the only configured command succeeds", async () => {
+    invokeMock.mockResolvedValueOnce({
+      commands: [{ id: "cmd-1", label: "Lint", command: "pnpm lint", kind: "lint", enabled: true }],
+    }); // verify_get_config
+    invokeMock.mockResolvedValueOnce({
+      commandId: "cmd-1",
+      label: "Lint",
+      kind: "lint",
+      code: 0,
+      stdout: "no problems found",
+      stderr: "",
+      durationMs: 10,
+      timedOut: false,
+    }); // verify_run
+
+    const addMessage = vi.fn();
+    const failure = await runVerificationPhase("turn-1", addMessage);
+
+    expect(failure).toBeNull();
+    expect(addMessage).toHaveBeenCalledTimes(1);
+    const notice = parseVerifyNotice(addMessage.mock.calls[0][0] as ChatMessage);
+    expect(notice?.ok).toBe(true);
+  });
+
+  it("returns the first failing command's details when a command fails", async () => {
+    invokeMock.mockResolvedValueOnce({
+      commands: [{ id: "cmd-1", label: "Tests", command: "pnpm test", kind: "test", enabled: true }],
+    }); // verify_get_config
+    invokeMock.mockResolvedValueOnce({
+      commandId: "cmd-1",
+      label: "Tests",
+      kind: "test",
+      code: 1,
+      stdout: "",
+      stderr: "1 failing",
+      durationMs: 20,
+      timedOut: false,
+    }); // verify_run
+
+    const addMessage = vi.fn();
+    const failure = await runVerificationPhase("turn-1", addMessage);
+
+    expect(failure).toEqual({ label: "Tests", code: 1, output: "1 failing" });
+    const notice = parseVerifyNotice(addMessage.mock.calls[0][0] as ChatMessage);
+    expect(notice?.ok).toBe(false);
+  });
+});
+
+describe("shouldFeedBackVerifyFailure", () => {
+  const failure: VerifyFailure = { label: "Tests", code: 1, output: "1 failing" };
+
+  it("never feeds back a passing (null) result, regardless of the round budget", () => {
+    expect(shouldFeedBackVerifyFailure(null, 0, 3)).toBe(false);
+    expect(shouldFeedBackVerifyFailure(null, 0, 0)).toBe(false);
+  });
+
+  it("triggers exactly one feedback round when verifyMaxRounds is 1, then stops once the round is spent", () => {
+    const maxRounds = 1;
+    let verifyRound = 0;
+
+    // First failure this turn: a round is still available.
+    expect(shouldFeedBackVerifyFailure(failure, verifyRound, maxRounds)).toBe(true);
+    verifyRound += 1; // mirrors runAgentTurnBody incrementing after appending the fix instruction
+
+    // Same failure recurring after the fix round: budget is exhausted.
+    expect(shouldFeedBackVerifyFailure(failure, verifyRound, maxRounds)).toBe(false);
+  });
+
+  it("never appends feedback when verifyMaxRounds is 0 (report-only)", () => {
+    expect(shouldFeedBackVerifyFailure(failure, 0, 0)).toBe(false);
+  });
+
+  it("allows up to verifyMaxRounds rounds before exhausting the budget", () => {
+    const maxRounds = 3;
+    let verifyRound = 0;
+    for (let i = 0; i < maxRounds; i++) {
+      expect(shouldFeedBackVerifyFailure(failure, verifyRound, maxRounds)).toBe(true);
+      verifyRound += 1;
+    }
+    expect(shouldFeedBackVerifyFailure(failure, verifyRound, maxRounds)).toBe(false);
   });
 });
