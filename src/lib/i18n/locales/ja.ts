@@ -164,6 +164,8 @@ export const ja: Record<string, string> = {
   "ModelManager.noModelsAvailable": "利用可能なモデルがありません。",
   "ModelManager.customLocalModels": "カスタムローカルモデル",
   "ModelManager.addCustomModel": "カスタムモデルを追加",
+  "ModelManager.embeddingsToggleLabel": "埋め込み(embeddings)サポート付きで起動",
+  "ModelManager.embeddingsToggleDescription": "llama-serverを--embeddings付きで起動し、ローカルAPIサーバーがこのモデルでPOST /v1/embeddingsを提供できるようにします。変更を適用するにはモデルを再起動してください。",
   "OllamaImportForm.description": "ローカルのGGUFファイルまたはSafetensorsフォルダをOllamaにインポート",
   "OllamaImportForm.pickGgufButton": "GGUFファイル…",
   "OllamaImportForm.pickSafetensorsButton": "Safetensorsフォルダ…",

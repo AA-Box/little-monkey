@@ -164,6 +164,8 @@ export const id: Record<string, string> = {
   "ModelManager.noModelsAvailable": "Tidak ada model yang tersedia.",
   "ModelManager.customLocalModels": "Model lokal kustom",
   "ModelManager.addCustomModel": "Tambahkan model kustom",
+  "ModelManager.embeddingsToggleLabel": "Mulai dengan dukungan embeddings",
+  "ModelManager.embeddingsToggleDescription": "Menjalankan llama-server dengan --embeddings, sehingga server API lokal dapat melayani POST /v1/embeddings untuk model ini. Mulai ulang model untuk menerapkan perubahan.",
   "OllamaImportForm.description": "Impor berkas GGUF lokal atau folder Safetensors ke Ollama",
   "OllamaImportForm.pickGgufButton": "Berkas GGUF…",
   "OllamaImportForm.pickSafetensorsButton": "Folder Safetensors…",

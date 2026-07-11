@@ -164,6 +164,8 @@ export const es419: Record<string, string> = {
   "ModelManager.noModelsAvailable": "No hay modelos disponibles.",
   "ModelManager.customLocalModels": "Modelos locales personalizados",
   "ModelManager.addCustomModel": "Agregar un modelo personalizado",
+  "ModelManager.embeddingsToggleLabel": "Iniciar con soporte de embeddings",
+  "ModelManager.embeddingsToggleDescription": "Inicia llama-server con --embeddings, para que el servidor API local pueda ofrecer POST /v1/embeddings para este modelo. Reinicia el modelo para aplicar el cambio.",
   "OllamaImportForm.description": "Importa un archivo GGUF local o una carpeta Safetensors a Ollama",
   "OllamaImportForm.pickGgufButton": "Archivo GGUF…",
   "OllamaImportForm.pickSafetensorsButton": "Carpeta Safetensors…",
