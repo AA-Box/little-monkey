@@ -11,6 +11,18 @@ export interface PermissionRequest {
   id: string;
   tool: string;
   detail: string;
+  /** Advisory risk annotation (Phase 2 of the Plan/Act + risk-adaptive
+   * permissions design — docs/roadmap/p2-plan-act-safety.md). `undefined`
+   * when risk annotations are off, the tool wasn't classified, or nothing
+   * usable came back from the floor/judge — `PermissionModal` shows no badge
+   * in that case, never a fabricated "low risk" one. Purely informative: it
+   * never changes what gets auto-approved. */
+  risk_level?: "low" | "medium" | "high";
+  risk_reason?: string;
+  /** True when `risk_level`/`risk_reason` came from the authoritative,
+   * un-overridable `path_risk_floor` rather than the LLM judge — lets the
+   * modal show a stronger "sensitive path" warning. */
+  risk_floored?: boolean;
 }
 
 /**

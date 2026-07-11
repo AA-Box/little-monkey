@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
-import { executeToolCall, PRESENT_PLAN_RESULT } from "./turnEngine";
+import { executeToolCall, PRESENT_PLAN_RESULT, type RiskAnnotationContext } from "./turnEngine";
+import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
 import type { ToolCall } from "./llamaClient";
 
@@ -49,5 +50,129 @@ describe("executeToolCall / present_plan", () => {
     invokeMock.mockResolvedValue("ok");
     await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
     expect(invokeMock).toHaveBeenCalledWith("tool_read_file", expect.objectContaining({ path: "a.txt" }));
+  });
+});
+
+// IPC-level tests pinning the risk_level/risk_reason scrub-then-overwrite
+// invariant — mirrors the spirit of tools.rs's
+// `edit_file_ipc_accepts_snake_case_argument_keys` test, but on the frontend
+// side of the boundary: these keys are frontend-owned exactly like
+// `checkpoint_id`/`turn_id`, and this is what actually enforces that a
+// model can never smuggle its own risk rating through, since it's the last
+// place before the value crosses into Rust via `invoke`.
+describe("executeToolCall / risk_level and risk_reason scrubbing", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("ok");
+  });
+
+  it("strips a model-supplied risk_level/risk_reason when risk annotations are disabled", async () => {
+    const toolCall = call("write_file", {
+      path: "a.txt",
+      content: "x",
+      risk_level: "low",
+      risk_reason: "trust me, totally safe",
+    });
+
+    await executeToolCall(toolCall, null, "turn-1", emptyMcpRegistry, undefined, {
+      enabled: false,
+      cache: new Map(),
+      classify: vi.fn(),
+    });
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.risk_level).toBeUndefined();
+    expect(sentArgs.risk_reason).toBeUndefined();
+  });
+
+  it("strips a model-supplied risk_level/risk_reason even with no risk context supplied at all", async () => {
+    const toolCall = call("run_shell", { command: "ls", risk_level: "low", risk_reason: "harmless" });
+
+    await executeToolCall(toolCall, null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.risk_level).toBeUndefined();
+    expect(sentArgs.risk_reason).toBeUndefined();
+  });
+
+  it("overwrites a model-supplied risk_level/risk_reason with the judge's own result when annotations are enabled — the model's values never survive", async () => {
+    const toolCall = call("write_file", {
+      path: "a.txt",
+      content: "x",
+      risk_level: "low",
+      risk_reason: "trust me, totally safe",
+    });
+
+    // `executeToolCall` mutates the same `args` object in place after
+    // `classify` resolves (to inject the judge's result) — snapshot what
+    // `classify` was actually called with (a clone) rather than reading
+    // `classify.mock.calls` afterward, which would observe the post-mutation
+    // object instead of what the judge was actually shown.
+    let snapshotAtClassifyTime: Record<string, unknown> | null = null;
+    const classify = vi.fn(async (_tool: string, seenArgs: Record<string, unknown>): Promise<RiskClassification> => {
+      snapshotAtClassifyTime = { ...seenArgs };
+      return { level: "high", reason: "judge says risky" };
+    });
+    const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify };
+
+    await executeToolCall(toolCall, null, "turn-1", emptyMcpRegistry, undefined, risk);
+
+    // The judge was called with the model's args already stripped of any
+    // risk_level/risk_reason it tried to supply.
+    expect(snapshotAtClassifyTime).not.toBeNull();
+    expect(snapshotAtClassifyTime!.risk_level).toBeUndefined();
+    expect(snapshotAtClassifyTime!.risk_reason).toBeUndefined();
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.risk_level).toBe("high");
+    expect(sentArgs.risk_reason).toBe("judge says risky");
+  });
+
+  it("classifies write_file, edit_file, and run_shell, but not read-only tools", async () => {
+    const classify = vi.fn(async (): Promise<RiskClassification | null> => ({ level: "medium", reason: "r" }));
+    const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify };
+
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+    await executeToolCall(call("edit_file", { path: "b.txt", old_string: "a", new_string: "b" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+    await executeToolCall(call("run_shell", { command: "ls" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+    await executeToolCall(call("read_file", { path: "c.txt" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+
+    expect(classify).toHaveBeenCalledTimes(3);
+  });
+
+  it("never calls classify when annotations are disabled, for any tool", async () => {
+    const classify = vi.fn();
+    const risk: RiskAnnotationContext = { enabled: false, cache: new Map(), classify };
+
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+    await executeToolCall(call("run_shell", { command: "ls" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+
+    expect(classify).not.toHaveBeenCalled();
+  });
+
+  it("reuses a cached classification for an identical (tool, args) pair instead of calling classify again", async () => {
+    const classify = vi.fn(async (): Promise<RiskClassification> => ({ level: "low", reason: "cached" }));
+    const cache = new Map<string, RiskClassification | null>();
+    const risk: RiskAnnotationContext = { enabled: true, cache, classify };
+
+    const args = { path: "a.txt", content: "same" };
+    await executeToolCall(call("write_file", args), null, "turn-1", emptyMcpRegistry, undefined, risk);
+    await executeToolCall(call("write_file", args), null, "turn-1", emptyMcpRegistry, undefined, risk);
+
+    expect(classify).toHaveBeenCalledTimes(1);
+    const [, secondCallArgs] = invokeMock.mock.calls[1] as [string, Record<string, unknown>];
+    expect(secondCallArgs.risk_level).toBe("low");
+    expect(secondCallArgs.risk_reason).toBe("cached");
+  });
+
+  it("injects no risk_level/risk_reason at all when the judge fails closed (returns null)", async () => {
+    const classify = vi.fn(async (): Promise<RiskClassification | null> => null);
+    const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify };
+
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry, undefined, risk);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.risk_level).toBeUndefined();
+    expect(sentArgs.risk_reason).toBeUndefined();
   });
 });

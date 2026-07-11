@@ -38,7 +38,9 @@ import {
   PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
+  type RiskAnnotationContext,
 } from './turnEngine';
+import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
   composeReferencedText,
   extractMentionPaths,
@@ -54,6 +56,7 @@ import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
+import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import type { VerifyConfig } from '../store/verifyStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
@@ -1175,6 +1178,29 @@ async function runAgentTurnBody(
     return result.content.trim() || '(summary unavailable)';
   };
 
+  // Advisory risk annotations (Phase 2 of the Plan/Act + risk-adaptive
+  // permissions design — docs/roadmap/p2-plan-act-safety.md): built once per
+  // turn (`cache` must persist across every tool-calling round trip below,
+  // exactly like `mutatedFiles` just below it), passed unchanged into every
+  // `executeToolCall` call this turn. `classify` mirrors `sendForSummary`
+  // above almost exactly — the same `attemptStream`-against-`target` shape,
+  // just wrapping `riskJudge.ts`'s `classifyToolCall` instead of a plain
+  // summarization prompt (see that module's doc comment for why it takes this
+  // callback as a parameter instead of importing `attemptStream` itself).
+  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
+  const riskAnnotation: RiskAnnotationContext = {
+    enabled: settings.riskAnnotationsEnabled,
+    cache: new Map<string, RiskClassification | null>(),
+    classify: (toolName, toolArgs) =>
+      classifyToolCall(
+        toolName,
+        toolArgs,
+        workspaceRootPath,
+        (judgeMessages, judgeSignal) => attemptStream(target, judgeMessages, [], judgeSignal, effort, sessionId),
+        signal
+      ),
+  };
+
   // Absolute paths this turn's `write_file`/`edit_file` calls have
   // successfully mutated so far, across every tool-calling round trip below
   // — read by `runVerificationPhase` at the loop's natural exit to decide
@@ -1338,7 +1364,7 @@ async function runAgentTurnBody(
       // (several providers reject such a history on the next turn).
       const resultContent = signal?.aborted
         ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal);
+        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,

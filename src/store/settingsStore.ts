@@ -46,6 +46,8 @@ export interface SettingsState {
   verifyEnabled: boolean;
   /** How many times `runAgentTurnBody` will feed a failed verification command's output back to the model as a fix instruction and let the loop continue, before leaving the failure notice as-is. Range 0-3 (mirrors Aider's `max_reflections=3`); default 1. 0 means report-only — the same behavior as before this setting existed. */
   verifyMaxRounds: number;
+  /** Whether `write_file`/`edit_file`/`run_shell` calls get an LLM-judged risk classification (low/medium/high + a short reason) attached to their permission prompt — see `riskJudge.ts`'s `classifyToolCall` and `agentLoop.ts`'s `runAgentTurnBody`. Default false: it costs one extra model call per mutating tool call. Purely advisory in every mode as of Phase 2 (docs/roadmap/p2-plan-act-safety.md) — turning this on changes what the permission prompt *shows*, never what gets auto-approved. */
+  riskAnnotationsEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -65,6 +67,7 @@ export interface SettingsState {
   setWebToolsEnabled: (value: boolean) => void;
   setVerifyEnabled: (value: boolean) => void;
   setVerifyMaxRounds: (value: number) => void;
+  setRiskAnnotationsEnabled: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -111,6 +114,7 @@ interface PersistedShape {
   webToolsEnabled: boolean;
   verifyEnabled: boolean;
   verifyMaxRounds: number;
+  riskAnnotationsEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -129,6 +133,7 @@ function defaults(): PersistedShape {
     webToolsEnabled: true,
     verifyEnabled: false,
     verifyMaxRounds: DEFAULT_VERIFY_MAX_ROUNDS,
+    riskAnnotationsEnabled: false,
   };
 }
 
@@ -190,6 +195,8 @@ function hydrate(): PersistedShape {
         parsed.verifyMaxRounds <= MAX_VERIFY_MAX_ROUNDS
           ? Math.round(parsed.verifyMaxRounds)
           : fallback.verifyMaxRounds,
+      riskAnnotationsEnabled:
+        typeof parsed.riskAnnotationsEnabled === "boolean" ? parsed.riskAnnotationsEnabled : fallback.riskAnnotationsEnabled,
     };
   } catch {
     return fallback;
@@ -318,6 +325,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   setVerifyMaxRounds: (value) => {
     const clamped = Math.min(MAX_VERIFY_MAX_ROUNDS, Math.max(MIN_VERIFY_MAX_ROUNDS, Math.round(value)));
     set({ verifyMaxRounds: clamped });
+    persist({ ...get() });
+  },
+
+  setRiskAnnotationsEnabled: (value) => {
+    set({ riskAnnotationsEnabled: value });
     persist({ ...get() });
   },
 }));
