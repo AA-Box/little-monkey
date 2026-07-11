@@ -4,6 +4,7 @@ import {
   BookmarkX,
   Brain,
   ChevronRight,
+  ClipboardCheck,
   FilePenLine,
   FileSearch,
   FileText,
@@ -21,6 +22,7 @@ import {
 } from "lucide-react";
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
+import { StatusPill } from "../ui";
 import {
   checkpointAnchorValid,
   formatCheckpointNotice,
@@ -28,17 +30,25 @@ import {
   isCheckpointNotice,
   isMemoryNotice,
   isMentionNotice,
+  isPlanNotice,
   isSwitchNotice,
+  isVerifyFixNotice,
+  isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
+  parsePlanNotice,
+  parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
+  type PlanNotice,
+  type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
-import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
+import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
+import PlanCard from "./PlanCard";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
@@ -63,6 +73,8 @@ type TimelineItem =
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
+  | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
+  | { kind: "verify"; key: string; notice: VerifyNotice }
   | { kind: "typing"; key: string };
 
 /**
@@ -75,7 +87,7 @@ type TimelineItem =
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
  *   synthetic notices (compaction, model switch, per-turn checkpoint,
- *   remembered fact).
+ *   remembered fact, presented plan).
  */
 function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
@@ -149,7 +161,21 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         }
         return;
       }
-      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg)) {
+      if (isPlanNotice(msg)) {
+        const notice = parsePlanNotice(msg);
+        if (notice) {
+          items.push({ kind: "plan", key: `plan-${notice.id}`, notice, messageIndex: index });
+        }
+        return;
+      }
+      if (isVerifyNotice(msg)) {
+        const notice = parseVerifyNotice(msg);
+        if (notice) {
+          items.push({ kind: "verify", key: `verify-${index}`, notice });
+        }
+        return;
+      }
+      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg) || isVerifyFixNotice(msg)) {
         items.push({ kind: "notice", key: `notice-${index}`, text: textContent(msg.content) });
       }
     }
@@ -518,6 +544,51 @@ const MemoryRow = memo(function MemoryRow({
   );
 });
 
+/** Renders one `[Verify]` notice: the configured command's label, a
+ * pass/fail `StatusPill`, its duration, and a collapsible output block —
+ * reuses `ToolCallRow`'s collapse affordance rather than introducing a new
+ * one. Report-only in this slice: there is nothing to act on here yet (no
+ * "run again"/"fix it" affordance), just the result. */
+const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) {
+  const { t } = useT();
+  const [open, setOpen] = useState(false);
+  const seconds = (notice.durationMs / 1000).toFixed(1);
+
+  return (
+    <div className="flex justify-center">
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+        <button
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+        >
+          <ChevronRight
+            size={12}
+            className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+          />
+          <ClipboardCheck size={13} className="shrink-0 text-faint" />
+          <span className="truncate font-medium text-foreground">{notice.label}</span>
+          <StatusPill tone={notice.ok ? "success" : "danger"}>
+            {notice.ok ? t("MessageList.verifyPassedBadge") : t("MessageList.verifyFailedBadge")}
+          </StatusPill>
+          <span className="ml-auto shrink-0 whitespace-nowrap text-faint">
+            {t("MessageList.verifyDuration", { seconds })}
+          </span>
+        </button>
+        {open && (
+          <div className="border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
+            {notice.output ? (
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{notice.output}</pre>
+            ) : (
+              <span className="text-faint">{t("MessageList.verifyNoOutput")}</span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
@@ -525,6 +596,32 @@ function TypingIndicator() {
         <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
         <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-faint [animation-delay:-0.15s]" />
         <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-faint" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Shown while a configured verification command is actually executing
+ * (`sessionStore.runningVerifyLabel`, set/cleared by `runVerificationPhase`
+ * in agentLoop.ts) — a dedicated "running <label>…" row rather than the bare
+ * `TypingIndicator`, since test suites can run for minutes (up to a
+ * command's `timeout_secs`) and a bouncing-dots bubble alone would read as a
+ * hang (see the design doc's "long-running test suites stall the turn"
+ * risk). Same bounce animation, kept visually related to `TypingIndicator`.
+ */
+function VerifyRunningRow({ label }: { label: string }) {
+  const { t } = useT();
+  return (
+    <div className="flex justify-center">
+      <div className="flex items-center gap-2 rounded-md border border-border bg-surface-2 px-3 py-1.5 text-xs text-muted">
+        <ClipboardCheck size={13} className="shrink-0 text-faint" />
+        <span className="truncate">{t("MessageList.verifyRunning", { label })}</span>
+        <span className="flex items-center gap-1">
+          <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
+          <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.15s]" />
+          <span className="h-1 w-1 animate-bounce rounded-full bg-faint" />
+        </span>
       </div>
     </div>
   );
@@ -570,6 +667,7 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
 
   const items = buildTimeline(messages);
   const showRetry = Boolean(onRetry) && !editingDisabled && canRetry(messages);
+  const runningVerifyLabel = useSessionStore(selectRunningVerifyLabel(sessionId));
 
   return (
     <div
@@ -589,6 +687,7 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
                   key={item.key}
                   message={item.message}
                   index={item.index}
+                  sessionId={sessionId}
                   onEditMessage={editable ? onEditUserMessage : undefined}
                   editDisabled={editingDisabled}
                 />
@@ -616,8 +715,17 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
                 <MemoryRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
               );
             }
+            if (item.kind === "plan") {
+              return (
+                <PlanCard key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
+              );
+            }
+            if (item.kind === "verify") {
+              return <VerifyRow key={item.key} notice={item.notice} />;
+            }
             return <TypingIndicator key={item.key} />;
           })}
+          {runningVerifyLabel && <VerifyRunningRow label={runningVerifyLabel} />}
           {showRetry && (
             <div className="flex justify-start">
               <button

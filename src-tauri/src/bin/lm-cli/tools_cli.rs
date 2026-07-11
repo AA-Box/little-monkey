@@ -121,10 +121,16 @@ pub async fn write_file(
     content: &str,
     checkpoint_id: Option<&str>,
 ) -> Result<String, String> {
-    let detail = format!("Write {} bytes to {}", content.len(), path);
-    perms.request("write_file", &detail).await?;
+    // Resolved BEFORE the permission prompt (mirroring the GUI's
+    // `tool_write_file`, which reorders for the identical reason as of its
+    // own Phase 2) so `"smart"` mode's `path_risk_floor` check has an actual
+    // sandboxed/canonicalized target to consult, and an invalid path fails
+    // before a prompt is even shown.
+    let (resolved, root) = workspace::resolve_path_and_root(state, path)?;
 
-    let (resolved, _) = workspace::resolve_path_and_root(state, path)?;
+    let detail = format!("Write {} bytes to {}", content.len(), path);
+    perms.request_with_path("write_file", &detail, &resolved, &root).await?;
+
     checkpoints::record_original(state, checkpoint_id, &resolved)?;
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent)
@@ -184,7 +190,7 @@ pub async fn edit_file(
         return Err("old_string must not be empty".to_string());
     }
 
-    let (resolved, _) = workspace::resolve_path_and_root(state, path)?;
+    let (resolved, root) = workspace::resolve_path_and_root(state, path)?;
     if !resolved.is_file() {
         return Err(format!("'{path}' is not a file"));
     }
@@ -202,7 +208,7 @@ pub async fn edit_file(
 
     let preview = build_diff_preview(old_string, new_string);
     let detail = format!("Edit {path}\n{preview}");
-    perms.request("edit_file", &detail).await?;
+    perms.request_with_path("edit_file", &detail, &resolved, &root).await?;
 
     checkpoints::record_original(state, checkpoint_id, &resolved)?;
 

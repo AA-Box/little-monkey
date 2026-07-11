@@ -24,14 +24,23 @@
  * same mechanism a manual model switch uses — no separate sticky field.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { streamChat, textContent } from './llamaClient';
-import type { ChatContentPart, ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
-import { streamProviderChat } from './providerClient';
-import { TOOLS } from './tools';
-import { formatMcpCallToolResult, mcpToolDefs, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
+import { textContent } from './llamaClient';
+import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
+import { TOOLS, PRESENT_PLAN_TOOL } from './tools';
+import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
-import { recordRequest } from './rateLimitTracker';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
+import {
+  abortedPromise,
+  attemptStream,
+  CANCELLED_TOOL_RESULT,
+  executeToolCall,
+  PRESENT_PLAN_RESULT,
+  stringifyToolError,
+  type ResolvedTarget,
+  type RiskAnnotationContext,
+} from './turnEngine';
+import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
   composeReferencedText,
   extractMentionPaths,
@@ -46,6 +55,11 @@ import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
+import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
+import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import type { VerifyConfig } from '../store/verifyStore';
+import { extractArtifacts } from './artifacts';
+import { useArtifactStore } from '../store/artifactStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -193,6 +207,109 @@ export function formatCheckpointNotice(notice: CheckpointNotice): string {
   return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
+/** Prefix identifying a synthetic notice inserted after a `present_plan` tool
+ * call (Plan Mode only — see `toolsForMode`) — cloned from the
+ * `CHECKPOINT_NOTE_PREFIX` pattern above. The rest of the content is a JSON
+ * payload (see `PlanNotice`), so `MessageList` can render a `PlanCard` with
+ * "Approve & start acting" / "Keep planning" buttons for it. */
+export const PLAN_NOTE_PREFIX = '[Plan]';
+
+/** Payload embedded in a plan notice message. */
+export interface PlanNotice {
+  id: string;
+  title: string;
+  /** The plan body, as Markdown — rendered by `PlanCard` with the same
+   * `prose` classes `MessageBubble` uses for assistant messages. */
+  plan: string;
+  openQuestions?: string[];
+  /** `'proposed'` until the user acts on the card; `'approved'` after
+   * "Approve & start acting", `'dismissed'` after "Keep planning". Both
+   * terminal states rewrite the notice in place (`updateMessageAt`), same
+   * pattern as `CheckpointNotice.reverted`/`MemoryNotice.forgotten`. */
+  status: 'proposed' | 'approved' | 'dismissed';
+}
+
+export function isPlanNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PLAN_NOTE_PREFIX);
+}
+
+/** Parses a plan notice's JSON payload; `null` for anything malformed. */
+export function parsePlanNotice(message: ChatMessage): PlanNotice | null {
+  if (!isPlanNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(PLAN_NOTE_PREFIX.length));
+    const openQuestions = (parsed as PlanNotice | null)?.openQuestions;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as PlanNotice).id === 'string' &&
+      typeof (parsed as PlanNotice).title === 'string' &&
+      typeof (parsed as PlanNotice).plan === 'string' &&
+      typeof (parsed as PlanNotice).status === 'string' &&
+      // Mirrors parseCheckpointNotice's Array.isArray(files) check just
+      // above — openQuestions is optional, but if present it must actually
+      // be a string[], or PlanCard's `.map()` over it throws at render time
+      // (e.g. a persisted/hand-edited session whose payload sets it to a
+      // truthy non-array like a string).
+      (openQuestions === undefined || (Array.isArray(openQuestions) && openQuestions.every((q) => typeof q === 'string')))
+    ) {
+      return parsed as PlanNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a plan notice".
+  }
+  return null;
+}
+
+/** Serializes a plan notice back into message content — used both when the
+ * notice is first added and when Approve/Keep planning rewrite its status. */
+export function formatPlanNotice(notice: PlanNotice): string {
+  return `${PLAN_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/**
+ * Extracts a `present_plan` tool call's arguments into the fields a
+ * `PlanNotice` needs (everything except `id`/`status`, which the caller
+ * fills in). Never throws: malformed arguments JSON, or a missing
+ * `title`/`plan` string, both degrade to `null` rather than throwing — same
+ * "no path known" degradation `toolCallPathArg` uses for write/edit calls.
+ * `open_questions` (the model's snake_case argument, matching the tool's
+ * declared schema in `tools.ts`) is filtered down to just its string
+ * entries and dropped entirely if empty or absent.
+ */
+export function toolCallPlanArgs(toolCall: ToolCall): { title: string; plan: string; openQuestions?: string[] } | null {
+  try {
+    const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+    const title = (parsed as { title?: unknown } | null)?.title;
+    const plan = (parsed as { plan?: unknown } | null)?.plan;
+    if (typeof title !== 'string' || typeof plan !== 'string') return null;
+    const rawQuestions = (parsed as { open_questions?: unknown } | null)?.open_questions;
+    const openQuestions = Array.isArray(rawQuestions)
+      ? rawQuestions.filter((q): q is string => typeof q === 'string')
+      : [];
+    return { title, plan, openQuestions: openQuestions.length > 0 ? openQuestions : undefined };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the tool list offered to the model this turn, appending
+ * `PRESENT_PLAN_TOOL` only while `mode === 'plan'` — every other mode gets
+ * `tools` back unchanged. Kept as its own pure function (mirroring
+ * `toolsForSettings` just below) so it can be unit-tested and so the model's
+ * offered tool list stays a single, easy-to-audit place: `present_plan` must
+ * never be offered outside Plan Mode, since it has no purpose (and the
+ * backend hard-blocks every other mutating tool in Plan Mode instead) once
+ * the user has switched out of it. Named `toolsForMode` rather than the
+ * design doc's `toolsForTurn` to avoid shadowing `runAgentTurnBody`'s own
+ * `toolsForTurn` local (the final, fully-assembled per-turn tool list this
+ * function's output feeds into, alongside `toolsForSettings`).
+ */
+export function toolsForMode(tools: ToolDef[], mode: PermissionMode): ToolDef[] {
+  return mode === 'plan' ? [...tools, PRESENT_PLAN_TOOL] : tools;
+}
+
 /** Prefix identifying a synthetic notice inserted right after a successful
  * `remember` tool call — cloned from the `CHECKPOINT_NOTE_PREFIX` pattern
  * above. The rest of the content is a JSON payload (see `MemoryNotice`), so
@@ -234,6 +351,78 @@ export function parseMemoryNotice(message: ChatMessage): MemoryNotice | null {
  * notice is first added and when the Forget button marks it forgotten. */
 export function formatMemoryNotice(notice: MemoryNotice): string {
   return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/** Prefix identifying a synthetic notice inserted after a turn that mutated
+ * files ran the workspace's configured verification commands (see
+ * `src-tauri/src/verify.rs`) — cloned from the `CHECKPOINT_NOTE_PREFIX`
+ * pattern above. One notice is appended per command that ran, each carrying
+ * a `VerifyNotice` JSON payload, so `MessageList` can render a labeled,
+ * pass/fail, collapsible-output row per command. This slice (report-only,
+ * `verifyMaxRounds` not yet implemented) never feeds a failure back to the
+ * model — a later slice adds that on top of the same notice shape. */
+export const VERIFY_NOTE_PREFIX = '[Verify]';
+
+/** Payload embedded in a verify notice message. `code`/`output` mirror the
+ * Rust `VerifyResult`'s `code`/combined `stdout`+`stderr` (see
+ * `buildVerifyOutput`), `output` tail-capped again to
+ * `VERIFY_NOTICE_OUTPUT_CAP` chars for the wire — `verify.rs` already caps
+ * each stream at ~20k chars server-side, but stdout+stderr combined can still
+ * exceed what's worth sending over IPC and storing in the transcript. */
+export interface VerifyNotice {
+  label: string;
+  kind: string;
+  /** `true` only when the command exited 0 and didn't time out. */
+  ok: boolean;
+  code: number | null;
+  output: string;
+  durationMs: number;
+}
+
+export function isVerifyNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_NOTE_PREFIX);
+}
+
+/** Parses a verify notice's JSON payload; `null` for anything malformed. */
+export function parseVerifyNotice(message: ChatMessage): VerifyNotice | null {
+  if (!isVerifyNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(VERIFY_NOTE_PREFIX.length));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as VerifyNotice).label === 'string' &&
+      typeof (parsed as VerifyNotice).ok === 'boolean'
+    ) {
+      return parsed as VerifyNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a verify notice".
+  }
+  return null;
+}
+
+/** Serializes a verify notice back into message content. */
+export function formatVerifyNotice(notice: VerifyNotice): string {
+  return `${VERIFY_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/** Prefix identifying the plain-text "fix this" instruction appended to the
+ * transcript when a verification failure triggers a feed-back round (see
+ * `runAgentTurnBody`'s use of `shouldFeedBackVerifyFailure`). Deliberately
+ * NOT `VERIFY_NOTE_PREFIX`: that prefix's contract (see `isVerifyNotice`/
+ * `parseVerifyNotice`) is "the rest of the content is a `VerifyNotice` JSON
+ * payload", and this message is plain prose, not JSON — reusing the JSON
+ * prefix here made `MessageList.tsx` match `isVerifyNotice`, fail to parse,
+ * and silently drop the message from the timeline (the model still saw it
+ * via `wireHistory`, but the user never did). Recognized by `MessageList.tsx`
+ * as a plain-text notice, same rendering as `SWITCH_NOTE_PREFIX`/
+ * `MENTION_NOTE_PREFIX` — this is an intentional deviation from the design
+ * doc, which suggested reusing `VERIFY_NOTE_PREFIX` for this message. */
+export const VERIFY_FIX_NOTE_PREFIX = '[Verify Fix]';
+
+export function isVerifyFixNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_FIX_NOTE_PREFIX);
 }
 
 /** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
@@ -292,6 +481,219 @@ function parseRememberedFact(resultContent: string): { id: string; text: string 
   return null;
 }
 
+/** Whether `resultContent` (a `write_file`/`edit_file` tool result string)
+ * represents success rather than the `{"error": ...}` shape
+ * `stringifyToolError` produces — used only to decide whether to add the
+ * call's path to `mutatedFiles` (see `runAgentTurnBody`). Structurally the
+ * same check as `MessageList.tsx`'s `resultLooksLikeError`, kept as its own
+ * tiny copy here rather than a shared import — both are one-line structural
+ * checks against the same wire shape, not enough shared complexity to be
+ * worth coupling the two modules over. */
+export function isSuccessfulMutationResult(resultContent: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(resultContent);
+    return !(parsed && typeof parsed === 'object' && 'error' in parsed);
+  } catch {
+    // Not JSON at all — the plain "Wrote N bytes to …"/"Edited …" success string.
+    return true;
+  }
+}
+
+/** Extracts the `path` argument from a `write_file`/`edit_file` tool call —
+ * used only to populate `mutatedFiles`. Never throws: malformed arguments
+ * JSON already surfaced as an error result from `executeToolCall` itself, so
+ * this just degrades to "no path known" rather than duplicating that error. */
+export function toolCallPathArg(toolCall: ToolCall): string | null {
+  try {
+    const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+    const path = (parsed as { path?: unknown } | null)?.path;
+    return typeof path === 'string' ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Shape returned by the `verify_run` Tauri command — mirrors the Rust
+ * `VerifyResult` struct (src-tauri/src/verify.rs) exactly. */
+interface VerifyRunResult {
+  commandId: string;
+  label: string;
+  kind: string;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+}
+
+/** Each verify notice's `output` field is capped at this many chars — a
+ * second, wire-facing cap on top of `verify.rs`'s own ~20k-char cap on each
+ * of stdout/stderr individually (combining both here can still exceed what's
+ * worth sending over IPC and keeping in the transcript). */
+const VERIFY_NOTICE_OUTPUT_CAP = 8000;
+
+/** Combines a verify command's stdout/stderr into the single `output` string
+ * a `VerifyNotice` carries, tail-capping the combination (a failure's most
+ * useful detail is almost always printed last) at
+ * `VERIFY_NOTICE_OUTPUT_CAP` chars. */
+function buildVerifyOutput(result: VerifyRunResult): string {
+  const parts: string[] = [];
+  if (result.timedOut) parts.push('Command timed out.');
+  if (result.stdout.trim().length > 0) parts.push(result.stdout.trim());
+  if (result.stderr.trim().length > 0) parts.push(result.stderr.trim());
+  const combined = parts.join('\n\n');
+  if (combined.length <= VERIFY_NOTICE_OUTPUT_CAP) return combined;
+  return `… (truncated)\n${combined.slice(combined.length - VERIFY_NOTICE_OUTPUT_CAP)}`;
+}
+
+/** The first failed command from a `runVerificationPhase` pass — enough
+ * detail to build the feed-back-to-the-model fix instruction in
+ * `runAgentTurnBody`. `null` when every command passed (or none ran). */
+export interface VerifyFailure {
+  label: string;
+  code: number | null;
+  output: string;
+}
+
+/**
+ * Whether a verification failure should trigger one more feed-back round of
+ * `runAgentTurnBody`'s tool-calling loop — i.e. whether there's a round left
+ * to spend in `settings.verifyMaxRounds`'s budget (default 1, clamp 0-3; 0
+ * means report-only, the failure notice is left as-is and never fed back).
+ * Extracted out of the loop's exit branch as its own pure function so the
+ * round-exhaustion boundary can be exercised directly by tests without
+ * mocking the entire turn. A `null` failure (every command passed, or
+ * verification didn't run at all — e.g. plan mode, `verifyEnabled` off, no
+ * enabled commands) never triggers a round regardless of the round budget.
+ */
+export function shouldFeedBackVerifyFailure(failure: VerifyFailure | null, verifyRound: number, verifyMaxRounds: number): boolean {
+  return failure !== null && verifyRound < verifyMaxRounds;
+}
+
+/**
+ * Runs every enabled verification command configured for the current
+ * workspace (see `verify.rs`/`verifyStore.ts`), in order, appending one
+ * `[Verify]` notice per command to the transcript, and returns the first
+ * command that failed (if any) so `runAgentTurnBody` can decide whether to
+ * feed it back to the model as a fix instruction (bounded by
+ * `settings.verifyMaxRounds`). This function itself stays report-only — it
+ * never appends a fix-instruction message and never loops — the caller owns
+ * all feed-back-round bookkeeping. No-ops (without any IPC calls, returning
+ * `null`) unless `verifyEnabled` is on, the active permission mode isn't
+ * `'plan'` (belt-and-braces — plan mode already blocks every write, so
+ * `mutatedFiles` should already be empty by the time a caller would reach
+ * this), and the workspace actually has at least one enabled command
+ * configured. `sessionId` is used only to set/clear
+ * `sessionStore.runningVerifyLabel` around each command so
+ * `MessageList.tsx` can render a "running <label>…" indicator while a
+ * (possibly long) command executes — it is not otherwise part of this
+ * function's control flow.
+ *
+ * `signal`, when given, makes Stop work throughout the whole phase, not just
+ * the single in-flight command: checked before every command starts (so a
+ * Stop that lands between two commands doesn't kick off another one), and
+ * raced against each in-flight `verify_run` invoke the same way
+ * `executeToolCall` races a tool call — on abort, `tools_cancel_running` is
+ * invoked to fire the turn's `tool_cancel` `Notify` (the same channel
+ * `run_command_impl`'s `tokio::select!` listens on), so the Rust-side child
+ * process actually dies instead of running to completion or its own timeout
+ * while the phase — and the turn, and the session's "a turn is already
+ * running" guard — sit blocked waiting for it.
+ */
+export async function runVerificationPhase(
+  sessionId: string,
+  turnId: string,
+  addMessage: (msg: ChatMessage) => void,
+  signal?: AbortSignal
+): Promise<VerifyFailure | null> {
+  if (!useSettingsStore.getState().verifyEnabled) return null;
+  if (usePermissionStore.getState().mode === 'plan') return null;
+  if (signal?.aborted) return null;
+
+  let config: VerifyConfig;
+  try {
+    config = await invoke<VerifyConfig>('verify_get_config', {});
+  } catch {
+    // No workspace open, or the config file couldn't be read — nothing to run.
+    return null;
+  }
+
+  const enabledCommands = config.commands.filter((c) => c.enabled);
+  if (enabledCommands.length === 0) return null;
+
+  let firstFailure: VerifyFailure | null = null;
+
+  for (const cmd of enabledCommands) {
+    // Stop fired either before this iteration or while the previous
+    // command's invoke was in flight (handled below) — either way, don't
+    // start another configured command.
+    if (signal?.aborted) break;
+
+    // Surfaced as a "running <label>…" row in the timeline
+    // (MessageList.tsx's VerifyRunningRow) — test suites can run long enough
+    // (up to `timeout_secs`, default 300s) that a bare typing indicator would
+    // read as a hang. Cleared in `finally` so a thrown/rejected invoke below
+    // never leaves a stale "running" row behind.
+    useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
+    try {
+      const invocation = invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
+      const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
+
+      if (result === null) {
+        // Aborted mid-command: tell the Rust side to kill it via the same
+        // turn-keyed cancel channel `executeToolCall` uses for tool calls,
+        // then stop the phase entirely rather than starting the next
+        // configured command. The original invocation promise already has a
+        // handler attached (via Promise.race), so its eventual (discarded)
+        // result never becomes an unhandled rejection.
+        void invoke('tools_cancel_running', { turnId }).catch(() => {});
+        break;
+      }
+
+      const ok = !result.timedOut && result.code === 0;
+      const output = buildVerifyOutput(result);
+      addMessage({
+        role: 'system',
+        content: formatVerifyNotice({
+          label: result.label,
+          kind: result.kind,
+          ok,
+          code: result.code,
+          output,
+          durationMs: result.durationMs,
+        }),
+      });
+      if (!ok && firstFailure === null) {
+        firstFailure = { label: result.label, code: result.code, output };
+      }
+    } catch (err) {
+      // verify_run itself rejected (e.g. the command was deleted from the
+      // config in another window between the check above and this call) —
+      // surface it as a failed notice rather than silently dropping the
+      // round.
+      const message = err instanceof Error ? err.message : String(err);
+      addMessage({
+        role: 'system',
+        content: formatVerifyNotice({
+          label: cmd.label,
+          kind: cmd.kind,
+          ok: false,
+          code: null,
+          output: message,
+          durationMs: 0,
+        }),
+      });
+      if (firstFailure === null) {
+        firstFailure = { label: cmd.label, code: null, output: message };
+      }
+    } finally {
+      useSessionStore.getState().setRunningVerifyLabel(sessionId, null);
+    }
+  }
+
+  return firstFailure;
+}
+
 /** Shape returned by the `llama_status` Tauri command. */
 interface LlamaStatusPayload {
   status: 'stopped' | 'starting' | 'ready' | 'error';
@@ -319,16 +721,6 @@ async function resolveBaseUrl(): Promise<string> {
     return `http://127.0.0.1:${DEFAULT_LLAMA_PORT}`;
   }
 }
-
-/** Where a turn's requests should go. Local llama.cpp and Ollama are kept
- * distinct (rather than a single generic "direct fetch" kind) so
- * failover/vision-switch logic can tell exactly which store setter
- * (`useOllamaModel` vs `useProviderModel`) to call when it picks a
- * different target — both still stream via the same `streamChat` transport. */
-export type ResolvedTarget =
-  | { kind: 'local'; baseUrl: string }
-  | { kind: 'ollama'; baseUrl: string; model: string }
-  | { kind: 'provider'; providerId: string; model: string };
 
 /**
  * Resolves the active chat target into exactly what's needed to stream a
@@ -446,21 +838,6 @@ function findVisionCandidate(): ResolvedTarget | null {
   return null;
 }
 
-/** Stringifies a tool invocation's result (or error) for use as tool-message content. */
-function stringifyToolResult(result: unknown): string {
-  if (typeof result === 'string') return result;
-  try {
-    return JSON.stringify(result);
-  } catch {
-    return String(result);
-  }
-}
-
-function stringifyToolError(err: unknown): string {
-  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
-  return JSON.stringify({ error: message });
-}
-
 /** An explicit attachment (from the "+" attach menu), as opposed to a text-derived "@"-mention. */
 export interface AttachmentRef {
   path: string;
@@ -556,213 +933,6 @@ function toMessageContent(text: string, images: ResolvedImage[]): string | ChatC
   return parts;
 }
 
-/** The tool-message content used for a call the user's Stop button cancelled
- * (either mid-execution, or before it ever started). A result message is
- * still recorded for every requested call so the persisted transcript never
- * contains an assistant `tool_calls` entry without its matching results —
- * several providers reject such a history outright on the next turn. */
-const CANCELLED_TOOL_RESULT = JSON.stringify({ error: 'Cancelled by the user' });
-
-/** Resolves when `signal` aborts (never resolves for an undefined signal). */
-function abortedPromise(signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    signal.addEventListener('abort', () => resolve(), { once: true });
-  });
-}
-
-/**
- * Dispatches a `mcp__<serverId>__<toolName>`-named tool call to the Rust
- * `mcp_call_tool` command. `serverId`/`toolName` are resolved via
- * `resolveMcpToolName` against `mcpRegistry` — THIS turn's own
- * `mcpToolDefs()` result, passed in by the caller rather than read from any
- * shared/module-level state — rather than re-parsed out of `name` itself;
- * see `mcpTools.ts`'s doc comment for why a naive split on `__` isn't
- * reliably reversible, and for why the registry must be turn-scoped rather
- * than a shared singleton (a concurrent split-pane turn's own
- * `mcpToolDefs()` call must never be able to invalidate or repoint a name
- * THIS turn's model was already offered).
- *
- * No `checkpoint_id` is injected here (unlike write_file/edit_file/run_shell
- * below): MCP side effects are explicitly outside the checkpoint revert
- * guarantee, same documented gap as `run_shell`'s shell commands (see
- * `CheckpointNotice.shellRan`'s doc comment). `turn_id` still is, though —
- * it scopes this call's permission prompt and Stop-button cancellation to
- * this turn, via the same `AppState.tool_cancel` mechanism `run_shell` uses.
- */
-function invokeMcpTool(
-  name: string,
-  args: Record<string, unknown>,
-  turnId: string,
-  mcpRegistry: McpToolRegistry
-): Promise<string> {
-  const resolved = resolveMcpToolName(mcpRegistry, name);
-  if (!resolved) {
-    return Promise.resolve(stringifyToolError(new Error(`MCP tool "${name}" was not offered this turn.`)));
-  }
-  return invoke<McpCallToolResult>('mcp_call_tool', {
-    server_id: resolved.serverId,
-    tool_name: resolved.toolName,
-    arguments: args,
-    turn_id: turnId,
-  }).then(formatMcpCallToolResult, stringifyToolError);
-}
-
-/**
- * Executes a single model-requested tool call via the corresponding
- * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
- * `invokeMcpTool` above) and returns the string to use as the content of the
- * resulting `tool` message. Never throws — invocation errors (bad JSON
- * arguments, permission denial, sandbox violations, command failures) are
- * captured and returned as a JSON error payload so the model can see what
- * went wrong and try to recover instead of the whole loop crashing.
- *
- * If `signal` aborts while the command is in flight, the Rust side is told
- * to cancel everything cancellable (`tools_cancel_running` kills any running
- * shell child and denies any pending permission prompt) and a cancelled
- * result is returned immediately rather than waiting the command out.
- */
-async function executeToolCall(
-  toolCall: ToolCall,
-  checkpointId: string | null,
-  turnId: string,
-  mcpRegistry: McpToolRegistry,
-  signal?: AbortSignal
-): Promise<string> {
-  const { name, arguments: rawArguments } = toolCall.function;
-
-  let args: Record<string, unknown> = {};
-  if (rawArguments && rawArguments.trim().length > 0) {
-    try {
-      const parsed: unknown = JSON.parse(rawArguments);
-      if (parsed && typeof parsed === 'object') {
-        args = parsed as Record<string, unknown>;
-      }
-    } catch (err) {
-      return stringifyToolError(new Error(`Invalid tool call arguments JSON for "${name}": ${(err as Error).message}`));
-    }
-  }
-
-  // File-mutating tools record a pre-mutation backup into this turn's own
-  // checkpoint — with the split pane, another turn (with its own checkpoint)
-  // may be running concurrently, so the id pins the backup to the right one.
-  // run_shell doesn't snapshot anything, but gets the same injected id so
-  // `record_shell` can flag the owning checkpoint's `shell_ran` — the
-  // revert-coverage caveat the UI shows. Injected here rather than exposed in
-  // the tool schema: the model must never pick (or fabricate) a checkpoint
-  // id. snake_case key — write_file/edit_file/run_shell all use
-  // `rename_all = "snake_case"` so the model's snake_case tool arguments
-  // (old_string, new_string) match without translation.
-  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
-    args.checkpoint_id = checkpointId;
-  }
-  // The turn id scopes permission prompts and shell/fetch cancellation to
-  // THIS turn — Stop in one pane must not kill the other pane's command (or
-  // in-flight fetch) or deny its prompt. Injected like checkpoint_id (never
-  // model-supplied). All six commands use `rename_all = "snake_case"`, so
-  // all take the snake_case key. `remember`/`web_fetch`/`web_search` don't
-  // take a checkpoint_id (see tool_remember's/tool_web_fetch's/
-  // tool_web_search's doc comments in tools.rs/web.rs — none snapshots a
-  // workspace file), but all three are still permission-gated and need the
-  // turn id for that prompt (and, for web_fetch only, for Stop-button
-  // cancellation of the in-flight request — web_search's request is short
-  // and fixed-endpoint, so it gets `remember`'s simpler "turn id for the
-  // prompt only" treatment, see tool_web_search's doc comment).
-  if (
-    name === 'write_file' ||
-    name === 'edit_file' ||
-    name === 'run_shell' ||
-    name === 'remember' ||
-    name === 'web_fetch' ||
-    name === 'web_search'
-  ) {
-    args.turn_id = turnId;
-  }
-
-  const invocation = name.startsWith('mcp__')
-    ? invokeMcpTool(name, args, turnId, mcpRegistry)
-    : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
-  if (!signal) return invocation;
-
-  const raced = await Promise.race([invocation, abortedPromise(signal).then(() => null)]);
-  if (raced !== null) return raced;
-
-  // Aborted mid-invocation: kill what can be killed on the Rust side. The
-  // original invocation promise already has handlers attached (never an
-  // unhandled rejection) and its eventual result is simply discarded.
-  void invoke('tools_cancel_running', { turnId }).catch(() => {});
-  return CANCELLED_TOOL_RESULT;
-}
-
-/** Result of a single streaming attempt against one target. */
-interface AttemptResult {
-  content: string;
-  toolCalls: ToolCall[];
-  streamError: string | null;
-  /** Whether any content/tool-call fragment arrived before `streamError` (if any) — the failover safety rule below only ever retries a *different* target when this is `false`, since a mid-stream error has already shown the user partial output that a retry could duplicate or contradict. */
-  contentStarted: boolean;
-}
-
-/**
- * Streams one chat-completion attempt against `target` and reports what
- * happened, without touching the session transcript itself — the caller
- * (`runAgentTurn`) owns writing content into the active session as it
- * streams in via `onDelta`, and owns deciding what a failure means (retry a
- * different target vs. surface the error).
- *
- * Every attempt through here — main turn or the one-shot summarization call
- * `contextTrimmer.ts` triggers — is recorded via `rateLimitTracker` when
- * `target.kind === 'provider'`, so a single tracking call site covers both.
- */
-async function attemptStream(
-  target: ResolvedTarget,
-  wireHistory: ChatMessage[],
-  tools: ToolDef[],
-  signal: AbortSignal | undefined,
-  effort: string | undefined,
-  sessionId: string,
-  onDelta?: (content: string) => void
-): Promise<AttemptResult> {
-  if (target.kind === 'provider') recordRequest(target.providerId);
-
-  let content = '';
-  const toolCalls: ToolCall[] = [];
-  let streamError: string | null = null;
-  let contentStarted = false;
-
-  const events: AsyncGenerator<StreamEvent> =
-    target.kind === 'provider'
-      ? streamProviderChat(target.providerId, target.model, wireHistory, tools, signal, target.providerId === 'anthropic' ? effort : undefined)
-      : streamChat(target.baseUrl, wireHistory, tools, target.kind === 'ollama' ? target.model : undefined, signal);
-
-  try {
-    for await (const event of events) {
-      if (event.type === 'delta') {
-        contentStarted = true;
-        content += event.content;
-        onDelta?.(content);
-      } else if (event.type === 'tool_call') {
-        contentStarted = true;
-        toolCalls.push(event.toolCall);
-      } else if (event.type === 'usage') {
-        useUsageStore.getState().setUsage(sessionId, {
-          promptTokens: event.usage.prompt_tokens,
-          completionTokens: event.usage.completion_tokens,
-          totalTokens: event.usage.total_tokens,
-        });
-      }
-      // 'done' carries no data; the generator simply returns after it.
-    }
-  } catch (err) {
-    streamError = err instanceof Error ? err.message : String(err);
-  }
-
-  return { content, toolCalls, streamError, contentStarted };
-}
-
 /**
  * Runs one full agentic turn for `userText` in session `sessionId` (the
  * chat pane that submitted it — with the split pane open, two turns can run
@@ -820,6 +990,40 @@ export async function runAgentTurn(
   }
 }
 
+/** When `artifactAutoPreview` (see `settingsStore.ts`) is on, opens the
+ * newest previewable artifact (html/svg/mermaid fence, see `artifacts.ts`)
+ * produced by the turn that just finished — filtered to `ref.messageIndex >=
+ * anchorIndex` so an artifact already sitting earlier in the transcript from
+ * a previous turn is never re-opened just because this turn happened to run.
+ * Best-effort and silent: `extractArtifacts` is a pure re-scan of the
+ * transcript, so "no previewable artifact this turn" is simply a no-op, not
+ * an error. Called from `runTurnGuarded` right after `runAgentTurnBody`
+ * returns — the turn-completion point the design doc calls out — so this
+ * runs whether the turn ended in a plain answer, the tool-calling safety
+ * cap, or a caught stream error; it does NOT run if `runAgentTurnBody`
+ * itself throws, since there's no well-defined "finished assistant message"
+ * in that case.
+ *
+ * `ArtifactPane` is a single shared surface across the main pane and the
+ * split pane (see `artifactStore.ts`'s doc comment), and with the split pane
+ * open, two turns can run fully concurrently in two different sessions (see
+ * `runAgentTurn`'s per-session `turnControllers`). Without a guard, whichever
+ * session's turn happens to finish LAST would silently steal the shared pane
+ * away from whatever artifact the user is actually looking at for the OTHER
+ * session — mid-read, mid-Save-As, whatever — with no indication anything
+ * changed beyond the title. So this only ever opens into an empty pane, or
+ * refreshes the pane for the SAME session it's already showing; a
+ * background session's completed turn never reaches across and hijacks a
+ * different session's open artifact. */
+export function maybeAutoPreviewNewestArtifact(sessionId: string, anchorIndex: number): void {
+  if (!useSettingsStore.getState().artifactAutoPreview) return;
+  const active = useArtifactStore.getState().active;
+  if (active && active.sessionId !== sessionId) return;
+  const artifacts = extractArtifacts(sessionMessages(sessionId)).filter((a) => a.ref.messageIndex >= anchorIndex);
+  if (artifacts.length === 0) return;
+  useArtifactStore.getState().open(sessionId, artifacts[artifacts.length - 1].ref);
+}
+
 /** `runAgentTurn` minus the per-session turn registration — the checkpoint
  * lifecycle half of the wrapper. */
 async function runTurnGuarded(
@@ -860,6 +1064,7 @@ async function runTurnGuarded(
   const turnId = crypto.randomUUID();
   try {
     await runAgentTurnBody(sessionId, userText, attachments, checkpointId, turnId, signal);
+    maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
   } finally {
     if (checkpointId !== null) {
       const summary = await invoke<CheckpointNotice>('checkpoint_end', { id: checkpointId }).catch(() => null);
@@ -974,6 +1179,14 @@ async function runAgentTurnBody(
 
   const effort = useModelStore.getState().effort;
 
+  // Read once per turn, like `effort` above — not re-derived on every
+  // tool-calling round trip, so a mode switch mid-turn (possible via the
+  // split pane's shared global mode, or the user clicking Approve on a plan
+  // card mid-turn) never changes what's offered partway through this turn's
+  // own tool-calling loop. See `toolsForMode`'s doc comment for why
+  // `present_plan` is gated on this snapshot.
+  const mode = usePermissionStore.getState().mode;
+
   // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
   // newly remembered facts) before building the system prompt below — two
   // local-file reads per turn is negligible and needs no file watcher.
@@ -989,7 +1202,11 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
-  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpDefs], settings.memoryEnabled, settings.webToolsEnabled);
+  const toolsForTurn: ToolDef[] = toolsForSettings(
+    toolsForMode([...TOOLS, ...mcpDefs], mode),
+    settings.memoryEnabled,
+    settings.webToolsEnabled
+  );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [
@@ -1004,6 +1221,49 @@ async function runAgentTurnBody(
     if (result.streamError) throw new Error(result.streamError);
     return result.content.trim() || '(summary unavailable)';
   };
+
+  // Advisory risk annotations (Phase 2 of the Plan/Act + risk-adaptive
+  // permissions design — docs/roadmap/p2-plan-act-safety.md): built once per
+  // turn (`cache` must persist across every tool-calling round trip below,
+  // exactly like `mutatedFiles` just below it), passed unchanged into every
+  // `executeToolCall` call this turn. `classify` mirrors `sendForSummary`
+  // above almost exactly — the same `attemptStream`-against-`target` shape,
+  // just wrapping `riskJudge.ts`'s `classifyToolCall` instead of a plain
+  // summarization prompt (see that module's doc comment for why it takes this
+  // callback as a parameter instead of importing `attemptStream` itself).
+  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
+  const riskAnnotation: RiskAnnotationContext = {
+    // "smart" mode (Phase 3) needs a classification for every mutating call
+    // to decide whether it can auto-approve — so classification runs
+    // whenever the user opted into the advisory badges OR is in "smart"
+    // mode, even if they never flipped the AutomationPanel toggle on.
+    enabled: settings.riskAnnotationsEnabled || mode === 'smart',
+    cache: new Map<string, RiskClassification | null>(),
+    classify: (toolName, toolArgs) =>
+      classifyToolCall(
+        toolName,
+        toolArgs,
+        workspaceRootPath,
+        (judgeMessages, judgeSignal) => attemptStream(target, judgeMessages, [], judgeSignal, effort, sessionId),
+        signal
+      ),
+  };
+
+  // Absolute paths this turn's `write_file`/`edit_file` calls have
+  // successfully mutated so far, across every tool-calling round trip below
+  // — read by `runVerificationPhase` at the loop's natural exit to decide
+  // whether there's anything worth verifying. Populated in the tool-call
+  // loop right below via `isSuccessfulMutationResult`/`toolCallPathArg`.
+  const mutatedFiles = new Set<string>();
+
+  // How many verification feed-back rounds have been consumed so far this
+  // turn — compared against `settings.verifyMaxRounds` (default 1, clamp
+  // 0-3) at the loop's natural exit below. A round is "consumed" the moment
+  // a failure notice's fix instruction is appended and the loop is sent
+  // around again, regardless of whether that round's edits actually fix
+  // anything — this is what makes `verifyMaxRounds` a hard bound rather than
+  // a "keep trying until it passes" loop.
+  let verifyRound = 0;
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     // Stop button fired while a tool call was executing (between model
@@ -1097,7 +1357,30 @@ async function runAgentTurnBody(
         removeLastMessage();
         return;
       }
-      // The model gave a plain answer with no further tool requests — done.
+      // The model gave a plain answer with no further tool requests — this
+      // turn's natural exit point. Run the workspace's configured
+      // verification commands (if any files were mutated and the user
+      // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
+      // comment for exactly what gates this.
+      if (!signal?.aborted && mutatedFiles.size > 0) {
+        const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
+        // A command failed and there's a feed-back round left to spend —
+        // append one fix instruction and send the loop around again instead
+        // of returning. `mutatedFiles` is cleared so only edits made in
+        // response to *this* failure trigger the next verification pass;
+        // `signal?.aborted` is re-checked since `runVerificationPhase` can
+        // return early (rather than run every command) once Stop fires
+        // mid-phase — see its doc comment.
+        if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
+          verifyRound += 1;
+          mutatedFiles.clear();
+          addMessage({
+            role: 'system',
+            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+          });
+          continue;
+        }
+      }
       return;
     }
 
@@ -1129,13 +1412,26 @@ async function runAgentTurnBody(
       // (several providers reject such a history on the next turn).
       const resultContent = signal?.aborted
         ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal);
+        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
         content: resultContent,
       };
       addMessage(toolMessage);
+
+      // Track this turn's file mutations for `runVerificationPhase` at the
+      // loop's eventual exit — only for calls that actually ran (not
+      // cancelled, not rejected above) and actually succeeded (the
+      // "Wrote…"/"Edited…" string shape, not `{"error": ...}"`).
+      if (
+        !signal?.aborted &&
+        (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file') &&
+        isSuccessfulMutationResult(resultContent)
+      ) {
+        const path = toolCallPathArg(toolCall);
+        if (path) mutatedFiles.add(path);
+      }
 
       // A successful `remember` gets its own transcript notice (with a
       // Forget button — see MessageList.tsx's MemoryRow), cloned from how
@@ -1147,6 +1443,31 @@ async function runAgentTurnBody(
         if (fact) {
           addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
           await useRulesStore.getState().refresh();
+        }
+      }
+
+      // A successful `present_plan` gets its own transcript notice (rendered
+      // as a `PlanCard` with Approve/Keep-planning buttons — see
+      // `MessageList.tsx`), cloned from the `remember` notice pattern just
+      // above. Gated on `resultContent === PRESENT_PLAN_RESULT` — the exact
+      // literal `executeToolCall`/`turnEngine.ts` returns for this tool and
+      // nothing else — rather than just the tool name, so a cancelled call
+      // (`CANCELLED_TOOL_RESULT`) or a call rejected by `isToolCallAllowed`
+      // above (which `continue`s before reaching here at all) never produces
+      // a plan card for a plan that was never actually presented.
+      if (toolCall.function.name === 'present_plan' && resultContent === PRESENT_PLAN_RESULT) {
+        const planArgs = toolCallPlanArgs(toolCall);
+        if (planArgs) {
+          addMessage({
+            role: 'system',
+            content: formatPlanNotice({
+              id: crypto.randomUUID(),
+              title: planArgs.title,
+              plan: planArgs.plan,
+              openQuestions: planArgs.openQuestions,
+              status: 'proposed',
+            }),
+          });
         }
       }
     }

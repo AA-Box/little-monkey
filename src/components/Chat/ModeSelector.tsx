@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ClipboardList, Pencil, Shield, ShieldAlert, Zap } from "lucide-react";
+import { ClipboardList, Pencil, Shield, ShieldAlert, Sparkles, Zap } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { usePermissionStore } from "../../store/permissionStore";
@@ -25,6 +25,11 @@ const MODE_META: Record<PermissionMode, ModeMeta> = {
     labelKey: "ModeSelector.modeAcceptEditsLabel",
     descriptionKey: "ModeSelector.modeAcceptEditsDescription",
   },
+  smart: {
+    icon: Sparkles,
+    labelKey: "ModeSelector.modeSmartLabel",
+    descriptionKey: "ModeSelector.modeSmartDescription",
+  },
   plan: {
     icon: ClipboardList,
     labelKey: "ModeSelector.modePlanLabel",
@@ -42,7 +47,7 @@ const MODE_META: Record<PermissionMode, ModeMeta> = {
   },
 };
 
-const ALL_MODES: PermissionMode[] = ["manual", "acceptEdits", "plan", "auto", "bypass"];
+const ALL_MODES: PermissionMode[] = ["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
 
 /**
  * Pill button + dropdown for switching the active permission mode (see
@@ -94,6 +99,13 @@ export function ModeSelector() {
     if (nextMode === "bypass") {
       setConfirmingBypass(true);
       return;
+    }
+    // Record every manually-selected non-plan, non-bypass mode as the mode
+    // PlanCard's "Approve & start acting" switches into later — a no-op
+    // (`setLastActMode` itself also guards this) for "plan", which never
+    // reaches here as anything but the current `nextMode` being re-selected.
+    if (nextMode !== "plan") {
+      usePermissionStore.getState().setLastActMode(nextMode);
     }
     void setMode(nextMode);
     closeDropdown();

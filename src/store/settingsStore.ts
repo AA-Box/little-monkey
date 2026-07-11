@@ -42,6 +42,16 @@ export interface SettingsState {
   memoryEnabled: boolean;
   /** Whether the `web_fetch`/`web_search` tools are offered to the model this turn (see `agentLoop.ts`'s `toolsForSettings` filter). Default true — DuckDuckGo search needs no key, so web research works out of the box, and the permission prompt shown for every call is the real gate. Turning this off makes both tools invisible to the model (not merely denied), mirroring `memoryEnabled`'s "disabled = not offered" treatment of `remember`. */
   webToolsEnabled: boolean;
+  /** Whether `runAgentTurnBody` auto-runs the current workspace's enabled verification commands (see `src-tauri/src/verify.rs`) after a turn that wrote files. Default false — running arbitrary configured shell automatically should be opt-in, mirroring `memoryEnabled`'s posture. This slice is report-only: results are appended as `[Verify]` notices, nothing is fed back to the model yet (that's a later slice's `verifyMaxRounds`). */
+  verifyEnabled: boolean;
+  /** How many times `runAgentTurnBody` will feed a failed verification command's output back to the model as a fix instruction and let the loop continue, before leaving the failure notice as-is. Range 0-3 (mirrors Aider's `max_reflections=3`); default 1. 0 means report-only — the same behavior as before this setting existed. */
+  verifyMaxRounds: number;
+  /** Whether `write_file`/`edit_file`/`run_shell` calls get an LLM-judged risk classification (low/medium/high + a short reason) attached to their permission prompt — see `riskJudge.ts`'s `classifyToolCall` and `agentLoop.ts`'s `runAgentTurnBody`. Default false: it costs one extra model call per mutating tool call. Purely advisory in every mode as of Phase 2 (docs/roadmap/p2-plan-act-safety.md) — turning this on changes what the permission prompt *shows*, never what gets auto-approved. */
+  riskAnnotationsEnabled: boolean;
+  /** Whether HTML artifacts render via the tier-2 `artifact://` protocol (`sandbox="allow-scripts"`, no `allow-same-origin` — an opaque, no-IPC, no-network origin; see `src-tauri/src/artifacts.rs`) so inline `<script>` tags actually run. Default true. When false, every artifact — including HTML with inline scripts — renders via tier-1 only (`<iframe sandbox="" srcdoc>`), where scripts are inert by construction; see `ArtifactPane.tsx`. */
+  artifactScriptsEnabled: boolean;
+  /** Whether `runTurnGuarded` (see `agentLoop.ts`) auto-opens the newest previewable artifact from a just-finished turn in `ArtifactPane`. Default false, mirroring `verifyEnabled`'s "automatically doing something on the user's behalf should be opt-in" posture — a user who didn't ask for a preview shouldn't have the workspace panel commandeered out from under them. Only artifacts produced by the turn that just completed are considered, never ones already sitting earlier in the transcript. */
+  artifactAutoPreview: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -59,6 +69,11 @@ export interface SettingsState {
   setCheckpointRetention: (value: number) => void;
   setMemoryEnabled: (value: boolean) => void;
   setWebToolsEnabled: (value: boolean) => void;
+  setVerifyEnabled: (value: boolean) => void;
+  setVerifyMaxRounds: (value: number) => void;
+  setRiskAnnotationsEnabled: (value: boolean) => void;
+  setArtifactScriptsEnabled: (value: boolean) => void;
+  setArtifactAutoPreview: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -85,6 +100,10 @@ const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
 const DEFAULT_CHECKPOINT_RETENTION = 20;
 export const MIN_CHECKPOINT_RETENTION = 5;
 export const MAX_CHECKPOINT_RETENTION = 100;
+/** Mirrors Aider's `max_reflections=3` — see `verifyMaxRounds`'s doc comment. */
+const DEFAULT_VERIFY_MAX_ROUNDS = 1;
+export const MIN_VERIFY_MAX_ROUNDS = 0;
+export const MAX_VERIFY_MAX_ROUNDS = 3;
 
 interface PersistedShape {
   autoFailoverEnabled: boolean;
@@ -99,6 +118,11 @@ interface PersistedShape {
   checkpointRetention: number;
   memoryEnabled: boolean;
   webToolsEnabled: boolean;
+  verifyEnabled: boolean;
+  verifyMaxRounds: number;
+  riskAnnotationsEnabled: boolean;
+  artifactScriptsEnabled: boolean;
+  artifactAutoPreview: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -115,6 +139,11 @@ function defaults(): PersistedShape {
     checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
     memoryEnabled: true,
     webToolsEnabled: true,
+    verifyEnabled: false,
+    verifyMaxRounds: DEFAULT_VERIFY_MAX_ROUNDS,
+    riskAnnotationsEnabled: false,
+    artifactScriptsEnabled: true,
+    artifactAutoPreview: false,
   };
 }
 
@@ -169,6 +198,19 @@ function hydrate(): PersistedShape {
           : fallback.checkpointRetention,
       memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
       webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
+      verifyEnabled: typeof parsed.verifyEnabled === "boolean" ? parsed.verifyEnabled : fallback.verifyEnabled,
+      verifyMaxRounds:
+        typeof parsed.verifyMaxRounds === "number" &&
+        parsed.verifyMaxRounds >= MIN_VERIFY_MAX_ROUNDS &&
+        parsed.verifyMaxRounds <= MAX_VERIFY_MAX_ROUNDS
+          ? Math.round(parsed.verifyMaxRounds)
+          : fallback.verifyMaxRounds,
+      riskAnnotationsEnabled:
+        typeof parsed.riskAnnotationsEnabled === "boolean" ? parsed.riskAnnotationsEnabled : fallback.riskAnnotationsEnabled,
+      artifactScriptsEnabled:
+        typeof parsed.artifactScriptsEnabled === "boolean" ? parsed.artifactScriptsEnabled : fallback.artifactScriptsEnabled,
+      artifactAutoPreview:
+        typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
     };
   } catch {
     return fallback;
@@ -286,6 +328,32 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setWebToolsEnabled: (value) => {
     set({ webToolsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setVerifyEnabled: (value) => {
+    set({ verifyEnabled: value });
+    persist({ ...get() });
+  },
+
+  setVerifyMaxRounds: (value) => {
+    const clamped = Math.min(MAX_VERIFY_MAX_ROUNDS, Math.max(MIN_VERIFY_MAX_ROUNDS, Math.round(value)));
+    set({ verifyMaxRounds: clamped });
+    persist({ ...get() });
+  },
+
+  setRiskAnnotationsEnabled: (value) => {
+    set({ riskAnnotationsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setArtifactScriptsEnabled: (value) => {
+    set({ artifactScriptsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setArtifactAutoPreview: (value) => {
+    set({ artifactAutoPreview: value });
     persist({ ...get() });
   },
 }));

@@ -241,3 +241,48 @@ export const TOOLS: ToolDef[] = [
     },
   },
 ];
+
+/**
+ * A frontend-only tool: presenting a structured plan for the user to
+ * approve before switching out of Plan Mode (see `agentLoop.ts`'s
+ * `toolsForMode`/`PLAN_NOTE_PREFIX`/`PlanNotice`). Deliberately kept OUT of
+ * the `TOOLS` array above — it is appended to the per-turn tool list only
+ * while the active permission mode is `'plan'` — and, unlike every other
+ * entry in `TOOLS`, it has NO `tool_present_plan` counterpart in
+ * `src-tauri/src/tools.rs`: `turnEngine.ts`'s `executeToolCall` short-circuits
+ * this name before it ever reaches `invoke`. This is an intentional
+ * three-way-registry-drift exception (TS tools.ts / Rust tools.rs / lm-cli
+ * tools_def.rs normally mirror each other 1:1 — see this module's top
+ * doc comment) called out explicitly in the Plan/Act design doc
+ * (docs/roadmap/p2-plan-act-safety.md) as a known, accepted risk: a reader
+ * scanning tools.rs for `present_plan` and finding nothing should look here,
+ * not assume a missing Rust command.
+ */
+export const PRESENT_PLAN_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'present_plan',
+    description:
+      "Present a structured plan to the user for approval. Call this exactly once, after investigating with read-only tools, then stop and wait — do not call it more than once per turn, and do not attempt to make changes until the user approves.",
+    parameters: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'A short (few words) title summarizing the plan.',
+        },
+        plan: {
+          type: 'string',
+          description: 'The full plan, written as Markdown, describing the changes you intend to make and why.',
+        },
+        open_questions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of questions to ask the user before proceeding, if anything is ambiguous.',
+        },
+      },
+      required: ['title', 'plan'],
+      additionalProperties: false,
+    },
+  },
+};

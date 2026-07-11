@@ -269,6 +269,13 @@ fn glob_impl(
 /// Write (overwrite/create) a text file in the workspace. Permission-gated.
 /// `checkpoint_id` is injected by the frontend agent loop (not the model) so
 /// the pre-mutation backup lands in the calling turn's own checkpoint.
+/// `risk_level`/`risk_reason` are likewise frontend-injected (never
+/// model-suppliable — see `turnEngine.ts`'s `executeToolCall`, which
+/// unconditionally scrubs any risk keys the model's own arguments JSON might
+/// contain before ever setting these): the optional LLM risk-judge
+/// classification for this call, combined here with the authoritative
+/// `permissions::path_risk_floor` (which always wins) into the
+/// `RiskAssessment` shown on the permission prompt.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -282,12 +289,19 @@ pub async fn tool_write_file(
     content: String,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    risk_level: Option<String>,
+    risk_reason: Option<String>,
 ) -> Result<String, String> {
-    let detail = format!("Write {} bytes to {}", content.len(), path);
-    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref())
-        .await?;
+    // Resolved BEFORE the permission prompt (unlike this function's
+    // pre-Phase-2 ordering) so `path_risk_floor` can be checked against the
+    // actual sandboxed/canonicalized target — an invalid path now fails
+    // before a prompt is even shown, which is also strictly safer.
+    let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
-    let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let detail = format!("Write {} bytes to {}", content.len(), path);
+    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref(), risk)
+        .await?;
 
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
@@ -342,7 +356,9 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
 /// workspace file. Permission-gated; errors if `old_string` isn't found, or
 /// is found more than once (to avoid ambiguous edits). `checkpoint_id` is
 /// injected by the frontend agent loop (not the model) so the pre-mutation
-/// backup lands in the calling turn's own checkpoint.
+/// backup lands in the calling turn's own checkpoint. `risk_level`/
+/// `risk_reason` are likewise frontend-injected — see `tool_write_file`'s doc
+/// comment, identical treatment here.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -357,12 +373,14 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     new_string: String,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    risk_level: Option<String>,
+    risk_reason: Option<String>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
     }
 
-    let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
 
     if !resolved.is_file() {
         return Err(format!("'{}' is not a file", path));
@@ -382,10 +400,11 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
         ));
     }
 
+    let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
     let preview = build_diff_preview(&old_string, &new_string);
     let detail = format!("Edit {}\n{}", path, preview);
 
-    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref())
+    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref(), risk)
         .await?;
 
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
@@ -402,7 +421,14 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 /// same as `tool_write_file`/`tool_edit_file` — but here it isn't used to
 /// snapshot anything (shell side effects aren't captured); it only flags the
 /// owning turn's checkpoint as `shell_ran` so the UI can show a revert-coverage
-/// caveat.
+/// caveat. `risk_level`/`risk_reason` are likewise frontend-injected, DISPLAY
+/// PURPOSES ONLY — there is no path here for `permissions::path_risk_floor`
+/// (a shell command has no single filesystem target to floor-check), so the
+/// risk shown is judge-only, and — this is the load-bearing invariant, see
+/// `permissions.rs`'s module doc comment and `mode_short_circuit` — it can
+/// NEVER be threaded into anything that decides whether this call is
+/// auto-approved. `run_shell` always falls through to a real prompt in every
+/// mode below `"bypass"`, full stop.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
@@ -411,8 +437,11 @@ pub async fn tool_run_shell(
     cwd: Option<String>,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    risk_level: Option<String>,
+    risk_reason: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref())
+    let risk = permissions::compute_risk(None, risk_level, risk_reason);
+    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref(), risk)
         .await?;
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
@@ -522,7 +551,7 @@ pub async fn tool_remember(
     text: String,
     turn_id: Option<String>,
 ) -> Result<memory::Fact, String> {
-    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref())
+    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref(), None)
         .await?;
 
     let root = workspace::primary_root_canon(state.inner())?;
