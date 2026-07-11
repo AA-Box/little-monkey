@@ -58,6 +58,8 @@ import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import type { VerifyConfig } from '../store/verifyStore';
+import { extractArtifacts } from './artifacts';
+import { useArtifactStore } from '../store/artifactStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -988,6 +990,40 @@ export async function runAgentTurn(
   }
 }
 
+/** When `artifactAutoPreview` (see `settingsStore.ts`) is on, opens the
+ * newest previewable artifact (html/svg/mermaid fence, see `artifacts.ts`)
+ * produced by the turn that just finished — filtered to `ref.messageIndex >=
+ * anchorIndex` so an artifact already sitting earlier in the transcript from
+ * a previous turn is never re-opened just because this turn happened to run.
+ * Best-effort and silent: `extractArtifacts` is a pure re-scan of the
+ * transcript, so "no previewable artifact this turn" is simply a no-op, not
+ * an error. Called from `runTurnGuarded` right after `runAgentTurnBody`
+ * returns — the turn-completion point the design doc calls out — so this
+ * runs whether the turn ended in a plain answer, the tool-calling safety
+ * cap, or a caught stream error; it does NOT run if `runAgentTurnBody`
+ * itself throws, since there's no well-defined "finished assistant message"
+ * in that case.
+ *
+ * `ArtifactPane` is a single shared surface across the main pane and the
+ * split pane (see `artifactStore.ts`'s doc comment), and with the split pane
+ * open, two turns can run fully concurrently in two different sessions (see
+ * `runAgentTurn`'s per-session `turnControllers`). Without a guard, whichever
+ * session's turn happens to finish LAST would silently steal the shared pane
+ * away from whatever artifact the user is actually looking at for the OTHER
+ * session — mid-read, mid-Save-As, whatever — with no indication anything
+ * changed beyond the title. So this only ever opens into an empty pane, or
+ * refreshes the pane for the SAME session it's already showing; a
+ * background session's completed turn never reaches across and hijacks a
+ * different session's open artifact. */
+export function maybeAutoPreviewNewestArtifact(sessionId: string, anchorIndex: number): void {
+  if (!useSettingsStore.getState().artifactAutoPreview) return;
+  const active = useArtifactStore.getState().active;
+  if (active && active.sessionId !== sessionId) return;
+  const artifacts = extractArtifacts(sessionMessages(sessionId)).filter((a) => a.ref.messageIndex >= anchorIndex);
+  if (artifacts.length === 0) return;
+  useArtifactStore.getState().open(sessionId, artifacts[artifacts.length - 1].ref);
+}
+
 /** `runAgentTurn` minus the per-session turn registration — the checkpoint
  * lifecycle half of the wrapper. */
 async function runTurnGuarded(
@@ -1028,6 +1064,7 @@ async function runTurnGuarded(
   const turnId = crypto.randomUUID();
   try {
     await runAgentTurnBody(sessionId, userText, attachments, checkpointId, turnId, signal);
+    maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
   } finally {
     if (checkpointId !== null) {
       const summary = await invoke<CheckpointNotice>('checkpoint_end', { id: checkpointId }).catch(() => null);

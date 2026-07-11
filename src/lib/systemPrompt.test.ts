@@ -165,6 +165,16 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('present_plan');
     expect(prompt).toContain('every mutating tool (write_file, edit_file, run_shell, remember) is blocked');
   });
+
+  it('nudges the model to tag html/svg/mermaid fences by default (artifactGuidanceAvailable defaults to true)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).toContain('tagged html/svg/mermaid so it can be previewed');
+  });
+
+  it('omits the artifact guidance line when artifactGuidanceAvailable is false', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', false);
+    expect(prompt).not.toContain('tagged html/svg/mermaid');
+  });
 });
 
 describe('composeSystemPrompt', () => {

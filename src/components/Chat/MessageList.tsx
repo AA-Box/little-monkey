@@ -687,6 +687,7 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
                   key={item.key}
                   message={item.message}
                   index={item.index}
+                  sessionId={sessionId}
                   onEditMessage={editable ? onEditUserMessage : undefined}
                   editDisabled={editingDisabled}
                 />

@@ -48,6 +48,10 @@ export interface SettingsState {
   verifyMaxRounds: number;
   /** Whether `write_file`/`edit_file`/`run_shell` calls get an LLM-judged risk classification (low/medium/high + a short reason) attached to their permission prompt — see `riskJudge.ts`'s `classifyToolCall` and `agentLoop.ts`'s `runAgentTurnBody`. Default false: it costs one extra model call per mutating tool call. Purely advisory in every mode as of Phase 2 (docs/roadmap/p2-plan-act-safety.md) — turning this on changes what the permission prompt *shows*, never what gets auto-approved. */
   riskAnnotationsEnabled: boolean;
+  /** Whether HTML artifacts render via the tier-2 `artifact://` protocol (`sandbox="allow-scripts"`, no `allow-same-origin` — an opaque, no-IPC, no-network origin; see `src-tauri/src/artifacts.rs`) so inline `<script>` tags actually run. Default true. When false, every artifact — including HTML with inline scripts — renders via tier-1 only (`<iframe sandbox="" srcdoc>`), where scripts are inert by construction; see `ArtifactPane.tsx`. */
+  artifactScriptsEnabled: boolean;
+  /** Whether `runTurnGuarded` (see `agentLoop.ts`) auto-opens the newest previewable artifact from a just-finished turn in `ArtifactPane`. Default false, mirroring `verifyEnabled`'s "automatically doing something on the user's behalf should be opt-in" posture — a user who didn't ask for a preview shouldn't have the workspace panel commandeered out from under them. Only artifacts produced by the turn that just completed are considered, never ones already sitting earlier in the transcript. */
+  artifactAutoPreview: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -68,6 +72,8 @@ export interface SettingsState {
   setVerifyEnabled: (value: boolean) => void;
   setVerifyMaxRounds: (value: number) => void;
   setRiskAnnotationsEnabled: (value: boolean) => void;
+  setArtifactScriptsEnabled: (value: boolean) => void;
+  setArtifactAutoPreview: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -115,6 +121,8 @@ interface PersistedShape {
   verifyEnabled: boolean;
   verifyMaxRounds: number;
   riskAnnotationsEnabled: boolean;
+  artifactScriptsEnabled: boolean;
+  artifactAutoPreview: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -134,6 +142,8 @@ function defaults(): PersistedShape {
     verifyEnabled: false,
     verifyMaxRounds: DEFAULT_VERIFY_MAX_ROUNDS,
     riskAnnotationsEnabled: false,
+    artifactScriptsEnabled: true,
+    artifactAutoPreview: false,
   };
 }
 
@@ -197,6 +207,10 @@ function hydrate(): PersistedShape {
           : fallback.verifyMaxRounds,
       riskAnnotationsEnabled:
         typeof parsed.riskAnnotationsEnabled === "boolean" ? parsed.riskAnnotationsEnabled : fallback.riskAnnotationsEnabled,
+      artifactScriptsEnabled:
+        typeof parsed.artifactScriptsEnabled === "boolean" ? parsed.artifactScriptsEnabled : fallback.artifactScriptsEnabled,
+      artifactAutoPreview:
+        typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
     };
   } catch {
     return fallback;
@@ -330,6 +344,16 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setRiskAnnotationsEnabled: (value) => {
     set({ riskAnnotationsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setArtifactScriptsEnabled: (value) => {
+    set({ artifactScriptsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setArtifactAutoPreview: (value) => {
+    set({ artifactAutoPreview: value });
     persist({ ...get() });
   },
 }));

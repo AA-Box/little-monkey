@@ -14,6 +14,7 @@ import {
   isToolCallAllowed,
   isVerifyFixNotice,
   isVerifyNotice,
+  maybeAutoPreviewNewestArtifact,
   parseMemoryNotice,
   parsePlanNotice,
   parseVerifyNotice,
@@ -34,7 +35,8 @@ import {
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
-import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../store/sessionStore";
+import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore, type ChatSession } from "../store/sessionStore";
+import { useArtifactStore } from "../store/artifactStore";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -656,5 +658,108 @@ describe("shouldFeedBackVerifyFailure", () => {
       verifyRound += 1;
     }
     expect(shouldFeedBackVerifyFailure(failure, verifyRound, maxRounds)).toBe(false);
+  });
+});
+
+describe("maybeAutoPreviewNewestArtifact", () => {
+  const sessionId = "artifact-preview-session";
+
+  function withMessages(messages: ChatMessage[]): void {
+    const session: ChatSession = {
+      id: sessionId,
+      title: "Test",
+      messages,
+      createdAt: 0,
+      updatedAt: 0,
+      pinned: false,
+      unread: false,
+      archived: false,
+      groupId: null,
+      workspacePath: null,
+      personaId: null,
+    };
+    useSessionStore.setState((state) => ({
+      sessions: [...state.sessions.filter((s) => s.id !== sessionId), session],
+    }));
+  }
+
+  beforeEach(() => {
+    useSettingsStore.setState({ artifactAutoPreview: true });
+    useArtifactStore.getState().close();
+    withMessages([]);
+  });
+
+  it("does nothing when artifactAutoPreview is off", () => {
+    useSettingsStore.setState({ artifactAutoPreview: false });
+    withMessages([{ role: "assistant", content: "```html\n<div>hi</div>\n```" }]);
+    maybeAutoPreviewNewestArtifact(sessionId, 0);
+    expect(useArtifactStore.getState().active).toBeNull();
+  });
+
+  it("does nothing when the turn produced no previewable artifact", () => {
+    withMessages([{ role: "assistant", content: "plain text answer, no fences" }]);
+    maybeAutoPreviewNewestArtifact(sessionId, 0);
+    expect(useArtifactStore.getState().active).toBeNull();
+  });
+
+  it("opens the newest artifact produced by this turn", () => {
+    withMessages([
+      { role: "assistant", content: "```html\n<div>first</div>\n```" },
+      { role: "assistant", content: "```html\n<div>second</div>\n```" },
+    ]);
+    maybeAutoPreviewNewestArtifact(sessionId, 0);
+    expect(useArtifactStore.getState().active).toMatchObject({ sessionId, ref: { messageIndex: 1, blockIndex: 0 } });
+  });
+
+  it("never opens an artifact that predates anchorIndex (from an earlier turn)", () => {
+    withMessages([
+      { role: "assistant", content: "```html\n<div>earlier turn</div>\n```" },
+      { role: "user", content: "do it again" },
+      { role: "assistant", content: "plain text answer, no fences this time" },
+    ]);
+    // anchorIndex is the length of the transcript just before THIS turn's
+    // user message was added (index 1 here) — this turn's own assistant
+    // reply (index 2) has no fence, so nothing should open even though an
+    // earlier turn's artifact still resolves fine via extractArtifacts.
+    maybeAutoPreviewNewestArtifact(sessionId, 1);
+    expect(useArtifactStore.getState().active).toBeNull();
+  });
+
+  it("does not steal the shared pane from a different session's already-open artifact", () => {
+    // Reproduces the split-pane review finding: session A's artifact is
+    // already open (e.g. the user is reading it), and a completely
+    // different session B's turn finishes in the background (the split
+    // pane) and would otherwise auto-open its own artifact into the SAME
+    // shared pane, silently discarding whatever the user was looking at.
+    const otherSessionId = "other-session";
+    withMessages([{ role: "assistant", content: "```html\n<div>session B's page</div>\n```" }]);
+    useArtifactStore.getState().open("session-a", { messageIndex: 0, blockIndex: 0, fingerprint: "whatever" });
+
+    maybeAutoPreviewNewestArtifact(otherSessionId, 0);
+
+    expect(useArtifactStore.getState().active?.sessionId).toBe("session-a");
+  });
+
+  it("still auto-opens into an empty pane when nothing is currently shown", () => {
+    withMessages([{ role: "assistant", content: "```html\n<div>hi</div>\n```" }]);
+    expect(useArtifactStore.getState().active).toBeNull();
+
+    maybeAutoPreviewNewestArtifact(sessionId, 0);
+
+    expect(useArtifactStore.getState().active?.sessionId).toBe(sessionId);
+  });
+
+  it("still refreshes the pane for a NEWER artifact in the SAME session it's already showing", () => {
+    withMessages([{ role: "assistant", content: "```html\n<div>first</div>\n```" }]);
+    maybeAutoPreviewNewestArtifact(sessionId, 0);
+    expect(useArtifactStore.getState().active?.ref.messageIndex).toBe(0);
+
+    withMessages([
+      { role: "assistant", content: "```html\n<div>first</div>\n```" },
+      { role: "assistant", content: "```html\n<div>second, same session</div>\n```" },
+    ]);
+    maybeAutoPreviewNewestArtifact(sessionId, 0);
+
+    expect(useArtifactStore.getState().active?.ref.messageIndex).toBe(1);
   });
 });
