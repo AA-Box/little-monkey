@@ -42,6 +42,8 @@ export interface SettingsState {
   memoryEnabled: boolean;
   /** Whether the `web_fetch`/`web_search` tools are offered to the model this turn (see `agentLoop.ts`'s `toolsForSettings` filter). Default true — DuckDuckGo search needs no key, so web research works out of the box, and the permission prompt shown for every call is the real gate. Turning this off makes both tools invisible to the model (not merely denied), mirroring `memoryEnabled`'s "disabled = not offered" treatment of `remember`. */
   webToolsEnabled: boolean;
+  /** Whether `runAgentTurnBody` auto-runs the current workspace's enabled verification commands (see `src-tauri/src/verify.rs`) after a turn that wrote files. Default false — running arbitrary configured shell automatically should be opt-in, mirroring `memoryEnabled`'s posture. This slice is report-only: results are appended as `[Verify]` notices, nothing is fed back to the model yet (that's a later slice's `verifyMaxRounds`). */
+  verifyEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -59,6 +61,7 @@ export interface SettingsState {
   setCheckpointRetention: (value: number) => void;
   setMemoryEnabled: (value: boolean) => void;
   setWebToolsEnabled: (value: boolean) => void;
+  setVerifyEnabled: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -99,6 +102,7 @@ interface PersistedShape {
   checkpointRetention: number;
   memoryEnabled: boolean;
   webToolsEnabled: boolean;
+  verifyEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -115,6 +119,7 @@ function defaults(): PersistedShape {
     checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
     memoryEnabled: true,
     webToolsEnabled: true,
+    verifyEnabled: false,
   };
 }
 
@@ -169,6 +174,7 @@ function hydrate(): PersistedShape {
           : fallback.checkpointRetention,
       memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
       webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
+      verifyEnabled: typeof parsed.verifyEnabled === "boolean" ? parsed.verifyEnabled : fallback.verifyEnabled,
     };
   } catch {
     return fallback;
@@ -286,6 +292,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setWebToolsEnabled: (value) => {
     set({ webToolsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setVerifyEnabled: (value) => {
+    set({ verifyEnabled: value });
     persist({ ...get() });
   },
 }));

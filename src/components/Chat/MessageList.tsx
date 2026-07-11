@@ -4,6 +4,7 @@ import {
   BookmarkX,
   Brain,
   ChevronRight,
+  ClipboardCheck,
   FilePenLine,
   FileSearch,
   FileText,
@@ -21,6 +22,7 @@ import {
 } from "lucide-react";
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
+import { StatusPill } from "../ui";
 import {
   checkpointAnchorValid,
   formatCheckpointNotice,
@@ -29,10 +31,13 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isSwitchNotice,
+  isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
+  parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
+  type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
@@ -63,6 +68,7 @@ type TimelineItem =
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
+  | { kind: "verify"; key: string; notice: VerifyNotice }
   | { kind: "typing"; key: string };
 
 /**
@@ -146,6 +152,13 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         const notice = parseMemoryNotice(msg);
         if (notice) {
           items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex: index });
+        }
+        return;
+      }
+      if (isVerifyNotice(msg)) {
+        const notice = parseVerifyNotice(msg);
+        if (notice) {
+          items.push({ kind: "verify", key: `verify-${index}`, notice });
         }
         return;
       }
@@ -518,6 +531,51 @@ const MemoryRow = memo(function MemoryRow({
   );
 });
 
+/** Renders one `[Verify]` notice: the configured command's label, a
+ * pass/fail `StatusPill`, its duration, and a collapsible output block —
+ * reuses `ToolCallRow`'s collapse affordance rather than introducing a new
+ * one. Report-only in this slice: there is nothing to act on here yet (no
+ * "run again"/"fix it" affordance), just the result. */
+const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) {
+  const { t } = useT();
+  const [open, setOpen] = useState(false);
+  const seconds = (notice.durationMs / 1000).toFixed(1);
+
+  return (
+    <div className="flex justify-center">
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+        <button
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+        >
+          <ChevronRight
+            size={12}
+            className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+          />
+          <ClipboardCheck size={13} className="shrink-0 text-faint" />
+          <span className="truncate font-medium text-foreground">{notice.label}</span>
+          <StatusPill tone={notice.ok ? "success" : "danger"}>
+            {notice.ok ? t("MessageList.verifyPassedBadge") : t("MessageList.verifyFailedBadge")}
+          </StatusPill>
+          <span className="ml-auto shrink-0 whitespace-nowrap text-faint">
+            {t("MessageList.verifyDuration", { seconds })}
+          </span>
+        </button>
+        {open && (
+          <div className="border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
+            {notice.output ? (
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{notice.output}</pre>
+            ) : (
+              <span className="text-faint">{t("MessageList.verifyNoOutput")}</span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
@@ -615,6 +673,9 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
               return (
                 <MemoryRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
               );
+            }
+            if (item.kind === "verify") {
+              return <VerifyRow key={item.key} notice={item.notice} />;
             }
             return <TypingIndicator key={item.key} />;
           })}

@@ -135,3 +135,48 @@ describe("settingsStore.webToolsEnabled", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+describe("settingsStore.verifyEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ verifyEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as memoryEnabled's
+    // own default test above — `beforeEach` forces `false` regardless, so
+    // only a fresh module import actually covers `defaults()`. Unlike
+    // memoryEnabled/webToolsEnabled, this one defaults OFF: running
+    // arbitrary configured shell automatically should be opt-in.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().verifyEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setVerifyEnabled(true);
+    expect(useSettingsStore.getState().verifyEnabled).toBe(true);
+    useSettingsStore.getState().setVerifyEnabled(false);
+    expect(useSettingsStore.getState().verifyEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setVerifyEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().verifyEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ verifyEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().verifyEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});

@@ -3,12 +3,18 @@ import { describe, expect, it } from "vitest";
 import {
   checkpointChainBlockReason,
   formatMemoryNotice,
+  formatVerifyNotice,
   isMemoryNotice,
+  isSuccessfulMutationResult,
   isToolCallAllowed,
+  isVerifyNotice,
   parseMemoryNotice,
+  parseVerifyNotice,
+  toolCallPathArg,
   toolsForSettings,
   type CheckpointChainLink,
   type MemoryNotice,
+  type VerifyNotice,
 } from "./agentLoop";
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 
@@ -101,6 +107,75 @@ describe("memory notices", () => {
   it("returns null when the payload is missing required fields", () => {
     const message: ChatMessage = { role: "system", content: `[Memory]${JSON.stringify({ id: "only-id" })}` };
     expect(parseMemoryNotice(message)).toBeNull();
+  });
+});
+
+describe("verify notices", () => {
+  const notice: VerifyNotice = { label: "Lint", kind: "lint", ok: true, code: 0, output: "no problems found", durationMs: 1234 };
+
+  it("formats a notice as a [Verify]-prefixed JSON payload and round-trips it back", () => {
+    const formatted = formatVerifyNotice(notice);
+    expect(formatted.startsWith("[Verify]")).toBe(true);
+
+    const message: ChatMessage = { role: "system", content: formatted };
+    expect(isVerifyNotice(message)).toBe(true);
+    expect(parseVerifyNotice(message)).toEqual(notice);
+  });
+
+  it("round-trips a failing result", () => {
+    const failed: VerifyNotice = { label: "Tests", kind: "test", ok: false, code: 1, output: "1 failing", durationMs: 500 };
+    const message: ChatMessage = { role: "system", content: formatVerifyNotice(failed) };
+    expect(parseVerifyNotice(message)).toEqual(failed);
+  });
+
+  it("is not misidentified as a verify notice for other message shapes", () => {
+    expect(isVerifyNotice({ role: "system", content: "[Checkpoint]{}" })).toBe(false);
+    expect(isVerifyNotice({ role: "user", content: "[Verify]{}" })).toBe(false);
+    expect(parseVerifyNotice({ role: "assistant", content: "hello" })).toBeNull();
+  });
+
+  it("returns null for a malformed JSON payload instead of throwing", () => {
+    const message: ChatMessage = { role: "system", content: "[Verify]not-json" };
+    expect(parseVerifyNotice(message)).toBeNull();
+  });
+
+  it("returns null when the payload is missing required fields", () => {
+    const message: ChatMessage = { role: "system", content: `[Verify]${JSON.stringify({ label: "only-label" })}` };
+    expect(parseVerifyNotice(message)).toBeNull();
+  });
+});
+
+describe("isSuccessfulMutationResult", () => {
+  it("treats a plain-string success result (write_file/edit_file's actual shape) as successful", () => {
+    expect(isSuccessfulMutationResult("Wrote 42 bytes to src/foo.ts")).toBe(true);
+    expect(isSuccessfulMutationResult("Edited src/foo.ts")).toBe(true);
+  });
+
+  it("treats the {\"error\": ...} shape stringifyToolError produces as unsuccessful", () => {
+    expect(isSuccessfulMutationResult(JSON.stringify({ error: "old_string not found in 'src/foo.ts'" }))).toBe(false);
+  });
+
+  it("treats arbitrary JSON without an error key as successful (only the error shape is excluded)", () => {
+    expect(isSuccessfulMutationResult(JSON.stringify({ ok: true }))).toBe(true);
+  });
+});
+
+describe("toolCallPathArg", () => {
+  function call(args: unknown): ToolCall {
+    return { id: "c1", type: "function", function: { name: "write_file", arguments: JSON.stringify(args) } };
+  }
+
+  it("extracts the path argument", () => {
+    expect(toolCallPathArg(call({ path: "src/foo.ts", content: "x" }))).toBe("src/foo.ts");
+  });
+
+  it("returns null when arguments are malformed JSON", () => {
+    const toolCall: ToolCall = { id: "c1", type: "function", function: { name: "write_file", arguments: "{not json" } };
+    expect(toolCallPathArg(toolCall)).toBeNull();
+  });
+
+  it("returns null when there is no path argument", () => {
+    expect(toolCallPathArg(call({ content: "x" }))).toBeNull();
   });
 });
 
