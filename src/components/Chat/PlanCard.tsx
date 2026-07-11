@@ -57,11 +57,19 @@ export function PlanCard({ sessionId, notice, messageIndex }: PlanCardProps) {
     setBusy(true);
     setError(null);
     try {
+      // Switch mode first, and only rewrite the notice to "approved" (a
+      // terminal, un-recoverable UI state — see the render logic below,
+      // which only shows Approve/Keep-planning while status === "proposed")
+      // once that fallible step has actually succeeded. If setMode throws,
+      // the notice stays "proposed" so the button is still there to retry —
+      // otherwise a transient IPC failure would permanently strand the card
+      // showing "Approved" while the mode never actually changed and no
+      // follow-up turn ran.
+      const lastActMode = usePermissionStore.getState().lastActMode;
+      await usePermissionStore.getState().setMode(lastActMode);
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatPlanNotice({ ...notice, status: "approved" }),
       });
-      const lastActMode = usePermissionStore.getState().lastActMode;
-      await usePermissionStore.getState().setMode(lastActMode);
       void runAgentTurn(sessionId, PLAN_APPROVED_INSTRUCTION);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

@@ -73,19 +73,26 @@ const SHELL_RC_FILES: &[&str] = &[
 /// Cargo `build.rs`, etc.) can execute arbitrary code the next time someone
 /// installs/builds the project — editing them is a supply-chain-shaped
 /// mutation, not an ordinary source-code change.
+///
+/// Kept all-lowercase deliberately: [`path_risk_floor`] lowercases the
+/// candidate file name before comparing against this list (case-insensitive
+/// match — see that function's doc comment for why), so these literals must
+/// already be lowercase or the comparison would never match, even though
+/// some of these files' canonical on-disk spelling is mixed-case (e.g.
+/// `Cargo.toml`, `Gemfile`).
 const SCRIPT_EXECUTING_MANIFESTS: &[&str] = &[
     "package.json",
     "package-lock.json",
     "npm-shrinkwrap.json",
     "yarn.lock",
     "pnpm-lock.yaml",
-    "Cargo.toml",
-    "Cargo.lock",
-    "Gemfile",
-    "Gemfile.lock",
+    "cargo.toml",
+    "cargo.lock",
+    "gemfile",
+    "gemfile.lock",
     "requirements.txt",
-    "Pipfile",
-    "Pipfile.lock",
+    "pipfile",
+    "pipfile.lock",
     "pyproject.toml",
     "composer.json",
     "composer.lock",
@@ -107,18 +114,30 @@ const SCRIPT_EXECUTING_MANIFESTS: &[&str] = &[
 /// (as `workspace::resolve_path_and_root` returns), `root` is that same
 /// call's canonical workspace root, so a path outside the workspace can never
 /// reach here in the first place (the sandbox already rejects it upstream).
+///
+/// All comparisons here are case-insensitive (via `.to_ascii_lowercase()` on
+/// each path component/file name before matching against the — already
+/// lowercase — literals above). macOS's default APFS and Windows' default
+/// NTFS are both case-insensitive-but-case-preserving: a model-supplied path
+/// like `.ZSHRC` or `PACKAGE.JSON` for a not-yet-existing file resolves
+/// (`workspace::resolve_against_root`) with that exact casing preserved on
+/// disk, yet is the *same file* `.zshrc`/`package.json` would be to the
+/// filesystem, the shell, and every other tool. A case-sensitive comparison
+/// here would let a case-variant filename sail past the floor entirely on
+/// exactly the platforms this app ships on — folding case before comparing
+/// keeps the floor authoritative regardless of the casing the model chose.
 pub fn path_risk_floor(path: &Path, root: &Path) -> Option<&'static str> {
     let rel = path.strip_prefix(root).unwrap_or(path);
 
-    let components: Vec<&std::ffi::OsStr> = rel
+    let components: Vec<String> = rel
         .components()
         .filter_map(|c| match c {
-            std::path::Component::Normal(part) => Some(part),
+            std::path::Component::Normal(part) => part.to_str().map(|s| s.to_ascii_lowercase()),
             _ => None,
         })
         .collect();
 
-    if components.iter().any(|part| *part == ".git") {
+    if components.iter().any(|part| part == ".git") {
         return Some("inside .git/ — version-control metadata");
     }
 
@@ -126,17 +145,17 @@ pub fn path_risk_floor(path: &Path, root: &Path) -> Option<&'static str> {
         return Some("inside .github/workflows/ — CI pipeline definition, runs with repo permissions");
     }
 
-    let file_name = path.file_name().and_then(|n| n.to_str())?;
+    let file_name = path.file_name().and_then(|n| n.to_str())?.to_ascii_lowercase();
 
     if file_name.starts_with(".env") {
         return Some("environment/secrets file (.env*)");
     }
 
-    if SHELL_RC_FILES.contains(&file_name) {
+    if SHELL_RC_FILES.contains(&file_name.as_str()) {
         return Some("shell startup/rc file — runs on every new shell");
     }
 
-    if SCRIPT_EXECUTING_MANIFESTS.contains(&file_name) {
+    if SCRIPT_EXECUTING_MANIFESTS.contains(&file_name.as_str()) {
         return Some("package manifest/lockfile that can execute scripts on install/build");
     }
 
@@ -949,6 +968,23 @@ mod tests {
                 "{name} should be floored"
             );
         }
+    }
+
+    #[test]
+    fn floor_flags_case_variant_filenames() {
+        // Case-insensitive-but-case-preserving filesystems (default on both
+        // macOS/APFS and Windows/NTFS) treat ".ZSHRC" and ".zshrc" as the
+        // same on-disk file — the floor must fire on the case variant too,
+        // or "smart" mode could silently auto-approve writing what is
+        // effectively a shell rc file / .env / script-executing manifest.
+        let root = Path::new("/ws");
+        assert!(path_risk_floor(&root.join(".ZSHRC"), root).is_some());
+        assert!(path_risk_floor(&root.join(".Env"), root).is_some());
+        assert!(path_risk_floor(&root.join(".ENV.LOCAL"), root).is_some());
+        assert!(path_risk_floor(&root.join("PACKAGE.JSON"), root).is_some());
+        assert!(path_risk_floor(&root.join("Cargo.TOML"), root).is_some());
+        assert!(path_risk_floor(&root.join(".Git").join("config"), root).is_some());
+        assert!(path_risk_floor(&root.join(".GitHub").join("Workflows").join("ci.yml"), root).is_some());
     }
 
     #[test]

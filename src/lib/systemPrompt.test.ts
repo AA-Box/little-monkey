@@ -145,6 +145,26 @@ describe('buildSystemPrompt', () => {
     const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, true);
     expect(prompt).toContain('Configured verification commands run automatically after your edits; fix any failures they report.');
   });
+
+  it('omits the Plan Mode section when mode is omitted (defaults to "manual")', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('## Plan Mode');
+    expect(prompt).not.toContain('present_plan');
+  });
+
+  it('omits the Plan Mode section for every non-"plan" mode', () => {
+    for (const mode of ['manual', 'acceptEdits', 'smart', 'auto', 'bypass'] as const) {
+      const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, mode);
+      expect(prompt).not.toContain('## Plan Mode');
+    }
+  });
+
+  it('includes the Plan Mode section, steering the model toward present_plan and away from mutating tools, only when mode is "plan"', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'plan');
+    expect(prompt).toContain('## Plan Mode');
+    expect(prompt).toContain('present_plan');
+    expect(prompt).toContain('every mutating tool (write_file, edit_file, run_shell, remember) is blocked');
+  });
 });
 
 describe('composeSystemPrompt', () => {
