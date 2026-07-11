@@ -29,8 +29,10 @@
 //! per-hop, it doesn't pin the resolved address for the connection itself.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tauri::Manager;
 use tokio::sync::Notify;
 use url::Url;
 
@@ -44,17 +46,246 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// the model's context window from an enormous or unbounded response.
 const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 
-/// Default char-window size when the model doesn't pass `max_chars`. Mirrors
-/// the 20k-char cap precedent in `src/lib/mentions.ts`'s `truncateMentionContent`.
-/// Settings-driven in phase 3 — hardcoded for now.
+/// Default char-window size when the model doesn't pass `max_chars` AND
+/// `web_settings.json` doesn't override it — mirrors the 20k-char cap
+/// precedent in `src/lib/mentions.ts`'s `truncateMentionContent`. Phase 1/2
+/// hardcoded this; phase 3 makes it `WebSettings::fetch_max_chars`'s serde
+/// default (see below) while keeping the same fallback value.
 const DEFAULT_MAX_CHARS: usize = 20_000;
 
 const USER_AGENT: &str = "LittleMonkey/0.1";
 
-/// Whether fetching a loopback/private/link-local target is allowed.
-/// Hardcoded to `false` for phase 1 — settings plumbing (the `allow_local_network`
-/// toggle in `web_settings.json`) is phase 3.
-const ALLOW_LOCAL_NETWORK: bool = false;
+/// Keychain service name for the Brave API key — same string `providers.rs`
+/// and `mcp.rs` use for their own secrets; keychain entries are disambiguated
+/// by *account* (see [`BRAVE_KEYCHAIN_ACCOUNT`]), not service, so this is
+/// fine to duplicate rather than export from `providers.rs`.
+const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
+
+/// Keychain account name the Brave API key is stored under.
+const BRAVE_KEYCHAIN_ACCOUNT: &str = "search-brave";
+
+/// Filename for the persisted web-tools settings under the app data
+/// directory — same file-per-feature pattern as `providers.json`/
+/// `mcp_servers.json`.
+const SETTINGS_FILE: &str = "web_settings.json";
+
+/// Which search backend `web_search` dispatches to — see [`search_impl`].
+/// `#[serde(rename_all = "snake_case")]` on a single-uppercase-run identifier
+/// like `Duckduckgo`/`Searxng` just lowercases it (there's no internal
+/// camelCase boundary to split on), so this serializes to exactly the design
+/// doc's `"duckduckgo"|"brave"|"searxng"` strings with no explicit renames —
+/// verified by [`tests::search_provider_serializes_to_the_expected_strings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProvider {
+    #[default]
+    Duckduckgo,
+    Brave,
+    Searxng,
+}
+
+/// Serde default for [`WebSettings::fetch_max_chars`] — same fallback value
+/// as [`DEFAULT_MAX_CHARS`], just exposed as a `fn` since `#[serde(default)]`
+/// needs one rather than a bare const for a non-zero primitive default.
+fn default_fetch_max_chars() -> usize {
+    DEFAULT_MAX_CHARS
+}
+
+/// Persisted at `<app_data>/web_settings.json`, mirrored to the frontend by
+/// `src/store/webStore.ts`. Plain snake_case field names, no `serde(rename)`
+/// — same hand-editable-file convention as `providers.json`/`mcp_servers.json`.
+/// Notably absent: the Brave API key itself, which lives only in the OS
+/// keychain (see [`has_brave_key`]/[`read_brave_key`]) and is never part of
+/// this struct or this file.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WebSettings {
+    #[serde(default)]
+    pub search_provider: SearchProvider,
+    /// Required when `search_provider == Searxng`; ignored otherwise. `None`
+    /// (not an empty string) is the "unset" state — see
+    /// `normalize_and_validate_settings`, which turns a blank input back into
+    /// `None` before this is ever persisted.
+    #[serde(default)]
+    pub searxng_base_url: Option<String>,
+    /// Whether `web_fetch`/`web_search` may target a loopback/private/
+    /// link-local host. Defaults to `false` — see the module doc's SSRF
+    /// guard rationale. Real (settings-driven) as of phase 3; phases 1-2
+    /// hardcoded this to `false` via a module constant.
+    #[serde(default)]
+    pub allow_local_network: bool,
+    /// Char-window size `tool_web_fetch` uses when the model doesn't pass its
+    /// own `max_chars`. Real (settings-driven) as of phase 3.
+    #[serde(default = "default_fetch_max_chars")]
+    pub fetch_max_chars: usize,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self {
+            search_provider: SearchProvider::default(),
+            searxng_base_url: None,
+            allow_local_network: false,
+            fetch_max_chars: DEFAULT_MAX_CHARS,
+        }
+    }
+}
+
+/// Resolves (and creates, if missing) `<app_data_dir>/web_settings.json`'s
+/// path — same shape as `providers.rs::providers_file_path`/
+/// `mcp.rs::config_file_path`.
+fn settings_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    if !base.exists() {
+        std::fs::create_dir_all(&base)
+            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+    }
+    Ok(base.join(SETTINGS_FILE))
+}
+
+/// Core load logic, parameterized by path for testability — a missing file
+/// (nothing configured yet, the common case) is simply [`WebSettings::default`],
+/// never an error, same stance as `mcp.rs::load_config_impl`.
+fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt web_settings.json: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WebSettings::default()),
+        Err(e) => Err(format!("Failed to read web_settings.json: {e}")),
+    }
+}
+
+/// Core save logic: atomic sibling temp file + rename, same idiom as
+/// `sessions.rs`'s `save_to` / `mcp.rs`'s `save_config_impl`.
+fn save_settings_impl(path: &Path, settings: &WebSettings) -> Result<(), String> {
+    let payload =
+        serde_json::to_string_pretty(settings).map_err(|e| format!("Failed to serialize web_settings.json: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write web_settings.json: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize web_settings.json: {e}"))?;
+    Ok(())
+}
+
+/// Rejects anything that isn't a plain `http(s)://...` base URL and
+/// normalizes away a trailing slash — same validation `providers.rs::validate_base_url`
+/// applies to custom-provider base URLs, duplicated here (rather than made
+/// `pub` there and imported) since that function is private to `providers.rs`
+/// and this is a small, self-contained rule.
+fn normalize_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err(format!("Invalid SearXNG base URL '{raw}': must start with http:// or https://"));
+    }
+    if trimmed.len() <= "https://".len() {
+        return Err(format!("Invalid SearXNG base URL '{raw}'"));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Pure validation/normalization core behind [`web_set_settings`]: blanks out
+/// a blank/whitespace-only `searxng_base_url` back to `None` (rather than
+/// persisting an empty string), otherwise validates+normalizes it, and
+/// rejects a zero `fetch_max_chars` (an unbounded-above value is left to the
+/// user's judgement — there's no analogous upper nonsense value to guard).
+/// Split out from the `#[tauri::command]` wrapper so it's directly testable
+/// without an `AppHandle`, same `*_impl` split as everywhere else in this
+/// module.
+fn normalize_and_validate_settings(mut settings: WebSettings) -> Result<WebSettings, String> {
+    if settings.fetch_max_chars == 0 {
+        return Err("fetch_max_chars must be greater than 0".to_string());
+    }
+    if let Some(raw) = settings.searxng_base_url.take() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            settings.searxng_base_url = Some(normalize_base_url(trimmed)?);
+        }
+    }
+    Ok(settings)
+}
+
+/// Whether a Brave API key is currently saved — always a live keychain
+/// probe, never a persisted flag, mirroring `providers::has_key`'s stance
+/// exactly (never drifts from reality).
+pub fn has_brave_key() -> bool {
+    keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+        .and_then(|e| e.get_password())
+        .is_ok()
+}
+
+/// Reads the saved Brave API key, for `search_impl`'s Brave branch (via
+/// `tool_web_search`) and lm-cli's shared `web::read_brave_key()` (phase 4).
+pub fn read_brave_key() -> Result<String, String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Failed to access keychain: {e}"))?;
+    entry.get_password().map_err(|e| match e {
+        keyring::Error::NoEntry => {
+            "No Brave API key saved — add one in Settings > Web, or switch the search provider.".to_string()
+        }
+        other => format!("Failed to read saved Brave API key: {other}"),
+    })
+}
+
+/// Core remove logic behind [`web_remove_brave_key`] — a missing entry is a
+/// no-op success, same stance as `providers::remove_key_impl`.
+fn remove_brave_key_impl() -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Failed to access keychain: {e}"))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Failed to remove saved key: {e}")),
+    }
+}
+
+/// Returns the persisted web-tools settings (never the Brave key itself —
+/// see [`web_has_brave_key`] for that live probe).
+#[tauri::command]
+pub fn web_get_settings(app: tauri::AppHandle) -> Result<WebSettings, String> {
+    load_settings_impl(&settings_file_path(&app)?)
+}
+
+/// Persists the web-tools settings after [`normalize_and_validate_settings`].
+/// Does not touch the Brave key — that's [`web_set_brave_key`]/
+/// [`web_remove_brave_key`]'s job, kept as separate commands since one lives
+/// in the keychain and the other in this JSON file.
+#[tauri::command]
+pub fn web_set_settings(app: tauri::AppHandle, settings: WebSettings) -> Result<(), String> {
+    let settings = normalize_and_validate_settings(settings)?;
+    save_settings_impl(&settings_file_path(&app)?, &settings)
+}
+
+/// Live keychain probe for the Settings "Web" tab's Brave key field — mirrors
+/// `ProviderCard`'s `has_key` pattern (a boolean the UI polls/refreshes,
+/// never the secret itself).
+#[tauri::command]
+pub fn web_has_brave_key() -> bool {
+    has_brave_key()
+}
+
+/// Validates `api_key` with a live 1-result Brave query *before* touching the
+/// keychain — a bad key is never persisted — exactly mirroring
+/// `providers::providers_set_key`'s validate-before-store shape (that one
+/// fetches the model list; this one runs a throwaway search).
+#[tauri::command]
+pub async fn web_set_brave_key(api_key: String) -> Result<(), String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("API key is required".to_string());
+    }
+
+    brave_search(&api_key, "test", 1).await?;
+
+    let entry =
+        keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT).map_err(|e| format!("Failed to access keychain: {e}"))?;
+    entry.set_password(&api_key).map_err(|e| format!("Failed to save key to keychain: {e}"))
+}
+
+/// Removes the saved Brave API key from the keychain.
+#[tauri::command]
+pub fn web_remove_brave_key() -> Result<(), String> {
+    remove_brave_key_impl()
+}
 
 /// Checks whether `ip` falls in any of the ranges the design doc calls out:
 /// loopback, RFC1918 private, and link-local. `Ipv4Addr::is_private` (the std
@@ -252,16 +483,27 @@ fn build_redirect_policy(allow_local_network: bool) -> reqwest::redirect::Policy
 /// cancellable; [`tool_web_fetch`] wraps the call in a `tokio::select!` against
 /// the turn's cancel `Notify`, the same split `tool_run_shell` uses for its
 /// child-process future.
-pub async fn fetch_impl(url: String, max_chars: Option<usize>, start_index: Option<usize>) -> Result<FetchResult, String> {
-    let max_chars = max_chars.unwrap_or(DEFAULT_MAX_CHARS);
+///
+/// `settings` supplies the real, user-configured `allow_local_network` and
+/// (as the fallback when the model omits `max_chars`) `fetch_max_chars` —
+/// phases 1-2 hardcoded both via module constants; this is the phase-3
+/// settings-driven version `tool_web_fetch` (and lm-cli, phase 4) call with
+/// whatever `web_settings.json` currently holds.
+pub async fn fetch_impl(
+    settings: &WebSettings,
+    url: String,
+    max_chars: Option<usize>,
+    start_index: Option<usize>,
+) -> Result<FetchResult, String> {
+    let max_chars = max_chars.unwrap_or(settings.fetch_max_chars);
     let start_index = start_index.unwrap_or(0);
 
     let parsed = Url::parse(&url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
-    validate_fetch_url(&parsed, ALLOW_LOCAL_NETWORK)?;
+    validate_fetch_url(&parsed, settings.allow_local_network)?;
 
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .redirect(build_redirect_policy(ALLOW_LOCAL_NETWORK))
+        .redirect(build_redirect_policy(settings.allow_local_network))
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
@@ -334,6 +576,8 @@ pub async fn tool_web_fetch(
     permissions::request_permission(&app, state.inner(), "web_fetch", url.clone(), turn_id.as_deref())
         .await?;
 
+    let settings = load_settings_impl(&settings_file_path(&app)?)?;
+
     // Same per-turn cancellation channel `tool_run_shell` uses — see
     // `AppState::tool_cancel`'s doc comment. Callers that don't thread a turn
     // id share the "" channel.
@@ -347,7 +591,7 @@ pub async fn tool_web_fetch(
         .clone();
 
     let outcome = tokio::select! {
-        result = fetch_impl(url, max_chars, start_index) => result,
+        result = fetch_impl(&settings, url, max_chars, start_index) => result,
         _ = cancel.notified() => Err("Fetch cancelled by the user".to_string()),
     };
 
@@ -467,18 +711,15 @@ fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
     results
 }
 
-/// Core `web_search` logic: AppHandle-free and directly testable, same split
-/// as [`fetch_impl`]. DuckDuckGo-only for phase 2 (the design doc's Brave and
-/// SearXNG branches are phase 3) — no provider parameter yet, so this is the
-/// entire dispatch.
+/// DuckDuckGo branch of [`search_impl`] (phase 2's entire dispatch, now one
+/// arm of three). AppHandle-free and directly testable, same split as
+/// [`fetch_impl`].
 ///
 /// Unlike `fetch_impl`, there is no SSRF guard here to run: the request
 /// target is DuckDuckGo's own fixed endpoint, never a user/model-supplied
 /// URL — only the query text (sent as a POST form field, not part of the
 /// URL) is untrusted.
-pub async fn search_impl(query: String, count: Option<usize>) -> Result<Vec<SearchResult>, String> {
-    let count = count.unwrap_or(DEFAULT_SEARCH_COUNT).clamp(1, DEFAULT_SEARCH_COUNT);
-
+async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
     let client = reqwest::Client::builder()
         .timeout(SEARCH_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -487,7 +728,7 @@ pub async fn search_impl(query: String, count: Option<usize>) -> Result<Vec<Sear
 
     let response = client
         .post(DUCKDUCKGO_HTML_ENDPOINT)
-        .form(&[("q", query.as_str())])
+        .form(&[("q", query)])
         .send()
         .await
         .map_err(|e| format!("Failed to search DuckDuckGo for '{}': {}", query, e))?;
@@ -505,15 +746,223 @@ pub async fn search_impl(query: String, count: Option<usize>) -> Result<Vec<Sear
     Ok(parse_ddg_results(&body, count))
 }
 
-/// Search the web (DuckDuckGo, keyless) and return up to `count` (1-10,
-/// default 10) ranked `{title, url, snippet}` results. Permission-gated:
-/// prompts with the query as detail, exactly like `tool_web_fetch` prompts
-/// with the URL. `turn_id` scopes the permission prompt to the calling turn
-/// (never model-supplied) — unlike `tool_web_fetch`, there is no Stop-button
-/// cancellation wiring here: the request is one short, fixed-endpoint POST
-/// (see `SEARCH_TIMEOUT`), not a potentially large streamed fetch, so it gets
-/// `remember`'s simpler "turn id for the prompt only" treatment rather than
-/// `web_fetch`'s `tokio::select!` + `state.tool_cancel` split.
+/// Brave Search API's web-search endpoint (design doc / task spec, verified
+/// against Brave's own API docs at implementation time): `X-Subscription-Token`
+/// header for auth, `q`/`count` query params, `web.results[].{title,url,description}`
+/// in the JSON response.
+const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+
+/// Minimal shape of a Brave web-search JSON response — same defensive,
+/// lenient style as `ollama.rs::RawTagEntry`: every field defaults rather
+/// than failing the whole parse if Brave's schema grows a field this doesn't
+/// know about, or omits `web` entirely (e.g. a query with zero results).
+#[derive(serde::Deserialize, Default)]
+struct BraveResponse {
+    #[serde(default)]
+    web: Option<BraveWebResults>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct BraveWebResults {
+    #[serde(default)]
+    results: Vec<BraveResult>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct BraveResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Parses a Brave web-search JSON response body into up to `count`
+/// [`SearchResult`]s. Split out from [`brave_search_at`] so a fixture can
+/// exercise the parsing on its own, same reasoning as [`parse_ddg_results`].
+fn parse_brave_response(body: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    let parsed: BraveResponse = serde_json::from_str(body).map_err(|e| format!("Failed to parse Brave response: {e}"))?;
+    let results = parsed.web.map(|w| w.results).unwrap_or_default();
+    Ok(results
+        .into_iter()
+        .take(count)
+        .map(|r| SearchResult { title: r.title, url: r.url, snippet: r.description })
+        .collect())
+}
+
+/// Brave branch of [`search_impl`], parameterized by `endpoint` so
+/// [`tests::brave_search_at_surfaces_an_unauthorized_response_as_an_error`]
+/// can point it at a local fixture server instead of the real Brave API —
+/// [`brave_search`] is the real-endpoint entry point both `search_impl` and
+/// [`web_set_brave_key`]'s validate-before-store call use.
+async fn brave_search_at(endpoint: &str, api_key: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(SEARCH_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let response = client
+        .get(endpoint)
+        .header("X-Subscription-Token", api_key)
+        .header("Accept", "application/json")
+        .query(&[("q", query), ("count", &count.to_string())])
+        .send()
+        .await
+        .map_err(|e| format!("Failed to search Brave for '{}': {}", query, e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Brave response for '{}': {}", query, e))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "Brave search for '{}' returned HTTP {}{}",
+            query,
+            status,
+            if body.is_empty() { String::new() } else { format!(": {body}") }
+        ));
+    }
+
+    parse_brave_response(&body, count)
+}
+
+async fn brave_search(api_key: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    brave_search_at(BRAVE_SEARCH_ENDPOINT, api_key, query, count).await
+}
+
+/// Minimal shape of a SearXNG `format=json` response — same lenient,
+/// defaults-everywhere style as [`BraveResponse`].
+#[derive(serde::Deserialize, Default)]
+struct SearxngResponse {
+    #[serde(default)]
+    results: Vec<SearxngResult>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SearxngResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    content: String,
+}
+
+/// Parses a SearXNG `format=json` response body into up to `count`
+/// [`SearchResult`]s. Split out from [`searxng_search`] for the same
+/// fixture-testability reason as [`parse_brave_response`].
+fn parse_searxng_response(body: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    let parsed: SearxngResponse =
+        serde_json::from_str(body).map_err(|e| format!("Failed to parse SearXNG response: {e}"))?;
+    Ok(parsed
+        .results
+        .into_iter()
+        .take(count)
+        .map(|r| SearchResult { title: r.title, url: r.url, snippet: r.content })
+        .collect())
+}
+
+/// SearXNG branch of [`search_impl`]: `GET {base_url}/search?q=&format=json`.
+/// A `403` is SearXNG's standard response when the instance's `settings.yml`
+/// hasn't opted into `formats: [html, json]` (JSON is off by default on most
+/// public instances for exactly this reason — it's meant for programmatic
+/// use, not casual scraping) — mapped to an explicit, actionable hint rather
+/// than a bare "HTTP 403" the user would have to go guess the cause of (the
+/// design doc's own risk note: "needs the explicit error hint or users will
+/// blame the app").
+async fn searxng_search(base_url: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(SEARCH_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let url = format!("{}/search", base_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .query(&[("q", query), ("format", "json")])
+        .send()
+        .await
+        .map_err(|e| format!("Failed to search SearXNG at '{}': {}", base_url, e))?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!(
+            "SearXNG at '{}' returned HTTP 403 — enable `formats: [html, json]` for this instance in its settings.yml",
+            base_url
+        ));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read SearXNG response from '{}': {}", base_url, e))?;
+
+    if !status.is_success() {
+        return Err(format!("SearXNG search at '{}' returned HTTP {}", base_url, status));
+    }
+
+    parse_searxng_response(&body, count)
+}
+
+/// Core `web_search` logic: AppHandle-free and directly testable, same split
+/// as [`fetch_impl`]. Dispatches on `settings.search_provider` — phase 2's
+/// DuckDuckGo-only version was the entire body of this function; Brave and
+/// SearXNG are phase 3.
+///
+/// `brave_key` is passed in rather than read from the keychain here, so this
+/// function stays free of any keychain access of its own — [`tool_web_search`]
+/// (and lm-cli's shared call site, phase 4) resolve it via [`read_brave_key`]
+/// and pass the result through, keeping `search_impl` trivially testable
+/// without touching the real OS keychain.
+///
+/// Unlike `fetch_impl`, there is no SSRF guard to run for any of the three
+/// branches: Brave/SearXNG/DuckDuckGo targets are either a fixed vendor
+/// endpoint or a user-configured SearXNG base URL the user themselves typed
+/// into Settings (not a model-supplied URL) — only the query text is
+/// untrusted, and it's sent as a query/form parameter, never used to build a
+/// request to an arbitrary host.
+pub async fn search_impl(
+    settings: &WebSettings,
+    brave_key: Option<String>,
+    query: String,
+    count: Option<usize>,
+) -> Result<Vec<SearchResult>, String> {
+    let count = count.unwrap_or(DEFAULT_SEARCH_COUNT).clamp(1, DEFAULT_SEARCH_COUNT);
+
+    match settings.search_provider {
+        SearchProvider::Duckduckgo => ddg_search(&query, count).await,
+        SearchProvider::Brave => {
+            let key = brave_key
+                .filter(|k| !k.trim().is_empty())
+                .ok_or_else(|| "Brave search requires an API key — add one in Settings > Web.".to_string())?;
+            brave_search(&key, &query, count).await
+        }
+        SearchProvider::Searxng => {
+            let base = settings
+                .searxng_base_url
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| "SearXNG requires a base URL — set one in Settings > Web.".to_string())?;
+            searxng_search(&base, &query, count).await
+        }
+    }
+}
+
+/// Search the web via the configured provider (DuckDuckGo/Brave/SearXNG) and
+/// return up to `count` (1-10, default 10) ranked `{title, url, snippet}`
+/// results. Permission-gated: prompts with the query as detail, exactly like
+/// `tool_web_fetch` prompts with the URL. `turn_id` scopes the permission
+/// prompt to the calling turn (never model-supplied) — unlike `tool_web_fetch`,
+/// there is no Stop-button cancellation wiring here: the request is one
+/// short, fixed-endpoint call (see `SEARCH_TIMEOUT`), not a potentially large
+/// streamed fetch, so it gets `remember`'s simpler "turn id for the prompt
+/// only" treatment rather than `web_fetch`'s `tokio::select!` +
+/// `state.tool_cancel` split.
 ///
 /// `rename_all = "snake_case"`: matches every other tool command, so the
 /// model's snake_case tool-call arguments (`count`) and the agent loop's
@@ -528,7 +977,19 @@ pub async fn tool_web_search(
 ) -> Result<Vec<SearchResult>, String> {
     permissions::request_permission(&app, state.inner(), "web_search", query.clone(), turn_id.as_deref())
         .await?;
-    search_impl(query, count).await
+
+    let settings = load_settings_impl(&settings_file_path(&app)?)?;
+    let brave_key = if settings.search_provider == SearchProvider::Brave {
+        // Absence just means "dispatch will surface the actionable error" —
+        // read_brave_key()'s own message ("add one in Settings") is a fine
+        // fallback but search_impl's Brave-branch message is more specific
+        // to this call site, so a missing key is folded to `None` here
+        // rather than short-circuiting on `read_brave_key`'s own Err.
+        read_brave_key().ok()
+    } else {
+        None
+    };
+    search_impl(&settings, brave_key, query, count).await
 }
 
 #[cfg(test)]
@@ -656,8 +1117,24 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_impl_rejects_a_disallowed_url_without_making_a_request() {
-        let err = fetch_impl("http://127.0.0.1:8090/".to_string(), None, None).await.unwrap_err();
+        let err = fetch_impl(&WebSettings::default(), "http://127.0.0.1:8090/".to_string(), None, None)
+            .await
+            .unwrap_err();
         assert!(err.contains("local/private"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_impl_honors_settings_allow_local_network() {
+        // Same disallowed target as the test above, but with
+        // `allow_local_network: true` — the SSRF guard must let it through
+        // the *validation* step (it will then fail to connect, since nothing
+        // is actually listening on that port in the test environment, but
+        // that's a connection error, not a "local/private" rejection).
+        let settings = WebSettings { allow_local_network: true, ..WebSettings::default() };
+        let err = fetch_impl(&settings, "http://127.0.0.1:1/".to_string(), None, None)
+            .await
+            .unwrap_err();
+        assert!(!err.contains("local/private"), "unexpected error: {err}");
     }
 
     /// Exercises the real `reqwest::redirect::Policy` (not just
@@ -804,5 +1281,234 @@ mod tests {
     fn search_impl_clamps_count_above_the_maximum_down_to_ten() {
         let clamped = 500usize.clamp(1, DEFAULT_SEARCH_COUNT);
         assert_eq!(clamped, DEFAULT_SEARCH_COUNT);
+    }
+
+    // --- phase 3: settings, Brave, SearXNG -------------------------------
+
+    fn temp_settings_path(name: &str) -> PathBuf {
+        // Same unique-path idiom as `sessions.rs`/`mcp.rs`'s own test
+        // helpers — an atomic counter plus nanos so parallel test threads
+        // (and repeated runs within the same nanosecond) never collide.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("little_monkey_web_settings_test_{}_{}_{}_{}", std::process::id(), n, nanos, name))
+    }
+
+    #[test]
+    fn search_provider_serializes_to_the_expected_strings() {
+        assert_eq!(serde_json::to_string(&SearchProvider::Duckduckgo).unwrap(), "\"duckduckgo\"");
+        assert_eq!(serde_json::to_string(&SearchProvider::Brave).unwrap(), "\"brave\"");
+        assert_eq!(serde_json::to_string(&SearchProvider::Searxng).unwrap(), "\"searxng\"");
+
+        assert_eq!(serde_json::from_str::<SearchProvider>("\"duckduckgo\"").unwrap(), SearchProvider::Duckduckgo);
+        assert_eq!(serde_json::from_str::<SearchProvider>("\"brave\"").unwrap(), SearchProvider::Brave);
+        assert_eq!(serde_json::from_str::<SearchProvider>("\"searxng\"").unwrap(), SearchProvider::Searxng);
+    }
+
+    #[test]
+    fn web_settings_default_matches_the_design_docs_defaults() {
+        let settings = WebSettings::default();
+        assert_eq!(settings.search_provider, SearchProvider::Duckduckgo);
+        assert_eq!(settings.searxng_base_url, None);
+        assert!(!settings.allow_local_network);
+        assert_eq!(settings.fetch_max_chars, DEFAULT_MAX_CHARS);
+    }
+
+    #[test]
+    fn load_settings_returns_default_when_file_missing() {
+        let path = temp_settings_path("missing.json");
+        assert_eq!(load_settings_impl(&path).unwrap(), WebSettings::default());
+    }
+
+    #[test]
+    fn settings_save_then_load_roundtrips() {
+        let path = temp_settings_path("roundtrip.json");
+        let settings = WebSettings {
+            search_provider: SearchProvider::Searxng,
+            searxng_base_url: Some("https://searx.example.com".to_string()),
+            allow_local_network: true,
+            fetch_max_chars: 50_000,
+        };
+        save_settings_impl(&path, &settings).unwrap();
+        assert_eq!(load_settings_impl(&path).unwrap(), settings);
+        // The temp file must not linger after a successful save (atomic
+        // temp+rename, same as `sessions.rs`/`mcp.rs`).
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_save_overwrites_previous_content() {
+        let path = temp_settings_path("overwrite.json");
+        save_settings_impl(&path, &WebSettings { fetch_max_chars: 1_000, ..WebSettings::default() }).unwrap();
+        save_settings_impl(&path, &WebSettings { fetch_max_chars: 2_000, ..WebSettings::default() }).unwrap();
+        assert_eq!(load_settings_impl(&path).unwrap().fetch_max_chars, 2_000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn normalize_and_validate_settings_rejects_a_zero_fetch_max_chars() {
+        let err = normalize_and_validate_settings(WebSettings { fetch_max_chars: 0, ..WebSettings::default() }).unwrap_err();
+        assert!(err.contains("fetch_max_chars"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn normalize_and_validate_settings_blanks_a_whitespace_only_searxng_url_to_none() {
+        let settings = WebSettings { searxng_base_url: Some("   ".to_string()), ..WebSettings::default() };
+        let normalized = normalize_and_validate_settings(settings).unwrap();
+        assert_eq!(normalized.searxng_base_url, None);
+    }
+
+    #[test]
+    fn normalize_and_validate_settings_normalizes_a_trailing_slash_on_the_searxng_url() {
+        let settings = WebSettings { searxng_base_url: Some("https://searx.example.com/".to_string()), ..WebSettings::default() };
+        let normalized = normalize_and_validate_settings(settings).unwrap();
+        assert_eq!(normalized.searxng_base_url.as_deref(), Some("https://searx.example.com"));
+    }
+
+    #[test]
+    fn normalize_and_validate_settings_rejects_a_non_http_searxng_url() {
+        let settings = WebSettings { searxng_base_url: Some("ftp://searx.example.com".to_string()), ..WebSettings::default() };
+        let err = normalize_and_validate_settings(settings).unwrap_err();
+        assert!(err.contains("http"), "unexpected error: {err}");
+    }
+
+    /// Brave's actual response shape (`web.results[].{title,url,description}`)
+    /// per the design doc / task spec — trimmed to two results.
+    const BRAVE_FIXTURE_JSON: &str = r#"{
+        "web": {
+            "results": [
+                { "title": "Rust Programming Language", "url": "https://www.rust-lang.org/", "description": "A language empowering everyone." },
+                { "title": "Rust (programming language) - Wikipedia", "url": "https://en.wikipedia.org/wiki/Rust_(programming_language)", "description": "A general-purpose systems programming language." }
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parse_brave_response_extracts_title_url_and_snippet() {
+        let results = parse_brave_response(BRAVE_FIXTURE_JSON, 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], SearchResult {
+            title: "Rust Programming Language".to_string(),
+            url: "https://www.rust-lang.org/".to_string(),
+            snippet: "A language empowering everyone.".to_string(),
+        });
+        assert_eq!(results[1].title, "Rust (programming language) - Wikipedia");
+    }
+
+    #[test]
+    fn parse_brave_response_respects_the_count_cap() {
+        let results = parse_brave_response(BRAVE_FIXTURE_JSON, 1).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn parse_brave_response_tolerates_a_missing_web_key() {
+        // A query with zero results omits `web` entirely rather than sending
+        // an empty `results` array — must yield an empty list, not an error.
+        let results = parse_brave_response(r#"{"query": {"original": "asdf"}}"#, 10).unwrap();
+        assert_eq!(results, Vec::new());
+    }
+
+    #[test]
+    fn parse_brave_response_rejects_unparseable_json() {
+        assert!(parse_brave_response("not json", 10).is_err());
+    }
+
+    /// SearXNG's `format=json` response shape (`results[].{title,url,content}`)
+    /// per the design doc.
+    const SEARXNG_FIXTURE_JSON: &str = r#"{
+        "query": "rust",
+        "results": [
+            { "title": "Rust Programming Language", "url": "https://www.rust-lang.org/", "content": "A language empowering everyone." },
+            { "title": "The Rust Book", "url": "https://doc.rust-lang.org/book/", "content": "The official book on Rust." }
+        ]
+    }"#;
+
+    #[test]
+    fn parse_searxng_response_extracts_title_url_and_snippet() {
+        let results = parse_searxng_response(SEARXNG_FIXTURE_JSON, 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], SearchResult {
+            title: "Rust Programming Language".to_string(),
+            url: "https://www.rust-lang.org/".to_string(),
+            snippet: "A language empowering everyone.".to_string(),
+        });
+        assert_eq!(results[1].title, "The Rust Book");
+    }
+
+    #[test]
+    fn parse_searxng_response_respects_the_count_cap() {
+        let results = parse_searxng_response(SEARXNG_FIXTURE_JSON, 1).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn parse_searxng_response_rejects_unparseable_json() {
+        assert!(parse_searxng_response("not json", 10).is_err());
+    }
+
+    /// Spins up a tiny local HTTP server that always answers with `status`
+    /// and `body`, for exercising the HTTP-error paths of `brave_search_at`/
+    /// `searxng_search` without a live network call — same one-shot
+    /// `TcpListener` idiom `redirect_hop_to_a_private_ip_is_blocked` (above)
+    /// already uses for the redirect-policy test.
+    fn spawn_fixed_response_server(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// Exercises `brave_search_at`'s real HTTP-error handling (not just the
+    /// pure parser) — a bad/revoked API key gets a `401` from the real Brave
+    /// API, and this must surface as an `Err` naming the status rather than
+    /// panicking on the (non-JSON, in this fixture) error body. This is the
+    /// "reject a bad key" behavior `web_set_brave_key` relies on to validate
+    /// before ever touching the keychain — driven here at the HTTP layer
+    /// (not via `web_set_brave_key` itself) so the test never touches the
+    /// developer's real OS keychain.
+    #[tokio::test]
+    async fn brave_search_at_surfaces_an_unauthorized_response_as_an_error() {
+        let base = spawn_fixed_response_server("401 Unauthorized", "{\"message\":\"Invalid API key\"}");
+        let err = brave_search_at(&base, "a-bad-key", "test", 1).await.unwrap_err();
+        assert!(err.contains("401"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn searxng_search_maps_403_to_an_actionable_hint() {
+        let base = spawn_fixed_response_server("403 Forbidden", "");
+        let err = searxng_search(&base, "rust", 10).await.unwrap_err();
+        assert!(err.contains("formats") && err.contains("settings.yml"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn search_impl_rejects_brave_without_a_key() {
+        let settings = WebSettings { search_provider: SearchProvider::Brave, ..WebSettings::default() };
+        let err = search_impl(&settings, None, "rust".to_string(), None).await.unwrap_err();
+        assert!(err.contains("API key"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn search_impl_rejects_searxng_without_a_base_url() {
+        let settings = WebSettings { search_provider: SearchProvider::Searxng, ..WebSettings::default() };
+        let err = search_impl(&settings, None, "rust".to_string(), None).await.unwrap_err();
+        assert!(err.contains("base URL"), "unexpected error: {err}");
     }
 }
