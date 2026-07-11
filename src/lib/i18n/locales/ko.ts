@@ -121,6 +121,8 @@ export const ko: Record<string, string> = {
   "ModeSelector.modeManualDescription": "모든 파일 편집이나 명령 실행 전에 확인 요청",
   "ModeSelector.modeAcceptEditsLabel": "편집 자동 승인",
   "ModeSelector.modeAcceptEditsDescription": "파일 편집은 자동으로 승인하지만 명령 실행 전에는 확인 요청",
+  "ModeSelector.modeSmartLabel": "스마트",
+  "ModeSelector.modeSmartDescription": "위험도가 낮은 파일 편집은 자동으로 승인하고, 나머지는 모두 확인 요청",
   "ModeSelector.modePlanLabel": "계획",
   "ModeSelector.modePlanDescription": "읽기 전용 - 변경 사항을 직접 적용하는 대신 설명만 제공",
   "ModeSelector.modeAutoLabel": "자동",

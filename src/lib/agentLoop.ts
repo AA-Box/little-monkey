@@ -1189,7 +1189,11 @@ async function runAgentTurnBody(
   // callback as a parameter instead of importing `attemptStream` itself).
   const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
   const riskAnnotation: RiskAnnotationContext = {
-    enabled: settings.riskAnnotationsEnabled,
+    // "smart" mode (Phase 3) needs a classification for every mutating call
+    // to decide whether it can auto-approve — so classification runs
+    // whenever the user opted into the advisory badges OR is in "smart"
+    // mode, even if they never flipped the AutomationPanel toggle on.
+    enabled: settings.riskAnnotationsEnabled || mode === 'smart',
     cache: new Map<string, RiskClassification | null>(),
     classify: (toolName, toolArgs) =>
       classifyToolCall(

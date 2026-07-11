@@ -285,7 +285,7 @@ describe("toolsForMode", () => {
   });
 
   it("returns the tool list unchanged (same reference) in every other mode", () => {
-    for (const mode of ["manual", "acceptEdits", "auto", "bypass"] as const) {
+    for (const mode of ["manual", "acceptEdits", "smart", "auto", "bypass"] as const) {
       expect(toolsForMode(base, mode)).toBe(base);
     }
   });

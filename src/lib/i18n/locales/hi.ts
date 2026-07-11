@@ -121,6 +121,8 @@ export const hi: Record<string, string> = {
   "ModeSelector.modeManualDescription": "हर फ़ाइल संपादन या कमांड से पहले पूछें",
   "ModeSelector.modeAcceptEditsLabel": "संपादन स्वीकार करें",
   "ModeSelector.modeAcceptEditsDescription": "फ़ाइल संपादनों को स्वतः स्वीकृत करें, कमांड चलाने से पहले फिर भी पूछें",
+  "ModeSelector.modeSmartLabel": "स्मार्ट",
+  "ModeSelector.modeSmartDescription": "कम जोखिम वाले फ़ाइल संपादनों को स्वतः स्वीकृत करता है, बाकी सब के लिए पूछता है",
   "ModeSelector.modePlanLabel": "योजना",
   "ModeSelector.modePlanDescription": "केवल पढ़ने योग्य - बदलाव करने के बजाय उन्हें बताएं",
   "ModeSelector.modeAutoLabel": "ऑटो",

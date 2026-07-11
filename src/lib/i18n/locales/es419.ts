@@ -121,6 +121,8 @@ export const es419: Record<string, string> = {
   "ModeSelector.modeManualDescription": "Preguntar antes de cada edición de archivo o comando",
   "ModeSelector.modeAcceptEditsLabel": "Aceptar ediciones",
   "ModeSelector.modeAcceptEditsDescription": "Aprueba automáticamente las ediciones de archivos, pero sigue preguntando antes de ejecutar comandos",
+  "ModeSelector.modeSmartLabel": "Inteligente",
+  "ModeSelector.modeSmartDescription": "Aprueba automáticamente las ediciones de archivos de bajo riesgo; todo lo demás pide confirmación",
   "ModeSelector.modePlanLabel": "Plan",
   "ModeSelector.modePlanDescription": "Solo lectura: describe los cambios en lugar de aplicarlos",
   "ModeSelector.modeAutoLabel": "Automático",

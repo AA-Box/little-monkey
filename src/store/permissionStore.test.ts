@@ -28,11 +28,21 @@ describe("permissionStore.lastActMode", () => {
     expect(fresh.usePermissionStore.getState().lastActMode).toBe("acceptEdits");
   });
 
-  it("setLastActMode accepts manual/acceptEdits/auto", () => {
-    for (const mode of ["manual", "acceptEdits", "auto"] as const) {
+  it("setLastActMode accepts manual/acceptEdits/smart/auto", () => {
+    for (const mode of ["manual", "acceptEdits", "smart", "auto"] as const) {
       usePermissionStore.getState().setLastActMode(mode);
       expect(usePermissionStore.getState().lastActMode).toBe(mode);
     }
+  });
+
+  it("setLastActMode accepts smart — it is a legitimate act mode, unlike plan/bypass", () => {
+    // Phase 3: "smart" must behave exactly like "manual"/"acceptEdits"/"auto"
+    // here — it still enforces every prompt except pre-vetted low-risk file
+    // edits, so PlanCard's "Approve & start acting" may legitimately switch
+    // into it and it must be recordable as lastActMode.
+    usePermissionStore.getState().setLastActMode("manual");
+    usePermissionStore.getState().setLastActMode("smart");
+    expect(usePermissionStore.getState().lastActMode).toBe("smart");
   });
 
   it("setLastActMode is a no-op for plan — lastActMode never becomes 'plan'", () => {

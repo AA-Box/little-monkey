@@ -121,6 +121,8 @@ export const ja: Record<string, string> = {
   "ModeSelector.modeManualDescription": "ファイルの編集やコマンドの実行前に毎回確認する",
   "ModeSelector.modeAcceptEditsLabel": "編集を承認",
   "ModeSelector.modeAcceptEditsDescription": "ファイルの編集は自動承認し、コマンドの実行前には引き続き確認する",
+  "ModeSelector.modeSmartLabel": "スマート",
+  "ModeSelector.modeSmartDescription": "低リスクなファイル編集は自動承認し、それ以外はすべて確認します",
   "ModeSelector.modePlanLabel": "プラン",
   "ModeSelector.modePlanDescription": "読み取り専用 - 変更を実行せず、内容を説明します",
   "ModeSelector.modeAutoLabel": "自動",

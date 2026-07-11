@@ -121,6 +121,8 @@ export const it: Record<string, string> = {
   "ModeSelector.modeManualDescription": "Chiedi conferma prima di ogni modifica ai file o comando",
   "ModeSelector.modeAcceptEditsLabel": "Accetta modifiche",
   "ModeSelector.modeAcceptEditsDescription": "Approva automaticamente le modifiche ai file, ma chiede conferma prima di eseguire i comandi",
+  "ModeSelector.modeSmartLabel": "Intelligente",
+  "ModeSelector.modeSmartDescription": "Approva automaticamente le modifiche a basso rischio, tutto il resto chiede conferma",
   "ModeSelector.modePlanLabel": "Pianifica",
   "ModeSelector.modePlanDescription": "Sola lettura - descrive le modifiche invece di applicarle",
   "ModeSelector.modeAutoLabel": "Automatico",
