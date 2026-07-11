@@ -80,6 +80,16 @@ url = "2"
 # no need for the `serde` cargo feature since results are re-serialized into
 # our own `SearchResult` struct.
 scraper = "0.27"
+# web.rs: Mozilla-readability-style article extraction, run on HTML pages
+# before htmd conversion (tool_web_fetch, phase 5 polish — see
+# `extract_readable_content`). The design doc named ~0.6 (dated 2026-07-10);
+# 0.18.0 is current on crates.io as of implementation time — a much larger
+# jump than htmd/scraper's own doc-vs-actual deltas, but the API surface used
+# here (`Readability::new(html, document_url, config) -> Result<Self, _>`,
+# `.parse() -> Result<Article, _>`, `Article::{title, content, length}`)
+# matches the design doc's description; verified against docs.rs at
+# implementation time rather than assumed from the stale version number.
+dom_smoothie = "0.18.0"
 
 [dev-dependencies]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the

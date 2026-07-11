@@ -444,17 +444,75 @@ fn char_window(content: &str, start_index: usize, max_chars: usize) -> (String, 
     (windowed, total, truncated)
 }
 
+/// Minimum `Article::length` (characters of extracted text content) `dom_smoothie`
+/// must produce before its output is trusted over the raw page — below this,
+/// a page is more likely something Readability's heuristics simply don't fit
+/// (a docs page, a short reference article, a listing page) than a "real"
+/// article whose boilerplate was successfully stripped, so falling back to
+/// full-page conversion is the safer default. Chosen well below a typical
+/// short article's length (a few hundred words) rather than tuned tightly,
+/// since a false-fallback (using the full page when readability *would* have
+/// worked) only costs some extra boilerplate in the Markdown, while a
+/// false-positive (trusting a near-empty extraction) could silently drop the
+/// entire page the model asked to read.
+const MIN_READABLE_CONTENT_CHARS: usize = 200;
+
+/// Attempts `dom_smoothie::Readability` article extraction on `body` before
+/// falling back to the raw page — see the module doc's phase-5 note. Returns
+/// `(title, html_to_convert)`: on a successful, non-trivial extraction this is
+/// the article's own title and its cleaned inner HTML (nav/ads/footer/sidebar
+/// stripped); otherwise it's `extract_title(body)` and `body` itself unchanged,
+/// so callers don't need their own fallback branch.
+///
+/// `document_url` is threaded through as `Readability::new`'s `document_url`
+/// so Readability can resolve any relative links/images inside the article
+/// content against the actual page URL rather than treating them as
+/// document-relative to nothing — passed as `Some` only when `url` parses,
+/// since a malformed URL should degrade to "no base" rather than fail the
+/// whole extraction.
+///
+/// Never itself an error: any `Readability::new`/`parse` failure (malformed
+/// HTML tendril, no discernible article, etc.) is swallowed and treated the
+/// same as "extraction wasn't useful here" — `dispatch_content`'s HTML branch
+/// must still succeed via the raw-page fallback so a page Readability doesn't
+/// like isn't worse off than before this feature existed.
+fn extract_readable_content(body: &str, url: &str) -> (Option<String>, String) {
+    let fallback = || (extract_title(body), body.to_string());
+
+    let document_url = Url::parse(url).ok().map(|_| url);
+    let mut readability = match dom_smoothie::Readability::new(body, document_url, None) {
+        Ok(r) => r,
+        Err(_) => return fallback(),
+    };
+    let article = match readability.parse() {
+        Ok(a) => a,
+        Err(_) => return fallback(),
+    };
+
+    if article.length < MIN_READABLE_CONTENT_CHARS {
+        return fallback();
+    }
+
+    let title = if article.title.trim().is_empty() { extract_title(body) } else { Some(article.title) };
+    (title, article.content.to_string())
+}
+
 /// Content-Types `web_fetch` knows how to turn into text. Anything else
 /// (images, binaries, video, ...) is rejected with an error naming the type
 /// rather than silently returned as garbage.
-fn dispatch_content(content_type: &str, body: &str) -> Result<(Option<String>, String), String> {
+///
+/// `url` is the page's (final, post-redirect) URL — only used for the HTML
+/// branch's readability extraction (see [`extract_readable_content`]), not
+/// otherwise part of content dispatch.
+fn dispatch_content(content_type: &str, body: &str, url: &str) -> Result<(Option<String>, String), String> {
     // Strip any `; charset=...` parameter before matching.
     let base = content_type.split(';').next().unwrap_or(content_type).trim().to_ascii_lowercase();
 
     match base.as_str() {
         "text/html" => {
-            let title = extract_title(body);
-            let markdown = htmd::convert(body).map_err(|e| format!("Failed to convert HTML to Markdown: {}", e))?;
+            let (title, html_for_conversion) = extract_readable_content(body, url);
+            let markdown =
+                htmd::convert(&html_for_conversion).map_err(|e| format!("Failed to convert HTML to Markdown: {}", e))?;
             Ok((title, markdown))
         }
         "text/plain" | "text/markdown" | "application/json" | "application/xml" | "text/xml" => Ok((None, body.to_string())),
@@ -542,7 +600,7 @@ pub async fn fetch_impl(
     }
 
     let body = String::from_utf8_lossy(&bytes).into_owned();
-    let (title, full_content) = dispatch_content(&content_type, &body)?;
+    let (title, full_content) = dispatch_content(&content_type, &body, &final_url)?;
     let (markdown, total_chars, truncated) = char_window(&full_content, start_index, max_chars);
 
     Ok(FetchResult {
@@ -1098,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn html_is_converted_to_markdown_with_title_extracted() {
         let html = "<html><head><title>Hello World</title></head><body><h1>Heading</h1><p>Some text.</p></body></html>";
-        let (title, markdown) = dispatch_content("text/html; charset=utf-8", html).unwrap();
+        let (title, markdown) = dispatch_content("text/html; charset=utf-8", html, "https://example.com/").unwrap();
         assert_eq!(title.as_deref(), Some("Hello World"));
         assert!(markdown.contains("Heading"));
         assert!(markdown.contains("Some text."));
@@ -1107,7 +1165,7 @@ mod tests {
     #[tokio::test]
     async fn plain_text_content_types_pass_through_unchanged() {
         for ct in ["text/plain", "text/markdown", "application/json", "application/xml"] {
-            let (title, content) = dispatch_content(ct, "raw content").unwrap();
+            let (title, content) = dispatch_content(ct, "raw content", "https://example.com/").unwrap();
             assert!(title.is_none());
             assert_eq!(content, "raw content");
         }
@@ -1115,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_content_type_is_rejected_by_name() {
-        let err = dispatch_content("image/png", "binary").unwrap_err();
+        let err = dispatch_content("image/png", "binary", "https://example.com/").unwrap_err();
         assert!(err.contains("image/png"), "unexpected error: {err}");
     }
 
@@ -1514,5 +1572,203 @@ mod tests {
         let settings = WebSettings { search_provider: SearchProvider::Searxng, ..WebSettings::default() };
         let err = search_impl(&settings, None, "rust".to_string(), None).await.unwrap_err();
         assert!(err.contains("base URL"), "unexpected error: {err}");
+    }
+
+    // --- phase 5: readability, pagination end-to-end, cancellation wiring ---
+
+    /// A trimmed but structurally realistic news-article page: nav with a
+    /// "Subscribe Now" link, a header ad slot, the actual article (multiple
+    /// substantive paragraphs, comfortably over [`MIN_READABLE_CONTENT_CHARS`]),
+    /// a footer, and a "Trending" sidebar of unrelated headlines — exactly the
+    /// boilerplate-vs-content shape `dom_smoothie::Readability` exists to
+    /// separate.
+    const ARTICLE_FIXTURE_HTML: &str = r#"
+        <html>
+        <head><title>Local News Site</title></head>
+        <body>
+        <nav><ul><li><a href="/">Home</a></li><li><a href="/about">About</a></li><li><a href="/subscribe">Subscribe Now</a></li></ul></nav>
+        <header><div class="logo">Daily Gazette</div><div class="ad">Advertisement: Buy Now and Save!</div></header>
+        <article>
+        <h1>Scientists Discover New Method For Sorting Data Efficiently</h1>
+        <p>Researchers at a university announced today a novel sorting algorithm that outperforms existing methods on large datasets by a significant margin, according to a paper published this week in a peer-reviewed journal.</p>
+        <p>The team, led by several computer scientists, spent three years developing and testing the approach across a wide variety of real-world workloads, finding consistent improvements in both raw speed and peak memory usage compared to the previous state of the art.</p>
+        <p>Industry experts who reviewed the work have praised it, noting that such efficiency gains could meaningfully reduce computing costs for companies that process enormous volumes of data on a daily basis, from search engines to financial institutions.</p>
+        <p>The researchers plan to release their implementation as open source software within the next few months, along with a detailed technical report describing the algorithm's design and the benchmarks used to evaluate it.</p>
+        </article>
+        <footer><p>Copyright 2026 Daily Gazette. All rights reserved. <a href="/privacy">Privacy Policy</a></p></footer>
+        <div class="sidebar"><h3>Trending</h3><ul><li><a href="/story1">Local team wins championship game</a></li><li><a href="/story2">City council approves new budget</a></li></ul></div>
+        </body>
+        </html>
+    "#;
+
+    #[test]
+    fn extract_readable_content_strips_boilerplate_from_an_article_shaped_page() {
+        let (title, html) = extract_readable_content(ARTICLE_FIXTURE_HTML, "https://example.com/article");
+
+        // Readability reports the page's own `<title>` here (not the `<h1>`) —
+        // this fixture's title happens to equal the site name, so the useful
+        // assertion is on the stripped *content*, not the title text.
+        assert!(title.is_some());
+        assert!(html.contains("novel sorting algorithm"), "article body missing from extracted content: {html}");
+        assert!(html.contains("open source software"), "article body missing from extracted content: {html}");
+        assert!(!html.contains("Subscribe Now"), "nav boilerplate leaked into extracted content: {html}");
+        assert!(!html.contains("Trending"), "sidebar boilerplate leaked into extracted content: {html}");
+        assert!(!html.contains("Buy Now and Save"), "header ad boilerplate leaked into extracted content: {html}");
+    }
+
+    #[test]
+    fn extract_readable_content_falls_back_to_the_raw_page_when_extraction_is_too_short() {
+        // Well under MIN_READABLE_CONTENT_CHARS — Readability may still "succeed"
+        // on a page this small, but the length gate must reject it and fall back
+        // to the untouched body, same as a hard parse failure would.
+        let html = "<html><head><title>Hi</title></head><body><p>Short.</p></body></html>";
+        let (title, content) = extract_readable_content(html, "https://example.com/");
+        assert_eq!(title.as_deref(), Some("Hi"));
+        assert_eq!(content, html);
+    }
+
+    /// Spins up a one-shot local HTTP server that answers with a `Content-Type`
+    /// header (so `dispatch_content`'s type dispatch is exercised for real,
+    /// unlike [`spawn_fixed_response_server`] which never sets one) and the
+    /// given `body`. `body` is owned (not `&'static str`) since the pagination
+    /// test below generates its fixture content at runtime.
+    fn spawn_content_response_server(content_type: &'static str, body: String) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// End-to-end proof that `start_index` pagination actually covers a large
+    /// document without gap or overlap: the same content is fetched in two
+    /// windowed calls (`[0, 3000)` then `[3000, 6000)` against a 5000-char
+    /// fixture) and the two windows, concatenated, must reconstruct the exact
+    /// original content — not just that each window's *length* looks right in
+    /// isolation (the existing `char_window` unit tests already cover that),
+    /// but that the two calls' windows actually line up end-to-end the way a
+    /// model paging through a long fetched page would rely on.
+    #[tokio::test]
+    async fn start_index_pagination_reconstructs_the_full_content_across_two_windowed_fetches() {
+        // Deterministic, non-repeating-in-a-way-that-would-mask-a-bug content:
+        // cycles through the alphabet so a byte transposed between windows
+        // would very likely produce a mismatch rather than accidentally still
+        // matching.
+        let full_content: String = (0..5000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        // The local test server is a 127.0.0.1 loopback target, which the SSRF
+        // guard rejects by default (correctly) — this test is exercising
+        // pagination, not the guard, so it opts in the same way a real user
+        // enabling "allow local network" in Settings would.
+        let settings = WebSettings { allow_local_network: true, ..WebSettings::default() };
+
+        let base_a = spawn_content_response_server("text/plain", full_content.clone());
+        let first = fetch_impl(&settings, format!("{base_a}/"), Some(3000), Some(0))
+            .await
+            .expect("first windowed fetch should succeed");
+        assert_eq!(first.total_chars, 5000);
+        assert!(first.truncated, "a 3000-char window over 5000 chars of content must report truncated");
+        assert_eq!(first.markdown.chars().count(), 3000);
+        assert_eq!(first.markdown, full_content[0..3000]);
+
+        let base_b = spawn_content_response_server("text/plain", full_content.clone());
+        let second = fetch_impl(&settings, format!("{base_b}/"), Some(3000), Some(3000))
+            .await
+            .expect("second windowed fetch should succeed");
+        assert_eq!(second.total_chars, 5000);
+        assert!(!second.truncated, "a window reaching the end of the content must not report truncated");
+        assert_eq!(second.markdown.chars().count(), 2000);
+        assert_eq!(second.markdown, full_content[3000..5000]);
+
+        // The actual continuity guarantee `start_index` pagination exists for:
+        // paging through both windows reconstructs the original byte-for-byte.
+        assert_eq!(format!("{}{}", first.markdown, second.markdown), full_content);
+    }
+
+    /// Spins up a one-shot local HTTP server that accepts the connection but
+    /// deliberately waits `delay` before writing any response — a stand-in for
+    /// a slow/hanging page, used to prove Stop-button cancellation actually
+    /// abandons an in-flight fetch rather than just returning a "cancelled"
+    /// label after quietly waiting for the real response anyway.
+    fn spawn_slow_response_server(delay: Duration, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(delay);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// Drives the *exact* `tokio::select!` shape [`tool_web_fetch`] wraps
+    /// [`fetch_impl`] in (see its body) against a server that would otherwise
+    /// take several seconds to respond, with the cancellation `Notify` firing
+    /// almost immediately — proving the wiring actually drops the in-flight
+    /// request future rather than merely racing a label onto a result that
+    /// still shows up later. This can't drive `tool_web_fetch` itself (it
+    /// needs a live `AppHandle`/`tauri::State` for the permission gate and
+    /// `state.tool_cancel`), so it reconstructs the same `select!` inline —
+    /// which is faithful because `tool_web_fetch`'s cancellation branch is
+    /// nothing more than this `select!` around `fetch_impl`, with the
+    /// `Notify` sourced from `state.tool_cancel` instead of a local one.
+    #[tokio::test]
+    async fn select_cancellation_drops_the_in_flight_fetch_instead_of_waiting_for_it() {
+        let slow_server_delay = Duration::from_secs(3);
+        let base = spawn_slow_response_server(slow_server_delay, "too slow");
+        // Same opt-in as the pagination test above — a 127.0.0.1 test server
+        // is exactly what the SSRF guard exists to block by default.
+        let settings = WebSettings { allow_local_network: true, ..WebSettings::default() };
+
+        let cancel = std::sync::Arc::new(Notify::new());
+        let cancel_signal = cancel.clone();
+        tokio::spawn(async move {
+            // Stand-in for the user pressing Stop shortly after the request
+            // started — well before the slow server would ever respond.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_signal.notify_one();
+        });
+
+        let started = std::time::Instant::now();
+        let outcome: Result<FetchResult, String> = tokio::select! {
+            result = fetch_impl(&settings, format!("{base}/"), None, None) => result,
+            _ = cancel.notified() => Err("Fetch cancelled by the user".to_string()),
+        };
+        let elapsed = started.elapsed();
+
+        let err = outcome.expect_err("a cancelled fetch must surface as an error, not a result");
+        assert!(err.contains("cancelled"), "unexpected error: {err}");
+        assert!(
+            elapsed < slow_server_delay / 2,
+            "expected cancellation to abandon the in-flight fetch immediately, but the select! took {:?} \
+             (close to the server's {:?} artificial delay) as if it had actually waited for the response",
+            elapsed,
+            slow_server_delay
+        );
     }
 }
