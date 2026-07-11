@@ -469,6 +469,7 @@ export const id: Record<string, string> = {
   "ApiServerPanel.status.running": "Berjalan",
   "ApiServerPanel.status.error": "Error",
   "ApiServerPanel.requestsLabel": "{{count}} permintaan telah dilayani",
+  "ApiServerPanel.lastRequestLabel": "Permintaan terakhir: {{time}}",
   "ApiServerPanel.connectionHeading": "Koneksi",
   "ApiServerPanel.portLabel": "Port",
   "ApiServerPanel.portHint": "Berlaku langsung — jika server sedang berjalan, server akan dimulai ulang otomatis untuk menerapkan port baru.",

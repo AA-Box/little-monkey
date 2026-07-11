@@ -275,6 +275,19 @@ enum Cmd {
         /// Checkpoint id to revert; omit for the most recent CLI checkpoint.
         id: Option<String>,
     },
+    /// Run the local OpenAI-compatible API server headlessly (no GUI),
+    /// reusing the exact same routing/proxy core the desktop app's Settings
+    /// > API Server toggle drives (`little_monkey_lib::server`). Reads and
+    /// writes the SAME `api_server.json`/`providers.json` the GUI does — a
+    /// token minted in Settings works here, and vice versa (see the design
+    /// doc's "config drift" risk note). Runs until interrupted (Ctrl+C).
+    ApiServe {
+        /// Port to bind on 127.0.0.1 — defaults to whatever's saved in
+        /// `api_server.json` (1234 if nothing's been configured yet).
+        /// Overriding it here does NOT persist back to the config file.
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 fn resolve_target(cli: &Cli) -> Result<chat::Target, String> {
@@ -631,10 +644,26 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             }
             Err(e) => Err(e),
         },
+        Cmd::ApiServe { port } => run_api_serve(*port).await,
     };
     if let Err(e) = result {
         fail(&e);
     }
+}
+
+/// `lm-cli api-serve`'s setup: resolves `api_server.json` at the same
+/// hardcoded-identifier app-data path every other `_cli.rs` module uses,
+/// reads its saved port (falling back to `--port`, then the file's own
+/// default), and hands off to `little_monkey_lib::server::run_cli_server` —
+/// the one place the actual routing/proxy/accept-loop logic lives, so this
+/// function is pure CLI-args-to-config wiring, nothing more.
+async fn run_api_serve(port_override: Option<u16>) -> Result<(), String> {
+    let data_dir = app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let config_path = data_dir.join("api_server.json");
+    let saved_config = little_monkey_lib::server::load_config_impl(&config_path)?;
+    let port = port_override.unwrap_or(saved_config.port);
+
+    little_monkey_lib::server::run_cli_server(port, config_path, providers_cli::load_custom_providers).await
 }
 
 /// Runs the chat side — a one-shot turn, or the interactive REPL when no

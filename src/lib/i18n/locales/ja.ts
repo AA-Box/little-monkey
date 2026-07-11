@@ -469,6 +469,7 @@ export const ja: Record<string, string> = {
   "ApiServerPanel.status.running": "実行中",
   "ApiServerPanel.status.error": "エラー",
   "ApiServerPanel.requestsLabel": "{{count}} 件のリクエストを処理済み",
+  "ApiServerPanel.lastRequestLabel": "最終リクエスト: {{time}}",
   "ApiServerPanel.connectionHeading": "接続",
   "ApiServerPanel.portLabel": "ポート",
   "ApiServerPanel.portHint": "すぐに適用されます — サーバーが実行中の場合、新しいポートを反映するために自動的に再起動します。",

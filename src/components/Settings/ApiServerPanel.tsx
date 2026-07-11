@@ -212,12 +212,17 @@ export function ApiServerPanel() {
       </div>
 
       {loaded && (
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <StatusPill tone={STATUS_TONES[status.status] ?? "neutral"}>
             {t(`ApiServerPanel.status.${status.status}`)}
           </StatusPill>
           {status.status === "running" && (
             <span className="text-xs text-muted">{t("ApiServerPanel.requestsLabel", { count: status.request_count })}</span>
+          )}
+          {status.status === "running" && status.last_request_at && (
+            <span className="text-xs text-faint">
+              {t("ApiServerPanel.lastRequestLabel", { time: formatDate(status.last_request_at) })}
+            </span>
           )}
         </div>
       )}

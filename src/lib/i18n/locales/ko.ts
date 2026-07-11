@@ -469,6 +469,7 @@ export const ko: Record<string, string> = {
   "ApiServerPanel.status.running": "실행 중",
   "ApiServerPanel.status.error": "오류",
   "ApiServerPanel.requestsLabel": "{{count}}건 요청 처리됨",
+  "ApiServerPanel.lastRequestLabel": "마지막 요청: {{time}}",
   "ApiServerPanel.connectionHeading": "연결",
   "ApiServerPanel.portLabel": "포트",
   "ApiServerPanel.portHint": "즉시 적용됩니다 — 서버가 실행 중이면 새 포트를 적용하기 위해 자동으로 재시작됩니다.",

@@ -469,6 +469,7 @@ export const hi: Record<string, string> = {
   "ApiServerPanel.status.running": "चल रहा है",
   "ApiServerPanel.status.error": "त्रुटि",
   "ApiServerPanel.requestsLabel": "{{count}} अनुरोध पूरे किए गए",
+  "ApiServerPanel.lastRequestLabel": "अंतिम अनुरोध: {{time}}",
   "ApiServerPanel.connectionHeading": "कनेक्शन",
   "ApiServerPanel.portLabel": "पोर्ट",
   "ApiServerPanel.portHint": "तुरंत लागू होता है — यदि सर्वर चल रहा है, तो नया पोर्ट अपनाने के लिए वह अपने आप फिर से शुरू हो जाएगा।",
