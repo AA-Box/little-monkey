@@ -44,6 +44,8 @@ export interface SettingsState {
   webToolsEnabled: boolean;
   /** Whether `runAgentTurnBody` auto-runs the current workspace's enabled verification commands (see `src-tauri/src/verify.rs`) after a turn that wrote files. Default false — running arbitrary configured shell automatically should be opt-in, mirroring `memoryEnabled`'s posture. This slice is report-only: results are appended as `[Verify]` notices, nothing is fed back to the model yet (that's a later slice's `verifyMaxRounds`). */
   verifyEnabled: boolean;
+  /** How many times `runAgentTurnBody` will feed a failed verification command's output back to the model as a fix instruction and let the loop continue, before leaving the failure notice as-is. Range 0-3 (mirrors Aider's `max_reflections=3`); default 1. 0 means report-only — the same behavior as before this setting existed. */
+  verifyMaxRounds: number;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -62,6 +64,7 @@ export interface SettingsState {
   setMemoryEnabled: (value: boolean) => void;
   setWebToolsEnabled: (value: boolean) => void;
   setVerifyEnabled: (value: boolean) => void;
+  setVerifyMaxRounds: (value: number) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -88,6 +91,10 @@ const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
 const DEFAULT_CHECKPOINT_RETENTION = 20;
 export const MIN_CHECKPOINT_RETENTION = 5;
 export const MAX_CHECKPOINT_RETENTION = 100;
+/** Mirrors Aider's `max_reflections=3` — see `verifyMaxRounds`'s doc comment. */
+const DEFAULT_VERIFY_MAX_ROUNDS = 1;
+export const MIN_VERIFY_MAX_ROUNDS = 0;
+export const MAX_VERIFY_MAX_ROUNDS = 3;
 
 interface PersistedShape {
   autoFailoverEnabled: boolean;
@@ -103,6 +110,7 @@ interface PersistedShape {
   memoryEnabled: boolean;
   webToolsEnabled: boolean;
   verifyEnabled: boolean;
+  verifyMaxRounds: number;
 }
 
 function defaults(): PersistedShape {
@@ -120,6 +128,7 @@ function defaults(): PersistedShape {
     memoryEnabled: true,
     webToolsEnabled: true,
     verifyEnabled: false,
+    verifyMaxRounds: DEFAULT_VERIFY_MAX_ROUNDS,
   };
 }
 
@@ -175,6 +184,12 @@ function hydrate(): PersistedShape {
       memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
       webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
       verifyEnabled: typeof parsed.verifyEnabled === "boolean" ? parsed.verifyEnabled : fallback.verifyEnabled,
+      verifyMaxRounds:
+        typeof parsed.verifyMaxRounds === "number" &&
+        parsed.verifyMaxRounds >= MIN_VERIFY_MAX_ROUNDS &&
+        parsed.verifyMaxRounds <= MAX_VERIFY_MAX_ROUNDS
+          ? Math.round(parsed.verifyMaxRounds)
+          : fallback.verifyMaxRounds,
     };
   } catch {
     return fallback;
@@ -297,6 +312,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setVerifyEnabled: (value) => {
     set({ verifyEnabled: value });
+    persist({ ...get() });
+  },
+
+  setVerifyMaxRounds: (value) => {
+    const clamped = Math.min(MAX_VERIFY_MAX_ROUNDS, Math.max(MIN_VERIFY_MAX_ROUNDS, Math.round(value)));
+    set({ verifyMaxRounds: clamped });
     persist({ ...get() });
   },
 }));

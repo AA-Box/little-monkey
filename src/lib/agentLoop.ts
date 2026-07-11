@@ -418,47 +418,81 @@ function buildVerifyOutput(result: VerifyRunResult): string {
   return `… (truncated)\n${combined.slice(combined.length - VERIFY_NOTICE_OUTPUT_CAP)}`;
 }
 
+/** The first failed command from a `runVerificationPhase` pass — enough
+ * detail to build the feed-back-to-the-model fix instruction in
+ * `runAgentTurnBody`. `null` when every command passed (or none ran). */
+export interface VerifyFailure {
+  label: string;
+  code: number | null;
+  output: string;
+}
+
+/**
+ * Whether a verification failure should trigger one more feed-back round of
+ * `runAgentTurnBody`'s tool-calling loop — i.e. whether there's a round left
+ * to spend in `settings.verifyMaxRounds`'s budget (default 1, clamp 0-3; 0
+ * means report-only, the failure notice is left as-is and never fed back).
+ * Extracted out of the loop's exit branch as its own pure function so the
+ * round-exhaustion boundary can be exercised directly by tests without
+ * mocking the entire turn. A `null` failure (every command passed, or
+ * verification didn't run at all — e.g. plan mode, `verifyEnabled` off, no
+ * enabled commands) never triggers a round regardless of the round budget.
+ */
+export function shouldFeedBackVerifyFailure(failure: VerifyFailure | null, verifyRound: number, verifyMaxRounds: number): boolean {
+  return failure !== null && verifyRound < verifyMaxRounds;
+}
+
 /**
  * Runs every enabled verification command configured for the current
  * workspace (see `verify.rs`/`verifyStore.ts`), in order, appending one
- * `[Verify]` notice per command to the transcript. Report-only in this
- * slice: whether a command passes or fails, nothing is fed back to the model
- * — that's a later slice's job (bounded by a `verifyMaxRounds` setting not
- * yet implemented). No-ops (without any IPC calls) unless `verifyEnabled` is
- * on, the active permission mode isn't `'plan'` (belt-and-braces — plan mode
- * already blocks every write, so `mutatedFiles` should already be empty by
- * the time a caller would reach this), and the workspace actually has at
- * least one enabled command configured.
+ * `[Verify]` notice per command to the transcript, and returns the first
+ * command that failed (if any) so `runAgentTurnBody` can decide whether to
+ * feed it back to the model as a fix instruction (bounded by
+ * `settings.verifyMaxRounds`). This function itself stays report-only — it
+ * never appends a fix-instruction message and never loops — the caller owns
+ * all feed-back-round bookkeeping. No-ops (without any IPC calls, returning
+ * `null`) unless `verifyEnabled` is on, the active permission mode isn't
+ * `'plan'` (belt-and-braces — plan mode already blocks every write, so
+ * `mutatedFiles` should already be empty by the time a caller would reach
+ * this), and the workspace actually has at least one enabled command
+ * configured.
  */
-async function runVerificationPhase(turnId: string, addMessage: (msg: ChatMessage) => void): Promise<void> {
-  if (!useSettingsStore.getState().verifyEnabled) return;
-  if (usePermissionStore.getState().mode === 'plan') return;
+export async function runVerificationPhase(turnId: string, addMessage: (msg: ChatMessage) => void): Promise<VerifyFailure | null> {
+  if (!useSettingsStore.getState().verifyEnabled) return null;
+  if (usePermissionStore.getState().mode === 'plan') return null;
 
   let config: VerifyConfig;
   try {
     config = await invoke<VerifyConfig>('verify_get_config', {});
   } catch {
     // No workspace open, or the config file couldn't be read — nothing to run.
-    return;
+    return null;
   }
 
   const enabledCommands = config.commands.filter((c) => c.enabled);
-  if (enabledCommands.length === 0) return;
+  if (enabledCommands.length === 0) return null;
+
+  let firstFailure: VerifyFailure | null = null;
 
   for (const cmd of enabledCommands) {
     try {
       const result = await invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
+      const ok = !result.timedOut && result.code === 0;
+      const output = buildVerifyOutput(result);
       addMessage({
         role: 'system',
         content: formatVerifyNotice({
           label: result.label,
           kind: result.kind,
-          ok: !result.timedOut && result.code === 0,
+          ok,
           code: result.code,
-          output: buildVerifyOutput(result),
+          output,
           durationMs: result.durationMs,
         }),
       });
+      if (!ok && firstFailure === null) {
+        firstFailure = { label: result.label, code: result.code, output };
+      }
     } catch (err) {
       // verify_run itself rejected (e.g. the command was deleted from the
       // config in another window between the check above and this call) —
@@ -476,8 +510,13 @@ async function runVerificationPhase(turnId: string, addMessage: (msg: ChatMessag
           durationMs: 0,
         }),
       });
+      if (firstFailure === null) {
+        firstFailure = { label: cmd.label, code: null, output: message };
+      }
     }
   }
+
+  return firstFailure;
 }
 
 /** Shape returned by the `llama_status` Tauri command. */
@@ -968,6 +1007,15 @@ async function runAgentTurnBody(
   // loop right below via `isSuccessfulMutationResult`/`toolCallPathArg`.
   const mutatedFiles = new Set<string>();
 
+  // How many verification feed-back rounds have been consumed so far this
+  // turn — compared against `settings.verifyMaxRounds` (default 1, clamp
+  // 0-3) at the loop's natural exit below. A round is "consumed" the moment
+  // a failure notice's fix instruction is appended and the loop is sent
+  // around again, regardless of whether that round's edits actually fix
+  // anything — this is what makes `verifyMaxRounds` a hard bound rather than
+  // a "keep trying until it passes" loop.
+  let verifyRound = 0;
+
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     // Stop button fired while a tool call was executing (between model
     // round trips, where there's no stream to abort) — don't start another.
@@ -1066,7 +1114,24 @@ async function runAgentTurnBody(
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
       if (!signal?.aborted && mutatedFiles.size > 0) {
-        await runVerificationPhase(turnId, addMessage);
+        const failure = await runVerificationPhase(turnId, addMessage);
+        // A command failed and there's a feed-back round left to spend —
+        // append one fix instruction and send the loop around again instead
+        // of returning. `mutatedFiles` is cleared so only edits made in
+        // response to *this* failure trigger the next verification pass;
+        // `signal?.aborted` is re-checked since verify_run's own commands
+        // can run long enough for Stop to have fired while they were in
+        // flight (verify_run itself already dies on the turn's cancel
+        // channel — this just stops us from also queuing a fix round).
+        if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
+          verifyRound += 1;
+          mutatedFiles.clear();
+          addMessage({
+            role: 'system',
+            content: `${VERIFY_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+          });
+          continue;
+        }
       }
       return;
     }
