@@ -21,6 +21,10 @@ pub mod workspace;
 // `pub` so `lm-cli` (phase 4) can call `web::fetch_impl` directly, the same
 // AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory` above.
 pub mod web;
+// `pub` so a future `lm-cli` `api-serve` subcommand (design doc phase 4) can
+// call `server::handle_request` directly for headless use, the same
+// AppHandle-free-core reasoning as `web`/`rules`/`memory` above.
+pub mod server;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -98,6 +102,13 @@ pub struct AppState {
     /// `std::sync::Mutex`, not `tokio::sync::Mutex`: the guarded section is
     /// synchronous with no `.await` in between.
     pub web_settings_lock: std::sync::Mutex<()>,
+    /// In-memory lifecycle state for the local OpenAI-compatible API server
+    /// (`server.rs`) — mirrors `llama: Mutex<llama::LlamaState>` above.
+    /// Binds `127.0.0.1` only and exposes just `/health`, `/v1/models`,
+    /// `/v1/chat/completions` — never the agent tools (`tool_run_shell` et
+    /// al. over HTTP would be a remote-code-execution surface, an explicit
+    /// non-goal of this feature — see `server.rs`'s module doc).
+    pub api_server: std::sync::Mutex<server::ApiServerState>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -112,6 +123,9 @@ pub fn run() {
             llama::llama_start,
             llama::llama_stop,
             llama::llama_status,
+            server::api_server_start,
+            server::api_server_stop,
+            server::api_server_status,
             ollama::ollama_status,
             ollama::ollama_start,
             ollama::ollama_list_models,

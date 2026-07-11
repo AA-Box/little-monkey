@@ -313,6 +313,32 @@ pub async fn ollama_list_models() -> Result<Vec<OllamaModelInfo>, String> {
     Ok(models)
 }
 
+/// Lightweight tag-name-only fetch for `server.rs`'s `GET /v1/models`
+/// merging — reuses the same lenient `/api/tags` parse as
+/// [`ollama_list_models`] but deliberately skips the per-model `/api/show`
+/// capability probes that function does: those are the slow part (the
+/// design doc's "Ollama model listing latency" risk note), and an API
+/// client listing servable model ids has no use for the tool-calling/vision
+/// UI hints those probes exist for.
+pub async fn list_tag_names(client: &reqwest::Client) -> Result<Vec<String>, String> {
+    let resp = client
+        .get(format!("{OLLAMA_BASE_URL}/api/tags"))
+        .send()
+        .await
+        .map_err(|_| "Ollama isn't running — start it first".to_string())?;
+
+    if !resp.status().is_success() {
+        return Err("Ollama isn't running — start it first".to_string());
+    }
+
+    let parsed: RawTagsResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Ollama's model list: {e}"))?;
+
+    Ok(parsed.models.into_iter().filter_map(|entry| entry.name.or(entry.model)).collect())
+}
+
 /// Returns the built-in list of example cloud model tags, so the frontend
 /// carries zero hardcoded tag strings of its own.
 #[tauri::command]
