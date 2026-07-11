@@ -649,14 +649,16 @@ async function executeToolCall(
   if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
     args.checkpoint_id = checkpointId;
   }
-  // The turn id scopes permission prompts and shell cancellation to THIS
-  // turn — Stop in one pane must not kill the other pane's command or deny
-  // its prompt. Injected like checkpoint_id (never model-supplied). All four
-  // commands use `rename_all = "snake_case"`, so all take the snake_case key.
-  // `remember` doesn't take a checkpoint_id (see tool_remember's doc comment
-  // in tools.rs — there's no workspace file for a checkpoint to snapshot),
-  // but it's still permission-gated and needs the turn id for that prompt.
-  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell' || name === 'remember') {
+  // The turn id scopes permission prompts and shell/fetch cancellation to
+  // THIS turn — Stop in one pane must not kill the other pane's command (or
+  // in-flight fetch) or deny its prompt. Injected like checkpoint_id (never
+  // model-supplied). All five commands use `rename_all = "snake_case"`, so
+  // all take the snake_case key. `remember`/`web_fetch` don't take a
+  // checkpoint_id (see tool_remember's/tool_web_fetch's doc comments in
+  // tools.rs/web.rs — neither snapshots a workspace file), but both are still
+  // permission-gated and need the turn id for that prompt (and, for
+  // web_fetch, for Stop-button cancellation of the in-flight request).
+  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell' || name === 'remember' || name === 'web_fetch') {
     args.turn_id = turnId;
   }
 

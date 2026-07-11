@@ -57,6 +57,15 @@ schemars = "1"
 # doesn't re-export it. Version-matched to the copy already in Cargo.lock via
 # rmcp's own dependency so only one copy resolves.
 tokio-util = "0.7"
+# web.rs: HTML->Markdown conversion for tool_web_fetch (turndown.js-style,
+# html5ever-based). The design doc named ~0.2; 0.5 is current on crates.io as
+# of implementation time — API used here (the free `convert` fn) is stable
+# across that range.
+htmd = "0.5"
+# web.rs: explicit dependency (was already a transitive reqwest dep) so
+# `validate_fetch_url`'s SSRF guard can parse/inspect the URL's host without
+# relying on reqwest's internals.
+url = "2"
 
 [dev-dependencies]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the

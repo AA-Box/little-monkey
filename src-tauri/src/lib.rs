@@ -18,6 +18,9 @@ mod permissions;
 pub mod rules;
 pub mod memory;
 pub mod workspace;
+// `pub` so `lm-cli` (phase 4) can call `web::fetch_impl` directly, the same
+// AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory` above.
+pub mod web;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -134,6 +137,7 @@ pub fn run() {
             tools::tools_cancel_running,
             tools::list_workspace_paths,
             tools::tool_remember,
+            web::tool_web_fetch,
             rules::rules_read,
             rules::rules_write,
             memory::memory_list,
