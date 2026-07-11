@@ -10,6 +10,7 @@ import {
   isMemoryNotice,
   isSuccessfulMutationResult,
   isToolCallAllowed,
+  isVerifyFixNotice,
   isVerifyNotice,
   parseMemoryNotice,
   parseVerifyNotice,
@@ -17,6 +18,7 @@ import {
   shouldFeedBackVerifyFailure,
   toolCallPathArg,
   toolsForSettings,
+  VERIFY_FIX_NOTE_PREFIX,
   type CheckpointChainLink,
   type MemoryNotice,
   type VerifyFailure,
@@ -378,6 +380,108 @@ describe("runVerificationPhase", () => {
     await runVerificationPhase("session-1", "turn-1", vi.fn());
 
     expect(selectRunningVerifyLabel("session-1")(useSessionStore.getState())).toBeNull();
+  });
+
+  it("returns null without any IPC calls when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const addMessage = vi.fn();
+
+    const failure = await runVerificationPhase("session-1", "turn-1", addMessage, controller.signal);
+
+    expect(failure).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(addMessage).not.toHaveBeenCalled();
+  });
+
+  it("cancels the in-flight command via tools_cancel_running and stops the phase when Stop fires mid-command", async () => {
+    const controller = new AbortController();
+    invokeMock.mockResolvedValueOnce({
+      commands: [
+        { id: "cmd-1", label: "Lint", command: "pnpm lint", kind: "lint", enabled: true },
+        { id: "cmd-2", label: "Tests", command: "pnpm test", kind: "test", enabled: true },
+      ],
+    }); // verify_get_config
+    let resolveVerifyRun: (value: unknown) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveVerifyRun = resolve;
+        })
+    ); // verify_run for cmd-1 — deliberately left pending until after abort
+    invokeMock.mockResolvedValueOnce(undefined); // tools_cancel_running
+
+    const addMessage = vi.fn();
+    const phasePromise = runVerificationPhase("session-1", "turn-1", addMessage, controller.signal);
+
+    // Let the phase reach and start awaiting the (still-pending) verify_run
+    // call before firing Stop, mirroring the user clicking Stop while a
+    // command is genuinely running.
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort();
+
+    const failure = await phasePromise;
+
+    expect(failure).toBeNull();
+    expect(addMessage).not.toHaveBeenCalled();
+    // config + verify_run(cmd-1) + tools_cancel_running — cmd-2 must never
+    // start once Stop fired mid-cmd-1.
+    expect(invokeMock).toHaveBeenCalledTimes(3);
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "tools_cancel_running", { turnId: "turn-1" });
+
+    // Let the abandoned invocation settle so it can't outlive the test.
+    resolveVerifyRun({});
+  });
+
+  it("doesn't start a second configured command once Stop fires after the first one already finished", async () => {
+    const controller = new AbortController();
+    invokeMock.mockResolvedValueOnce({
+      commands: [
+        { id: "cmd-1", label: "Lint", command: "pnpm lint", kind: "lint", enabled: true },
+        { id: "cmd-2", label: "Tests", command: "pnpm test", kind: "test", enabled: true },
+      ],
+    }); // verify_get_config
+    invokeMock.mockImplementationOnce(async () => {
+      // Stop fires while cmd-1 is nominally "in flight" but resolves
+      // normally anyway (e.g. it finished just as the user clicked Stop).
+      controller.abort();
+      return {
+        commandId: "cmd-1",
+        label: "Lint",
+        kind: "lint",
+        code: 0,
+        stdout: "ok",
+        stderr: "",
+        durationMs: 5,
+        timedOut: false,
+      };
+    }); // verify_run for cmd-1
+
+    const addMessage = vi.fn();
+    const failure = await runVerificationPhase("session-1", "turn-1", addMessage, controller.signal);
+
+    expect(failure).toBeNull();
+    expect(addMessage).toHaveBeenCalledTimes(1); // cmd-1's passing notice only
+    expect(invokeMock).toHaveBeenCalledTimes(2); // config + verify_run(cmd-1) — cmd-2 never runs
+  });
+});
+
+describe("VERIFY_FIX_NOTE_PREFIX / isVerifyFixNotice", () => {
+  it("is recognized by isVerifyFixNotice but never by isVerifyNotice, so MessageList never tries to JSON-parse it", () => {
+    // This is deliberately plain prose, not a VerifyNotice JSON payload —
+    // reusing VERIFY_NOTE_PREFIX for this message used to make
+    // isVerifyNotice match, parseVerifyNotice fail, and MessageList drop it
+    // from the timeline entirely (see the doc comment on
+    // VERIFY_FIX_NOTE_PREFIX).
+    const message: ChatMessage = {
+      role: "system",
+      content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "Tests" failed (exit 1). Fix the reported problems, then stop.\n1 failing`,
+    };
+
+    expect(isVerifyFixNotice(message)).toBe(true);
+    expect(isVerifyNotice(message)).toBe(false);
+    expect(parseVerifyNotice(message)).toBeNull();
   });
 });
 

@@ -51,8 +51,12 @@ export function stringifyToolError(err: unknown): string {
  * several providers reject such a history outright on the next turn. */
 export const CANCELLED_TOOL_RESULT = JSON.stringify({ error: 'Cancelled by the user' });
 
-/** Resolves when `signal` aborts (never resolves for an undefined signal). */
-function abortedPromise(signal: AbortSignal): Promise<void> {
+/** Resolves when `signal` aborts (never resolves for an undefined signal).
+ * Exported so other callers that race a Tauri `invoke` against Stop —
+ * currently just `runVerificationPhase` in `agentLoop.ts` — can reuse the
+ * exact same race/cancel shape `executeToolCall` uses below instead of
+ * hand-rolling their own. */
+export function abortedPromise(signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) {
       resolve();

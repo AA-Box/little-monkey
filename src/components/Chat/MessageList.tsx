@@ -31,6 +31,7 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isSwitchNotice,
+  isVerifyFixNotice,
   isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
@@ -162,7 +163,7 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         }
         return;
       }
-      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg)) {
+      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg) || isVerifyFixNotice(msg)) {
         items.push({ kind: "notice", key: `notice-${index}`, text: textContent(msg.content) });
       }
     }
