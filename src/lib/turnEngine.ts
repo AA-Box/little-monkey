@@ -51,6 +51,23 @@ export function stringifyToolError(err: unknown): string {
  * several providers reject such a history outright on the next turn. */
 export const CANCELLED_TOOL_RESULT = JSON.stringify({ error: 'Cancelled by the user' });
 
+/**
+ * The tool-message content returned for a `present_plan` call — see
+ * `tools.ts`'s `PRESENT_PLAN_TOOL` doc comment for why this tool has no
+ * `tool_present_plan` Rust command. Deliberately a fixed literal, not
+ * anything derived from the model's own arguments: the result content only
+ * needs to end the model's turn cleanly, not carry data back to it — the
+ * plan's actual title/body/open-questions are surfaced to the *user* as a
+ * `PlanNotice` transcript notice, appended by `agentLoop.ts`'s tool-calling
+ * loop from this same call's arguments (this function only returns the tool
+ * result string; the transcript side effect lives one layer up, same split
+ * responsibility as the `remember` tool's result vs. its `MemoryNotice`).
+ */
+export const PRESENT_PLAN_RESULT = JSON.stringify({
+  status: 'plan_presented',
+  note: 'Wait for the user to approve before doing anything else.',
+});
+
 /** Resolves when `signal` aborts (never resolves for an undefined signal).
  * Exported so other callers that race a Tauri `invoke` against Stop —
  * currently just `runVerificationPhase` in `agentLoop.ts` — can reuse the
@@ -172,6 +189,15 @@ export async function executeToolCall(
     name === 'web_search'
   ) {
     args.turn_id = turnId;
+  }
+
+  // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
+  // doc comment): it never reaches Rust at all, checked BEFORE the
+  // mcp__/tool_<name> dispatch below so this holds regardless of what future
+  // caller invokes `executeToolCall` for it, not just today's single call
+  // site in `agentLoop.ts`.
+  if (name === 'present_plan') {
+    return PRESENT_PLAN_RESULT;
   }
 
   const invocation = name.startsWith('mcp__')

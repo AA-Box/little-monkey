@@ -25,7 +25,7 @@ export interface MessageBubbleProps {
  * below — these overrides only adjust behavior (external links open in a new
  * tab) rather than appearance.
  */
-const markdownComponents: Components = {
+export const markdownComponents: Components = {
   a: ({ children, href }) => (
     <a href={href} target="_blank" rel="noreferrer">
       {children}
@@ -33,7 +33,10 @@ const markdownComponents: Components = {
   ),
 };
 
-const PROSE_CLASSES =
+// Exported so `PlanCard.tsx` can render a plan's Markdown body with the exact
+// same typography as an assistant message — see this app's Plan/Act design
+// doc's explicit instruction to match `MessageBubble`'s prose classes.
+export const PROSE_CLASSES =
   "prose prose-sm max-w-none prose-headings:font-sans prose-p:text-foreground prose-headings:text-foreground prose-strong:text-foreground prose-code:font-mono prose-code:text-foreground prose-code:before:content-none prose-code:after:content-none prose-pre:bg-surface-2 prose-pre:border prose-pre:border-border prose-pre:rounded-lg prose-a:text-accent prose-blockquote:border-l-border prose-blockquote:text-muted";
 
 function UserBubble({

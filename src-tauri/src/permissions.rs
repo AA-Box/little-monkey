@@ -85,7 +85,7 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
     match mode {
         "bypass" => Some(Ok(())),
         "plan" => Some(Err(format!(
-            "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - ask the user to switch out of Plan Mode before making changes."
+            "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - call the present_plan tool with your proposed plan, then ask the user to approve it and switch out of Plan Mode before making changes."
         ))),
         "acceptEdits" | "auto" => {
             if tool == "write_file" || tool == "edit_file" || tool == "remember" {

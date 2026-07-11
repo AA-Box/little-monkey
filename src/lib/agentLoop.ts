@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { TOOLS } from './tools';
+import { TOOLS, PRESENT_PLAN_TOOL } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -35,6 +35,7 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
 } from './turnEngine';
@@ -52,7 +53,7 @@ import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
-import { usePermissionStore } from '../store/permissionStore';
+import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 import type { VerifyConfig } from '../store/verifyStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
@@ -199,6 +200,102 @@ export function parseCheckpointNotice(message: ChatMessage): CheckpointNotice | 
  * the notice is first added and when the Revert button marks it reverted. */
 export function formatCheckpointNotice(notice: CheckpointNotice): string {
   return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/** Prefix identifying a synthetic notice inserted after a `present_plan` tool
+ * call (Plan Mode only — see `toolsForMode`) — cloned from the
+ * `CHECKPOINT_NOTE_PREFIX` pattern above. The rest of the content is a JSON
+ * payload (see `PlanNotice`), so `MessageList` can render a `PlanCard` with
+ * "Approve & start acting" / "Keep planning" buttons for it. */
+export const PLAN_NOTE_PREFIX = '[Plan]';
+
+/** Payload embedded in a plan notice message. */
+export interface PlanNotice {
+  id: string;
+  title: string;
+  /** The plan body, as Markdown — rendered by `PlanCard` with the same
+   * `prose` classes `MessageBubble` uses for assistant messages. */
+  plan: string;
+  openQuestions?: string[];
+  /** `'proposed'` until the user acts on the card; `'approved'` after
+   * "Approve & start acting", `'dismissed'` after "Keep planning". Both
+   * terminal states rewrite the notice in place (`updateMessageAt`), same
+   * pattern as `CheckpointNotice.reverted`/`MemoryNotice.forgotten`. */
+  status: 'proposed' | 'approved' | 'dismissed';
+}
+
+export function isPlanNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PLAN_NOTE_PREFIX);
+}
+
+/** Parses a plan notice's JSON payload; `null` for anything malformed. */
+export function parsePlanNotice(message: ChatMessage): PlanNotice | null {
+  if (!isPlanNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(PLAN_NOTE_PREFIX.length));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as PlanNotice).id === 'string' &&
+      typeof (parsed as PlanNotice).title === 'string' &&
+      typeof (parsed as PlanNotice).plan === 'string' &&
+      typeof (parsed as PlanNotice).status === 'string'
+    ) {
+      return parsed as PlanNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a plan notice".
+  }
+  return null;
+}
+
+/** Serializes a plan notice back into message content — used both when the
+ * notice is first added and when Approve/Keep planning rewrite its status. */
+export function formatPlanNotice(notice: PlanNotice): string {
+  return `${PLAN_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/**
+ * Extracts a `present_plan` tool call's arguments into the fields a
+ * `PlanNotice` needs (everything except `id`/`status`, which the caller
+ * fills in). Never throws: malformed arguments JSON, or a missing
+ * `title`/`plan` string, both degrade to `null` rather than throwing — same
+ * "no path known" degradation `toolCallPathArg` uses for write/edit calls.
+ * `open_questions` (the model's snake_case argument, matching the tool's
+ * declared schema in `tools.ts`) is filtered down to just its string
+ * entries and dropped entirely if empty or absent.
+ */
+export function toolCallPlanArgs(toolCall: ToolCall): { title: string; plan: string; openQuestions?: string[] } | null {
+  try {
+    const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+    const title = (parsed as { title?: unknown } | null)?.title;
+    const plan = (parsed as { plan?: unknown } | null)?.plan;
+    if (typeof title !== 'string' || typeof plan !== 'string') return null;
+    const rawQuestions = (parsed as { open_questions?: unknown } | null)?.open_questions;
+    const openQuestions = Array.isArray(rawQuestions)
+      ? rawQuestions.filter((q): q is string => typeof q === 'string')
+      : [];
+    return { title, plan, openQuestions: openQuestions.length > 0 ? openQuestions : undefined };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the tool list offered to the model this turn, appending
+ * `PRESENT_PLAN_TOOL` only while `mode === 'plan'` — every other mode gets
+ * `tools` back unchanged. Kept as its own pure function (mirroring
+ * `toolsForSettings` just below) so it can be unit-tested and so the model's
+ * offered tool list stays a single, easy-to-audit place: `present_plan` must
+ * never be offered outside Plan Mode, since it has no purpose (and the
+ * backend hard-blocks every other mutating tool in Plan Mode instead) once
+ * the user has switched out of it. Named `toolsForMode` rather than the
+ * design doc's `toolsForTurn` to avoid shadowing `runAgentTurnBody`'s own
+ * `toolsForTurn` local (the final, fully-assembled per-turn tool list this
+ * function's output feeds into, alongside `toolsForSettings`).
+ */
+export function toolsForMode(tools: ToolDef[], mode: PermissionMode): ToolDef[] {
+  return mode === 'plan' ? [...tools, PRESENT_PLAN_TOOL] : tools;
 }
 
 /** Prefix identifying a synthetic notice inserted right after a successful
@@ -1035,6 +1132,14 @@ async function runAgentTurnBody(
 
   const effort = useModelStore.getState().effort;
 
+  // Read once per turn, like `effort` above — not re-derived on every
+  // tool-calling round trip, so a mode switch mid-turn (possible via the
+  // split pane's shared global mode, or the user clicking Approve on a plan
+  // card mid-turn) never changes what's offered partway through this turn's
+  // own tool-calling loop. See `toolsForMode`'s doc comment for why
+  // `present_plan` is gated on this snapshot.
+  const mode = usePermissionStore.getState().mode;
+
   // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
   // newly remembered facts) before building the system prompt below — two
   // local-file reads per turn is negligible and needs no file watcher.
@@ -1050,7 +1155,11 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
-  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpDefs], settings.memoryEnabled, settings.webToolsEnabled);
+  const toolsForTurn: ToolDef[] = toolsForSettings(
+    toolsForMode([...TOOLS, ...mcpDefs], mode),
+    settings.memoryEnabled,
+    settings.webToolsEnabled
+  );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [
@@ -1260,6 +1369,31 @@ async function runAgentTurnBody(
         if (fact) {
           addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
           await useRulesStore.getState().refresh();
+        }
+      }
+
+      // A successful `present_plan` gets its own transcript notice (rendered
+      // as a `PlanCard` with Approve/Keep-planning buttons — see
+      // `MessageList.tsx`), cloned from the `remember` notice pattern just
+      // above. Gated on `resultContent === PRESENT_PLAN_RESULT` — the exact
+      // literal `executeToolCall`/`turnEngine.ts` returns for this tool and
+      // nothing else — rather than just the tool name, so a cancelled call
+      // (`CANCELLED_TOOL_RESULT`) or a call rejected by `isToolCallAllowed`
+      // above (which `continue`s before reaching here at all) never produces
+      // a plan card for a plan that was never actually presented.
+      if (toolCall.function.name === 'present_plan' && resultContent === PRESENT_PLAN_RESULT) {
+        const planArgs = toolCallPlanArgs(toolCall);
+        if (planArgs) {
+          addMessage({
+            role: 'system',
+            content: formatPlanNotice({
+              id: crypto.randomUUID(),
+              title: planArgs.title,
+              plan: planArgs.plan,
+              openQuestions: planArgs.openQuestions,
+              status: 'proposed',
+            }),
+          });
         }
       }
     }

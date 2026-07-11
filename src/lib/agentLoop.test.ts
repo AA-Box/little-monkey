@@ -6,28 +6,35 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 import {
   checkpointChainBlockReason,
   formatMemoryNotice,
+  formatPlanNotice,
   formatVerifyNotice,
   isMemoryNotice,
+  isPlanNotice,
   isSuccessfulMutationResult,
   isToolCallAllowed,
   isVerifyFixNotice,
   isVerifyNotice,
   parseMemoryNotice,
+  parsePlanNotice,
   parseVerifyNotice,
+  PLAN_NOTE_PREFIX,
   runVerificationPhase,
   shouldFeedBackVerifyFailure,
   toolCallPathArg,
+  toolCallPlanArgs,
+  toolsForMode,
   toolsForSettings,
   VERIFY_FIX_NOTE_PREFIX,
   type CheckpointChainLink,
   type MemoryNotice,
+  type PlanNotice,
   type VerifyFailure,
   type VerifyNotice,
 } from "./agentLoop";
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
-import { selectRunningVerifyLabel, useSessionStore } from "../store/sessionStore";
+import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../store/sessionStore";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -263,6 +270,128 @@ describe("isToolCallAllowed", () => {
 
   it("rejects a hallucinated tool name that was never offered at all", () => {
     expect(isToolCallAllowed(call("delete_everything"), toolsForTurn)).toBe(false);
+  });
+});
+
+describe("toolsForMode", () => {
+  function toolDef(name: string): ToolDef {
+    return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
+  }
+
+  const base = [toolDef("read_file"), toolDef("write_file")];
+
+  it("appends present_plan only in plan mode", () => {
+    expect(toolsForMode(base, "plan").map((t) => t.function.name)).toEqual(["read_file", "write_file", "present_plan"]);
+  });
+
+  it("returns the tool list unchanged (same reference) in every other mode", () => {
+    for (const mode of ["manual", "acceptEdits", "auto", "bypass"] as const) {
+      expect(toolsForMode(base, mode)).toBe(base);
+    }
+  });
+});
+
+describe("PlanNotice: formatPlanNotice/parsePlanNotice round trip", () => {
+  const notice: PlanNotice = {
+    id: "p1",
+    title: "Refactor auth",
+    plan: "1. Extract the token check\n2. Add a test",
+    openQuestions: ["Should old sessions be invalidated?"],
+    status: "proposed",
+  };
+
+  it("round-trips a full notice through format -> parse", () => {
+    const message: ChatMessage = { role: "system", content: formatPlanNotice(notice) };
+    expect(isPlanNotice(message)).toBe(true);
+    expect(parsePlanNotice(message)).toEqual(notice);
+  });
+
+  it("round-trips a notice with no open questions", () => {
+    const { openQuestions: _openQuestions, ...withoutQuestions } = notice;
+    const message: ChatMessage = { role: "system", content: formatPlanNotice(withoutQuestions as PlanNotice) };
+    expect(parsePlanNotice(message)).toEqual(withoutQuestions);
+  });
+
+  it("round-trips the approved/dismissed status rewrites the Approve/Keep-planning buttons produce", () => {
+    const approved: PlanNotice = { ...notice, status: "approved" };
+    const dismissed: PlanNotice = { ...notice, status: "dismissed" };
+    expect(parsePlanNotice({ role: "system", content: formatPlanNotice(approved) })).toEqual(approved);
+    expect(parsePlanNotice({ role: "system", content: formatPlanNotice(dismissed) })).toEqual(dismissed);
+  });
+
+  it("does not misidentify an unrelated system message as a plan notice", () => {
+    expect(isPlanNotice({ role: "system", content: "just a regular system message" })).toBe(false);
+    expect(parsePlanNotice({ role: "system", content: "just a regular system message" })).toBeNull();
+  });
+
+  it("returns null for malformed JSON after the prefix", () => {
+    expect(parsePlanNotice({ role: "system", content: `${PLAN_NOTE_PREFIX}{not json` })).toBeNull();
+  });
+
+  it("returns null for a well-formed but incomplete payload (missing plan)", () => {
+    const badPayload = JSON.stringify({ id: "p1", title: "T", status: "proposed" });
+    expect(parsePlanNotice({ role: "system", content: `${PLAN_NOTE_PREFIX}${badPayload}` })).toBeNull();
+  });
+});
+
+describe("toolCallPlanArgs", () => {
+  function call(args: unknown): ToolCall {
+    return { id: "c1", type: "function", function: { name: "present_plan", arguments: JSON.stringify(args) } };
+  }
+
+  it("extracts title, plan, and open_questions", () => {
+    expect(toolCallPlanArgs(call({ title: "T", plan: "P", open_questions: ["Q1", "Q2"] }))).toEqual({
+      title: "T",
+      plan: "P",
+      openQuestions: ["Q1", "Q2"],
+    });
+  });
+
+  it("omits openQuestions when open_questions is absent or empty", () => {
+    expect(toolCallPlanArgs(call({ title: "T", plan: "P" }))).toEqual({ title: "T", plan: "P" });
+    expect(toolCallPlanArgs(call({ title: "T", plan: "P", open_questions: [] }))).toEqual({ title: "T", plan: "P" });
+  });
+
+  it("filters non-string entries out of open_questions", () => {
+    expect(toolCallPlanArgs(call({ title: "T", plan: "P", open_questions: ["Q1", 2, null, "Q2"] }))).toEqual({
+      title: "T",
+      plan: "P",
+      openQuestions: ["Q1", "Q2"],
+    });
+  });
+
+  it("returns null when title or plan is missing or not a string", () => {
+    expect(toolCallPlanArgs(call({ plan: "P" }))).toBeNull();
+    expect(toolCallPlanArgs(call({ title: "T" }))).toBeNull();
+    expect(toolCallPlanArgs(call({ title: 42, plan: "P" }))).toBeNull();
+  });
+
+  it("returns null for malformed arguments JSON", () => {
+    const toolCall: ToolCall = { id: "c1", type: "function", function: { name: "present_plan", arguments: "{not json" } };
+    expect(toolCallPlanArgs(toolCall)).toBeNull();
+  });
+});
+
+describe("selectTurnRunning (what PlanCard's Approve-disabled state reads)", () => {
+  // `PlanCard.tsx` disables its "Approve & start acting" button via
+  // `useSessionStore(selectTurnRunning(sessionId))`. This repo's vitest
+  // config runs under a plain Node environment and only collects
+  // `src/**/*.test.ts` (see vitest.config.ts) — there is no jsdom/React
+  // Testing Library set up anywhere, so no component in this codebase is
+  // rendered in a test. Rather than introduce a new testing subsystem for
+  // this one component, this test pins the exact selector/state transition
+  // PlanCard's `disabled` prop depends on instead.
+  it("reports true only while markTurnRunning(sessionId, true) is in effect", () => {
+    const sessionId = "session-plan-card-approve-gating";
+    const selector = selectTurnRunning(sessionId);
+
+    expect(selector(useSessionStore.getState())).toBe(false);
+
+    useSessionStore.getState().markTurnRunning(sessionId, true);
+    expect(selector(useSessionStore.getState())).toBe(true);
+
+    useSessionStore.getState().markTurnRunning(sessionId, false);
+    expect(selector(useSessionStore.getState())).toBe(false);
   });
 });
 

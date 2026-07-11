@@ -15,6 +15,7 @@ import { useMcpStore } from '../store/mcpStore';
 import { usePromptStore, type PromptEntry } from '../store/promptStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useVerifyStore } from '../store/verifyStore';
+import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -123,7 +124,15 @@ export function buildSystemPrompt(
   // `buildSystemPrompt` pure and unit-testable; `currentSystemPrompt`
   // computes it. Defaults to `false` so existing call sites/tests are
   // unaffected.
-  verifyGuidanceAvailable: boolean = false
+  verifyGuidanceAvailable: boolean = false,
+  // The active permission mode (see `permissionStore.ts`) — only ever
+  // changes this prompt's output when it's `'plan'` (see `planModeLines`
+  // below); every other mode produces byte-identical output to omitting
+  // this parameter entirely, which is what every pre-existing call site
+  // (and test) that doesn't pass it still gets via the default. Read once
+  // per turn by `currentSystemPrompt`, same as every other store snapshot
+  // in this module.
+  mode: PermissionMode = 'manual'
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -202,6 +211,23 @@ export function buildSystemPrompt(
     ? ['', 'Configured verification commands run automatically after your edits; fix any failures they report.']
     : [];
 
+  // Plan Mode instructs the model to investigate read-only and present a
+  // structured plan instead of acting — the actual enforcement is the
+  // backend hard block (mode_short_circuit in permissions.rs), this is just
+  // steering so a well-behaved model doesn't bother trying a mutating tool
+  // (or a plain prose "plan") in the first place. `present_plan` is only
+  // ever offered to the model while `mode === 'plan'` (see `toolsForMode` in
+  // agentLoop.ts), so this section and that tool's availability are always
+  // in sync.
+  const planModeLines =
+    mode === 'plan'
+      ? [
+          '',
+          '## Plan Mode',
+          "You are in Plan Mode: read-only tools (read_file, glob, grep, list_dir, web_fetch, web_search) work normally, but every mutating tool (write_file, edit_file, run_shell, remember) is blocked and will return an error if you try. Investigate first, then call present_plan exactly once with your proposed plan (a short title, the plan itself as Markdown, and any open_questions worth asking) — then stop and wait for the user to approve it.",
+        ]
+      : [];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -220,6 +246,7 @@ export function buildSystemPrompt(
     ...rememberGuidanceLines,
     ...webToolsLines,
     ...verifyGuidanceLines,
+    ...planModeLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');
@@ -253,7 +280,8 @@ export function currentSystemPrompt(personaId: string | null = null): string {
   // prose, not a behavior change.
   const verifyGuidanceAvailable =
     useSettingsStore.getState().verifyEnabled && useVerifyStore.getState().config.commands.some((c) => c.enabled);
-  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable, verifyGuidanceAvailable);
+  const mode = usePermissionStore.getState().mode;
+  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable, verifyGuidanceAvailable, mode);
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
 }
