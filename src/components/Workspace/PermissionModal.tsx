@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Plug, Search, TerminalSquare } from "lucide-react";
+import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Globe, Plug, Search, TerminalSquare } from "lucide-react";
 import { usePermissionStore } from "../../store/permissionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -16,11 +16,13 @@ const TOOL_ICONS: Record<string, typeof AlertTriangle> = {
   list_dir: Folder,
   grep: Search,
   remember: Brain,
+  web_fetch: Globe,
+  web_search: Search,
 };
 
 /**
  * Centered dialog shown whenever the agent needs the user's sign-off
- * before running a sensitive tool (write_file / edit_file / run_shell / remember).
+ * before running a sensitive tool (write_file / edit_file / run_shell / remember / web_fetch / web_search).
  * Mirrors permissionStore.pending exactly — {id, tool, detail} | null.
  */
 export function PermissionModal() {

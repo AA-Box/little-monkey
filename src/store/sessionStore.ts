@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { textContent, type ChatMessage } from "../lib/llamaClient";
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
+import { usePromptStore } from "./promptStore";
 
 /** localStorage key sessions were persisted under BEFORE file-based
  * persistence existed — only read (once, then removed) to migrate old data.
@@ -54,6 +55,15 @@ export interface ChatSession {
    * app-global and can change after a session is created. Falls back to
    * the current primary root at click time if null (older sessions). */
   workspacePath: string | null;
+  /** id of a `PromptEntry` (`kind: "persona"`, see `promptStore.ts`) applied
+   * on top of the base system prompt for this session, or `null` for none —
+   * set via `setSessionPersona` (the `PersonaSelector` toolbar pill, or
+   * picking a persona row in the "/"-command popup). Per-session rather than
+   * app-global so the split pane can run two different personas side by
+   * side. Looked up fresh every turn (see `agentLoop.ts`/`systemPrompt.ts`'s
+   * `resolvePersona`), so a deleted persona resolves to null instead of
+   * leaving a session broken. */
+  personaId: string | null;
 }
 
 /** A user-defined grouping sessions can be filed under via the session
@@ -127,6 +137,9 @@ export interface SessionStore {
   createGroup: (name: string) => string;
   /** File a session under a group, or clear its group with `null`. */
   moveToGroup: (sessionId: string, groupId: string | null) => void;
+  /** Sets (or clears with `null`) the persona applied to `sessionId`'s system
+   * prompt — see `ChatSession.personaId`. */
+  setSessionPersona: (sessionId: string, personaId: string | null) => void;
   /** Record whether an agent turn is in flight for `sessionId` — called
    * only by `runAgentTurn` (start/finally). */
   markTurnRunning: (sessionId: string, running: boolean) => void;
@@ -202,11 +215,16 @@ function createSession(): ChatSession {
     archived: false,
     groupId: null,
     workspacePath: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+    // New sessions start on the user's chosen default persona, if any (see
+    // `promptStore.ts`'s `defaultPersonaId` / `setDefaultPersona`). A dangling
+    // id (its persona got deleted) resolves to "None" at turn time same as
+    // any other persona reference — see `composeSystemPrompt`.
+    personaId: usePromptStore.getState().defaultPersonaId,
   };
 }
 
 /** Builds the new session a "Fork" action produces: same messages/group/
- * workspace path as `source`, fresh id/title/timestamps, and reset
+ * workspace path/persona as `source`, fresh id/title/timestamps, and reset
  * pinned/unread/archived flags. */
 function cloneSessionAsFork(source: ChatSession): ChatSession {
   const now = Date.now();
@@ -221,6 +239,7 @@ function cloneSessionAsFork(source: ChatSession): ChatSession {
     archived: false,
     groupId: source.groupId,
     workspacePath: source.workspacePath,
+    personaId: source.personaId,
   };
 }
 
@@ -270,6 +289,7 @@ function normalizeSession(raw: Partial<ChatSession>): ChatSession {
     archived: raw.archived ?? false,
     groupId: raw.groupId ?? null,
     workspacePath: raw.workspacePath ?? null,
+    personaId: typeof raw.personaId === "string" ? raw.personaId : null,
   };
 }
 
@@ -626,6 +646,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   moveToGroup: (sessionId, groupId) => {
     set((state) => {
       const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, groupId } : s));
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  setSessionPersona: (sessionId, personaId) => {
+    set((state) => {
+      const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, personaId } : s));
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
     });

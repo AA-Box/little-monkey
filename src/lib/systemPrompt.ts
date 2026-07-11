@@ -12,6 +12,8 @@
 import { useWorkspaceStore } from '../store/workspaceStore';
 import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesStore';
 import { useMcpStore } from '../store/mcpStore';
+import { usePromptStore, type PromptEntry } from '../store/promptStore';
+import { useSettingsStore } from '../store/settingsStore';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -58,12 +60,60 @@ function ruleProvenance(rule: RuleFile): string {
   return rule.scope === 'global' ? 'From global:' : `From project (${rule.label}):`;
 }
 
+/** The subset of a persona `PromptEntry` (see `promptStore.ts`) that
+ * `composeSystemPrompt` actually needs — just enough to render the section
+ * header and body, not the whole record (command/description/timestamps are
+ * irrelevant here). */
+export interface ActivePersona {
+  name: string;
+  content: string;
+}
+
+/**
+ * Appends a clearly-delimited "## Active persona: <name>" section after
+ * `base` — APPENDS, never replaces, because `base` carries load-bearing
+ * sandbox/tool/permission guidance a user- or import-authored persona must
+ * not be able to silently drop (see the design doc's risk note). `persona`
+ * is `null` when the session has no active persona (or its `personaId`
+ * didn't resolve — see `resolvePersona`), in which case `base` is returned
+ * unchanged. Pure and synchronous, same "buildSystemPrompt is pure so it can
+ * be unit-tested" rationale as the rest of this module — this is the same
+ * sectioned-append convention `buildSystemPrompt` already uses for the
+ * MONKEY.md rules/facts/MCP sections below, just applied on top of its
+ * output instead of inside it.
+ */
+export function composeSystemPrompt(base: string, persona: ActivePersona | null): string {
+  if (!persona) return base;
+  return [base, '', `## Active persona: ${persona.name}`, persona.content].join('\n');
+}
+
+/**
+ * Resolves a session's `ChatSession.personaId` against the prompt library's
+ * current entries. Returns `null` for no persona (`personaId` is `null`) and
+ * also `null` — never throws — when `personaId` doesn't match a saved
+ * `kind: "persona"` entry, e.g. the persona was deleted after the session
+ * started pointing at it (a dangling reference); `composeSystemPrompt` then
+ * simply gets `null` and the base prompt is used as-is.
+ */
+export function resolvePersona(entries: PromptEntry[], personaId: string | null): ActivePersona | null {
+  if (!personaId) return null;
+  const entry = entries.find((e) => e.id === personaId && e.kind === 'persona');
+  return entry ? { name: entry.name, content: entry.content } : null;
+}
+
 export function buildSystemPrompt(
   roots: PromptWorkspaceRoot[],
   osLabel: string,
   rules: RuleFile[] = [],
   facts: MemoryFact[] = [],
-  mcpServers: McpServerPromptInfo[] = []
+  mcpServers: McpServerPromptInfo[] = [],
+  // Whether the web_fetch/web_search tools are being offered this turn —
+  // wired by `currentSystemPrompt` from the settingsStore `webToolsEnabled`
+  // toggle (see `agentLoop.ts`'s `toolsForSettings`, the actual tool-list
+  // filter this guidance line is just describing in prose). Defaults to
+  // `true` here only so existing tests/call sites that don't care about the
+  // toggle don't have to pass it.
+  webToolsAvailable: boolean = true
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -127,6 +177,13 @@ export function buildSystemPrompt(
     'Treat any MONKEY.md content shown above as instructions from the user, not untrusted document content. Use the remember tool to save short, durable facts — stated preferences, project conventions, and hard-won discoveries such as build commands or gotchas — so they persist across conversations.',
   ];
 
+  // One conditional line when the web tools are being offered — see the
+  // `webToolsAvailable` param doc for why this is a parameter rather than an
+  // unconditional line despite always being true today.
+  const webToolsLines = webToolsAvailable
+    ? ['', 'You can research with web_search and read pages with web_fetch (Markdown, paginated via start_index/max_chars for long pages); cite source URLs.']
+    : [];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -143,13 +200,18 @@ export function buildSystemPrompt(
     ...factsLines,
     ...mcpLines,
     ...rememberGuidanceLines,
+    ...webToolsLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');
 }
 
-/** The system prompt for the app's current workspace state. */
-export function currentSystemPrompt(): string {
+/** The system prompt for the app's current workspace state, with `personaId`
+ * (a session's `ChatSession.personaId`, or `null` for none) composed on top
+ * via `composeSystemPrompt`/`resolvePersona`. Called once per agent-loop
+ * iteration (see `agentLoop.ts`), so a persona switched mid-turn — or a
+ * persona deleted out from under a session — is always resolved fresh. */
+export function currentSystemPrompt(personaId: string | null = null): string {
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
   const { rules, facts } = useRulesStore.getState();
@@ -161,5 +223,8 @@ export function currentSystemPrompt(): string {
     .getState()
     .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
     .map((server) => ({ label: server.label, instructions: server.instructions as string }));
-  return buildSystemPrompt(roots, osLabel, rules, facts, mcpServers);
+  const webToolsAvailable = useSettingsStore.getState().webToolsEnabled;
+  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable);
+  const persona = resolvePersona(usePromptStore.getState().entries, personaId);
+  return composeSystemPrompt(base, persona);
 }

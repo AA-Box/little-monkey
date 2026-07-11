@@ -27,7 +27,13 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tokio = { version = "1.52.3", features = ["full"] }
-reqwest = { version = "0.13.4", features = ["json", "stream"] }
+# "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
+# `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
+# to POST the DuckDuckGo query as `application/x-www-form-urlencoded`.
+# "query" added in phase 3 for the same reason: `RequestBuilder::query` (used
+# by the Brave/SearXNG branches to attach `?q=&count=`/`?q=&format=json`) is
+# also feature-gated in reqwest 0.13, separately from "form".
+reqwest = { version = "0.13.4", features = ["json", "stream", "form", "query"] }
 futures-util = "0.3.32"
 uuid = { version = "1.23.4", features = ["v4"] }
 regex = "1.12.4"
@@ -57,6 +63,51 @@ schemars = "1"
 # doesn't re-export it. Version-matched to the copy already in Cargo.lock via
 # rmcp's own dependency so only one copy resolves.
 tokio-util = "0.7"
+# web.rs: HTML->Markdown conversion for tool_web_fetch (turndown.js-style,
+# html5ever-based). The design doc named ~0.2; 0.5 is current on crates.io as
+# of implementation time — API used here (the free `convert` fn) is stable
+# across that range.
+htmd = "0.5"
+# web.rs: explicit dependency (was already a transitive reqwest dep) so
+# `validate_fetch_url`'s SSRF guard can parse/inspect the URL's host without
+# relying on reqwest's internals.
+url = "2"
+# web.rs: CSS-selector HTML parsing for the DuckDuckGo results page
+# (tool_web_search, phase 2). The design doc named ~0.24; 0.27 is current on
+# crates.io as of implementation time — the `Html::parse_document` /
+# `Selector::parse` / `ElementRef::text`/`.attr()` API used here is stable
+# across that range. Default features (html5ever-based parsing) are enough;
+# no need for the `serde` cargo feature since results are re-serialized into
+# our own `SearchResult` struct.
+scraper = "0.27"
+# web.rs: Mozilla-readability-style article extraction, run on HTML pages
+# before htmd conversion (tool_web_fetch, phase 5 polish — see
+# `extract_readable_content`). The design doc named ~0.6 (dated 2026-07-10);
+# 0.18.0 is current on crates.io as of implementation time — a much larger
+# jump than htmd/scraper's own doc-vs-actual deltas, but the API surface used
+# here (`Readability::new(html, document_url, config) -> Result<Self, _>`,
+# `.parse() -> Result<Article, _>`, `Article::{title, content, length}`)
+# matches the design doc's description; verified against docs.rs at
+# implementation time rather than assumed from the stale version number.
+dom_smoothie = "0.18.0"
+# server.rs (local OpenAI-compatible API server, phase 1): the design doc
+# named hyper/hyper-util/http-body-util/sha2/rand as already-transitive deps
+# (pulled in via reqwest/tauri/keyring) as of its 2026-07-10 Cargo.lock
+# snapshot — verified still true for hyper/hyper-util/http-body-util/sha2 via
+# `cargo tree -i` against the *current* lockfile (versions below match
+# exactly). `rand` is the one exception: `cargo tree -i rand`/`-i quinn-proto`
+# print nothing against this lockfile — `rand 0.10.2` is listed in Cargo.lock
+# only as reqwest's optional (never-enabled) `http3`/quinn dependency chain,
+# not as a package actually compiled into this build. Adding it here as a
+# direct dependency (pinned to the exact version already recorded in
+# Cargo.lock) is therefore a small real addition to the build graph, not the
+# "zero new downloads" the design doc claimed — the only such deviation among
+# the five crates it named.
+hyper = { version = "1.10.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.3"
+sha2 = "0.10.9"
+rand = "0.10.2"
 
 [dev-dependencies]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
