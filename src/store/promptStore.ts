@@ -95,7 +95,10 @@ export interface PromptStore {
    * generated `id` is otherwise unobservable until the next render). */
   addEntry: (input: NewPromptInput) => PromptEntry;
   /** Patch an existing entry by id; no-ops if it doesn't exist. Bumps
-   * `updatedAt`. */
+   * `updatedAt`. Clears `defaultPersonaId` if it pointed at this entry and
+   * `patch.kind` changes it away from `"persona"` — same "stale default
+   * can't outlive what it points at" rule `removeEntry` enforces on
+   * deletion. */
   updateEntry: (id: string, patch: PromptEntryPatch) => void;
   /** Remove an entry by id; no-ops if it doesn't exist. Clears
    * `defaultPersonaId` if it pointed at the removed entry. */
@@ -165,19 +168,37 @@ export function slugify(name: string): string {
     .slice(0, 32);
 }
 
+/** The `command` field's documented max length — `/^[a-z0-9-]{1,32}$/`. */
+const COMMAND_MAX_LENGTH = 32;
+
+/** Builds `${base}-${n}`, capped at `COMMAND_MAX_LENGTH` by shortening
+ * `base` (never the numeric suffix). Shortening the base instead of
+ * truncating the whole string guarantees the result actually changes as
+ * `n` increases, even when `base` is already at the length limit — see
+ * `uniqueCommand`. */
+function withSuffix(base: string, n: number): string {
+  const suffix = `-${n}`;
+  return `${base.slice(0, Math.max(0, COMMAND_MAX_LENGTH - suffix.length))}${suffix}`;
+}
+
 /** Appends `-2`, `-3`, ... to `command` until it no longer collides with
  * anything in `taken`, so a batch import never silently overwrites an
- * existing entry's command. Truncates back to 32 characters (the
- * `command` field's limit) after appending the suffix. Returns `command`
- * unchanged if it doesn't collide. */
+ * existing entry's command. `command` itself is first capped at
+ * `COMMAND_MAX_LENGTH` (the `command` field's limit) regardless of whether
+ * it collides, so a caller never has to re-validate the result. Every
+ * retry candidate is built via `withSuffix`, which shortens the *base*
+ * rather than truncating the suffixed string — truncating the suffixed
+ * string instead would, for a `base` already at the length limit, always
+ * cut off the entire `-${n}` suffix and yield `base` unchanged for every
+ * `n`, looping forever since `base` is already known to collide. */
 function uniqueCommand(command: string, taken: Set<string>): string {
-  const base = command.length > 0 ? command : "prompt";
+  const base = (command.length > 0 ? command : "prompt").slice(0, COMMAND_MAX_LENGTH);
   if (!taken.has(base)) return base;
   let n = 2;
-  let candidate = `${base}-${n}`.slice(0, 32);
+  let candidate = withSuffix(base, n);
   while (taken.has(candidate)) {
     n += 1;
-    candidate = `${base}-${n}`.slice(0, 32);
+    candidate = withSuffix(base, n);
   }
   return candidate;
 }
@@ -482,8 +503,11 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
       const target = state.entries.find((e) => e.id === id);
       if (!target) return state;
       const entries = state.entries.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e));
-      persist(entries, state.defaultPersonaId, state.hasSeededDefaults);
-      return { entries };
+      const updated = entries.find((e) => e.id === id)!;
+      const defaultPersonaId =
+        state.defaultPersonaId === id && updated.kind !== "persona" ? null : state.defaultPersonaId;
+      persist(entries, defaultPersonaId, state.hasSeededDefaults);
+      return { entries, defaultPersonaId };
     });
   },
 

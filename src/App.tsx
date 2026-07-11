@@ -59,6 +59,9 @@ function App() {
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
   // for the normal "open on whatever tab was last active" path (AppMenu).
+  // Reset back to `undefined` on close (see the `SettingsModal` below) so a
+  // one-off deep link doesn't stick around and hijack every later normal
+  // open too.
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>(undefined);
 
   const handleManagePrompts = useCallback(() => {
@@ -216,7 +219,18 @@ function App() {
       </aside>
 
       <PermissionModal />
-      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} initialTab={settingsInitialTab} />
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => {
+          setSettingsOpen(false);
+          // Consume the deep-link tab on close so it only affects the
+          // opening it was requested for — otherwise it would stick around
+          // and force every later normal open (e.g. the plain gear icon)
+          // back onto that tab instead of "whatever was last active".
+          setSettingsInitialTab(undefined);
+        }}
+        initialTab={settingsInitialTab}
+      />
     </div>
   );
 }

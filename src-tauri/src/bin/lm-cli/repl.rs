@@ -88,13 +88,19 @@ impl Reader {
 }
 
 /// Runs the interactive session against an already-resolved target until
-/// `/bye`, `exit`, `quit`, or EOF.
+/// `/bye`, `exit`, `quit`, or EOF. `options.system` coming in is just
+/// rules/facts + `--system` text — WITHOUT any `--persona` folded in (see
+/// `main.rs::chat_setup`/`chat_loop`); `initial_persona` carries that
+/// resolved persona, if any, as structured data so it becomes the REPL's
+/// own active persona from the start instead of being baked unremovably
+/// into the base text.
 pub async fn run(
     client: &reqwest::Client,
     mut target: Target,
     state: &AppState,
     mode: PermissionMode,
     mut options: chat::ChatOptions,
+    initial_persona: Option<PromptEntry>,
     mcp_entries: &[McpServerEntry],
 ) {
     let mut reader = Reader::new();
@@ -106,17 +112,18 @@ pub async fn run(
     let mut history: Vec<serde_json::Value> = Vec::new();
     let mut keep_history = true;
     // The system text `/persona` layers its section on top of, restored
-    // verbatim by `/persona clear` — captures whatever `--system`/`--persona`
-    // (see `main.rs::chat_setup`) already composed at startup, and is kept
-    // in sync by `/set system` too (see `handle_set`). Layering rather than
-    // clobbering mirrors the desktop app's "append, never replace"
-    // `composeSystemPrompt` convention.
+    // verbatim by `/persona clear` — the rules/facts + `--system` text ONLY,
+    // never a persona (see the doc comment on `run` above). Kept in sync by
+    // `/set system` too (see `handle_set`). Layering rather than clobbering
+    // mirrors the desktop app's "append, never replace" `composeSystemPrompt`
+    // convention.
     let mut system_base = options.system.clone();
-    // The REPL's own active persona, set by `/persona <command>` and
-    // cleared by `/persona clear`/`/persona none` — independent of any
-    // `--persona` given at startup (that one is already baked into
-    // `system_base` above).
-    let mut persona: Option<PromptEntry> = None;
+    // The REPL's own active persona, set by `/persona <command>` and cleared
+    // by `/persona clear`/`/persona none` — seeded from whatever `--persona`
+    // resolved to at startup (if anything), so `/persona clear` can actually
+    // remove it and `/persona <other>` replaces it instead of stacking.
+    let mut persona: Option<PromptEntry> = initial_persona;
+    options.system = crate::compose_persona_and_system(persona.as_ref(), system_base.as_deref());
 
     loop {
         let line = match reader.read(">>> ") {

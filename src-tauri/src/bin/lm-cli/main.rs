@@ -510,19 +510,25 @@ fn effective_system(cli: &Cli, state: &AppState, user_system: Option<&str>) -> O
 }
 
 /// Builds the chat-side pieces shared by the flat invocation and `run`:
-/// the sandboxed workspace state, the parsed permission mode, and the
-/// validated generation options (whose `system` field is the composed
-/// rules/facts + persona + `--system` prompt — see [`effective_system`],
-/// [`compose_persona_and_system`]). An unresolvable `--persona <command>`
-/// is a hard error here, before any network target is contacted.
-fn chat_setup(cli: &Cli) -> Result<(AppState, PermissionMode, chat::ChatOptions), String> {
+/// the sandboxed workspace state, the parsed permission mode, the validated
+/// generation options (whose `system` field is just the composed
+/// rules/facts + `--system` prompt — see [`effective_system`] — deliberately
+/// WITHOUT the persona folded in), and the resolved `--persona` entry itself
+/// kept as structured data. Keeping the persona separate (rather than
+/// baking its text into `options.system` here) lets every downstream
+/// consumer — `run`'s own `--system` override, and the REPL's `/persona`
+/// state — recompose persona-then-system fresh at the point it's actually
+/// needed instead of racing to overwrite/lose a persona already flattened
+/// into a string (see [`chat_loop`], `repl::run`). An unresolvable
+/// `--persona <command>` is still a hard error here, before any network
+/// target is contacted.
+fn chat_setup(cli: &Cli) -> Result<(AppState, PermissionMode, chat::ChatOptions, Option<PromptEntry>), String> {
     let state = build_state(&cli.workspace)?;
     let mode = PermissionMode::parse(&cli.permission_mode)?;
     let mut options = cli.chat.to_options()?;
     let persona = cli.persona.as_deref().map(resolve_persona_entry).transpose()?;
-    let persona_and_system = compose_persona_and_system(persona.as_ref(), options.system.as_deref());
-    options.system = effective_system(cli, &state, persona_and_system.as_deref());
-    Ok((state, mode, options))
+    options.system = effective_system(cli, &state, options.system.as_deref());
+    Ok((state, mode, options, persona))
 }
 
 fn fail(message: &str) -> ! {
@@ -562,12 +568,12 @@ async fn main() {
         Ok(t) => t,
         Err(e) => fail(&e),
     };
-    let (state, mode, options) = match chat_setup(&cli) {
+    let (state, mode, options, persona) = match chat_setup(&cli) {
         Ok(v) => v,
         Err(e) => fail(&e),
     };
     let mcp_entries = resolve_mcp_entries(&cli, &state).await;
-    chat_loop(&client, target, &state, mode, options, cli.prompt.as_deref(), &mcp_entries).await;
+    chat_loop(&client, target, &state, mode, options, persona, cli.prompt.as_deref(), &mcp_entries).await;
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -591,13 +597,17 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Serve => cmds::passthrough("serve"),
         Cmd::Run { model, prompt, system } => {
             // Validate chat-side flags before a potentially long auto-pull.
-            let (state, mode, mut options) = match chat_setup(cli) {
+            let (state, mode, mut options, persona) = match chat_setup(cli) {
                 Ok(v) => v,
                 Err(e) => fail(&e),
             };
             // `run`'s own --system wins over one given before the subcommand
             // (still composed with the rules/facts section unless
-            // --no-rules — see `effective_system`).
+            // --no-rules — see `effective_system`). The persona (if any) is
+            // NOT re-applied here: it stays structured in `persona` and
+            // `chat_loop` folds it back in on top of whichever system text
+            // ends up in `options.system`, so a `--persona` given alongside
+            // `run`'s own `--system` is layered rather than dropped.
             if let Some(system) = system {
                 options.system = effective_system(cli, &state, Some(system.as_str()));
             }
@@ -610,7 +620,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 native_ollama: true,
             };
             let mcp_entries = resolve_mcp_entries(cli, &state).await;
-            chat_loop(client, target, &state, mode, options, prompt.as_deref(), &mcp_entries).await;
+            chat_loop(client, target, &state, mode, options, persona, prompt.as_deref(), &mcp_entries).await;
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -628,14 +638,24 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
 
 /// Runs the chat side — a one-shot turn, or the interactive REPL when no
 /// prompt is given — against an already-resolved target. Both the classic
-/// flat invocation and `lm-cli run` land here. The REPL takes the target and
-/// options by value since its slash commands (`/load`, `/set`) mutate them.
+/// flat invocation and `lm-cli run` land here. `options.system` going in is
+/// the rules/facts + `--system` text WITHOUT any persona folded in yet (see
+/// `chat_setup`); `persona` carries the resolved `--persona` entry, if any,
+/// as structured data. The two paths recompose them differently: a one-shot
+/// turn folds the persona in once, right here, since there's no later
+/// mutation point; the REPL instead receives `persona` as its *initial*
+/// active persona and recomposes on every `/persona`/`/set system` the same
+/// way (see `repl::run`) — so a persona given via `--persona` is layered
+/// exactly once no matter which path is taken, never dropped and never
+/// stacked. The REPL takes the target and options by value since its slash
+/// commands (`/load`, `/set`) mutate them.
 async fn chat_loop(
     client: &reqwest::Client,
     target: chat::Target,
     state: &AppState,
     mode: PermissionMode,
-    options: chat::ChatOptions,
+    mut options: chat::ChatOptions,
+    persona: Option<PromptEntry>,
     prompt: Option<&str>,
     mcp_entries: &[McpServerEntry],
 ) {
@@ -646,6 +666,7 @@ async fn chat_loop(
     }
 
     if let Some(prompt) = prompt {
+        options.system = compose_persona_and_system(persona.as_ref(), options.system.as_deref());
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
         if let Err(e) =
@@ -657,7 +678,7 @@ async fn chat_loop(
         return;
     }
 
-    repl::run(client, target, state, mode, options, mcp_entries).await;
+    repl::run(client, target, state, mode, options, persona, mcp_entries).await;
 }
 
 #[cfg(test)]
@@ -949,6 +970,40 @@ mod tests {
         assert!(both.starts_with("## Active persona: Terse\nBe brief."));
         assert!(both.ends_with("Only system."));
         assert!(both.find("Be brief.").unwrap() < both.find("Only system.").unwrap());
+    }
+
+    /// Regression test for a bug where `lm-cli --persona <cmd> run <model>
+    /// --system <text>` silently dropped the persona instead of layering it
+    /// (see `chat_setup`'s doc comment and `Cmd::Run`'s arm in
+    /// `run_subcommand`). Since `chat_setup` no longer folds the persona
+    /// into `options.system` itself, `run`'s own `--system` override can
+    /// freely replace `options.system` with `effective_system(...)` (rules/
+    /// facts + the new text, no persona) and still have the persona survive:
+    /// `chat_loop` composes `persona` back on top of whatever
+    /// `options.system` ends up holding, exactly once, right before the
+    /// turn/REPL starts (mirrored here directly against
+    /// `compose_persona_and_system` since `chat_loop` itself needs a live
+    /// network target to drive).
+    #[test]
+    fn compose_persona_and_system_reapplies_persona_over_runs_own_system_override() {
+        let persona = PromptEntry {
+            id: "p1".to_string(),
+            kind: "persona".to_string(),
+            name: "Code Reviewer".to_string(),
+            command: "code-reviewer".to_string(),
+            content: "Review code carefully.".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        // What `run`'s own `--system` override leaves in `options.system`
+        // after `chat_setup` (no persona folded in — see its doc comment).
+        let system_after_own_override = Some("Reply in French.".to_string());
+
+        let folded = compose_persona_and_system(Some(&persona), system_after_own_override.as_deref()).unwrap();
+        assert!(folded.contains("## Active persona: Code Reviewer"));
+        assert!(folded.contains("Review code carefully."));
+        assert!(folded.ends_with("Reply in French."));
     }
 
     #[test]

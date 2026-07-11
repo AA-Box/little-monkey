@@ -180,21 +180,17 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Canonical fixture also parsed by `promptStore.test.ts` — pins the
-    /// TS<->Rust schema against drift (the `providers_cli.rs`
-    /// `APP_IDENTIFIER` drift risk the design doc calls out), since
-    /// `PromptEntry` is read directly by `lm-cli` without going through the
-    /// frontend at all.
-    const CANONICAL_ENTRY_JSON: &str = r#"{
-        "id": "11111111-1111-4111-8111-111111111111",
-        "kind": "persona",
-        "name": "Code Reviewer",
-        "command": "code-reviewer",
-        "content": "You are a meticulous code reviewer.",
-        "description": "Reviews diffs for bugs",
-        "createdAt": 1700000000000,
-        "updatedAt": 1700000000000
-    }"#;
+    /// Canonical fixture also read (from disk, not re-typed) by
+    /// `promptStore.test.ts` — a single shared file, not two independently
+    /// hand-maintained literals, is what actually pins the TS<->Rust schema
+    /// against drift (the `providers_cli.rs` `APP_IDENTIFIER` drift risk the
+    /// design doc calls out): if either language's serialization of
+    /// `PromptEntry` changes shape, this test and `promptStore.test.ts`'s
+    /// both read the exact same bytes, so only a genuine cross-language
+    /// disagreement about the shared shape can make one fail without the
+    /// other. Matters because `lm-cli` reads `PromptEntry` directly out of
+    /// `prompts.json` without going through the frontend at all.
+    const CANONICAL_ENTRY_JSON: &str = include_str!("../fixtures/prompt-entry.canonical.json");
 
     #[test]
     fn prompt_entry_deserializes_canonical_fixture() {
