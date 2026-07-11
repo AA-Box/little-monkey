@@ -5,6 +5,8 @@ export { default as MessageBubble } from "./MessageBubble";
 export type { MessageBubbleProps } from "./MessageBubble";
 export { default as MentionAutocomplete } from "./MentionAutocomplete";
 export type { MentionEntry, MentionAutocompleteProps } from "./MentionAutocomplete";
+export { default as SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
+export type { SlashCommandAutocompleteProps } from "./SlashCommandAutocomplete";
 export { default as ModeSelector } from "./ModeSelector";
 export { default as EffortSelector } from "./EffortSelector";
 export { default as ModelSwitcher } from "./ModelSwitcher";
