@@ -402,7 +402,7 @@ export const it: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "Nuovo prompt",
   "PromptLibraryPanel.editHeading": "Modifica prompt",
   "PromptLibraryPanel.kindSnippetLabel": "Snippet (inserito nel campo di composizione)",
-  "PromptLibraryPanel.kindPersonaLabel": "Persona (in arrivo — non ancora applicata alla conversazione)",
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (plasma l'intera conversazione tramite il prompt di sistema)",
   "PromptLibraryPanel.namePlaceholder": "Nome, es. \"Code Reviewer\"",
   "PromptLibraryPanel.commandPlaceholder": "comando-slash",
   "PromptLibraryPanel.contentPlaceholder": "Il testo del prompt o dello snippet…",
@@ -419,4 +419,7 @@ export const it: Record<string, string> = {
   "SlashCommandAutocomplete.noMatches": "Nessun prompt corrispondente",
   "SlashCommandAutocomplete.personaBadge": "Persona",
   "SlashCommandAutocomplete.snippetBadge": "Snippet",
+  "PersonaSelector.noneLabel": "Nessuna",
+  "PersonaSelector.emptyState": "Nessuna persona salvata — aggiungine una nella scheda Prompt.",
+  "PersonaSelector.managePromptsLabel": "Gestisci prompt…"
 };

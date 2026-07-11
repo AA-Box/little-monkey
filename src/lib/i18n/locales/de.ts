@@ -402,7 +402,7 @@ export const de: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "Neuer Prompt",
   "PromptLibraryPanel.editHeading": "Prompt bearbeiten",
   "PromptLibraryPanel.kindSnippetLabel": "Snippet (wird in die Eingabe eingefügt)",
-  "PromptLibraryPanel.kindPersonaLabel": "Persona (bald verfügbar — wird noch nicht auf die Unterhaltung angewendet)",
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (prägt die gesamte Unterhaltung über den System-Prompt)",
   "PromptLibraryPanel.namePlaceholder": "Name, z. B. „Code Reviewer“",
   "PromptLibraryPanel.commandPlaceholder": "slash-befehl",
   "PromptLibraryPanel.contentPlaceholder": "Der Prompt- oder Snippet-Text…",
@@ -418,5 +418,8 @@ export const de: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "Inhalt ist erforderlich.",
   "SlashCommandAutocomplete.noMatches": "Keine passenden Prompts",
   "SlashCommandAutocomplete.personaBadge": "Persona",
-  "SlashCommandAutocomplete.snippetBadge": "Snippet"
+  "SlashCommandAutocomplete.snippetBadge": "Snippet",
+  "PersonaSelector.noneLabel": "Keine",
+  "PersonaSelector.emptyState": "Noch keine Personas gespeichert — füge eine im Tab „Prompts“ hinzu.",
+  "PersonaSelector.managePromptsLabel": "Prompts verwalten…"
 };

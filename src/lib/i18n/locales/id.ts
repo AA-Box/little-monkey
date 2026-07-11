@@ -402,7 +402,7 @@ export const id: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "Prompt baru",
   "PromptLibraryPanel.editHeading": "Edit prompt",
   "PromptLibraryPanel.kindSnippetLabel": "Cuplikan (disisipkan ke kolom obrolan)",
-  "PromptLibraryPanel.kindPersonaLabel": "Persona (segera hadir — belum diterapkan ke percakapan)",
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (membentuk seluruh percakapan melalui prompt sistem)",
   "PromptLibraryPanel.namePlaceholder": "Nama, mis. \"Code Reviewer\"",
   "PromptLibraryPanel.commandPlaceholder": "perintah-slash",
   "PromptLibraryPanel.contentPlaceholder": "Teks prompt atau cuplikan…",
@@ -418,5 +418,8 @@ export const id: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "Konten wajib diisi.",
   "SlashCommandAutocomplete.noMatches": "Tidak ada prompt yang cocok",
   "SlashCommandAutocomplete.personaBadge": "Persona",
-  "SlashCommandAutocomplete.snippetBadge": "Cuplikan"
+  "SlashCommandAutocomplete.snippetBadge": "Cuplikan",
+  "PersonaSelector.noneLabel": "Tidak ada",
+  "PersonaSelector.emptyState": "Belum ada persona tersimpan — tambahkan satu di tab Prompt.",
+  "PersonaSelector.managePromptsLabel": "Kelola prompt…"
 };

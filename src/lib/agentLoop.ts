@@ -1006,14 +1006,19 @@ async function runAgentTurnBody(
     // never gets sent back to the model as part of its own history.
     const history: ChatMessage[] = sessionMessages(sessionId);
 
-    // The system prompt (identity, workspace roots, OS, tool guidance, and
-    // MONKEY.md rules/facts — see systemPrompt.ts) is injected at the head of
-    // the OUTGOING payload only, never stored in the session transcript.
-    // Rebuilt every iteration (not just once before the loop) so a `remember`
-    // call earlier in *this* turn — which refreshes rulesStore right below —
-    // actually shows up in the system prompt sent for the next round trip,
-    // instead of only from the next user turn onward.
-    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
+    // The system prompt (identity, workspace roots, OS, tool guidance,
+    // MONKEY.md rules/facts, and the active persona — see systemPrompt.ts) is
+    // injected at the head of the OUTGOING payload only, never stored in the
+    // session transcript. Rebuilt every iteration (not just once before the
+    // loop) so a `remember` call earlier in *this* turn — which refreshes
+    // rulesStore right below — actually shows up in the system prompt sent
+    // for the next round trip, instead of only from the next user turn
+    // onward; the session's `personaId` is re-read fresh here too, for the
+    // same reason (a persona switch or deletion mid-turn takes effect on the
+    // very next round trip, and a dangling id just resolves to no persona —
+    // see `resolvePersona`).
+    const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
+    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt(personaId) };
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user

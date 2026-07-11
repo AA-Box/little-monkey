@@ -402,7 +402,7 @@ export const en: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "New prompt",
   "PromptLibraryPanel.editHeading": "Edit prompt",
   "PromptLibraryPanel.kindSnippetLabel": "Snippet (inserted into the composer)",
-  "PromptLibraryPanel.kindPersonaLabel": "Persona (coming soon — not yet applied to the conversation)",
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (shapes the whole conversation via the system prompt)",
   "PromptLibraryPanel.namePlaceholder": "Name, e.g. \"Code Reviewer\"",
   "PromptLibraryPanel.commandPlaceholder": "slash-command",
   "PromptLibraryPanel.contentPlaceholder": "The prompt or snippet text…",
@@ -418,5 +418,8 @@ export const en: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "Content is required.",
   "SlashCommandAutocomplete.noMatches": "No matching prompts",
   "SlashCommandAutocomplete.personaBadge": "Persona",
-  "SlashCommandAutocomplete.snippetBadge": "Snippet"
+  "SlashCommandAutocomplete.snippetBadge": "Snippet",
+  "PersonaSelector.noneLabel": "None",
+  "PersonaSelector.emptyState": "No personas saved yet — add one in the Prompts tab.",
+  "PersonaSelector.managePromptsLabel": "Manage prompts…"
 };

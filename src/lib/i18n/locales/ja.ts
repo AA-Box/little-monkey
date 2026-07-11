@@ -402,7 +402,7 @@ export const ja: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "新しいプロンプト",
   "PromptLibraryPanel.editHeading": "プロンプトを編集",
   "PromptLibraryPanel.kindSnippetLabel": "スニペット(入力欄に挿入されます)",
-  "PromptLibraryPanel.kindPersonaLabel": "ペルソナ(近日公開 — まだ会話には適用されません)",
+  "PromptLibraryPanel.kindPersonaLabel": "ペルソナ(システムプロンプトを通じて会話全体を形作ります)",
   "PromptLibraryPanel.namePlaceholder": "名前、例:「コードレビュアー」",
   "PromptLibraryPanel.commandPlaceholder": "スラッシュコマンド",
   "PromptLibraryPanel.contentPlaceholder": "プロンプトまたはスニペットのテキスト…",
@@ -419,4 +419,7 @@ export const ja: Record<string, string> = {
   "SlashCommandAutocomplete.noMatches": "一致するプロンプトがありません",
   "SlashCommandAutocomplete.personaBadge": "ペルソナ",
   "SlashCommandAutocomplete.snippetBadge": "スニペット",
+  "PersonaSelector.noneLabel": "なし",
+  "PersonaSelector.emptyState": "保存されたペルソナはまだありません。プロンプトタブで追加してください。",
+  "PersonaSelector.managePromptsLabel": "プロンプトを管理…"
 };

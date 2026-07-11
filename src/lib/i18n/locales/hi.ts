@@ -402,7 +402,7 @@ export const hi: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "नया प्रॉम्प्ट",
   "PromptLibraryPanel.editHeading": "प्रॉम्प्ट संपादित करें",
   "PromptLibraryPanel.kindSnippetLabel": "स्निपेट (कंपोज़र में डाला जाता है)",
-  "PromptLibraryPanel.kindPersonaLabel": "पर्सोना (जल्द आ रहा है — अभी बातचीत पर लागू नहीं होता)",
+  "PromptLibraryPanel.kindPersonaLabel": "पर्सोना (सिस्टम प्रॉम्प्ट के ज़रिए पूरी बातचीत को आकार देता है)",
   "PromptLibraryPanel.namePlaceholder": "नाम, जैसे \"कोड रिव्यूअर\"",
   "PromptLibraryPanel.commandPlaceholder": "स्लैश-कमांड",
   "PromptLibraryPanel.contentPlaceholder": "प्रॉम्प्ट या स्निपेट का टेक्स्ट…",
@@ -418,5 +418,8 @@ export const hi: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "सामग्री आवश्यक है।",
   "SlashCommandAutocomplete.noMatches": "कोई मिलता-जुलता प्रॉम्प्ट नहीं",
   "SlashCommandAutocomplete.personaBadge": "पर्सोना",
-  "SlashCommandAutocomplete.snippetBadge": "स्निपेट"
+  "SlashCommandAutocomplete.snippetBadge": "स्निपेट",
+  "PersonaSelector.noneLabel": "कोई नहीं",
+  "PersonaSelector.emptyState": "अभी तक कोई पर्सोना सेव नहीं है — प्रॉम्प्ट्स टैब में एक जोड़ें।",
+  "PersonaSelector.managePromptsLabel": "प्रॉम्प्ट्स प्रबंधित करें…"
 };

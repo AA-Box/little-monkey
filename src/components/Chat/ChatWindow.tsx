@@ -18,6 +18,7 @@ import type { MentionEntry } from "./MentionAutocomplete";
 import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
 import { ModeSelector } from "./ModeSelector";
 import { EffortSelector } from "./EffortSelector";
+import { PersonaSelector } from "./PersonaSelector";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
@@ -144,9 +145,12 @@ interface ChatWindowProps {
   /** The session this pane renders and sends turns into. Each pane (primary
    * and split — see App.tsx) owns one; they operate independently. */
   sessionId: string;
+  /** Opens Settings on the Prompts tab — passed down to `PersonaSelector`'s
+   * "Manage prompts…" row (see App.tsx's deep-link hook). */
+  onManagePrompts: () => void;
 }
 
-export default function ChatWindow({ sessionId }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -397,17 +401,31 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
         return;
       }
 
-      // Personas aren't wired into the agent loop yet (slice 2 — see the
-      // design doc's "Shippable slices"); selecting one here just dismisses
-      // the popup rather than building partial plumbing for a state nothing
-      // reads yet.
+      const currentValue = el ? el.value : input;
+      const end = el?.selectionStart ?? currentValue.length;
+
+      // Picking a persona sets it as this session's active persona (composed
+      // into the system prompt every turn — see systemPrompt.ts) and clears
+      // the "/command" the user typed, the Cherry-Studio-style "switch
+      // assistant from the composer" gesture; it never inserts text into the
+      // composer the way a snippet does.
       if (entry.kind === "persona") {
+        useSessionStore.getState().setSessionPersona(sessionId, entry.id);
+        const nextValue = currentValue.slice(0, start) + currentValue.slice(end);
+        setInput(nextValue);
         closeSlashPopup();
+
+        requestAnimationFrame(() => {
+          const node = textareaRef.current;
+          if (node) {
+            node.focus();
+            node.setSelectionRange(start, start);
+          }
+          resizeTextarea();
+        });
         return;
       }
 
-      const currentValue = el ? el.value : input;
-      const end = el?.selectionStart ?? currentValue.length;
       const insertion = entry.content;
       const nextValue = currentValue.slice(0, start) + insertion + currentValue.slice(end);
       const cursorPos = start + insertion.length;
@@ -424,7 +442,7 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
         resizeTextarea();
       });
     },
-    [input, closeSlashPopup, resizeTextarea]
+    [input, closeSlashPopup, resizeTextarea, sessionId]
   );
 
   const handleInput = (event: FormEvent<HTMLTextAreaElement>) => {
@@ -628,6 +646,7 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
         <div className="mx-auto mt-1.5 flex max-w-3xl items-center justify-between">
           <div className="flex items-center gap-1.5">
             <ModeSelector />
+            <PersonaSelector sessionId={sessionId} onManagePrompts={onManagePrompts} />
             <AttachMenu onAddFiles={() => void handleAddFiles()} onAddFolder={() => void handleAddFolder()} />
           </div>
           <div className="flex items-center gap-3">
