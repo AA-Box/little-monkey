@@ -10,6 +10,7 @@ import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { McpPanel } from "./McpPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
 import { WebPanel } from "./WebPanel";
+import { ApiServerPanel } from "./ApiServerPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -24,7 +25,7 @@ interface SettingsModalProps {
   initialTab?: SettingsTab;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver";
 
 const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
   { id: "local", labelKey: "SettingsModal.tabLocalModels" },
@@ -35,6 +36,7 @@ const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] =
   { id: "mcp", labelKey: "SettingsModal.tabMcp" },
   { id: "prompts", labelKey: "SettingsModal.tabPrompts" },
   { id: "web", labelKey: "SettingsModal.tabWeb" },
+  { id: "apiserver", labelKey: "SettingsModal.tabApiServer" },
 ];
 
 /**
@@ -138,6 +140,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
           {tab === "mcp" && <McpPanel />}
           {tab === "prompts" && <PromptLibraryPanel />}
           {tab === "web" && <WebPanel />}
+          {tab === "apiserver" && <ApiServerPanel />}
         </div>
       </div>
     </div>

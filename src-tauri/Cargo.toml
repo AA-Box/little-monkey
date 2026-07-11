@@ -90,6 +90,24 @@ scraper = "0.27"
 # matches the design doc's description; verified against docs.rs at
 # implementation time rather than assumed from the stale version number.
 dom_smoothie = "0.18.0"
+# server.rs (local OpenAI-compatible API server, phase 1): the design doc
+# named hyper/hyper-util/http-body-util/sha2/rand as already-transitive deps
+# (pulled in via reqwest/tauri/keyring) as of its 2026-07-10 Cargo.lock
+# snapshot — verified still true for hyper/hyper-util/http-body-util/sha2 via
+# `cargo tree -i` against the *current* lockfile (versions below match
+# exactly). `rand` is the one exception: `cargo tree -i rand`/`-i quinn-proto`
+# print nothing against this lockfile — `rand 0.10.2` is listed in Cargo.lock
+# only as reqwest's optional (never-enabled) `http3`/quinn dependency chain,
+# not as a package actually compiled into this build. Adding it here as a
+# direct dependency (pinned to the exact version already recorded in
+# Cargo.lock) is therefore a small real addition to the build graph, not the
+# "zero new downloads" the design doc claimed — the only such deviation among
+# the five crates it named.
+hyper = { version = "1.10.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.3"
+sha2 = "0.10.9"
+rand = "0.10.2"
 
 [dev-dependencies]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
