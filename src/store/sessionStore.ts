@@ -107,6 +107,9 @@ export interface SessionStore {
    * session — NOT by pane — so a pane landing on a session mid-turn shows
    * it as busy and can stop it. Never persisted. */
   runningTurns: Record<string, true>;
+  /** Session ids currently executing a verification command, mapped to that
+   * command's label — see `setRunningVerifyLabel`. Never persisted. */
+  runningVerifyLabel: Record<string, string>;
   /** Last file-persistence failure, surfaced in the UI (ChatWindow banner)
    * instead of silently dropping history; cleared by the next successful
    * save. */
@@ -143,6 +146,13 @@ export interface SessionStore {
   /** Record whether an agent turn is in flight for `sessionId` — called
    * only by `runAgentTurn` (start/finally). */
   markTurnRunning: (sessionId: string, running: boolean) => void;
+  /** Sets (or clears with `null`) the label of the verification command
+   * currently executing for `sessionId` — called only by
+   * `runVerificationPhase` (agentLoop.ts), around each `verify_run` invoke,
+   * so `MessageList` can show a "running <label>…" indicator for
+   * potentially long test suites (see the design doc's "long-running test
+   * suites stall the turn" risk). Mirrors `markTurnRunning`'s shape. */
+  setRunningVerifyLabel: (sessionId: string, label: string | null) => void;
   /** Open `id` in the split pane (no-op if it doesn't exist). Clears the
    * target's `unread` flag, mirroring "opening it marks it read". */
   openSplit: (id: string) => void;
@@ -200,6 +210,12 @@ export function sessionMessages(sessionId: string): ChatMessage[] {
 /** Zustand selector: whether an agent turn is in flight for `sessionId`. */
 export function selectTurnRunning(sessionId: string) {
   return (state: SessionStore): boolean => state.runningTurns[sessionId] === true;
+}
+
+/** Zustand selector: the label of the verification command currently
+ * executing for `sessionId`, or `null` when none is running. */
+export function selectRunningVerifyLabel(sessionId: string) {
+  return (state: SessionStore): string | null => state.runningVerifyLabel[sessionId] ?? null;
 }
 
 function createSession(): ChatSession {
@@ -504,6 +520,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   splitSessionId: null,
   messages: initialSession.messages,
   runningTurns: {},
+  runningVerifyLabel: {},
   persistError: null,
 
   markTurnRunning: (sessionId, running) => {
@@ -513,6 +530,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const runningTurns = { ...state.runningTurns };
       delete runningTurns[sessionId];
       return { runningTurns };
+    });
+  },
+
+  setRunningVerifyLabel: (sessionId, label) => {
+    set((state) => {
+      if (label !== null) return { runningVerifyLabel: { ...state.runningVerifyLabel, [sessionId]: label } };
+      if (!(sessionId in state.runningVerifyLabel)) return state;
+      const runningVerifyLabel = { ...state.runningVerifyLabel };
+      delete runningVerifyLabel[sessionId];
+      return { runningVerifyLabel };
     });
   },
 

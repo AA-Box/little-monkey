@@ -117,6 +117,48 @@ describe('applyContextCompaction', () => {
     expect(marker!.content).toContain('summarization failed');
   });
 
+  it('drops or summarizes a synthetic notice (e.g. [Verify]/[Checkpoint]) sitting mid-history exactly like any other message', async () => {
+    // `applyContextCompaction` never special-cases notice prefixes — it cuts
+    // by user-turn boundaries over the raw message array, so a `[Verify]`
+    // (or `[Checkpoint]`/`[Memory]`) system notice inside the oldest run of
+    // turns is dropped/summarized right along with everything else in that
+    // span. This is what makes verify notices interact safely with
+    // compaction without any dedicated handling in contextTrimmer.ts.
+    const verifyNotice: ChatMessage = { role: 'system', content: `[Verify]${JSON.stringify({ label: 'Lint', kind: 'lint', ok: false, code: 1, output: 'e'.repeat(400), durationMs: 10 })}` };
+    const history = [
+      userMsg('a'.repeat(400)),
+      assistantMsg('b'.repeat(400)),
+      verifyNotice,
+      userMsg('c'.repeat(400)),
+      assistantMsg('d'.repeat(400)),
+      userMsg('e'.repeat(400)),
+      assistantMsg('f'.repeat(400)),
+    ];
+
+    const trimmed = await applyContextCompaction(history, {
+      strategy: 'trim',
+      contextLimit: 700,
+      thresholdPercent: 85,
+      sendForSummary: failingSummary,
+    });
+    expect(trimmed.changed).toBe(true);
+    expect(trimmed.messages).not.toContain(verifyNotice);
+
+    const summarized = await applyContextCompaction(history, {
+      strategy: 'summarize',
+      contextLimit: 700,
+      thresholdPercent: 85,
+      sendForSummary: async (dropped) => {
+        expect(dropped).toContain(verifyNotice);
+        return 'summary covering the verify notice';
+      },
+    });
+    expect(summarized.changed).toBe(true);
+    expect(summarized.messages).not.toContain(verifyNotice);
+    const marker = summarized.messages.find(isCompactionMarker);
+    expect(marker!.content).toContain('summary covering the verify notice');
+  });
+
   it('preserves a leading system prefix', async () => {
     const system: ChatMessage = { role: 'system', content: 'pinned' };
     const history = [system, ...sampleHistory()];

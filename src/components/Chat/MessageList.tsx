@@ -40,7 +40,7 @@ import {
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
-import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
+import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
@@ -588,6 +588,32 @@ function TypingIndicator() {
   );
 }
 
+/**
+ * Shown while a configured verification command is actually executing
+ * (`sessionStore.runningVerifyLabel`, set/cleared by `runVerificationPhase`
+ * in agentLoop.ts) — a dedicated "running <label>…" row rather than the bare
+ * `TypingIndicator`, since test suites can run for minutes (up to a
+ * command's `timeout_secs`) and a bouncing-dots bubble alone would read as a
+ * hang (see the design doc's "long-running test suites stall the turn"
+ * risk). Same bounce animation, kept visually related to `TypingIndicator`.
+ */
+function VerifyRunningRow({ label }: { label: string }) {
+  const { t } = useT();
+  return (
+    <div className="flex justify-center">
+      <div className="flex items-center gap-2 rounded-md border border-border bg-surface-2 px-3 py-1.5 text-xs text-muted">
+        <ClipboardCheck size={13} className="shrink-0 text-faint" />
+        <span className="truncate">{t("MessageList.verifyRunning", { label })}</span>
+        <span className="flex items-center gap-1">
+          <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.3s]" />
+          <span className="h-1 w-1 animate-bounce rounded-full bg-faint [animation-delay:-0.15s]" />
+          <span className="h-1 w-1 animate-bounce rounded-full bg-faint" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function EmptyState() {
   const { t } = useT();
   return (
@@ -628,6 +654,7 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
 
   const items = buildTimeline(messages);
   const showRetry = Boolean(onRetry) && !editingDisabled && canRetry(messages);
+  const runningVerifyLabel = useSessionStore(selectRunningVerifyLabel(sessionId));
 
   return (
     <div
@@ -679,6 +706,7 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             return <TypingIndicator key={item.key} />;
           })}
+          {runningVerifyLabel && <VerifyRunningRow label={runningVerifyLabel} />}
           {showRetry && (
             <div className="flex justify-start">
               <button

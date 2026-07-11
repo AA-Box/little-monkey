@@ -58,6 +58,11 @@ const STRATEGY_OPTIONS: { value: ContextTrimStrategy; labelKey: string; descript
   { value: "trim", labelKey: "AutomationPanel.strategyTrimLabel", descriptionKey: "AutomationPanel.strategyTrimDescription" },
 ];
 
+/** Mirrors `DEFAULT_VERIFY_TIMEOUT_SECS` in `src-tauri/src/verify.rs` — shown
+ * only as the timeout input's placeholder (an empty field means "use the
+ * backend default", not literally 0). */
+const DEFAULT_VERIFY_TIMEOUT_SECS = 300;
+
 const VERIFY_KIND_OPTIONS: { value: VerifyCommandKind; labelKey: string }[] = [
   { value: "lint", labelKey: "AutomationPanel.verifyKindLint" },
   { value: "test", labelKey: "AutomationPanel.verifyKindTest" },
@@ -106,6 +111,18 @@ function VerifyCommandRow({ command }: { command: VerifyCommand }) {
           </option>
         ))}
       </select>
+      <input
+        type="number"
+        min={1}
+        value={command.timeoutSecs ?? ""}
+        placeholder={String(DEFAULT_VERIFY_TIMEOUT_SECS)}
+        title={t("AutomationPanel.verifyTimeoutLabel")}
+        aria-label={t("AutomationPanel.verifyTimeoutAriaLabel", { label: command.label || command.command })}
+        onChange={(event) =>
+          void updateCommand(command.id, { timeoutSecs: event.target.value ? Number(event.target.value) : undefined })
+        }
+        className="h-8 w-16 shrink-0 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+      />
       <button
         type="button"
         role="switch"

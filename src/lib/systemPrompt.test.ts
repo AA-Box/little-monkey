@@ -135,6 +135,16 @@ describe('buildSystemPrompt', () => {
     expect(prompt).not.toContain('web_fetch');
     expect(prompt).not.toContain('web_search');
   });
+
+  it('omits the verification guidance line by default (verifyGuidanceAvailable defaults to false)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('Configured verification commands');
+  });
+
+  it('includes the verification guidance line only when verifyGuidanceAvailable is true', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, true);
+    expect(prompt).toContain('Configured verification commands run automatically after your edits; fix any failures they report.');
+  });
 });
 
 describe('composeSystemPrompt', () => {
