@@ -110,6 +110,29 @@ pub fn prompts_save(
     Ok(())
 }
 
+/// Read an arbitrary file's contents as UTF-8 text, for the Settings
+/// "Prompts" tab's Import button. `path` comes from a user-picked OS file
+/// dialog (`@tauri-apps/plugin-dialog`'s `open()`), not a workspace-relative
+/// path — unlike every `tool_*` command this deliberately does NOT go
+/// through `workspace::resolve_path_and_root` and is NOT routed through
+/// `permissions::request_permission`. Same precedent as `git_commit` /
+/// `checkpoint_revert` / `rules_write`: the human already picked exactly
+/// this file via a native dialog, so there is nothing to gate. It also isn't
+/// model-callable regardless, since it's a plain command name, not a
+/// `tool_*` one the agent loop dispatches.
+#[tauri::command]
+pub fn prompts_read_external(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read '{}': {}", path, e))
+}
+
+/// Write `payload` verbatim to an arbitrary file, for the Settings "Prompts"
+/// tab's Export button. Same rationale as [`prompts_read_external`] for why
+/// this skips both the workspace sandbox and the permission system.
+#[tauri::command]
+pub fn prompts_write_external(path: String, payload: String) -> Result<(), String> {
+    std::fs::write(&path, payload).map_err(|e| format!("Failed to write '{}': {}", path, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +207,34 @@ mod tests {
         assert_eq!(entry.description.as_deref(), Some("Reviews diffs for bugs"));
         assert_eq!(entry.created_at, 1700000000000);
         assert_eq!(entry.updated_at, 1700000000000);
+    }
+
+    #[test]
+    fn read_external_returns_err_for_missing_file() {
+        let path = temp_file();
+        assert!(prompts_read_external(path.to_string_lossy().into_owned()).is_err());
+    }
+
+    #[test]
+    fn write_then_read_external_roundtrips_arbitrary_path() {
+        let path = temp_file();
+        let payload = r#"{"version":1,"entries":[]}"#;
+        prompts_write_external(path.to_string_lossy().into_owned(), payload.to_string()).unwrap();
+        let read = prompts_read_external(path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(read, payload);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_external_overwrites_existing_file() {
+        let path = temp_file();
+        prompts_write_external(path.to_string_lossy().into_owned(), "first".to_string()).unwrap();
+        prompts_write_external(path.to_string_lossy().into_owned(), "second".to_string()).unwrap();
+        assert_eq!(
+            prompts_read_external(path.to_string_lossy().into_owned()).unwrap(),
+            "second"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -5,7 +5,16 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
-import { findByCommand, hydratePrompts, selectPersonas, selectSnippets, usePromptStore, type PromptEntry } from "./promptStore";
+import {
+  findByCommand,
+  hydratePrompts,
+  ImportParseError,
+  parseImportPayload,
+  selectPersonas,
+  selectSnippets,
+  usePromptStore,
+  type PromptEntry,
+} from "./promptStore";
 
 /** Resets the singleton store to empty, as if freshly hydrated with no
  * saved prompts. */
@@ -167,5 +176,92 @@ describe("hydratePrompts", () => {
     expect(entries[0].name).toBe("Untitled");
     expect(entries[0].command).toBe("");
     expect(entries[0].content).toBe("");
+  });
+});
+
+describe("importEntries", () => {
+  it("adds every incoming entry with a fresh id and timestamps", () => {
+    const incoming: PromptEntry[] = [
+      { id: "external-1", kind: "snippet", name: "Standup", command: "standup", content: "c", createdAt: 1, updatedAt: 1 },
+      { id: "external-2", kind: "persona", name: "Reviewer", command: "reviewer", content: "c", createdAt: 1, updatedAt: 1 },
+    ];
+
+    const added = usePromptStore.getState().importEntries(incoming);
+
+    expect(added).toBe(2);
+    const entries = usePromptStore.getState().entries;
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.command).sort()).toEqual(["reviewer", "standup"]);
+    // Ids are regenerated, never carried over from the source file.
+    expect(entries.every((e) => e.id !== "external-1" && e.id !== "external-2")).toBe(true);
+  });
+
+  it("renames the imported entry's command on collision instead of overwriting the existing one", () => {
+    seed([{ id: "1", kind: "snippet", name: "Existing", command: "review", content: "old", createdAt: 1, updatedAt: 1 }]);
+
+    const added = usePromptStore
+      .getState()
+      .importEntries([{ id: "x", kind: "snippet", name: "Incoming", command: "review", content: "new", createdAt: 1, updatedAt: 1 }]);
+
+    expect(added).toBe(1);
+    const entries = usePromptStore.getState().entries;
+    expect(entries).toHaveLength(2);
+    const existing = entries.find((e) => e.name === "Existing");
+    const imported = entries.find((e) => e.name === "Incoming");
+    expect(existing?.command).toBe("review");
+    expect(existing?.content).toBe("old"); // never overwritten
+    expect(imported?.command).toBe("review-2");
+  });
+
+  it("uniquifies commands within the same import batch, not just against the existing library", () => {
+    const added = usePromptStore.getState().importEntries([
+      { id: "a", kind: "snippet", name: "A", command: "dup", content: "1", createdAt: 1, updatedAt: 1 },
+      { id: "b", kind: "snippet", name: "B", command: "dup", content: "2", createdAt: 1, updatedAt: 1 },
+    ]);
+
+    expect(added).toBe(2);
+    const commands = usePromptStore.getState().entries.map((e) => e.command).sort();
+    expect(commands).toEqual(["dup", "dup-2"]);
+  });
+});
+
+describe("parseImportPayload", () => {
+  it("throws ImportParseError for invalid JSON", () => {
+    expect(() => parseImportPayload("not json{")).toThrow(ImportParseError);
+  });
+
+  it("throws ImportParseError for valid JSON in an unrecognized shape", () => {
+    expect(() => parseImportPayload(JSON.stringify({ foo: "bar" }))).toThrow(ImportParseError);
+  });
+
+  it("parses this app's own export shape", () => {
+    const payload = JSON.stringify({
+      version: 1,
+      entries: [{ id: "1", kind: "snippet", name: "N", command: "n", content: "c", createdAt: 1, updatedAt: 1 }],
+    });
+    const entries = parseImportPayload(payload);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].name).toBe("N");
+  });
+
+  it("adapts Cherry Studio's exported agents JSON shape into personas", () => {
+    const payload = JSON.stringify([
+      { name: "Code Reviewer", prompt: "You are a meticulous code reviewer.", description: "Reviews diffs" },
+      { name: "Rust Mentor", prompt: "You teach idiomatic Rust." },
+    ]);
+
+    const entries = parseImportPayload(payload);
+
+    expect(entries).toHaveLength(2);
+    expect(entries.every((e) => e.kind === "persona")).toBe(true);
+    expect(entries[0].name).toBe("Code Reviewer");
+    expect(entries[0].content).toBe("You are a meticulous code reviewer.");
+    expect(entries[0].command).toBe("code-reviewer");
+    expect(entries[0].description).toBe("Reviews diffs");
+    expect(entries[1].description).toBeUndefined();
+  });
+
+  it("does not misidentify an arbitrary array as Cherry Studio's shape", () => {
+    expect(() => parseImportPayload(JSON.stringify([{ foo: "bar" }, 1, "two"]))).toThrow(ImportParseError);
   });
 });

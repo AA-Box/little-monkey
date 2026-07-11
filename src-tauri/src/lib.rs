@@ -145,6 +145,8 @@ pub fn run() {
             sessions::sessions_save,
             prompts::prompts_load,
             prompts::prompts_save,
+            prompts::prompts_read_external,
+            prompts::prompts_write_external,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,
