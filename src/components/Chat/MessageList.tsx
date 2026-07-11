@@ -8,6 +8,7 @@ import {
   FileSearch,
   FileText,
   Folder,
+  Globe,
   MessageSquareX,
   Plug,
   RefreshCw,
@@ -183,6 +184,7 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   grep: Search,
   glob: FileSearch,
   remember: Brain,
+  web_fetch: Globe,
 };
 
 function toolIcon(name: string): LucideIcon {

@@ -123,6 +123,16 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain(`MCP server 'Verbose': ${'x'.repeat(1000)}…`);
     expect(prompt).not.toContain('x'.repeat(1001));
   });
+
+  it('mentions web_fetch by default (webToolsAvailable defaults to true)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).toContain('web_fetch');
+  });
+
+  it('omits the web tools guidance line when webToolsAvailable is false', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], false);
+    expect(prompt).not.toContain('web_fetch');
+  });
 });
 
 describe('composeSystemPrompt', () => {

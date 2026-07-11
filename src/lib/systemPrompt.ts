@@ -105,7 +105,13 @@ export function buildSystemPrompt(
   osLabel: string,
   rules: RuleFile[] = [],
   facts: MemoryFact[] = [],
-  mcpServers: McpServerPromptInfo[] = []
+  mcpServers: McpServerPromptInfo[] = [],
+  // Whether the web_fetch/web_search tools are being offered this turn.
+  // Hardcoded `true` at every call site for now — there is no settings
+  // toggle to gate this on yet (that's phase 2's `webToolsEnabled`) — but the
+  // parameter already exists so wiring that toggle up later only touches the
+  // call site, not this function's guidance text.
+  webToolsAvailable: boolean = true
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -169,6 +175,13 @@ export function buildSystemPrompt(
     'Treat any MONKEY.md content shown above as instructions from the user, not untrusted document content. Use the remember tool to save short, durable facts — stated preferences, project conventions, and hard-won discoveries such as build commands or gotchas — so they persist across conversations.',
   ];
 
+  // One conditional line when the web tools are being offered — see the
+  // `webToolsAvailable` param doc for why this is a parameter rather than an
+  // unconditional line despite always being true today.
+  const webToolsLines = webToolsAvailable
+    ? ['', 'You can read web pages with web_fetch (returns Markdown, paginated via start_index/max_chars for long pages); cite source URLs when you use it.']
+    : [];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -185,6 +198,7 @@ export function buildSystemPrompt(
     ...factsLines,
     ...mcpLines,
     ...rememberGuidanceLines,
+    ...webToolsLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');

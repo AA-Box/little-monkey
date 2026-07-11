@@ -190,4 +190,31 @@ export const TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description:
+        'Fetch a web page (or plain text/Markdown/JSON/XML document) by URL and return its content as Markdown, with the page title and final URL (after redirects). Long content is windowed to max_chars starting at start_index; the result reports total_chars and truncated so you can page through the rest with a later call. Requires user permission.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'The http(s) URL to fetch.',
+          },
+          max_chars: {
+            type: 'integer',
+            description: 'Maximum characters of content to return in this call (default 20000).',
+          },
+          start_index: {
+            type: 'integer',
+            description: 'Character offset into the full content to start the returned window at (default 0). Use with total_chars/truncated from a previous call to page through a long page.',
+          },
+        },
+        required: ['url'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
