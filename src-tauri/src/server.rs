@@ -110,6 +110,18 @@ const TOKEN_PREFIX: &str = "lmk-";
 /// same file-per-feature pattern as `providers.json`/`web_settings.json`.
 const CONFIG_FILE: &str = "api_server.json";
 
+/// Hard cap on a request body this server will buffer into memory, enforced
+/// by [`read_capped_body`] as it streams frames in (never after the fact —
+/// buffering the whole thing first and checking the length would defeat the
+/// point). Chat-completion payloads can legitimately run to several MB
+/// (inline base64 image content for multimodal messages), so this is set
+/// generously rather than to a tight "small JSON payload" bound — it exists
+/// only to put a ceiling on a malicious or mistaken caller's memory impact,
+/// the same "streamed cap regardless of what Content-Length claims" stance
+/// `web.rs::MAX_BODY_BYTES` takes for fetched page bodies (see the
+/// security-review finding this addresses).
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Boxed error type for [`ResponseBody`] — reqwest's streaming errors and
 /// our own infallible bodies both erase to this.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -144,6 +156,17 @@ pub struct ApiServerState {
     /// this is the other half.
     pub last_request_at: Option<u64>,
     pub last_error: Option<String>,
+    /// `JoinHandle` of the currently-spawned [`run_accept_loop`] task, so
+    /// [`stop_server_core`] can `.await` it — actually confirming the task
+    /// observed the `shutdown` notify, broke out of its `select!`, and
+    /// dropped its `TcpListener` (freeing the port) — before reporting
+    /// "stopped" or letting a caller (e.g. `start_server_core`'s own
+    /// restart path) attempt to rebind the same port. Without this, a
+    /// same-port restart races the old listener's teardown against the new
+    /// bind and fails almost every time with "Address already in use" (see
+    /// the review finding this addresses). Never serialized/cloned — this
+    /// is pure internal bookkeeping, never part of [`ApiServerStatusPayload`].
+    accept_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ApiServerState {
@@ -155,6 +178,7 @@ impl Default for ApiServerState {
             request_count: 0,
             last_request_at: None,
             last_error: None,
+            accept_task: None,
         }
     }
 }
@@ -642,7 +666,9 @@ fn cors_preflight_response() -> Response<ResponseBody> {
 /// returns (not just `/v1/*`) — a browser-based client fetching `/health`
 /// benefits too, and there's nothing origin-sensitive being protected here
 /// (the bearer token, not the browser's same-origin policy, is the actual
-/// gate).
+/// gate). This is only true because [`authenticate`] always requires a real
+/// token for any request carrying an `Origin` header, even when
+/// `require_token` is off — see its doc comment.
 fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
     resp.headers_mut()
         .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
@@ -657,7 +683,23 @@ fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
 /// handlers must still check `auth.scopes`/`auth.backends`. `Err(response)`
 /// is the exact response to return immediately.
 fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
-    if !deps.require_token {
+    // `require_token: false` is documented (module doc comment) as an escape
+    // hatch for tools that literally can't set a custom header — it was
+    // never meant to also hand out unauthenticated access to whatever
+    // webpage the user happens to have open in a browser tab. A browser
+    // always attaches an `Origin` header on a cross-origin fetch/XHR (and,
+    // per the Fetch spec, on most same-origin non-`GET` ones too); a genuine
+    // "can't set headers" tool never sends one. So treat a request carrying
+    // an `Origin` header as always requiring a real bearer token, regardless
+    // of the `require_token` toggle — this is what actually backs up
+    // `with_cors`'s "the bearer token is the real gate" reasoning, which
+    // this server's wildcard `Access-Control-Allow-Origin: *` otherwise
+    // leaves with no gate at all whenever `require_token` is off (the
+    // security-review finding this closes: without it, any open browser tab
+    // could silently drive `/v1/chat/completions` — including a live,
+    // credential-spending provider call — with zero authentication).
+    let browser_request = headers.contains_key(header::ORIGIN);
+    if !deps.require_token && !browser_request {
         return Ok(None);
     }
 
@@ -702,6 +744,27 @@ fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<Option<TokenAu
     ))
 }
 
+/// Whether a token (if any) is allowed to see/route to `backend` — split out
+/// as a pure, directly unit-testable helper (no I/O), mirroring
+/// [`route_backend`]'s style. `None` (no matched token, i.e. `require_token`
+/// off) always allows every backend, the same "nothing to restrict" stance
+/// every other route's `if let Some(auth) = authed` check already takes.
+/// [`handle_models`] uses this to gate each section of the merged listing —
+/// see its doc comment for why this must hold there too, not just in
+/// `handle_chat_completions`/`handle_embeddings`.
+fn backend_visible(authed: Option<&TokenAuth>, backend: Backend) -> bool {
+    authed.map_or(true, |auth| auth.backends.contains(&backend))
+}
+
+/// `GET /v1/models`. Every section of the merged listing is gated on BOTH
+/// the matching `deps.expose_*` global toggle AND (via [`backend_visible`])
+/// the token's own `backends` restriction — the same two-independent-gates
+/// invariant `handle_chat_completions`/`handle_embeddings` already enforce
+/// before ever routing a request to a backend (see the module doc comment).
+/// Before this fix, only `scopes` was checked here, so a token deliberately
+/// scoped away from `Backend::Providers`/`Backend::Ollama` could still
+/// enumerate — and, for providers, trigger a live authenticated network call
+/// against — every configured backend via this one route.
 async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Response<ResponseBody> {
     if let Some(auth) = authed {
         if !auth.scopes.contains(&Scope::Models) {
@@ -711,7 +774,7 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
 
     let mut data = Vec::new();
 
-    if deps.llama_ready {
+    if deps.llama_ready && backend_visible(authed, Backend::Local) {
         if let Some(stem) = &deps.llama_model_stem {
             data.push(json!({ "id": stem, "object": "model", "owned_by": "local" }));
         }
@@ -722,8 +785,11 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     // "Ollama model listing latency" risk note. Gated behind the config's
     // `expose_ollama` toggle: when it's off, `/v1/models` must only ever
     // advertise what will actually serve — see the design doc's "Jan
-    // pitfall to avoid" note.
-    if deps.expose_ollama {
+    // pitfall to avoid" note. Also gated on `Backend::Ollama` visibility —
+    // a token not scoped for the `ollama` backend must never see (or cause a
+    // request against) it, exactly like `handle_chat_completions` already
+    // enforces for that backend.
+    if deps.expose_ollama && backend_visible(authed, Backend::Ollama) {
         match ollama::list_tag_names(&deps.client).await {
             Ok(tags) => {
                 for tag in tags {
@@ -746,8 +812,12 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     // or unreachable (`fetch_models` err) is just omitted, same
     // "unreachable is normal, don't fail the whole list" stance as Ollama
     // above — a misconfigured provider shouldn't take `/v1/models` down for
-    // every other backend.
-    if deps.expose_providers {
+    // every other backend. Also gated on `Backend::Providers` visibility —
+    // without this, a token scoped away from `providers` could still force a
+    // real keychain read + authenticated outbound request to every
+    // configured cloud provider just by calling this route (the exact
+    // security-review finding this gate closes).
+    if deps.expose_providers && backend_visible(authed, Backend::Providers) {
         for provider in &deps.providers {
             let Ok(api_key) = providers::read_key(&provider.id) else { continue };
             if let Ok(models) = providers::fetch_models(&provider.base_url, &provider.id, &api_key).await {
@@ -1182,17 +1252,62 @@ async fn probe_llama_server(client: &reqwest::Client, port: u16) -> (bool, Optio
     (true, model_id)
 }
 
-/// Buffers a real hyper request's body into a single `Bytes` (unbounded —
-/// chat-completion request bodies are small JSON payloads, unlike
-/// `web.rs::tool_web_fetch`'s arbitrary-page responses, which do need a cap)
-/// and hands off to the `AppHandle`-free [`handle_request`] core.
+/// Streams a real hyper request's body in frame by frame, rejecting it the
+/// moment the running total would exceed [`MAX_REQUEST_BODY_BYTES`] — unlike
+/// `Incoming::collect()`, this never buffers past the cap, so an oversized
+/// body can't force an unbounded allocation before it's rejected (the
+/// security-review finding this addresses: `collect()` used to buffer the
+/// *entire* body — no matter how large — before `handle_request` had even
+/// looked at the Authorization header). A read that fails partway through
+/// (client disconnect, malformed chunked encoding) is reported as its own
+/// distinct `400 body_read_error`, rather than silently substituting an
+/// empty body and letting it fail later as a confusing generic "Invalid JSON
+/// body" — a second, independently-reported review finding.
+/// Generic over the body type (rather than hardcoded to [`Incoming`]) purely
+/// so unit tests can drive it with a synthetic `StreamBody` instead of a real
+/// hyper connection — [`serve_one_request`] always calls it with a real
+/// `Incoming` and [`MAX_REQUEST_BODY_BYTES`].
+async fn read_capped_body<B>(mut body: B, limit: usize) -> Result<Bytes, Response<ResponseBody>>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let Some(data) = frame.data_ref() else { continue };
+                if collected.len() + data.len() > limit {
+                    return Err(with_cors(error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!("Request body exceeds the {limit}-byte limit."),
+                        "request_too_large",
+                    )));
+                }
+                collected.extend_from_slice(data);
+            }
+            Some(Err(_)) => {
+                return Err(with_cors(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "The request body could not be fully read — the connection was interrupted or the transfer encoding was malformed.",
+                    "body_read_error",
+                )));
+            }
+            None => break,
+        }
+    }
+    Ok(Bytes::from(collected))
+}
+
+/// Adapts a real hyper request into the `AppHandle`-free [`handle_request`]
+/// core: reads the body (capped — see [`read_capped_body`]) and hands
+/// everything off unchanged.
 async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
-    let body = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => Bytes::new(),
+    let body = match read_capped_body(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(response) => return Ok((response, None)),
     };
 
     Ok(handle_request(&deps, ServerRequest { method, path, headers, body }).await)
@@ -1232,6 +1347,15 @@ fn record_token_used(app: &AppHandle, token_id: &str) {
     record_token_used_with_state(&app.state::<AppState>(), &path, token_id);
 }
 
+/// The accept loop. Exits only when `shutdown` is notified — `stop_server_core`
+/// is the only caller of that, and it `.await`s this task's `JoinHandle`
+/// specifically so it can rely on `listener` having actually been dropped
+/// (freeing the port) by the time it returns. Status bookkeeping ("stopped",
+/// clearing `shutdown`/`accept_task`) is deliberately NOT done here — it's
+/// `stop_server_core`'s job, since it already took both fields out of
+/// `ApiServerState` before notifying this loop, and doing it here too would
+/// race that same-port-restart concern right back in (see the review finding
+/// `ApiServerState::accept_task`'s doc comment addresses).
 async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<Notify>, runtime: Arc<ServerRuntime>) {
     loop {
         tokio::select! {
@@ -1262,14 +1386,8 @@ async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<No
             }
         }
     }
-
-    if let Ok(mut s) = app.state::<AppState>().api_server.lock() {
-        s.status = "stopped".to_string();
-        s.shutdown = None;
-    }
-    if let Ok(s) = app.state::<AppState>().api_server.lock() {
-        emit_status(&app, &status_payload(&s));
-    }
+    // `listener` drops here as the function returns — the exact event
+    // `stop_server_core` is waiting for by awaiting this task's handle.
 }
 
 /// Attempts to bind `port` on loopback only. Split out from
@@ -1419,7 +1537,12 @@ fn req_log_hint(token_id: Option<&str>) -> String {
 /// restart) can call this with just an `AppHandle`.
 async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
     let state = app.state::<AppState>();
-    let _ = stop_server_core(app);
+    // Awaited (not fire-and-forget) — see `ApiServerState::accept_task`'s
+    // doc comment: without actually waiting for a previous instance's accept
+    // loop to observe the shutdown notify and drop its `TcpListener`, the
+    // `bind_listener` call below would race that teardown and fail almost
+    // every time on a same-port restart.
+    let _ = stop_server_core(app).await;
 
     let config = load_config_impl(&config_file_path(app)?)?;
 
@@ -1458,20 +1581,42 @@ async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, St
         expose_providers: config.expose_providers,
     });
 
-    tokio::spawn(run_accept_loop(app.clone(), listener, shutdown, runtime));
+    let accept_task = tokio::spawn(run_accept_loop(app.clone(), listener, shutdown, runtime));
+    if let Ok(mut s) = state.api_server.lock() {
+        s.accept_task = Some(accept_task);
+    }
 
     Ok(payload)
 }
 
 /// Stops the server if running (a no-op, not an error, if it's already
-/// stopped).
-fn stop_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
+/// stopped). Async — and must stay that way — because it `.await`s the
+/// accept loop's `JoinHandle` after notifying it, so the port is
+/// *guaranteed* free by the time this returns (see
+/// `ApiServerState::accept_task`'s doc comment). Every caller (the
+/// `api_server_stop` command, `start_server_core`'s own leading call,
+/// `api_server_set_config`'s restart path) awaits this for exactly that
+/// reason.
+async fn stop_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
     let state = app.state::<AppState>();
+    let (shutdown, accept_task) = {
+        let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
+        (s.shutdown.take(), s.accept_task.take())
+    };
+    if let Some(shutdown) = shutdown {
+        shutdown.notify_one();
+    }
+    if let Some(accept_task) = accept_task {
+        // The actual fix: block until the accept loop has broken out of its
+        // `select!` and dropped its `TcpListener`, not just until we've
+        // asked it to. A plain `notify_one()` with no `.await` here is
+        // exactly the bug this addresses — the task may not even have been
+        // polled yet when the caller goes on to rebind the same port.
+        let _ = accept_task.await;
+    }
+
     let payload = {
         let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
-        if let Some(shutdown) = s.shutdown.take() {
-            shutdown.notify_one();
-        }
         s.status = "stopped".to_string();
         status_payload(&s)
     };
@@ -1489,8 +1634,8 @@ pub async fn api_server_start(app: AppHandle) -> Result<ApiServerStatusPayload, 
 }
 
 #[tauri::command]
-pub fn api_server_stop(app: AppHandle) -> Result<ApiServerStatusPayload, String> {
-    stop_server_core(&app)
+pub async fn api_server_stop(app: AppHandle) -> Result<ApiServerStatusPayload, String> {
+    stop_server_core(&app).await
 }
 
 /// Returns the current status snapshot — same shape as the
@@ -1560,7 +1705,7 @@ pub async fn api_server_set_config(
 ) -> Result<ApiServerConfigView, String> {
     let (updated, needs_restart) = set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
     if needs_restart {
-        stop_server_core(&app)?;
+        stop_server_core(&app).await?;
         start_server_core(&app).await?;
     }
     Ok(ApiServerConfigView::from(&updated))
@@ -2601,5 +2746,204 @@ mod tests {
         assert!(result.is_err());
         drop(blocker);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -------------------------------------------------------------
+    // Review-finding regressions
+    // -------------------------------------------------------------
+
+    #[test]
+    fn backend_visible_allows_everything_when_no_token_is_matched() {
+        assert!(backend_visible(None, Backend::Local));
+        assert!(backend_visible(None, Backend::Ollama));
+        assert!(backend_visible(None, Backend::Providers));
+    }
+
+    #[test]
+    fn backend_visible_respects_a_matched_tokens_backend_list() {
+        let auth = TokenAuth { id: "t".to_string(), scopes: vec![Scope::Models], backends: vec![Backend::Local] };
+        assert!(backend_visible(Some(&auth), Backend::Local));
+        assert!(!backend_visible(Some(&auth), Backend::Ollama));
+        assert!(!backend_visible(Some(&auth), Backend::Providers));
+    }
+
+    /// The core regression for the `handle_models` finding: a token scoped
+    /// away from `Backend::Local` must not see the locally-managed model in
+    /// the merged listing, even though `scopes` alone (the pre-fix check)
+    /// would have let it through.
+    #[tokio::test]
+    async fn models_endpoint_omits_the_local_model_for_a_token_not_scoped_for_the_local_backend() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token(
+            "tok-no-local",
+            "lmk-no-local",
+            vec![Scope::Models],
+            vec![Backend::Ollama, Backend::Providers],
+        )];
+
+        let req = with_bearer(get_request("/v1/models"), "lmk-no-local");
+        let (resp, _) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = value["data"].as_array().unwrap();
+        assert!(
+            data.iter().all(|m| m["owned_by"] != "local"),
+            "a token without the `local` backend must never see the locally-managed model"
+        );
+    }
+
+    /// Positive control for the test above: a token that DOES carry
+    /// `Backend::Local` still sees the local model, so the new gate isn't
+    /// simply hiding everything.
+    #[tokio::test]
+    async fn models_endpoint_includes_the_local_model_for_a_token_scoped_for_the_local_backend() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token("tok-local", "lmk-local", vec![Scope::Models], vec![Backend::Local])];
+
+        let req = with_bearer(get_request("/v1/models"), "lmk-local");
+        let (resp, _) = handle_request(&deps, req).await;
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = value["data"].as_array().unwrap();
+        assert!(data.iter().any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
+    }
+
+    /// The core regression for the CORS/`require_token: false` finding: a
+    /// browser-style request (one carrying an `Origin` header, exactly what
+    /// a same-page or cross-origin `fetch`/`XHR` always attaches) must still
+    /// be rejected without a valid bearer token, even when `require_token`
+    /// is off — otherwise the server's own wildcard
+    /// `Access-Control-Allow-Origin: *` would let any webpage the user has
+    /// open drive `/v1/chat/completions` (including a real, credential-
+    /// spending provider call) with zero authentication.
+    #[tokio::test]
+    async fn a_request_carrying_an_origin_header_is_never_exempt_from_auth_even_when_require_token_is_off() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = false;
+        deps.tokens = vec![stored_token("tok-1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local])];
+
+        let mut req = get_request("/v1/models");
+        req.headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(matched.is_none());
+
+        // The same request WITH a valid bearer token must still succeed —
+        // this isn't a blanket ban on `Origin`, just a requirement that a
+        // real token accompany it.
+        let mut authed_req = get_request("/v1/models");
+        authed_req.headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        let authed_req = with_bearer(authed_req, "lmk-real-token");
+        let (resp, matched) = handle_request(&deps, authed_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(matched.as_deref(), Some("tok-1"));
+    }
+
+    /// Regression guard: a request with NO `Origin` header (a normal
+    /// non-browser HTTP client — curl, an SDK, an IDE plugin) must keep
+    /// working with no token at all when `require_token` is off, exactly
+    /// the documented escape hatch for tools that can't set custom headers —
+    /// the fix above must not accidentally require a token universally.
+    #[tokio::test]
+    async fn a_request_with_no_origin_header_still_needs_no_token_when_require_token_is_off() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = false;
+
+        let (resp, matched) = handle_request(&deps, get_request("/v1/models")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matched.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_capped_body_returns_the_bytes_when_well_within_the_limit() {
+        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"hello world")))]);
+        let bytes = read_capped_body(StreamBody::new(stream), 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_capped_body_rejects_a_single_oversized_frame_with_413() {
+        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"0123456789")))]);
+        let response = read_capped_body(StreamBody::new(stream), 4).await.unwrap_err();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = body_bytes(response).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "request_too_large");
+    }
+
+    /// The running total, not just any single frame in isolation, must be
+    /// checked against the limit — otherwise a caller could smuggle an
+    /// arbitrarily large body past the cap by splitting it into many
+    /// small-enough frames (exactly what a real chunked-encoded upload from
+    /// an oversized client would look like at the hyper frame level).
+    #[tokio::test]
+    async fn read_capped_body_catches_an_oversized_body_split_across_many_small_frames() {
+        let stream = futures_util::stream::iter(vec![
+            Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"12345"))),
+            Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"67890"))),
+        ]);
+        let response = read_capped_body(StreamBody::new(stream), 6).await.unwrap_err();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The core regression for the "partial read silently becomes an empty
+    /// body" finding: a failed frame read must surface as its own distinct
+    /// `400 body_read_error`, never as `Ok(Bytes::new())`.
+    #[tokio::test]
+    async fn read_capped_body_reports_a_distinct_error_instead_of_silently_substituting_an_empty_body() {
+        let stream = futures_util::stream::iter(vec![Err::<Frame<Bytes>, BoxError>("simulated connection drop".into())]);
+        let response = read_capped_body(StreamBody::new(stream), 1024).await.unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = body_bytes(response).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "body_read_error");
+    }
+
+    /// Pins down the actual fix for the restart-race finding:
+    /// `stop_server_core` must `.await` the accept loop's `JoinHandle` (which
+    /// only resolves once the task has broken out of its `select!` and
+    /// dropped its `TcpListener`) before a caller attempts to rebind the same
+    /// port — a synchronous `notify_one()` alone is not enough, since the
+    /// spawned task may not even have been polled yet. This mirrors
+    /// `run_accept_loop`'s exact `tokio::select!` shape without needing a
+    /// real `AppHandle`, run several times to make sure it isn't a fluke.
+    #[tokio::test]
+    async fn awaiting_the_accept_loops_join_handle_before_rebinding_avoids_the_restart_race() {
+        for _ in 0..20 {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let shutdown = Arc::new(Notify::new());
+            let listener = bind_listener(port).await.unwrap();
+            let shutdown_for_task = shutdown.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown_for_task.notified() => break,
+                        _ = listener.accept() => {}
+                    }
+                }
+                // `listener` dropped here, exactly like `run_accept_loop`.
+            });
+
+            // Give the spawned task a chance to actually be polled at least
+            // once, so it's genuinely sitting inside `select!` — matching
+            // production, where the accept loop has been running for a
+            // while before any restart is triggered.
+            tokio::task::yield_now().await;
+
+            shutdown.notify_one();
+            handle.await.unwrap();
+
+            let rebound = bind_listener(port).await;
+            assert!(
+                rebound.is_ok(),
+                "rebinding immediately after joining the accept loop's task must succeed every time, not race the old listener's teardown"
+            );
+        }
     }
 }
