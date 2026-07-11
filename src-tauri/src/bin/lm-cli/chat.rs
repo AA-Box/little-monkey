@@ -51,6 +51,13 @@ pub struct ChatOptions {
     /// capability instead; without this, non-native prompts pass through
     /// verbatim).
     pub attach_images: bool,
+    /// `--verify`/`--no-verify` — see `agent::run_verification_phase`. Not a
+    /// wire-protocol option (nothing here is sent to the model directly);
+    /// carried on `ChatOptions` purely so it travels the same
+    /// flag-parsing-to-`run_turn` path as everything else `ChatFlags`
+    /// collects, rather than threading a separate parameter through
+    /// `chat_setup`/`chat_loop`/`repl::run`.
+    pub verify: bool,
 }
 
 /// Parses a `--format` value: `json`, an inline JSON schema, or `@path` to a

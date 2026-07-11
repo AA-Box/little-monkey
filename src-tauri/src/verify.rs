@@ -143,6 +143,22 @@ fn resolve_root_key(state: &AppState, workspace_path: Option<&str>) -> Result<St
     Ok(canon.to_string_lossy().to_string())
 }
 
+/// AppHandle-free lookup of a single workspace's verify config directly from
+/// disk, given an already-resolved `configs_path` and the workspace's
+/// canonicalized `root` — the same key shape `resolve_root_key` produces
+/// (`root.to_string_lossy()`), just without needing an `AppState`/`AppHandle`
+/// to derive either from. `lm-cli` (`verify_cli.rs`) computes `configs_path`
+/// via the same hardcoded-identifier app-data convention `providers_cli.rs`
+/// uses for `providers.json`, so both binaries read the exact same
+/// `verify_configs.json` the desktop app's Settings > Verification tab
+/// writes. Degrades to an empty `VerifyConfig` (no commands) for a
+/// missing/corrupt file or an unconfigured root — never an error, matching
+/// `verify_get_config`'s own tolerance.
+pub fn load_config_for_workspace(configs_path: &Path, root: &Path) -> VerifyConfig {
+    let key = root.to_string_lossy().to_string();
+    load_configs_from(configs_path).get(&key).cloned().unwrap_or_default()
+}
+
 /// Finds `command_id` within `config.commands` — the ONLY way `verify_run`
 /// is allowed to turn an id into an actual command to execute. Never takes
 /// (or matches against) a raw command string, which is the whole point: a
@@ -397,6 +413,26 @@ mod tests {
 
         let round_tripped: VerifyCommand = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped.timeout_secs, Some(45));
+    }
+
+    /// `lm-cli` (`verify_cli.rs`) is the only consumer of this — it never
+    /// has an `AppState`/`AppHandle` to derive `resolve_root_key` through,
+    /// only a plain `configs_path` and its own canonicalized workspace root.
+    #[test]
+    fn load_config_for_workspace_finds_the_matching_root_and_defaults_for_others() {
+        let path = temp_path("cli_config.json");
+        let mut configs = VerifyConfigMap::new();
+        configs.insert("/some/root".to_string(), VerifyConfig { commands: vec![command("a", "echo hi")] });
+        save_configs_to(&path, &configs).unwrap();
+
+        let found = load_config_for_workspace(&path, Path::new("/some/root"));
+        assert_eq!(found.commands.len(), 1);
+        assert_eq!(found.commands[0].id, "a");
+
+        let missing = load_config_for_workspace(&path, Path::new("/no/such/root"));
+        assert!(missing.commands.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
