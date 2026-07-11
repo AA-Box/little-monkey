@@ -5,6 +5,9 @@ pub mod mcp;
 mod models;
 pub mod ollama;
 pub mod providers;
+// `pub` so `lm-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
+// the same reasoning as `rules`/`checkpoints` above.
+pub mod prompts;
 mod sessions;
 mod system;
 mod tools;
@@ -140,6 +143,8 @@ pub fn run() {
             memory::memory_clear,
             sessions::sessions_load,
             sessions::sessions_save,
+            prompts::prompts_load,
+            prompts::prompts_save,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,

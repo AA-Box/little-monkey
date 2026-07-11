@@ -10,9 +10,12 @@ import { isImagePath, readImageAsDataUrl } from "../../lib/imageAttachment";
 import { textContent } from "../../lib/llamaClient";
 import { selectSessionMessages, selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
+import { usePromptStore } from "../../store/promptStore";
+import type { PromptEntry } from "../../store/promptStore";
 import MessageList from "./MessageList";
 import { MentionAutocomplete } from "./MentionAutocomplete";
 import type { MentionEntry } from "./MentionAutocomplete";
+import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
 import { ModeSelector } from "./ModeSelector";
 import { EffortSelector } from "./EffortSelector";
 import { ModelSwitcher } from "./ModelSwitcher";
@@ -87,6 +90,56 @@ function filterMentionEntries(all: MentionEntry[], query: string): MentionEntry[
   return ranked.slice(0, MAX_MENTION_RESULTS).map((r) => r.entry);
 }
 
+/**
+ * Looks for an active "/"-command trigger: unlike `findMentionRange`, this
+ * only fires when "/" is the FIRST non-whitespace character of the whole
+ * input and the cursor hasn't moved past that leading token — "/" mid-text
+ * is almost always a path (e.g. "src/lib"), so no popup there. Returns the
+ * trigger's start index (the position of "/" itself) and the query text
+ * typed after it, or `null` if the cursor isn't inside an active trigger.
+ */
+function findSlashRange(text: string, cursor: number): { start: number; query: string } | null {
+  const start = text.search(/\S/);
+  if (start === -1 || text[start] !== "/") return null;
+  if (cursor <= start) return null; // cursor is at or before the "/" itself — not an active trigger yet
+
+  const query = text.slice(start + 1, cursor);
+  if (/\s/.test(query)) return null; // whitespace between "/" and cursor — the leading token ended
+
+  return { start, query };
+}
+
+/**
+ * Filters/ranks prompt-library entries against `query`: command-starts-with
+ * ranked above name-starts-with, ranked above either containing the query —
+ * fully client-side against `promptStore` entries, unlike mentions there's
+ * no Rust round trip since the whole library is already in memory.
+ */
+function filterSlashEntries(all: PromptEntry[], query: string): PromptEntry[] {
+  const needle = query.toLowerCase();
+
+  const ranked: { entry: PromptEntry; rank: number }[] = [];
+  for (const entry of all) {
+    const command = entry.command.toLowerCase();
+    const name = entry.name.toLowerCase();
+
+    let rank: number;
+    if (needle === "" || command.startsWith(needle)) {
+      rank = 0;
+    } else if (name.startsWith(needle)) {
+      rank = 1;
+    } else if (command.includes(needle) || name.includes(needle)) {
+      rank = 2;
+    } else {
+      continue;
+    }
+    ranked.push({ entry, rank });
+  }
+
+  ranked.sort((a, b) => a.rank - b.rank || a.entry.command.length - b.entry.command.length);
+  return ranked.map((r) => r.entry);
+}
+
 interface ChatWindowProps {
   /** The session this pane renders and sends turns into. Each pane (primary
    * and split — see App.tsx) owns one; they operate independently. */
@@ -135,6 +188,16 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
     workspacePathsRef.current = null;
     workspacePathsPromiseRef.current = null;
   }, [rootsKey]);
+
+  // "/"-command autocomplete state — mirrors the "@"-mention state above.
+  // `slashQuery` being non-null is what controls whether the popup renders.
+  const promptEntries = usePromptStore((state) => state.entries);
+  const [slashQuery, setSlashQuery] = useState<string | null>(null);
+  const [slashEntries, setSlashEntries] = useState<PromptEntry[]>([]);
+  const [slashActiveIndex, setSlashActiveIndex] = useState(0);
+  // Index of the "/" that opened the current slash trigger, so selection
+  // knows exactly what span of the textarea to replace.
+  const slashStartRef = useRef<number | null>(null);
 
   const resizeTextarea = useCallback(() => {
     const el = textareaRef.current;
@@ -320,27 +383,86 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
     [input, closeMentionPopup, resizeTextarea]
   );
 
+  const closeSlashPopup = useCallback(() => {
+    setSlashQuery(null);
+    slashStartRef.current = null;
+  }, []);
+
+  const selectSlashEntry = useCallback(
+    (entry: PromptEntry) => {
+      const start = slashStartRef.current;
+      const el = textareaRef.current;
+      if (start === null) {
+        closeSlashPopup();
+        return;
+      }
+
+      // Personas aren't wired into the agent loop yet (slice 2 — see the
+      // design doc's "Shippable slices"); selecting one here just dismisses
+      // the popup rather than building partial plumbing for a state nothing
+      // reads yet.
+      if (entry.kind === "persona") {
+        closeSlashPopup();
+        return;
+      }
+
+      const currentValue = el ? el.value : input;
+      const end = el?.selectionStart ?? currentValue.length;
+      const insertion = entry.content;
+      const nextValue = currentValue.slice(0, start) + insertion + currentValue.slice(end);
+      const cursorPos = start + insertion.length;
+
+      setInput(nextValue);
+      closeSlashPopup();
+
+      requestAnimationFrame(() => {
+        const node = textareaRef.current;
+        if (node) {
+          node.focus();
+          node.setSelectionRange(cursorPos, cursorPos);
+        }
+        resizeTextarea();
+      });
+    },
+    [input, closeSlashPopup, resizeTextarea]
+  );
+
   const handleInput = (event: FormEvent<HTMLTextAreaElement>) => {
     const value = event.currentTarget.value;
     const cursor = event.currentTarget.selectionStart;
     setInput(value);
     resizeTextarea();
 
-    const range = findMentionRange(value, cursor);
-    if (!range) {
-      if (mentionQuery !== null) closeMentionPopup();
+    // Mention and slash triggers are mutually exclusive: one anchors at an
+    // "@" that can appear anywhere, the other only at index 0 — but both
+    // popups are still separate pieces of state, so an inactive trigger's
+    // popup must be explicitly closed rather than left stale.
+    const mentionRange = findMentionRange(value, cursor);
+    if (mentionRange) {
+      if (slashQuery !== null) closeSlashPopup();
+
+      mentionStartRef.current = mentionRange.start;
+      setMentionQuery(mentionRange.query);
+      setMentionActiveIndex(0);
+
+      const requestId = ++mentionRequestIdRef.current;
+      void loadWorkspacePaths().then((all) => {
+        if (mentionRequestIdRef.current !== requestId) return; // a newer keystroke superseded this fetch
+        setMentionEntries(filterMentionEntries(all, mentionRange.query));
+      });
       return;
     }
+    if (mentionQuery !== null) closeMentionPopup();
 
-    mentionStartRef.current = range.start;
-    setMentionQuery(range.query);
-    setMentionActiveIndex(0);
-
-    const requestId = ++mentionRequestIdRef.current;
-    void loadWorkspacePaths().then((all) => {
-      if (mentionRequestIdRef.current !== requestId) return; // a newer keystroke superseded this fetch
-      setMentionEntries(filterMentionEntries(all, range.query));
-    });
+    const slashRange = findSlashRange(value, cursor);
+    if (slashRange) {
+      slashStartRef.current = slashRange.start;
+      setSlashQuery(slashRange.query);
+      setSlashActiveIndex(0);
+      setSlashEntries(filterSlashEntries(promptEntries, slashRange.query));
+      return;
+    }
+    if (slashQuery !== null) closeSlashPopup();
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -370,6 +492,34 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
       if (event.key === "Escape") {
         event.preventDefault();
         closeMentionPopup();
+        return;
+      }
+    }
+
+    if (slashQuery !== null) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSlashActiveIndex((prev) => (slashEntries.length === 0 ? 0 : (prev + 1) % slashEntries.length));
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSlashActiveIndex((prev) => (slashEntries.length === 0 ? 0 : (prev - 1 + slashEntries.length) % slashEntries.length));
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        const entry = slashEntries[slashActiveIndex];
+        if (entry) {
+          selectSlashEntry(entry);
+        } else {
+          closeSlashPopup();
+        }
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeSlashPopup();
         return;
       }
     }
@@ -424,6 +574,15 @@ export default function ChatWindow({ sessionId }: ChatWindowProps) {
               activeIndex={mentionActiveIndex}
               onSelect={selectMentionEntry}
               onHoverIndex={setMentionActiveIndex}
+            />
+          )}
+          {slashQuery !== null && (
+            <SlashCommandAutocomplete
+              query={slashQuery}
+              entries={slashEntries}
+              activeIndex={slashActiveIndex}
+              onSelect={selectSlashEntry}
+              onHoverIndex={setSlashActiveIndex}
             />
           )}
           <div className="flex flex-col rounded-3xl border border-border bg-surface px-4 py-2.5 transition-colors focus-within:border-accent focus-within:ring-1 focus-within:ring-accent">

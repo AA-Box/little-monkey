@@ -1,0 +1,312 @@
+import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+/** Emitted by the backend after every successful `prompts_save`, with the
+ * saving window's label as payload (see src-tauri/src/prompts.rs). Other
+ * windows rehydrate from the file on it so two open windows stop clobbering
+ * each other's prompt library — same mechanism as `sessionStore.ts`. */
+const PROMPTS_CHANGED_EVENT = "prompts://changed";
+
+/** How long after the last mutation the debounced file write fires — same
+ * value/rationale as `sessionStore.ts`'s `PERSIST_DEBOUNCE_MS`. */
+const PERSIST_DEBOUNCE_MS = 400;
+
+export type PromptKind = "persona" | "snippet";
+
+/**
+ * A saved prompt-library entry: a persona (a system-prompt extension that
+ * shapes the whole session — wired into the agent loop in slice 2) or a
+ * snippet (reusable text inserted into the chat composer). Mirrors the Rust
+ * `PromptEntry` struct (src-tauri/src/prompts.rs) field-for-field —
+ * `camelCase` on the wire, matching that struct's `#[serde(rename_all =
+ * "camelCase")]`.
+ */
+export interface PromptEntry {
+  id: string;
+  kind: PromptKind;
+  /** Display name, e.g. "Code Reviewer". */
+  name: string;
+  /** Slash-trigger slug, `/^[a-z0-9-]{1,32}$/`, unique across the library. */
+  command: string;
+  /** The prompt/snippet text. */
+  content: string;
+  /** One-liner shown in the autocomplete row. */
+  description?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Fields a caller supplies to `addEntry` — the store fills in `id` and the
+ * timestamps. */
+export interface NewPromptInput {
+  kind: PromptKind;
+  name: string;
+  command: string;
+  content: string;
+  description?: string;
+}
+
+/** Fields `updateEntry` may patch — `id`/`createdAt` never change after
+ * creation. */
+export type PromptEntryPatch = Partial<Omit<PromptEntry, "id" | "createdAt" | "updatedAt">>;
+
+interface PersistedShape {
+  version: 1;
+  entries: PromptEntry[];
+  defaultPersonaId: string | null;
+}
+
+/**
+ * The prompt/persona library: personas and snippets share one table since
+ * they share every behavior except what "invoke" means (see
+ * `src/components/Chat/SlashCommandAutocomplete.tsx`). Persistence lives in
+ * a file in the app data directory (see src-tauri/src/prompts.rs), written
+ * debounced after every mutation — the same file-based pattern
+ * `sessionStore.ts` uses, just without that store's split-pane/legacy-
+ * localStorage complexity (this feature has no earlier persisted form to
+ * migrate from). Call `hydratePrompts()` once at startup (main.tsx does,
+ * alongside `hydrateSessions()`) before the first render.
+ */
+export interface PromptStore {
+  /** All saved prompt-library entries, in no particular order (sort/filter
+   * at render time via `selectPersonas`/`selectSnippets`). */
+  entries: PromptEntry[];
+  /** The persona applied to new sessions by default, or `null` for none.
+   * Not yet surfaced in the UI (that lands with the default-persona picker
+   * in a later slice) — persisted now so the schema doesn't need a bump
+   * when it is. */
+  defaultPersonaId: string | null;
+  /** Last file-persistence failure, surfaced in the UI instead of silently
+   * dropping a save; cleared by the next successful save. */
+  persistError: string | null;
+  /** Create a new entry and persist it. Returns the created entry (its
+   * generated `id` is otherwise unobservable until the next render). */
+  addEntry: (input: NewPromptInput) => PromptEntry;
+  /** Patch an existing entry by id; no-ops if it doesn't exist. Bumps
+   * `updatedAt`. */
+  updateEntry: (id: string, patch: PromptEntryPatch) => void;
+  /** Remove an entry by id; no-ops if it doesn't exist. Clears
+   * `defaultPersonaId` if it pointed at the removed entry. */
+  removeEntry: (id: string) => void;
+}
+
+/** Fills in defaults for a possibly hand-edited or partially malformed
+ * persisted entry, so it never corrupts the rest of the library — mirrors
+ * `sessionStore.ts`'s `normalizeSession`. Unlike `normalizeMessage` (which
+ * drops unrecognizable messages), a raw object here always yields a usable
+ * entry: an id is generated if absent, and every other field falls back to
+ * an empty/derived default rather than causing the whole entry to be
+ * dropped. */
+function normalizeEntry(raw: Partial<PromptEntry>): PromptEntry {
+  const now = Date.now();
+  const createdAt = typeof raw.createdAt === "number" ? raw.createdAt : now;
+  return {
+    id: typeof raw.id === "string" && raw.id.length > 0 ? raw.id : crypto.randomUUID(),
+    kind: raw.kind === "persona" ? "persona" : "snippet",
+    name: typeof raw.name === "string" && raw.name.trim().length > 0 ? raw.name : "Untitled",
+    command: typeof raw.command === "string" ? raw.command : "",
+    content: typeof raw.content === "string" ? raw.content : "",
+    description: typeof raw.description === "string" && raw.description.length > 0 ? raw.description : undefined,
+    createdAt,
+    updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : createdAt,
+  };
+}
+
+/** Parses and validates a persisted `{ version, entries, defaultPersonaId }`
+ * JSON blob. Returns `null` for anything absent, corrupt, or missing an
+ * `entries` array. */
+function parsePersisted(raw: string | null): PersistedShape | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { version?: unknown; entries?: unknown; defaultPersonaId?: unknown } | null;
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return {
+      version: 1,
+      entries: (parsed.entries as unknown[])
+        .filter((e): e is Partial<PromptEntry> => !!e && typeof e === "object")
+        .map(normalizeEntry),
+      defaultPersonaId: typeof parsed.defaultPersonaId === "string" ? parsed.defaultPersonaId : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Debounced file persistence — identical shape to `sessionStore.ts`'s.
+// ---------------------------------------------------------------------------
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingPayload: string | null = null;
+
+function flushPersist(): void {
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  const payload = pendingPayload;
+  pendingPayload = null;
+  if (payload === null) return;
+
+  invoke("prompts_save", { payload })
+    .then(() => {
+      if (usePromptStore.getState().persistError !== null) {
+        usePromptStore.setState({ persistError: null });
+      }
+    })
+    .catch((err: unknown) => {
+      usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    });
+}
+
+function persist(entries: PromptEntry[], defaultPersonaId: string | null): void {
+  try {
+    pendingPayload = JSON.stringify({ version: 1, entries, defaultPersonaId });
+  } catch (err) {
+    usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+  if (persistTimer === null) {
+    persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+  }
+}
+
+// Best-effort flush of a pending (debounced) write when the window goes away
+// mid-debounce — mirrors `sessionStore.ts`.
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", flushPersist);
+}
+
+/** Re-reads the saved blob after ANOTHER window persisted it, replacing this
+ * window's entries wholesale. Read errors are ignored: the current
+ * in-memory state stays, and this window's own next save will surface any
+ * real persistence problem — same stance as `sessionStore.ts`'s
+ * `rehydrateFromFile`. */
+async function rehydrateFromFile(): Promise<void> {
+  let fromFile: PersistedShape | null = null;
+  try {
+    const raw = await invoke<string | null>("prompts_load");
+    fromFile = parsePersisted(raw);
+  } catch {
+    return;
+  }
+  if (!fromFile) return;
+  usePromptStore.setState({ entries: fromFile.entries, defaultPersonaId: fromFile.defaultPersonaId });
+}
+
+/** Starts listening for other windows' saves. Called once per window from
+ * `hydratePrompts`. */
+async function listenForOtherWindowSaves(): Promise<void> {
+  const ownLabel = getCurrentWindow().label;
+  await listen<string>(PROMPTS_CHANGED_EVENT, (event) => {
+    // Our own save — the store already reflects it.
+    if (event.payload === ownLabel) return;
+    // A local mutation is still waiting in the debounce window: rehydrating
+    // now would visibly discard it. Skip — our imminent flush notifies the
+    // other window instead, and subsequent events converge us onto whoever
+    // saved last.
+    if (pendingPayload !== null) return;
+    void rehydrateFromFile();
+  });
+}
+
+/**
+ * Loads the persisted prompt library from the app-data file (see
+ * src-tauri/src/prompts.rs) into the store. Must be awaited before the
+ * first render (main.tsx does, alongside `hydrateSessions()`) so a user
+ * action can never race the hydrate and get overwritten by it. Also
+ * subscribes this window to other windows' saves so multi-window use stays
+ * in sync.
+ */
+export async function hydratePrompts(): Promise<void> {
+  // Subscribe before the initial load so a save landing in another window
+  // during hydration isn't missed.
+  void listenForOtherWindowSaves().catch((err: unknown) => {
+    console.error("Failed to subscribe to cross-window prompt-library sync", err);
+  });
+
+  let fromFile: PersistedShape | null = null;
+  try {
+    const raw = await invoke<string | null>("prompts_load");
+    fromFile = parsePersisted(raw);
+  } catch (err) {
+    // Read failure (not "file missing" — that returns null). Keep the empty
+    // in-memory library and surface the error; the file on disk is left
+    // untouched until the user actually does something worth saving.
+    usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+
+  if (fromFile) {
+    usePromptStore.setState({ entries: fromFile.entries, defaultPersonaId: fromFile.defaultPersonaId });
+  }
+  // No file yet (first run) — keep the empty initial state. Unlike
+  // `sessionStore.ts` there's no legacy localStorage blob to migrate from:
+  // this feature never persisted anywhere before this file existed.
+}
+
+export const usePromptStore = create<PromptStore>((set) => ({
+  entries: [],
+  defaultPersonaId: null,
+  persistError: null,
+
+  addEntry: (input) => {
+    const now = Date.now();
+    const entry: PromptEntry = {
+      id: crypto.randomUUID(),
+      kind: input.kind,
+      name: input.name,
+      command: input.command,
+      content: input.content,
+      description: input.description,
+      createdAt: now,
+      updatedAt: now,
+    };
+    set((state) => {
+      const entries = [...state.entries, entry];
+      persist(entries, state.defaultPersonaId);
+      return { entries };
+    });
+    return entry;
+  },
+
+  updateEntry: (id, patch) => {
+    set((state) => {
+      const target = state.entries.find((e) => e.id === id);
+      if (!target) return state;
+      const entries = state.entries.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e));
+      persist(entries, state.defaultPersonaId);
+      return { entries };
+    });
+  },
+
+  removeEntry: (id) => {
+    set((state) => {
+      if (!state.entries.some((e) => e.id === id)) return state;
+      const entries = state.entries.filter((e) => e.id !== id);
+      const defaultPersonaId = state.defaultPersonaId === id ? null : state.defaultPersonaId;
+      persist(entries, defaultPersonaId);
+      return { entries, defaultPersonaId };
+    });
+  },
+}));
+
+/** Zustand selector: every saved persona, in library order. */
+export function selectPersonas(state: PromptStore): PromptEntry[] {
+  return state.entries.filter((e) => e.kind === "persona");
+}
+
+/** Zustand selector: every saved snippet, in library order. */
+export function selectSnippets(state: PromptStore): PromptEntry[] {
+  return state.entries.filter((e) => e.kind === "snippet");
+}
+
+/** Finds the entry (if any) whose `command` matches exactly — used for
+ * slash-command exact lookup and for the create/edit form's uniqueness
+ * validation (exclude the entry being edited by checking `.id` on the
+ * result). */
+export function findByCommand(entries: PromptEntry[], command: string): PromptEntry | undefined {
+  return entries.find((e) => e.command === command);
+}

@@ -8,6 +8,7 @@ import { AutomationPanel } from "./AutomationPanel";
 import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { McpPanel } from "./McpPanel";
+import { PromptLibraryPanel } from "./PromptLibraryPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -17,7 +18,7 @@ interface SettingsModalProps {
   onClose: () => void;
 }
 
-type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp";
+type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts";
 
 const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
   { id: "local", labelKey: "SettingsModal.tabLocalModels" },
@@ -26,6 +27,7 @@ const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] =
   { id: "automation", labelKey: "SettingsModal.tabAutomation" },
   { id: "rules", labelKey: "SettingsModal.tabRules" },
   { id: "mcp", labelKey: "SettingsModal.tabMcp" },
+  { id: "prompts", labelKey: "SettingsModal.tabPrompts" },
 ];
 
 /**
@@ -118,6 +120,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
           {tab === "automation" && <AutomationPanel />}
           {tab === "rules" && <RulesMemoryPanel />}
           {tab === "mcp" && <McpPanel />}
+          {tab === "prompts" && <PromptLibraryPanel />}
         </div>
       </div>
     </div>
