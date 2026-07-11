@@ -204,6 +204,8 @@ export function AutomationPanel() {
   const setVerifyEnabled = useSettingsStore((s) => s.setVerifyEnabled);
   const verifyMaxRounds = useSettingsStore((s) => s.verifyMaxRounds);
   const setVerifyMaxRounds = useSettingsStore((s) => s.setVerifyMaxRounds);
+  const riskAnnotationsEnabled = useSettingsStore((s) => s.riskAnnotationsEnabled);
+  const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
@@ -339,6 +341,18 @@ export function AutomationPanel() {
               </>
             )}
           </div>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.riskAnnotationsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={riskAnnotationsEnabled}
+            onChange={setRiskAnnotationsEnabled}
+            label={t("AutomationPanel.riskAnnotationsLabel")}
+            description={t("AutomationPanel.riskAnnotationsDescription")}
+          />
         </div>
       </section>
 

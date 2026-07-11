@@ -1,8 +1,19 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Globe, Plug, Search, TerminalSquare } from "lucide-react";
-import { usePermissionStore } from "../../store/permissionStore";
-import { Button } from "../ui";
+import { usePermissionStore, type PermissionRequest } from "../../store/permissionStore";
+import { Button, StatusPill } from "../ui";
+import type { PillTone } from "../ui";
 import { useT } from "../../lib/i18n";
+
+/** Maps a risk level to the `StatusPill` tone used for its badge — a floored
+ * path is always shown as `danger` regardless of its (always `"high"`, see
+ * `permissions.rs`'s `compute_risk`) level, same visual weight as an
+ * ordinary high-risk judge classification. */
+const RISK_TONE: Record<"low" | "medium" | "high", PillTone> = {
+  low: "success",
+  medium: "warning",
+  high: "danger",
+};
 
 /** Maps a tool name to the icon shown in the dialog's tinted circle. An MCP
  * tool call's permission-request name (`mcp:<serverId>:<toolName>`, see
@@ -19,6 +30,41 @@ const TOOL_ICONS: Record<string, typeof AlertTriangle> = {
   web_fetch: Globe,
   web_search: Search,
 };
+
+/**
+ * The advisory risk badge/reason/floored-warning block (Phase 2 of the
+ * Plan/Act + risk-adaptive permissions design —
+ * docs/roadmap/p2-plan-act-safety.md), rendered only when `pending.risk_level`
+ * is present — an unclassified or annotations-off prompt renders nothing
+ * here at all, same as before this feature existed. Purely informative: it
+ * never changes which buttons are shown or what they do.
+ */
+function RiskAnnotation({ pending, t }: { pending: PermissionRequest; t: (key: string, vars?: Record<string, string | number>) => string }) {
+  if (!pending.risk_level) return null;
+
+  const badgeKey =
+    pending.risk_level === "low"
+      ? "PermissionModal.riskLowBadge"
+      : pending.risk_level === "medium"
+        ? "PermissionModal.riskMediumBadge"
+        : "PermissionModal.riskHighBadge";
+
+  return (
+    <div className="mt-3 flex flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <StatusPill tone={RISK_TONE[pending.risk_level]}>{t(badgeKey)}</StatusPill>
+        {pending.risk_floored && (
+          <span className="text-xs font-medium text-danger">{t("PermissionModal.riskFlooredText")}</span>
+        )}
+      </div>
+      {pending.risk_reason && (
+        <p className="text-xs text-muted">
+          <span className="font-medium text-faint">{t("PermissionModal.riskReasonLabel")}</span> {pending.risk_reason}
+        </p>
+      )}
+    </div>
+  );
+}
 
 /**
  * Centered dialog shown whenever the agent needs the user's sign-off
@@ -91,6 +137,8 @@ export function PermissionModal() {
             </p>
           </div>
         </div>
+
+        <RiskAnnotation pending={pending} t={t} />
 
         <div className="mt-4">
           <div className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-surface-2 p-2.5 font-mono text-xs text-muted">

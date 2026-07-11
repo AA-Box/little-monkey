@@ -18,6 +18,7 @@ import { streamProviderChat } from './providerClient';
 import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
+import { riskCacheKey, type RiskClassification } from './riskJudge';
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -120,6 +121,38 @@ function invokeMcpTool(
   }).then(formatMcpCallToolResult, stringifyToolError);
 }
 
+/** Tool names eligible for risk classification — see `RiskAnnotationContext`.
+ * `run_shell` is included for DISPLAY purposes only (the permission modal can
+ * show a badge on a shell prompt too) — see `permissions.rs`'s
+ * `tool_run_shell` doc comment for the load-bearing invariant this must never
+ * violate: nothing computed here ever feeds into whether `run_shell` (or
+ * anything else) gets auto-approved. */
+const RISK_ELIGIBLE_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
+
+/**
+ * Everything `executeToolCall` needs to attach an advisory risk annotation to
+ * a mutating tool call — see `riskJudge.ts`'s module doc comment for why
+ * `classify` is a plain injected callback rather than this module importing
+ * `classifyToolCall` directly (it would create an import cycle). Built once
+ * per turn by `agentLoop.ts`'s `runAgentTurnBody` (`cache` in particular must
+ * survive across this turn's tool-calling round trips, exactly like
+ * `mutatedFiles`) and passed down unchanged.
+ */
+export interface RiskAnnotationContext {
+  /** Mirrors `settingsStore`'s `riskAnnotationsEnabled` — when `false`,
+   * classification is skipped entirely (model-supplied risk keys are still
+   * scrubbed either way, see below) and no risk args are injected. */
+  enabled: boolean;
+  /** Keyed by `riskJudge.ts`'s `riskCacheKey(tool, args)` — reused across
+   * this turn's round trips so a repeated identical call never pays for (or
+   * waits on) a second judge round trip. */
+  cache: Map<string, RiskClassification | null>;
+  /** Runs the actual one-shot judge call — an `agentLoop.ts` closure around
+   * `attemptStream` and the turn's current target (see `riskJudge.ts`'s
+   * `classifyToolCall`, which this wraps). */
+  classify: (tool: string, args: Record<string, unknown>) => Promise<RiskClassification | null>;
+}
+
 /**
  * Executes a single model-requested tool call via the corresponding
  * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
@@ -139,7 +172,8 @@ export async function executeToolCall(
   checkpointId: string | null,
   turnId: string,
   mcpRegistry: McpToolRegistry,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  risk?: RiskAnnotationContext
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
 
@@ -152,6 +186,35 @@ export async function executeToolCall(
       }
     } catch (err) {
       return stringifyToolError(new Error(`Invalid tool call arguments JSON for "${name}": ${(err as Error).message}`));
+    }
+  }
+
+  // `risk_level`/`risk_reason` are frontend-owned, exactly like
+  // `checkpoint_id`/`turn_id` below — the model must never be able to smuggle
+  // its own risk rating through its tool-call arguments (a model that always
+  // claimed "low" for its own edits would defeat the entire point of an
+  // independent judge). Unconditionally deleted here, BEFORE anything else
+  // touches `args`, regardless of tool name or whether risk annotations are
+  // even enabled this turn, so there is no code path — now or from a future
+  // change to `RISK_ELIGIBLE_TOOLS` — where a model-supplied value survives.
+  delete args.risk_level;
+  delete args.risk_reason;
+
+  // Classify (cached per turn) BEFORE the checkpoint_id/turn_id injection
+  // below, so both the cache key and the judge prompt reflect only the
+  // model's actual call — not internal bookkeeping fields it never provided.
+  if (RISK_ELIGIBLE_TOOLS.has(name) && risk?.enabled) {
+    const key = riskCacheKey(name, args);
+    let classification: RiskClassification | null;
+    if (risk.cache.has(key)) {
+      classification = risk.cache.get(key) ?? null;
+    } else {
+      classification = await risk.classify(name, args);
+      risk.cache.set(key, classification);
+    }
+    if (classification) {
+      args.risk_level = classification.level;
+      args.risk_reason = classification.reason;
     }
   }
 
