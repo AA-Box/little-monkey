@@ -332,6 +332,16 @@ describe("PlanNotice: formatPlanNotice/parsePlanNotice round trip", () => {
     const badPayload = JSON.stringify({ id: "p1", title: "T", status: "proposed" });
     expect(parsePlanNotice({ role: "system", content: `${PLAN_NOTE_PREFIX}${badPayload}` })).toBeNull();
   });
+
+  it("returns null when openQuestions is present but not an array (e.g. a corrupted/hand-edited persisted session)", () => {
+    const badPayload = JSON.stringify({ id: "p1", title: "T", plan: "P", status: "proposed", openQuestions: "pending" });
+    expect(parsePlanNotice({ role: "system", content: `${PLAN_NOTE_PREFIX}${badPayload}` })).toBeNull();
+  });
+
+  it("returns null when openQuestions is an array containing a non-string entry", () => {
+    const badPayload = JSON.stringify({ id: "p1", title: "T", plan: "P", status: "proposed", openQuestions: ["ok", 5] });
+    expect(parsePlanNotice({ role: "system", content: `${PLAN_NOTE_PREFIX}${badPayload}` })).toBeNull();
+  });
 });
 
 describe("toolCallPlanArgs", () => {

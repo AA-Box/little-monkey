@@ -236,13 +236,20 @@ export function parsePlanNotice(message: ChatMessage): PlanNotice | null {
   if (!isPlanNotice(message)) return null;
   try {
     const parsed: unknown = JSON.parse((message.content as string).slice(PLAN_NOTE_PREFIX.length));
+    const openQuestions = (parsed as PlanNotice | null)?.openQuestions;
     if (
       parsed &&
       typeof parsed === 'object' &&
       typeof (parsed as PlanNotice).id === 'string' &&
       typeof (parsed as PlanNotice).title === 'string' &&
       typeof (parsed as PlanNotice).plan === 'string' &&
-      typeof (parsed as PlanNotice).status === 'string'
+      typeof (parsed as PlanNotice).status === 'string' &&
+      // Mirrors parseCheckpointNotice's Array.isArray(files) check just
+      // above — openQuestions is optional, but if present it must actually
+      // be a string[], or PlanCard's `.map()` over it throws at render time
+      // (e.g. a persisted/hand-edited session whose payload sets it to a
+      // truthy non-array like a string).
+      (openQuestions === undefined || (Array.isArray(openQuestions) && openQuestions.every((q) => typeof q === 'string')))
     ) {
       return parsed as PlanNotice;
     }
