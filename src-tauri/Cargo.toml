@@ -27,7 +27,10 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tokio = { version = "1.52.3", features = ["full"] }
-reqwest = { version = "0.13.4", features = ["json", "stream"] }
+# "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
+# `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
+# to POST the DuckDuckGo query as `application/x-www-form-urlencoded`.
+reqwest = { version = "0.13.4", features = ["json", "stream", "form"] }
 futures-util = "0.3.32"
 uuid = { version = "1.23.4", features = ["v4"] }
 regex = "1.12.4"
@@ -66,6 +69,14 @@ htmd = "0.5"
 # `validate_fetch_url`'s SSRF guard can parse/inspect the URL's host without
 # relying on reqwest's internals.
 url = "2"
+# web.rs: CSS-selector HTML parsing for the DuckDuckGo results page
+# (tool_web_search, phase 2). The design doc named ~0.24; 0.27 is current on
+# crates.io as of implementation time — the `Html::parse_document` /
+# `Selector::parse` / `ElementRef::text`/`.attr()` API used here is stable
+# across that range. Default features (html5ever-based parsing) are enough;
+# no need for the `serde` cargo feature since results are re-serialized into
+# our own `SearchResult` struct.
+scraper = "0.27"
 
 [dev-dependencies]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the

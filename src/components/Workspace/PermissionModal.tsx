@@ -17,11 +17,12 @@ const TOOL_ICONS: Record<string, typeof AlertTriangle> = {
   grep: Search,
   remember: Brain,
   web_fetch: Globe,
+  web_search: Search,
 };
 
 /**
  * Centered dialog shown whenever the agent needs the user's sign-off
- * before running a sensitive tool (write_file / edit_file / run_shell / remember / web_fetch).
+ * before running a sensitive tool (write_file / edit_file / run_shell / remember / web_fetch / web_search).
  * Mirrors permissionStore.pending exactly — {id, tool, detail} | null.
  */
 export function PermissionModal() {

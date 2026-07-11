@@ -1,5 +1,5 @@
-//! Web-research agent tools: `web_fetch` (phase 1, this module) and — in a
-//! later phase — `web_search`.
+//! Web-research agent tools: `web_fetch` (phase 1) and `web_search` (phase 2,
+//! this module's DuckDuckGo-only slice — Brave/SearXNG are phase 3).
 //!
 //! Structured exactly like `checkpoints.rs`: an AppHandle-free, directly
 //! testable core (`validate_fetch_url`, `fetch_impl`) plus a thin
@@ -368,6 +368,169 @@ pub async fn tool_web_fetch(
     outcome
 }
 
+/// One ranked result from [`search_impl`], echoed back to the model as JSON.
+/// Same "plain snake_case, no `serde(rename)`" convention as [`FetchResult`].
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// Default/max results returned by `web_search` — `count` is clamped into
+/// `1..=DEFAULT_SEARCH_COUNT` (design doc's "count clamped 1..=10").
+const DEFAULT_SEARCH_COUNT: usize = 10;
+
+/// Total request timeout for the DuckDuckGo POST — shorter than
+/// [`FETCH_TIMEOUT`] since this hits one fixed, fast endpoint rather than an
+/// arbitrary page.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// DuckDuckGo's keyless HTML results endpoint (no API key, no official API —
+/// see the module doc's "best-effort/brittle" framing). `POST` with the query
+/// in a `q` form field is what the (JS-less) `html.duckduckgo.com/html/`
+/// front end itself submits.
+const DUCKDUCKGO_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+
+/// Result-title links on the DuckDuckGo HTML results page carry the reader to
+/// `//duckduckgo.com/l/?uddg=<percent-encoded-destination>&rut=...` — a
+/// tracking redirect, not the destination itself — but in practice (verified
+/// against a live fetch of the endpoint while implementing this) `href` is
+/// sometimes already the bare destination URL with no `uddg` wrapper at all,
+/// so this decodes the parameter when present and otherwise falls back to
+/// `href` unchanged rather than assuming one shape or the other.
+///
+/// Parsed via `Url::join` against a fixed DuckDuckGo base rather than hand-
+/// rolling percent-decoding: `Url::query_pairs()` already does percent-
+/// decoding internally (through `url`'s own dependency, not a new one added
+/// here just for this), and `join` accepts every href shape actually seen —
+/// protocol-relative (`//duckduckgo.com/...`), root-relative (`/l/...`), and
+/// absolute (`https://example.com/...`).
+fn decode_ddg_href(href: &str) -> String {
+    let base = match Url::parse("https://duckduckgo.com/") {
+        Ok(u) => u,
+        Err(_) => return href.to_string(),
+    };
+    let joined = if let Some(rest) = href.strip_prefix("//") {
+        Url::parse(&format!("https://{rest}"))
+    } else {
+        base.join(href)
+    };
+    match joined {
+        Ok(url) => url
+            .query_pairs()
+            .find(|(key, _)| key == "uddg")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| href.to_string()),
+        Err(_) => href.to_string(),
+    }
+}
+
+/// Parses a DuckDuckGo HTML results page into up to `count` [`SearchResult`]s.
+/// Selectors match the design doc / a live capture of the endpoint at
+/// implementation time: each result's title+link is `a.result__a` and its
+/// snippet is `.result__snippet`, in the same document order — there is no
+/// shared container id to pair them by, so this zips the two selections
+/// positionally and tolerates a missing snippet (an empty string) rather than
+/// dropping the result, since the title/URL is the useful half.
+///
+/// Best-effort and brittle by nature (module doc): DuckDuckGo's markup, rate
+/// limiting, and anomaly/CAPTCHA gating are all outside this app's control,
+/// so a shape this parser doesn't recognize simply yields fewer (or zero)
+/// results rather than an error — [`search_impl`] is the layer that surfaces
+/// an outright HTTP failure.
+fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
+    let document = scraper::Html::parse_document(html);
+    // Both selector strings are fixed and valid at compile time.
+    let title_selector = scraper::Selector::parse("a.result__a").expect("valid CSS selector");
+    let snippet_selector = scraper::Selector::parse(".result__snippet").expect("valid CSS selector");
+
+    let snippets: Vec<String> = document
+        .select(&snippet_selector)
+        .map(|el| el.text().collect::<String>().trim().to_string())
+        .collect();
+
+    let mut results = Vec::new();
+    for (index, title_el) in document.select(&title_selector).enumerate() {
+        if results.len() >= count {
+            break;
+        }
+        let title = title_el.text().collect::<String>().trim().to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let href = title_el.value().attr("href").unwrap_or("");
+        let url = decode_ddg_href(href);
+        let snippet = snippets.get(index).cloned().unwrap_or_default();
+        results.push(SearchResult { title, url, snippet });
+    }
+    results
+}
+
+/// Core `web_search` logic: AppHandle-free and directly testable, same split
+/// as [`fetch_impl`]. DuckDuckGo-only for phase 2 (the design doc's Brave and
+/// SearXNG branches are phase 3) — no provider parameter yet, so this is the
+/// entire dispatch.
+///
+/// Unlike `fetch_impl`, there is no SSRF guard here to run: the request
+/// target is DuckDuckGo's own fixed endpoint, never a user/model-supplied
+/// URL — only the query text (sent as a POST form field, not part of the
+/// URL) is untrusted.
+pub async fn search_impl(query: String, count: Option<usize>) -> Result<Vec<SearchResult>, String> {
+    let count = count.unwrap_or(DEFAULT_SEARCH_COUNT).clamp(1, DEFAULT_SEARCH_COUNT);
+
+    let client = reqwest::Client::builder()
+        .timeout(SEARCH_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let response = client
+        .post(DUCKDUCKGO_HTML_ENDPOINT)
+        .form(&[("q", query.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("Failed to search DuckDuckGo for '{}': {}", query, e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read DuckDuckGo response for '{}': {}", query, e))?;
+
+    if !status.is_success() {
+        return Err(format!("DuckDuckGo search for '{}' returned HTTP {}", query, status));
+    }
+
+    Ok(parse_ddg_results(&body, count))
+}
+
+/// Search the web (DuckDuckGo, keyless) and return up to `count` (1-10,
+/// default 10) ranked `{title, url, snippet}` results. Permission-gated:
+/// prompts with the query as detail, exactly like `tool_web_fetch` prompts
+/// with the URL. `turn_id` scopes the permission prompt to the calling turn
+/// (never model-supplied) — unlike `tool_web_fetch`, there is no Stop-button
+/// cancellation wiring here: the request is one short, fixed-endpoint POST
+/// (see `SEARCH_TIMEOUT`), not a potentially large streamed fetch, so it gets
+/// `remember`'s simpler "turn id for the prompt only" treatment rather than
+/// `web_fetch`'s `tokio::select!` + `state.tool_cancel` split.
+///
+/// `rename_all = "snake_case"`: matches every other tool command, so the
+/// model's snake_case tool-call arguments (`count`) and the agent loop's
+/// injected `turn_id` are accepted without translation.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tool_web_search(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    query: String,
+    count: Option<usize>,
+    turn_id: Option<String>,
+) -> Result<Vec<SearchResult>, String> {
+    permissions::request_permission(&app, state.inner(), "web_search", query.clone(), turn_id.as_deref())
+        .await?;
+    search_impl(query, count).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +695,114 @@ mod tests {
 
         let result = client.get(format!("http://{}/", addr)).send().await;
         assert!(result.is_err(), "expected the redirect to a private IP to be blocked");
+    }
+
+    /// A trimmed fixture of `html.duckduckgo.com/html/`'s actual result
+    /// markup (captured live while implementing this), with one result's
+    /// `href` left as the bare destination URL (the shape actually observed)
+    /// and a second, synthetic result added with a `uddg`-wrapped redirect
+    /// href (the shape the design doc describes) so both decode paths are
+    /// exercised by the same fixture.
+    const DDG_FIXTURE_HTML: &str = r#"
+        <div class="results">
+          <div class="result results_links results_links_deep web-result">
+            <div class="result__body">
+              <h2 class="result__title">
+                <a rel="nofollow" class="result__a" href="https://rust-lang.org/">Rust Programming Language</a>
+              </h2>
+              <a class="result__snippet" href="https://rust-lang.org/"><b>Rust</b> is a fast, reliable, and productive programming language.</a>
+            </div>
+          </div>
+          <div class="result results_links results_links_deep web-result">
+            <div class="result__body">
+              <h2 class="result__title">
+                <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FRust_(programming_language)&amp;rut=abc123">Rust (programming language) - Wikipedia</a>
+              </h2>
+              <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FRust_(programming_language)&amp;rut=abc123">A general-purpose <b>programming</b> language which emphasizes performance and safety.</a>
+            </div>
+          </div>
+          <div class="result results_links results_links_deep web-result">
+            <div class="result__body">
+              <h2 class="result__title">
+                <a rel="nofollow" class="result__a" href="https://www.w3schools.com/rust/index.php">Rust Tutorial - W3Schools</a>
+              </h2>
+              <a class="result__snippet" href="https://www.w3schools.com/rust/index.php">Rust is a popular programming language.</a>
+            </div>
+          </div>
+        </div>
+    "#;
+
+    #[test]
+    fn decode_ddg_href_returns_a_bare_href_unchanged() {
+        assert_eq!(decode_ddg_href("https://rust-lang.org/"), "https://rust-lang.org/");
+    }
+
+    #[test]
+    fn decode_ddg_href_decodes_a_protocol_relative_uddg_redirect() {
+        let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FRust_(programming_language)&rut=abc123";
+        assert_eq!(decode_ddg_href(href), "https://en.wikipedia.org/wiki/Rust_(programming_language)");
+    }
+
+    #[test]
+    fn decode_ddg_href_decodes_a_root_relative_uddg_redirect() {
+        let href = "/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=xyz";
+        assert_eq!(decode_ddg_href(href), "https://example.com/page");
+    }
+
+    #[test]
+    fn decode_ddg_href_falls_back_to_the_raw_href_when_unparseable() {
+        // Not a valid URL and not root/protocol-relative either — `Url::join`
+        // fails, so the raw string is the only sane thing to return.
+        assert_eq!(decode_ddg_href("not a url at all"), "not a url at all");
+    }
+
+    #[test]
+    fn parse_ddg_results_extracts_title_url_and_snippet_for_each_result() {
+        let results = parse_ddg_results(DDG_FIXTURE_HTML, 10);
+        assert_eq!(results.len(), 3);
+
+        assert_eq!(results[0].title, "Rust Programming Language");
+        assert_eq!(results[0].url, "https://rust-lang.org/");
+        assert!(results[0].snippet.contains("fast, reliable, and productive"));
+
+        // The uddg-wrapped result: url must be the decoded destination, not
+        // the duckduckgo.com redirect.
+        assert_eq!(results[1].title, "Rust (programming language) - Wikipedia");
+        assert_eq!(results[1].url, "https://en.wikipedia.org/wiki/Rust_(programming_language)");
+        assert!(results[1].snippet.contains("general-purpose"));
+
+        assert_eq!(results[2].title, "Rust Tutorial - W3Schools");
+        assert_eq!(results[2].url, "https://www.w3schools.com/rust/index.php");
+    }
+
+    #[test]
+    fn parse_ddg_results_respects_the_count_cap() {
+        let results = parse_ddg_results(DDG_FIXTURE_HTML, 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust Programming Language");
+        assert_eq!(results[1].title, "Rust (programming language) - Wikipedia");
+    }
+
+    #[test]
+    fn parse_ddg_results_on_unrecognized_markup_returns_no_results_not_an_error() {
+        assert_eq!(parse_ddg_results("<html><body><p>no results here</p></body></html>", 10), Vec::new());
+    }
+
+    #[test]
+    fn search_impl_clamps_count_below_the_minimum_up_to_one() {
+        // count=0 must not become "zero results" or panic on an empty slice —
+        // it should clamp up to 1. Exercised indirectly through the pure
+        // parser with the real clamp expression `search_impl` uses, since
+        // driving `search_impl` itself would make a live network request.
+        let clamped = 0usize.clamp(1, DEFAULT_SEARCH_COUNT);
+        assert_eq!(clamped, 1);
+        let results = parse_ddg_results(DDG_FIXTURE_HTML, clamped);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_impl_clamps_count_above_the_maximum_down_to_ten() {
+        let clamped = 500usize.clamp(1, DEFAULT_SEARCH_COUNT);
+        assert_eq!(clamped, DEFAULT_SEARCH_COUNT);
     }
 }

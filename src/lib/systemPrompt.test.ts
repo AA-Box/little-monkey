@@ -124,14 +124,16 @@ describe('buildSystemPrompt', () => {
     expect(prompt).not.toContain('x'.repeat(1001));
   });
 
-  it('mentions web_fetch by default (webToolsAvailable defaults to true)', () => {
+  it('mentions web_fetch and web_search by default (webToolsAvailable defaults to true)', () => {
     const prompt = buildSystemPrompt([primary], 'macOS');
     expect(prompt).toContain('web_fetch');
+    expect(prompt).toContain('web_search');
   });
 
-  it('omits the web tools guidance line when webToolsAvailable is false', () => {
+  it('omits the web tools guidance line (both web_fetch and web_search) when webToolsAvailable is false', () => {
     const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], false);
     expect(prompt).not.toContain('web_fetch');
+    expect(prompt).not.toContain('web_search');
   });
 });
 

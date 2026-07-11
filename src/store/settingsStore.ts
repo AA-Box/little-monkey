@@ -40,6 +40,8 @@ export interface SettingsState {
   checkpointRetention: number;
   /** Whether the `remember` tool is offered to the model this turn (see `agentLoop.ts`'s `TOOLS` filter). Default true. Turning this off is not amnesia: rules and previously-saved facts are still injected into every system prompt regardless — it only stops the agent from saving *new* facts on its own. Facts remain manually addable/editable/deletable in the Rules tab either way. */
   memoryEnabled: boolean;
+  /** Whether the `web_fetch`/`web_search` tools are offered to the model this turn (see `agentLoop.ts`'s `toolsForSettings` filter). Default true — DuckDuckGo search needs no key, so web research works out of the box, and the permission prompt shown for every call is the real gate. Turning this off makes both tools invisible to the model (not merely denied), mirroring `memoryEnabled`'s "disabled = not offered" treatment of `remember`. */
+  webToolsEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -56,6 +58,7 @@ export interface SettingsState {
   clearProviderModelSelection: (providerId: string) => void;
   setCheckpointRetention: (value: number) => void;
   setMemoryEnabled: (value: boolean) => void;
+  setWebToolsEnabled: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -95,6 +98,7 @@ interface PersistedShape {
   providerModelFilters: Record<string, ProviderModelFilter>;
   checkpointRetention: number;
   memoryEnabled: boolean;
+  webToolsEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -110,6 +114,7 @@ function defaults(): PersistedShape {
     providerModelFilters: {},
     checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
     memoryEnabled: true,
+    webToolsEnabled: true,
   };
 }
 
@@ -163,6 +168,7 @@ function hydrate(): PersistedShape {
           ? Math.round(parsed.checkpointRetention)
           : fallback.checkpointRetention,
       memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
+      webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
     };
   } catch {
     return fallback;
@@ -275,6 +281,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setMemoryEnabled: (value) => {
     set({ memoryEnabled: value });
+    persist({ ...get() });
+  },
+
+  setWebToolsEnabled: (value) => {
+    set({ webToolsEnabled: value });
     persist({ ...get() });
   },
 }));

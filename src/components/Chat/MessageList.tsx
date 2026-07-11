@@ -185,6 +185,7 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   glob: FileSearch,
   remember: Brain,
   web_fetch: Globe,
+  web_search: Search,
 };
 
 function toolIcon(name: string): LucideIcon {
