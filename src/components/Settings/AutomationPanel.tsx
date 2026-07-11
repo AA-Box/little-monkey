@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
@@ -7,6 +8,8 @@ import {
   type ContextTrimStrategy,
 } from "../../store/settingsStore";
 import { useModelStore } from "../../store/modelStore";
+import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
+import { useVerifyStore, type VerifyCommand, type VerifyCommandKind } from "../../store/verifyStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
 
@@ -53,6 +56,87 @@ const STRATEGY_OPTIONS: { value: ContextTrimStrategy; labelKey: string; descript
   { value: "trim", labelKey: "AutomationPanel.strategyTrimLabel", descriptionKey: "AutomationPanel.strategyTrimDescription" },
 ];
 
+const VERIFY_KIND_OPTIONS: { value: VerifyCommandKind; labelKey: string }[] = [
+  { value: "lint", labelKey: "AutomationPanel.verifyKindLint" },
+  { value: "test", labelKey: "AutomationPanel.verifyKindTest" },
+  { value: "build", labelKey: "AutomationPanel.verifyKindBuild" },
+  { value: "custom", labelKey: "AutomationPanel.verifyKindCustom" },
+];
+
+/**
+ * One editable verification command: label / shell command / kind-select /
+ * enabled toggle / delete. Every field change round-trips through
+ * `verifyStore` (`verify_set_config` then a refresh) immediately — cheap for
+ * a local app, and it means the on-disk config never drifts from what's
+ * shown here even if the panel closes mid-edit.
+ */
+function VerifyCommandRow({ command }: { command: VerifyCommand }) {
+  const { t } = useT();
+  const updateCommand = useVerifyStore((s) => s.updateCommand);
+  const removeCommand = useVerifyStore((s) => s.removeCommand);
+  const toggleCommand = useVerifyStore((s) => s.toggleCommand);
+  const [removing, setRemoving] = useState(false);
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-border py-2.5 first:border-t-0">
+      <input
+        type="text"
+        value={command.label}
+        placeholder={t("AutomationPanel.verifyLabelPlaceholder")}
+        onChange={(event) => void updateCommand(command.id, { label: event.target.value })}
+        className="h-8 w-28 min-w-0 shrink-0 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+      />
+      <input
+        type="text"
+        value={command.command}
+        placeholder={t("AutomationPanel.verifyCommandPlaceholder")}
+        onChange={(event) => void updateCommand(command.id, { command: event.target.value })}
+        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+      />
+      <select
+        value={command.kind}
+        onChange={(event) => void updateCommand(command.id, { kind: event.target.value as VerifyCommandKind })}
+        className="h-8 shrink-0 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+      >
+        {VERIFY_KIND_OPTIONS.map((option) => (
+          <option key={option.value} value={option.value}>
+            {t(option.labelKey)}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={command.enabled}
+        aria-label={t("AutomationPanel.verifyEnabledAriaLabel", { label: command.label || command.command })}
+        onClick={() => void toggleCommand(command.id)}
+        className={`relative h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors ${
+          command.enabled ? "bg-accent" : "border border-border bg-surface-2"
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-[left] ${
+            command.enabled ? "left-[18px]" : "left-0.5"
+          }`}
+        />
+      </button>
+      <button
+        type="button"
+        disabled={removing}
+        aria-label={t("AutomationPanel.verifyDeleteAriaLabel", { label: command.label || command.command })}
+        onClick={async () => {
+          setRemoving(true);
+          await removeCommand(command.id).catch(() => {});
+          setRemoving(false);
+        }}
+        className="shrink-0 cursor-pointer text-faint transition-colors hover:text-danger disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <Trash2 size={14} />
+      </button>
+    </div>
+  );
+}
+
 /**
  * Settings tab for the client-side reliability behaviors this app ported
  * from the idea of a server-side multi-provider gateway: auto-failover,
@@ -81,10 +165,27 @@ export function AutomationPanel() {
   const visionOverrides = useSettingsStore((s) => s.visionOverrides);
   const setVisionOverride = useSettingsStore((s) => s.setVisionOverride);
   const clearVisionOverride = useSettingsStore((s) => s.clearVisionOverride);
+  const verifyEnabled = useSettingsStore((s) => s.verifyEnabled);
+  const setVerifyEnabled = useSettingsStore((s) => s.setVerifyEnabled);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
   const connectedProviders = useMemo(() => providers.filter((p) => p.has_key), [providers]);
+
+  const roots = useWorkspaceStore((s) => s.roots);
+  const rootsVersion = useWorkspaceStore((s) => s.rootsVersion);
+  const hasWorkspace = primaryRoot(roots) !== null;
+  const verifyCommands = useVerifyStore((s) => s.config.commands);
+  const addVerifyCommand = useVerifyStore((s) => s.addCommand);
+  const refreshVerifyConfig = useVerifyStore((s) => s.refresh);
+
+  // Reload the verification config whenever the primary workspace changes —
+  // it's keyed by workspace root on the backend, so a different folder has a
+  // different (possibly empty) command list. Same `rootsVersion`-keyed
+  // reload trigger `App.tsx` uses for `FileTree`/`WorkspaceBar`.
+  useEffect(() => {
+    void refreshVerifyConfig();
+  }, [rootsVersion, refreshVerifyConfig]);
 
   const [overrideProviderId, setOverrideProviderId] = useState("");
   const [overrideModelId, setOverrideModelId] = useState("");
@@ -155,6 +256,37 @@ export function AutomationPanel() {
                 </label>
               ))}
             </div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.verifyHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={verifyEnabled}
+            onChange={setVerifyEnabled}
+            label={t("AutomationPanel.verifyEnabledLabel")}
+            description={t("AutomationPanel.verifyEnabledDescription")}
+          />
+          <div className="border-t border-border py-2.5">
+            {!hasWorkspace ? (
+              <p className="text-xs text-faint">{t("AutomationPanel.verifyNoWorkspaceOpen")}</p>
+            ) : (
+              <>
+                {verifyCommands.length === 0 ? (
+                  <p className="pb-2 text-xs text-faint">{t("AutomationPanel.verifyEmptyState")}</p>
+                ) : (
+                  verifyCommands.map((command) => <VerifyCommandRow key={command.id} command={command} />)
+                )}
+                <div className={verifyCommands.length > 0 ? "border-t border-border pt-2.5" : ""}>
+                  <Button size="sm" variant="secondary" onClick={() => void addVerifyCommand()}>
+                    <Plus size={12} />
+                    {t("AutomationPanel.verifyAddCommandButton")}
+                  </Button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </section>

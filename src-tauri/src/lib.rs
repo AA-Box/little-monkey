@@ -25,6 +25,10 @@ pub mod web;
 // call `server::handle_request` directly for headless use, the same
 // AppHandle-free-core reasoning as `web`/`rules`/`memory` above.
 pub mod server;
+// `pub` so `lm-cli` (a later slice) can call `verify::run_command_impl`
+// directly, the same AppHandle-free-core reasoning as `web`/`rules`/`memory`
+// above.
+pub mod verify;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -243,6 +247,9 @@ pub fn run() {
             system::open_in_terminal,
             system::open_in_editor,
             system::open_session_window,
+            verify::verify_get_config,
+            verify::verify_set_config,
+            verify::verify_run,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -51,6 +51,8 @@ import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
+import { usePermissionStore } from '../store/permissionStore';
+import type { VerifyConfig } from '../store/verifyStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -241,6 +243,60 @@ export function formatMemoryNotice(notice: MemoryNotice): string {
   return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
+/** Prefix identifying a synthetic notice inserted after a turn that mutated
+ * files ran the workspace's configured verification commands (see
+ * `src-tauri/src/verify.rs`) — cloned from the `CHECKPOINT_NOTE_PREFIX`
+ * pattern above. One notice is appended per command that ran, each carrying
+ * a `VerifyNotice` JSON payload, so `MessageList` can render a labeled,
+ * pass/fail, collapsible-output row per command. This slice (report-only,
+ * `verifyMaxRounds` not yet implemented) never feeds a failure back to the
+ * model — a later slice adds that on top of the same notice shape. */
+export const VERIFY_NOTE_PREFIX = '[Verify]';
+
+/** Payload embedded in a verify notice message. `code`/`output` mirror the
+ * Rust `VerifyResult`'s `code`/combined `stdout`+`stderr` (see
+ * `buildVerifyOutput`), `output` tail-capped again to
+ * `VERIFY_NOTICE_OUTPUT_CAP` chars for the wire — `verify.rs` already caps
+ * each stream at ~20k chars server-side, but stdout+stderr combined can still
+ * exceed what's worth sending over IPC and storing in the transcript. */
+export interface VerifyNotice {
+  label: string;
+  kind: string;
+  /** `true` only when the command exited 0 and didn't time out. */
+  ok: boolean;
+  code: number | null;
+  output: string;
+  durationMs: number;
+}
+
+export function isVerifyNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_NOTE_PREFIX);
+}
+
+/** Parses a verify notice's JSON payload; `null` for anything malformed. */
+export function parseVerifyNotice(message: ChatMessage): VerifyNotice | null {
+  if (!isVerifyNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(VERIFY_NOTE_PREFIX.length));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as VerifyNotice).label === 'string' &&
+      typeof (parsed as VerifyNotice).ok === 'boolean'
+    ) {
+      return parsed as VerifyNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a verify notice".
+  }
+  return null;
+}
+
+/** Serializes a verify notice back into message content. */
+export function formatVerifyNotice(notice: VerifyNotice): string {
+  return `${VERIFY_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
 /** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
 const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
 
@@ -295,6 +351,133 @@ function parseRememberedFact(resultContent: string): { id: string; text: string 
     // Not JSON — can't be a successful remember result either.
   }
   return null;
+}
+
+/** Whether `resultContent` (a `write_file`/`edit_file` tool result string)
+ * represents success rather than the `{"error": ...}` shape
+ * `stringifyToolError` produces — used only to decide whether to add the
+ * call's path to `mutatedFiles` (see `runAgentTurnBody`). Structurally the
+ * same check as `MessageList.tsx`'s `resultLooksLikeError`, kept as its own
+ * tiny copy here rather than a shared import — both are one-line structural
+ * checks against the same wire shape, not enough shared complexity to be
+ * worth coupling the two modules over. */
+export function isSuccessfulMutationResult(resultContent: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(resultContent);
+    return !(parsed && typeof parsed === 'object' && 'error' in parsed);
+  } catch {
+    // Not JSON at all — the plain "Wrote N bytes to …"/"Edited …" success string.
+    return true;
+  }
+}
+
+/** Extracts the `path` argument from a `write_file`/`edit_file` tool call —
+ * used only to populate `mutatedFiles`. Never throws: malformed arguments
+ * JSON already surfaced as an error result from `executeToolCall` itself, so
+ * this just degrades to "no path known" rather than duplicating that error. */
+export function toolCallPathArg(toolCall: ToolCall): string | null {
+  try {
+    const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+    const path = (parsed as { path?: unknown } | null)?.path;
+    return typeof path === 'string' ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Shape returned by the `verify_run` Tauri command — mirrors the Rust
+ * `VerifyResult` struct (src-tauri/src/verify.rs) exactly. */
+interface VerifyRunResult {
+  commandId: string;
+  label: string;
+  kind: string;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+}
+
+/** Each verify notice's `output` field is capped at this many chars — a
+ * second, wire-facing cap on top of `verify.rs`'s own ~20k-char cap on each
+ * of stdout/stderr individually (combining both here can still exceed what's
+ * worth sending over IPC and keeping in the transcript). */
+const VERIFY_NOTICE_OUTPUT_CAP = 8000;
+
+/** Combines a verify command's stdout/stderr into the single `output` string
+ * a `VerifyNotice` carries, tail-capping the combination (a failure's most
+ * useful detail is almost always printed last) at
+ * `VERIFY_NOTICE_OUTPUT_CAP` chars. */
+function buildVerifyOutput(result: VerifyRunResult): string {
+  const parts: string[] = [];
+  if (result.timedOut) parts.push('Command timed out.');
+  if (result.stdout.trim().length > 0) parts.push(result.stdout.trim());
+  if (result.stderr.trim().length > 0) parts.push(result.stderr.trim());
+  const combined = parts.join('\n\n');
+  if (combined.length <= VERIFY_NOTICE_OUTPUT_CAP) return combined;
+  return `… (truncated)\n${combined.slice(combined.length - VERIFY_NOTICE_OUTPUT_CAP)}`;
+}
+
+/**
+ * Runs every enabled verification command configured for the current
+ * workspace (see `verify.rs`/`verifyStore.ts`), in order, appending one
+ * `[Verify]` notice per command to the transcript. Report-only in this
+ * slice: whether a command passes or fails, nothing is fed back to the model
+ * — that's a later slice's job (bounded by a `verifyMaxRounds` setting not
+ * yet implemented). No-ops (without any IPC calls) unless `verifyEnabled` is
+ * on, the active permission mode isn't `'plan'` (belt-and-braces — plan mode
+ * already blocks every write, so `mutatedFiles` should already be empty by
+ * the time a caller would reach this), and the workspace actually has at
+ * least one enabled command configured.
+ */
+async function runVerificationPhase(turnId: string, addMessage: (msg: ChatMessage) => void): Promise<void> {
+  if (!useSettingsStore.getState().verifyEnabled) return;
+  if (usePermissionStore.getState().mode === 'plan') return;
+
+  let config: VerifyConfig;
+  try {
+    config = await invoke<VerifyConfig>('verify_get_config', {});
+  } catch {
+    // No workspace open, or the config file couldn't be read — nothing to run.
+    return;
+  }
+
+  const enabledCommands = config.commands.filter((c) => c.enabled);
+  if (enabledCommands.length === 0) return;
+
+  for (const cmd of enabledCommands) {
+    try {
+      const result = await invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
+      addMessage({
+        role: 'system',
+        content: formatVerifyNotice({
+          label: result.label,
+          kind: result.kind,
+          ok: !result.timedOut && result.code === 0,
+          code: result.code,
+          output: buildVerifyOutput(result),
+          durationMs: result.durationMs,
+        }),
+      });
+    } catch (err) {
+      // verify_run itself rejected (e.g. the command was deleted from the
+      // config in another window between the check above and this call) —
+      // surface it as a failed notice rather than silently dropping the
+      // round.
+      const message = err instanceof Error ? err.message : String(err);
+      addMessage({
+        role: 'system',
+        content: formatVerifyNotice({
+          label: cmd.label,
+          kind: cmd.kind,
+          ok: false,
+          code: null,
+          output: message,
+          durationMs: 0,
+        }),
+      });
+    }
+  }
 }
 
 /** Shape returned by the `llama_status` Tauri command. */
@@ -778,6 +961,13 @@ async function runAgentTurnBody(
     return result.content.trim() || '(summary unavailable)';
   };
 
+  // Absolute paths this turn's `write_file`/`edit_file` calls have
+  // successfully mutated so far, across every tool-calling round trip below
+  // — read by `runVerificationPhase` at the loop's natural exit to decide
+  // whether there's anything worth verifying. Populated in the tool-call
+  // loop right below via `isSuccessfulMutationResult`/`toolCallPathArg`.
+  const mutatedFiles = new Set<string>();
+
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     // Stop button fired while a tool call was executing (between model
     // round trips, where there's no stream to abort) — don't start another.
@@ -870,7 +1060,14 @@ async function runAgentTurnBody(
         removeLastMessage();
         return;
       }
-      // The model gave a plain answer with no further tool requests — done.
+      // The model gave a plain answer with no further tool requests — this
+      // turn's natural exit point. Run the workspace's configured
+      // verification commands (if any files were mutated and the user
+      // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
+      // comment for exactly what gates this.
+      if (!signal?.aborted && mutatedFiles.size > 0) {
+        await runVerificationPhase(turnId, addMessage);
+      }
       return;
     }
 
@@ -909,6 +1106,19 @@ async function runAgentTurnBody(
         content: resultContent,
       };
       addMessage(toolMessage);
+
+      // Track this turn's file mutations for `runVerificationPhase` at the
+      // loop's eventual exit — only for calls that actually ran (not
+      // cancelled, not rejected above) and actually succeeded (the
+      // "Wrote…"/"Edited…" string shape, not `{"error": ...}"`).
+      if (
+        !signal?.aborted &&
+        (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file') &&
+        isSuccessfulMutationResult(resultContent)
+      ) {
+        const path = toolCallPathArg(toolCall);
+        if (path) mutatedFiles.add(path);
+      }
 
       // A successful `remember` gets its own transcript notice (with a
       // Forget button — see MessageList.tsx's MemoryRow), cloned from how
