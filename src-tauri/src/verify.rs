@@ -64,7 +64,13 @@ pub struct VerifyCommand {
     /// frontend's kind-select and MessageList's icon.
     pub kind: String,
     pub enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Renamed on the wire — `verifyStore.ts`'s `VerifyCommand.timeoutSecs`
+    /// (like `VerifyResult`'s `commandId`/`durationMs`/`timedOut` below)
+    /// expects camelCase; without this rename Serde would silently drop an
+    /// incoming `timeoutSecs` field (missing `Option` fields default to
+    /// `None` rather than erroring), so the per-command timeout the editor
+    /// sets would never actually persist.
+    #[serde(rename = "timeoutSecs", skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -371,6 +377,26 @@ mod tests {
         assert_eq!(loaded.get("/some/root").unwrap().commands[0].id, "a");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The frontend (`verifyStore.ts`) sends/reads `timeoutSecs` (camelCase)
+    /// over IPC — without the `#[serde(rename = "timeoutSecs")]` on
+    /// `VerifyCommand::timeout_secs`, this field would silently deserialize
+    /// to `None` instead of erroring (missing `Option` fields default rather
+    /// than fail), so the command editor's timeout input would never
+    /// actually take effect. Guards the wire format directly rather than
+    /// relying on the frontend types alone.
+    #[test]
+    fn verify_command_timeout_secs_round_trips_as_camel_case_on_the_wire() {
+        let mut cmd = command("a", "echo hi");
+        cmd.timeout_secs = Some(45);
+
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(json.get("timeoutSecs").and_then(|v| v.as_u64()), Some(45));
+        assert!(json.get("timeout_secs").is_none());
+
+        let round_tripped: VerifyCommand = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.timeout_secs, Some(45));
     }
 
     #[test]

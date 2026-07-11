@@ -455,9 +455,17 @@ export function shouldFeedBackVerifyFailure(failure: VerifyFailure | null, verif
  * `'plan'` (belt-and-braces — plan mode already blocks every write, so
  * `mutatedFiles` should already be empty by the time a caller would reach
  * this), and the workspace actually has at least one enabled command
- * configured.
+ * configured. `sessionId` is used only to set/clear
+ * `sessionStore.runningVerifyLabel` around each command so
+ * `MessageList.tsx` can render a "running <label>…" indicator while a
+ * (possibly long) command executes — it is not otherwise part of this
+ * function's control flow.
  */
-export async function runVerificationPhase(turnId: string, addMessage: (msg: ChatMessage) => void): Promise<VerifyFailure | null> {
+export async function runVerificationPhase(
+  sessionId: string,
+  turnId: string,
+  addMessage: (msg: ChatMessage) => void
+): Promise<VerifyFailure | null> {
   if (!useSettingsStore.getState().verifyEnabled) return null;
   if (usePermissionStore.getState().mode === 'plan') return null;
 
@@ -475,6 +483,12 @@ export async function runVerificationPhase(turnId: string, addMessage: (msg: Cha
   let firstFailure: VerifyFailure | null = null;
 
   for (const cmd of enabledCommands) {
+    // Surfaced as a "running <label>…" row in the timeline
+    // (MessageList.tsx's VerifyRunningRow) — test suites can run long enough
+    // (up to `timeout_secs`, default 300s) that a bare typing indicator would
+    // read as a hang. Cleared in `finally` so a thrown/rejected invoke below
+    // never leaves a stale "running" row behind.
+    useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
     try {
       const result = await invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
       const ok = !result.timedOut && result.code === 0;
@@ -513,6 +527,8 @@ export async function runVerificationPhase(turnId: string, addMessage: (msg: Cha
       if (firstFailure === null) {
         firstFailure = { label: cmd.label, code: null, output: message };
       }
+    } finally {
+      useSessionStore.getState().setRunningVerifyLabel(sessionId, null);
     }
   }
 
@@ -1114,7 +1130,7 @@ async function runAgentTurnBody(
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
       if (!signal?.aborted && mutatedFiles.size > 0) {
-        const failure = await runVerificationPhase(turnId, addMessage);
+        const failure = await runVerificationPhase(sessionId, turnId, addMessage);
         // A command failed and there's a feed-back round left to spend —
         // append one fix instruction and send the loop around again instead
         // of returning. `mutatedFiles` is cleared so only edits made in

@@ -14,6 +14,7 @@ import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesSto
 import { useMcpStore } from '../store/mcpStore';
 import { usePromptStore, type PromptEntry } from '../store/promptStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useVerifyStore } from '../store/verifyStore';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -113,7 +114,16 @@ export function buildSystemPrompt(
   // filter this guidance line is just describing in prose). Defaults to
   // `true` here only so existing tests/call sites that don't care about the
   // toggle don't have to pass it.
-  webToolsAvailable: boolean = true
+  webToolsAvailable: boolean = true,
+  // Whether `runVerificationPhase` (agentLoop.ts) will actually auto-run
+  // verification commands after this turn — true only when
+  // `settings.verifyEnabled` is on AND the current workspace has at least
+  // one enabled command configured. A plain boolean rather than reaching
+  // into `settingsStore`/`verifyStore` from inside this function keeps
+  // `buildSystemPrompt` pure and unit-testable; `currentSystemPrompt`
+  // computes it. Defaults to `false` so existing call sites/tests are
+  // unaffected.
+  verifyGuidanceAvailable: boolean = false
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -184,6 +194,14 @@ export function buildSystemPrompt(
     ? ['', 'You can research with web_search and read pages with web_fetch (Markdown, paginated via start_index/max_chars for long pages); cite source URLs.']
     : [];
 
+  // One conditional line telling the model that configured verification
+  // commands (see AutomationPanel's "Verification" section) run
+  // automatically after edits — set only when there's actually something
+  // that will run (see the `verifyGuidanceAvailable` param doc).
+  const verifyGuidanceLines = verifyGuidanceAvailable
+    ? ['', 'Configured verification commands run automatically after your edits; fix any failures they report.']
+    : [];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -201,6 +219,7 @@ export function buildSystemPrompt(
     ...mcpLines,
     ...rememberGuidanceLines,
     ...webToolsLines,
+    ...verifyGuidanceLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');
@@ -224,7 +243,17 @@ export function currentSystemPrompt(personaId: string | null = null): string {
     .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
     .map((server) => ({ label: server.label, instructions: server.instructions as string }));
   const webToolsAvailable = useSettingsStore.getState().webToolsEnabled;
-  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable);
+  // Mirrors `runVerificationPhase`'s own gate (verifyEnabled + >=1 enabled
+  // command for the current workspace) so the guidance line only appears
+  // when verification will actually run — see the `verifyGuidanceAvailable`
+  // param doc on `buildSystemPrompt`. Note this does NOT check permission
+  // mode (`runVerificationPhase` also skips plan mode) since the prompt is
+  // built once per turn before that mode is necessarily settled here; a
+  // stale "verification runs automatically" line in plan mode is harmless
+  // prose, not a behavior change.
+  const verifyGuidanceAvailable =
+    useSettingsStore.getState().verifyEnabled && useVerifyStore.getState().config.commands.some((c) => c.enabled);
+  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable, verifyGuidanceAvailable);
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
 }

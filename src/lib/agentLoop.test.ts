@@ -25,6 +25,7 @@ import {
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
+import { selectRunningVerifyLabel, useSessionStore } from "../store/sessionStore";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -268,13 +269,14 @@ describe("runVerificationPhase", () => {
     invokeMock.mockReset();
     useSettingsStore.setState({ verifyEnabled: true });
     usePermissionStore.setState({ mode: "manual" });
+    useSessionStore.setState({ runningVerifyLabel: {} });
   });
 
   it("no-ops without any IPC calls when verifyEnabled is off (report-only posture stays off by default)", async () => {
     useSettingsStore.setState({ verifyEnabled: false });
     const addMessage = vi.fn();
 
-    const failure = await runVerificationPhase("turn-1", addMessage);
+    const failure = await runVerificationPhase("session-1", "turn-1", addMessage);
 
     expect(failure).toBeNull();
     expect(invokeMock).not.toHaveBeenCalled();
@@ -285,7 +287,7 @@ describe("runVerificationPhase", () => {
     usePermissionStore.setState({ mode: "plan" });
     const addMessage = vi.fn();
 
-    const failure = await runVerificationPhase("turn-1", addMessage);
+    const failure = await runVerificationPhase("session-1", "turn-1", addMessage);
 
     expect(failure).toBeNull();
     expect(invokeMock).not.toHaveBeenCalled();
@@ -308,7 +310,7 @@ describe("runVerificationPhase", () => {
     }); // verify_run
 
     const addMessage = vi.fn();
-    const failure = await runVerificationPhase("turn-1", addMessage);
+    const failure = await runVerificationPhase("session-1", "turn-1", addMessage);
 
     expect(failure).toBeNull();
     expect(addMessage).toHaveBeenCalledTimes(1);
@@ -332,11 +334,50 @@ describe("runVerificationPhase", () => {
     }); // verify_run
 
     const addMessage = vi.fn();
-    const failure = await runVerificationPhase("turn-1", addMessage);
+    const failure = await runVerificationPhase("session-1", "turn-1", addMessage);
 
     expect(failure).toEqual({ label: "Tests", code: 1, output: "1 failing" });
     const notice = parseVerifyNotice(addMessage.mock.calls[0][0] as ChatMessage);
     expect(notice?.ok).toBe(false);
+  });
+
+  it("sets the running-verify-label for the duration of each command and clears it afterwards", async () => {
+    let labelWhileRunning: string | null = null;
+    invokeMock.mockResolvedValueOnce({
+      commands: [{ id: "cmd-1", label: "Tests", command: "pnpm test", kind: "test", enabled: true }],
+    }); // verify_get_config
+    invokeMock.mockImplementationOnce(async () => {
+      // Captured mid-flight — `verify_run` resolves after the label has
+      // already been set, mirroring the "running <label>…" timeline row a
+      // real (possibly long-running) command would show.
+      labelWhileRunning = selectRunningVerifyLabel("session-1")(useSessionStore.getState());
+      return {
+        commandId: "cmd-1",
+        label: "Tests",
+        kind: "test",
+        code: 0,
+        stdout: "ok",
+        stderr: "",
+        durationMs: 10,
+        timedOut: false,
+      };
+    });
+
+    await runVerificationPhase("session-1", "turn-1", vi.fn());
+
+    expect(labelWhileRunning).toBe("Tests");
+    expect(selectRunningVerifyLabel("session-1")(useSessionStore.getState())).toBeNull();
+  });
+
+  it("clears the running-verify-label even when verify_run itself rejects", async () => {
+    invokeMock.mockResolvedValueOnce({
+      commands: [{ id: "cmd-1", label: "Tests", command: "pnpm test", kind: "test", enabled: true }],
+    }); // verify_get_config
+    invokeMock.mockRejectedValueOnce(new Error("command not found")); // verify_run
+
+    await runVerificationPhase("session-1", "turn-1", vi.fn());
+
+    expect(selectRunningVerifyLabel("session-1")(useSessionStore.getState())).toBeNull();
   });
 });
 
