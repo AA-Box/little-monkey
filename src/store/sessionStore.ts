@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { textContent, type ChatMessage } from "../lib/llamaClient";
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
+import { usePromptStore } from "./promptStore";
 
 /** localStorage key sessions were persisted under BEFORE file-based
  * persistence existed — only read (once, then removed) to migrate old data.
@@ -214,7 +215,11 @@ function createSession(): ChatSession {
     archived: false,
     groupId: null,
     workspacePath: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
-    personaId: null,
+    // New sessions start on the user's chosen default persona, if any (see
+    // `promptStore.ts`'s `defaultPersonaId` / `setDefaultPersona`). A dangling
+    // id (its persona got deleted) resolves to "None" at turn time same as
+    // any other persona reference — see `composeSystemPrompt`.
+    personaId: usePromptStore.getState().defaultPersonaId,
   };
 }
 

@@ -56,6 +56,14 @@ interface PersistedShape {
   version: 1;
   entries: PromptEntry[];
   defaultPersonaId: string | null;
+  /** Whether the built-in starter personas (see `STARTER_PERSONAS`) have
+   * already been seeded once. Tracked in the persisted blob itself — NOT
+   * derived from `entries.length === 0` — so a user who deletes every
+   * starter persona (or every entry) never has them silently reappear on
+   * the next launch. Absent/`false` on any blob written before this field
+   * existed, which is exactly the "never seeded yet" state those blobs
+   * should get. */
+  hasSeededDefaults: boolean;
 }
 
 /**
@@ -73,11 +81,13 @@ export interface PromptStore {
   /** All saved prompt-library entries, in no particular order (sort/filter
    * at render time via `selectPersonas`/`selectSnippets`). */
   entries: PromptEntry[];
-  /** The persona applied to new sessions by default, or `null` for none.
-   * Not yet surfaced in the UI (that lands with the default-persona picker
-   * in a later slice) — persisted now so the schema doesn't need a bump
-   * when it is. */
+  /** The persona applied to new sessions by default (see `sessionStore.ts`'s
+   * `createSession`), or `null` for none. Set via the "Set as default" action
+   * on a persona row in `PromptLibraryPanel.tsx`, or `setDefaultPersona`. */
   defaultPersonaId: string | null;
+  /** Whether the built-in starter personas have already been seeded once —
+   * see `STARTER_PERSONAS`. Internal bookkeeping, not surfaced in the UI. */
+  hasSeededDefaults: boolean;
   /** Last file-persistence failure, surfaced in the UI instead of silently
    * dropping a save; cleared by the next successful save. */
   persistError: string | null;
@@ -102,7 +112,43 @@ export interface PromptStore {
    * Deliberately omits `defaultPersonaId`: it's a local preference, not
    * something that should travel into a teammate's imported copy. */
   exportPayload: () => string;
+  /** Sets (or, passed the id already set, clears) the persona new sessions
+   * start on — see `sessionStore.ts`'s `createSession`. No-ops if `id`
+   * doesn't name a persona entry. Passing `null` always clears it. */
+  setDefaultPersona: (id: string | null) => void;
 }
+
+/** 2-3 small built-in personas seeded once, on the very first hydration ever
+ * (see `hasSeededDefaults` on `PersistedShape`) — enough to make the "/"
+ * popup and the Prompts tab feel populated on a fresh install, without
+ * pretending to be a curated prompt marketplace. English-only: there is no
+ * ergonomic way to call `useT()` from `hydratePrompts()` (it runs before
+ * React mounts, in `main.tsx`), and these are ordinary editable/deletable
+ * library entries afterward, not chrome — a deliberately small deviation
+ * from full i18n coverage for this one piece of seed *data*. */
+const STARTER_PERSONAS: readonly Omit<NewPromptInput, "kind">[] = [
+  {
+    name: "Code Reviewer",
+    command: "code-reviewer",
+    description: "Reviews code for correctness, clarity, and maintainability.",
+    content:
+      "You are a meticulous code reviewer. Point out correctness bugs, unclear naming, missed edge cases, and simplification opportunities. Be direct and specific — cite the exact line or snippet. Prefer small, targeted suggestions over rewrites.",
+  },
+  {
+    name: "Concise Explainer",
+    command: "concise-explainer",
+    description: "Explains things plainly, in as few words as needed.",
+    content:
+      "Explain things as plainly and concisely as possible. Prefer short sentences and concrete examples over abstract prose. Skip preamble and caveats unless they change the answer. If something is genuinely uncertain, say so in one sentence rather than hedging throughout.",
+  },
+  {
+    name: "Brainstorm Partner",
+    command: "brainstorm-partner",
+    description: "Generates a wide range of options before narrowing down.",
+    content:
+      "Act as a brainstorming partner. When given a problem, first generate a diverse range of options or angles before evaluating any of them. Favor breadth over premature convergence, and clearly separate 'ideas' from 'recommendation' when you do narrow down.",
+  },
+];
 
 /** Derives a candidate command slug from a display name — lowercased,
  * non-alphanumerics collapsed to single hyphens, trimmed of leading/
@@ -237,7 +283,9 @@ function normalizeEntry(raw: Partial<PromptEntry>): PromptEntry {
 function parsePersisted(raw: string | null): PersistedShape | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as { version?: unknown; entries?: unknown; defaultPersonaId?: unknown } | null;
+    const parsed = JSON.parse(raw) as
+      | { version?: unknown; entries?: unknown; defaultPersonaId?: unknown; hasSeededDefaults?: unknown }
+      | null;
     if (!parsed || !Array.isArray(parsed.entries)) return null;
     return {
       version: 1,
@@ -245,6 +293,9 @@ function parsePersisted(raw: string | null): PersistedShape | null {
         .filter((e): e is Partial<PromptEntry> => !!e && typeof e === "object")
         .map(normalizeEntry),
       defaultPersonaId: typeof parsed.defaultPersonaId === "string" ? parsed.defaultPersonaId : null,
+      // Absent on any blob written before this field existed — exactly the
+      // "never seeded yet" state those blobs should get.
+      hasSeededDefaults: parsed.hasSeededDefaults === true,
     };
   } catch {
     return null;
@@ -278,9 +329,9 @@ function flushPersist(): void {
     });
 }
 
-function persist(entries: PromptEntry[], defaultPersonaId: string | null): void {
+function persist(entries: PromptEntry[], defaultPersonaId: string | null, hasSeededDefaults: boolean): void {
   try {
-    pendingPayload = JSON.stringify({ version: 1, entries, defaultPersonaId });
+    pendingPayload = JSON.stringify({ version: 1, entries, defaultPersonaId, hasSeededDefaults });
   } catch (err) {
     usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
     return;
@@ -310,7 +361,11 @@ async function rehydrateFromFile(): Promise<void> {
     return;
   }
   if (!fromFile) return;
-  usePromptStore.setState({ entries: fromFile.entries, defaultPersonaId: fromFile.defaultPersonaId });
+  usePromptStore.setState({
+    entries: fromFile.entries,
+    defaultPersonaId: fromFile.defaultPersonaId,
+    hasSeededDefaults: fromFile.hasSeededDefaults,
+  });
 }
 
 /** Starts listening for other windows' saves. Called once per window from
@@ -357,16 +412,49 @@ export async function hydratePrompts(): Promise<void> {
   }
 
   if (fromFile) {
-    usePromptStore.setState({ entries: fromFile.entries, defaultPersonaId: fromFile.defaultPersonaId });
+    usePromptStore.setState({
+      entries: fromFile.entries,
+      defaultPersonaId: fromFile.defaultPersonaId,
+      hasSeededDefaults: fromFile.hasSeededDefaults,
+    });
   }
   // No file yet (first run) — keep the empty initial state. Unlike
   // `sessionStore.ts` there's no legacy localStorage blob to migrate from:
   // this feature never persisted anywhere before this file existed.
+
+  // First-ever hydration (this device has never seeded the starter personas,
+  // whether because the file is brand new or predates this field): add them
+  // once and persist immediately so a fast quit-after-launch doesn't lose the
+  // seed. Never re-runs afterward, even if the user deletes every entry —
+  // `hasSeededDefaults` is what's checked, not `entries.length === 0`.
+  const stateAfterLoad = usePromptStore.getState();
+  if (!stateAfterLoad.hasSeededDefaults) {
+    const now = Date.now();
+    const taken = new Set(stateAfterLoad.entries.map((e) => e.command));
+    const seeded: PromptEntry[] = STARTER_PERSONAS.map((starter) => {
+      const command = uniqueCommand(starter.command, taken);
+      taken.add(command);
+      return {
+        id: crypto.randomUUID(),
+        kind: "persona",
+        name: starter.name,
+        command,
+        content: starter.content,
+        description: starter.description,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+    const entries = [...stateAfterLoad.entries, ...seeded];
+    usePromptStore.setState({ entries, hasSeededDefaults: true });
+    persist(entries, stateAfterLoad.defaultPersonaId, true);
+  }
 }
 
 export const usePromptStore = create<PromptStore>((set, get) => ({
   entries: [],
   defaultPersonaId: null,
+  hasSeededDefaults: false,
   persistError: null,
 
   addEntry: (input) => {
@@ -383,7 +471,7 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
     };
     set((state) => {
       const entries = [...state.entries, entry];
-      persist(entries, state.defaultPersonaId);
+      persist(entries, state.defaultPersonaId, state.hasSeededDefaults);
       return { entries };
     });
     return entry;
@@ -394,7 +482,7 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
       const target = state.entries.find((e) => e.id === id);
       if (!target) return state;
       const entries = state.entries.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e));
-      persist(entries, state.defaultPersonaId);
+      persist(entries, state.defaultPersonaId, state.hasSeededDefaults);
       return { entries };
     });
   },
@@ -404,7 +492,7 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
       if (!state.entries.some((e) => e.id === id)) return state;
       const entries = state.entries.filter((e) => e.id !== id);
       const defaultPersonaId = state.defaultPersonaId === id ? null : state.defaultPersonaId;
-      persist(entries, defaultPersonaId);
+      persist(entries, defaultPersonaId, state.hasSeededDefaults);
       return { entries, defaultPersonaId };
     });
   },
@@ -421,13 +509,22 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
       });
       added = imported.length;
       const entries = [...state.entries, ...imported];
-      persist(entries, state.defaultPersonaId);
+      persist(entries, state.defaultPersonaId, state.hasSeededDefaults);
       return { entries };
     });
     return added;
   },
 
   exportPayload: () => JSON.stringify({ version: 1, entries: get().entries }, null, 2),
+
+  setDefaultPersona: (id) => {
+    set((state) => {
+      if (id !== null && !state.entries.some((e) => e.id === id && e.kind === "persona")) return state;
+      if (state.defaultPersonaId === id) return state;
+      persist(state.entries, id, state.hasSeededDefaults);
+      return { defaultPersonaId: id };
+    });
+  },
 }));
 
 /** Zustand selector: every saved persona, in library order. */

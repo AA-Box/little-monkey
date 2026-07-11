@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Download, Pencil, Plus, Trash2, Upload } from "lucide-react";
+import { Download, Pencil, Plus, Star, Trash2, Upload } from "lucide-react";
 import { Button } from "../ui";
 import {
   findByCommand,
@@ -68,6 +68,8 @@ export function PromptLibraryPanel() {
   const removeEntry = usePromptStore((s) => s.removeEntry);
   const importEntries = usePromptStore((s) => s.importEntries);
   const exportPayload = usePromptStore((s) => s.exportPayload);
+  const defaultPersonaId = usePromptStore((s) => s.defaultPersonaId);
+  const setDefaultPersona = usePromptStore((s) => s.setDefaultPersona);
 
   const [draft, setDraft] = useState<DraftState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -252,7 +254,24 @@ export function PromptLibraryPanel() {
                 </span>
                 <span className="truncate text-sm font-medium text-foreground">{entry.name}</span>
                 <span className="truncate font-mono text-xs text-faint">/{entry.command}</span>
+                {entry.kind === "persona" && entry.id === defaultPersonaId && (
+                  <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-accent-soft text-accent">
+                    {t("PromptLibraryPanel.defaultBadge")}
+                  </span>
+                )}
                 <div className="ml-auto flex shrink-0 items-center gap-1">
+                  {entry.kind === "persona" &&
+                    (entry.id === defaultPersonaId ? (
+                      <Button variant="ghost" size="sm" onClick={() => setDefaultPersona(null)}>
+                        <Star size={12} />
+                        {t("PromptLibraryPanel.unsetDefaultButton")}
+                      </Button>
+                    ) : (
+                      <Button variant="ghost" size="sm" onClick={() => setDefaultPersona(entry.id)}>
+                        <Star size={12} />
+                        {t("PromptLibraryPanel.setDefaultButton")}
+                      </Button>
+                    ))}
                   <Button variant="ghost" size="sm" onClick={() => startEdit(entry)}>
                     <Pencil size={12} />
                     {t("PromptLibraryPanel.editButton")}
