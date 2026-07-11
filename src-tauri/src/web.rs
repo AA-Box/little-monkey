@@ -8,25 +8,28 @@
 //! the same reason it does there — `lm-cli` (phase 4) reuses `fetch_impl`
 //! directly instead of duplicating the fetch pipeline.
 //!
-//! SSRF GUARD. [`validate_fetch_url`] is the actual security boundary of this
-//! feature: `llama-server` (:8090) and Ollama (:11434) both listen on
-//! loopback, so a page or prompt that talks the agent into fetching
-//! `http://127.0.0.1:8090/...` (or any other private-range target) could
+//! SSRF GUARD. [`validate_fetch_url`] plus [`SsrfGuardedResolver`] together
+//! are the actual security boundary of this feature: `llama-server` (:8090)
+//! and Ollama (:11434) both listen on loopback, so a page or prompt that
+//! talks the agent into fetching `http://127.0.0.1:8090/...` (or any other
+//! private-range, link-local, or unspecified (`0.0.0.0`/`::`) target) could
 //! reach a service on the user's own machine that was never meant to be
-//! internet-reachable. It is called once on the request's initial URL and
-//! again, from inside the custom `reqwest::redirect::Policy`, on every
-//! redirect hop — a server can otherwise pass the initial check with a public
-//! URL and then 302 the client to a private one. DNS resolution for a
-//! hostname (as opposed to a literal IP in the URL) uses the blocking
-//! `std::net::ToSocketAddrs`, not an async resolver: `redirect::Policy::custom`
-//! takes a *synchronous* closure (`Fn(Attempt<'_>) -> Action`), so there is no
-//! way to `.await` inside it — see that closure's construction in
-//! `fetch_impl` for why the whole guard is written sync-only rather than
-//! having two copies (one async for the entry check, one blocking for
-//! redirects). A brief blocking DNS lookup on the async runtime thread is an
-//! accepted tradeoff here, same category as the "residual DNS-rebinding risk"
-//! the design doc already calls out: this only re-resolves and re-checks
-//! per-hop, it doesn't pin the resolved address for the connection itself.
+//! internet-reachable. `validate_fetch_url` is called once on the request's
+//! initial URL and again, from inside the custom `reqwest::redirect::Policy`,
+//! on every redirect hop — a server can otherwise pass the initial check
+//! with a public URL and then 302 the client to a private one; that policy
+//! also caps the chain at `MAX_REDIRECT_HOPS`, since `Policy::custom` doesn't
+//! get `reqwest`'s default loop-cap for free. For a hostname target (as
+//! opposed to a literal IP in the URL), `validate_fetch_url`'s own DNS
+//! resolution (via the blocking `std::net::ToSocketAddrs` — `redirect::Policy::custom`
+//! takes a *synchronous* closure, so there's no way to `.await` inside it) is
+//! only ever a fast-reject pre-check, not the actual security boundary for
+//! the connection: `fetch_impl` installs [`SsrfGuardedResolver`] as the
+//! `reqwest::Client`'s DNS resolver, so hostname resolution for the real TCP
+//! connect happens exactly once, filtered through the same blocklist, with no
+//! separate later lookup for a DNS-rebinding attacker (TTL=0 / a rebinding
+//! service answering the check-time and connect-time queries differently) to
+//! race against.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -61,8 +64,18 @@ const USER_AGENT: &str = "LittleMonkey/0.1";
 /// fine to duplicate rather than export from `providers.rs`.
 const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
 
-/// Keychain account name the Brave API key is stored under.
-const BRAVE_KEYCHAIN_ACCOUNT: &str = "search-brave";
+/// Keychain account name the Brave API key is stored under. Namespaced with
+/// a `web:` prefix — same reasoning as `mcp.rs::keychain_account`'s `mcp:`
+/// prefix (see its doc comment and `keychain_account_namespaces_by_mcp_prefix`
+/// test): `providers.rs` stores custom-LLM-provider keys under the *bare*
+/// slugified provider id (`providers::slugify`, which only ever produces
+/// lowercase alphanumerics and dashes — never a colon), in the very same
+/// keychain *service* this module uses. A custom provider labeled e.g.
+/// "Search Brave" slugifies to exactly `search-brave`, so an unprefixed
+/// account here would silently collide with — and let one feature overwrite
+/// or read — the other's secret. The `web:` prefix makes that collision
+/// structurally impossible.
+const BRAVE_KEYCHAIN_ACCOUNT: &str = "web:search-brave";
 
 /// Filename for the persisted web-tools settings under the app data
 /// directory — same file-per-feature pattern as `providers.json`/
@@ -253,9 +266,18 @@ pub fn web_get_settings(app: tauri::AppHandle) -> Result<WebSettings, String> {
 /// Does not touch the Brave key — that's [`web_set_brave_key`]/
 /// [`web_remove_brave_key`]'s job, kept as separate commands since one lives
 /// in the keychain and the other in this JSON file.
+///
+/// Serialized against every other call via `state.web_settings_lock` (see
+/// its doc comment on `AppState`) — this is a synchronous command, so Tauri
+/// can dispatch two concurrent calls (e.g. a rapid double-click of Save, or
+/// two Settings > Web controls firing close together) onto genuinely
+/// concurrent OS threads; without the lock, both could `std::fs::write` the
+/// same deterministic `web_settings.json.tmp` path at once and leave a
+/// torn/interleaved file for whichever `rename` lands last to publish.
 #[tauri::command]
-pub fn web_set_settings(app: tauri::AppHandle, settings: WebSettings) -> Result<(), String> {
+pub fn web_set_settings(app: tauri::AppHandle, state: tauri::State<'_, AppState>, settings: WebSettings) -> Result<(), String> {
     let settings = normalize_and_validate_settings(settings)?;
+    let _guard = state.web_settings_lock.lock().map_err(|_| "Web settings lock poisoned".to_string())?;
     save_settings_impl(&settings_file_path(&app)?, &settings)
 }
 
@@ -292,26 +314,33 @@ pub fn web_remove_brave_key() -> Result<(), String> {
 }
 
 /// Checks whether `ip` falls in any of the ranges the design doc calls out:
-/// loopback, RFC1918 private, and link-local. `Ipv4Addr::is_private` (the std
-/// method) already covers exactly 10.0.0.0/8, 172.16.0.0/12, and
-/// 192.168.0.0/16, so it's used as-is rather than hand-rolling the same
-/// three CIDR checks.
+/// loopback, RFC1918 private, link-local, and unspecified (`0.0.0.0`).
+/// `Ipv4Addr::is_private` (the std method) already covers exactly
+/// 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16, so it's used as-is rather
+/// than hand-rolling the same three CIDR checks. `is_unspecified` (`0.0.0.0`)
+/// is checked explicitly and separately from the other three: it isn't
+/// loopback, private, *or* link-local by any of those predicates' own
+/// definitions, yet the OS routes an outbound connection to `0.0.0.0` to
+/// `127.0.0.1` (verified empirically on macOS) — i.e. it's a real path to a
+/// loopback-bound service like `llama-server`/Ollama, not a dead address,
+/// so it must be blocked exactly like a literal `127.0.0.1`.
 fn is_blocked_ipv4(ip: &Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local()
+    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
 }
 
-/// IPv6 equivalent of [`is_blocked_ipv4`]. `Ipv6Addr::is_loopback` is stable
-/// std, but the unique-local (`fc00::/7`) and link-local (`fe80::/10`) checks
-/// are hand-rolled here because the corresponding std predicates
-/// (`is_unique_local`, `is_unicast_link_local`) are still gated behind the
-/// unstable `ip` feature. An IPv4-mapped address (`::ffff:a.b.c.d`) is
-/// unwrapped and re-checked against [`is_blocked_ipv4`] so a v4-mapped
-/// private address can't slip past a v6-only check.
+/// IPv6 equivalent of [`is_blocked_ipv4`]. `Ipv6Addr::is_loopback` and
+/// `is_unspecified` are stable std, but the unique-local (`fc00::/7`) and
+/// link-local (`fe80::/10`) checks are hand-rolled here because the
+/// corresponding std predicates (`is_unique_local`, `is_unicast_link_local`)
+/// are still gated behind the unstable `ip` feature. An IPv4-mapped address
+/// (`::ffff:a.b.c.d`) is unwrapped and re-checked against [`is_blocked_ipv4`]
+/// so a v4-mapped private (or unspecified) address can't slip past a
+/// v6-only check.
 fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_blocked_ipv4(&v4);
     }
-    if ip.is_loopback() {
+    if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
     let octets = ip.octets();
@@ -523,21 +552,95 @@ fn dispatch_content(content_type: &str, body: &str, url: &str) -> Result<(Option
     }
 }
 
-/// Builds the redirect policy [`fetch_impl`] hands to `reqwest`: re-runs
-/// [`validate_fetch_url`] against every hop's target (`Attempt::url()` is
-/// already a parsed `Url`, so no re-parsing is needed) and errors the whole
-/// request out the moment one fails, rather than silently stopping at the
-/// last-good URL — a caller must not mistake a blocked redirect for a
-/// successful fetch of the pre-redirect page. Factored out of [`fetch_impl`]
-/// so a test can drive the exact same policy against a real local server
-/// without going through the rest of the fetch pipeline (whose own entry
-/// check would otherwise reject a `127.0.0.1` test server before ever
-/// reaching the redirect).
+/// Hop cap for [`build_redirect_policy`]'s custom policy — same maximum
+/// `reqwest::redirect::Policy::default()`/`Policy::limited(10)` already
+/// enforce for every *other* client in this app. `Policy::custom` does not
+/// get that cap for free (its own doc comment says so explicitly: "the
+/// custom variant does not do that for you automatically"), so without this
+/// a redirect loop between two hosts that both pass [`validate_fetch_url`]
+/// (i.e. both public) would otherwise only ever stop at [`FETCH_TIMEOUT`].
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// Builds the redirect policy [`fetch_impl`] hands to `reqwest`: caps the
+/// chain at [`MAX_REDIRECT_HOPS`] hops (mirroring `Policy::default`'s own
+/// limit, which a custom policy must reimplement itself — see
+/// `MAX_REDIRECT_HOPS`'s doc comment) and re-runs [`validate_fetch_url`]
+/// against every hop's target (`Attempt::url()` is already a parsed `Url`,
+/// so no re-parsing is needed), erroring the whole request out the moment
+/// either check fails rather than silently stopping at the last-good URL —
+/// a caller must not mistake a blocked redirect for a successful fetch of
+/// the pre-redirect page. Factored out of [`fetch_impl`] so a test can drive
+/// the exact same policy against a real local server without going through
+/// the rest of the fetch pipeline (whose own entry check would otherwise
+/// reject a `127.0.0.1` test server before ever reaching the redirect).
 fn build_redirect_policy(allow_local_network: bool) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| match validate_fetch_url(attempt.url(), allow_local_network) {
-        Ok(()) => attempt.follow(),
-        Err(e) => attempt.error(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)),
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECT_HOPS {
+            return attempt.error(std::io::Error::other(format!(
+                "Refusing to follow more than {MAX_REDIRECT_HOPS} redirects"
+            )));
+        }
+        match validate_fetch_url(attempt.url(), allow_local_network) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)),
+        }
     })
+}
+
+/// Custom `reqwest` DNS resolver that closes the check-then-connect
+/// DNS-rebinding gap the module doc calls out: without this, [`validate_fetch_url`]
+/// resolves a hostname once (via blocking `std::net::ToSocketAddrs`) purely to
+/// decide whether to allow the request, and `reqwest`'s own default resolver
+/// then performs a completely separate, later resolution to actually open the
+/// TCP connection — an attacker controlling DNS for the target domain (TTL=0 /
+/// a rebinding service) can answer those two lookups differently, passing the
+/// check with a public address while the real connection lands on a private
+/// one. Installed via `ClientBuilder::dns_resolver` in [`fetch_impl`], this
+/// resolver is the *only* resolution that ever happens for a hostname target:
+/// it resolves once (async, via `tokio::net::lookup_host`, so no blocking-DNS
+/// call lands on the async runtime thread the way `validate_fetch_url`'s
+/// pre-check does) and filters the result through the exact same
+/// [`is_blocked_ip`] predicate `validate_fetch_url` uses, handing `reqwest`
+/// only addresses that already passed the filter. Since the addresses handed
+/// back are exactly what `reqwest` connects to — not a hint checked against a
+/// separate, later lookup — there is no second resolution left for a
+/// rebinding attacker to race. Applies on the initial request and every
+/// redirect hop alike, since `reqwest` calls the installed resolver fresh for
+/// each new host it connects to.
+struct SsrfGuardedResolver {
+    allow_local_network: bool,
+}
+
+impl reqwest::dns::Resolve for SsrfGuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_local_network = self.allow_local_network;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port `0` here is intentional and harmless: `reqwest` overrides
+            // it with whatever port the request URL itself specifies (or the
+            // scheme's conventional port) — see `Resolve::resolve`'s own doc
+            // comment. Formatted as an owned `"{host}:0"` string (rather than
+            // a `(&str, u16)` tuple) purely so the future `lookup_host`
+            // returns doesn't borrow from `host` across the `.await` — it
+            // owns its own copy instead.
+            let resolved = tokio::net::lookup_host(format!("{host}:0"))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            if allow_local_network {
+                return Ok(Box::new(resolved) as reqwest::dns::Addrs);
+            }
+
+            let allowed: Vec<std::net::SocketAddr> = resolved.filter(|addr| !is_blocked_ip(&addr.ip())).collect();
+            if allowed.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Refusing to connect to '{host}': host resolves only to local/private addresses"),
+                )) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Core `web_fetch` logic: AppHandle-free and directly testable (against a
@@ -566,6 +669,7 @@ pub async fn fetch_impl(
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .redirect(build_redirect_policy(settings.allow_local_network))
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver { allow_local_network: settings.allow_local_network }))
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
@@ -1018,13 +1122,15 @@ pub async fn search_impl(
 /// Search the web via the configured provider (DuckDuckGo/Brave/SearXNG) and
 /// return up to `count` (1-10, default 10) ranked `{title, url, snippet}`
 /// results. Permission-gated: prompts with the query as detail, exactly like
-/// `tool_web_fetch` prompts with the URL. `turn_id` scopes the permission
-/// prompt to the calling turn (never model-supplied) — unlike `tool_web_fetch`,
-/// there is no Stop-button cancellation wiring here: the request is one
-/// short, fixed-endpoint call (see `SEARCH_TIMEOUT`), not a potentially large
-/// streamed fetch, so it gets `remember`'s simpler "turn id for the prompt
-/// only" treatment rather than `web_fetch`'s `tokio::select!` +
-/// `state.tool_cancel` split.
+/// `tool_web_fetch` prompts with the URL. `turn_id` scopes both the
+/// permission prompt and Stop-button cancellation to the calling turn (never
+/// model-supplied) — same `tokio::select!` + `state.tool_cancel` split
+/// `tool_web_fetch` uses, rather than the earlier "no cancellation wiring"
+/// stance: a user-configured SearXNG instance (`settings.searxng_base_url`)
+/// can be slow or hang just as easily as an arbitrary fetched page, and
+/// without this a Stop click would silently do nothing on the backend for
+/// up to `SEARCH_TIMEOUT` while the frontend already reports the tool call
+/// as cancelled.
 ///
 /// `rename_all = "snake_case"`: matches every other tool command, so the
 /// model's snake_case tool-call arguments (`count`) and the agent loop's
@@ -1051,7 +1157,38 @@ pub async fn tool_web_search(
     } else {
         None
     };
-    search_impl(&settings, brave_key, query, count).await
+
+    // Same per-turn cancellation channel `tool_web_fetch`/`tool_run_shell`
+    // use — see `AppState::tool_cancel`'s doc comment. Callers that don't
+    // thread a turn id share the "" channel.
+    let cancel_key = turn_id.unwrap_or_default();
+    let cancel = state
+        .tool_cancel
+        .lock()
+        .map_err(|_| "Tool-cancel lock poisoned".to_string())?
+        .entry(cancel_key.clone())
+        .or_insert_with(|| std::sync::Arc::new(Notify::new()))
+        .clone();
+
+    let outcome = tokio::select! {
+        result = search_impl(&settings, brave_key, query, count) => result,
+        _ = cancel.notified() => Err("Search cancelled by the user".to_string()),
+    };
+
+    // Drop this turn's channel once no other in-flight tool of the same turn
+    // still holds it — mirrors `tool_web_fetch`'s own cleanup so the map
+    // doesn't grow one entry per turn forever.
+    {
+        let mut guard = state
+            .tool_cancel
+            .lock()
+            .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
+        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+            guard.remove(&cancel_key);
+        }
+    }
+
+    outcome
 }
 
 #[cfg(test)]
@@ -1111,6 +1248,33 @@ mod tests {
     #[test]
     fn rejects_ipv4_mapped_ipv6_private_address() {
         let err = validate_fetch_url(&url("http://[::ffff:127.0.0.1]/"), false).unwrap_err();
+        assert!(err.contains("local/private"), "unexpected error: {err}");
+    }
+
+    /// `0.0.0.0`/`::` are neither loopback, private, nor link-local by any of
+    /// std's own predicates, yet the OS routes an outbound connection to
+    /// `0.0.0.0` to `127.0.0.1` — a real path to a loopback-bound service
+    /// like `llama-server`/Ollama, not a dead address. Must be rejected the
+    /// same as a literal `127.0.0.1`.
+    #[test]
+    fn rejects_unspecified_ipv4_and_ipv6() {
+        for target in ["http://0.0.0.0:8090/v1/chat", "http://[::]:11434/api/tags"] {
+            let err = validate_fetch_url(&url(target), false).unwrap_err();
+            assert!(err.contains("local/private"), "unexpected error for {target}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_unspecified_ipv6_address() {
+        let err = validate_fetch_url(&url("http://[::ffff:0.0.0.0]/"), false).unwrap_err();
+        assert!(err.contains("local/private"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_impl_rejects_the_unspecified_address() {
+        let err = fetch_impl(&WebSettings::default(), "http://0.0.0.0:8090/".to_string(), None, None)
+            .await
+            .unwrap_err();
         assert!(err.contains("local/private"), "unexpected error: {err}");
     }
 
@@ -1234,6 +1398,85 @@ mod tests {
 
         let result = client.get(format!("http://{}/", addr)).send().await;
         assert!(result.is_err(), "expected the redirect to a private IP to be blocked");
+    }
+
+    /// `reqwest::redirect::Policy::custom` does not get a redirect-loop cap
+    /// for free (its own doc comment says so explicitly), so without
+    /// `MAX_REDIRECT_HOPS` a server that keeps 302ing (to itself, or to a
+    /// chain of other otherwise-public hosts) would only ever be stopped by
+    /// the whole-request `FETCH_TIMEOUT`. `allow_local_network: true` here is
+    /// deliberate: this test is exercising the hop-count cap, not the SSRF
+    /// filter (already covered by `redirect_hop_to_a_private_ip_is_blocked`
+    /// above), so the SSRF check is opted out of the same way a real user
+    /// enabling "allow local network" in Settings would, letting the
+    /// loopback test server redirect to itself freely.
+    #[tokio::test]
+    async fn redirect_policy_caps_an_infinite_redirect_loop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+        let self_url = format!("http://{addr}/");
+
+        std::thread::spawn(move || {
+            // Keep answering every connection the same way for as long as
+            // the (short-lived) test needs it to — each hop is a fresh
+            // connection since the response sets `Connection: close`.
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {self_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let client = reqwest::Client::builder().redirect(build_redirect_policy(true)).build().unwrap();
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), client.get(format!("http://{addr}/")).send())
+            .await
+            .expect("the hop cap must stop the loop well within the 5s test timeout, not hang until it");
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "expected the redirect loop to be capped rather than followed forever");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected the {MAX_REDIRECT_HOPS}-hop cap to stop the loop quickly, took {elapsed:?}"
+        );
+    }
+
+    /// Exercises [`SsrfGuardedResolver`] directly (not through `fetch_impl`,
+    /// which would also reject `localhost` via `validate_fetch_url`'s own
+    /// pre-check) — this is the resolver installed as the `reqwest::Client`'s
+    /// actual DNS resolver, i.e. the one whose output is what the real TCP
+    /// connect uses, closing the check-then-connect DNS-rebinding gap the
+    /// module doc describes.
+    #[tokio::test]
+    async fn ssrf_guarded_resolver_rejects_a_hostname_resolving_to_loopback() {
+        use reqwest::dns::Resolve;
+
+        let resolver = SsrfGuardedResolver { allow_local_network: false };
+        let name: reqwest::dns::Name = "localhost".parse().expect("valid dns name");
+        // `Addrs` (the `Ok` type) is a boxed `dyn Iterator`, which isn't
+        // `Debug` — so this matches manually rather than using
+        // `Result::expect_err`, which requires the `Ok` type to be `Debug`.
+        match resolver.resolve(name).await {
+            Ok(_) => panic!("localhost must not resolve through the guarded resolver"),
+            Err(err) => assert!(err.to_string().contains("local/private"), "unexpected error: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_guarded_resolver_allows_loopback_when_allow_local_network_is_set() {
+        use reqwest::dns::Resolve;
+
+        let resolver = SsrfGuardedResolver { allow_local_network: true };
+        let name: reqwest::dns::Name = "localhost".parse().expect("valid dns name");
+        let addrs = resolver.resolve(name).await.expect("allow_local_network must let loopback resolve");
+        assert!(addrs.count() > 0, "expected at least one resolved address for localhost");
     }
 
     /// A trimmed fixture of `html.duckduckgo.com/html/`'s actual result
@@ -1368,6 +1611,23 @@ mod tests {
         assert_eq!(serde_json::from_str::<SearchProvider>("\"searxng\"").unwrap(), SearchProvider::Searxng);
     }
 
+    /// `providers.rs::slugify` only ever produces lowercase alphanumerics and
+    /// dashes (never a colon), so any keychain account prefixed with a colon
+    /// segment is structurally unreachable from a custom-provider label —
+    /// same reasoning as `mcp.rs`'s `keychain_account_namespaces_by_mcp_prefix`
+    /// test, applied to this module's own Brave-key account.
+    #[test]
+    fn brave_keychain_account_is_namespaced_away_from_provider_slugs() {
+        assert!(
+            BRAVE_KEYCHAIN_ACCOUNT.contains(':'),
+            "expected a namespaced account name, got {BRAVE_KEYCHAIN_ACCOUNT}"
+        );
+        // A custom LLM provider labeled "Search Brave" (or any casing/
+        // punctuation variant) slugifies to exactly this — the collision the
+        // namespace prefix must rule out.
+        assert_ne!(BRAVE_KEYCHAIN_ACCOUNT, "search-brave");
+    }
+
     #[test]
     fn web_settings_default_matches_the_design_docs_defaults() {
         let settings = WebSettings::default();
@@ -1407,6 +1667,49 @@ mod tests {
         save_settings_impl(&path, &WebSettings { fetch_max_chars: 2_000, ..WebSettings::default() }).unwrap();
         assert_eq!(load_settings_impl(&path).unwrap().fetch_max_chars, 2_000);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Reproduces (and proves fixed) the concurrent-save corruption
+    /// `AppState::web_settings_lock` exists to prevent: without a lock
+    /// serializing the load-then-write-then-rename cycle, two threads
+    /// `std::fs::write`-ing the same deterministic `.json.tmp` path at once
+    /// can interleave, leaving a torn/unparseable file. Driven at high
+    /// repetition (not just once) since the race is timing-dependent and a
+    /// single iteration could pass by luck even with the lock removed.
+    #[test]
+    fn concurrent_saves_serialized_by_web_settings_lock_never_corrupt_the_file() {
+        let path = std::sync::Arc::new(temp_settings_path("concurrent.json"));
+        let state = std::sync::Arc::new(crate::AppState::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let make_worker = |fetch_max_chars: usize| {
+            let path = path.clone();
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                for _ in 0..200 {
+                    let settings = WebSettings { fetch_max_chars, ..WebSettings::default() };
+                    let _guard = state.web_settings_lock.lock().unwrap();
+                    save_settings_impl(&path, &settings).unwrap();
+                }
+            }
+        };
+
+        let handle_a = std::thread::spawn(make_worker(1_000));
+        let handle_b = std::thread::spawn(make_worker(2_000));
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // The file must always parse cleanly (never torn/interleaved) and
+        // hold exactly one writer's complete settings, never a mix of both.
+        let loaded = load_settings_impl(&path).expect("serialized concurrent saves must never corrupt the file");
+        assert!(
+            loaded.fetch_max_chars == 1_000 || loaded.fetch_max_chars == 2_000,
+            "unexpected fetch_max_chars: {}",
+            loaded.fetch_max_chars
+        );
+        let _ = std::fs::remove_file(path.as_path());
     }
 
     #[test]

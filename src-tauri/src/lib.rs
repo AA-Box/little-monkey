@@ -87,6 +87,17 @@ pub struct AppState {
     /// the connection itself, so this lock is never held across a
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
+    /// Serializes `web_settings.json` writes (see `web.rs::web_set_settings`)
+    /// — same reasoning as `mcp_config_lock` protects `mcp_servers.json`.
+    /// `web_set_settings` is a synchronous command (Tauri can dispatch two
+    /// calls onto genuinely concurrent OS threads), and its save is a plain
+    /// temp-file-write-then-rename with a deterministic temp path; without
+    /// this lock, two concurrent saves can both `std::fs::write` the same
+    /// `web_settings.json.tmp` at once and leave a torn/interleaved file
+    /// behind for whichever `rename` lands last to publish. A plain
+    /// `std::sync::Mutex`, not `tokio::sync::Mutex`: the guarded section is
+    /// synchronous with no `.await` in between.
+    pub web_settings_lock: std::sync::Mutex<()>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
