@@ -1,6 +1,6 @@
 //! Permission request/response system.
 //!
-//! Every mutating agent tool (write_file, edit_file, run_shell — see tools.rs) must
+//! Every mutating agent tool (write_file, edit_file, run_shell, remember — see tools.rs) must
 //! call [`request_permission`] before doing anything destructive. This emits a
 //! `permission://request` event to the frontend, which renders a modal
 //! (Allow Once / Allow for Session / Deny). The frontend responds via the
@@ -88,7 +88,7 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
             "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - ask the user to switch out of Plan Mode before making changes."
         ))),
         "acceptEdits" | "auto" => {
-            if tool == "write_file" || tool == "edit_file" {
+            if tool == "write_file" || tool == "edit_file" || tool == "remember" {
                 Some(Ok(()))
             } else {
                 None
@@ -108,10 +108,11 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
 /// - `"plan"`: always `Err(..)` — every caller of this function is already a
 ///   mutating tool (read-only tools never call it), so plan mode blocks all
 ///   of them unconditionally.
-/// - `"acceptEdits"`: `write_file`/`edit_file` are auto-approved; anything
-///   else (i.e. `run_shell`) falls through to the normal prompting logic.
-/// - `"auto"`: same as `"acceptEdits"` — `write_file`/`edit_file` are
-///   auto-approved, and `run_shell` ALWAYS falls through to the normal
+/// - `"acceptEdits"`: `write_file`/`edit_file`/`remember` are auto-approved;
+///   anything else (i.e. `run_shell`) falls through to the normal prompting
+///   logic.
+/// - `"auto"`: same as `"acceptEdits"` — `write_file`/`edit_file`/`remember`
+///   are auto-approved, and `run_shell` ALWAYS falls through to the normal
 ///   prompting logic (see [`mode_short_circuit`] for why it is never
 ///   auto-approved).
 /// - `"manual"`, or any unrecognized value (as a safe default): always falls
@@ -286,6 +287,30 @@ pub fn deny_pending(state: &AppState, turn: Option<&str>) {
     }
 }
 
+/// Clears every "allow for session" grant scoped to MCP server `server_id`
+/// (i.e. every `mcp:<server_id>:<tool>` entry in `session_allow`), without
+/// touching grants for any other tool/server or denying in-flight prompts.
+///
+/// MCP grants are keyed only by the mutable `server_id`/tool-name strings
+/// (see `mcp.rs::mcp_call_tool`'s `mcp:<server_id>:<tool_name>` format), with
+/// no binding to what that id's transport (command/args/env/url) actually
+/// points at. So this must be called whenever `server_id`'s config could
+/// have just changed out from under an existing grant — `mcp_update_server`
+/// (the transport a grant was approved against may no longer be what this
+/// id now does) and `mcp_remove_server`/`mcp_add_server` (the id may be
+/// about to be, or was just, reused by a completely different server) — so a
+/// grant approved for one server can never silently keep applying to
+/// whatever now answers to the same id.
+pub fn revoke_session_allow_for_mcp_server(state: &AppState, server_id: &str) {
+    let prefix = format!("mcp:{}:", server_id);
+    state
+        .permissions
+        .session_allow
+        .lock()
+        .unwrap()
+        .retain(|tool| !tool.starts_with(&prefix));
+}
+
 /// Clears every "allow for session" grant and denies any still-in-flight
 /// permission prompts. Must be called whenever the workspace root changes:
 /// a grant approved (or a prompt shown) in the context of one workspace must
@@ -399,6 +424,33 @@ mod tests {
     }
 
     #[test]
+    fn revoke_session_allow_for_mcp_server_clears_only_that_servers_grants() {
+        let state = AppState::default();
+        {
+            let mut allowed = state.permissions.session_allow.lock().unwrap();
+            allowed.insert("mcp:docs:search".to_string());
+            allowed.insert("mcp:docs:write".to_string());
+            allowed.insert("mcp:other:search".to_string());
+            allowed.insert("write_file".to_string());
+        }
+
+        revoke_session_allow_for_mcp_server(&state, "docs");
+
+        let allowed = state.permissions.session_allow.lock().unwrap();
+        assert!(!allowed.contains("mcp:docs:search"));
+        assert!(!allowed.contains("mcp:docs:write"));
+        assert!(allowed.contains("mcp:other:search"), "a different server's grant must survive");
+        assert!(allowed.contains("write_file"), "a non-MCP tool's grant must survive");
+    }
+
+    #[test]
+    fn revoke_session_allow_for_mcp_server_is_a_no_op_when_nothing_is_granted() {
+        let state = AppState::default();
+        revoke_session_allow_for_mcp_server(&state, "never-granted"); // must not panic
+        assert!(state.permissions.session_allow.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn reset_for_new_workspace_clears_grants_and_denies_pending() {
         let state = AppState::default();
         state
@@ -506,10 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_accept_edits_short_circuit_only_file_edits() {
+    fn auto_and_accept_edits_short_circuit_only_file_edits_and_remember() {
         for mode in ["auto", "acceptEdits"] {
             assert_eq!(mode_short_circuit(mode, "write_file"), Some(Ok(())));
             assert_eq!(mode_short_circuit(mode, "edit_file"), Some(Ok(())));
+            assert_eq!(mode_short_circuit(mode, "remember"), Some(Ok(())));
             assert!(mode_short_circuit(mode, "run_shell").is_none());
         }
     }
@@ -525,6 +578,7 @@ mod tests {
         for mode in ["manual", "yolo"] {
             assert!(mode_short_circuit(mode, "write_file").is_none());
             assert!(mode_short_circuit(mode, "run_shell").is_none());
+            assert!(mode_short_circuit(mode, "remember").is_none());
         }
     }
 
@@ -532,5 +586,18 @@ mod tests {
     fn plan_mode_short_circuits_to_an_error() {
         let decision = mode_short_circuit("plan", "run_shell").unwrap();
         assert!(decision.unwrap_err().contains("Plan Mode"));
+    }
+
+    #[test]
+    fn plan_mode_blocks_remember_too() {
+        // Plan mode blocks every mutating tool unconditionally — remember
+        // (writes to app-data, not the workspace) is no exception.
+        let decision = mode_short_circuit("plan", "remember").unwrap();
+        assert!(decision.unwrap_err().contains("Plan Mode"));
+    }
+
+    #[test]
+    fn bypass_mode_short_circuits_remember() {
+        assert_eq!(mode_short_circuit("bypass", "remember"), Some(Ok(())));
     }
 }

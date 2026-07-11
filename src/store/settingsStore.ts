@@ -1,7 +1,10 @@
 import { create } from "zustand";
 
-/** localStorage key the full settings blob is persisted under after every mutation. */
-const STORAGE_KEY = "little-monkey-automation-settings";
+/** localStorage key the full settings blob is persisted under after every mutation.
+ * Exported so tests can clear it and re-import the module to genuinely
+ * exercise `hydrate()`'s default-fallback path, rather than asserting
+ * against a store state a test set up by hand. */
+export const STORAGE_KEY = "little-monkey-automation-settings";
 
 /** How aggressively to reclaim context-window space once `contextTrimThreshold` is crossed. */
 export type ContextTrimStrategy = "trim" | "summarize";
@@ -33,6 +36,10 @@ export interface SettingsState {
   visionOverrides: Record<string, boolean>;
   /** Provider id -> user-curated model allowlist for that provider's model list (e.g. the OpenRouter tab's picker). Absent/`showAll: true` means unfiltered. */
   providerModelFilters: Record<string, ProviderModelFilter>;
+  /** How many finished checkpoints (see checkpoints.rs) to keep on disk before the oldest are pruned — passed as `checkpoint_begin`'s `max_keep` param. Range 5-100, default 20 (mirrors the backend's own `MAX_CHECKPOINTS` fallback). */
+  checkpointRetention: number;
+  /** Whether the `remember` tool is offered to the model this turn (see `agentLoop.ts`'s `TOOLS` filter). Default true. Turning this off is not amnesia: rules and previously-saved facts are still injected into every system prompt regardless — it only stops the agent from saving *new* facts on its own. Facts remain manually addable/editable/deletable in the Rules tab either way. */
+  memoryEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -47,6 +54,8 @@ export interface SettingsState {
   setProviderModelShowAll: (providerId: string, showAll: boolean) => void;
   toggleProviderModelSelected: (providerId: string, modelId: string) => void;
   clearProviderModelSelection: (providerId: string) => void;
+  setCheckpointRetention: (value: number) => void;
+  setMemoryEnabled: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -67,6 +76,12 @@ export interface ProviderModelFilter {
 export const DEFAULT_PROVIDER_MODEL_FILTER: ProviderModelFilter = { showAll: true, selectedModelIds: [] };
 
 const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
+/** Mirrors `MAX_CHECKPOINTS` in src-tauri/src/checkpoints.rs — the backend's
+ * own fallback when no `max_keep` is supplied, kept in sync here so the
+ * setting's default matches pre-existing behavior. */
+const DEFAULT_CHECKPOINT_RETENTION = 20;
+export const MIN_CHECKPOINT_RETENTION = 5;
+export const MAX_CHECKPOINT_RETENTION = 100;
 
 interface PersistedShape {
   autoFailoverEnabled: boolean;
@@ -78,6 +93,8 @@ interface PersistedShape {
   providerRateLimits: Record<string, ProviderRateLimit>;
   visionOverrides: Record<string, boolean>;
   providerModelFilters: Record<string, ProviderModelFilter>;
+  checkpointRetention: number;
+  memoryEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -91,6 +108,8 @@ function defaults(): PersistedShape {
     providerRateLimits: {},
     visionOverrides: {},
     providerModelFilters: {},
+    checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
+    memoryEnabled: true,
   };
 }
 
@@ -137,6 +156,13 @@ function hydrate(): PersistedShape {
         parsed.providerRateLimits && typeof parsed.providerRateLimits === "object" ? parsed.providerRateLimits : fallback.providerRateLimits,
       visionOverrides: parsed.visionOverrides && typeof parsed.visionOverrides === "object" ? parsed.visionOverrides : fallback.visionOverrides,
       providerModelFilters: sanitizeProviderModelFilters(parsed.providerModelFilters),
+      checkpointRetention:
+        typeof parsed.checkpointRetention === "number" &&
+        parsed.checkpointRetention >= MIN_CHECKPOINT_RETENTION &&
+        parsed.checkpointRetention <= MAX_CHECKPOINT_RETENTION
+          ? Math.round(parsed.checkpointRetention)
+          : fallback.checkpointRetention,
+      memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
     };
   } catch {
     return fallback;
@@ -238,6 +264,17 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
       return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds: [] } } };
     });
+    persist({ ...get() });
+  },
+
+  setCheckpointRetention: (value) => {
+    const clamped = Math.min(MAX_CHECKPOINT_RETENTION, Math.max(MIN_CHECKPOINT_RETENTION, Math.round(value)));
+    set({ checkpointRetention: clamped });
+    persist({ ...get() });
+  },
+
+  setMemoryEnabled: (value) => {
+    set({ memoryEnabled: value });
     persist({ ...get() });
   },
 }));

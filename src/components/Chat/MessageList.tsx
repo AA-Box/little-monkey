@@ -1,14 +1,19 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  BookmarkX,
+  Brain,
   ChevronRight,
   FilePenLine,
   FileSearch,
   FileText,
   Folder,
+  MessageSquareX,
+  Plug,
   RefreshCw,
   Search,
   TerminalSquare,
+  TriangleAlert,
   Undo2,
   Wrench,
   type LucideIcon,
@@ -16,15 +21,22 @@ import {
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import {
+  checkpointAnchorValid,
   formatCheckpointNotice,
+  formatMemoryNotice,
   isCheckpointNotice,
+  isMemoryNotice,
   isMentionNotice,
   isSwitchNotice,
   parseCheckpointNotice,
+  parseMemoryNotice,
   type CheckpointNotice,
+  type MemoryNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
-import { useSessionStore } from "../../store/sessionStore";
+import { selectTurnRunning, useSessionStore } from "../../store/sessionStore";
+import { useCheckpointStore } from "../../store/checkpointStore";
+import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
 import { useT } from "../../lib/i18n";
 
@@ -49,6 +61,7 @@ type TimelineItem =
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
+  | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "typing"; key: string };
 
 /**
@@ -60,7 +73,8 @@ type TimelineItem =
  * - a trailing empty assistant message (no content, no tool calls yet)
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
- *   synthetic notices (compaction, model switch, per-turn checkpoint).
+ *   synthetic notices (compaction, model switch, per-turn checkpoint,
+ *   remembered fact).
  */
 function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
@@ -117,13 +131,20 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
 
     if (msg.role === "system") {
       // Only our own synthetic notices (context compaction, model
-      // auto-switch, unresolved mentions, per-turn checkpoint) are ever
-      // rendered — any other system message stays hidden, same as before
-      // this app ever produced these.
+      // auto-switch, unresolved mentions, per-turn checkpoint, remembered
+      // fact) are ever rendered — any other system message stays hidden,
+      // same as before this app ever produced these.
       if (isCheckpointNotice(msg)) {
         const notice = parseCheckpointNotice(msg);
         if (notice) {
           items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex: index });
+        }
+        return;
+      }
+      if (isMemoryNotice(msg)) {
+        const notice = parseMemoryNotice(msg);
+        if (notice) {
+          items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex: index });
         }
         return;
       }
@@ -161,9 +182,14 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   list_dir: Folder,
   grep: Search,
   glob: FileSearch,
+  remember: Brain,
 };
 
 function toolIcon(name: string): LucideIcon {
+  // An MCP tool call's name is `mcp__<serverId>__<toolName>` (see
+  // `mcpTools.ts::mcpToolDefs`) — never a fixed key in `TOOL_ICONS` above,
+  // since the server/tool half varies, so it's matched by prefix instead.
+  if (name.startsWith("mcp__")) return Plug;
   return TOOL_ICONS[name] ?? Wrench;
 }
 
@@ -231,38 +257,115 @@ const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
   );
 });
 
+/** The three restore scopes a checkpoint notice offers — Claude Code
+ * /rewind semantics: code only / conversation only / both. */
+type RestoreScope = "files" | "conversation" | "both";
+
 /**
  * Renders a per-turn checkpoint notice: how many files the turn changed,
- * with a one-click Revert that restores every one of them to its pre-turn
- * state (see src-tauri/src/checkpoints.rs). After a successful revert the
- * notice's message content is rewritten in place with `reverted: true`, so
- * the state survives re-renders and app restarts.
+ * with a Restore menu offering three scopes (see src-tauri/src/checkpoints.rs):
+ * - "Restore files" copies every touched file back to its pre-turn state and
+ *   rewrites the notice in place with `reverted: true`, so the state survives
+ *   re-renders and app restarts.
+ * - "Rewind conversation" truncates the transcript back to just before the
+ *   turn's user message (`anchorIndex`). Offered only while `anchorValid`
+ *   (the anchored message still matches the turn's prompt — compaction and
+ *   edit-resubmit shift indices) and hard-blocked while a turn is running in
+ *   this session, whose `addMessage` calls would resurrect truncated state.
+ * - "Restore both" does both, files first (a failed file restore must not
+ *   still rewind the conversation).
  */
 const CheckpointRow = memo(function CheckpointRow({
   sessionId,
   notice,
   messageIndex,
+  anchorValid,
 }: {
   sessionId: string;
   notice: CheckpointNotice;
   messageIndex: number;
+  anchorValid: boolean;
 }) {
   const { t } = useT();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const turnRunning = useSessionStore(selectTurnRunning(sessionId));
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [menuOpen]);
 
   const fileNames = notice.files.map((path) => path.split(/[\\/]/).filter(Boolean).pop() ?? path);
+  const canRewind = anchorValid && !turnRunning;
+  const rewindBlockedReason = turnRunning
+    ? t("MessageList.checkpointRewindBlockedTurnRunning")
+    : !anchorValid
+      ? t("MessageList.checkpointRewindUnavailable")
+      : undefined;
 
-  const handleRevert = async () => {
-    setBusy(true);
-    setError(null);
+  const restoreFiles = async (): Promise<boolean> => {
     try {
       await invoke("checkpoint_revert", { id: notice.id });
       useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
         content: formatCheckpointNotice({ ...notice, reverted: true }),
       });
+      void useCheckpointStore.getState().refresh(sessionId);
+      return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(t("MessageList.checkpointRevertFailed", { error: message }));
+      return false;
+    }
+  };
+
+  /** Undoes a previous "Restore files": plays the checkpoint's redo backups
+   * back over the files revert touched (see `checkpoint_reapply` in
+   * checkpoints.rs) and flips the notice back to not-reverted. */
+  const reapplyFiles = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("checkpoint_reapply", { id: notice.id });
+      useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
+        content: formatCheckpointNotice({ ...notice, reverted: false }),
+      });
+      void useCheckpointStore.getState().refresh(sessionId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(t("MessageList.checkpointReapplyFailed", { error: message }));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Truncating at the anchor drops the turn's user message and everything
+   * after it — including this notice itself, so no in-place rewrite needed. */
+  const rewindConversation = () => {
+    if (!canRewind || typeof notice.anchorIndex !== "number") return;
+    useSessionStore.getState().truncateFromIndex(sessionId, notice.anchorIndex);
+  };
+
+  const handleRestore = async (scope: RestoreScope) => {
+    setMenuOpen(false);
+    setBusy(true);
+    setError(null);
+    try {
+      if (scope === "files") {
+        await restoreFiles();
+      } else if (scope === "conversation") {
+        rewindConversation();
+      } else if (await restoreFiles()) {
+        rewindConversation();
+      }
     } finally {
       setBusy(false);
     }
@@ -277,20 +380,136 @@ const CheckpointRow = memo(function CheckpointRow({
             {t("MessageList.checkpointFilesChanged", { count: notice.files.length, files: fileNames.join(", ") })}
           </span>
           {notice.reverted ? (
-            <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
+            <>
+              <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
+              <button
+                type="button"
+                onClick={() => void reapplyFiles()}
+                disabled={busy}
+                className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RefreshCw size={11} />
+                {busy ? t("MessageList.checkpointReapplying") : t("MessageList.checkpointReapplyButton")}
+              </button>
+            </>
+          ) : (
+            <div ref={menuRef} className="relative inline-block">
+              <button
+                type="button"
+                onClick={() => setMenuOpen((prev) => !prev)}
+                disabled={busy}
+                aria-haspopup="true"
+                aria-expanded={menuOpen}
+                className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Undo2 size={11} />
+                {busy ? t("MessageList.checkpointReverting") : t("MessageList.checkpointRestoreButton")}
+              </button>
+              {menuOpen && (
+                <div className="absolute left-1/2 top-full z-20 mt-1 w-52 -translate-x-1/2 rounded-lg border border-border bg-background py-1 shadow-lg">
+                  <button
+                    type="button"
+                    onClick={() => void handleRestore("files")}
+                    className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm hover:bg-surface-2"
+                  >
+                    <FilePenLine size={14} className="shrink-0 text-faint" />
+                    {t("MessageList.checkpointRestoreFiles")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleRestore("conversation")}
+                    disabled={!canRewind}
+                    title={rewindBlockedReason}
+                    className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                  >
+                    <MessageSquareX size={14} className="shrink-0 text-faint" />
+                    {t("MessageList.checkpointRewindConversation")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleRestore("both")}
+                    disabled={!canRewind}
+                    title={rewindBlockedReason}
+                    className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-sm hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                  >
+                    <Undo2 size={14} className="shrink-0 text-faint" />
+                    {t("MessageList.checkpointRestoreBoth")}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        {notice.shellRan && (
+          <div className="flex items-center gap-1 text-warning">
+            <TriangleAlert size={11} className="shrink-0" />
+            <span>{t("MessageList.checkpointShellRanCaveat")}</span>
+          </div>
+        )}
+        {error && <div className="text-danger">{error}</div>}
+      </div>
+    </div>
+  );
+});
+
+/**
+ * Renders a "remembered fact" notice inserted right after a successful
+ * `remember` tool call: the fact's text plus a one-click Forget button that
+ * calls `memory_delete` and rewrites the notice in place with
+ * `forgotten: true` (exact `CheckpointRow` "Restore files" pattern, minus the
+ * restore-scope menu — there's only one thing to undo here).
+ */
+const MemoryRow = memo(function MemoryRow({
+  sessionId,
+  notice,
+  messageIndex,
+}: {
+  sessionId: string;
+  notice: MemoryNotice;
+  messageIndex: number;
+}) {
+  const { t } = useT();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const forget = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("memory_delete", { id: notice.id });
+      useSessionStore.getState().updateMessageAt(sessionId, messageIndex, {
+        content: formatMemoryNotice({ ...notice, forgotten: true }),
+      });
+      void useRulesStore.getState().refresh();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(t("MessageList.memoryForgetFailed", { error: message }));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] flex-col items-center gap-1 rounded-md bg-surface-2 px-3 py-1.5 text-center text-xs text-faint">
+        <div className="flex items-center gap-2">
+          <Brain size={12} className="shrink-0" />
+          <span>{t("MessageList.memoryRemembered", { text: notice.text })}</span>
+          {notice.forgotten ? (
+            <span className="font-medium text-muted">{t("MessageList.memoryForgottenLabel")}</span>
           ) : (
             <button
               type="button"
-              onClick={() => void handleRevert()}
+              onClick={() => void forget()}
               disabled={busy}
               className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <Undo2 size={11} />
-              {busy ? t("MessageList.checkpointReverting") : t("MessageList.checkpointRevertButton")}
+              <BookmarkX size={11} />
+              {busy ? t("MessageList.memoryForgetting") : t("MessageList.memoryForgetButton")}
             </button>
           )}
         </div>
-        {error && <div className="text-danger">{t("MessageList.checkpointRevertFailed", { error })}</div>}
+        {error && <div className="text-danger">{error}</div>}
       </div>
     </div>
   );
@@ -380,7 +599,18 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "checkpoint") {
               return (
-                <CheckpointRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
+                <CheckpointRow
+                  key={item.key}
+                  sessionId={sessionId}
+                  notice={item.notice}
+                  messageIndex={item.messageIndex}
+                  anchorValid={checkpointAnchorValid(messages, item.notice)}
+                />
+              );
+            }
+            if (item.kind === "memory") {
+              return (
+                <MemoryRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
               );
             }
             return <TypingIndicator key={item.key} />;

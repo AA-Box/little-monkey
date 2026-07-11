@@ -52,7 +52,7 @@ impl TerminalPermissions {
             // rule as the GUI's `permissions.rs::mode_short_circuit` — so
             // both edit-approving modes behave identically here.
             PermissionMode::AcceptEdits | PermissionMode::Auto => {
-                if tool == "write_file" || tool == "edit_file" {
+                if tool == "write_file" || tool == "edit_file" || tool == "remember" {
                     return Ok(());
                 }
             }

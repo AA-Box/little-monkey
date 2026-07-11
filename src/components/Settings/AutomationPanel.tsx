@@ -1,6 +1,11 @@
 import { useMemo, useState } from "react";
 import { Button, StatusPill } from "../ui";
-import { useSettingsStore, type ContextTrimStrategy } from "../../store/settingsStore";
+import {
+  MAX_CHECKPOINT_RETENTION,
+  MIN_CHECKPOINT_RETENTION,
+  useSettingsStore,
+  type ContextTrimStrategy,
+} from "../../store/settingsStore";
 import { useModelStore } from "../../store/modelStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
@@ -67,6 +72,8 @@ export function AutomationPanel() {
   const setContextTrimThreshold = useSettingsStore((s) => s.setContextTrimThreshold);
   const contextTrimStrategy = useSettingsStore((s) => s.contextTrimStrategy);
   const setContextTrimStrategy = useSettingsStore((s) => s.setContextTrimStrategy);
+  const checkpointRetention = useSettingsStore((s) => s.checkpointRetention);
+  const setCheckpointRetention = useSettingsStore((s) => s.setCheckpointRetention);
   const rateLimitWarningsEnabled = useSettingsStore((s) => s.rateLimitWarningsEnabled);
   const setRateLimitWarningsEnabled = useSettingsStore((s) => s.setRateLimitWarningsEnabled);
   const providerRateLimits = useSettingsStore((s) => s.providerRateLimits);
@@ -149,6 +156,29 @@ export function AutomationPanel() {
               ))}
             </div>
           </div>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.checkpointsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3 py-2.5">
+          <label className="flex items-center justify-between gap-3 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.checkpointRetentionLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.checkpointRetentionDescription")}</span>
+            </span>
+            <span className="flex shrink-0 items-center gap-1.5">
+              <input
+                type="number"
+                min={MIN_CHECKPOINT_RETENTION}
+                max={MAX_CHECKPOINT_RETENTION}
+                value={checkpointRetention}
+                onChange={(event) => setCheckpointRetention(Number(event.target.value))}
+                className="h-8 w-16 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+              <span className="text-muted">{t("AutomationPanel.checkpointRetentionUnit")}</span>
+            </span>
+          </label>
         </div>
       </section>
 

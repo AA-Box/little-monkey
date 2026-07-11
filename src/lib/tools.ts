@@ -171,4 +171,23 @@ export const TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'remember',
+      description:
+        "Save a short durable fact about this project or the user's preferences so future conversations remember it. Use for stated preferences, project conventions, and hard-won discoveries (build commands, gotchas). Requires user permission.",
+      parameters: {
+        type: 'object',
+        properties: {
+          text: {
+            type: 'string',
+            description: 'The fact to remember, written as a short standalone statement (max 500 characters).',
+          },
+        },
+        required: ['text'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];

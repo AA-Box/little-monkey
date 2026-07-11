@@ -24,10 +24,11 @@
  * same mechanism a manual model switch uses — no separate sticky field.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { streamChat } from './llamaClient';
+import { streamChat, textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { TOOLS } from './tools';
+import { formatMcpCallToolResult, mcpToolDefs, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { recordRequest } from './rateLimitTracker';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -43,6 +44,8 @@ import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useRulesStore } from '../store/rulesStore';
+import { useCheckpointStore } from '../store/checkpointStore';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -78,13 +81,87 @@ export function isMentionNotice(message: ChatMessage): boolean {
  * `CheckpointNotice`), so `MessageList` can render a Revert button for it. */
 export const CHECKPOINT_NOTE_PREFIX = '[Checkpoint]';
 
+/** How much of the user prompt is kept as the checkpoint's label — used for
+ * timeline display and for validating the rewind anchor (see
+ * `checkpointAnchorValid`). Mirrors the manifest's `label` field cap. */
+export const CHECKPOINT_LABEL_MAX_CHARS = 120;
+
 /** Payload embedded in a checkpoint notice message. */
 export interface CheckpointNotice {
   id: string;
   /** Absolute paths of every file the turn mutated. */
   files: string[];
+  /** Index of the turn's user message in the transcript — the target for
+   * "Rewind conversation". Absent on notices recorded before manifest v2
+   * (those degrade to file-only restore). */
+  anchorIndex?: number;
+  /** First ~120 chars of the prompt that started the turn — validates that
+   * `anchorIndex` still points at the same message after compaction or
+   * edit-and-resubmit shifted indices. */
+  label?: string;
+  /** True if `run_shell` executed during the turn (see `record_shell` in
+   * checkpoints.rs) — file restore may not undo everything, since shell side
+   * effects are never snapshotted. */
+  shellRan?: boolean;
   /** Set once the user has reverted this checkpoint. */
   reverted?: boolean;
+}
+
+/**
+ * Whether `notice`'s conversation-rewind anchor still points at the user
+ * message that started its turn. Context compaction and edit-and-resubmit
+ * both shift transcript indices, so before offering "Rewind conversation"
+ * the anchored message must still be a user message whose text starts with
+ * the notice's label — otherwise the UI degrades to file-only restore.
+ */
+export function checkpointAnchorValid(messages: ChatMessage[], notice: CheckpointNotice): boolean {
+  if (typeof notice.anchorIndex !== 'number' || !Number.isInteger(notice.anchorIndex) || notice.anchorIndex < 0) {
+    return false;
+  }
+  if (typeof notice.label !== 'string') return false;
+  const anchored = messages[notice.anchorIndex];
+  if (!anchored || anchored.role !== 'user') return false;
+  return textContent(anchored.content).startsWith(notice.label);
+}
+
+/** Minimal shape `checkpointChainBlockReason` needs from a `CheckpointInfo`
+ * (see `src/store/checkpointStore.ts`) — kept local rather than imported to
+ * avoid a store <-> lib import cycle. */
+export interface CheckpointChainLink {
+  id: string;
+  shellRan: boolean;
+  prevId?: string | null;
+}
+
+/** Why (if at all) `CheckpointTimeline.tsx`'s "Restore to here" should be
+ * disabled for the checkpoint at `targetIndex`, or `null` if the newest→
+ * target chain is safe to revert in full. */
+export type CheckpointChainBlockReason = 'shellRan' | 'prunedGap' | null;
+
+/**
+ * Scans `checkpoints` (newest-first, as returned by `checkpoint_list`) from
+ * index 0 through `targetIndex` inclusive for anything that makes "Restore
+ * to here" unsafe across that span:
+ * - `'prunedGap'`: a checkpoint's recorded `prevId` doesn't match the id of
+ *   the next-older entry in the chain, meaning something in between was
+ *   pruned off disk and its changes can no longer be reverted.
+ * - `'shellRan'`: a shell command ran during one of these turns, so file
+ *   restore alone can't guarantee full coverage.
+ * A pruned gap is checked first since it's the harder guarantee failure —
+ * shell coverage is merely partial, a pruned checkpoint's changes are gone
+ * entirely.
+ */
+export function checkpointChainBlockReason(checkpoints: CheckpointChainLink[], targetIndex: number): CheckpointChainBlockReason {
+  const hasPrunedGap = checkpoints.slice(0, targetIndex).some((c, i) => {
+    const next = checkpoints[i + 1];
+    return Boolean(c.prevId) && Boolean(next) && next.id !== c.prevId;
+  });
+  if (hasPrunedGap) return 'prunedGap';
+
+  const hasShellRan = checkpoints.slice(0, targetIndex + 1).some((c) => c.shellRan);
+  if (hasShellRan) return 'shellRan';
+
+  return null;
 }
 
 export function isCheckpointNotice(message: ChatMessage): boolean {
@@ -114,6 +191,95 @@ export function parseCheckpointNotice(message: ChatMessage): CheckpointNotice | 
  * the notice is first added and when the Revert button marks it reverted. */
 export function formatCheckpointNotice(notice: CheckpointNotice): string {
   return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/** Prefix identifying a synthetic notice inserted right after a successful
+ * `remember` tool call — cloned from the `CHECKPOINT_NOTE_PREFIX` pattern
+ * above. The rest of the content is a JSON payload (see `MemoryNotice`), so
+ * `MessageList` can render a Forget button for it. */
+export const MEMORY_NOTE_PREFIX = '[Memory]';
+
+/** Payload embedded in a memory notice message. */
+export interface MemoryNotice {
+  id: string;
+  text: string;
+  /** Set once the user has forgotten this fact via the notice's Forget button. */
+  forgotten?: boolean;
+}
+
+export function isMemoryNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MEMORY_NOTE_PREFIX);
+}
+
+/** Parses a memory notice's JSON payload; `null` for anything malformed. */
+export function parseMemoryNotice(message: ChatMessage): MemoryNotice | null {
+  if (!isMemoryNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(MEMORY_NOTE_PREFIX.length));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as MemoryNotice).id === 'string' &&
+      typeof (parsed as MemoryNotice).text === 'string'
+    ) {
+      return parsed as MemoryNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a memory notice".
+  }
+  return null;
+}
+
+/** Serializes a memory notice back into message content — used both when the
+ * notice is first added and when the Forget button marks it forgotten. */
+export function formatMemoryNotice(notice: MemoryNotice): string {
+  return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/**
+ * Filters `remember` out of the tool list offered to the model this turn
+ * when the settingsStore `memoryEnabled` toggle is off. This is the ONLY
+ * effect of that toggle — rules and previously-saved facts are still
+ * injected into the system prompt unconditionally (see `runAgentTurnBody`'s
+ * `useRulesStore.getState().refresh()` call); turning it off stops the agent
+ * from saving *new* facts on its own, it is not amnesia.
+ */
+export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean): ToolDef[] {
+  return memoryEnabled ? tools : tools.filter((tool) => tool.function.name !== 'remember');
+}
+
+/**
+ * Whether `toolCall` was actually among the tools offered to the model this
+ * turn. `toolsForSettings` only shapes the *schema* sent to the model (e.g.
+ * dropping `remember` when `memoryEnabled` is off) — nothing downstream of
+ * that used to check it, so a model that still emitted a disabled or
+ * hallucinated tool call (a real risk with local/quantized models that don't
+ * strictly respect the offered tool schema) would have it executed anyway.
+ * The tool-calling loop calls this before dispatch and rejects (without
+ * executing) anything that fails it.
+ */
+export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
+  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
+}
+
+/** Shape of a successful `tool_remember` result (the created/deduplicated
+ * fact) — checked structurally against the tool's stringified result so an
+ * error payload (`{ error: string }`) never gets misread as one. */
+function parseRememberedFact(resultContent: string): { id: string; text: string } | null {
+  try {
+    const parsed: unknown = JSON.parse(resultContent);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as { id?: unknown }).id === 'string' &&
+      typeof (parsed as { text?: unknown }).text === 'string'
+    ) {
+      return parsed as { id: string; text: string };
+    }
+  } catch {
+    // Not JSON — can't be a successful remember result either.
+  }
+  return null;
 }
 
 /** Shape returned by the `llama_status` Tauri command. */
@@ -399,12 +565,50 @@ function abortedPromise(signal: AbortSignal): Promise<void> {
 }
 
 /**
+ * Dispatches a `mcp__<serverId>__<toolName>`-named tool call to the Rust
+ * `mcp_call_tool` command. `serverId`/`toolName` are resolved via
+ * `resolveMcpToolName` against `mcpRegistry` — THIS turn's own
+ * `mcpToolDefs()` result, passed in by the caller rather than read from any
+ * shared/module-level state — rather than re-parsed out of `name` itself;
+ * see `mcpTools.ts`'s doc comment for why a naive split on `__` isn't
+ * reliably reversible, and for why the registry must be turn-scoped rather
+ * than a shared singleton (a concurrent split-pane turn's own
+ * `mcpToolDefs()` call must never be able to invalidate or repoint a name
+ * THIS turn's model was already offered).
+ *
+ * No `checkpoint_id` is injected here (unlike write_file/edit_file/run_shell
+ * below): MCP side effects are explicitly outside the checkpoint revert
+ * guarantee, same documented gap as `run_shell`'s shell commands (see
+ * `CheckpointNotice.shellRan`'s doc comment). `turn_id` still is, though —
+ * it scopes this call's permission prompt and Stop-button cancellation to
+ * this turn, via the same `AppState.tool_cancel` mechanism `run_shell` uses.
+ */
+function invokeMcpTool(
+  name: string,
+  args: Record<string, unknown>,
+  turnId: string,
+  mcpRegistry: McpToolRegistry
+): Promise<string> {
+  const resolved = resolveMcpToolName(mcpRegistry, name);
+  if (!resolved) {
+    return Promise.resolve(stringifyToolError(new Error(`MCP tool "${name}" was not offered this turn.`)));
+  }
+  return invoke<McpCallToolResult>('mcp_call_tool', {
+    server_id: resolved.serverId,
+    tool_name: resolved.toolName,
+    arguments: args,
+    turn_id: turnId,
+  }).then(formatMcpCallToolResult, stringifyToolError);
+}
+
+/**
  * Executes a single model-requested tool call via the corresponding
- * `tool_<name>` Tauri command and returns the string to use as the content
- * of the resulting `tool` message. Never throws — invocation errors (bad
- * JSON arguments, permission denial, sandbox violations, command failures)
- * are captured and returned as a JSON error payload so the model can see
- * what went wrong and try to recover instead of the whole loop crashing.
+ * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
+ * `invokeMcpTool` above) and returns the string to use as the content of the
+ * resulting `tool` message. Never throws — invocation errors (bad JSON
+ * arguments, permission denial, sandbox violations, command failures) are
+ * captured and returned as a JSON error payload so the model can see what
+ * went wrong and try to recover instead of the whole loop crashing.
  *
  * If `signal` aborts while the command is in flight, the Rust side is told
  * to cancel everything cancellable (`tools_cancel_running` kills any running
@@ -415,6 +619,7 @@ async function executeToolCall(
   toolCall: ToolCall,
   checkpointId: string | null,
   turnId: string,
+  mcpRegistry: McpToolRegistry,
   signal?: AbortSignal
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
@@ -434,25 +639,30 @@ async function executeToolCall(
   // File-mutating tools record a pre-mutation backup into this turn's own
   // checkpoint — with the split pane, another turn (with its own checkpoint)
   // may be running concurrently, so the id pins the backup to the right one.
-  // Injected here rather than exposed in the tool schema: the model must
-  // never pick (or fabricate) a checkpoint id. snake_case key — these
-  // commands use `rename_all = "snake_case"` so the model's snake_case tool
-  // arguments (old_string, new_string) match without translation.
-  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file')) {
+  // run_shell doesn't snapshot anything, but gets the same injected id so
+  // `record_shell` can flag the owning checkpoint's `shell_ran` — the
+  // revert-coverage caveat the UI shows. Injected here rather than exposed in
+  // the tool schema: the model must never pick (or fabricate) a checkpoint
+  // id. snake_case key — write_file/edit_file/run_shell all use
+  // `rename_all = "snake_case"` so the model's snake_case tool arguments
+  // (old_string, new_string) match without translation.
+  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
     args.checkpoint_id = checkpointId;
   }
   // The turn id scopes permission prompts and shell cancellation to THIS
   // turn — Stop in one pane must not kill the other pane's command or deny
-  // its prompt. Injected like checkpoint_id (never model-supplied). Casing
-  // follows each command's macro: write/edit match snake_case keys,
-  // run_shell (no rename_all) matches the camelCase form.
-  if (name === 'write_file' || name === 'edit_file') {
+  // its prompt. Injected like checkpoint_id (never model-supplied). All four
+  // commands use `rename_all = "snake_case"`, so all take the snake_case key.
+  // `remember` doesn't take a checkpoint_id (see tool_remember's doc comment
+  // in tools.rs — there's no workspace file for a checkpoint to snapshot),
+  // but it's still permission-gated and needs the turn id for that prompt.
+  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell' || name === 'remember') {
     args.turn_id = turnId;
-  } else if (name === 'run_shell') {
-    args.turnId = turnId;
   }
 
-  const invocation = invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+  const invocation = name.startsWith('mcp__')
+    ? invokeMcpTool(name, args, turnId, mcpRegistry)
+    : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
   if (!signal) return invocation;
 
   const raced = await Promise.race([invocation, abortedPromise(signal).then(() => null)]);
@@ -596,6 +806,11 @@ async function runTurnGuarded(
   attachments: AttachmentRef[],
   signal: AbortSignal
 ): Promise<void> {
+  // The index this turn's user message will land at — captured before
+  // `addMessage` so it can anchor a later "Rewind conversation" back to the
+  // state just before this turn.
+  const anchorIndex = sessionMessages(sessionId).length;
+
   // Added as plain text first for instant feedback (resolving references
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
@@ -606,10 +821,18 @@ async function runTurnGuarded(
   // every write_file/edit_file this turn makes can be reverted in one click.
   // Checkpoints are keyed by id — with the split pane, the other pane's turn
   // may hold its own concurrent checkpoint — so this turn's id is threaded
-  // through to every file-mutating tool call and to checkpoint_end. Failure
-  // to open one (e.g. app-data dir unavailable) must never block the turn
-  // itself — the turn just runs without a revert affordance.
-  const checkpointId = await invoke<string>('checkpoint_begin').catch(() => null);
+  // through to every file-mutating tool call and to checkpoint_end. The
+  // session/anchor/label metadata ends up in the manifest for conversation
+  // rewind and timeline labels; maxKeep is the retention cap, user-configurable
+  // via AutomationPanel's "Keep last N checkpoints" setting (settingsStore).
+  // Failure to open one (e.g. app-data dir unavailable) must never block the
+  // turn itself — the turn just runs without a revert affordance.
+  const checkpointId = await invoke<string>('checkpoint_begin', {
+    sessionId,
+    anchorIndex,
+    label: userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS),
+    maxKeep: useSettingsStore.getState().checkpointRetention,
+  }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell
   // cancellation and permission prompts to this turn on the Rust side.
   const turnId = crypto.randomUUID();
@@ -621,9 +844,20 @@ async function runTurnGuarded(
       if (summary && summary.files.length > 0) {
         useSessionStore.getState().addMessage(sessionId, {
           role: 'system',
-          content: formatCheckpointNotice({ id: summary.id, files: summary.files }),
+          content: formatCheckpointNotice({
+            id: summary.id,
+            files: summary.files,
+            anchorIndex: summary.anchorIndex,
+            label: summary.label,
+            shellRan: summary.shellRan,
+          }),
         });
       }
+      // Invalidate the timeline's cache for this session — whether or not
+      // this particular turn produced a checkpoint, retention pruning at the
+      // next `checkpoint_begin` can also change what's on disk. Safe to fire
+      // and forget: a panel that isn't open just gets a fresher cache.
+      void useCheckpointStore.getState().refresh(sessionId);
     }
   }
 }
@@ -718,11 +952,22 @@ async function runAgentTurnBody(
 
   const effort = useModelStore.getState().effort;
 
-  // The system prompt (identity, workspace roots, OS, tool guidance — see
-  // systemPrompt.ts) is injected at the head of the OUTGOING payload only,
-  // never stored in the session transcript, so it always reflects the
-  // current workspace instead of a snapshot. Computed once per turn.
-  const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
+  // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
+  // newly remembered facts) before building the system prompt below — two
+  // local-file reads per turn is negligible and needs no file watcher.
+  await useRulesStore.getState().refresh();
+
+  // Computed once per turn (not re-derived on every tool-calling round trip)
+  // so a server that connects/disconnects mid-turn doesn't change what's on
+  // offer between one model round trip and the next within the same turn —
+  // mirrors how `sequence`/`target` above are also fixed for the turn.
+  // `mcpRegistry` is THIS turn's own resolution table (see `mcpTools.ts`'s
+  // doc comment) — with the split pane, another turn's concurrent
+  // `mcpToolDefs()` call must never be able to invalidate or repoint a name
+  // this turn's model was already offered, so it's threaded through to
+  // `executeToolCall` explicitly rather than read back out of shared state.
+  const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
+  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpDefs], settings.memoryEnabled);
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [
@@ -761,6 +1006,15 @@ async function runAgentTurnBody(
     // never gets sent back to the model as part of its own history.
     const history: ChatMessage[] = sessionMessages(sessionId);
 
+    // The system prompt (identity, workspace roots, OS, tool guidance, and
+    // MONKEY.md rules/facts — see systemPrompt.ts) is injected at the head of
+    // the OUTGOING payload only, never stored in the session transcript.
+    // Rebuilt every iteration (not just once before the loop) so a `remember`
+    // call earlier in *this* turn — which refreshes rulesStore right below —
+    // actually shows up in the system prompt sent for the next round trip,
+    // instead of only from the next user turn onward.
+    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt() };
+
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user
     // message had text references to expand, in which case that one message
@@ -778,7 +1032,7 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
-    let attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+    let attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
 
     // Failover: only ever retry a *different* target when nothing streamed
     // back yet for this attempt — once tokens have started arriving, a
@@ -797,7 +1051,7 @@ async function runAgentTurnBody(
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistory, TOOLS, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
     }
 
     const { content, toolCalls, streamError } = attempt;
@@ -825,17 +1079,49 @@ async function runAgentTurnBody(
     updateLastMessage({ content, tool_calls: toolCalls });
 
     for (const toolCall of toolCalls) {
+      // Reject (without executing) any call whose name wasn't actually
+      // offered to the model this turn — e.g. `remember` after
+      // `memoryEnabled` was turned off, or any other tool a local/quantized
+      // model hallucinates outside the schema it was given. `toolsForSettings`
+      // only shapes what's *offered*; this is the enforcement point that
+      // makes that toggle an actual authorization boundary rather than a
+      // polite suggestion the model can ignore. Still gets a result message,
+      // same invariant as the cancelled-call path below.
+      if (!isToolCallAllowed(toolCall, toolsForTurn)) {
+        addMessage({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
+        });
+        continue;
+      }
+
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
-      const resultContent = signal?.aborted ? CANCELLED_TOOL_RESULT : await executeToolCall(toolCall, checkpointId, turnId, signal);
+      const resultContent = signal?.aborted
+        ? CANCELLED_TOOL_RESULT
+        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
         content: resultContent,
       };
       addMessage(toolMessage);
+
+      // A successful `remember` gets its own transcript notice (with a
+      // Forget button — see MessageList.tsx's MemoryRow), cloned from how
+      // checkpoint_end's summary becomes a checkpoint notice. rulesStore is
+      // refreshed right after so later iterations of THIS turn already see
+      // the new fact in the system prompt, not just the next turn.
+      if (toolCall.function.name === 'remember') {
+        const fact = parseRememberedFact(resultContent);
+        if (fact) {
+          addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
+          await useRulesStore.getState().refresh();
+        }
+      }
     }
 
     if (signal?.aborted) return;

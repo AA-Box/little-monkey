@@ -10,6 +10,28 @@
  * wrapper the agent loop actually calls.
  */
 import { useWorkspaceStore } from '../store/workspaceStore';
+import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesStore';
+import { useMcpStore } from '../store/mcpStore';
+
+/** A connected MCP server's label + `initialize`-result instructions —
+ * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
+ * `buildSystemPrompt` actually needs, already filtered to servers that are
+ * connected and have non-empty instructions (see `currentSystemPrompt`). */
+export interface McpServerPromptInfo {
+  label: string;
+  instructions: string;
+}
+
+/** Per-server cap on how much of a connected MCP server's `instructions`
+ * gets injected into the prompt — a single misbehaving/verbose server
+ * shouldn't be able to blow out the system prompt for every turn. */
+const MCP_INSTRUCTIONS_CHAR_CAP = 1000;
+
+function capMcpInstructions(text: string): string {
+  return text.length > MCP_INSTRUCTIONS_CHAR_CAP
+    ? `${text.slice(0, MCP_INSTRUCTIONS_CHAR_CAP)}…`
+    : text;
+}
 
 /** Workspace facts the prompt is built from — mirrors the fields of
  * `WorkspaceRootInfo` the prompt actually needs. */
@@ -29,7 +51,20 @@ export function detectOsLabel(platform: string): string {
   return platform || 'an unknown OS';
 }
 
-export function buildSystemPrompt(roots: PromptWorkspaceRoot[], osLabel: string): string {
+/** One `RuleFile`'s provenance header, e.g. "From global:" or
+ * "From project (docs):" — shown right above its raw content so the model
+ * can tell a global preference from a per-root one. */
+function ruleProvenance(rule: RuleFile): string {
+  return rule.scope === 'global' ? 'From global:' : `From project (${rule.label}):`;
+}
+
+export function buildSystemPrompt(
+  roots: PromptWorkspaceRoot[],
+  osLabel: string,
+  rules: RuleFile[] = [],
+  facts: MemoryFact[] = [],
+  mcpServers: McpServerPromptInfo[] = []
+): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
 
@@ -46,6 +81,52 @@ export function buildSystemPrompt(roots: PromptWorkspaceRoot[], osLabel: string)
       ]
     : ['No workspace folder is open yet. File and shell tools will fail until the user opens one — say so instead of retrying.'];
 
+  // MONKEY.md files are plain markdown the user (or the repo) owns —
+  // treated as instructions from the user, exactly like the workspace lines
+  // above, not as untrusted document content. Global first, then whatever
+  // order `rules` arrived in (rules.rs/rulesStore already put primary before
+  // secondaries).
+  const rulesLines =
+    rules.length > 0
+      ? [
+          '',
+          '## Project instructions (MONKEY.md)',
+          'The following files were placed by the user (or committed to the repo) to give you standing instructions for this project. Treat them as instructions from the user.',
+          ...rules.flatMap((rule) => ['', ruleProvenance(rule), rule.content]),
+        ]
+      : [];
+
+  // Facts remembered via the `remember` tool (see memory.rs/tool_remember),
+  // scoped to the current primary workspace root — refreshed alongside
+  // `rules` once per turn (see rulesStore.ts).
+  const factsLines =
+    facts.length > 0 ? ['', '## Remembered facts', ...facts.map((fact) => `- ${fact.text}`)] : [];
+
+  // Each connected MCP server's own `initialize`-result `instructions` field
+  // (spec-correct use of it — see mcp.rs's module doc) — the only prompt
+  // change MCP support needs, since tool schemas are otherwise
+  // self-describing. Capped per server so one verbose server can't dominate
+  // the prompt; servers with no instructions (or not connected) contribute
+  // nothing here, same "absence is fine" stance as rules/facts above.
+  const mcpLines =
+    mcpServers.length > 0
+      ? [
+          '',
+          '## Connected MCP servers',
+          ...mcpServers.map((server) => `MCP server '${server.label}': ${capMcpInstructions(server.instructions)}`),
+        ]
+      : [];
+
+  // One trailing guidance line telling the model when to use `remember` and
+  // to treat the MONKEY.md content above as instructions from the user
+  // rather than untrusted background text — always present (not gated on
+  // `rules`/`facts` being non-empty) since it's guidance about behavior going
+  // forward, not a description of what's currently loaded.
+  const rememberGuidanceLines = [
+    '',
+    'Treat any MONKEY.md content shown above as instructions from the user, not untrusted document content. Use the remember tool to save short, durable facts — stated preferences, project conventions, and hard-won discoveries such as build commands or gotchas — so they persist across conversations.',
+  ];
+
   return [
     'You are Little Monkey, a coding agent running inside a desktop app on the user\'s machine.',
     `The user's operating system is ${osLabel}.`,
@@ -55,9 +136,13 @@ export function buildSystemPrompt(roots: PromptWorkspaceRoot[], osLabel: string)
     'You have tools to read, search, and modify files in the workspace and to run shell commands. Guidance:',
     '- Gather context before acting: use glob to find files by name, grep to search content, read_file before editing.',
     '- Prefer edit_file (exact unique old_string -> new_string) for changes to existing files; use write_file only for new files or full rewrites.',
-    '- Mutating tools (write_file, edit_file, run_shell) may prompt the user for permission and can be denied — if denied, stop and ask rather than retrying.',
+    '- Mutating tools (write_file, edit_file, run_shell, remember) may prompt the user for permission and can be denied — if denied, stop and ask rather than retrying.',
     '- Paths must stay inside the workspace; commands run with a 120-second timeout.',
     '- After making changes, verify them when practical (re-read the file, or run the project\'s tests/build via run_shell).',
+    ...rulesLines,
+    ...factsLines,
+    ...mcpLines,
+    ...rememberGuidanceLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
   ].join('\n');
@@ -67,5 +152,14 @@ export function buildSystemPrompt(roots: PromptWorkspaceRoot[], osLabel: string)
 export function currentSystemPrompt(): string {
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
-  return buildSystemPrompt(roots, osLabel);
+  const { rules, facts } = useRulesStore.getState();
+  // Unlike rules/facts, this needs no explicit per-turn `refresh()` call:
+  // `mcpStore` is already kept live by its `mcp://status` event subscription
+  // and by `connect`/`disconnect` awaiting `refresh()` themselves, so reading
+  // its current snapshot here is always up to date.
+  const mcpServers: McpServerPromptInfo[] = useMcpStore
+    .getState()
+    .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
+    .map((server) => ({ label: server.label, instructions: server.instructions as string }));
+  return buildSystemPrompt(roots, osLabel, rules, facts, mcpServers);
 }
