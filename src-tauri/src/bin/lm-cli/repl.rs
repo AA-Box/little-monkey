@@ -10,6 +10,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use little_monkey_lib::mcp::McpServerEntry;
+use little_monkey_lib::prompts::PromptEntry;
 use little_monkey_lib::AppState;
 use rustyline::error::ReadlineError;
 
@@ -87,13 +88,19 @@ impl Reader {
 }
 
 /// Runs the interactive session against an already-resolved target until
-/// `/bye`, `exit`, `quit`, or EOF.
+/// `/bye`, `exit`, `quit`, or EOF. `options.system` coming in is just
+/// rules/facts + `--system` text — WITHOUT any `--persona` folded in (see
+/// `main.rs::chat_setup`/`chat_loop`); `initial_persona` carries that
+/// resolved persona, if any, as structured data so it becomes the REPL's
+/// own active persona from the start instead of being baked unremovably
+/// into the base text.
 pub async fn run(
     client: &reqwest::Client,
     mut target: Target,
     state: &AppState,
     mode: PermissionMode,
     mut options: chat::ChatOptions,
+    initial_persona: Option<PromptEntry>,
     mcp_entries: &[McpServerEntry],
 ) {
     let mut reader = Reader::new();
@@ -104,6 +111,19 @@ pub async fn run(
     let mut perms = TerminalPermissions::new(mode);
     let mut history: Vec<serde_json::Value> = Vec::new();
     let mut keep_history = true;
+    // The system text `/persona` layers its section on top of, restored
+    // verbatim by `/persona clear` — the rules/facts + `--system` text ONLY,
+    // never a persona (see the doc comment on `run` above). Kept in sync by
+    // `/set system` too (see `handle_set`). Layering rather than clobbering
+    // mirrors the desktop app's "append, never replace" `composeSystemPrompt`
+    // convention.
+    let mut system_base = options.system.clone();
+    // The REPL's own active persona, set by `/persona <command>` and cleared
+    // by `/persona clear`/`/persona none` — seeded from whatever `--persona`
+    // resolved to at startup (if anything), so `/persona clear` can actually
+    // remove it and `/persona <other>` replaces it instead of stacking.
+    let mut persona: Option<PromptEntry> = initial_persona;
+    options.system = crate::compose_persona_and_system(persona.as_ref(), system_base.as_deref());
 
     loop {
         let line = match reader.read(">>> ") {
@@ -129,6 +149,8 @@ pub async fn run(
                 &mut options,
                 &mut history,
                 &mut keep_history,
+                &mut system_base,
+                &mut persona,
                 trimmed,
             )
             .await;
@@ -199,6 +221,8 @@ async fn handle_command(
     options: &mut chat::ChatOptions,
     history: &mut Vec<serde_json::Value>,
     keep_history: &mut bool,
+    system_base: &mut Option<String>,
+    persona: &mut Option<PromptEntry>,
     line: &str,
 ) -> Result<(), String> {
     let (cmd, rest) = split_first_word(line);
@@ -215,12 +239,64 @@ async fn handle_command(
             println!("Cleared session context");
             Ok(())
         }
-        "/set" => handle_set(options, keep_history, target.is_native(), rest),
+        "/set" => handle_set(options, keep_history, target.is_native(), system_base, persona, rest),
         "/show" => handle_show(client, target, options, rest).await,
         "/save" => handle_save(client, target, options, rest).await,
         "/load" => handle_load(client, target, rest).await,
         "/revert" => handle_revert(rest),
+        "/persona" => handle_persona(options, system_base, persona, rest),
+        "/prompts" => {
+            print_prompts();
+            Ok(())
+        }
         other => Err(format!("Unknown command '{other}'. Type /? for help")),
+    }
+}
+
+/// `/persona <command>`: resolves a saved persona by its slash-command
+/// (`crate::resolve_persona_entry`, the same `prompts.json` the desktop app
+/// reads/writes) and layers its content on top of `system_base` via
+/// `crate::compose_persona_and_system` — the REPL analogue of the toolbar
+/// `PersonaSelector` in the desktop app. `/persona clear` (or `/persona
+/// none`) removes the layered section, restoring `system_base` unchanged.
+fn handle_persona(
+    options: &mut chat::ChatOptions,
+    system_base: &Option<String>,
+    persona: &mut Option<PromptEntry>,
+    args: &str,
+) -> Result<(), String> {
+    let (sub, _) = split_first_word(args);
+    if sub.is_empty() {
+        return Err("Usage: /persona <command>  (/persona clear to remove)".to_string());
+    }
+    if sub == "clear" || sub == "none" {
+        *persona = None;
+        options.system = system_base.clone();
+        println!("Cleared active persona.");
+        return Ok(());
+    }
+    let entry = crate::resolve_persona_entry(sub)?;
+    println!("Set active persona: {}", entry.name);
+    *persona = Some(entry);
+    options.system = crate::compose_persona_and_system(persona.as_ref(), system_base.as_deref());
+    Ok(())
+}
+
+/// `/prompts`: lists every saved prompt-library entry (personas and
+/// snippets alike) — the REPL's read-only analogue of the desktop app's
+/// Settings > Prompts tab. Snippet *insertion* stays GUI-only per the design
+/// doc (meaningless in a line-editor REPL), but listing them here still
+/// lets a user see what commands are already taken before picking a new
+/// one, or check a persona's exact command before `/persona <command>`.
+fn print_prompts() {
+    let entries = crate::load_prompt_entries();
+    if entries.is_empty() {
+        println!("No saved prompts. Use the desktop app's Settings > Prompts tab to create one.");
+        return;
+    }
+    for entry in &entries {
+        let desc = entry.description.as_deref().unwrap_or("");
+        println!("  {:<8} /{:<20} {}  {}", entry.kind, entry.command, entry.name, desc);
     }
 }
 
@@ -243,11 +319,16 @@ fn warn_native_only(name: &str) {
 
 /// `/set ...`: mutates the live `ChatOptions` (and the history toggle).
 /// `is_native` gates the warning for Ollama-only options that OpenAI-compat
-/// requests silently drop.
+/// requests silently drop. `system_base`/`persona` are threaded through so
+/// `/set system` updates the text `/persona` layers on top of, rather than
+/// silently discarding whichever persona is currently active (see
+/// `handle_persona`).
 fn handle_set(
     options: &mut chat::ChatOptions,
     keep_history: &mut bool,
     is_native: bool,
+    system_base: &mut Option<String>,
+    persona: &Option<PromptEntry>,
     args: &str,
 ) -> Result<(), String> {
     let (sub, rest) = split_first_word(args);
@@ -270,7 +351,8 @@ fn handle_set(
             if rest.is_empty() {
                 return Err("Usage: /set system <message>".to_string());
             }
-            options.system = Some(strip_wrapping_quotes(rest).to_string());
+            *system_base = Some(strip_wrapping_quotes(rest).to_string());
+            options.system = crate::compose_persona_and_system(persona.as_ref(), system_base.as_deref());
             println!("Set system message.");
             Ok(())
         }
@@ -527,6 +609,8 @@ fn print_help() {
   /save <model>    Save the session's system/parameters as a new model
   /load <model>    Switch to a different local model (keeps the conversation)
   /revert [id]     Restore a checkpoint's files (defaults to the most recent)
+  /persona <cmd>   Set the active persona (/persona clear to remove)
+  /prompts         List saved personas and snippets
   /clear           Clear session context
   /bye             Exit (also exit, quit, or Ctrl+D)
   /?, /help        Help for a command
@@ -653,34 +737,97 @@ mod tests {
     fn handle_set_toggles_and_modes() {
         let mut options = chat::ChatOptions::default();
         let mut keep_history = true;
+        let mut system_base: Option<String> = None;
+        let persona: Option<PromptEntry> = None;
 
-        handle_set(&mut options, &mut keep_history, true, "verbose").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "verbose").unwrap();
         assert!(options.verbose);
-        handle_set(&mut options, &mut keep_history, true, "quiet").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "quiet").unwrap();
         assert!(!options.verbose);
 
-        handle_set(&mut options, &mut keep_history, true, "nohistory").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "nohistory").unwrap();
         assert!(!keep_history);
-        handle_set(&mut options, &mut keep_history, true, "history").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "history").unwrap();
         assert!(keep_history);
 
-        handle_set(&mut options, &mut keep_history, true, "think low").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "think low").unwrap();
         assert_eq!(options.think, Some(serde_json::json!("low")));
-        handle_set(&mut options, &mut keep_history, true, "think").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "think").unwrap();
         assert_eq!(options.think, Some(serde_json::json!(true)));
-        handle_set(&mut options, &mut keep_history, true, "nothink").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "nothink").unwrap();
         assert_eq!(options.think, Some(serde_json::json!(false)));
 
-        handle_set(&mut options, &mut keep_history, true, "format json").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "format json").unwrap();
         assert_eq!(options.format, Some(serde_json::json!("json")));
-        handle_set(&mut options, &mut keep_history, true, "noformat").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "noformat").unwrap();
         assert_eq!(options.format, None);
 
-        handle_set(&mut options, &mut keep_history, true, "system \"You are terse.\"").unwrap();
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "system \"You are terse.\"").unwrap();
         assert_eq!(options.system.as_deref(), Some("You are terse."));
 
-        assert!(handle_set(&mut options, &mut keep_history, true, "bogus on").is_err());
-        assert!(handle_set(&mut options, &mut keep_history, true, "system").is_err());
+        assert!(handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "bogus on").is_err());
+        assert!(handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "system").is_err());
+    }
+
+    fn stub_persona(name: &str, content: &str) -> PromptEntry {
+        PromptEntry {
+            id: "p1".to_string(),
+            kind: "persona".to_string(),
+            name: name.to_string(),
+            command: "stub".to_string(),
+            content: content.to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn handle_set_system_recomposes_on_top_of_the_active_persona() {
+        // `/set system` after a persona is already active must not silently
+        // drop the persona section — it re-layers it via
+        // `compose_persona_and_system` (see `handle_set`'s "system" arm).
+        let mut options = chat::ChatOptions::default();
+        let mut keep_history = true;
+        let mut system_base: Option<String> = None;
+        let persona = Some(stub_persona("Terse", "Be brief."));
+
+        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "system \"Reply in French.\"")
+            .unwrap();
+
+        assert_eq!(system_base.as_deref(), Some("Reply in French."));
+        let system = options.system.as_deref().unwrap();
+        assert!(system.contains("## Active persona: Terse\nBe brief."));
+        assert!(system.ends_with("Reply in French."));
+    }
+
+    #[test]
+    fn handle_persona_requires_an_argument() {
+        let mut options = chat::ChatOptions::default();
+        let system_base: Option<String> = None;
+        let mut persona: Option<PromptEntry> = None;
+        assert!(handle_persona(&mut options, &system_base, &mut persona, "").is_err());
+        assert!(persona.is_none());
+    }
+
+    #[test]
+    fn handle_persona_clear_restores_system_base_and_drops_the_persona() {
+        let mut options = chat::ChatOptions {
+            system: Some("## Active persona: Terse\nBe brief.\n\nUser system.".to_string()),
+            ..chat::ChatOptions::default()
+        };
+        let system_base = Some("User system.".to_string());
+        let mut persona = Some(stub_persona("Terse", "Be brief."));
+
+        handle_persona(&mut options, &system_base, &mut persona, "clear").unwrap();
+
+        assert!(persona.is_none());
+        assert_eq!(options.system.as_deref(), Some("User system."));
+
+        // "none" is accepted as a synonym for "clear".
+        let mut persona2 = Some(stub_persona("Terse", "Be brief."));
+        handle_persona(&mut options, &system_base, &mut persona2, "none").unwrap();
+        assert!(persona2.is_none());
     }
 
     #[test]

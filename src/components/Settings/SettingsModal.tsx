@@ -8,6 +8,9 @@ import { AutomationPanel } from "./AutomationPanel";
 import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { McpPanel } from "./McpPanel";
+import { PromptLibraryPanel } from "./PromptLibraryPanel";
+import { WebPanel } from "./WebPanel";
+import { ApiServerPanel } from "./ApiServerPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -15,9 +18,14 @@ import { useT } from "../../lib/i18n";
 interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
+  /** Tab to select the moment the modal transitions from closed to open —
+   * the deep-link hook `PersonaSelector`'s "Manage prompts…" row (and
+   * anything else that wants to jump straight to a tab) uses, via App.tsx.
+   * Left unset for the normal "open on whatever tab was last active" case. */
+  initialTab?: SettingsTab;
 }
 
-type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver";
 
 const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
   { id: "local", labelKey: "SettingsModal.tabLocalModels" },
@@ -26,6 +34,9 @@ const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] =
   { id: "automation", labelKey: "SettingsModal.tabAutomation" },
   { id: "rules", labelKey: "SettingsModal.tabRules" },
   { id: "mcp", labelKey: "SettingsModal.tabMcp" },
+  { id: "prompts", labelKey: "SettingsModal.tabPrompts" },
+  { id: "web", labelKey: "SettingsModal.tabWeb" },
+  { id: "apiserver", labelKey: "SettingsModal.tabApiServer" },
 ];
 
 /**
@@ -35,7 +46,7 @@ const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] =
  * (`ModelManager`, `OllamaPanel`) so switching tabs is just a render swap,
  * no extra fetching logic here.
  */
-export function SettingsModal({ open, onClose }: SettingsModalProps) {
+export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps) {
   const refreshProviders = useModelStore((s) => s.refreshProviders);
   const providers = useModelStore((s) => s.providers);
 
@@ -66,6 +77,15 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   useEffect(() => {
     if (tab === "openrouter" && !openrouterConnected) setTab("providers");
   }, [tab, openrouterConnected]);
+
+  // Jump to the requested tab whenever the modal opens with one specified
+  // (e.g. PersonaSelector's "Manage prompts…" row) — re-applied on every
+  // open, not just the first, so opening it a second time from a different
+  // deep link still lands on the right tab even if the modal already
+  // remembers a different one from last time.
+  useEffect(() => {
+    if (open && initialTab) setTab(initialTab);
+  }, [open, initialTab]);
 
   useEffect(() => {
     if (!open) return;
@@ -118,6 +138,9 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
           {tab === "automation" && <AutomationPanel />}
           {tab === "rules" && <RulesMemoryPanel />}
           {tab === "mcp" && <McpPanel />}
+          {tab === "prompts" && <PromptLibraryPanel />}
+          {tab === "web" && <WebPanel />}
+          {tab === "apiserver" && <ApiServerPanel />}
         </div>
       </div>
     </div>

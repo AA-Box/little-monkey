@@ -5,6 +5,9 @@ pub mod mcp;
 mod models;
 pub mod ollama;
 pub mod providers;
+// `pub` so `lm-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
+// the same reasoning as `rules`/`checkpoints` above.
+pub mod prompts;
 mod sessions;
 mod system;
 mod tools;
@@ -15,6 +18,13 @@ mod permissions;
 pub mod rules;
 pub mod memory;
 pub mod workspace;
+// `pub` so `lm-cli` (phase 4) can call `web::fetch_impl` directly, the same
+// AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory` above.
+pub mod web;
+// `pub` so a future `lm-cli` `api-serve` subcommand (design doc phase 4) can
+// call `server::handle_request` directly for headless use, the same
+// AppHandle-free-core reasoning as `web`/`rules`/`memory` above.
+pub mod server;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -81,6 +91,34 @@ pub struct AppState {
     /// the connection itself, so this lock is never held across a
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
+    /// Serializes `web_settings.json` writes (see `web.rs::web_set_settings`)
+    /// — same reasoning as `mcp_config_lock` protects `mcp_servers.json`.
+    /// `web_set_settings` is a synchronous command (Tauri can dispatch two
+    /// calls onto genuinely concurrent OS threads), and its save is a plain
+    /// temp-file-write-then-rename with a deterministic temp path; without
+    /// this lock, two concurrent saves can both `std::fs::write` the same
+    /// `web_settings.json.tmp` at once and leave a torn/interleaved file
+    /// behind for whichever `rename` lands last to publish. A plain
+    /// `std::sync::Mutex`, not `tokio::sync::Mutex`: the guarded section is
+    /// synchronous with no `.await` in between.
+    pub web_settings_lock: std::sync::Mutex<()>,
+    /// In-memory lifecycle state for the local OpenAI-compatible API server
+    /// (`server.rs`) — mirrors `llama: Mutex<llama::LlamaState>` above.
+    /// Binds `127.0.0.1` only and exposes just `/health`, `/v1/models`,
+    /// `/v1/chat/completions` — never the agent tools (`tool_run_shell` et
+    /// al. over HTTP would be a remote-code-execution surface, an explicit
+    /// non-goal of this feature — see `server.rs`'s module doc).
+    pub api_server: std::sync::Mutex<server::ApiServerState>,
+    /// Serializes `api_server.json` read-modify-write cycles (config
+    /// get/set, token create/revoke, and the per-request `last_used_at`
+    /// bump) — same reasoning as `web_settings_lock`/`mcp_config_lock`
+    /// protect their own files: several of these are synchronous commands
+    /// Tauri can dispatch onto genuinely concurrent OS threads, and without
+    /// a shared lock two concurrent read-modify-write cycles (e.g. minting
+    /// two tokens back to back, or a token-used bump racing a revoke) could
+    /// both load the same "before" file and the later save silently
+    /// clobbers the earlier one's change.
+    pub api_server_config_lock: std::sync::Mutex<()>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -91,10 +129,37 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
+        .setup(|app| {
+            // Autostart the local API server if `api_server.json` says to —
+            // the only reader of that file at launch time, since every
+            // other consumer (the Settings panel) fetches it on demand via
+            // `api_server_get_config`. Spawned rather than awaited here:
+            // `setup` must return promptly, and a bind failure just leaves
+            // the server in its default "stopped"/"error" state for the
+            // user to retry from the panel, the same as any other failed
+            // manual start.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let Ok(path) = server::config_file_path(&app_handle) else { return };
+                let Ok(config) = server::load_config_impl(&path) else { return };
+                if config.autostart {
+                    let _ = server::api_server_start(app_handle).await;
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             llama::llama_start,
             llama::llama_stop,
             llama::llama_status,
+            server::api_server_start,
+            server::api_server_stop,
+            server::api_server_status,
+            server::api_server_get_config,
+            server::api_server_set_config,
+            server::api_server_create_token,
+            server::api_server_revoke_token,
+            server::api_server_list_tokens,
             ollama::ollama_status,
             ollama::ollama_start,
             ollama::ollama_list_models,
@@ -131,6 +196,13 @@ pub fn run() {
             tools::tools_cancel_running,
             tools::list_workspace_paths,
             tools::tool_remember,
+            web::tool_web_fetch,
+            web::tool_web_search,
+            web::web_get_settings,
+            web::web_set_settings,
+            web::web_has_brave_key,
+            web::web_set_brave_key,
+            web::web_remove_brave_key,
             rules::rules_read,
             rules::rules_write,
             memory::memory_list,
@@ -140,6 +212,10 @@ pub fn run() {
             memory::memory_clear,
             sessions::sessions_load,
             sessions::sessions_save,
+            prompts::prompts_load,
+            prompts::prompts_save,
+            prompts::prompts_read_external,
+            prompts::prompts_write_external,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,

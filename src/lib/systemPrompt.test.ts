@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSystemPrompt, detectOsLabel, type McpServerPromptInfo } from './systemPrompt';
+import { buildSystemPrompt, composeSystemPrompt, detectOsLabel, resolvePersona, type McpServerPromptInfo } from './systemPrompt';
 import type { MemoryFact, RuleFile } from '../store/rulesStore';
+import type { PromptEntry } from '../store/promptStore';
 
 describe('detectOsLabel', () => {
   it('maps navigator platforms to friendly names', () => {
@@ -121,5 +122,59 @@ describe('buildSystemPrompt', () => {
 
     expect(prompt).toContain(`MCP server 'Verbose': ${'x'.repeat(1000)}…`);
     expect(prompt).not.toContain('x'.repeat(1001));
+  });
+
+  it('mentions web_fetch and web_search by default (webToolsAvailable defaults to true)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).toContain('web_fetch');
+    expect(prompt).toContain('web_search');
+  });
+
+  it('omits the web tools guidance line (both web_fetch and web_search) when webToolsAvailable is false', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], false);
+    expect(prompt).not.toContain('web_fetch');
+    expect(prompt).not.toContain('web_search');
+  });
+});
+
+describe('composeSystemPrompt', () => {
+  it('returns the base prompt unchanged when there is no active persona', () => {
+    expect(composeSystemPrompt('BASE PROMPT', null)).toBe('BASE PROMPT');
+  });
+
+  it('appends a clearly-delimited persona section after the base prompt, never replacing it', () => {
+    const base = 'You are Little Monkey. Mutating tools may prompt for permission.';
+    const composed = composeSystemPrompt(base, { name: 'Code Reviewer', content: 'Focus only on bugs, not style.' });
+
+    // The base prompt's sandbox/tool/permission guidance must survive intact.
+    expect(composed.startsWith(base)).toBe(true);
+    expect(composed).toContain('## Active persona: Code Reviewer');
+    expect(composed).toContain('Focus only on bugs, not style.');
+    // The persona section comes strictly after the base content, not before it.
+    expect(composed.indexOf('## Active persona')).toBeGreaterThan(composed.indexOf('Mutating tools'));
+  });
+});
+
+describe('resolvePersona', () => {
+  const entries: PromptEntry[] = [
+    { id: 'p1', kind: 'persona', name: 'Reviewer', command: 'reviewer', content: 'Be critical.', createdAt: 1, updatedAt: 1 },
+    { id: 's1', kind: 'snippet', name: 'Standup', command: 'standup', content: 'Wrote code.', createdAt: 1, updatedAt: 1 },
+  ];
+
+  it('resolves a matching persona id to its name/content', () => {
+    expect(resolvePersona(entries, 'p1')).toEqual({ name: 'Reviewer', content: 'Be critical.' });
+  });
+
+  it('returns null when personaId is null (no active persona)', () => {
+    expect(resolvePersona(entries, null)).toBeNull();
+  });
+
+  it('resolves a dangling personaId (its persona was deleted) to null instead of throwing', () => {
+    expect(() => resolvePersona(entries, 'deleted-id')).not.toThrow();
+    expect(resolvePersona(entries, 'deleted-id')).toBeNull();
+  });
+
+  it('does not resolve a snippet entry even if its id happens to match', () => {
+    expect(resolvePersona(entries, 's1')).toBeNull();
   });
 });

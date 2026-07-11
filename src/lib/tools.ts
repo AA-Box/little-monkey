@@ -190,4 +190,54 @@ export const TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description:
+        'Fetch a web page (or plain text/Markdown/JSON/XML document) by URL and return its content as Markdown, with the page title and final URL (after redirects). Long content is windowed to max_chars starting at start_index; the result reports total_chars and truncated so you can page through the rest with a later call. Requires user permission.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'The http(s) URL to fetch.',
+          },
+          max_chars: {
+            type: 'integer',
+            description: 'Maximum characters of content to return in this call (default 20000).',
+          },
+          start_index: {
+            type: 'integer',
+            description: 'Character offset into the full content to start the returned window at (default 0). Use with total_chars/truncated from a previous call to page through a long page.',
+          },
+        },
+        required: ['url'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description:
+        'Search the web (keyless DuckDuckGo by default) and return up to `count` ranked results, each with a title, url, and snippet. Follow up with web_fetch to read a result in full. Requires user permission.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The search query.',
+          },
+          count: {
+            type: 'integer',
+            description: 'Number of results to return, 1-10 (default 10).',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];

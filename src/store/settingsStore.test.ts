@@ -92,3 +92,46 @@ describe("settingsStore.memoryEnabled", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+describe("settingsStore.webToolsEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ webToolsEnabled: true });
+  });
+
+  it("defaults to true when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as memoryEnabled's
+    // own default test above — `beforeEach` forces `true` regardless, so
+    // only a fresh module import actually covers `defaults()`.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().webToolsEnabled).toBe(true);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setWebToolsEnabled(false);
+    expect(useSettingsStore.getState().webToolsEnabled).toBe(false);
+    useSettingsStore.getState().setWebToolsEnabled(true);
+    expect(useSettingsStore.getState().webToolsEnabled).toBe(true);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setWebToolsEnabled(false);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().webToolsEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ webToolsEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().webToolsEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});

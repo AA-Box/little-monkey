@@ -18,11 +18,13 @@ mod repl;
 mod sse;
 mod tools_cli;
 mod tools_def;
+mod web_cli;
 
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use little_monkey_lib::mcp::McpServerEntry;
+use little_monkey_lib::prompts::{self, PromptEntry};
 use little_monkey_lib::workspace::{self, WorkspaceRoot};
 use little_monkey_lib::{memory, rules, AppState};
 
@@ -87,6 +89,19 @@ struct Cli {
     /// behavior as rules/facts (see `--no-rules`), just for MCP instead.
     #[arg(long, global = true)]
     no_mcp: bool,
+
+    /// Slash-command of a saved persona (see the desktop app's Settings >
+    /// Prompts tab, or `/prompts` in the REPL) to append to the system
+    /// prompt, e.g. `--persona code-reviewer`. Resolved against the same
+    /// `prompts.json` the GUI reads/writes (`little_monkey_lib::prompts`);
+    /// an unrecognized command is a startup error. Composed the same
+    /// "append, never replace" way as the desktop app's per-session
+    /// persona (see `compose_persona_and_system`): if `--system` is also
+    /// given, the persona's content is appended first and `--system` keeps
+    /// the final say, mirroring how `run`'s own `--system` already
+    /// overrides one given before the subcommand.
+    #[arg(long, global = true)]
+    persona: Option<String>,
 
     #[command(flatten)]
     chat: ChatFlags,
@@ -260,6 +275,19 @@ enum Cmd {
         /// Checkpoint id to revert; omit for the most recent CLI checkpoint.
         id: Option<String>,
     },
+    /// Run the local OpenAI-compatible API server headlessly (no GUI),
+    /// reusing the exact same routing/proxy core the desktop app's Settings
+    /// > API Server toggle drives (`little_monkey_lib::server`). Reads and
+    /// writes the SAME `api_server.json`/`providers.json` the GUI does — a
+    /// token minted in Settings works here, and vice versa (see the design
+    /// doc's "config drift" risk note). Runs until interrupted (Ctrl+C).
+    ApiServe {
+        /// Port to bind on 127.0.0.1 — defaults to whatever's saved in
+        /// `api_server.json` (1234 if nothing's been configured yet).
+        /// Overriding it here does NOT persist back to the config file.
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 fn resolve_target(cli: &Cli) -> Result<chat::Target, String> {
@@ -317,6 +345,93 @@ const APP_IDENTIFIER: &str = "com.littlemonkey.app";
 
 fn app_data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(APP_IDENTIFIER))
+}
+
+/// The outer shape of `prompts.json` — this CLI path only ever reads as far
+/// as `entries` (never `defaultPersonaId`, never migrates/normalizes): the
+/// desktop app's `promptStore.ts` is the schema owner, and `PromptEntry`'s
+/// `#[serde(default)]` leniency already tolerates a partially malformed
+/// individual entry.
+#[derive(serde::Deserialize, Default)]
+struct PromptsBlob {
+    #[serde(default)]
+    entries: Vec<PromptEntry>,
+}
+
+/// Loads every saved prompt-library entry from `<data_dir>/prompts.json` via
+/// `little_monkey_lib::prompts::load_impl` — parameterized by `data_dir` so
+/// it's directly unit-testable, same split as [`compose_system_prompt_impl`].
+/// Best-effort: a missing file, unreadable dir, or corrupt JSON all just mean
+/// "no saved prompts" rather than a hard error, matching
+/// `providers_cli::load_custom_providers`'s stance.
+fn load_prompt_entries_impl(data_dir: &Path) -> Vec<PromptEntry> {
+    let path = data_dir.join("prompts.json");
+    let Ok(Some(raw)) = prompts::load_impl(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<PromptsBlob>(&raw).map(|blob| blob.entries).unwrap_or_default()
+}
+
+/// Resolves the real app-data dir and defers to [`load_prompt_entries_impl`].
+fn load_prompt_entries() -> Vec<PromptEntry> {
+    match app_data_dir() {
+        Some(data_dir) => load_prompt_entries_impl(&data_dir),
+        None => Vec::new(),
+    }
+}
+
+/// Core of `--persona <command>`/the REPL's `/persona <command>`: finds a
+/// `kind: "persona"` entry with an exact `command` match among `entries`.
+/// Kept as a pure list lookup (rather than doing the loading itself) so it's
+/// unit-testable without touching disk.
+fn find_persona_entry(entries: &[PromptEntry], command: &str) -> Option<PromptEntry> {
+    entries.iter().find(|e| e.kind == "persona" && e.command == command).cloned()
+}
+
+/// Resolves `--persona <command>` against `<data_dir>/prompts.json`; `Err`
+/// names the command that failed to resolve so a typo is obvious, distinct
+/// from "no prompt library at all".
+fn resolve_persona_entry_impl(data_dir: &Path, command: &str) -> Result<PromptEntry, String> {
+    find_persona_entry(&load_prompt_entries_impl(data_dir), command).ok_or_else(|| {
+        format!(
+            "No persona found with command '{command}'. See the desktop app's Settings > Prompts tab (or run `/prompts` in the REPL) for saved personas."
+        )
+    })
+}
+
+/// Resolves the real app-data dir and defers to [`resolve_persona_entry_impl`].
+fn resolve_persona_entry(command: &str) -> Result<PromptEntry, String> {
+    match app_data_dir() {
+        Some(data_dir) => resolve_persona_entry_impl(&data_dir, command),
+        None => Err(format!("No persona found with command '{command}'.")),
+    }
+}
+
+/// Formats a persona's system-prompt-extension section exactly like the
+/// desktop app's `composeSystemPrompt` (`src/lib/systemPrompt.ts`) — a
+/// `## Active persona: <name>` header followed by the raw content — so a
+/// persona reads identically whether it reached the model via the GUI or
+/// the CLI.
+fn format_persona_section(entry: &PromptEntry) -> String {
+    format!("## Active persona: {}\n{}", entry.name, entry.content)
+}
+
+/// Combines an optional active persona with the CLI's own `--system`/`/set
+/// system` text into the single string that becomes the "user system" slot
+/// [`compose_system_prompt_impl`] appends after the MONKEY.md rules/facts
+/// section. Order is persona-then-system (never the reverse) so an explicit
+/// `--system`/`/set system` always keeps the final say — mirroring how
+/// `run`'s own `--system` already overrides one given before the subcommand.
+/// APPENDS, never replaces, the persona alongside the system text — same
+/// "base prompt carries load-bearing guidance" rationale as
+/// `composeSystemPrompt` on the frontend.
+fn compose_persona_and_system(persona: Option<&PromptEntry>, user_system: Option<&str>) -> Option<String> {
+    match (persona, user_system) {
+        (Some(p), Some(s)) => Some(format!("{}\n\n{}", format_persona_section(p), s)),
+        (Some(p), None) => Some(format_persona_section(p)),
+        (None, Some(s)) => Some(s.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Core logic behind [`compose_system_prompt`], parameterized by a plain
@@ -409,15 +524,25 @@ fn effective_system(cli: &Cli, state: &AppState, user_system: Option<&str>) -> O
 }
 
 /// Builds the chat-side pieces shared by the flat invocation and `run`:
-/// the sandboxed workspace state, the parsed permission mode, and the
-/// validated generation options (whose `system` field is the composed
-/// rules/facts + `--system` prompt — see [`effective_system`]).
-fn chat_setup(cli: &Cli) -> Result<(AppState, PermissionMode, chat::ChatOptions), String> {
+/// the sandboxed workspace state, the parsed permission mode, the validated
+/// generation options (whose `system` field is just the composed
+/// rules/facts + `--system` prompt — see [`effective_system`] — deliberately
+/// WITHOUT the persona folded in), and the resolved `--persona` entry itself
+/// kept as structured data. Keeping the persona separate (rather than
+/// baking its text into `options.system` here) lets every downstream
+/// consumer — `run`'s own `--system` override, and the REPL's `/persona`
+/// state — recompose persona-then-system fresh at the point it's actually
+/// needed instead of racing to overwrite/lose a persona already flattened
+/// into a string (see [`chat_loop`], `repl::run`). An unresolvable
+/// `--persona <command>` is still a hard error here, before any network
+/// target is contacted.
+fn chat_setup(cli: &Cli) -> Result<(AppState, PermissionMode, chat::ChatOptions, Option<PromptEntry>), String> {
     let state = build_state(&cli.workspace)?;
     let mode = PermissionMode::parse(&cli.permission_mode)?;
     let mut options = cli.chat.to_options()?;
+    let persona = cli.persona.as_deref().map(resolve_persona_entry).transpose()?;
     options.system = effective_system(cli, &state, options.system.as_deref());
-    Ok((state, mode, options))
+    Ok((state, mode, options, persona))
 }
 
 fn fail(message: &str) -> ! {
@@ -457,12 +582,12 @@ async fn main() {
         Ok(t) => t,
         Err(e) => fail(&e),
     };
-    let (state, mode, options) = match chat_setup(&cli) {
+    let (state, mode, options, persona) = match chat_setup(&cli) {
         Ok(v) => v,
         Err(e) => fail(&e),
     };
     let mcp_entries = resolve_mcp_entries(&cli, &state).await;
-    chat_loop(&client, target, &state, mode, options, cli.prompt.as_deref(), &mcp_entries).await;
+    chat_loop(&client, target, &state, mode, options, persona, cli.prompt.as_deref(), &mcp_entries).await;
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -486,13 +611,17 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Serve => cmds::passthrough("serve"),
         Cmd::Run { model, prompt, system } => {
             // Validate chat-side flags before a potentially long auto-pull.
-            let (state, mode, mut options) = match chat_setup(cli) {
+            let (state, mode, mut options, persona) = match chat_setup(cli) {
                 Ok(v) => v,
                 Err(e) => fail(&e),
             };
             // `run`'s own --system wins over one given before the subcommand
             // (still composed with the rules/facts section unless
-            // --no-rules — see `effective_system`).
+            // --no-rules — see `effective_system`). The persona (if any) is
+            // NOT re-applied here: it stays structured in `persona` and
+            // `chat_loop` folds it back in on top of whichever system text
+            // ends up in `options.system`, so a `--persona` given alongside
+            // `run`'s own `--system` is layered rather than dropped.
             if let Some(system) = system {
                 options.system = effective_system(cli, &state, Some(system.as_str()));
             }
@@ -505,7 +634,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 native_ollama: true,
             };
             let mcp_entries = resolve_mcp_entries(cli, &state).await;
-            chat_loop(client, target, &state, mode, options, prompt.as_deref(), &mcp_entries).await;
+            chat_loop(client, target, &state, mode, options, persona, prompt.as_deref(), &mcp_entries).await;
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -515,22 +644,48 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             }
             Err(e) => Err(e),
         },
+        Cmd::ApiServe { port } => run_api_serve(*port).await,
     };
     if let Err(e) = result {
         fail(&e);
     }
 }
 
+/// `lm-cli api-serve`'s setup: resolves `api_server.json` at the same
+/// hardcoded-identifier app-data path every other `_cli.rs` module uses,
+/// reads its saved port (falling back to `--port`, then the file's own
+/// default), and hands off to `little_monkey_lib::server::run_cli_server` —
+/// the one place the actual routing/proxy/accept-loop logic lives, so this
+/// function is pure CLI-args-to-config wiring, nothing more.
+async fn run_api_serve(port_override: Option<u16>) -> Result<(), String> {
+    let data_dir = app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let config_path = data_dir.join("api_server.json");
+    let saved_config = little_monkey_lib::server::load_config_impl(&config_path)?;
+    let port = port_override.unwrap_or(saved_config.port);
+
+    little_monkey_lib::server::run_cli_server(port, config_path, providers_cli::load_custom_providers).await
+}
+
 /// Runs the chat side — a one-shot turn, or the interactive REPL when no
 /// prompt is given — against an already-resolved target. Both the classic
-/// flat invocation and `lm-cli run` land here. The REPL takes the target and
-/// options by value since its slash commands (`/load`, `/set`) mutate them.
+/// flat invocation and `lm-cli run` land here. `options.system` going in is
+/// the rules/facts + `--system` text WITHOUT any persona folded in yet (see
+/// `chat_setup`); `persona` carries the resolved `--persona` entry, if any,
+/// as structured data. The two paths recompose them differently: a one-shot
+/// turn folds the persona in once, right here, since there's no later
+/// mutation point; the REPL instead receives `persona` as its *initial*
+/// active persona and recomposes on every `/persona`/`/set system` the same
+/// way (see `repl::run`) — so a persona given via `--persona` is layered
+/// exactly once no matter which path is taken, never dropped and never
+/// stacked. The REPL takes the target and options by value since its slash
+/// commands (`/load`, `/set`) mutate them.
 async fn chat_loop(
     client: &reqwest::Client,
     target: chat::Target,
     state: &AppState,
     mode: PermissionMode,
-    options: chat::ChatOptions,
+    mut options: chat::ChatOptions,
+    persona: Option<PromptEntry>,
     prompt: Option<&str>,
     mcp_entries: &[McpServerEntry],
 ) {
@@ -541,6 +696,7 @@ async fn chat_loop(
     }
 
     if let Some(prompt) = prompt {
+        options.system = compose_persona_and_system(persona.as_ref(), options.system.as_deref());
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
         if let Err(e) =
@@ -552,7 +708,7 @@ async fn chat_loop(
         return;
     }
 
-    repl::run(client, target, state, mode, options, mcp_entries).await;
+    repl::run(client, target, state, mode, options, persona, mcp_entries).await;
 }
 
 #[cfg(test)]
@@ -686,6 +842,7 @@ mod tests {
             permission_mode: "manual".to_string(),
             no_rules: true,
             no_mcp: false,
+            persona: None,
             chat: ChatFlags {
                 temperature: None,
                 top_p: None,
@@ -705,5 +862,217 @@ mod tests {
 
         assert_eq!(effective_system(&cli, &state, Some("Only this.")), Some("Only this.".to_string()));
         assert_eq!(effective_system(&cli, &state, None), None);
+    }
+
+    /// Writes a `prompts.json` blob (the same shape `promptStore.ts` writes)
+    /// with one persona and one snippet entry that share the `"shared-slug"`
+    /// command, so tests can assert `find_persona_entry` ignores the
+    /// snippet — a `command` collision across kinds isn't otherwise possible
+    /// via the GUI, but nothing on the read side should assume it can't
+    /// happen in a hand-edited file.
+    fn write_prompts_fixture(data_dir: &Path) {
+        let payload = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "id": "p1",
+                    "kind": "persona",
+                    "name": "Code Reviewer",
+                    "command": "code-reviewer",
+                    "content": "You are a meticulous code reviewer.",
+                    "description": "Reviews diffs for bugs",
+                    "createdAt": 1700000000000,
+                    "updatedAt": 1700000000000
+                },
+                {
+                    "id": "s1",
+                    "kind": "snippet",
+                    "name": "Shared Slug Snippet",
+                    "command": "shared-slug",
+                    "content": "Not a persona.",
+                    "createdAt": 1700000000000,
+                    "updatedAt": 1700000000000
+                },
+                {
+                    "id": "p2",
+                    "kind": "persona",
+                    "name": "Shared Slug Persona",
+                    "command": "shared-slug",
+                    "content": "A persona sharing a command with a snippet.",
+                    "createdAt": 1700000000000,
+                    "updatedAt": 1700000000000
+                }
+            ],
+            "defaultPersonaId": null
+        }"#;
+        prompts::save_impl(&data_dir.join("prompts.json"), payload).unwrap();
+    }
+
+    #[test]
+    fn load_prompt_entries_impl_returns_empty_when_file_missing() {
+        let data_dir = TempDir::new();
+        assert!(load_prompt_entries_impl(&data_dir.path).is_empty());
+    }
+
+    #[test]
+    fn load_prompt_entries_impl_parses_saved_entries() {
+        let data_dir = TempDir::new();
+        write_prompts_fixture(&data_dir.path);
+
+        let entries = load_prompt_entries_impl(&data_dir.path);
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().any(|e| e.command == "code-reviewer" && e.kind == "persona"));
+    }
+
+    #[test]
+    fn find_persona_entry_ignores_snippets_with_the_same_command() {
+        let data_dir = TempDir::new();
+        write_prompts_fixture(&data_dir.path);
+        let entries = load_prompt_entries_impl(&data_dir.path);
+
+        let found = find_persona_entry(&entries, "shared-slug").unwrap();
+        assert_eq!(found.kind, "persona");
+        assert_eq!(found.name, "Shared Slug Persona");
+
+        assert!(find_persona_entry(&entries, "no-such-command").is_none());
+    }
+
+    #[test]
+    fn resolve_persona_entry_impl_finds_matching_persona() {
+        let data_dir = TempDir::new();
+        write_prompts_fixture(&data_dir.path);
+
+        let entry = resolve_persona_entry_impl(&data_dir.path, "code-reviewer").unwrap();
+        assert_eq!(entry.name, "Code Reviewer");
+        assert_eq!(entry.content, "You are a meticulous code reviewer.");
+    }
+
+    #[test]
+    fn resolve_persona_entry_impl_errors_for_unknown_command() {
+        let data_dir = TempDir::new();
+        write_prompts_fixture(&data_dir.path);
+
+        let err = resolve_persona_entry_impl(&data_dir.path, "does-not-exist").unwrap_err();
+        assert!(err.contains("does-not-exist"));
+    }
+
+    #[test]
+    fn format_persona_section_matches_frontend_convention() {
+        let entry = PromptEntry {
+            id: "p1".to_string(),
+            kind: "persona".to_string(),
+            name: "Rust Mentor".to_string(),
+            command: "rust-mentor".to_string(),
+            content: "Explain borrow-checker errors patiently.".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(
+            format_persona_section(&entry),
+            "## Active persona: Rust Mentor\nExplain borrow-checker errors patiently."
+        );
+    }
+
+    #[test]
+    fn compose_persona_and_system_orders_persona_before_system_and_keeps_system_last() {
+        let entry = PromptEntry {
+            id: "p1".to_string(),
+            kind: "persona".to_string(),
+            name: "Terse".to_string(),
+            command: "terse".to_string(),
+            content: "Be brief.".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert_eq!(compose_persona_and_system(None, None), None);
+        assert_eq!(
+            compose_persona_and_system(None, Some("Only system.")),
+            Some("Only system.".to_string())
+        );
+        assert_eq!(
+            compose_persona_and_system(Some(&entry), None),
+            Some("## Active persona: Terse\nBe brief.".to_string())
+        );
+        let both = compose_persona_and_system(Some(&entry), Some("Only system.")).unwrap();
+        assert!(both.starts_with("## Active persona: Terse\nBe brief."));
+        assert!(both.ends_with("Only system."));
+        assert!(both.find("Be brief.").unwrap() < both.find("Only system.").unwrap());
+    }
+
+    /// Regression test for a bug where `lm-cli --persona <cmd> run <model>
+    /// --system <text>` silently dropped the persona instead of layering it
+    /// (see `chat_setup`'s doc comment and `Cmd::Run`'s arm in
+    /// `run_subcommand`). Since `chat_setup` no longer folds the persona
+    /// into `options.system` itself, `run`'s own `--system` override can
+    /// freely replace `options.system` with `effective_system(...)` (rules/
+    /// facts + the new text, no persona) and still have the persona survive:
+    /// `chat_loop` composes `persona` back on top of whatever
+    /// `options.system` ends up holding, exactly once, right before the
+    /// turn/REPL starts (mirrored here directly against
+    /// `compose_persona_and_system` since `chat_loop` itself needs a live
+    /// network target to drive).
+    #[test]
+    fn compose_persona_and_system_reapplies_persona_over_runs_own_system_override() {
+        let persona = PromptEntry {
+            id: "p1".to_string(),
+            kind: "persona".to_string(),
+            name: "Code Reviewer".to_string(),
+            command: "code-reviewer".to_string(),
+            content: "Review code carefully.".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        // What `run`'s own `--system` override leaves in `options.system`
+        // after `chat_setup` (no persona folded in — see its doc comment).
+        let system_after_own_override = Some("Reply in French.".to_string());
+
+        let folded = compose_persona_and_system(Some(&persona), system_after_own_override.as_deref()).unwrap();
+        assert!(folded.contains("## Active persona: Code Reviewer"));
+        assert!(folded.contains("Review code carefully."));
+        assert!(folded.ends_with("Reply in French."));
+    }
+
+    #[test]
+    fn chat_setup_errors_when_persona_command_is_unresolvable() {
+        // `--persona` resolves against the real OS app-data dir (no
+        // `_impl` seam here, same as `effective_system`'s non-`no_rules`
+        // path) — a nonexistent command must surface as a clear error
+        // rather than silently proceeding with no persona.
+        let cli = Cli {
+            cmd: None,
+            prompt: None,
+            workspace: None,
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            permission_mode: "manual".to_string(),
+            no_rules: true,
+            no_mcp: false,
+            persona: Some("definitely-not-a-real-persona-command".to_string()),
+            chat: ChatFlags {
+                temperature: None,
+                top_p: None,
+                seed: None,
+                stop: Vec::new(),
+                num_ctx: None,
+                num_predict: None,
+                system: None,
+                format: None,
+                think: None,
+                hidethinking: false,
+                keepalive: None,
+                verbose: false,
+                attach_images: false,
+            },
+        };
+        match chat_setup(&cli) {
+            Ok(_) => panic!("expected an unresolvable --persona command to error"),
+            Err(err) => assert!(err.contains("definitely-not-a-real-persona-command")),
+        }
     }
 }

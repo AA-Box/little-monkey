@@ -35,6 +35,18 @@ interface LlamaStatusEvent {
   model_path: string | null;
 }
 
+/** localStorage key for the "start with embeddings" preference — mirrors
+ * `EFFORT_STORAGE_KEY`'s persistence pattern below. */
+const EMBEDDINGS_ENABLED_STORAGE_KEY = "little-monkey-llama-embeddings-enabled";
+
+function readInitialEmbeddingsEnabled(): boolean {
+  try {
+    return localStorage.getItem(EMBEDDINGS_ENABLED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
 /** Payload of the `models://download-progress` Tauri event emitted by src-tauri/src/models.rs. */
 interface DownloadProgressEvent {
   file: string;
@@ -165,6 +177,15 @@ export interface ModelStore {
   active: ModelInfo | null;
   downloadProgress: Record<string, DownloadProgress>;
   llamaStatus: LlamaStatus;
+  /** Whether the next `start()` should launch llama-server with `--embeddings`
+   * (surfaced as a checkbox in the Models panel — see `docs/roadmap/p1-local-api-server.md`
+   * phase 3). Persisted to localStorage so the preference survives a restart,
+   * same as `effort` below. Only takes effect on the *next* start — restarting
+   * a model that's currently running is required to pick up a change, exactly
+   * like every other llama-server launch flag (ctx size, gpu layers). */
+  embeddingsEnabled: boolean;
+  /** Update the "start with embeddings" preference and persist it. */
+  setEmbeddingsEnabled: (value: boolean) => void;
   /** Reload curated + installed model lists and sync llama-server status from the backend. */
   refresh: () => Promise<void>;
   /** Download a curated model's GGUF weights, then refresh the installed list. */
@@ -248,6 +269,16 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   active: null,
   downloadProgress: {},
   llamaStatus: "stopped",
+  embeddingsEnabled: readInitialEmbeddingsEnabled(),
+
+  setEmbeddingsEnabled: (value) => {
+    set({ embeddingsEnabled: value });
+    try {
+      localStorage.setItem(EMBEDDINGS_ENABLED_STORAGE_KEY, String(value));
+    } catch {
+      // Best-effort persistence; a failure here shouldn't block the toggle.
+    }
+  },
 
   ollamaReachable: false,
   ollamaVersion: null,
@@ -308,6 +339,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       modelPath: model.path,
       ctxSize: DEFAULT_CTX_SIZE,
       gpuLayers: DEFAULT_GPU_LAYERS,
+      embeddings: get().embeddingsEnabled,
     });
     // The context limit for a local model is exactly the ctx_size it was
     // started with.
