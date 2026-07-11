@@ -63,6 +63,22 @@ const STRATEGY_OPTIONS: { value: ContextTrimStrategy; labelKey: string; descript
  * backend default", not literally 0). */
 const DEFAULT_VERIFY_TIMEOUT_SECS = 300;
 
+/** Parses the timeout input into `VerifyCommand.timeoutSecs` — mirrors
+ * `AddMcpServerForm.tsx`'s `parseTimeoutSecs`: `undefined` (falls back to
+ * `verify.rs`'s `DEFAULT_VERIFY_TIMEOUT_SECS`) for empty/invalid/non-positive
+ * input, otherwise a rounded positive integer. Needed because `timeoutSecs`
+ * round-trips through `verify_set_config` into a Rust `Option<u64>` — an
+ * unvalidated negative or fractional value would fail Tauri's argument
+ * deserialization before `verify_set_config` even runs, silently dropping the
+ * whole config write (the `number` input's `min={1}` only affects `:invalid`
+ * styling, it doesn't stop the user from typing "-5" or "1.5"). */
+function parseVerifyTimeoutSecs(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : undefined;
+}
+
 const VERIFY_KIND_OPTIONS: { value: VerifyCommandKind; labelKey: string }[] = [
   { value: "lint", labelKey: "AutomationPanel.verifyKindLint" },
   { value: "test", labelKey: "AutomationPanel.verifyKindTest" },
@@ -119,7 +135,7 @@ function VerifyCommandRow({ command }: { command: VerifyCommand }) {
         title={t("AutomationPanel.verifyTimeoutLabel")}
         aria-label={t("AutomationPanel.verifyTimeoutAriaLabel", { label: command.label || command.command })}
         onChange={(event) =>
-          void updateCommand(command.id, { timeoutSecs: event.target.value ? Number(event.target.value) : undefined })
+          void updateCommand(command.id, { timeoutSecs: parseVerifyTimeoutSecs(event.target.value) }).catch(() => {})
         }
         className="h-8 w-16 shrink-0 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
       />

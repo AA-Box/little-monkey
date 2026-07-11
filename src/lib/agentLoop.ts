@@ -31,6 +31,7 @@ import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
 import {
+  abortedPromise,
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
@@ -297,6 +298,24 @@ export function formatVerifyNotice(notice: VerifyNotice): string {
   return `${VERIFY_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
+/** Prefix identifying the plain-text "fix this" instruction appended to the
+ * transcript when a verification failure triggers a feed-back round (see
+ * `runAgentTurnBody`'s use of `shouldFeedBackVerifyFailure`). Deliberately
+ * NOT `VERIFY_NOTE_PREFIX`: that prefix's contract (see `isVerifyNotice`/
+ * `parseVerifyNotice`) is "the rest of the content is a `VerifyNotice` JSON
+ * payload", and this message is plain prose, not JSON — reusing the JSON
+ * prefix here made `MessageList.tsx` match `isVerifyNotice`, fail to parse,
+ * and silently drop the message from the timeline (the model still saw it
+ * via `wireHistory`, but the user never did). Recognized by `MessageList.tsx`
+ * as a plain-text notice, same rendering as `SWITCH_NOTE_PREFIX`/
+ * `MENTION_NOTE_PREFIX` — this is an intentional deviation from the design
+ * doc, which suggested reusing `VERIFY_NOTE_PREFIX` for this message. */
+export const VERIFY_FIX_NOTE_PREFIX = '[Verify Fix]';
+
+export function isVerifyFixNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_FIX_NOTE_PREFIX);
+}
+
 /** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
 const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
 
@@ -460,14 +479,27 @@ export function shouldFeedBackVerifyFailure(failure: VerifyFailure | null, verif
  * `MessageList.tsx` can render a "running <label>…" indicator while a
  * (possibly long) command executes — it is not otherwise part of this
  * function's control flow.
+ *
+ * `signal`, when given, makes Stop work throughout the whole phase, not just
+ * the single in-flight command: checked before every command starts (so a
+ * Stop that lands between two commands doesn't kick off another one), and
+ * raced against each in-flight `verify_run` invoke the same way
+ * `executeToolCall` races a tool call — on abort, `tools_cancel_running` is
+ * invoked to fire the turn's `tool_cancel` `Notify` (the same channel
+ * `run_command_impl`'s `tokio::select!` listens on), so the Rust-side child
+ * process actually dies instead of running to completion or its own timeout
+ * while the phase — and the turn, and the session's "a turn is already
+ * running" guard — sit blocked waiting for it.
  */
 export async function runVerificationPhase(
   sessionId: string,
   turnId: string,
-  addMessage: (msg: ChatMessage) => void
+  addMessage: (msg: ChatMessage) => void,
+  signal?: AbortSignal
 ): Promise<VerifyFailure | null> {
   if (!useSettingsStore.getState().verifyEnabled) return null;
   if (usePermissionStore.getState().mode === 'plan') return null;
+  if (signal?.aborted) return null;
 
   let config: VerifyConfig;
   try {
@@ -483,6 +515,11 @@ export async function runVerificationPhase(
   let firstFailure: VerifyFailure | null = null;
 
   for (const cmd of enabledCommands) {
+    // Stop fired either before this iteration or while the previous
+    // command's invoke was in flight (handled below) — either way, don't
+    // start another configured command.
+    if (signal?.aborted) break;
+
     // Surfaced as a "running <label>…" row in the timeline
     // (MessageList.tsx's VerifyRunningRow) — test suites can run long enough
     // (up to `timeout_secs`, default 300s) that a bare typing indicator would
@@ -490,7 +527,20 @@ export async function runVerificationPhase(
     // never leaves a stale "running" row behind.
     useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
     try {
-      const result = await invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
+      const invocation = invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
+      const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
+
+      if (result === null) {
+        // Aborted mid-command: tell the Rust side to kill it via the same
+        // turn-keyed cancel channel `executeToolCall` uses for tool calls,
+        // then stop the phase entirely rather than starting the next
+        // configured command. The original invocation promise already has a
+        // handler attached (via Promise.race), so its eventual (discarded)
+        // result never becomes an unhandled rejection.
+        void invoke('tools_cancel_running', { turnId }).catch(() => {});
+        break;
+      }
+
       const ok = !result.timedOut && result.code === 0;
       const output = buildVerifyOutput(result);
       addMessage({
@@ -1130,21 +1180,20 @@ async function runAgentTurnBody(
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
       if (!signal?.aborted && mutatedFiles.size > 0) {
-        const failure = await runVerificationPhase(sessionId, turnId, addMessage);
+        const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
         // A command failed and there's a feed-back round left to spend —
         // append one fix instruction and send the loop around again instead
         // of returning. `mutatedFiles` is cleared so only edits made in
         // response to *this* failure trigger the next verification pass;
-        // `signal?.aborted` is re-checked since verify_run's own commands
-        // can run long enough for Stop to have fired while they were in
-        // flight (verify_run itself already dies on the turn's cancel
-        // channel — this just stops us from also queuing a fix round).
+        // `signal?.aborted` is re-checked since `runVerificationPhase` can
+        // return early (rather than run every command) once Stop fires
+        // mid-phase — see its doc comment.
         if (failure !== null && !signal?.aborted && shouldFeedBackVerifyFailure(failure, verifyRound, settings.verifyMaxRounds)) {
           verifyRound += 1;
           mutatedFiles.clear();
           addMessage({
             role: 'system',
-            content: `${VERIFY_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
+            content: `${VERIFY_FIX_NOTE_PREFIX} The verification command "${failure.label}" failed (exit ${failure.code ?? 'timeout'}). Fix the reported problems, then stop.\n${failure.output}`,
           });
           continue;
         }
