@@ -138,6 +138,7 @@ pub fn run() {
             tools::list_workspace_paths,
             tools::tool_remember,
             web::tool_web_fetch,
+            web::tool_web_search,
             rules::rules_read,
             rules::rules_write,
             memory::memory_list,

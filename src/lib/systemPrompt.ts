@@ -13,6 +13,7 @@ import { useWorkspaceStore } from '../store/workspaceStore';
 import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesStore';
 import { useMcpStore } from '../store/mcpStore';
 import { usePromptStore, type PromptEntry } from '../store/promptStore';
+import { useSettingsStore } from '../store/settingsStore';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -106,11 +107,12 @@ export function buildSystemPrompt(
   rules: RuleFile[] = [],
   facts: MemoryFact[] = [],
   mcpServers: McpServerPromptInfo[] = [],
-  // Whether the web_fetch/web_search tools are being offered this turn.
-  // Hardcoded `true` at every call site for now — there is no settings
-  // toggle to gate this on yet (that's phase 2's `webToolsEnabled`) — but the
-  // parameter already exists so wiring that toggle up later only touches the
-  // call site, not this function's guidance text.
+  // Whether the web_fetch/web_search tools are being offered this turn —
+  // wired by `currentSystemPrompt` from the settingsStore `webToolsEnabled`
+  // toggle (see `agentLoop.ts`'s `toolsForSettings`, the actual tool-list
+  // filter this guidance line is just describing in prose). Defaults to
+  // `true` here only so existing tests/call sites that don't care about the
+  // toggle don't have to pass it.
   webToolsAvailable: boolean = true
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
@@ -179,7 +181,7 @@ export function buildSystemPrompt(
   // `webToolsAvailable` param doc for why this is a parameter rather than an
   // unconditional line despite always being true today.
   const webToolsLines = webToolsAvailable
-    ? ['', 'You can read web pages with web_fetch (returns Markdown, paginated via start_index/max_chars for long pages); cite source URLs when you use it.']
+    ? ['', 'You can research with web_search and read pages with web_fetch (Markdown, paginated via start_index/max_chars for long pages); cite source URLs.']
     : [];
 
   return [
@@ -221,7 +223,8 @@ export function currentSystemPrompt(personaId: string | null = null): string {
     .getState()
     .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
     .map((server) => ({ label: server.label, instructions: server.instructions as string }));
-  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers);
+  const webToolsAvailable = useSettingsStore.getState().webToolsEnabled;
+  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable);
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
 }

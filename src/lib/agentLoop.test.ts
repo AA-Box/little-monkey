@@ -123,6 +123,32 @@ describe("toolsForSettings", () => {
     const noRemember = [toolDef("write_file"), toolDef("run_shell")];
     expect(toolsForSettings(noRemember, false)).toEqual(noRemember);
   });
+
+  const toolsWithWeb = [toolDef("write_file"), toolDef("web_fetch"), toolDef("web_search"), toolDef("run_shell")];
+
+  it("keeps web_fetch and web_search when webToolsEnabled is true (or omitted)", () => {
+    expect(toolsForSettings(toolsWithWeb, true, true).map((t) => t.function.name)).toEqual([
+      "write_file",
+      "web_fetch",
+      "web_search",
+      "run_shell",
+    ]);
+    expect(toolsForSettings(toolsWithWeb, true).map((t) => t.function.name)).toEqual([
+      "write_file",
+      "web_fetch",
+      "web_search",
+      "run_shell",
+    ]);
+  });
+
+  it("filters both web_fetch and web_search out when webToolsEnabled is false, leaving every other tool untouched", () => {
+    expect(toolsForSettings(toolsWithWeb, true, false).map((t) => t.function.name)).toEqual(["write_file", "run_shell"]);
+  });
+
+  it("applies the memoryEnabled and webToolsEnabled filters independently", () => {
+    const all = [toolDef("remember"), toolDef("web_fetch"), toolDef("web_search"), toolDef("write_file")];
+    expect(toolsForSettings(all, false, false).map((t) => t.function.name)).toEqual(["write_file"]);
+  });
 });
 
 describe("isToolCallAllowed", () => {

@@ -236,16 +236,26 @@ export function formatMemoryNotice(notice: MemoryNotice): string {
   return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
+/** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
+const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
+
 /**
  * Filters `remember` out of the tool list offered to the model this turn
- * when the settingsStore `memoryEnabled` toggle is off. This is the ONLY
- * effect of that toggle — rules and previously-saved facts are still
+ * when the settingsStore `memoryEnabled` toggle is off, and/or `web_fetch`
+ * and `web_search` out when `webToolsEnabled` is off. This is the ONLY
+ * effect of either toggle — rules and previously-saved facts are still
  * injected into the system prompt unconditionally (see `runAgentTurnBody`'s
- * `useRulesStore.getState().refresh()` call); turning it off stops the agent
- * from saving *new* facts on its own, it is not amnesia.
+ * `useRulesStore.getState().refresh()` call); turning `memoryEnabled` off
+ * stops the agent from saving *new* facts on its own, it is not amnesia.
+ * Likewise, `webToolsEnabled` off just makes the two web tools invisible to
+ * the model — it doesn't touch anything else.
  */
-export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean): ToolDef[] {
-  return memoryEnabled ? tools : tools.filter((tool) => tool.function.name !== 'remember');
+export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true): ToolDef[] {
+  return tools.filter((tool) => {
+    if (!memoryEnabled && tool.function.name === 'remember') return false;
+    if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
+    return true;
+  });
 }
 
 /**
@@ -652,13 +662,23 @@ async function executeToolCall(
   // The turn id scopes permission prompts and shell/fetch cancellation to
   // THIS turn — Stop in one pane must not kill the other pane's command (or
   // in-flight fetch) or deny its prompt. Injected like checkpoint_id (never
-  // model-supplied). All five commands use `rename_all = "snake_case"`, so
-  // all take the snake_case key. `remember`/`web_fetch` don't take a
-  // checkpoint_id (see tool_remember's/tool_web_fetch's doc comments in
-  // tools.rs/web.rs — neither snapshots a workspace file), but both are still
-  // permission-gated and need the turn id for that prompt (and, for
-  // web_fetch, for Stop-button cancellation of the in-flight request).
-  if (name === 'write_file' || name === 'edit_file' || name === 'run_shell' || name === 'remember' || name === 'web_fetch') {
+  // model-supplied). All six commands use `rename_all = "snake_case"`, so
+  // all take the snake_case key. `remember`/`web_fetch`/`web_search` don't
+  // take a checkpoint_id (see tool_remember's/tool_web_fetch's/
+  // tool_web_search's doc comments in tools.rs/web.rs — none snapshots a
+  // workspace file), but all three are still permission-gated and need the
+  // turn id for that prompt (and, for web_fetch only, for Stop-button
+  // cancellation of the in-flight request — web_search's request is short
+  // and fixed-endpoint, so it gets `remember`'s simpler "turn id for the
+  // prompt only" treatment, see tool_web_search's doc comment).
+  if (
+    name === 'write_file' ||
+    name === 'edit_file' ||
+    name === 'run_shell' ||
+    name === 'remember' ||
+    name === 'web_fetch' ||
+    name === 'web_search'
+  ) {
     args.turn_id = turnId;
   }
 
@@ -969,7 +989,7 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
-  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpDefs], settings.memoryEnabled);
+  const toolsForTurn: ToolDef[] = toolsForSettings([...TOOLS, ...mcpDefs], settings.memoryEnabled, settings.webToolsEnabled);
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
     const summaryMessages: ChatMessage[] = [
