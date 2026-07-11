@@ -9,6 +9,7 @@
 
 use little_monkey_lib::checkpoints;
 use little_monkey_lib::mcp::McpServerEntry;
+use little_monkey_lib::web;
 use little_monkey_lib::AppState;
 
 use crate::checkpoints_cli;
@@ -17,6 +18,7 @@ use crate::mcp_cli;
 use crate::permission::TerminalPermissions;
 use crate::tools_cli;
 use crate::tools_def::{self, McpToolRegistry};
+use crate::web_cli;
 
 const MAX_ITERATIONS: usize = 25;
 
@@ -118,6 +120,52 @@ async fn execute_tool_call(
         "remember" => tools_cli::remember(state, perms, args["text"].as_str().unwrap_or_default())
             .await
             .and_then(|fact| serde_json::to_value(fact).map_err(|e| e.to_string())),
+        // Both web tools always prompt outside `--mode bypass` — same
+        // `TerminalPermissions::request` choke point every other
+        // permission-gated tool goes through — and then call
+        // `little_monkey_lib::web::{fetch_impl,search_impl}` directly (the
+        // AppHandle-free lib fns the desktop app's `tool_web_fetch`/
+        // `tool_web_search` commands also call), rather than duplicating the
+        // fetch/search pipeline a third time. `web_cli::load_settings()`
+        // reads the identical `web_settings.json` the GUI's Settings > Web
+        // tab writes, resolved via the same hardcoded-identifier convention
+        // `providers_cli.rs` uses for `providers.json`.
+        "web_fetch" => {
+            let url = args["url"].as_str().unwrap_or_default().to_string();
+            match perms.request("web_fetch", &url).await {
+                Ok(()) => {
+                    let settings = web_cli::load_settings();
+                    let max_chars = args["max_chars"].as_u64().map(|v| v as usize);
+                    let start_index = args["start_index"].as_u64().map(|v| v as usize);
+                    web::fetch_impl(&settings, url, max_chars, start_index)
+                        .await
+                        .and_then(|result| serde_json::to_value(result).map_err(|e| e.to_string()))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "web_search" => {
+            let query = args["query"].as_str().unwrap_or_default().to_string();
+            match perms.request("web_search", &query).await {
+                Ok(()) => {
+                    let settings = web_cli::load_settings();
+                    // Only resolved when actually needed, same as
+                    // `tool_web_search`'s own dispatch — a missing key just
+                    // means `search_impl`'s Brave branch surfaces its own
+                    // actionable error rather than short-circuiting here.
+                    let brave_key = if settings.search_provider == web::SearchProvider::Brave {
+                        web::read_brave_key().ok()
+                    } else {
+                        None
+                    };
+                    let count = args["count"].as_u64().map(|v| v as usize);
+                    web::search_impl(&settings, brave_key, query, count)
+                        .await
+                        .and_then(|results| serde_json::to_value(results).map_err(|e| e.to_string()))
+                }
+                Err(e) => Err(e),
+            }
+        }
         other => Err(format!("Unknown tool \"{other}\"")),
     };
 
