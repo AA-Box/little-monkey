@@ -469,6 +469,7 @@ export const fr: Record<string, string> = {
   "ApiServerPanel.status.running": "En cours d'exécution",
   "ApiServerPanel.status.error": "Erreur",
   "ApiServerPanel.requestsLabel": "{{count}} requêtes traitées",
+  "ApiServerPanel.lastRequestLabel": "Dernière requête : {{time}}",
   "ApiServerPanel.connectionHeading": "Connexion",
   "ApiServerPanel.portLabel": "Port",
   "ApiServerPanel.portHint": "Appliqué immédiatement — si le serveur est en cours d'exécution, il redémarre automatiquement pour prendre en compte le nouveau port.",

@@ -158,4 +158,14 @@ describe("apiserver://status event subscription", () => {
     statusHandlerRef.current?.({ payload: pushed });
     expect(useApiServerStore.getState().status).toEqual(pushed);
   });
+
+  // Phase 4 addition: `last_request_at` is the other half of the "request
+  // counter/last-request display" parity item — `request_count` itself was
+  // already wired end to end since phase 1. Pins down that it flows through
+  // the same live event subscription, not just the initial `refresh()`.
+  it("carries last_request_at through to the store", () => {
+    const pushed = makeStatus({ status: "running", request_count: 3, last_request_at: 1700000000000 });
+    statusHandlerRef.current?.({ payload: pushed });
+    expect(useApiServerStore.getState().status.last_request_at).toBe(1700000000000);
+  });
 });

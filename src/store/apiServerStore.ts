@@ -12,6 +12,9 @@ export interface ApiServerStatus {
   status: "stopped" | "starting" | "running" | "error";
   port: number;
   request_count: number;
+  /** Epoch milliseconds of the most recently completed request, or `null`
+   * if the server hasn't served one yet since it last started. */
+  last_request_at: number | null;
   last_error: string | null;
 }
 
@@ -59,6 +62,7 @@ export const DEFAULT_API_SERVER_STATUS: ApiServerStatus = {
   status: "stopped",
   port: 1234,
   request_count: 0,
+  last_request_at: null,
   last_error: null,
 };
 

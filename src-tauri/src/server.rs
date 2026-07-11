@@ -135,6 +135,14 @@ pub struct ApiServerState {
     /// `"stopped" | "starting" | "running" | "error"`.
     pub status: String,
     pub request_count: u64,
+    /// Epoch milliseconds of the most recently completed request, or `None`
+    /// if the server hasn't served one yet since it last started (reset to
+    /// `None` on every `start`, same as `request_count` resetting to `0` —
+    /// see [`start_server_core`]). Phase 4 addition: the design doc's
+    /// "request counter/last-request display in the panel" parity item —
+    /// `request_count` itself was already wired end to end since phase 1,
+    /// this is the other half.
+    pub last_request_at: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -145,6 +153,7 @@ impl Default for ApiServerState {
             port: DEFAULT_PORT,
             status: "stopped".to_string(),
             request_count: 0,
+            last_request_at: None,
             last_error: None,
         }
     }
@@ -158,6 +167,7 @@ pub struct ApiServerStatusPayload {
     pub status: String,
     pub port: u16,
     pub request_count: u64,
+    pub last_request_at: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -166,6 +176,7 @@ fn status_payload(state: &ApiServerState) -> ApiServerStatusPayload {
         status: state.status.clone(),
         port: state.port,
         request_count: state.request_count,
+        last_request_at: state.last_request_at,
         last_error: state.last_error.clone(),
     }
 }
@@ -1048,6 +1059,21 @@ struct ServerRuntime {
     expose_providers: bool,
 }
 
+/// Pure merge of built-in presets + a caller-supplied custom-provider list
+/// into the routing catalog — split out from [`build_provider_catalog`] so
+/// `lm-cli`'s `api-serve` subcommand (design doc phase 4) can build the same
+/// catalog from its own `AppHandle`-free custom-provider loader
+/// (`providers_cli::load_custom_providers`) without duplicating the
+/// preset+custom merge logic. See [`run_cli_server`].
+fn provider_catalog_from(custom: Vec<providers::CustomProviderEntry>) -> Vec<ProviderSummary> {
+    let mut out: Vec<ProviderSummary> = providers::providers_list_presets()
+        .into_iter()
+        .map(|p| ProviderSummary { id: p.id, base_url: p.base_url })
+        .collect();
+    out.extend(custom.into_iter().map(|c| ProviderSummary { id: c.id, base_url: c.base_url }));
+    out
+}
+
 /// Builds the routing catalog of configured cloud providers (built-in
 /// presets + custom OpenAI-compatible endpoints from `providers.json`) —
 /// `providers::providers_list_presets`/`providers::read_custom_providers`
@@ -1056,14 +1082,24 @@ struct ServerRuntime {
 /// whole request, same "best-effort, don't take routing down" stance as
 /// [`build_deps`]'s token load.
 fn build_provider_catalog(app: &AppHandle) -> Vec<ProviderSummary> {
-    let mut out: Vec<ProviderSummary> = providers::providers_list_presets()
-        .into_iter()
-        .map(|p| ProviderSummary { id: p.id, base_url: p.base_url })
-        .collect();
-    if let Ok(custom) = providers::read_custom_providers(app) {
-        out.extend(custom.into_iter().map(|c| ProviderSummary { id: c.id, base_url: c.base_url }));
-    }
-    out
+    provider_catalog_from(providers::read_custom_providers(app).unwrap_or_default())
+}
+
+/// Pure conversion from the persisted [`TokenEntry`] list to the
+/// request-auth-only [`StoredToken`] shape — split out from [`build_deps`]
+/// so [`run_cli_server`] can build the same auth view from a config it
+/// loaded itself, without duplicating the field list.
+fn tokens_from_config(config: &ApiServerConfig) -> Vec<StoredToken> {
+    config
+        .tokens
+        .iter()
+        .map(|t| StoredToken {
+            id: t.id.clone(),
+            sha256: t.sha256.clone(),
+            scopes: t.scopes.clone(),
+            backends: t.backends.clone(),
+        })
+        .collect()
 }
 
 fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
@@ -1087,17 +1123,7 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
     // silently accepting anything.
     let tokens = config_file_path(app)
         .and_then(|p| load_config_impl(&p))
-        .map(|cfg| {
-            cfg.tokens
-                .into_iter()
-                .map(|t| StoredToken {
-                    id: t.id,
-                    sha256: t.sha256,
-                    scopes: t.scopes,
-                    backends: t.backends,
-                })
-                .collect()
-        })
+        .map(|cfg| tokens_from_config(&cfg))
         .unwrap_or_default();
 
     ServerDeps {
@@ -1113,6 +1139,47 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
         tokens,
         client: runtime.client.clone(),
     }
+}
+
+/// Probes the managed llama-server process's readiness and reports the
+/// model id it advertises — the CLI-context substitute for reading
+/// `AppState::llama` in-process (which only exists inside the GUI). Used
+/// exclusively by [`run_cli_server`]: `lm-cli api-serve` runs as its own OS
+/// process with no Tauri `AppState`, but llama-server (if the GUI already
+/// started it) is a plain independent TCP listener on `port` that anyone on
+/// loopback can reach, so a `/health` + `/v1/models` probe is a faithful
+/// (if slightly higher-latency) stand-in for the GUI's in-memory
+/// `LlamaState::status`/`model_path`. Any failure (unreachable, non-200,
+/// unexpected body) is reported as "not ready" — same "absence is normal,
+/// don't fail routing" stance as [`handle_models`]'s Ollama/provider
+/// omission.
+async fn probe_llama_server(client: &reqwest::Client, port: u16) -> (bool, Option<String>) {
+    let healthy = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false);
+    if !healthy {
+        return (false, None);
+    }
+
+    let model_id = client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .send()
+        .await
+        .ok()
+        .and_then(|resp| resp.error_for_status().ok())
+        .map(|resp| async move { resp.json::<serde_json::Value>().await.ok() });
+    let model_id = match model_id {
+        Some(fut) => fut.await,
+        None => None,
+    };
+    let model_id = model_id
+        .and_then(|v| v.get("data").and_then(|d| d.as_array()).and_then(|arr| arr.first().cloned()))
+        .and_then(|entry| entry.get("id").and_then(|id| id.as_str()).map(str::to_string));
+
+    (true, model_id)
 }
 
 /// Buffers a real hyper request's body into a single `Bytes` (unbounded —
@@ -1136,6 +1203,7 @@ fn bump_request_count(app: &AppHandle) {
     let payload = {
         let Ok(mut s) = state.api_server.lock() else { return };
         s.request_count += 1;
+        s.last_request_at = Some(now_ms());
         status_payload(&s)
     };
     // Emitted per-request rather than throttled — phase 1 traffic volume
@@ -1221,6 +1289,121 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 }
 
 // ---------------------------------------------------------------------
+// lm-cli `api-serve` (design doc phase 4): the SAME routing/proxy core
+// (`ServerDeps`/`serve_one_request`/`handle_request`/`bind_listener`/
+// `load_config_impl`) the GUI uses, with no `AppHandle`/`AppState` at all —
+// only the surrounding bookkeeping differs (stdout/stderr logging instead
+// of `apiserver://status` events, an `AtomicU64` instead of
+// `AppState::api_server.request_count`, an HTTP probe instead of reading
+// `AppState::llama` in-process). `lm-cli`'s `main.rs` resolves the
+// `api_server.json`/`providers.json` paths itself (the same
+// `APP_IDENTIFIER`-hardcoding technique `providers_cli.rs`/
+// `checkpoints_cli.rs` already use) and hands them in here — see the design
+// doc's "config drift" risk note: this deliberately reads the SAME
+// `api_server.json` the GUI writes, so tokens and toggles set in Settings
+// carry over to the CLI and vice versa.
+// ---------------------------------------------------------------------
+
+/// Runs the local API server as a blocking, headless accept loop — never
+/// returns on success (Ctrl+C/SIGINT ends the process the same way `ollama
+/// serve`'s passthrough does); returns `Err` only for a bind failure, so
+/// `lm-cli`'s `main` can print it and exit non-zero exactly like every other
+/// subcommand's error path (`fail()`).
+///
+/// `load_custom_providers` is re-invoked on every accepted connection (not
+/// cached once at startup) for the same "never stale" reasoning
+/// [`build_deps`] applies to tokens — a provider added via the GUI's
+/// Settings while `api-serve` is already running becomes routable
+/// immediately, no CLI restart needed.
+pub async fn run_cli_server(
+    port: u16,
+    config_path: PathBuf,
+    load_custom_providers: impl Fn() -> Vec<providers::CustomProviderEntry> + Send + Sync + 'static,
+) -> Result<(), String> {
+    let listener = bind_listener(port).await?;
+    println!("Little Monkey API server listening on http://127.0.0.1:{port}/v1 (Ctrl+C to stop)");
+
+    let client = reqwest::Client::new();
+    let llama_port = crate::llama::LlamaState::default().port;
+    let request_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let load_custom_providers = Arc::new(load_custom_providers);
+    // Guards this process's own `api_server.json` read-modify-write cycles
+    // for the `last_used_at` bump below — a fresh, CLI-local `AppState` is
+    // enough to serialize concurrent requests *within this process*; it
+    // does not (and can't, being an in-memory lock) protect against a
+    // simultaneously-running GUI process also writing the same file. That
+    // cross-process race is the same pre-existing "shared JSON file" risk
+    // the design doc's "config drift" note already flags — the atomic
+    // temp+rename write in `save_config_impl` bounds it to "last writer
+    // wins", never a torn file.
+    let cli_state = Arc::new(AppState::default());
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => continue, // transient accept error — keep serving
+        };
+        let io = TokioIo::new(stream);
+        let client = client.clone();
+        let config_path = config_path.clone();
+        let request_count = request_count.clone();
+        let load_custom_providers = load_custom_providers.clone();
+        let cli_state = cli_state.clone();
+
+        tokio::spawn(async move {
+            let service = service_fn(move |req: Request<Incoming>| {
+                let client = client.clone();
+                let config_path = config_path.clone();
+                let request_count = request_count.clone();
+                let load_custom_providers = load_custom_providers.clone();
+                let cli_state = cli_state.clone();
+                async move {
+                    let config = load_config_impl(&config_path).unwrap_or_default();
+                    let (llama_ready, llama_model_stem) = probe_llama_server(&client, llama_port).await;
+                    let deps = ServerDeps {
+                        llama_port,
+                        llama_ready,
+                        llama_model_stem,
+                        // The CLI can't know whether the GUI started
+                        // llama-server with `--embeddings` (that flag lives
+                        // only in the GUI's in-memory `LlamaState`, not on
+                        // disk) — conservatively `false`, so
+                        // `POST /v1/embeddings` 501s with a clear message
+                        // instead of guessing.
+                        llama_embeddings_enabled: false,
+                        ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
+                        require_token: config.require_token,
+                        expose_ollama: config.expose_ollama,
+                        expose_providers: config.expose_providers,
+                        providers: provider_catalog_from(load_custom_providers()),
+                        tokens: tokens_from_config(&config),
+                        client,
+                    };
+
+                    let (resp, matched_token_id) = serve_one_request(deps, req).await?;
+                    let n = request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(token_id) = &matched_token_id {
+                        record_token_used_with_state(&cli_state, &config_path, token_id);
+                    }
+                    eprintln!("[api-serve] request #{n} {} -> {}", req_log_hint(matched_token_id.as_deref()), resp.status());
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+    }
+}
+
+/// Tiny formatting helper for [`run_cli_server`]'s per-request log line —
+/// split out purely so the `eprintln!` above stays readable.
+fn req_log_hint(token_id: Option<&str>) -> String {
+    match token_id {
+        Some(id) => format!("(token {id})"),
+        None => "(no token)".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------
 // AppHandle-owning core start/stop, shared by the commands below and by
 // lib.rs's autostart setup hook + api_server_set_config's restart path.
 // ---------------------------------------------------------------------
@@ -1261,6 +1444,7 @@ async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, St
         s.port = config.port;
         s.status = "running".to_string();
         s.request_count = 0;
+        s.last_request_at = None;
         s.last_error = None;
         status_payload(&s)
     };
@@ -1697,6 +1881,26 @@ mod tests {
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(matched.as_deref(), Some("tok-1"));
+    }
+
+    /// Phase 4 addition: `request_count` was already wired end to end since
+    /// phase 1 — this pins down the other half of the design doc's
+    /// "request counter/last-request display" parity item, `last_request_at`,
+    /// mirroring exactly what [`bump_request_count`] does to `ApiServerState`
+    /// (a fresh `AppHandle` isn't available in a unit test — see this
+    /// module's other `AppState`-only, `AppHandle`-free tests for why).
+    #[test]
+    fn last_request_at_starts_none_and_is_set_once_a_request_is_recorded() {
+        let mut state = ApiServerState::default();
+        assert_eq!(state.last_request_at, None);
+        assert_eq!(status_payload(&state).last_request_at, None);
+
+        state.request_count += 1;
+        state.last_request_at = Some(now_ms());
+
+        let payload = status_payload(&state);
+        assert_eq!(payload.request_count, 1);
+        assert!(payload.last_request_at.is_some());
     }
 
     #[tokio::test]
@@ -2221,6 +2425,181 @@ mod tests {
         assert!(reloaded.tokens.iter().find(|t| t.id == "a").unwrap().last_used_at.is_none());
         assert!(reloaded.tokens.iter().find(|t| t.id == "b").unwrap().last_used_at.is_some());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 4 regression test: phases 2-3 layered `api_server_set_config`'s
+    /// stop-then-start restart path on top of phase 1's bind-conflict
+    /// handling — this confirms that sequence (not just a bare fresh start)
+    /// still surfaces a conflicting port as `status: "error"` promptly,
+    /// never a hang or a panic. Exercises the exact primitives
+    /// `start_server_core`/`stop_server_core` use (`ApiServerState`,
+    /// `bind_listener`, `record_bind_error`) rather than the commands
+    /// themselves, since those need a real `AppHandle` whose mocked
+    /// `app_data_dir()` resolves to the developer's actual OS config
+    /// directory (see this module's doc comment on why every other I/O path
+    /// here is tested through a `*_with_state_impl`/`*_impl` taking an
+    /// explicit `&Path` instead) — `tokio::time::timeout` is the hang guard.
+    #[tokio::test]
+    async fn config_triggered_restart_onto_an_already_taken_port_surfaces_status_error_without_hanging() {
+        let mut state = ApiServerState::default();
+
+        // Simulates a healthy running server on an OS-assigned port, exactly
+        // what `start_server_core` leaves behind on a successful bind.
+        let first_listener = bind_listener(0).await.unwrap();
+        state.port = first_listener.local_addr().unwrap().port();
+        state.status = "running".to_string();
+        state.shutdown = Some(Arc::new(Notify::new()));
+
+        // Something else holds the port the new config wants — e.g. LM
+        // Studio, or the port field was edited to collide with another app.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conflicting_port = blocker.local_addr().unwrap().port();
+
+        // `api_server_set_config`'s restart path: stop (notify + clear the
+        // handle) immediately followed by a fresh bind attempt on the new
+        // port — the same order `start_server_core`'s own leading
+        // `stop_server_core` call plus `api_server_set_config`'s explicit
+        // one produce.
+        if let Some(shutdown) = state.shutdown.take() {
+            shutdown.notify_one();
+        }
+        state.status = "stopped".to_string();
+
+        let bind_result = tokio::time::timeout(std::time::Duration::from_secs(2), bind_listener(conflicting_port))
+            .await
+            .expect("bind_listener must not hang when the target port is already taken");
+
+        match bind_result {
+            Ok(_) => panic!("expected a bind conflict against an already-bound port"),
+            Err(message) => record_bind_error(&mut state, message),
+        }
+
+        assert_eq!(state.status, "error");
+        assert!(state.last_error.is_some());
+        assert!(state.shutdown.is_none());
+
+        drop(first_listener);
+        drop(blocker);
+    }
+
+    // -------------------------------------------------------------
+    // Phase 4: lm-cli `api-serve` reuse (`provider_catalog_from`,
+    // `tokens_from_config`, `probe_llama_server`)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn provider_catalog_from_merges_presets_and_custom_entries() {
+        let custom = vec![providers::CustomProviderEntry {
+            id: "my-local-router".to_string(),
+            label: "My Router".to_string(),
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+        }];
+        let catalog = provider_catalog_from(custom);
+
+        // Every built-in preset id is still present...
+        assert!(catalog.iter().any(|p| p.id == "openai"));
+        assert!(catalog.iter().any(|p| p.id == "anthropic"));
+        // ...alongside the custom entry.
+        assert!(catalog.iter().any(|p| p.id == "my-local-router" && p.base_url == "http://127.0.0.1:9999/v1"));
+    }
+
+    #[test]
+    fn provider_catalog_from_with_no_custom_entries_is_just_the_presets() {
+        let presets_len = providers::providers_list_presets().len();
+        assert_eq!(provider_catalog_from(Vec::new()).len(), presets_len);
+    }
+
+    #[test]
+    fn tokens_from_config_carries_every_field_needed_for_auth() {
+        let mut config = ApiServerConfig::default();
+        config.tokens.push(TokenEntry {
+            id: "tok-1".to_string(),
+            label: "CI".to_string(),
+            sha256: sha256_hex("lmk-cli-token"),
+            scopes: vec![Scope::Chat, Scope::Embeddings],
+            backends: vec![Backend::Local, Backend::Ollama],
+            created_at: 1,
+            last_used_at: None,
+        });
+
+        let tokens = tokens_from_config(&config);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].id, "tok-1");
+        assert_eq!(tokens[0].sha256, sha256_hex("lmk-cli-token"));
+        assert_eq!(tokens[0].scopes, vec![Scope::Chat, Scope::Embeddings]);
+        assert_eq!(tokens[0].backends, vec![Backend::Local, Backend::Ollama]);
+    }
+
+    #[tokio::test]
+    async fn probe_llama_server_reports_not_ready_when_unreachable() {
+        // Port 1 on loopback: nothing listens there.
+        let client = reqwest::Client::new();
+        let (ready, model_id) = probe_llama_server(&client, 1).await;
+        assert!(!ready);
+        assert!(model_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_llama_server_reports_ready_and_model_id_when_healthy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // /health
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"status":"ok"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            // /v1/models
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let (ready, model_id) = probe_llama_server(&client, addr.port()).await;
+        assert!(ready);
+        assert_eq!(model_id.as_deref(), Some("qwen2.5-7b-instruct"));
+
+        handle.join().unwrap();
+    }
+
+    /// Regression guard for the phase-4 CLI reuse: `run_cli_server` must
+    /// still surface a conflicting port as an `Err` (so `lm-cli`'s `fail()`
+    /// prints it and exits non-zero) rather than hanging or panicking —
+    /// mirrors `config_triggered_restart_onto_an_already_taken_port_...`
+    /// above, but through the actual public entry point `lm-cli` calls.
+    #[tokio::test]
+    async fn run_cli_server_reports_a_bind_conflict_as_an_error() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let path = temp_config_path();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_cli_server(port, path.clone(), Vec::new),
+        )
+        .await
+        .expect("run_cli_server must not hang on a bind conflict");
+
+        assert!(result.is_err());
+        drop(blocker);
         let _ = std::fs::remove_file(&path);
     }
 }
