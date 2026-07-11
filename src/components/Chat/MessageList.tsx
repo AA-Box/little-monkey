@@ -30,14 +30,17 @@ import {
   isCheckpointNotice,
   isMemoryNotice,
   isMentionNotice,
+  isPlanNotice,
   isSwitchNotice,
   isVerifyFixNotice,
   isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
+  parsePlanNotice,
   parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
+  type PlanNotice,
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
@@ -45,6 +48,7 @@ import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "..
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
+import PlanCard from "./PlanCard";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
@@ -69,6 +73,7 @@ type TimelineItem =
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
+  | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
   | { kind: "typing"; key: string };
 
@@ -82,7 +87,7 @@ type TimelineItem =
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
  *   synthetic notices (compaction, model switch, per-turn checkpoint,
- *   remembered fact).
+ *   remembered fact, presented plan).
  */
 function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
@@ -153,6 +158,13 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         const notice = parseMemoryNotice(msg);
         if (notice) {
           items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex: index });
+        }
+        return;
+      }
+      if (isPlanNotice(msg)) {
+        const notice = parsePlanNotice(msg);
+        if (notice) {
+          items.push({ kind: "plan", key: `plan-${notice.id}`, notice, messageIndex: index });
         }
         return;
       }
@@ -700,6 +712,11 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             if (item.kind === "memory") {
               return (
                 <MemoryRow key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
+              );
+            }
+            if (item.kind === "plan") {
+              return (
+                <PlanCard key={item.key} sessionId={sessionId} notice={item.notice} messageIndex={item.messageIndex} />
               );
             }
             if (item.kind === "verify") {

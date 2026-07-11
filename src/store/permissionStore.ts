@@ -20,9 +20,40 @@ export interface PermissionRequest {
  */
 export type PermissionMode = "manual" | "acceptEdits" | "plan" | "auto" | "bypass";
 
+/**
+ * The subset of `PermissionMode` that "Approve & start acting" (PlanCard.tsx)
+ * is allowed to switch into — every mode except the two that must never be
+ * `lastActMode`'s value: `"plan"` (that would make approving a plan a no-op)
+ * and `"bypass"` (the most dangerous mode must never be silently re-entered
+ * just because it happened to be active before the user entered Plan Mode —
+ * mirrors `readInitialMode`'s "bypass is never restored" rule below).
+ */
+export type ActPermissionMode = "manual" | "acceptEdits" | "auto";
+
 const PERMISSION_MODE_STORAGE_KEY = "little-monkey-permission-mode";
+const LAST_ACT_MODE_STORAGE_KEY = "little-monkey-last-act-mode";
 
 const VALID_PERMISSION_MODES: PermissionMode[] = ["manual", "acceptEdits", "plan", "auto", "bypass"];
+const ACT_PERMISSION_MODES: ActPermissionMode[] = ["manual", "acceptEdits", "auto"];
+
+/**
+ * Reads the persisted "last act mode" from localStorage for the store's
+ * initial value — defaults to `"acceptEdits"` (the design doc's chosen
+ * default) whenever nothing valid is stored, mirroring `readInitialMode`'s
+ * shape just below.
+ */
+function readInitialLastActMode(): ActPermissionMode {
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(LAST_ACT_MODE_STORAGE_KEY);
+  } catch {
+    return "acceptEdits";
+  }
+  if (stored && (ACT_PERMISSION_MODES as string[]).includes(stored)) {
+    return stored as ActPermissionMode;
+  }
+  return "acceptEdits";
+}
 
 /**
  * Reads the persisted mode from localStorage for the store's initial value.
@@ -88,6 +119,17 @@ export interface PermissionStore {
    */
   mode: PermissionMode;
   /**
+   * The non-Plan, non-bypass mode "Approve & start acting" (PlanCard.tsx)
+   * switches into. Restored from localStorage at store initialization (see
+   * `readInitialLastActMode`), default `"acceptEdits"`. Updated by
+   * `setLastActMode` whenever the user manually selects a mode other than
+   * `"plan"`/`"bypass"` (see `ModeSelector.tsx`'s `handleSelect`) — NOT by
+   * `setMode` itself, since `setMode` is also how PlanCard's Approve button
+   * switches *into* this very mode, which must not overwrite it with itself
+   * via some incidental side effect.
+   */
+  lastActMode: ActPermissionMode;
+  /**
    * Resolve the pending permission request. `allow` grants/denies the single
    * in-flight tool call; `remember` (only meaningful when `allow` is true)
    * tells the backend to auto-allow this tool for the rest of the session.
@@ -104,6 +146,17 @@ export interface PermissionStore {
    * rather than being swallowed.
    */
   setMode: (mode: PermissionMode) => Promise<void>;
+  /**
+   * Records `mode` as `lastActMode`, persisting it to localStorage — but
+   * ONLY when `mode` is actually an `ActPermissionMode` (i.e. neither
+   * `"plan"` nor `"bypass"`); called with either of those two is a silent
+   * no-op rather than an error, since every call site (`ModeSelector.tsx`)
+   * already guards against calling this for `"plan"`, and `"bypass"`
+   * selection goes through a separate confirm step that never calls this at
+   * all — this is the last line of defense, not the only one, mirroring
+   * `readInitialMode`'s belt-and-braces "bypass is never restored" rule.
+   */
+  setLastActMode: (mode: PermissionMode) => void;
 }
 
 export const usePermissionStore = create<PermissionStore>((set, get) => ({
@@ -111,6 +164,7 @@ export const usePermissionStore = create<PermissionStore>((set, get) => ({
   queue: [],
   sessionGrants: [],
   mode: readInitialMode(),
+  lastActMode: readInitialLastActMode(),
 
   respond: async (allow, remember) => {
     const { pending } = get();
@@ -155,6 +209,19 @@ export const usePermissionStore = create<PermissionStore>((set, get) => ({
       } catch {
         // Best-effort persistence; a failure here shouldn't fail the mode switch.
       }
+    }
+  },
+
+  setLastActMode: (mode) => {
+    if (!(ACT_PERMISSION_MODES as string[]).includes(mode)) {
+      return;
+    }
+    const actMode = mode as ActPermissionMode;
+    set({ lastActMode: actMode });
+    try {
+      localStorage.setItem(LAST_ACT_MODE_STORAGE_KEY, actMode);
+    } catch {
+      // Best-effort persistence; a failure here shouldn't fail the caller.
     }
   },
 }));

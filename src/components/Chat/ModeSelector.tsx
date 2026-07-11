@@ -95,6 +95,13 @@ export function ModeSelector() {
       setConfirmingBypass(true);
       return;
     }
+    // Record every manually-selected non-plan, non-bypass mode as the mode
+    // PlanCard's "Approve & start acting" switches into later — a no-op
+    // (`setLastActMode` itself also guards this) for "plan", which never
+    // reaches here as anything but the current `nextMode` being re-selected.
+    if (nextMode !== "plan") {
+      usePermissionStore.getState().setLastActMode(nextMode);
+    }
     void setMode(nextMode);
     closeDropdown();
   }
