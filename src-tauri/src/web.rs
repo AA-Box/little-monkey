@@ -147,8 +147,12 @@ fn settings_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Core load logic, parameterized by path for testability — a missing file
 /// (nothing configured yet, the common case) is simply [`WebSettings::default`],
-/// never an error, same stance as `mcp.rs::load_config_impl`.
-fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
+/// never an error, same stance as `mcp.rs::load_config_impl`. `pub` (rather
+/// than private, like most other `*_impl` load fns in this module) because
+/// lm-cli's `web_cli.rs` (phase 4) calls this directly with its own
+/// APP_IDENTIFIER-resolved path — same reuse-the-lib-fn-directly shape as
+/// `checkpoints_cli.rs` calling `checkpoints::begin_impl`.
+pub fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
     match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt web_settings.json: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WebSettings::default()),

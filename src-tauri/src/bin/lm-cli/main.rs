@@ -18,6 +18,7 @@ mod repl;
 mod sse;
 mod tools_cli;
 mod tools_def;
+mod web_cli;
 
 use std::path::{Path, PathBuf};
 
