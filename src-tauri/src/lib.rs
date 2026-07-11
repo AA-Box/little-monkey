@@ -109,6 +109,16 @@ pub struct AppState {
     /// al. over HTTP would be a remote-code-execution surface, an explicit
     /// non-goal of this feature — see `server.rs`'s module doc).
     pub api_server: std::sync::Mutex<server::ApiServerState>,
+    /// Serializes `api_server.json` read-modify-write cycles (config
+    /// get/set, token create/revoke, and the per-request `last_used_at`
+    /// bump) — same reasoning as `web_settings_lock`/`mcp_config_lock`
+    /// protect their own files: several of these are synchronous commands
+    /// Tauri can dispatch onto genuinely concurrent OS threads, and without
+    /// a shared lock two concurrent read-modify-write cycles (e.g. minting
+    /// two tokens back to back, or a token-used bump racing a revoke) could
+    /// both load the same "before" file and the later save silently
+    /// clobbers the earlier one's change.
+    pub api_server_config_lock: std::sync::Mutex<()>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -119,6 +129,25 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
+        .setup(|app| {
+            // Autostart the local API server if `api_server.json` says to —
+            // the only reader of that file at launch time, since every
+            // other consumer (the Settings panel) fetches it on demand via
+            // `api_server_get_config`. Spawned rather than awaited here:
+            // `setup` must return promptly, and a bind failure just leaves
+            // the server in its default "stopped"/"error" state for the
+            // user to retry from the panel, the same as any other failed
+            // manual start.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let Ok(path) = server::config_file_path(&app_handle) else { return };
+                let Ok(config) = server::load_config_impl(&path) else { return };
+                if config.autostart {
+                    let _ = server::api_server_start(app_handle).await;
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             llama::llama_start,
             llama::llama_stop,
@@ -126,6 +155,11 @@ pub fn run() {
             server::api_server_start,
             server::api_server_stop,
             server::api_server_status,
+            server::api_server_get_config,
+            server::api_server_set_config,
+            server::api_server_create_token,
+            server::api_server_revoke_token,
+            server::api_server_list_tokens,
             ollama::ollama_status,
             ollama::ollama_start,
             ollama::ollama_list_models,

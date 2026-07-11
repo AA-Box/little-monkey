@@ -1,4 +1,4 @@
-//! Local OpenAI-compatible API server (phase 1 of the local-model-hub
+//! Local OpenAI-compatible API server (phases 1-2 of the local-model-hub
 //! roadmap item — see `docs/roadmap/p1-local-api-server.md`).
 //!
 //! This is a *routing reverse proxy*, not a new inference engine: it runs a
@@ -9,6 +9,7 @@
 //!   - `GET  /health`              — unauthenticated liveness probe
 //!   - `GET  /v1/models`           — merged list of servable models
 //!   - `POST /v1/chat/completions` — proxies to llama-server or Ollama
+//!   - `OPTIONS /v1/*`             — CORS preflight (unauthenticated)
 //!   - everything else            — `404`
 //!
 //! SECURITY: this surface is deliberately narrow. It must NEVER grow a route
@@ -20,38 +21,51 @@
 //!
 //! Structured like `checkpoints.rs`/`web.rs`: an `AppHandle`-free,
 //! independently testable core ([`handle_request`], [`route_model`]) plus a
-//! thin `#[tauri::command]` layer (`api_server_start`/`_stop`/`_status`) that
-//! owns the actual listening socket and `AppState` bookkeeping. `pub` (not
-//! `mod`) so a future `lm-cli` `api-serve` subcommand (design doc phase 4)
-//! can reuse [`handle_request`] directly, the same reasoning as
-//! `web`/`prompts`/`rules` above it in `lib.rs`.
+//! thin `#[tauri::command]` layer that owns the actual listening socket and
+//! `AppState` bookkeeping. `pub` (not `mod`) so a future `lm-cli` `api-serve`
+//! subcommand (design doc phase 4) can reuse [`handle_request`] directly,
+//! the same reasoning as `web`/`prompts`/`rules` above it in `lib.rs`.
 //!
-//! Auth (phase 1 slice): a single bearer token, auto-generated fresh every
-//! time the server starts and shown once in the Settings panel. Only its
-//! SHA-256 digest is ever compared against — the plaintext lives in
-//! [`ApiServerState`] purely so the UI can display/copy it, never written to
-//! disk. The full multi-token `TokenEntry` model with scopes/backends and
-//! `api_server.json` persistence is phase 2 — see the design doc.
-
+//! Auth (phase 2): a full multi-token model. Every [`TokenEntry`] is
+//! generated as `lmk-` + 32 hex chars, shown in plaintext exactly once at
+//! creation time (the command's return value), and persisted to
+//! `api_server.json` as a SHA-256 digest only — the plaintext never touches
+//! disk. Each token carries its own [`Scope`] (which routes it may call) and
+//! [`Backend`] (which upstream it may be routed to) restrictions, enforced
+//! per request in [`handle_models`]/[`handle_chat_completions`].
+//!
+//! Hot vs. restart-gated config: [`ServerRuntime`] snapshots `require_token`/
+//! `expose_ollama`/`expose_providers`/the bound port once, at
+//! `api_server_start` time — [`api_server_set_config`] always restarts the
+//! running server so those scalars can never silently drift from the
+//! listening socket's actual behavior (the design doc calls this out
+//! explicitly). The *token list*, by contrast, is re-read from
+//! `api_server.json` fresh on every single request (see [`build_deps`]) —
+//! creating or revoking a token must take effect immediately, without
+//! forcing a restart that would drop every other in-flight connection just
+//! to pick up one credential change.
 use std::convert::Infallible;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
+use hyper::header::{self, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use crate::{ollama, AppState};
 
@@ -64,6 +78,10 @@ const DEFAULT_PORT: u16 = 1234;
 /// `ghp_`/OpenAI's `sk-` prefixes are.
 const TOKEN_PREFIX: &str = "lmk-";
 
+/// Filename for the persisted server config under the app data directory —
+/// same file-per-feature pattern as `providers.json`/`web_settings.json`.
+const CONFIG_FILE: &str = "api_server.json";
+
 /// Boxed error type for [`ResponseBody`] — reqwest's streaming errors and
 /// our own infallible bodies both erase to this.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -75,14 +93,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResponseBody = BoxBody<Bytes, BoxError>;
 
 /// In-memory lifecycle state for the managed API server process — mirrors
-/// `llama::LlamaState` field-for-field where the design doc specified it
-/// (`shutdown`/`port`/`status`/`request_count`/`last_error`), plus two extra
-/// fields the doc's literal struct listing didn't account for:
-/// `token`/`token_sha256`. Phase 1 needs *somewhere* to hold the single
-/// auto-generated bearer token so the Settings panel can display/copy it —
-/// phase 2's full `TokenEntry`/`api_server.json` store doesn't exist yet.
-/// Both are held only in memory (never written to disk) and regenerated
-/// fresh on every start, cleared on stop.
+/// `llama::LlamaState` field-for-field. No token material lives here as of
+/// phase 2 (that was a phase-1-only stopgap before `api_server.json`
+/// existed) — tokens are minted/revoked/listed via their own commands below.
 pub struct ApiServerState {
     /// Present while the accept loop is running; `notify_one()`-ing this is
     /// how `api_server_stop` asks it to close the listening socket — same
@@ -95,12 +108,6 @@ pub struct ApiServerState {
     pub status: String,
     pub request_count: u64,
     pub last_error: Option<String>,
-    /// Plaintext, in memory only — shown once (and re-shown while the
-    /// server stays up) in the Settings panel's copy chip.
-    pub token: Option<String>,
-    /// SHA-256 hex digest of `token`, compared against every request's
-    /// `Authorization: Bearer` header.
-    pub token_sha256: Option<String>,
 }
 
 impl Default for ApiServerState {
@@ -111,21 +118,19 @@ impl Default for ApiServerState {
             status: "stopped".to_string(),
             request_count: 0,
             last_error: None,
-            token: None,
-            token_sha256: None,
         }
     }
 }
 
-/// Snapshot broadcast on `apiserver://status` and returned by the three
-/// commands below — mirrors `llama::emit_status`'s payload shape.
+/// Snapshot broadcast on `apiserver://status` and returned by
+/// `api_server_start`/`_stop`/`_status` — mirrors `llama::emit_status`'s
+/// payload shape.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiServerStatusPayload {
     pub status: String,
     pub port: u16,
     pub request_count: u64,
     pub last_error: Option<String>,
-    pub token: Option<String>,
 }
 
 fn status_payload(state: &ApiServerState) -> ApiServerStatusPayload {
@@ -134,7 +139,6 @@ fn status_payload(state: &ApiServerState) -> ApiServerStatusPayload {
         port: state.port,
         request_count: state.request_count,
         last_error: state.last_error.clone(),
-        token: state.token.clone(),
     }
 }
 
@@ -142,6 +146,13 @@ fn status_payload(state: &ApiServerState) -> ApiServerStatusPayload {
 /// `llama.rs`'s `emit_status`/`ollama.rs`'s `emit_status` convention.
 fn emit_status(app: &AppHandle, payload: &ApiServerStatusPayload) {
     let _ = app.emit("apiserver://status", payload.clone());
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------
@@ -166,9 +177,23 @@ fn sha256_hex(input: &str) -> String {
 
 /// Constant-time comparison of two equal-length-when-valid hex digest
 /// strings, so a mismatched bearer token can't be brute-forced faster via
-/// early-exit timing differences. Both inputs here are always fixed-length
-/// (64-char) SHA-256 hex digests in the real request path, so the length
-/// check itself leaks nothing an attacker doesn't already know.
+/// early-exit timing differences.
+///
+/// Note on *what* needs to be constant-time here: [`authenticate`] never
+/// compares the raw secret token byte-for-byte — it always hashes the
+/// incoming bearer first (`sha256_hex`) and compares *digests*. A digest
+/// compare's timing genuinely doesn't leak anything useful about the
+/// pre-image: SHA-256's avalanche effect means an attacker who learns "the
+/// first byte of the stored digest matches" gains no information about which
+/// tokens might hash to it (finding one is exactly as hard as finding any
+/// other preimage). So a naive `==` on the digests would already be safe in
+/// practice. This function exists anyway because (a) it's essentially free —
+/// two 64-byte compares — and (b) it keeps the invariant "every credential
+/// compare in this file is constant-time" trivially true by inspection,
+/// which is worth more than the few nanoseconds it costs, especially since a
+/// future change here is exactly the kind of thing that's easy to get wrong
+/// under review pressure. What would matter for real is if this ever
+/// compared *unhashed* tokens directly — it must not start doing that.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a_bytes, b_bytes) = (a.as_bytes(), b.as_bytes());
     if a_bytes.len() != b_bytes.len() {
@@ -179,6 +204,191 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+// ---------------------------------------------------------------------
+// Token + config data model (persisted to `api_server.json`)
+// ---------------------------------------------------------------------
+
+/// Which routes a [`TokenEntry`] may call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Chat,
+    Models,
+    Embeddings,
+}
+
+/// Which upstream a [`TokenEntry`] may be routed to. Mirrors [`ModelRoute`]
+/// one level up — see [`route_backend`] for the mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    Local,
+    Ollama,
+    Providers,
+}
+
+fn backend_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Local => "local",
+        Backend::Ollama => "ollama",
+        Backend::Providers => "providers",
+    }
+}
+
+/// A single persisted bearer token. `sha256` is the only trace of the
+/// secret that ever reaches disk — see [`mint_token`]. `#[serde(default)]`
+/// throughout for the same hand-edited-file leniency as `CustomProviderEntry`/
+/// `WebSettings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub scopes: Vec<Scope>,
+    #[serde(default)]
+    pub backends: Vec<Backend>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_used_at: Option<u64>,
+}
+
+/// Frontend-facing view of a [`TokenEntry`] with the digest stripped —
+/// `api_server_list_tokens` never sends a hash to the WebView, even though
+/// it's not the plaintext, on general "secrets stay on the Rust side"
+/// principle.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenEntryView {
+    pub id: String,
+    pub label: String,
+    pub scopes: Vec<Scope>,
+    pub backends: Vec<Backend>,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+}
+
+impl From<&TokenEntry> for TokenEntryView {
+    fn from(entry: &TokenEntry) -> Self {
+        TokenEntryView {
+            id: entry.id.clone(),
+            label: entry.label.clone(),
+            scopes: entry.scopes.clone(),
+            backends: entry.backends.clone(),
+            created_at: entry.created_at,
+            last_used_at: entry.last_used_at,
+        }
+    }
+}
+
+fn default_port() -> u16 {
+    DEFAULT_PORT
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Persisted at `<app_data>/api_server.json`. Plain snake_case field names,
+/// no `serde(rename)` — same hand-editable-file convention as
+/// `providers.json`/`web_settings.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiServerConfig {
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default = "default_true")]
+    pub require_token: bool,
+    #[serde(default = "default_true")]
+    pub expose_ollama: bool,
+    #[serde(default)]
+    pub expose_providers: bool,
+    #[serde(default)]
+    pub tokens: Vec<TokenEntry>,
+}
+
+impl Default for ApiServerConfig {
+    fn default() -> Self {
+        ApiServerConfig {
+            port: DEFAULT_PORT,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+            tokens: Vec::new(),
+        }
+    }
+}
+
+/// The subset of [`ApiServerConfig`] the Settings panel gets/sets directly —
+/// deliberately excludes `tokens` (managed via its own create/revoke/list
+/// commands so the frontend never round-trips a whole token list, digests
+/// included, just to flip a checkbox).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiServerConfigView {
+    pub port: u16,
+    pub autostart: bool,
+    pub require_token: bool,
+    pub expose_ollama: bool,
+    pub expose_providers: bool,
+}
+
+impl From<&ApiServerConfig> for ApiServerConfigView {
+    fn from(config: &ApiServerConfig) -> Self {
+        ApiServerConfigView {
+            port: config.port,
+            autostart: config.autostart,
+            require_token: config.require_token,
+            expose_ollama: config.expose_ollama,
+            expose_providers: config.expose_providers,
+        }
+    }
+}
+
+/// Resolves (and creates, if missing) `<app_data_dir>/api_server.json`'s
+/// path — same shape as `providers.rs::providers_file_path`/
+/// `web.rs::settings_file_path`. `pub` so a future `lm-cli` `api-serve`
+/// subcommand (phase 4) can resolve the same path with its own
+/// APP_IDENTIFIER, the same config-drift concern the design doc flags.
+pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    if !base.exists() {
+        std::fs::create_dir_all(&base)
+            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+    }
+    Ok(base.join(CONFIG_FILE))
+}
+
+/// Core load logic, parameterized by path so it needs no `AppHandle` —
+/// directly unit-testable and reusable from `lm-cli`. A missing file (the
+/// common case — nothing configured yet) is simply [`ApiServerConfig::default`],
+/// never an error, same stance as `web.rs::load_settings_impl`.
+pub fn load_config_impl(path: &Path) -> Result<ApiServerConfig, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt api_server.json: {e}")),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(ApiServerConfig::default()),
+        Err(e) => Err(format!("Failed to read api_server.json: {e}")),
+    }
+}
+
+/// Core save logic: atomic sibling temp file + rename, same idiom as
+/// `sessions.rs`'s `save_to` / `web.rs`'s `save_settings_impl`.
+pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), String> {
+    let payload =
+        serde_json::to_string_pretty(config).map_err(|e| format!("Failed to serialize api_server.json: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write api_server.json: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize api_server.json: {e}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -219,14 +429,50 @@ pub fn route_model(model: &str, llama_ready: bool, llama_model_stem: Option<&str
     ModelRoute::Ollama
 }
 
+/// Maps a routing decision to the [`Backend`] a token's `backends` list is
+/// checked against — `Unknown` never reaches here (handled earlier as a
+/// 404), and cloud-provider routing (`Backend::Providers`) has no
+/// corresponding `ModelRoute` variant yet (phase 3), so it can't be produced
+/// by [`route_model`] today.
+fn route_backend(route: ModelRoute) -> Option<Backend> {
+    match route {
+        ModelRoute::Llama => Some(Backend::Local),
+        ModelRoute::Ollama => Some(Backend::Ollama),
+        ModelRoute::Unknown => None,
+    }
+}
+
 // ---------------------------------------------------------------------
 // AppHandle-free request handling core
 // ---------------------------------------------------------------------
 
+/// A token that matched on the current request, stripped down to just what
+/// route handlers need to enforce scope/backend restrictions — returned by
+/// [`authenticate`].
+#[derive(Clone)]
+struct TokenAuth {
+    id: String,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+}
+
+/// The subset of a [`TokenEntry`] needed to authenticate one request —
+/// deliberately not the full struct (no `label`/`created_at`), assembled
+/// fresh from `api_server.json` in [`build_deps`] on every request so a
+/// revoked token stops working immediately without a server restart.
+#[derive(Clone)]
+struct StoredToken {
+    id: String,
+    sha256: String,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+}
+
 /// Everything a single request needs to be routed/authenticated/served,
-/// snapshotted fresh per request (cheap: one mutex lock + a couple of
-/// clones — see [`build_deps`]) so llama's live port/status/model is never
-/// stale mid-connection. No `AppHandle` here by design — this is what makes
+/// snapshotted fresh per request (cheap: one mutex lock, a couple of clones,
+/// and a small JSON file read — see [`build_deps`]) so llama's live
+/// port/status/model *and* the current token list are never stale mid-
+/// connection. No `AppHandle` here by design — this is what makes
 /// [`handle_request`] directly unit-testable and, later, `lm-cli`-reusable.
 #[derive(Clone)]
 pub struct ServerDeps {
@@ -235,7 +481,9 @@ pub struct ServerDeps {
     pub llama_model_stem: Option<String>,
     pub ollama_base_url: String,
     pub require_token: bool,
-    pub token_sha256: Option<String>,
+    pub expose_ollama: bool,
+    pub expose_providers: bool,
+    tokens: Vec<StoredToken>,
     pub client: reqwest::Client,
 }
 
@@ -261,7 +509,7 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Respo
     let bytes = Bytes::from(value.to_string());
     Response::builder()
         .status(status)
-        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(bytes))
         .expect("building a response from a fixed status + static header never fails")
 }
@@ -281,6 +529,10 @@ fn error_response(status: StatusCode, message: &str, code: &str) -> Response<Res
     )
 }
 
+fn forbidden_response(message: &str) -> Response<ResponseBody> {
+    error_response(StatusCode::FORBIDDEN, message, "insufficient_scope")
+}
+
 fn health_response() -> Response<ResponseBody> {
     json_response(StatusCode::OK, json!({ "status": "ok" }))
 }
@@ -289,41 +541,90 @@ fn not_found_response() -> Response<ResponseBody> {
     error_response(StatusCode::NOT_FOUND, "Not Found", "not_found")
 }
 
-/// Bearer-token check for every route except `/health`. `Ok(())` means
-/// authenticated (or auth is off); `Err(response)` is the exact response to
-/// return immediately.
-fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<(), Response<ResponseBody>> {
+/// A bare `204` with the CORS headers a preflight `OPTIONS /v1/*` needs —
+/// browser-based clients (a primary consumer per the design doc) can't even
+/// send the real request otherwise.
+fn cors_preflight_response() -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"))
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Authorization"))
+        .body(full_body(Bytes::new()))
+        .expect("building a fixed-shape preflight response never fails")
+}
+
+/// Stamps `Access-Control-Allow-Origin: *` onto every response this server
+/// returns (not just `/v1/*`) — a browser-based client fetching `/health`
+/// benefits too, and there's nothing origin-sensitive being protected here
+/// (the bearer token, not the browser's same-origin policy, is the actual
+/// gate).
+fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
+    resp.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
+}
+
+/// Bearer-token check for every route except `/health`/`OPTIONS` preflight.
+/// `Ok(None)` means the request may proceed with no further scope/backend
+/// restriction (either `require_token` is off, or — not modeled today —
+/// a future "admin" token type with no restrictions at all). `Ok(Some(auth))`
+/// means the request is authenticated as that specific token, and route
+/// handlers must still check `auth.scopes`/`auth.backends`. `Err(response)`
+/// is the exact response to return immediately.
+fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
     if !deps.require_token {
-        return Ok(());
+        return Ok(None);
     }
 
-    let Some(expected) = deps.token_sha256.as_deref() else {
-        // No token configured at all (shouldn't happen in phase 1, where
-        // `require_token` is always paired with a freshly generated token)
-        // — fail closed rather than silently letting every request through.
+    if deps.tokens.is_empty() {
+        // Fail closed rather than silently letting every request through —
+        // `require_token` is on but nothing's been minted yet.
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
-            "No API token is configured for this server.",
+            "No API tokens are configured for this server. Create one in Settings > API Server.",
+            "invalid_api_key",
+        ));
+    }
+
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let Some(token) = provided else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Missing bearer token. Find or create one in Little Monkey's Settings > API Server.",
             "invalid_api_key",
         ));
     };
 
-    let provided = headers
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    match provided {
-        Some(token) if constant_time_eq(&sha256_hex(token), expected) => Ok(()),
-        _ => Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "Incorrect API key provided. Find the current one in Little Monkey's Settings > API Server.",
-            "invalid_api_key",
-        )),
+    let digest = sha256_hex(token);
+    for stored in &deps.tokens {
+        if constant_time_eq(&digest, &stored.sha256) {
+            return Ok(Some(TokenAuth {
+                id: stored.id.clone(),
+                scopes: stored.scopes.clone(),
+                backends: stored.backends.clone(),
+            }));
+        }
     }
+
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        "Incorrect API key provided. Find the current one in Little Monkey's Settings > API Server.",
+        "invalid_api_key",
+    ))
 }
 
-async fn handle_models(deps: &ServerDeps) -> Response<ResponseBody> {
+async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Response<ResponseBody> {
+    if let Some(auth) = authed {
+        if !auth.scopes.contains(&Scope::Models) {
+            return forbidden_response("This token isn't scoped for `models`.");
+        }
+    }
+
     let mut data = Vec::new();
 
     if deps.llama_ready {
@@ -332,28 +633,37 @@ async fn handle_models(deps: &ServerDeps) -> Response<ResponseBody> {
         }
     }
 
-    // `expose_ollama` hardcoded true for phase 1 (the config toggle, and
-    // `expose_providers`, land in phases 2/3 per the design doc). A skipped
-    // capability probe on purpose — `ollama::list_tag_names` fetches only
-    // `/api/tags`, never `/api/show`, per the design doc's "Ollama model
-    // listing latency" risk note.
-    match ollama::list_tag_names(&deps.client).await {
-        Ok(tags) => {
-            for tag in tags {
-                data.push(json!({ "id": tag, "object": "model", "owned_by": "ollama" }));
+    // A skipped capability probe on purpose — `ollama::list_tag_names`
+    // fetches only `/api/tags`, never `/api/show`, per the design doc's
+    // "Ollama model listing latency" risk note. Gated behind the config's
+    // `expose_ollama` toggle: when it's off, `/v1/models` must only ever
+    // advertise what will actually serve — see the design doc's "Jan
+    // pitfall to avoid" note.
+    if deps.expose_ollama {
+        match ollama::list_tag_names(&deps.client).await {
+            Ok(tags) => {
+                for tag in tags {
+                    data.push(json!({ "id": tag, "object": "model", "owned_by": "ollama" }));
+                }
             }
-        }
-        Err(_) => {
-            // Ollama being unreachable is a normal state (mirrors
-            // `ollama.rs`'s own stance) — just omit its models rather than
-            // failing the whole `/v1/models` call.
+            Err(_) => {
+                // Ollama being unreachable is a normal state (mirrors
+                // `ollama.rs`'s own stance) — just omit its models rather
+                // than failing the whole `/v1/models` call.
+            }
         }
     }
 
     json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
 }
 
-async fn handle_chat_completions(deps: &ServerDeps, body: Bytes) -> Response<ResponseBody> {
+async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, body: Bytes) -> Response<ResponseBody> {
+    if let Some(auth) = authed {
+        if !auth.scopes.contains(&Scope::Chat) {
+            return forbidden_response("This token isn't scoped for `chat`.");
+        }
+    }
+
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body", "invalid_request_error"),
@@ -362,19 +672,41 @@ async fn handle_chat_completions(deps: &ServerDeps, body: Bytes) -> Response<Res
     let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let stream = parsed.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let upstream_url = match route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref()) {
+    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref());
+
+    if route == ModelRoute::Unknown {
+        // Mirrors OpenAI's own wording for a request with no `model`.
+        return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
+    }
+
+    if route == ModelRoute::Ollama && !deps.expose_ollama {
+        // Same "only advertise/serve what's actually exposed" stance as
+        // `handle_models` — an Ollama-routed id must 404 exactly like an
+        // unknown one when the toggle is off, not silently proxy anyway.
+        return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+    }
+
+    if let Some(auth) = authed {
+        if let Some(backend) = route_backend(route) {
+            if !auth.backends.contains(&backend) {
+                return forbidden_response(&format!(
+                    "This token isn't scoped for the '{}' backend.",
+                    backend_label(backend)
+                ));
+            }
+        }
+    }
+
+    let upstream_url = match route {
         ModelRoute::Llama => format!("http://127.0.0.1:{}/v1/chat/completions", deps.llama_port),
         ModelRoute::Ollama => format!("{}/v1/chat/completions", deps.ollama_base_url),
-        ModelRoute::Unknown => {
-            // Mirrors OpenAI's own wording for a request with no `model`.
-            return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
-        }
+        ModelRoute::Unknown => unreachable!("handled above"),
     };
 
     let upstream = match deps
         .client
         .post(&upstream_url)
-        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/json")
         .body(body)
         .send()
         .await
@@ -392,7 +724,7 @@ async fn handle_chat_completions(deps: &ServerDeps, body: Bytes) -> Response<Res
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = upstream
         .headers()
-        .get(hyper::header::CONTENT_TYPE)
+        .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or(if stream { "text/event-stream" } else { "application/json" })
         .to_string();
@@ -405,14 +737,14 @@ async fn handle_chat_completions(deps: &ServerDeps, body: Bytes) -> Response<Res
             .map(|chunk| chunk.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
         Response::builder()
             .status(status)
-            .header(hyper::header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_TYPE, content_type)
             .body(BodyExt::boxed(StreamBody::new(byte_stream)))
             .expect("building a streaming response from an upstream status + content-type never fails")
     } else {
         match upstream.bytes().await {
             Ok(bytes) => Response::builder()
                 .status(status)
-                .header(hyper::header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_TYPE, content_type)
                 .body(full_body(bytes))
                 .expect("building a buffered response from an upstream status + content-type never fails"),
             Err(e) => error_response(
@@ -426,25 +758,39 @@ async fn handle_chat_completions(deps: &ServerDeps, body: Bytes) -> Response<Res
 
 /// The core router: a plain `match` on method + path, no framework — see the
 /// module doc's security note on why this surface must stay exactly these
-/// four routes.
-pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> Response<ResponseBody> {
+/// four routes. Returns the response to send *and*, when a token
+/// successfully authenticated the request (whether or not it then passed
+/// its scope/backend checks), that token's id — [`serve_one_request`]'s
+/// caller uses this to bump `last_used_at` without `handle_request` itself
+/// needing any I/O or `AppHandle`.
+pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> (Response<ResponseBody>, Option<String>) {
     let ServerRequest { method, path, headers, body } = req;
 
     // `/health` is the one unauthenticated route (a liveness probe has to
     // work before a caller has a token to hand it).
     if method == Method::GET && path == "/health" {
-        return health_response();
+        return (with_cors(health_response()), None);
     }
 
-    if let Err(unauthorized) = authenticate(deps, &headers) {
-        return unauthorized;
+    // CORS preflight never carries a bearer token — browsers deliberately
+    // don't attach one to an `OPTIONS` request.
+    if method == Method::OPTIONS && path.starts_with("/v1/") {
+        return (cors_preflight_response(), None);
     }
 
-    match (method, path.as_str()) {
-        (Method::GET, "/v1/models") => handle_models(deps).await,
-        (Method::POST, "/v1/chat/completions") => handle_chat_completions(deps, body).await,
+    let authed = match authenticate(deps, &headers) {
+        Ok(authed) => authed,
+        Err(response) => return (with_cors(response), None),
+    };
+    let matched_token_id = authed.as_ref().map(|a| a.id.clone());
+
+    let response = match (method, path.as_str()) {
+        (Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
+        (Method::POST, "/v1/chat/completions") => handle_chat_completions(deps, authed.as_ref(), body).await,
         _ => not_found_response(),
-    }
+    };
+
+    (with_cors(response), matched_token_id)
 }
 
 // ---------------------------------------------------------------------
@@ -452,14 +798,16 @@ pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> Response<R
 // ---------------------------------------------------------------------
 
 /// The parts of [`ServerDeps`] that don't change for the lifetime of one
-/// server run — built once in `api_server_start`, then cheaply cloned into
-/// every accepted connection to assemble that connection's per-request
-/// `ServerDeps` (which additionally reads `AppState::llama` live).
+/// server run — built once in [`start_server_core`], then cheaply cloned
+/// into every accepted connection to assemble that connection's per-request
+/// `ServerDeps` (which additionally reads `AppState::llama`'s live status
+/// and `api_server.json`'s live token list — see [`build_deps`]).
 struct ServerRuntime {
     client: reqwest::Client,
     ollama_base_url: String,
     require_token: bool,
-    token_sha256: String,
+    expose_ollama: bool,
+    expose_providers: bool,
 }
 
 fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
@@ -474,13 +822,37 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
             .map(|s| s.to_string_lossy().to_string());
         (llama.port, ready, stem)
     };
+
+    // Re-read fresh from disk on every request (not cached in `runtime`) so
+    // a token created or revoked while the server is already running takes
+    // effect immediately — see the module doc's "hot vs. restart-gated
+    // config" note. A read failure (corrupt file, permissions) fails closed:
+    // an empty token list means every authenticated route 401s rather than
+    // silently accepting anything.
+    let tokens = config_file_path(app)
+        .and_then(|p| load_config_impl(&p))
+        .map(|cfg| {
+            cfg.tokens
+                .into_iter()
+                .map(|t| StoredToken {
+                    id: t.id,
+                    sha256: t.sha256,
+                    scopes: t.scopes,
+                    backends: t.backends,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     ServerDeps {
         llama_port,
         llama_ready,
         llama_model_stem,
         ollama_base_url: runtime.ollama_base_url.clone(),
         require_token: runtime.require_token,
-        token_sha256: Some(runtime.token_sha256.clone()),
+        expose_ollama: runtime.expose_ollama,
+        expose_providers: runtime.expose_providers,
+        tokens,
         client: runtime.client.clone(),
     }
 }
@@ -489,7 +861,7 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
 /// chat-completion request bodies are small JSON payloads, unlike
 /// `web.rs::tool_web_fetch`'s arbitrary-page responses, which do need a cap)
 /// and hands off to the `AppHandle`-free [`handle_request`] core.
-async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<Response<ResponseBody>, Infallible> {
+async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
@@ -514,6 +886,26 @@ fn bump_request_count(app: &AppHandle) {
     emit_status(app, &payload);
 }
 
+/// Pure update: sets `last_used_at` on the matching token only. Split out
+/// from [`record_token_used`] so it's testable against a plain `AppState`
+/// with no `AppHandle` — same `*_with_state_impl` shape as
+/// `mcp.rs::add_server_with_state_impl`.
+fn record_token_used_with_state(state: &AppState, path: &Path, token_id: &str) {
+    let Ok(_guard) = state.api_server_config_lock.lock() else { return };
+    let Ok(mut config) = load_config_impl(path) else { return };
+    if let Some(entry) = config.tokens.iter_mut().find(|t| t.id == token_id) {
+        entry.last_used_at = Some(now_ms());
+        let _ = save_config_impl(path, &config);
+    }
+}
+
+/// Best-effort: a failure to record "last used" (corrupt file, race with a
+/// concurrent revoke) never fails the request that's already been served.
+fn record_token_used(app: &AppHandle, token_id: &str) {
+    let Ok(path) = config_file_path(app) else { return };
+    record_token_used_with_state(&app.state::<AppState>(), &path, token_id);
+}
+
 async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<Notify>, runtime: Arc<ServerRuntime>) {
     loop {
         tokio::select! {
@@ -531,9 +923,12 @@ async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<No
                         let app_for_req = app_for_conn.clone();
                         let deps = build_deps(&app_for_req, &runtime_for_conn);
                         async move {
-                            let resp = serve_one_request(deps, req).await;
+                            let (resp, matched_token_id) = serve_one_request(deps, req).await?;
+                            if let Some(token_id) = matched_token_id {
+                                record_token_used(&app_for_req, &token_id);
+                            }
                             bump_request_count(&app_for_req);
-                            resp
+                            Ok::<_, Infallible>(resp)
                         }
                     });
                     let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -552,8 +947,8 @@ async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<No
 }
 
 /// Attempts to bind `port` on loopback only. Split out from
-/// `api_server_start` so the "port already in use" failure path is directly
-/// unit-testable without a `#[tauri::command]`/`AppHandle` — see
+/// [`start_server_core`] so the "port already in use" failure path is
+/// directly unit-testable without a `#[tauri::command]`/`AppHandle` — see
 /// `tests::bind_conflict_surfaces_as_status_error`.
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
     TcpListener::bind(("127.0.0.1", port))
@@ -565,29 +960,29 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
     state.status = "error".to_string();
     state.last_error = Some(message);
     state.shutdown = None;
-    state.token = None;
-    state.token_sha256 = None;
 }
 
 // ---------------------------------------------------------------------
-// Tauri commands
+// AppHandle-owning core start/stop, shared by the commands below and by
+// lib.rs's autostart setup hook + api_server_set_config's restart path.
 // ---------------------------------------------------------------------
 
-/// Starts the server on `port`, stopping any previous instance first (so
-/// re-Starting after an edited port field rebinds cleanly instead of
-/// erroring on our own still-open old listener). A bind failure (most
-/// commonly: something else already has `port`) surfaces synchronously as
-/// `Err` *and* as `status: "error"` with `last_error` set — never a silent
-/// no-op, never a panic.
-#[tauri::command]
-pub async fn api_server_start(app: AppHandle, state: State<'_, AppState>, port: u16) -> Result<ApiServerStatusPayload, String> {
-    if let Ok(mut s) = state.api_server.lock() {
-        if let Some(shutdown) = s.shutdown.take() {
-            shutdown.notify_one();
-        }
-    }
+/// Starts the server using whatever's currently persisted in
+/// `api_server.json` (port/require_token/expose_*), stopping any previous
+/// instance first (so re-starting after an edited port field rebinds
+/// cleanly instead of erroring on our own still-open old listener). A bind
+/// failure (most commonly: something else already has the port) surfaces
+/// synchronously as `Err` *and* as `status: "error"` with `last_error` set —
+/// never a silent no-op, never a panic. No `State` parameter — callers
+/// without one (the `setup` autostart hook, `api_server_set_config`'s
+/// restart) can call this with just an `AppHandle`.
+async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
+    let state = app.state::<AppState>();
+    let _ = stop_server_core(app);
 
-    let listener = match bind_listener(port).await {
+    let config = load_config_impl(&config_file_path(app)?)?;
+
+    let listener = match bind_listener(config.port).await {
         Ok(listener) => listener,
         Err(message) => {
             let payload = {
@@ -595,35 +990,30 @@ pub async fn api_server_start(app: AppHandle, state: State<'_, AppState>, port: 
                 record_bind_error(&mut s, message.clone());
                 status_payload(&s)
             };
-            emit_status(&app, &payload);
+            emit_status(app, &payload);
             return Err(message);
         }
     };
 
-    let token = generate_token();
-    let token_sha256 = sha256_hex(&token);
     let shutdown = Arc::new(Notify::new());
 
     let payload = {
         let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
         s.shutdown = Some(shutdown.clone());
-        s.port = port;
+        s.port = config.port;
         s.status = "running".to_string();
         s.request_count = 0;
         s.last_error = None;
-        s.token = Some(token.clone());
-        s.token_sha256 = Some(token_sha256.clone());
         status_payload(&s)
     };
-    emit_status(&app, &payload);
+    emit_status(app, &payload);
 
-    // `require_token` hardcoded `true` for phase 1 — the full opt-out
-    // toggle (with its explicit warning) is phase 2's `api_server.json`.
     let runtime = Arc::new(ServerRuntime {
         client: reqwest::Client::new(),
         ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
-        require_token: true,
-        token_sha256,
+        require_token: config.require_token,
+        expose_ollama: config.expose_ollama,
+        expose_providers: config.expose_providers,
     });
 
     tokio::spawn(run_accept_loop(app.clone(), listener, shutdown, runtime));
@@ -632,21 +1022,33 @@ pub async fn api_server_start(app: AppHandle, state: State<'_, AppState>, port: 
 }
 
 /// Stops the server if running (a no-op, not an error, if it's already
-/// stopped) and clears the current token from memory.
-#[tauri::command]
-pub fn api_server_stop(app: AppHandle, state: State<'_, AppState>) -> Result<ApiServerStatusPayload, String> {
+/// stopped).
+fn stop_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, String> {
+    let state = app.state::<AppState>();
     let payload = {
         let mut s = state.api_server.lock().map_err(|e| e.to_string())?;
         if let Some(shutdown) = s.shutdown.take() {
             shutdown.notify_one();
         }
         s.status = "stopped".to_string();
-        s.token = None;
-        s.token_sha256 = None;
         status_payload(&s)
     };
-    emit_status(&app, &payload);
+    emit_status(app, &payload);
     Ok(payload)
+}
+
+// ---------------------------------------------------------------------
+// Tauri commands
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn api_server_start(app: AppHandle) -> Result<ApiServerStatusPayload, String> {
+    start_server_core(&app).await
+}
+
+#[tauri::command]
+pub fn api_server_stop(app: AppHandle) -> Result<ApiServerStatusPayload, String> {
+    stop_server_core(&app)
 }
 
 /// Returns the current status snapshot — same shape as the
@@ -655,6 +1057,166 @@ pub fn api_server_stop(app: AppHandle, state: State<'_, AppState>) -> Result<Api
 pub fn api_server_status(state: State<'_, AppState>) -> Result<ApiServerStatusPayload, String> {
     let s = state.api_server.lock().map_err(|e| e.to_string())?;
     Ok(status_payload(&s))
+}
+
+#[tauri::command]
+pub fn api_server_get_config(app: AppHandle) -> Result<ApiServerConfigView, String> {
+    let config = load_config_impl(&config_file_path(&app)?)?;
+    Ok(ApiServerConfigView::from(&config))
+}
+
+/// Persists `config` (merged onto the existing file's `tokens`, which this
+/// view never carries) and reports whether the caller must gracefully
+/// restart the running server — decided purely from `state.api_server`'s
+/// in-memory status, so it's directly unit-testable without a real
+/// `AppHandle`/listening socket (see `mcp.rs::add_server_with_state_impl`'s
+/// doc comment for the same rationale).
+fn set_config_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    config: ApiServerConfigView,
+) -> Result<(ApiServerConfig, bool), String> {
+    if config.port == 0 {
+        return Err("Port must be between 1 and 65535".to_string());
+    }
+
+    let updated = {
+        let _guard = state
+            .api_server_config_lock
+            .lock()
+            .map_err(|_| "API server config lock poisoned".to_string())?;
+        let mut existing = load_config_impl(path)?;
+        existing.port = config.port;
+        existing.autostart = config.autostart;
+        existing.require_token = config.require_token;
+        existing.expose_ollama = config.expose_ollama;
+        existing.expose_providers = config.expose_providers;
+        save_config_impl(path, &existing)?;
+        existing
+    };
+
+    let needs_restart = {
+        let s = state.api_server.lock().map_err(|e| e.to_string())?;
+        s.status == "running" || s.status == "starting"
+    };
+
+    Ok((updated, needs_restart))
+}
+
+/// Updates the persisted config. Any change — port, autostart,
+/// `require_token`, or either `expose_*` toggle — triggers a graceful
+/// restart if the server is currently running, so the listening socket's
+/// actual behavior can never silently drift from what the panel displays.
+/// The `expose_providers` toggle is the "money-spending switch" per the
+/// design doc; the explicit confirm for it lives in the frontend (this
+/// command just persists whatever it's told).
+#[tauri::command]
+pub async fn api_server_set_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: ApiServerConfigView,
+) -> Result<ApiServerConfigView, String> {
+    let (updated, needs_restart) = set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
+    if needs_restart {
+        stop_server_core(&app)?;
+        start_server_core(&app).await?;
+    }
+    Ok(ApiServerConfigView::from(&updated))
+}
+
+/// Builds a fresh token: `lmk-` + 32 hex chars, plus the [`TokenEntry`] that
+/// will be persisted (digest only). Split out from
+/// [`create_token_with_state_impl`] so the "plaintext never ends up in the
+/// persisted entry" property is testable with no file/lock/`AppState` at all
+/// — see `tests::creating_a_token_never_persists_its_plaintext`.
+fn mint_token(label: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> Result<(String, TokenEntry), String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("Label is required".to_string());
+    }
+    if scopes.is_empty() {
+        return Err("Select at least one scope".to_string());
+    }
+    if backends.is_empty() {
+        return Err("Select at least one backend".to_string());
+    }
+
+    let token = generate_token();
+    let entry = TokenEntry {
+        id: Uuid::new_v4().to_string(),
+        label,
+        sha256: sha256_hex(&token),
+        scopes,
+        backends,
+        created_at: now_ms(),
+        last_used_at: None,
+    };
+    Ok((token, entry))
+}
+
+fn create_token_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    label: &str,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+) -> Result<(String, TokenEntry), String> {
+    let (token, entry) = mint_token(label, scopes, backends)?;
+    let _guard = state
+        .api_server_config_lock
+        .lock()
+        .map_err(|_| "API server config lock poisoned".to_string())?;
+    let mut config = load_config_impl(path)?;
+    config.tokens.push(entry.clone());
+    save_config_impl(path, &config)?;
+    Ok((token, entry))
+}
+
+fn revoke_token_with_state_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
+    let _guard = state
+        .api_server_config_lock
+        .lock()
+        .map_err(|_| "API server config lock poisoned".to_string())?;
+    let mut config = load_config_impl(path)?;
+    let before = config.tokens.len();
+    config.tokens.retain(|t| t.id != id);
+    if config.tokens.len() == before {
+        return Err(format!("Unknown token '{id}'"));
+    }
+    save_config_impl(path, &config)
+}
+
+/// The plaintext token, returned exactly once — the caller (the Settings
+/// panel) must show/copy it now, since only [`TokenEntry::sha256`] is ever
+/// persisted.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTokenResult {
+    pub token: String,
+    pub entry: TokenEntryView,
+}
+
+#[tauri::command]
+pub fn api_server_create_token(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    label: String,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+) -> Result<CreateTokenResult, String> {
+    let (token, entry) = create_token_with_state_impl(state.inner(), &config_file_path(&app)?, &label, scopes, backends)?;
+    Ok(CreateTokenResult { token, entry: TokenEntryView::from(&entry) })
+}
+
+#[tauri::command]
+pub fn api_server_revoke_token(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    revoke_token_with_state_impl(state.inner(), &config_file_path(&app)?, &id)
+}
+
+/// Never exposes `sha256` to the frontend — see [`TokenEntryView`].
+#[tauri::command]
+pub fn api_server_list_tokens(app: AppHandle) -> Result<Vec<TokenEntryView>, String> {
+    let config = load_config_impl(&config_file_path(&app)?)?;
+    Ok(config.tokens.iter().map(TokenEntryView::from).collect())
 }
 
 #[cfg(test)]
@@ -669,9 +1231,15 @@ mod tests {
             llama_model_stem: Some("qwen2.5-7b-instruct".to_string()),
             ollama_base_url,
             require_token: false,
-            token_sha256: None,
+            expose_ollama: true,
+            expose_providers: false,
+            tokens: Vec::new(),
             client: reqwest::Client::new(),
         }
+    }
+
+    fn stored_token(id: &str, plaintext: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> StoredToken {
+        StoredToken { id: id.to_string(), sha256: sha256_hex(plaintext), scopes, backends }
     }
 
     fn get_request(path: &str) -> ServerRequest {
@@ -692,8 +1260,23 @@ mod tests {
         }
     }
 
+    fn with_bearer(mut req: ServerRequest, token: &str) -> ServerRequest {
+        req.headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        req
+    }
+
     async fn body_bytes(resp: Response<ResponseBody>) -> Bytes {
         resp.into_body().collect().await.unwrap().to_bytes()
+    }
+
+    fn temp_config_path() -> PathBuf {
+        // Nanos alone can collide across parallel test threads — the atomic
+        // counter guarantees uniqueness within the process (same idiom as
+        // `prompts.rs::tests::temp_file`).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("little_monkey_api_server_test_{}_{}_{}.json", std::process::id(), n, nanos))
     }
 
     #[test]
@@ -717,6 +1300,13 @@ mod tests {
     }
 
     #[test]
+    fn route_backend_maps_llama_and_ollama_but_not_unknown() {
+        assert_eq!(route_backend(ModelRoute::Llama), Some(Backend::Local));
+        assert_eq!(route_backend(ModelRoute::Ollama), Some(Backend::Ollama));
+        assert_eq!(route_backend(ModelRoute::Unknown), None);
+    }
+
+    #[test]
     fn generated_tokens_have_the_expected_shape_and_are_unique() {
         let a = generate_token();
         let b = generate_token();
@@ -737,14 +1327,34 @@ mod tests {
         assert!(!constant_time_eq("short", &digest1));
     }
 
+    /// Substantiates the reasoning in `constant_time_eq`'s doc comment: the
+    /// function must reject a mismatch regardless of *where* in the digest
+    /// the difference falls (a naive early-exit `==` would behave
+    /// identically in terms of *correctness* here — this only pins down
+    /// that behavior, since real timing can't be asserted in a unit test).
+    #[test]
+    fn constant_time_eq_rejects_mismatches_at_every_position() {
+        let base = sha256_hex("lmk-fixed-value");
+        let mut first_byte_flipped = base.clone();
+        first_byte_flipped.replace_range(0..1, if &base[0..1] == "0" { "1" } else { "0" });
+        let mut last_byte_flipped = base.clone();
+        let last = base.len() - 1;
+        last_byte_flipped.replace_range(last..last + 1, if &base[last..last + 1] == "0" { "1" } else { "0" });
+
+        assert!(!constant_time_eq(&base, &first_byte_flipped));
+        assert!(!constant_time_eq(&base, &last_byte_flipped));
+        assert!(constant_time_eq(&base, &base.clone()));
+    }
+
     #[tokio::test]
     async fn health_requires_no_token_even_when_auth_is_on() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.token_sha256 = Some(sha256_hex("lmk-real-token"));
+        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Chat], vec![Backend::Local])];
 
-        let resp = handle_request(&deps, get_request("/health")).await;
+        let (resp, matched) = handle_request(&deps, get_request("/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matched.is_none());
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["status"], "ok");
@@ -754,51 +1364,103 @@ mod tests {
     async fn missing_or_wrong_bearer_token_is_rejected_on_protected_routes() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.token_sha256 = Some(sha256_hex("lmk-real-token"));
+        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
 
-        let resp = handle_request(&deps, get_request("/v1/models")).await;
+        let (resp, matched) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(matched.is_none());
 
-        let mut wrong_auth = get_request("/v1/models");
-        wrong_auth.headers.insert(hyper::header::AUTHORIZATION, "Bearer lmk-not-it".parse().unwrap());
-        let resp = handle_request(&deps, wrong_auth).await;
+        let wrong_auth = with_bearer(get_request("/v1/models"), "lmk-not-it");
+        let (resp, matched) = handle_request(&deps, wrong_auth).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(matched.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_tokens_configured_fails_closed_even_with_a_bearer_header() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        // `deps.tokens` deliberately left empty.
+        let req = with_bearer(get_request("/v1/models"), "lmk-anything");
+        let (resp, _) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn correct_bearer_token_is_accepted() {
+    async fn correct_bearer_token_is_accepted_and_reports_its_id_for_last_used_tracking() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.token_sha256 = Some(sha256_hex("lmk-real-token"));
         deps.llama_ready = false;
+        deps.tokens = vec![stored_token("tok-1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
 
-        let mut req = get_request("/v1/models");
-        req.headers.insert(hyper::header::AUTHORIZATION, "Bearer lmk-real-token".parse().unwrap());
-        let resp = handle_request(&deps, req).await;
+        let req = with_bearer(get_request("/v1/models"), "lmk-real-token");
+        let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(matched.as_deref(), Some("tok-1"));
+    }
+
+    #[tokio::test]
+    async fn token_missing_the_required_scope_is_rejected_with_403() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token("tok-models-only", "lmk-models-only", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+
+        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"qwen2.5-7b-instruct"}"#), "lmk-models-only");
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Still authenticated as a real token, even though this particular
+        // route is out of scope for it — its id is still reported.
+        assert_eq!(matched.as_deref(), Some("tok-models-only"));
+    }
+
+    #[tokio::test]
+    async fn token_scoped_to_local_backend_is_rejected_when_the_request_routes_to_ollama() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token("tok-local-only", "lmk-local-only", vec![Scope::Chat], vec![Backend::Local])];
+
+        // "llama3.1:8b" isn't the ready llama stem, so `route_model` sends
+        // it to Ollama — a token scoped to `local` only must be rejected.
+        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#), "lmk-local-only");
+        let (resp, _) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_scoped_to_the_matching_backend_is_accepted() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token("tok-ollama", "lmk-ollama-scoped", vec![Scope::Chat], vec![Backend::Ollama])];
+
+        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#), "lmk-ollama-scoped");
+        let (resp, matched) = handle_request(&deps, req).await;
+        // 502, not 403: the scope/backend check passed, and it proceeded to
+        // (unsuccessfully) proxy to the dummy unreachable address.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(matched.as_deref(), Some("tok-ollama"));
     }
 
     #[tokio::test]
     async fn unmatched_routes_404() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let resp = handle_request(&deps, get_request("/v1/embeddings")).await;
+        let (resp, _) = handle_request(&deps, get_request("/v1/embeddings")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         // Never, ever a tool-dispatch route.
-        let resp = handle_request(&deps, post_request("/v1/tool_run_shell", "{}")).await;
+        let (resp, _) = handle_request(&deps, post_request("/v1/tool_run_shell", "{}")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn chat_completions_with_blank_model_returns_404() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let resp = handle_request(&deps, post_request("/v1/chat/completions", r#"{"messages":[]}"#)).await;
+        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"messages":[]}"#)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn chat_completions_with_invalid_json_returns_400() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let resp = handle_request(&deps, post_request("/v1/chat/completions", "not json")).await;
+        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", "not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -808,12 +1470,63 @@ mod tests {
         // must still succeed, just omitting Ollama's models (mirrors
         // `ollama.rs`'s own "unreachable is normal" stance).
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let resp = handle_request(&deps, get_request("/v1/models")).await;
+        let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
         assert!(data.iter().any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_omits_ollama_entirely_when_expose_ollama_is_off() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_ollama = false;
+        let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = value["data"].as_array().unwrap();
+        assert!(data.iter().all(|m| m["owned_by"] != "ollama"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_404s_for_an_ollama_routed_model_when_expose_ollama_is_off() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_ollama = false;
+        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn options_preflight_on_v1_routes_returns_cors_headers_and_needs_no_token() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Chat], vec![Backend::Local])];
+
+        let req = ServerRequest {
+            method: Method::OPTIONS,
+            path: "/v1/chat/completions".to_string(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert!(resp.headers().get("access-control-allow-methods").is_some());
+        assert!(matched.is_none());
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_cors_allow_origin_header() {
+        let deps = test_deps("http://127.0.0.1:1".to_string());
+        let (resp, _) = handle_request(&deps, get_request("/health")).await;
+        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+
+        let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
+        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+
+        let (resp, _) = handle_request(&deps, get_request("/v1/nope")).await;
+        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
     }
 
     /// Spins up a bare-bones raw-TCP "upstream" that writes back a fixed
@@ -841,7 +1554,7 @@ mod tests {
         });
 
         let deps = test_deps(format!("http://{addr}"));
-        let resp = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b","stream":true}"#)).await;
+        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b","stream":true}"#)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body_bytes(resp).await;
         assert_eq!(&bytes[..], canned);
@@ -854,7 +1567,7 @@ mod tests {
         // Port 1 on loopback: nothing listens there, so the connection is
         // refused immediately — a deterministic "unreachable upstream".
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let resp = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -872,12 +1585,173 @@ mod tests {
         assert_eq!(state.status, "error");
         assert!(state.last_error.is_some());
         assert!(state.shutdown.is_none());
-        assert!(state.token.is_none());
     }
 
     #[tokio::test]
     async fn bind_listener_succeeds_on_an_available_port() {
         let listener = bind_listener(0).await.expect("binding port 0 (OS-assigned) should always succeed");
         assert!(listener.local_addr().unwrap().port() > 0);
+    }
+
+    #[test]
+    fn creating_a_token_never_persists_its_plaintext() {
+        let (token, entry) = mint_token("CI", vec![Scope::Chat], vec![Backend::Local]).unwrap();
+        assert_ne!(entry.sha256, token, "the persisted entry must never contain the plaintext token");
+        assert_eq!(entry.sha256, sha256_hex(&token));
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains(&token), "serialized TokenEntry must never contain the plaintext token");
+    }
+
+    #[test]
+    fn mint_token_rejects_blank_label_or_empty_scopes_or_backends() {
+        assert!(mint_token("", vec![Scope::Chat], vec![Backend::Local]).is_err());
+        assert!(mint_token("   ", vec![Scope::Chat], vec![Backend::Local]).is_err());
+        assert!(mint_token("ok", vec![], vec![Backend::Local]).is_err());
+        assert!(mint_token("ok", vec![Scope::Chat], vec![]).is_err());
+        assert!(mint_token("ok", vec![Scope::Chat], vec![Backend::Local]).is_ok());
+    }
+
+    #[test]
+    fn token_entry_view_never_serializes_the_digest() {
+        let entry = TokenEntry {
+            id: "a".to_string(),
+            label: "A".to_string(),
+            sha256: sha256_hex("lmk-secret-value"),
+            scopes: vec![Scope::Chat],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+        };
+        let view = TokenEntryView::from(&entry);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("sha256"));
+        assert!(!json.contains(&entry.sha256));
+    }
+
+    #[test]
+    fn load_config_defaults_when_file_is_missing() {
+        let path = temp_config_path();
+        let config = load_config_impl(&path).unwrap();
+        assert_eq!(config.port, DEFAULT_PORT);
+        assert!(!config.autostart);
+        assert!(config.require_token);
+        assert!(config.expose_ollama);
+        assert!(!config.expose_providers);
+        assert!(config.tokens.is_empty());
+    }
+
+    #[test]
+    fn config_round_trips_through_save_and_load() {
+        let path = temp_config_path();
+        let mut config = ApiServerConfig::default();
+        config.port = 4444;
+        config.autostart = true;
+        config.tokens.push(TokenEntry {
+            id: "a".to_string(),
+            label: "CI".to_string(),
+            sha256: sha256_hex("lmk-ci"),
+            scopes: vec![Scope::Chat, Scope::Models],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+        });
+
+        save_config_impl(&path, &config).unwrap();
+        let loaded = load_config_impl(&path).unwrap();
+
+        assert_eq!(loaded.port, 4444);
+        assert!(loaded.autostart);
+        assert_eq!(loaded.tokens.len(), 1);
+        assert_eq!(loaded.tokens[0].sha256, sha256_hex("lmk-ci"));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_config_reports_restart_needed_only_when_the_server_is_running() {
+        let path = temp_config_path();
+        let state = AppState::default();
+
+        let view = ApiServerConfigView { port: 1234, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let (_, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
+        assert!(!needs_restart, "server is stopped — no restart needed");
+
+        {
+            let mut s = state.api_server.lock().unwrap();
+            s.status = "running".to_string();
+        }
+        let view = ApiServerConfigView { port: 5555, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let (updated, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
+        assert!(needs_restart, "server is running — a config change must trigger a restart");
+        assert_eq!(updated.port, 5555);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_config_rejects_a_zero_port() {
+        let path = temp_config_path();
+        let state = AppState::default();
+        let view = ApiServerConfigView { port: 0, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        assert!(set_config_with_state_impl(&state, &path, view).is_err());
+    }
+
+    #[test]
+    fn create_and_revoke_token_round_trip_through_the_config_file() {
+        let path = temp_config_path();
+        let state = AppState::default();
+
+        let (token, entry) =
+            create_token_with_state_impl(&state, &path, "My IDE", vec![Scope::Chat, Scope::Models], vec![Backend::Local]).unwrap();
+        assert!(token.starts_with(TOKEN_PREFIX));
+
+        let loaded = load_config_impl(&path).unwrap();
+        assert_eq!(loaded.tokens.len(), 1);
+        assert_eq!(loaded.tokens[0].id, entry.id);
+        assert_eq!(loaded.tokens[0].sha256, sha256_hex(&token));
+
+        revoke_token_with_state_impl(&state, &path, &entry.id).unwrap();
+        let loaded = load_config_impl(&path).unwrap();
+        assert!(loaded.tokens.is_empty());
+
+        assert!(revoke_token_with_state_impl(&state, &path, &entry.id).is_err(), "revoking an already-gone id must error, not silently succeed");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_token_used_sets_last_used_at_on_the_matching_entry_only() {
+        let path = temp_config_path();
+        let mut config = ApiServerConfig::default();
+        config.tokens.push(TokenEntry {
+            id: "a".to_string(),
+            label: "A".to_string(),
+            sha256: sha256_hex("lmk-a"),
+            scopes: vec![],
+            backends: vec![],
+            created_at: 1,
+            last_used_at: None,
+        });
+        config.tokens.push(TokenEntry {
+            id: "b".to_string(),
+            label: "B".to_string(),
+            sha256: sha256_hex("lmk-b"),
+            scopes: vec![],
+            backends: vec![],
+            created_at: 1,
+            last_used_at: None,
+        });
+        save_config_impl(&path, &config).unwrap();
+
+        let state = AppState::default();
+        record_token_used_with_state(&state, &path, "b");
+
+        let reloaded = load_config_impl(&path).unwrap();
+        assert!(reloaded.tokens.iter().find(|t| t.id == "a").unwrap().last_used_at.is_none());
+        assert!(reloaded.tokens.iter().find(|t| t.id == "b").unwrap().last_used_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
     }
 }
