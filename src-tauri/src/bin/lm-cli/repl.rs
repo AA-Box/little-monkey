@@ -145,6 +145,7 @@ pub async fn run(
         if trimmed.starts_with('/') {
             let result = handle_command(
                 client,
+                state,
                 &mut target,
                 &mut options,
                 &mut history,
@@ -217,6 +218,7 @@ fn truncate_to_system(history: &mut Vec<serde_json::Value>) {
 /// ending the session.
 async fn handle_command(
     client: &reqwest::Client,
+    state: &AppState,
     target: &mut Target,
     options: &mut chat::ChatOptions,
     history: &mut Vec<serde_json::Value>,
@@ -249,8 +251,61 @@ async fn handle_command(
             print_prompts();
             Ok(())
         }
+        "/verify" => handle_verify(state, rest).await,
         other => Err(format!("Unknown command '{other}'. Type /? for help")),
     }
+}
+
+/// `/verify` (no args): lists the current workspace's configured
+/// verification commands (see `little_monkey_lib::verify`), enabled or not,
+/// so a user can see what's set up before turning on `--verify`. `/verify
+/// run`: runs every ENABLED command right now, on demand, via the same
+/// `verify::run_command_impl` `agent.rs`'s automatic post-turn phase uses —
+/// just without feeding any failure back into the conversation, since this
+/// is a manual spot-check, not a turn's verification phase.
+async fn handle_verify(state: &AppState, rest: &str) -> Result<(), String> {
+    let root = little_monkey_lib::workspace::primary_root_canon(state)?;
+    let (sub, _) = split_first_word(rest);
+
+    if sub == "run" {
+        let commands = crate::verify_cli::enabled_commands(&root);
+        if commands.is_empty() {
+            println!("No enabled verification commands configured for this workspace.");
+            return Ok(());
+        }
+        for cmd in &commands {
+            println!("Running \"{}\"...", cmd.label);
+            let result = little_monkey_lib::verify::run_command_impl(state, &root, cmd, None).await;
+            let ok = !result.timed_out && result.code == Some(0);
+            println!("{} — {} ({} ms)", result.label, if ok { "PASS" } else { "FAIL" }, result.duration_ms);
+            if !ok {
+                let stdout = result.stdout.trim();
+                let stderr = result.stderr.trim();
+                if !stdout.is_empty() {
+                    println!("{stdout}");
+                }
+                if !stderr.is_empty() {
+                    println!("{stderr}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let commands = crate::verify_cli::all_commands(&root);
+    if commands.is_empty() {
+        println!(
+            "No verification commands configured for this workspace. Configure them in the desktop app's Settings > Verification tab."
+        );
+        return Ok(());
+    }
+    println!("Configured verification commands:");
+    for cmd in &commands {
+        let mark = if cmd.enabled { "x" } else { " " };
+        println!("  [{mark}] {:<8} {:<20} {}", cmd.kind, cmd.label, cmd.command);
+    }
+    println!("\nUse /verify run to run the enabled commands now.");
+    Ok(())
 }
 
 /// `/persona <command>`: resolves a saved persona by its slash-command
@@ -611,6 +666,8 @@ fn print_help() {
   /revert [id]     Restore a checkpoint's files (defaults to the most recent)
   /persona <cmd>   Set the active persona (/persona clear to remove)
   /prompts         List saved personas and snippets
+  /verify          List this workspace's configured verification commands
+  /verify run      Run the enabled verification commands now
   /clear           Clear session context
   /bye             Exit (also exit, quit, or Ctrl+D)
   /?, /help        Help for a command
