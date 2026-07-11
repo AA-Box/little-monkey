@@ -222,7 +222,7 @@ const NO_SESSION_REMEMBER: &[&str] = &["run_shell"];
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Every valid permission mode identifier, shared verbatim with the frontend.
-const VALID_MODES: &[&str] = &["manual", "acceptEdits", "plan", "auto", "bypass"];
+const VALID_MODES: &[&str] = &["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
 
 /// Mode-based short-circuit decision for [`request_permission`]:
 /// `Some(result)` means the mode decides on its own without prompting;
@@ -234,8 +234,18 @@ const VALID_MODES: &[&str] = &["manual", "acceptEdits", "plan", "auto", "bypass"
 /// the agent reads untrusted workspace content, so any heuristic gate on
 /// shell commands (a substring blacklist used to live here) is a prompt-
 /// injection-shaped exfiltration path. Users who truly want promptless shell
-/// have "bypass" mode.
-fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
+/// have "bypass" mode. This is the same invariant "smart" mode must uphold —
+/// see the `"smart"` arm below, and the `smart_mode_never_short_circuits_run_shell`
+/// regression test.
+///
+/// `risk` is the same [`RiskAssessment`] [`request_permission`] will go on to
+/// show in the prompt payload if this falls through — passed in here (rather
+/// than computed inside this function) so this stays a pure decision table
+/// over already-known inputs, exercisable in tests without needing a
+/// filesystem or a judge call. Only `"smart"` ever looks at it; every other
+/// mode's decision is unchanged by whatever `risk` says (Phase 2's invariant
+/// that risk annotations are purely advisory outside "smart" mode).
+fn mode_short_circuit(mode: &str, tool: &str, risk: Option<&RiskAssessment>) -> Option<Result<(), String>> {
     match mode {
         "bypass" => Some(Ok(())),
         "plan" => Some(Err(format!(
@@ -243,6 +253,18 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
         ))),
         "acceptEdits" | "auto" => {
             if tool == "write_file" || tool == "edit_file" || tool == "remember" {
+                Some(Ok(()))
+            } else {
+                None
+            }
+        }
+        "smart" => {
+            // Only write_file/edit_file are ever eligible — run_shell (and
+            // anything else) always falls through to `None` here, no matter
+            // what `risk` claims, exactly like "auto"/"acceptEdits" above.
+            if (tool == "write_file" || tool == "edit_file")
+                && matches!(risk, Some(r) if r.level == "low" && !r.floored)
+            {
                 Some(Ok(()))
             } else {
                 None
@@ -269,14 +291,24 @@ fn mode_short_circuit(mode: &str, tool: &str) -> Option<Result<(), String>> {
 ///   are auto-approved, and `run_shell` ALWAYS falls through to the normal
 ///   prompting logic (see [`mode_short_circuit`] for why it is never
 ///   auto-approved).
+/// - `"smart"` (Phase 3): `write_file`/`edit_file` are auto-approved ONLY
+///   when `risk` is `Some` with `level == "low"` and `floored == false`;
+///   every other case for those two tools, `remember`, and — critically —
+///   `run_shell` in every case, falls through to the normal prompting logic.
+///   `run_shell` NEVER short-circuits in `"smart"`, identical to `"auto"`/
+///   `"acceptEdits"` above and for the same reason (see [`mode_short_circuit`]'s
+///   doc comment).
 /// - `"manual"`, or any unrecognized value (as a safe default): always falls
 ///   through to the normal prompting logic, unchanged.
 ///
-/// `risk` (see [`RiskAssessment`]/[`compute_risk`]) is purely advisory as of
-/// this phase: it only ever changes what [`PermissionRequestPayload`] shows
-/// the user, never anything above — the mode short-circuit table is decided
-/// with no knowledge of it whatsoever, so a mis-classified "low risk" judge
-/// result can never itself approve anything.
+/// `risk` (see [`RiskAssessment`]/[`compute_risk`]) is purely advisory in
+/// every mode except `"smart"`: outside `"smart"` it only ever changes what
+/// [`PermissionRequestPayload`] shows the user, never anything above — those
+/// modes' short-circuit decisions are made with no knowledge of it
+/// whatsoever, so a mis-classified "low risk" judge result can never itself
+/// approve anything under them. `"smart"` is the sole, narrow exception, and
+/// even there it can only ever affect `write_file`/`edit_file` — never
+/// `run_shell` (see [`mode_short_circuit`]).
 ///
 /// The normal prompting logic: if `tool` has already been granted "allow for
 /// session", resolves `Ok(())` immediately without prompting; otherwise emits
@@ -292,7 +324,7 @@ pub async fn request_permission<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let mode = state.permissions.mode.lock().unwrap().clone();
 
-    if let Some(decision) = mode_short_circuit(&mode, tool) {
+    if let Some(decision) = mode_short_circuit(&mode, tool, risk.as_ref()) {
         return decision;
     }
 
@@ -706,6 +738,52 @@ mod tests {
     }
 
     #[test]
+    fn set_permission_mode_keeps_session_allow_when_switching_to_smart() {
+        // "smart" counts as neither tightening nor loosening — same
+        // treatment as "acceptEdits"/"auto": switching into it must not wipe
+        // out grants a stricter earlier mode never had reason to clear.
+        let state = AppState::default();
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("write_file".to_string());
+
+        set_permission_mode_impl(&state, "smart".to_string()).unwrap();
+
+        assert!(state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains("write_file"));
+    }
+
+    #[test]
+    fn set_permission_mode_does_not_treat_smart_as_tightening() {
+        // Mirrors `set_permission_mode_clears_session_allow_when_tightening_to_*`
+        // but asserts the opposite for "smart" — it must NOT be in the
+        // tightening set alongside "manual"/"plan".
+        let state = AppState::default();
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("edit_file".to_string());
+
+        set_permission_mode_impl(&state, "smart".to_string()).unwrap();
+
+        assert!(!state.permissions.session_allow.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_modes_includes_smart() {
+        assert!(VALID_MODES.contains(&"smart"));
+    }
+
+    #[test]
     fn get_permission_mode_returns_current_mode() {
         let state = AppState::default();
         *state.permissions.mode.lock().unwrap() = "auto".to_string();
@@ -718,37 +796,97 @@ mod tests {
         // a substring blacklist. run_shell must always fall through to the
         // normal permission prompt (None), no matter how harmless the
         // command looks.
-        assert!(mode_short_circuit("auto", "run_shell").is_none());
+        assert!(mode_short_circuit("auto", "run_shell", None).is_none());
+    }
+
+    #[test]
+    fn smart_mode_never_short_circuits_run_shell() {
+        // Twin of `auto_mode_never_short_circuits_run_shell` for Phase 3's
+        // "smart" mode — the load-bearing invariant restated in the design
+        // doc: the LLM risk judge must NEVER be allowed to influence
+        // run_shell, in any mode, no matter how confidently it (or a
+        // fabricated assessment) claims "low" risk.
+        assert!(mode_short_circuit("smart", "run_shell", None).is_none());
+        let low = RiskAssessment { level: "low".to_string(), reason: "looks harmless".to_string(), floored: false };
+        assert!(mode_short_circuit("smart", "run_shell", Some(&low)).is_none());
     }
 
     #[test]
     fn auto_and_accept_edits_short_circuit_only_file_edits_and_remember() {
         for mode in ["auto", "acceptEdits"] {
-            assert_eq!(mode_short_circuit(mode, "write_file"), Some(Ok(())));
-            assert_eq!(mode_short_circuit(mode, "edit_file"), Some(Ok(())));
-            assert_eq!(mode_short_circuit(mode, "remember"), Some(Ok(())));
-            assert!(mode_short_circuit(mode, "run_shell").is_none());
+            assert_eq!(mode_short_circuit(mode, "write_file", None), Some(Ok(())));
+            assert_eq!(mode_short_circuit(mode, "edit_file", None), Some(Ok(())));
+            assert_eq!(mode_short_circuit(mode, "remember", None), Some(Ok(())));
+            assert!(mode_short_circuit(mode, "run_shell", None).is_none());
         }
     }
 
     #[test]
+    fn smart_mode_auto_approves_write_and_edit_only_when_risk_is_low_and_unfloored() {
+        let low = RiskAssessment { level: "low".to_string(), reason: "trivial rename".to_string(), floored: false };
+        assert_eq!(mode_short_circuit("smart", "write_file", Some(&low)), Some(Ok(())));
+        assert_eq!(mode_short_circuit("smart", "edit_file", Some(&low)), Some(Ok(())));
+    }
+
+    #[test]
+    fn smart_mode_falls_through_for_write_and_edit_when_risk_is_medium_or_high() {
+        for level in ["medium", "high"] {
+            let risk = RiskAssessment { level: level.to_string(), reason: "reason".to_string(), floored: false };
+            assert!(mode_short_circuit("smart", "write_file", Some(&risk)).is_none());
+            assert!(mode_short_circuit("smart", "edit_file", Some(&risk)).is_none());
+        }
+    }
+
+    #[test]
+    fn smart_mode_falls_through_for_write_and_edit_when_risk_is_none() {
+        // No classification available (judge disabled/timed out/unparseable)
+        // — fails closed to a normal prompt, exactly like every other
+        // "unknown" case in this design.
+        assert!(mode_short_circuit("smart", "write_file", None).is_none());
+        assert!(mode_short_circuit("smart", "edit_file", None).is_none());
+    }
+
+    #[test]
+    fn smart_mode_never_auto_approves_a_floored_low_risk_path() {
+        // The deterministic path floor is authoritative and can never be
+        // relaxed by the judge — a floored path stays "low" only because
+        // `compute_risk` never actually emits `floored: true` with a level
+        // other than "high" in practice, but this pins the short-circuit
+        // table's own defense-in-depth: `floored: true` always falls through
+        // no matter what `level` says.
+        let floored_low = RiskAssessment { level: "low".to_string(), reason: "floored anyway".to_string(), floored: true };
+        assert!(mode_short_circuit("smart", "write_file", Some(&floored_low)).is_none());
+        assert!(mode_short_circuit("smart", "edit_file", Some(&floored_low)).is_none());
+    }
+
+    #[test]
+    fn smart_mode_never_short_circuits_remember() {
+        // `remember` is not write_file/edit_file — "smart" only ever
+        // auto-approves those two tools, unlike "auto"/"acceptEdits" which
+        // also cover `remember`.
+        let low = RiskAssessment { level: "low".to_string(), reason: "reason".to_string(), floored: false };
+        assert!(mode_short_circuit("smart", "remember", Some(&low)).is_none());
+        assert!(mode_short_circuit("smart", "remember", None).is_none());
+    }
+
+    #[test]
     fn bypass_mode_short_circuits_everything() {
-        assert_eq!(mode_short_circuit("bypass", "run_shell"), Some(Ok(())));
-        assert_eq!(mode_short_circuit("bypass", "write_file"), Some(Ok(())));
+        assert_eq!(mode_short_circuit("bypass", "run_shell", None), Some(Ok(())));
+        assert_eq!(mode_short_circuit("bypass", "write_file", None), Some(Ok(())));
     }
 
     #[test]
     fn manual_and_unknown_modes_never_short_circuit() {
         for mode in ["manual", "yolo"] {
-            assert!(mode_short_circuit(mode, "write_file").is_none());
-            assert!(mode_short_circuit(mode, "run_shell").is_none());
-            assert!(mode_short_circuit(mode, "remember").is_none());
+            assert!(mode_short_circuit(mode, "write_file", None).is_none());
+            assert!(mode_short_circuit(mode, "run_shell", None).is_none());
+            assert!(mode_short_circuit(mode, "remember", None).is_none());
         }
     }
 
     #[test]
     fn plan_mode_short_circuits_to_an_error() {
-        let decision = mode_short_circuit("plan", "run_shell").unwrap();
+        let decision = mode_short_circuit("plan", "run_shell", None).unwrap();
         assert!(decision.unwrap_err().contains("Plan Mode"));
     }
 
@@ -756,13 +894,13 @@ mod tests {
     fn plan_mode_blocks_remember_too() {
         // Plan mode blocks every mutating tool unconditionally — remember
         // (writes to app-data, not the workspace) is no exception.
-        let decision = mode_short_circuit("plan", "remember").unwrap();
+        let decision = mode_short_circuit("plan", "remember", None).unwrap();
         assert!(decision.unwrap_err().contains("Plan Mode"));
     }
 
     #[test]
     fn bypass_mode_short_circuits_remember() {
-        assert_eq!(mode_short_circuit("bypass", "remember"), Some(Ok(())));
+        assert_eq!(mode_short_circuit("bypass", "remember", None), Some(Ok(())));
     }
 
     // --- path_risk_floor / compute_risk (Phase 2 risk annotations) ---

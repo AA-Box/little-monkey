@@ -121,6 +121,8 @@ export const de: Record<string, string> = {
   "ModeSelector.modeManualDescription": "Vor jeder Dateiänderung oder jedem Befehl nachfragen",
   "ModeSelector.modeAcceptEditsLabel": "Änderungen akzeptieren",
   "ModeSelector.modeAcceptEditsDescription": "Dateiänderungen automatisch genehmigen, vor Befehlen aber weiterhin nachfragen",
+  "ModeSelector.modeSmartLabel": "Intelligent",
+  "ModeSelector.modeSmartDescription": "Genehmigt automatisch risikoarme Dateiänderungen, alles andere fragt nach",
   "ModeSelector.modePlanLabel": "Plan",
   "ModeSelector.modePlanDescription": "Nur lesend – Änderungen beschreiben, statt sie auszuführen",
   "ModeSelector.modeAutoLabel": "Auto",

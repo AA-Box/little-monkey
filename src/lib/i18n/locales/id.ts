@@ -121,6 +121,8 @@ export const id: Record<string, string> = {
   "ModeSelector.modeManualDescription": "Tanya sebelum setiap pengeditan berkas atau perintah",
   "ModeSelector.modeAcceptEditsLabel": "Terima Pengeditan",
   "ModeSelector.modeAcceptEditsDescription": "Setujui pengeditan berkas secara otomatis, tetap tanya sebelum menjalankan perintah",
+  "ModeSelector.modeSmartLabel": "Cerdas",
+  "ModeSelector.modeSmartDescription": "Menyetujui pengeditan berkas berisiko rendah secara otomatis, selainnya akan ditanyakan",
   "ModeSelector.modePlanLabel": "Rencana",
   "ModeSelector.modePlanDescription": "Hanya baca - jelaskan perubahan alih-alih menerapkannya",
   "ModeSelector.modeAutoLabel": "Otomatis",

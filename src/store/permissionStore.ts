@@ -26,11 +26,15 @@ export interface PermissionRequest {
 }
 
 /**
- * Stable string identifiers for the five permission modes, shared verbatim
+ * Stable string identifiers for the six permission modes, shared verbatim
  * with the Rust side (src-tauri/src/permissions.rs::VALID_MODES). See
- * ModeSelector for user-facing copy describing each mode.
+ * ModeSelector for user-facing copy describing each mode. `"smart"` (Phase 3
+ * of the Plan/Act + risk-adaptive permissions design —
+ * docs/roadmap/p2-plan-act-safety.md) auto-approves only low-risk,
+ * non-floored file edits; `run_shell` never short-circuits under it, exactly
+ * like `"auto"`/`"acceptEdits"` (see permissions.rs::mode_short_circuit).
  */
-export type PermissionMode = "manual" | "acceptEdits" | "plan" | "auto" | "bypass";
+export type PermissionMode = "manual" | "acceptEdits" | "smart" | "plan" | "auto" | "bypass";
 
 /**
  * The subset of `PermissionMode` that "Approve & start acting" (PlanCard.tsx)
@@ -39,14 +43,17 @@ export type PermissionMode = "manual" | "acceptEdits" | "plan" | "auto" | "bypas
  * and `"bypass"` (the most dangerous mode must never be silently re-entered
  * just because it happened to be active before the user entered Plan Mode —
  * mirrors `readInitialMode`'s "bypass is never restored" rule below).
+ * `"smart"` is a legitimate act mode (it still enforces every prompt except
+ * pre-vetted low-risk file edits), so it's included here alongside
+ * `"manual"`/`"acceptEdits"`/`"auto"`.
  */
-export type ActPermissionMode = "manual" | "acceptEdits" | "auto";
+export type ActPermissionMode = "manual" | "acceptEdits" | "smart" | "auto";
 
 const PERMISSION_MODE_STORAGE_KEY = "little-monkey-permission-mode";
 const LAST_ACT_MODE_STORAGE_KEY = "little-monkey-last-act-mode";
 
-const VALID_PERMISSION_MODES: PermissionMode[] = ["manual", "acceptEdits", "plan", "auto", "bypass"];
-const ACT_PERMISSION_MODES: ActPermissionMode[] = ["manual", "acceptEdits", "auto"];
+const VALID_PERMISSION_MODES: PermissionMode[] = ["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
+const ACT_PERMISSION_MODES: ActPermissionMode[] = ["manual", "acceptEdits", "smart", "auto"];
 
 /**
  * Reads the persisted "last act mode" from localStorage for the store's
