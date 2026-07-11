@@ -1,6 +1,7 @@
-mod checkpoints;
+pub mod checkpoints;
 mod git;
 mod llama;
+pub mod mcp;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -8,7 +9,17 @@ mod sessions;
 mod system;
 mod tools;
 mod permissions;
+// `pub` (not `mod`, like `permissions`/`sessions`/`tools`) so `lm-cli`
+// (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
+// from `little_monkey_lib`, the same way it already reuses `checkpoints`.
+pub mod rules;
+pub mod memory;
 pub mod workspace;
+
+// `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
+// `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
+// `mcp::disconnect_all`.
+use tauri::Manager;
 
 /// Shared application state, managed by Tauri and accessed from every
 /// #[tauri::command] via `tauri::State<'_, AppState>`.
@@ -27,17 +38,54 @@ pub struct AppState {
     /// With the split pane open, two turns (and thus two checkpoints) can be
     /// active concurrently — see `checkpoints.rs`.
     pub checkpoints: std::sync::Mutex<std::collections::HashMap<String, checkpoints::ActiveCheckpoint>>,
+    /// Checkpoint ids with a `checkpoint_revert`/`checkpoint_reapply` call
+    /// currently in progress. `MessageList.tsx`'s `CheckpointRow` and
+    /// `CheckpointTimeline.tsx`'s `TimelineRow` can both render controls for
+    /// the same checkpoint at once, and both call these commands with only a
+    /// component-local `busy` flag guarding each — nothing shared prevents
+    /// two concurrent revert/reapply calls for the same id from racing on
+    /// the same `redo/<n>.bak` files. Membership here is that lock — see
+    /// `checkpoints::acquire_revert_lock`.
+    pub checkpoint_locks: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Per-turn cancellation channels used by `tools::tools_cancel_running`
     /// to kill in-flight `tool_run_shell` child processes when the user hits
     /// Stop — keyed by the owning turn's id (empty string for callers that
     /// don't thread one) so stopping one pane's turn never kills a command
     /// the other pane's turn is still running.
     pub tool_cancel: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// Serializes `memories.json` read-modify-write cycles (see `memory.rs`)
+    /// so two concurrent split-pane `tool_remember` calls can never race and
+    /// clobber each other's fact — the whole file is rewritten on every add
+    /// or delete, so unsynchronized concurrent writers could silently drop
+    /// one of them.
+    pub memory_lock: std::sync::Mutex<()>,
+    /// Serializes `mcp_servers.json` read-modify-write cycles (see `mcp.rs`)
+    /// — same reasoning as `memory_lock` above protects `memories.json`.
+    /// `mcp_add_server`/`mcp_update_server` are synchronous commands (Tauri
+    /// can dispatch those on genuinely concurrent OS threads) and
+    /// `mcp_remove_server`/`mcp_set_enabled` are async commands (the tokio
+    /// runtime can run those in parallel too), so without a shared lock two
+    /// concurrent config-mutating calls (e.g. two Settings toggles fired
+    /// close together) can both load the same "before" config and the
+    /// later save silently clobbers the earlier one's change. A plain
+    /// `std::sync::Mutex`, not `tokio::sync::Mutex` like `AppState::mcp`:
+    /// every critical section this guards is the synchronous
+    /// `load_config_impl`/`save_config_impl` pair with no `.await` in
+    /// between, so there's nothing async to ever hold it across.
+    pub mcp_config_lock: std::sync::Mutex<()>,
+    /// Live MCP server connections, keyed by server id (see `mcp.rs`). A
+    /// `tokio::sync::Mutex` — unlike every other map here — because
+    /// connecting and calling a tool are both `.await`-ing operations; every
+    /// caller clones the cheap `Peer` handle out (or swaps the whole
+    /// connection in/out) and drops the guard before awaiting anything on
+    /// the connection itself, so this lock is never held across a
+    /// `call_tool`/`connect`/`disconnect` await.
+    pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -82,11 +130,21 @@ pub fn run() {
             tools::tool_run_shell,
             tools::tools_cancel_running,
             tools::list_workspace_paths,
+            tools::tool_remember,
+            rules::rules_read,
+            rules::rules_write,
+            memory::memory_list,
+            memory::memory_add,
+            memory::memory_delete,
+            memory::memory_update,
+            memory::memory_clear,
             sessions::sessions_load,
             sessions::sessions_save,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,
+            checkpoints::checkpoint_reapply,
+            checkpoints::checkpoint_list,
             workspace::set_primary_workspace_root,
             workspace::add_secondary_workspace_root,
             workspace::remove_secondary_workspace_root,
@@ -94,11 +152,40 @@ pub fn run() {
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
+            mcp::mcp_list_servers,
+            mcp::mcp_add_server,
+            mcp::mcp_update_server,
+            mcp::mcp_remove_server,
+            mcp::mcp_set_enabled,
+            mcp::mcp_connect,
+            mcp::mcp_disconnect,
+            mcp::mcp_set_http_token,
+            mcp::mcp_remove_http_token,
+            mcp::mcp_list_tools,
+            mcp::mcp_call_tool,
             system::reveal_in_finder,
             system::open_in_terminal,
             system::open_in_editor,
             system::open_session_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // `App::run` never returns — once the event loop is done, the
+        // underlying `tao` runtime calls `std::process::exit` directly
+        // (see its own doc comment), which skips Rust's Drop-based cleanup
+        // entirely. That means any live MCP stdio child process (held in
+        // `AppState::mcp`, cleaned up only via `McpConnection::service`'s
+        // `Drop`/`.cancel()`) would otherwise be silently orphaned on every
+        // normal app quit. `RunEvent::Exit` fires synchronously on the main
+        // thread right before that happens, so blocking here on
+        // `mcp::disconnect_all` (bounded and best-effort — see its own doc
+        // comment) is the only chance those child processes get to actually
+        // be killed before the process itself exits.
+        if let tauri::RunEvent::Exit = event {
+            let state = app_handle.state::<AppState>();
+            tauri::async_runtime::block_on(mcp::disconnect_all(state.inner()));
+        }
+    });
 }

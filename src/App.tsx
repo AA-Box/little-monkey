@@ -10,6 +10,7 @@ import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { useWorkspaceStore } from "./store/workspaceStore";
 import { useModelStore } from "./store/modelStore";
+import { useMcpStore } from "./store/mcpStore";
 import { useT } from "./lib/i18n";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
@@ -45,6 +46,8 @@ function App() {
   const refreshModels = useModelStore((s) => s.refresh);
   const refreshOllama = useModelStore((s) => s.refreshOllama);
   const refreshProviders = useModelStore((s) => s.refreshProviders);
+  const refreshMcp = useMcpStore((s) => s.refresh);
+  const connectMcp = useMcpStore((s) => s.connect);
 
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
@@ -59,6 +62,20 @@ function App() {
     void refreshOllama();
     void refreshProviders();
   }, [refreshRoots, refreshRecent, refreshModels, refreshOllama, refreshProviders]);
+
+  // Eager connect-on-startup for MCP servers: load the configured list, then
+  // kick off `mcp_connect` for every enabled-but-not-yet-connected one so
+  // their tools are ready before the user's first turn, without any Rust
+  // setup-hook plumbing (mirrors the design doc's "frontend triggers
+  // mcp_connect_all on mount" note). Failures surface per-server via the
+  // McpPanel status pill (mcp://status -> "error"), not here.
+  useEffect(() => {
+    void (async () => {
+      await refreshMcp();
+      const toConnect = useMcpStore.getState().servers.filter((s) => s.enabled && s.status !== "connected");
+      await Promise.all(toConnect.map((s) => connectMcp(s.id).catch(() => {})));
+    })();
+  }, [refreshMcp, connectMcp]);
 
   // The primary root changing (attach/detach of the whole workspace, not
   // secondary folders) invalidates whatever file was being previewed.

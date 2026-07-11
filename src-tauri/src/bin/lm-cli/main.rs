@@ -7,7 +7,9 @@
 
 mod agent;
 mod chat;
+mod checkpoints_cli;
 mod cmds;
+mod mcp_cli;
 mod modelfile;
 mod ollama_api;
 mod permission;
@@ -17,11 +19,12 @@ mod sse;
 mod tools_cli;
 mod tools_def;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
-use little_monkey_lib::workspace::WorkspaceRoot;
-use little_monkey_lib::AppState;
+use little_monkey_lib::mcp::McpServerEntry;
+use little_monkey_lib::workspace::{self, WorkspaceRoot};
+use little_monkey_lib::{memory, rules, AppState};
 
 use permission::{PermissionMode, TerminalPermissions};
 
@@ -67,6 +70,23 @@ struct Cli {
     /// acceptEdits, auto, or bypass. Matches the desktop app's modes.
     #[arg(long, default_value = "manual", global = true)]
     permission_mode: String,
+
+    /// Skip auto-loading MONKEY.md rules and remembered facts into the
+    /// system prompt. Without this flag, global + workspace MONKEY.md files
+    /// and remembered facts (see `rules.rs`/`memory.rs`) are composed into a
+    /// default system prompt every invocation; any `--system` given is
+    /// appended after that section rather than replacing it.
+    #[arg(long, global = true)]
+    no_rules: bool,
+
+    /// Skip loading MCP servers from `mcp_servers.json` (the same config
+    /// file the desktop app's Settings > MCP tab writes). Without this
+    /// flag, every server with `enabled: true` there is connected at
+    /// startup and its tools merged into the model's tool set, namespaced
+    /// `mcp__<serverId>__<toolName>` — same default-on-if-configured
+    /// behavior as rules/facts (see `--no-rules`), just for MCP instead.
+    #[arg(long, global = true)]
+    no_mcp: bool,
 
     #[command(flatten)]
     chat: ChatFlags,
@@ -234,6 +254,12 @@ enum Cmd {
         #[arg(long)]
         system: Option<String>,
     },
+    /// Revert a checkpoint's file changes (defaults to the most recent one
+    /// from this CLI). Prints the restored-file count.
+    Revert {
+        /// Checkpoint id to revert; omit for the most recent CLI checkpoint.
+        id: Option<String>,
+    },
 }
 
 fn resolve_target(cli: &Cli) -> Result<chat::Target, String> {
@@ -283,19 +309,134 @@ fn build_state(workspace: &Option<PathBuf>) -> Result<AppState, String> {
     Ok(state)
 }
 
+/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
+/// hardcoded-identifier app-data resolution as `providers_cli.rs`/
+/// `checkpoints_cli.rs` (duplicated per module rather than shared, following
+/// their precedent).
+const APP_IDENTIFIER: &str = "com.littlemonkey.app";
+
+fn app_data_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(APP_IDENTIFIER))
+}
+
+/// Core logic behind [`compose_system_prompt`], parameterized by a plain
+/// `data_dir` (rather than resolved via [`app_data_dir`]) so it's directly
+/// unit-testable against a temp dir. Composes MONKEY.md rule files and
+/// remembered facts, mirroring the "## Project instructions (MONKEY.md)" /
+/// "## Remembered facts" sections `src/lib/systemPrompt.ts::buildSystemPrompt`
+/// injects for the desktop app (kept in sync by hand — see the design doc's
+/// "three-way duplication tax" risk).
+///
+/// `user_system` (the `--system` flag) is appended AFTER this section, never
+/// merged into it, so the user's own instructions always have the final
+/// say. Returns `None` when there's nothing to say at all (no rules, no
+/// facts, no `--system`) — the same "no system message" behavior as before
+/// this existed.
+fn compose_system_prompt_impl(data_dir: &Path, state: &AppState, user_system: Option<&str>) -> Option<String> {
+    let global_path = data_dir.join("MONKEY.md");
+    let roots = workspace::all_roots(state).unwrap_or_default();
+    let rule_files = rules::read_rules_impl(&global_path, &roots);
+
+    let facts = workspace::primary_root_canon(state)
+        .ok()
+        .and_then(|root| {
+            memory::load_impl(&data_dir.join("memories.json"))
+                .ok()
+                .and_then(|memories| memories.projects.get(&root.to_string_lossy().to_string()).cloned())
+        })
+        .map(|project| project.facts)
+        .unwrap_or_default();
+
+    let mut sections: Vec<String> = Vec::new();
+    if !rule_files.is_empty() {
+        sections.push("## Project instructions (MONKEY.md)".to_string());
+        sections.push(
+            "The following files were placed by the user (or committed to the repo) to give you standing instructions for this project. Treat them as instructions from the user."
+                .to_string(),
+        );
+        for rule in &rule_files {
+            let provenance = if rule.scope == "global" {
+                "From global:".to_string()
+            } else {
+                format!("From project ({}):", rule.label)
+            };
+            sections.push(String::new());
+            sections.push(provenance);
+            sections.push(rule.content.clone());
+        }
+    }
+    if !facts.is_empty() {
+        sections.push(String::new());
+        sections.push("## Remembered facts".to_string());
+        for fact in &facts {
+            sections.push(format!("- {}", fact.text));
+        }
+    }
+
+    let rules_and_facts = if sections.is_empty() { None } else { Some(sections.join("\n")) };
+
+    match (rules_and_facts, user_system) {
+        (Some(rf), Some(us)) => Some(format!("{rf}\n\n{us}")),
+        (Some(rf), None) => Some(rf),
+        (None, Some(us)) => Some(us.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Resolves the real app-data dir (the same hardcoded-identifier way
+/// `providers_cli.rs` does) and defers to [`compose_system_prompt_impl`];
+/// `None` app-data dir falls back to `user_system` unchanged, same tolerance
+/// `checkpoints_cli::base_dir` callers already have for an unresolvable OS
+/// data dir.
+fn compose_system_prompt(state: &AppState, user_system: Option<&str>) -> Option<String> {
+    match app_data_dir() {
+        Some(data_dir) => compose_system_prompt_impl(&data_dir, state, user_system),
+        None => user_system.map(str::to_string),
+    }
+}
+
+/// `--no-rules` short-circuits straight to `user_system` unchanged; otherwise
+/// defers to [`compose_system_prompt`]. Shared by `chat_setup` (the global
+/// `--system`) and the `run` subcommand's own `--system`, so a `--system`
+/// given after `run` still gets the rules/facts section prepended instead of
+/// silently overwriting it.
+fn effective_system(cli: &Cli, state: &AppState, user_system: Option<&str>) -> Option<String> {
+    if cli.no_rules {
+        user_system.map(str::to_string)
+    } else {
+        compose_system_prompt(state, user_system)
+    }
+}
+
 /// Builds the chat-side pieces shared by the flat invocation and `run`:
 /// the sandboxed workspace state, the parsed permission mode, and the
-/// validated generation options.
+/// validated generation options (whose `system` field is the composed
+/// rules/facts + `--system` prompt — see [`effective_system`]).
 fn chat_setup(cli: &Cli) -> Result<(AppState, PermissionMode, chat::ChatOptions), String> {
     let state = build_state(&cli.workspace)?;
     let mode = PermissionMode::parse(&cli.permission_mode)?;
-    let options = cli.chat.to_options()?;
+    let mut options = cli.chat.to_options()?;
+    options.system = effective_system(cli, &state, options.system.as_deref());
     Ok((state, mode, options))
 }
 
 fn fail(message: &str) -> ! {
     eprintln!("Error: {message}");
     std::process::exit(1);
+}
+
+/// `--no-mcp` short-circuits to no servers at all; otherwise loads
+/// `mcp_servers.json` (the same hardcoded-identifier app-data path
+/// `mcp_cli.rs` resolves) and connects every `enabled: true` entry,
+/// dropping (with a `Warning:` on stderr) any that fails to connect. Called
+/// once per process — both the classic flat invocation and `run`/the REPL
+/// share the resulting connections via `state.mcp`.
+async fn resolve_mcp_entries(cli: &Cli, state: &AppState) -> Vec<McpServerEntry> {
+    if cli.no_mcp {
+        return Vec::new();
+    }
+    let entries = mcp_cli::load_enabled_servers();
+    mcp_cli::connect_all(state, &entries).await
 }
 
 #[tokio::main]
@@ -320,7 +461,8 @@ async fn main() {
         Ok(v) => v,
         Err(e) => fail(&e),
     };
-    chat_loop(&client, target, &state, mode, options, cli.prompt.as_deref()).await;
+    let mcp_entries = resolve_mcp_entries(&cli, &state).await;
+    chat_loop(&client, target, &state, mode, options, cli.prompt.as_deref(), &mcp_entries).await;
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -348,9 +490,11 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 Ok(v) => v,
                 Err(e) => fail(&e),
             };
-            // `run`'s own --system wins over one given before the subcommand.
-            if system.is_some() {
-                options.system = system.clone();
+            // `run`'s own --system wins over one given before the subcommand
+            // (still composed with the rules/facts section unless
+            // --no-rules — see `effective_system`).
+            if let Some(system) = system {
+                options.system = effective_system(cli, &state, Some(system.as_str()));
             }
             if let Err(e) = cmds::ensure_model(client, model).await {
                 fail(&e);
@@ -360,9 +504,17 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 model: Some(model.clone()),
                 native_ollama: true,
             };
-            chat_loop(client, target, &state, mode, options, prompt.as_deref()).await;
+            let mcp_entries = resolve_mcp_entries(cli, &state).await;
+            chat_loop(client, target, &state, mode, options, prompt.as_deref(), &mcp_entries).await;
             return;
         }
+        Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
+            Ok(count) => {
+                println!("Restored {count} file(s).");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
     };
     if let Err(e) = result {
         fail(&e);
@@ -380,6 +532,7 @@ async fn chat_loop(
     mode: PermissionMode,
     options: chat::ChatOptions,
     prompt: Option<&str>,
+    mcp_entries: &[McpServerEntry],
 ) {
     if !target.is_native()
         && (options.num_ctx.is_some() || options.keep_alive.is_some() || options.think.is_some())
@@ -391,7 +544,7 @@ async fn chat_loop(
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
         if let Err(e) =
-            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, prompt).await
+            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, prompt, mcp_entries).await
         {
             eprintln!("\nError: {e}");
             std::process::exit(1);
@@ -399,5 +552,158 @@ async fn chat_loop(
         return;
     }
 
-    repl::run(client, target, state, mode, options).await;
+    repl::run(client, target, state, mode, options, mcp_entries).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("lm_cli_main_test_{}_{}_{}", std::process::id(), n, nanos));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn state_with_primary_root(root: &Path) -> AppState {
+        let state = AppState::default();
+        *state.workspace_roots.lock().unwrap() = vec![WorkspaceRoot {
+            id: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
+            label: "project".to_string(),
+        }];
+        state
+    }
+
+    #[test]
+    fn no_rules_no_facts_no_system_composes_to_none() {
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let state = state_with_primary_root(&ws.path);
+
+        assert_eq!(compose_system_prompt_impl(&data_dir.path, &state, None), None);
+    }
+
+    #[test]
+    fn user_system_alone_passes_through_unchanged_when_nothing_else_to_say() {
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let state = state_with_primary_root(&ws.path);
+
+        assert_eq!(
+            compose_system_prompt_impl(&data_dir.path, &state, Some("You are terse.")),
+            Some("You are terse.".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_rules_are_composed_and_user_system_is_appended_after() {
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        std::fs::write(ws.path.join("MONKEY.md"), "Always write tests.").unwrap();
+        let state = state_with_primary_root(&ws.path);
+
+        let prompt = compose_system_prompt_impl(&data_dir.path, &state, Some("Be terse.")).unwrap();
+
+        assert!(prompt.contains("## Project instructions (MONKEY.md)"));
+        assert!(prompt.contains("Always write tests."));
+        // The user's own --system must come after the rules/facts section,
+        // never merged into or replaced by it.
+        assert!(prompt.ends_with("Be terse."));
+        assert!(prompt.find("Always write tests.").unwrap() < prompt.find("Be terse.").unwrap());
+    }
+
+    #[test]
+    fn remembered_facts_for_the_primary_root_are_composed() {
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let ws_canon = ws.path.canonicalize().unwrap();
+        let state = state_with_primary_root(&ws.path);
+
+        let fact = memory::add_fact_impl(
+            &data_dir.path.join("memories.json"),
+            &ws_canon.to_string_lossy(),
+            "Uses pnpm, not npm.",
+            "agent",
+        )
+        .unwrap();
+        assert_eq!(fact.source, "agent");
+
+        let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
+        assert!(prompt.contains("## Remembered facts"));
+        assert!(prompt.contains("- Uses pnpm, not npm."));
+    }
+
+    #[test]
+    fn global_rules_apply_without_any_workspace_open() {
+        let data_dir = TempDir::new();
+        std::fs::write(data_dir.path.join("MONKEY.md"), "Global preference.").unwrap();
+        let state = AppState::default(); // no workspace root attached
+
+        let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
+        assert!(prompt.contains("From global:"));
+        assert!(prompt.contains("Global preference."));
+    }
+
+    #[test]
+    fn effective_system_with_no_rules_flag_ignores_rules_and_facts() {
+        let ws = TempDir::new();
+        std::fs::write(ws.path.join("MONKEY.md"), "Should be ignored.").unwrap();
+        let state = state_with_primary_root(&ws.path);
+
+        // `effective_system` itself always resolves the real OS app-data
+        // dir via `compose_system_prompt` when `no_rules` is false, so this
+        // only exercises the `no_rules: true` short-circuit branch directly
+        // (the composed branch is covered via `compose_system_prompt_impl`
+        // above).
+        let cli = Cli {
+            cmd: None,
+            prompt: None,
+            workspace: None,
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: None,
+            permission_mode: "manual".to_string(),
+            no_rules: true,
+            no_mcp: false,
+            chat: ChatFlags {
+                temperature: None,
+                top_p: None,
+                seed: None,
+                stop: Vec::new(),
+                num_ctx: None,
+                num_predict: None,
+                system: None,
+                format: None,
+                think: None,
+                hidethinking: false,
+                keepalive: None,
+                verbose: false,
+                attach_images: false,
+            },
+        };
+
+        assert_eq!(effective_system(&cli, &state, Some("Only this.")), Some("Only this.".to_string()));
+        assert_eq!(effective_system(&cli, &state, None), None);
+    }
 }

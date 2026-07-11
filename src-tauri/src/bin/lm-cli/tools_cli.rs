@@ -9,7 +9,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use little_monkey_lib::{workspace, AppState};
+use little_monkey_lib::{checkpoints, memory, workspace, AppState};
 use regex::Regex;
 use walkdir::WalkDir;
 
@@ -18,6 +18,22 @@ use crate::permission::TerminalPermissions;
 const GREP_SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "dist"];
 const GREP_MAX_MATCHES: usize = 200;
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
+/// hardcoded-identifier app-data resolution as `providers_cli.rs`/
+/// `checkpoints_cli.rs` (duplicated per module rather than shared, following
+/// their precedent).
+const APP_IDENTIFIER: &str = "com.littlemonkey.app";
+
+/// Resolves (creating the app-data dir if necessary) `<app-data>/memories.json`
+/// — the same file `memory.rs::memories_file_path` resolves via an
+/// `AppHandle`. `None` only when the OS data dir can't be resolved or
+/// created, mirroring `checkpoints_cli::base_dir`'s tolerance.
+fn memories_file_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_dir()?.join(APP_IDENTIFIER);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("memories.json"))
+}
 
 pub fn read_file(state: &AppState, path: &str) -> Result<String, String> {
     let (resolved, _) = workspace::resolve_path_and_root(state, path)?;
@@ -95,16 +111,21 @@ pub fn grep(state: &AppState, pattern: &str, path: Option<&str>) -> Result<Vec<s
     Ok(matches)
 }
 
+/// `checkpoint_id` is the current turn's checkpoint (opened by
+/// `agent::run_turn`), so the pre-mutation backup lands there — same
+/// `record_original` hook the GUI's `tool_write_file` uses.
 pub async fn write_file(
     state: &AppState,
     perms: &mut TerminalPermissions,
     path: &str,
     content: &str,
+    checkpoint_id: Option<&str>,
 ) -> Result<String, String> {
     let detail = format!("Write {} bytes to {}", content.len(), path);
     perms.request("write_file", &detail).await?;
 
     let (resolved, _) = workspace::resolve_path_and_root(state, path)?;
+    checkpoints::record_original(state, checkpoint_id, &resolved)?;
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create parent directories for '{path}': {e}"))?;
@@ -150,12 +171,14 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
     preview.join("\n")
 }
 
+/// `checkpoint_id`: see `write_file` above.
 pub async fn edit_file(
     state: &AppState,
     perms: &mut TerminalPermissions,
     path: &str,
     old_string: &str,
     new_string: &str,
+    checkpoint_id: Option<&str>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
@@ -181,18 +204,26 @@ pub async fn edit_file(
     let detail = format!("Edit {path}\n{preview}");
     perms.request("edit_file", &detail).await?;
 
+    checkpoints::record_original(state, checkpoint_id, &resolved)?;
+
     let updated = current.replacen(old_string, new_string, 1);
     std::fs::write(&resolved, &updated).map_err(|e| format!("Failed to write '{path}': {e}"))?;
     Ok(format!("Edited {path}"))
 }
 
+/// `checkpoint_id`: no snapshotting happens for shell commands (side effects
+/// aren't captured), but it flags the owning checkpoint's `shell_ran` so
+/// `/revert` and the manifest are honest about partial coverage — same
+/// `record_shell` hook the GUI's `tool_run_shell` uses.
 pub async fn run_shell(
     state: &AppState,
     perms: &mut TerminalPermissions,
     command: &str,
     cwd: Option<&str>,
+    checkpoint_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     perms.request("run_shell", command).await?;
+    checkpoints::record_shell(state, checkpoint_id)?;
 
     let cwd_path = match cwd {
         Some(c) => workspace::resolve_path_and_root(state, c)?.0,
@@ -232,4 +263,18 @@ pub async fn run_shell(
         "stderr": String::from_utf8_lossy(&output.stderr),
         "code": output.status.code(),
     }))
+}
+
+/// Saves a durable fact to `<app-data>/memories.json` for the current
+/// workspace root — the CLI's `remember` tool, mirroring the GUI's
+/// `tool_remember` (see `tools.rs`). Permission-gated like the other
+/// mutating tools; no `checkpoint_id` (a fact isn't a workspace file for a
+/// checkpoint to snapshot or revert) and no `memory_lock`-equivalent (the
+/// CLI is single-process, so there's no concurrent split-pane writer to
+/// serialize against).
+pub async fn remember(state: &AppState, perms: &mut TerminalPermissions, text: &str) -> Result<memory::Fact, String> {
+    perms.request("remember", text).await?;
+    let root = workspace::primary_root_canon(state)?;
+    let path = memories_file_path().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    memory::add_fact_impl(&path, &root.to_string_lossy(), text, "agent")
 }

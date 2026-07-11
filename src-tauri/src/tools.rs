@@ -7,7 +7,7 @@
 //! outside the target workspace root — including via `..` traversal or a
 //! symlink that points outside the sandbox. A path may target any attached
 //! folder (see `workspace.rs`), not just the primary one. Every *mutating*
-//! tool (`write_file`, `edit_file`, `run_shell`) calls
+//! tool (`write_file`, `edit_file`, `run_shell`, `remember`) calls
 //! [`permissions::request_permission`] and refuses to run if the user (or an
 //! existing "allow for session" grant) doesn't approve it.
 
@@ -18,7 +18,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
-use crate::{checkpoints, permissions, workspace, AppState};
+use crate::{checkpoints, memory, permissions, workspace, AppState};
 
 /// Directory names that are never descended into by [`tool_grep`] — build
 /// output, VCS metadata, and dependency trees are noisy, huge, and almost
@@ -398,16 +398,24 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 
 /// Run a shell command (via `sh -c`, or `cmd /C` on Windows) rooted at `cwd`
 /// (defaults to the workspace root), with a hard timeout. Permission-gated.
-#[tauri::command]
+/// `checkpoint_id` is injected by the frontend agent loop (not the model), the
+/// same as `tool_write_file`/`tool_edit_file` — but here it isn't used to
+/// snapshot anything (shell side effects aren't captured); it only flags the
+/// owning turn's checkpoint as `shell_ran` so the UI can show a revert-coverage
+/// caveat.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     command: String,
     cwd: Option<String>,
+    checkpoint_id: Option<String>,
     turn_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref())
         .await?;
+
+    checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
 
     let cwd_path = match cwd {
         Some(ref c) => workspace::resolve_path_and_root(state.inner(), c)?.0,
@@ -486,6 +494,47 @@ pub async fn tool_run_shell(
         "stderr": String::from_utf8_lossy(&output.stderr),
         "code": output.status.code(),
     }))
+}
+
+/// Save a short durable fact about the current project/user preferences to
+/// `<app_data>/memories.json` (see `memory.rs`), so it's injected into every
+/// future turn's system prompt. Permission-gated (auto-allowed in
+/// acceptEdits/auto, blocked in plan mode — see `permissions::mode_short_circuit`).
+/// Takes no path — it only ever writes app-data, never a workspace file — so
+/// unlike the other mutating tools it skips `workspace::resolve_path_and_root`
+/// sandboxing entirely; it still requires a workspace to be open, since a
+/// fact has to be keyed by some project's canonical root.
+///
+/// `checkpoint_id` is deliberately NOT accepted here (unlike write/edit/
+/// run_shell): a remembered fact isn't a workspace file, so there is nothing
+/// for a per-turn checkpoint to snapshot or revert. `turn_id` is injected by
+/// the frontend agent loop (never model-supplied) purely to scope the
+/// permission prompt to the calling turn, exactly as it does for the other
+/// mutating tools.
+///
+/// `rename_all = "snake_case"`: matches every other tool command, so the
+/// model's snake_case tool-call arguments (and the agent loop's injected
+/// `turn_id`) are accepted without translation.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tool_remember(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    text: String,
+    turn_id: Option<String>,
+) -> Result<memory::Fact, String> {
+    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref())
+        .await?;
+
+    let root = workspace::primary_root_canon(state.inner())?;
+    let path = memory::memories_file_path(&app)?;
+
+    // Serialized against concurrent split-pane `tool_remember` calls (and
+    // against `memory_add`/`memory_delete`) via `AppState::memory_lock` — the
+    // whole `memories.json` file is rewritten on every add, so two
+    // unsynchronized concurrent writers could otherwise silently drop one
+    // fact's write.
+    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    memory::add_fact_impl(&path, &root.to_string_lossy(), &text, "agent")
 }
 
 /// Cancel in-flight tool invocations: kills running `tool_run_shell` child
@@ -715,6 +764,12 @@ mod tests {
             checkpoints::ActiveCheckpoint {
                 dir: checkpoint_dir,
                 entries: Vec::new(),
+                created_at_ms: 0,
+                session_id: String::new(),
+                anchor_index: 0,
+                label: String::new(),
+                shell_ran: false,
+                prev_id: None,
             },
         );
 

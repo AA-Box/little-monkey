@@ -1,7 +1,7 @@
 //! The interactive REPL — an `ollama run`-style chat prompt: rustyline line
 //! editing with persistent history in `~/.lm_cli_history`, a `>>> ` prompt,
 //! `"""` multi-line messages, and slash commands (`/set`, `/show`, `/save`,
-//! `/load`, `/clear`, `/bye`, `/?`) that mutate the live session. When stdin
+//! `/load`, `/revert`, `/clear`, `/bye`, `/?`) that mutate the live session. When stdin
 //! is not a TTY the whole thing falls back to a plain `read_line` loop with
 //! no prompts or banner, so piped input (`echo hi | lm-cli --ollama X`)
 //! keeps working.
@@ -9,6 +9,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::AppState;
 use rustyline::error::ReadlineError;
 
@@ -93,6 +94,7 @@ pub async fn run(
     state: &AppState,
     mode: PermissionMode,
     mut options: chat::ChatOptions,
+    mcp_entries: &[McpServerEntry],
 ) {
     let mut reader = Reader::new();
     if reader.interactive() {
@@ -148,7 +150,7 @@ pub async fn run(
             truncate_to_system(&mut history);
         }
         if let Err(e) =
-            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, &text).await
+            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, &text, mcp_entries).await
         {
             eprintln!("\nError: {e}");
         }
@@ -217,8 +219,20 @@ async fn handle_command(
         "/show" => handle_show(client, target, options, rest).await,
         "/save" => handle_save(client, target, options, rest).await,
         "/load" => handle_load(client, target, rest).await,
+        "/revert" => handle_revert(rest),
         other => Err(format!("Unknown command '{other}'. Type /? for help")),
     }
+}
+
+/// `/revert [id]`: restores a checkpoint's file changes — defaults to the
+/// most recent one opened by this CLI session (see `checkpoints_cli.rs`).
+/// Prints the restored-file count; never touches `history` or the
+/// conversation (no rewind for the CLI, unlike the desktop app).
+fn handle_revert(rest: &str) -> Result<(), String> {
+    let id = rest.trim();
+    let count = crate::checkpoints_cli::revert(if id.is_empty() { None } else { Some(id) })?;
+    println!("Restored {count} file(s).");
+    Ok(())
 }
 
 /// Warns (stderr) that an Ollama-only option was set on a target whose wire
@@ -512,6 +526,7 @@ fn print_help() {
   /show            Show model information
   /save <model>    Save the session's system/parameters as a new model
   /load <model>    Switch to a different local model (keeps the conversation)
+  /revert [id]     Restore a checkpoint's files (defaults to the most recent)
   /clear           Clear session context
   /bye             Exit (also exit, quit, or Ctrl+D)
   /?, /help        Help for a command
