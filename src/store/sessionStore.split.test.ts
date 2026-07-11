@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The store persists through Tauri IPC and subscribes to window events on
 // hydrate — none of which exists under vitest's node environment. `invoke`
@@ -11,6 +11,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
 import { hydrateSessions, useSessionStore, type ChatSession } from "./sessionStore";
+import { usePromptStore } from "./promptStore";
 
 function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSession {
   const now = Date.now();
@@ -153,6 +154,26 @@ describe("setSessionPersona", () => {
   it("only affects the targeted session", () => {
     useSessionStore.getState().setSessionPersona("a", "persona-1");
     expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.personaId).toBeNull();
+  });
+});
+
+describe("newSession applies the library's default persona", () => {
+  afterEach(() => {
+    usePromptStore.setState({ defaultPersonaId: null });
+  });
+
+  it("sets personaId to promptStore.defaultPersonaId on a freshly created session", () => {
+    usePromptStore.setState({ defaultPersonaId: "persona-default" });
+    useSessionStore.getState().newSession();
+    const active = useSessionStore.getState().sessions.find((s) => s.id === useSessionStore.getState().activeSessionId);
+    expect(active?.personaId).toBe("persona-default");
+  });
+
+  it("leaves personaId null when there is no default persona", () => {
+    usePromptStore.setState({ defaultPersonaId: null });
+    useSessionStore.getState().newSession();
+    const active = useSessionStore.getState().sessions.find((s) => s.id === useSessionStore.getState().activeSessionId);
+    expect(active?.personaId).toBeNull();
   });
 });
 

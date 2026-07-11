@@ -19,7 +19,11 @@ import {
 /** Resets the singleton store to empty, as if freshly hydrated with no
  * saved prompts. */
 function seed(entries: PromptEntry[] = []): void {
-  usePromptStore.setState({ entries, defaultPersonaId: null, persistError: null });
+  // hasSeededDefaults: true keeps these direct-state tests from ever
+  // exercising the starter-persona seed path — that's covered separately in
+  // the "hydratePrompts / starter personas" tests below, which manipulate it
+  // explicitly.
+  usePromptStore.setState({ entries, defaultPersonaId: null, hasSeededDefaults: true, persistError: null });
 }
 
 beforeEach(() => {
@@ -114,6 +118,7 @@ describe("hydratePrompts", () => {
         version: 1,
         entries: [{ id: "x", kind: "snippet", name: "X", command: "x", content: "hello" }],
         defaultPersonaId: null,
+        hasSeededDefaults: true,
       })
     );
 
@@ -127,6 +132,9 @@ describe("hydratePrompts", () => {
   it("keeps an empty library when nothing has been persisted yet", async () => {
     invokeMock.mockImplementationOnce(async () => null);
     await hydratePrompts();
+    // beforeEach's seed() already marked hasSeededDefaults true, so this
+    // no-file case stays empty rather than picking up the starter personas
+    // (that seeding path is covered on its own below).
     expect(usePromptStore.getState().entries).toEqual([]);
   });
 
@@ -154,7 +162,7 @@ describe("hydratePrompts", () => {
       updatedAt: 1700000000000,
     };
     invokeMock.mockImplementationOnce(async () =>
-      JSON.stringify({ version: 1, entries: [canonicalEntry], defaultPersonaId: null })
+      JSON.stringify({ version: 1, entries: [canonicalEntry], defaultPersonaId: null, hasSeededDefaults: true })
     );
 
     await hydratePrompts();
@@ -164,7 +172,7 @@ describe("hydratePrompts", () => {
 
   it("fills in defaults for a malformed entry instead of dropping it", async () => {
     invokeMock.mockImplementationOnce(async () =>
-      JSON.stringify({ version: 1, entries: [{ kind: "not-a-real-kind" }], defaultPersonaId: null })
+      JSON.stringify({ version: 1, entries: [{ kind: "not-a-real-kind" }], defaultPersonaId: null, hasSeededDefaults: true })
     );
 
     await hydratePrompts();
@@ -176,6 +184,75 @@ describe("hydratePrompts", () => {
     expect(entries[0].name).toBe("Untitled");
     expect(entries[0].command).toBe("");
     expect(entries[0].content).toBe("");
+  });
+});
+
+describe("hydratePrompts / starter personas", () => {
+  it("seeds the starter personas on the very first hydration (no file yet)", async () => {
+    usePromptStore.setState({ entries: [], defaultPersonaId: null, hasSeededDefaults: false, persistError: null });
+    invokeMock.mockImplementationOnce(async () => null); // prompts_load: no file
+
+    await hydratePrompts();
+
+    const state = usePromptStore.getState();
+    expect(state.hasSeededDefaults).toBe(true);
+    expect(state.entries.length).toBeGreaterThanOrEqual(2);
+    expect(state.entries.every((e) => e.kind === "persona")).toBe(true);
+  });
+
+  it("never re-seeds once hasSeededDefaults is true, even if the library is empty", async () => {
+    usePromptStore.setState({ entries: [], defaultPersonaId: null, hasSeededDefaults: true, persistError: null });
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({ version: 1, entries: [], defaultPersonaId: null, hasSeededDefaults: true })
+    );
+
+    await hydratePrompts();
+
+    expect(usePromptStore.getState().entries).toEqual([]);
+  });
+
+  it("avoids command collisions between seeded personas and existing entries", async () => {
+    usePromptStore.setState({ entries: [], defaultPersonaId: null, hasSeededDefaults: false, persistError: null });
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        version: 1,
+        entries: [{ id: "x", kind: "snippet", name: "X", command: "code-reviewer", content: "c" }],
+        defaultPersonaId: null,
+        hasSeededDefaults: false,
+      })
+    );
+    invokeMock.mockImplementationOnce(async () => undefined);
+
+    await hydratePrompts();
+
+    const commands = usePromptStore.getState().entries.map((e) => e.command);
+    expect(new Set(commands).size).toBe(commands.length);
+  });
+});
+
+describe("setDefaultPersona", () => {
+  it("sets the default when the id names a persona entry", () => {
+    const persona = usePromptStore.getState().addEntry({ kind: "persona", name: "P", command: "p", content: "c" });
+    usePromptStore.getState().setDefaultPersona(persona.id);
+    expect(usePromptStore.getState().defaultPersonaId).toBe(persona.id);
+  });
+
+  it("clears the default when passed null", () => {
+    const persona = usePromptStore.getState().addEntry({ kind: "persona", name: "P", command: "p", content: "c" });
+    usePromptStore.getState().setDefaultPersona(persona.id);
+    usePromptStore.getState().setDefaultPersona(null);
+    expect(usePromptStore.getState().defaultPersonaId).toBeNull();
+  });
+
+  it("no-ops for an id that isn't a persona entry", () => {
+    const snippet = usePromptStore.getState().addEntry({ kind: "snippet", name: "S", command: "s", content: "c" });
+    usePromptStore.getState().setDefaultPersona(snippet.id);
+    expect(usePromptStore.getState().defaultPersonaId).toBeNull();
+  });
+
+  it("no-ops for an unknown id", () => {
+    usePromptStore.getState().setDefaultPersona("ghost");
+    expect(usePromptStore.getState().defaultPersonaId).toBeNull();
   });
 });
 
