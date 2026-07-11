@@ -14,48 +14,78 @@ vi.mock("@tauri-apps/api/event", () => ({
   },
 }));
 
-import { useApiServerStore, DEFAULT_API_SERVER_STATUS, type ApiServerStatus } from "./apiServerStore";
+import {
+  useApiServerStore,
+  DEFAULT_API_SERVER_STATUS,
+  DEFAULT_API_SERVER_CONFIG,
+  type ApiServerConfig,
+  type ApiServerStatus,
+  type TokenEntry,
+} from "./apiServerStore";
 
 function makeStatus(overrides: Partial<ApiServerStatus> = {}): ApiServerStatus {
   return { ...DEFAULT_API_SERVER_STATUS, ...overrides };
+}
+
+function makeConfig(overrides: Partial<ApiServerConfig> = {}): ApiServerConfig {
+  return { ...DEFAULT_API_SERVER_CONFIG, ...overrides };
+}
+
+function makeToken(overrides: Partial<TokenEntry> = {}): TokenEntry {
+  return {
+    id: "tok-1",
+    label: "My IDE",
+    scopes: ["chat", "models"],
+    backends: ["local"],
+    created_at: 1700000000000,
+    last_used_at: null,
+    ...overrides,
+  };
 }
 
 beforeEach(() => {
   invokeMock.mockReset();
   useApiServerStore.setState({
     status: DEFAULT_API_SERVER_STATUS,
+    config: DEFAULT_API_SERVER_CONFIG,
+    tokens: [],
     loaded: false,
-    portInput: DEFAULT_API_SERVER_STATUS.port,
+    mintedToken: null,
   });
 });
 
 describe("apiServerStore.refresh", () => {
-  it("calls api_server_status and stores the result, syncing portInput", async () => {
-    const status = makeStatus({ status: "running", port: 4321, token: "lmk-abc" });
-    invokeMock.mockResolvedValueOnce(status);
+  it("fetches status, config, and tokens together", async () => {
+    const status = makeStatus({ status: "running", port: 4321 });
+    const config = makeConfig({ port: 4321, require_token: true });
+    const tokens = [makeToken()];
+    invokeMock.mockResolvedValueOnce(status).mockResolvedValueOnce(config).mockResolvedValueOnce(tokens);
 
     await useApiServerStore.getState().refresh();
 
-    expect(invokeMock).toHaveBeenCalledWith("api_server_status");
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "api_server_status");
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "api_server_get_config");
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "api_server_list_tokens");
     expect(useApiServerStore.getState().status).toEqual(status);
+    expect(useApiServerStore.getState().config).toEqual(config);
+    expect(useApiServerStore.getState().tokens).toEqual(tokens);
     expect(useApiServerStore.getState().loaded).toBe(true);
-    expect(useApiServerStore.getState().portInput).toBe(4321);
   });
 });
 
 describe("apiServerStore.start/stop", () => {
-  it("start invokes api_server_start with the given port and stores the returned status", async () => {
-    const status = makeStatus({ status: "running", port: 5555, token: "lmk-xyz" });
+  it("start invokes api_server_start with no args and stores the returned status", async () => {
+    const status = makeStatus({ status: "running", port: 5555 });
     invokeMock.mockResolvedValueOnce(status);
 
-    await useApiServerStore.getState().start(5555);
+    await useApiServerStore.getState().start();
 
-    expect(invokeMock).toHaveBeenCalledWith("api_server_start", { port: 5555 });
+    expect(invokeMock).toHaveBeenCalledWith("api_server_start");
     expect(useApiServerStore.getState().status).toEqual(status);
   });
 
   it("stop invokes api_server_stop and stores the returned status", async () => {
-    const status = makeStatus({ status: "stopped", token: null });
+    const status = makeStatus({ status: "stopped" });
     invokeMock.mockResolvedValueOnce(status);
 
     await useApiServerStore.getState().stop();
@@ -67,15 +97,57 @@ describe("apiServerStore.start/stop", () => {
   it("propagates a rejected start (e.g. a port-bind conflict) without silently swallowing it", async () => {
     invokeMock.mockRejectedValueOnce(new Error("Failed to bind 127.0.0.1:1234 — address in use"));
 
-    await expect(useApiServerStore.getState().start(1234)).rejects.toThrow("address in use");
+    await expect(useApiServerStore.getState().start()).rejects.toThrow("address in use");
   });
 });
 
-describe("apiServerStore.setPortInput", () => {
-  it("updates portInput without touching status", () => {
-    useApiServerStore.getState().setPortInput(9999);
-    expect(useApiServerStore.getState().portInput).toBe(9999);
-    expect(useApiServerStore.getState().status).toEqual(DEFAULT_API_SERVER_STATUS);
+describe("apiServerStore.setConfig", () => {
+  it("persists the config and stores exactly what the backend echoes back", async () => {
+    const updated = makeConfig({ port: 9999, expose_providers: true });
+    invokeMock.mockResolvedValueOnce(updated);
+
+    await useApiServerStore.getState().setConfig(updated);
+
+    expect(invokeMock).toHaveBeenCalledWith("api_server_set_config", { config: updated });
+    expect(useApiServerStore.getState().config).toEqual(updated);
+  });
+});
+
+describe("apiServerStore.createToken/revokeToken", () => {
+  it("createToken stores the minted plaintext once and appends the entry to the token list", async () => {
+    const entry = makeToken({ id: "tok-new", label: "New key" });
+    invokeMock.mockResolvedValueOnce({ token: "lmk-abcdef0123456789abcdef0123456789", entry });
+
+    await useApiServerStore.getState().createToken("New key", ["chat"], ["local"]);
+
+    expect(invokeMock).toHaveBeenCalledWith("api_server_create_token", {
+      label: "New key",
+      scopes: ["chat"],
+      backends: ["local"],
+    });
+    expect(useApiServerStore.getState().mintedToken).toEqual({
+      token: "lmk-abcdef0123456789abcdef0123456789",
+      entry,
+    });
+    expect(useApiServerStore.getState().tokens).toEqual([entry]);
+  });
+
+  it("revokeToken removes the entry from the local list on success", async () => {
+    useApiServerStore.setState({ tokens: [makeToken({ id: "a" }), makeToken({ id: "b" })] });
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await useApiServerStore.getState().revokeToken("a");
+
+    expect(invokeMock).toHaveBeenCalledWith("api_server_revoke_token", { id: "a" });
+    expect(useApiServerStore.getState().tokens.map((t) => t.id)).toEqual(["b"]);
+  });
+});
+
+describe("apiServerStore.dismissMintedToken", () => {
+  it("clears mintedToken without touching anything else", () => {
+    useApiServerStore.setState({ mintedToken: { token: "lmk-x", entry: makeToken() } });
+    useApiServerStore.getState().dismissMintedToken();
+    expect(useApiServerStore.getState().mintedToken).toBeNull();
   });
 });
 
