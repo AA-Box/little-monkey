@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// Shared with `prompts.rs`'s `prompt_entry_deserializes_canonical_fixture`
+// Rust test (which reads the same file via `include_str!`) — see the note
+// on the `it(...)` below that uses this.
+import canonicalEntryFixture from "../../src-tauri/fixtures/prompt-entry.canonical.json";
 
 const invokeMock = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -66,6 +70,26 @@ describe("updateEntry", () => {
     seed([{ id: "a", kind: "snippet", name: "A", command: "a", content: "c", createdAt: 1, updatedAt: 1 }]);
     usePromptStore.getState().updateEntry("ghost", { name: "New" });
     expect(usePromptStore.getState().entries[0].name).toBe("A");
+  });
+
+  it("clears defaultPersonaId when the default persona's kind is edited away from persona", () => {
+    const persona = usePromptStore.getState().addEntry({ kind: "persona", name: "P", command: "p", content: "c" });
+    usePromptStore.getState().setDefaultPersona(persona.id);
+
+    usePromptStore.getState().updateEntry(persona.id, { kind: "snippet" });
+
+    expect(usePromptStore.getState().defaultPersonaId).toBeNull();
+    expect(usePromptStore.getState().entries.find((e) => e.id === persona.id)?.kind).toBe("snippet");
+  });
+
+  it("leaves defaultPersonaId alone when patching an entry that isn't the default", () => {
+    const persona = usePromptStore.getState().addEntry({ kind: "persona", name: "P", command: "p", content: "c" });
+    const other = usePromptStore.getState().addEntry({ kind: "persona", name: "Q", command: "q", content: "c" });
+    usePromptStore.getState().setDefaultPersona(persona.id);
+
+    usePromptStore.getState().updateEntry(other.id, { kind: "snippet" });
+
+    expect(usePromptStore.getState().defaultPersonaId).toBe(persona.id);
   });
 });
 
@@ -146,21 +170,14 @@ describe("hydratePrompts", () => {
     expect(usePromptStore.getState().persistError).toBe("disk on fire");
   });
 
-  /** Canonical fixture also parsed by `prompts.rs`'s
-   * `prompt_entry_deserializes_canonical_fixture` Rust test — pins the
-   * TS<->Rust schema against drift, since `lm-cli` reads `PromptEntry`
-   * directly without going through this store at all. */
+  /** Reads the exact same file `prompts.rs`'s
+   * `prompt_entry_deserializes_canonical_fixture` Rust test reads via
+   * `include_str!` — a single shared fixture, not two independently
+   * hand-typed literals, is what actually pins the TS<->Rust schema against
+   * drift, since `lm-cli` reads `PromptEntry` directly without going
+   * through this store at all. */
   it("normalizes the same canonical entry the Rust unit test pins", async () => {
-    const canonicalEntry = {
-      id: "11111111-1111-4111-8111-111111111111",
-      kind: "persona",
-      name: "Code Reviewer",
-      command: "code-reviewer",
-      content: "You are a meticulous code reviewer.",
-      description: "Reviews diffs for bugs",
-      createdAt: 1700000000000,
-      updatedAt: 1700000000000,
-    };
+    const canonicalEntry = canonicalEntryFixture;
     invokeMock.mockImplementationOnce(async () =>
       JSON.stringify({ version: 1, entries: [canonicalEntry], defaultPersonaId: null, hasSeededDefaults: true })
     );
@@ -299,6 +316,38 @@ describe("importEntries", () => {
     expect(added).toBe(2);
     const commands = usePromptStore.getState().entries.map((e) => e.command).sort();
     expect(commands).toEqual(["dup", "dup-2"]);
+  });
+
+  it("terminates (rather than hanging) when a colliding command is already exactly 32 characters", () => {
+    // Regression test: appending "-2", "-3", ... to a 32-char base and then
+    // truncating the *whole* string back to 32 chars used to always cut off
+    // the entire suffix, reproducing the same 32-char string forever and
+    // hanging `uniqueCommand`'s retry loop. `withSuffix` now shortens the
+    // base instead, so this must return promptly with a genuinely different
+    // command.
+    const base = "a".repeat(32);
+    seed([{ id: "1", kind: "snippet", name: "Existing", command: base, content: "old", createdAt: 1, updatedAt: 1 }]);
+
+    const added = usePromptStore
+      .getState()
+      .importEntries([{ id: "x", kind: "snippet", name: "Incoming", command: base, content: "new", createdAt: 1, updatedAt: 1 }]);
+
+    expect(added).toBe(1);
+    const entries = usePromptStore.getState().entries;
+    const imported = entries.find((e) => e.name === "Incoming");
+    expect(imported?.command).not.toBe(base);
+    expect(imported?.command.length).toBeLessThanOrEqual(32);
+  });
+
+  it("caps an incoming command at 32 characters even when it doesn't collide with anything", () => {
+    const longCommand = "a".repeat(50);
+
+    const added = usePromptStore
+      .getState()
+      .importEntries([{ id: "x", kind: "snippet", name: "Incoming", command: longCommand, content: "c", createdAt: 1, updatedAt: 1 }]);
+
+    expect(added).toBe(1);
+    expect(usePromptStore.getState().entries[0].command).toBe("a".repeat(32));
   });
 });
 
