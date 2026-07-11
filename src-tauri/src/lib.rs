@@ -11,8 +11,16 @@ pub mod prompts;
 mod sessions;
 mod system;
 mod tools;
-mod permissions;
-// `pub` (not `mod`, like `permissions`/`sessions`/`tools`) so `lm-cli`
+// `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
+// `lm-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
+// call `permissions::path_risk_floor` directly for its own floor-only
+// `"smart"` mode — the same AppHandle-free-core reasoning as `web`/`rules`/
+// `memory`/`verify` above. Every other item in this module (the Tauri
+// commands, `PermissionState`, `request_permission`) stays reachable too,
+// but is only ever actually called from `main.rs`'s own Tauri app wiring,
+// not from `lm-cli`.
+pub mod permissions;
+// `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `lm-cli`
 // (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
 // from `little_monkey_lib`, the same way it already reuses `checkpoints`.
 pub mod rules;

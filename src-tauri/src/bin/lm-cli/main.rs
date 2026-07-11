@@ -70,7 +70,11 @@ struct Cli {
     local_url: Option<String>,
 
     /// Permission mode: manual (default, prompts every mutation),
-    /// acceptEdits, auto, or bypass. Matches the desktop app's modes.
+    /// acceptEdits, smart (auto-approves write_file/edit_file unless the
+    /// path is sensitive — see permissions::path_risk_floor — run_shell
+    /// always prompts), plan (read-only; call present_plan and approve at
+    /// its prompt to switch to acceptEdits), auto, or bypass. Matches the
+    /// desktop app's modes.
     #[arg(long, default_value = "manual", global = true)]
     permission_mode: String,
 

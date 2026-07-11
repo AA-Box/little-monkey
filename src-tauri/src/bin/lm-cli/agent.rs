@@ -7,6 +7,8 @@
 //! produces a plain answer with no tool calls, or after MAX_ITERATIONS round
 //! trips as a safety cap against a runaway/looping model.
 
+use std::io::Write;
+
 use little_monkey_lib::checkpoints;
 use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::verify::{self, VerifyResult};
@@ -17,7 +19,7 @@ use little_monkey_lib::AppState;
 use crate::checkpoints_cli;
 use crate::chat::{self, Target};
 use crate::mcp_cli;
-use crate::permission::TerminalPermissions;
+use crate::permission::{self, PermissionMode, TerminalPermissions};
 use crate::tools_cli;
 use crate::tools_def::{self, McpToolRegistry};
 use crate::verify_cli;
@@ -47,6 +49,15 @@ const DEFAULT_VERIFY_MAX_ROUNDS: u32 = 1;
 /// on each of stdout/stderr individually. Mirrors `agentLoop.ts`'s
 /// `VERIFY_NOTICE_OUTPUT_CAP`.
 const VERIFY_NOTICE_OUTPUT_CAP: usize = 8000;
+
+/// The tool-message content returned for a `present_plan` call — a Rust port
+/// of `turnEngine.ts`'s `PRESENT_PLAN_RESULT`. Deliberately a fixed literal,
+/// not anything derived from the model's own arguments: it only needs to end
+/// the model's turn cleanly, since the plan itself was already printed to
+/// the terminal (and the approve/keep-planning decision already made) by
+/// `present_plan` below before this is returned.
+const PRESENT_PLAN_RESULT: &str =
+    r#"{"status":"plan_presented","note":"Wait for the user to approve before doing anything else."}"#;
 
 /// The first failed command from a [`run_verification_phase`] pass — enough
 /// detail to build the feed-back-to-the-model fix instruction. Mirrors
@@ -173,6 +184,45 @@ fn preview(s: &str, max: usize) -> String {
     }
 }
 
+/// Prints the model's proposed plan to the terminal and prompts to approve
+/// switching from Plan Mode to Act mode — the terminal-side counterpart of
+/// the desktop app's `PlanCard` "Approve & start acting" button (see
+/// `src/components/Chat/PlanCard.tsx` and `agentLoop.ts`'s `PLAN_NOTE_PREFIX`
+/// notice/`lastActMode`). There is no persisted transcript notice or
+/// `lastActMode` setting here — the CLI's `history` is in-memory only and has
+/// no settings store to remember a preferred act mode in — so an approval
+/// always switches to `PermissionMode::AcceptEdits`, the same mode the
+/// desktop app's `lastActMode` itself defaults to before a user ever manually
+/// picks a different one. Anything other than y/yes leaves the mode at
+/// `Plan`, exactly like the GUI's "Keep planning" button.
+async fn present_plan(perms: &mut TerminalPermissions, args: &serde_json::Value) {
+    let title = args["title"].as_str().unwrap_or("(untitled plan)");
+    let plan = args["plan"].as_str().unwrap_or_default();
+    let open_questions: Vec<&str> = args["open_questions"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    println!("\n=== Plan: {title} ===\n{plan}");
+    if !open_questions.is_empty() {
+        println!("\nOpen questions:");
+        for question in &open_questions {
+            println!("  - {question}");
+        }
+    }
+
+    print!("\nApprove plan and switch to act mode? [y/N]: ");
+    std::io::stdout().flush().ok();
+    let answer = permission::read_line_blocking().await.trim().to_lowercase();
+
+    if answer == "y" || answer == "yes" {
+        perms.set_mode(PermissionMode::AcceptEdits);
+        println!("Switched to acceptEdits mode — mutating tools will now run without a plan-mode block.");
+    } else {
+        println!("Still in Plan Mode.");
+    }
+}
+
 /// Executes a single model-requested tool call, returning the string to use
 /// as the resulting `tool` message's content. Never propagates an error as
 /// a hard failure — the model sees it as a JSON `{"error": ...}` payload
@@ -199,6 +249,25 @@ async fn execute_tool_call(
             }
         }
     };
+
+    // `present_plan` is a frontend/terminal-only tool (see `tools_def.rs`'s
+    // `present_plan_tool_def` doc comment): it never dispatches to any
+    // `tool_<name>` command, checked BEFORE the mcp__/tool_<name> dispatch
+    // below just like `turnEngine.ts`'s `executeToolCall` checks it before
+    // its own `invoke` dispatch. Guarded on the CURRENT mode (not just
+    // whether it happened to be offered this turn) so a model that
+    // hallucinates the name outside Plan Mode can't flip it — the same
+    // "only offered while mode==='plan'" boundary the GUI enforces via
+    // `isToolCallAllowed`, just checked here at dispatch time instead of a
+    // separate offered-tools allowlist.
+    if name == "present_plan" {
+        return if perms.mode() != PermissionMode::Plan {
+            serde_json::json!({ "error": "present_plan is only available in Plan Mode." }).to_string()
+        } else {
+            present_plan(perms, &args).await;
+            PRESENT_PLAN_RESULT.to_string()
+        };
+    }
 
     // `mcp__<serverId>__<toolName>`-named calls dispatch to the connected
     // MCP server via `mcp_cli::call` instead of the `tool_<name>` switch
@@ -454,7 +523,15 @@ async fn run_tool_loop(
     // attempt within it): the connected server set doesn't change mid-turn,
     // so there's no need to re-read `state.mcp` on every iteration below.
     let (tools, mcp_registry) = tools_def::merged_tool_definitions(state, mcp_entries).await;
-    let tools_vec: Vec<serde_json::Value> = tools.as_array().cloned().unwrap_or_default();
+    let mut tools_vec: Vec<serde_json::Value> = tools.as_array().cloned().unwrap_or_default();
+    // `present_plan` is offered only in Plan Mode — read once per turn (like
+    // `agentLoop.ts`'s own `toolsForTurn(mode)` snapshot), not re-checked on
+    // every iteration below, so an approval mid-turn simply leaves it listed
+    // (but dispatch-blocked, see `execute_tool_call`) for the rest of this
+    // turn rather than disappearing out from under an in-flight model reply.
+    if perms.mode() == PermissionMode::Plan {
+        tools_vec.push(tools_def::present_plan_tool_def());
+    }
     let native = target.is_native();
 
     // Absolute (or workspace-relative, as given by the model) paths this
@@ -589,6 +666,34 @@ mod tests {
             stderr: stderr.to_string(),
             duration_ms: 42,
             timed_out,
+        }
+    }
+
+    /// `present_plan` must refuse to run (and, crucially, never touch stdin)
+    /// outside Plan Mode — otherwise a model that hallucinates the tool name
+    /// in, say, `"auto"` mode could pop an unexpected "switch to act mode?"
+    /// prompt. Every other mode used here is asserted, not just `"manual"`,
+    /// so a future mode addition can't silently widen the guard by accident.
+    #[tokio::test]
+    async fn present_plan_is_rejected_outside_plan_mode() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let args = r#"{"title":"t","plan":"p"}"#;
+
+        for mode in [
+            PermissionMode::Manual,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Smart,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            let mut perms = TerminalPermissions::new(mode);
+            let content = execute_tool_call(&state, &mut perms, "present_plan", args, None, &[], &registry).await;
+            let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(parsed["error"].as_str().unwrap().contains("Plan Mode"), "mode {mode:?} should reject present_plan");
+            // The guard must reject BEFORE flipping anything — mode stays
+            // exactly what it was.
+            assert_eq!(perms.mode(), mode);
         }
     }
 
