@@ -12,6 +12,7 @@
 import { useWorkspaceStore } from '../store/workspaceStore';
 import { useRulesStore, type MemoryFact, type RuleFile } from '../store/rulesStore';
 import { useMcpStore } from '../store/mcpStore';
+import { usePromptStore, type PromptEntry } from '../store/promptStore';
 
 /** A connected MCP server's label + `initialize`-result instructions —
  * mirrors the subset of `McpServerInfo` (mcpStore.ts) that
@@ -56,6 +57,47 @@ export function detectOsLabel(platform: string): string {
  * can tell a global preference from a per-root one. */
 function ruleProvenance(rule: RuleFile): string {
   return rule.scope === 'global' ? 'From global:' : `From project (${rule.label}):`;
+}
+
+/** The subset of a persona `PromptEntry` (see `promptStore.ts`) that
+ * `composeSystemPrompt` actually needs — just enough to render the section
+ * header and body, not the whole record (command/description/timestamps are
+ * irrelevant here). */
+export interface ActivePersona {
+  name: string;
+  content: string;
+}
+
+/**
+ * Appends a clearly-delimited "## Active persona: <name>" section after
+ * `base` — APPENDS, never replaces, because `base` carries load-bearing
+ * sandbox/tool/permission guidance a user- or import-authored persona must
+ * not be able to silently drop (see the design doc's risk note). `persona`
+ * is `null` when the session has no active persona (or its `personaId`
+ * didn't resolve — see `resolvePersona`), in which case `base` is returned
+ * unchanged. Pure and synchronous, same "buildSystemPrompt is pure so it can
+ * be unit-tested" rationale as the rest of this module — this is the same
+ * sectioned-append convention `buildSystemPrompt` already uses for the
+ * MONKEY.md rules/facts/MCP sections below, just applied on top of its
+ * output instead of inside it.
+ */
+export function composeSystemPrompt(base: string, persona: ActivePersona | null): string {
+  if (!persona) return base;
+  return [base, '', `## Active persona: ${persona.name}`, persona.content].join('\n');
+}
+
+/**
+ * Resolves a session's `ChatSession.personaId` against the prompt library's
+ * current entries. Returns `null` for no persona (`personaId` is `null`) and
+ * also `null` — never throws — when `personaId` doesn't match a saved
+ * `kind: "persona"` entry, e.g. the persona was deleted after the session
+ * started pointing at it (a dangling reference); `composeSystemPrompt` then
+ * simply gets `null` and the base prompt is used as-is.
+ */
+export function resolvePersona(entries: PromptEntry[], personaId: string | null): ActivePersona | null {
+  if (!personaId) return null;
+  const entry = entries.find((e) => e.id === personaId && e.kind === 'persona');
+  return entry ? { name: entry.name, content: entry.content } : null;
 }
 
 export function buildSystemPrompt(
@@ -148,8 +190,12 @@ export function buildSystemPrompt(
   ].join('\n');
 }
 
-/** The system prompt for the app's current workspace state. */
-export function currentSystemPrompt(): string {
+/** The system prompt for the app's current workspace state, with `personaId`
+ * (a session's `ChatSession.personaId`, or `null` for none) composed on top
+ * via `composeSystemPrompt`/`resolvePersona`. Called once per agent-loop
+ * iteration (see `agentLoop.ts`), so a persona switched mid-turn — or a
+ * persona deleted out from under a session — is always resolved fresh. */
+export function currentSystemPrompt(personaId: string | null = null): string {
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
   const { rules, facts } = useRulesStore.getState();
@@ -161,5 +207,7 @@ export function currentSystemPrompt(): string {
     .getState()
     .servers.filter((server) => server.status === 'connected' && !!server.instructions?.trim())
     .map((server) => ({ label: server.label, instructions: server.instructions as string }));
-  return buildSystemPrompt(roots, osLabel, rules, facts, mcpServers);
+  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers);
+  const persona = resolvePersona(usePromptStore.getState().entries, personaId);
+  return composeSystemPrompt(base, persona);
 }

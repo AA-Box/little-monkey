@@ -402,7 +402,7 @@ export const es419: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "Nuevo prompt",
   "PromptLibraryPanel.editHeading": "Editar prompt",
   "PromptLibraryPanel.kindSnippetLabel": "Snippet (se inserta en el campo de mensaje)",
-  "PromptLibraryPanel.kindPersonaLabel": "Persona (próximamente — aún no se aplica a la conversación)",
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (moldea toda la conversación mediante el prompt del sistema)",
   "PromptLibraryPanel.namePlaceholder": "Nombre, p. ej. \"Revisor de código\"",
   "PromptLibraryPanel.commandPlaceholder": "comando-slash",
   "PromptLibraryPanel.contentPlaceholder": "El texto del prompt o snippet…",
@@ -418,5 +418,8 @@ export const es419: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "El contenido es obligatorio.",
   "SlashCommandAutocomplete.noMatches": "No hay prompts coincidentes",
   "SlashCommandAutocomplete.personaBadge": "Persona",
-  "SlashCommandAutocomplete.snippetBadge": "Snippet"
+  "SlashCommandAutocomplete.snippetBadge": "Snippet",
+  "PersonaSelector.noneLabel": "Ninguna",
+  "PersonaSelector.emptyState": "Aún no hay personas guardadas — agrega una en la pestaña Prompts.",
+  "PersonaSelector.managePromptsLabel": "Administrar prompts…"
 };

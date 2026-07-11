@@ -5,6 +5,7 @@ import { PanelRight, PanelRightClose, X } from "lucide-react";
 import { ChatSessionList, ChatWindow } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { SettingsModal } from "./components/Settings";
+import type { SettingsTab } from "./components/Settings";
 import { FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
@@ -54,6 +55,16 @@ function App() {
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Tab Settings should jump to the moment it opens — set alongside
+  // `settingsOpen` by anything that deep-links into a specific tab (right
+  // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
+  // for the normal "open on whatever tab was last active" path (AppMenu).
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>(undefined);
+
+  const handleManagePrompts = useCallback(() => {
+    setSettingsInitialTab("prompts");
+    setSettingsOpen(true);
+  }, []);
 
   useEffect(() => {
     void refreshRoots();
@@ -120,7 +131,7 @@ function App() {
       <div className="flex min-w-0 flex-1 flex-col">
         <div data-tauri-drag-region className="h-11 shrink-0" />
         <SessionGrantBanner />
-        <ChatWindow sessionId={activeSessionId} />
+        <ChatWindow sessionId={activeSessionId} onManagePrompts={handleManagePrompts} />
       </div>
 
       {/* Split pane: a second, fully independent chat opened via the session
@@ -137,7 +148,7 @@ function App() {
               <X size={16} />
             </IconButton>
           </div>
-          <ChatWindow sessionId={splitSessionId} />
+          <ChatWindow sessionId={splitSessionId} onManagePrompts={handleManagePrompts} />
         </div>
       )}
 
@@ -205,7 +216,7 @@ function App() {
       </aside>
 
       <PermissionModal />
-      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} initialTab={settingsInitialTab} />
     </div>
   );
 }

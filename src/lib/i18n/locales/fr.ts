@@ -402,7 +402,7 @@ export const fr: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "Nouveau prompt",
   "PromptLibraryPanel.editHeading": "Modifier le prompt",
   "PromptLibraryPanel.kindSnippetLabel": "Extrait (inséré dans la zone de saisie)",
-  "PromptLibraryPanel.kindPersonaLabel": "Persona (bientôt disponible — pas encore appliqué à la conversation)",
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (façonne toute la conversation via le prompt système)",
   "PromptLibraryPanel.namePlaceholder": "Nom, ex. « Relecteur de code »",
   "PromptLibraryPanel.commandPlaceholder": "commande-slash",
   "PromptLibraryPanel.contentPlaceholder": "Le texte du prompt ou de l'extrait…",
@@ -418,5 +418,8 @@ export const fr: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "Le contenu est requis.",
   "SlashCommandAutocomplete.noMatches": "Aucun prompt correspondant",
   "SlashCommandAutocomplete.personaBadge": "Persona",
-  "SlashCommandAutocomplete.snippetBadge": "Extrait"
+  "SlashCommandAutocomplete.snippetBadge": "Extrait",
+  "PersonaSelector.noneLabel": "Aucune",
+  "PersonaSelector.emptyState": "Aucune persona enregistrée — ajoutez-en une dans l'onglet Prompts.",
+  "PersonaSelector.managePromptsLabel": "Gérer les prompts…"
 };

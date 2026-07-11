@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The store persists through Tauri IPC and subscribes to window events on
-// hydrate — none of which exists under vitest's node environment.
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
+// hydrate — none of which exists under vitest's node environment. `invoke`
+// forwards to a reassignable mock (rather than a fixed inline `vi.fn`) so
+// individual tests below can make `sessions_load` return a specific blob,
+// same pattern as `promptStore.test.ts`.
+const invokeMock = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
-import { useSessionStore, type ChatSession } from "./sessionStore";
+import { hydrateSessions, useSessionStore, type ChatSession } from "./sessionStore";
 
 function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSession {
   const now = Date.now();
@@ -21,6 +25,7 @@ function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSess
     archived: false,
     groupId: null,
     workspacePath: null,
+    personaId: null,
     ...overrides,
   };
 }
@@ -40,7 +45,11 @@ function seed(...extra: ChatSession[]): void {
   });
 }
 
-beforeEach(() => seed());
+beforeEach(() => {
+  invokeMock.mockReset();
+  invokeMock.mockImplementation(async () => null);
+  seed();
+});
 
 describe("openSplit", () => {
   it("opens another session in the split pane and clears its unread flag", () => {
@@ -126,5 +135,54 @@ describe("transcript mutations with a split pane open", () => {
     useSessionStore.getState().deleteSession("b");
     useSessionStore.getState().addMessage("b", { role: "user", content: "ghost" });
     expect(useSessionStore.getState().sessions.some((s) => s.id === "b")).toBe(false);
+  });
+});
+
+describe("setSessionPersona", () => {
+  it("sets the persona id for the given session", () => {
+    useSessionStore.getState().setSessionPersona("a", "persona-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.personaId).toBe("persona-1");
+  });
+
+  it("clears the persona with null", () => {
+    useSessionStore.getState().setSessionPersona("a", "persona-1");
+    useSessionStore.getState().setSessionPersona("a", null);
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.personaId).toBeNull();
+  });
+
+  it("only affects the targeted session", () => {
+    useSessionStore.getState().setSessionPersona("a", "persona-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.personaId).toBeNull();
+  });
+});
+
+describe("hydrateSessions persona default", () => {
+  it("defaults personaId to null for a persisted session predating the field", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            // No `personaId` field at all — simulates a blob saved before
+            // this feature existed.
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.personaId).toBeNull();
   });
 });

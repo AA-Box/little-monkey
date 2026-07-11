@@ -402,7 +402,7 @@ export const ko: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "새 프롬프트",
   "PromptLibraryPanel.editHeading": "프롬프트 편집",
   "PromptLibraryPanel.kindSnippetLabel": "스니펫(입력창에 삽입됨)",
-  "PromptLibraryPanel.kindPersonaLabel": "페르소나(출시 예정 — 아직 대화에 적용되지 않음)",
+  "PromptLibraryPanel.kindPersonaLabel": "페르소나(시스템 프롬프트를 통해 대화 전체에 적용됩니다)",
   "PromptLibraryPanel.namePlaceholder": "이름, 예: \"코드 리뷰어\"",
   "PromptLibraryPanel.commandPlaceholder": "슬래시 명령어",
   "PromptLibraryPanel.contentPlaceholder": "프롬프트 또는 스니펫 텍스트…",
@@ -418,5 +418,8 @@ export const ko: Record<string, string> = {
   "PromptLibraryPanel.contentRequiredError": "내용은 필수입니다.",
   "SlashCommandAutocomplete.noMatches": "일치하는 프롬프트가 없습니다",
   "SlashCommandAutocomplete.personaBadge": "페르소나",
-  "SlashCommandAutocomplete.snippetBadge": "스니펫"
+  "SlashCommandAutocomplete.snippetBadge": "스니펫",
+  "PersonaSelector.noneLabel": "없음",
+  "PersonaSelector.emptyState": "저장된 페르소나가 아직 없습니다 — 프롬프트 탭에서 추가하세요.",
+  "PersonaSelector.managePromptsLabel": "프롬프트 관리…"
 };
