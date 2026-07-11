@@ -6,12 +6,13 @@ import { ChatSessionList, ChatWindow } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
-import { FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
+import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { useWorkspaceStore } from "./store/workspaceStore";
 import { useModelStore } from "./store/modelStore";
 import { useMcpStore } from "./store/mcpStore";
+import { useArtifactStore } from "./store/artifactStore";
 import { useT } from "./lib/i18n";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
@@ -49,6 +50,7 @@ function App() {
   const refreshProviders = useModelStore((s) => s.refreshProviders);
   const refreshMcp = useMcpStore((s) => s.refresh);
   const connectMcp = useMcpStore((s) => s.connect);
+  const activeArtifact = useArtifactStore((s) => s.active);
 
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
@@ -96,6 +98,13 @@ function App() {
   useEffect(() => {
     setSelectedFile(null);
   }, [rootsVersion]);
+
+  // Clicking "Preview" on a code fence should actually reveal the pane, even
+  // if the user had collapsed it — otherwise `artifactStore.open()` would
+  // silently do nothing visible.
+  useEffect(() => {
+    if (activeArtifact) setWorkspacePanelOpen(true);
+  }, [activeArtifact]);
 
   const handleSelectFile = useCallback((path: string, content: string) => {
     setSelectedFile({ path, original: content, current: content });
@@ -178,7 +187,9 @@ function App() {
           </IconButton>
         </div>
 
-        {workspacePanelOpen && (
+        {workspacePanelOpen && (activeArtifact ? (
+          <ArtifactPane />
+        ) : (
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="min-h-0 flex-[3] border-b border-border">
               <FileTree key={rootsVersion} onSelectFile={handleSelectFile} />
@@ -215,7 +226,7 @@ function App() {
               </div>
             </div>
           </div>
-        )}
+        ))}
       </aside>
 
       <PermissionModal />

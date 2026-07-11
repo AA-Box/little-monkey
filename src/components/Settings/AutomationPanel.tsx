@@ -204,6 +204,10 @@ export function AutomationPanel() {
   const setVerifyEnabled = useSettingsStore((s) => s.setVerifyEnabled);
   const verifyMaxRounds = useSettingsStore((s) => s.verifyMaxRounds);
   const setVerifyMaxRounds = useSettingsStore((s) => s.setVerifyMaxRounds);
+  const artifactScriptsEnabled = useSettingsStore((s) => s.artifactScriptsEnabled);
+  const setArtifactScriptsEnabled = useSettingsStore((s) => s.setArtifactScriptsEnabled);
+  const artifactAutoPreview = useSettingsStore((s) => s.artifactAutoPreview);
+  const setArtifactAutoPreview = useSettingsStore((s) => s.setArtifactAutoPreview);
   const riskAnnotationsEnabled = useSettingsStore((s) => s.riskAnnotationsEnabled);
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
 
@@ -352,6 +356,24 @@ export function AutomationPanel() {
             onChange={setRiskAnnotationsEnabled}
             label={t("AutomationPanel.riskAnnotationsLabel")}
             description={t("AutomationPanel.riskAnnotationsDescription")}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.artifactsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={artifactScriptsEnabled}
+            onChange={setArtifactScriptsEnabled}
+            label={t("AutomationPanel.artifactScriptsEnabledLabel")}
+            description={t("AutomationPanel.artifactScriptsEnabledDescription")}
+          />
+          <Toggle
+            checked={artifactAutoPreview}
+            onChange={setArtifactAutoPreview}
+            label={t("AutomationPanel.artifactAutoPreviewLabel")}
+            description={t("AutomationPanel.artifactAutoPreviewDescription")}
           />
         </div>
       </section>

@@ -1,3 +1,9 @@
+// `pub` so a future `lm-cli` parity command (matching `checkpoints`/`rules`/
+// `memory`/`web`/`verify` above) could reuse `publish_impl`/`remove_impl`
+// directly — no such command exists yet (rendering has no terminal surface,
+// per the design doc's phase-4 note), but there's no reason to make this one
+// module-private when every sibling with reusable core logic already isn't.
+pub mod artifacts;
 pub mod checkpoints;
 mod git;
 mod llama;
@@ -131,6 +137,11 @@ pub struct AppState {
     /// both load the same "before" file and the later save silently
     /// clobbers the earlier one's change.
     pub api_server_config_lock: std::sync::Mutex<()>,
+    /// Published tier-2 (interactive HTML) artifacts, keyed by a
+    /// server-generated uuid — served by the `artifact://` custom protocol
+    /// registered below. See `artifacts.rs`'s module doc for the full
+    /// security model; content lives only here in memory, never on disk.
+    pub artifacts: std::sync::Mutex<std::collections::HashMap<String, artifacts::PublishedArtifact>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -141,6 +152,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
+        // Tier-2 interactive-artifact protocol — serves a previously
+        // `artifact_publish`-ed document by id with a strict per-document
+        // CSP (`connect-src 'none'`, no capability granted to this scheme —
+        // see `artifacts.rs`'s module doc for the full security argument).
+        // The frontend's consuming iframe uses `sandbox="allow-scripts"`
+        // WITHOUT `allow-same-origin`, so this protocol is never reachable
+        // with IPC/cookies/storage regardless of what it serves.
+        .register_uri_scheme_protocol("artifact", |ctx, request| {
+            artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
+        })
         .setup(|app| {
             // Autostart the local API server if `api_server.json` says to —
             // the only reader of that file at launch time, since every
@@ -233,6 +254,8 @@ pub fn run() {
             checkpoints::checkpoint_revert,
             checkpoints::checkpoint_reapply,
             checkpoints::checkpoint_list,
+            artifacts::artifact_publish,
+            artifacts::artifact_remove,
             workspace::set_primary_workspace_root,
             workspace::add_secondary_workspace_root,
             workspace::remove_secondary_workspace_root,

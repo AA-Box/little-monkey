@@ -9,3 +9,5 @@ export { PermissionModal } from "./PermissionModal";
 export { SessionGrantBanner } from "./SessionGrantBanner";
 
 export { WorkspaceBar } from "./WorkspaceBar";
+
+export { ArtifactPane } from "./ArtifactPane";

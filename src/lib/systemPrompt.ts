@@ -132,7 +132,16 @@ export function buildSystemPrompt(
   // (and test) that doesn't pass it still gets via the default. Read once
   // per turn by `currentSystemPrompt`, same as every other store snapshot
   // in this module.
-  mode: PermissionMode = 'manual'
+  mode: PermissionMode = 'manual',
+  // Whether to nudge the model toward tagging previewable code fences (see
+  // `src/lib/artifacts.ts`'s fence-detection scheme). Defaults to `true`
+  // since there's no settings toggle gating this in phase 1 — kept as a
+  // parameter anyway (rather than an unconditional line) purely to match
+  // this module's established "conditional guidance line" pattern
+  // (`webToolsLines`/`verifyGuidanceLines` below), so a later phase can wire
+  // in a real toggle (or turn it off in plan mode, say) without changing
+  // this function's shape again.
+  artifactGuidanceAvailable: boolean = true
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -211,6 +220,19 @@ export function buildSystemPrompt(
     ? ['', 'Configured verification commands run automatically after your edits; fix any failures they report.']
     : [];
 
+  // One conditional line telling the model that a complete HTML page, SVG
+  // image, or Mermaid diagram gets a live preview when tagged appropriately
+  // — model-agnostic nudging, not a protocol requirement: small local models
+  // that ignore this still just render as an ordinary code block (see
+  // `artifacts.ts`'s module doc comment for why this is fence-detection
+  // rather than a bespoke tag protocol).
+  const artifactGuidanceLines = artifactGuidanceAvailable
+    ? [
+        '',
+        'When producing a complete HTML page, SVG image, or Mermaid diagram, put it in a single fenced code block tagged html/svg/mermaid so it can be previewed.',
+      ]
+    : [];
+
   // Plan Mode instructs the model to investigate read-only and present a
   // structured plan instead of acting — the actual enforcement is the
   // backend hard block (mode_short_circuit in permissions.rs), this is just
@@ -246,6 +268,7 @@ export function buildSystemPrompt(
     ...rememberGuidanceLines,
     ...webToolsLines,
     ...verifyGuidanceLines,
+    ...artifactGuidanceLines,
     ...planModeLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
