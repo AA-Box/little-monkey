@@ -131,7 +131,12 @@ fn providers_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(base.join("providers.json"))
 }
 
-fn read_custom_providers(app: &AppHandle) -> Result<Vec<CustomProviderEntry>, String> {
+/// `pub` so `server.rs`'s local API server (phase 3) can build its
+/// provider-id routing catalog (presets + custom, via
+/// [`providers_list_presets`] + this) without duplicating the
+/// `providers.json` parsing logic — same file, same shape, no behavior
+/// change.
+pub fn read_custom_providers(app: &AppHandle) -> Result<Vec<CustomProviderEntry>, String> {
     let path = providers_file_path(app)?;
     if !path.exists() {
         return Ok(Vec::new());
@@ -257,23 +262,36 @@ fn unique_slug(label: &str, existing: &HashSet<String>) -> String {
     unreachable!("HashSet::contains cannot fail for every n");
 }
 
+/// Anthropic's native API additionally expects `x-api-key` +
+/// `anthropic-version` alongside (or instead of) a bearer token — a no-op
+/// for every other provider, whose OpenAI-compatible surfaces just ignore
+/// unrecognized headers. Factored out of [`fetch_models`]/[`build_chat_request`]
+/// (both applied the same two headers inline) so `server.rs`'s local API
+/// server (phase 3) can apply the identical quirk to an arbitrary
+/// already-OpenAI-shaped body it forwards verbatim, without duplicating the
+/// header names/version string in a third place. `pub` for that reuse; no
+/// behavior change to either existing call site.
+pub fn add_anthropic_headers(request: reqwest::RequestBuilder, provider_id: &str, api_key: &str) -> reqwest::RequestBuilder {
+    if provider_id == "anthropic" {
+        request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request
+    }
+}
+
 /// GETs `${base_url}/models` and parses the OpenAI-style `data[].id` list.
-/// Anthropic's native `/models` endpoint additionally expects `x-api-key`
-/// + `anthropic-version` alongside (or instead of) a bearer token, so those
-/// are sent too when `provider_id == "anthropic"` — harmless extra headers
-/// for every other provider.
-async fn fetch_models(
+/// `pub` so `server.rs`'s `GET /v1/models` (phase 3) can list cloud provider
+/// models the same keychain-authed way `providers_list_models` already does
+/// — no behavior change.
+pub async fn fetch_models(
     base_url: &str,
     provider_id: &str,
     api_key: &str,
 ) -> Result<Vec<ProviderModelInfo>, String> {
     let client = reqwest::Client::new();
-    let mut request = client.get(format!("{base_url}/models")).bearer_auth(api_key);
-    if provider_id == "anthropic" {
-        request = request
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
-    }
+    let request = add_anthropic_headers(client.get(format!("{base_url}/models")).bearer_auth(api_key), provider_id, api_key);
 
     let response = request
         .send()
@@ -574,15 +592,8 @@ pub fn build_chat_request(
         }
     }
 
-    let mut request = client.post(format!("{base_url}/chat/completions")).bearer_auth(api_key).json(&body);
-
-    if provider_id == "anthropic" {
-        request = request
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
-    }
-
-    request
+    let request = client.post(format!("{base_url}/chat/completions")).bearer_auth(api_key).json(&body);
+    add_anthropic_headers(request, provider_id, api_key)
 }
 
 async fn run_stream_chat(

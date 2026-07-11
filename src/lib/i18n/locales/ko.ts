@@ -164,6 +164,8 @@ export const ko: Record<string, string> = {
   "ModelManager.noModelsAvailable": "사용 가능한 모델이 없습니다.",
   "ModelManager.customLocalModels": "사용자 지정 로컬 모델",
   "ModelManager.addCustomModel": "사용자 지정 모델 추가",
+  "ModelManager.embeddingsToggleLabel": "임베딩 지원과 함께 시작",
+  "ModelManager.embeddingsToggleDescription": "llama-server를 --embeddings 옵션과 함께 실행하여 로컬 API 서버가 이 모델에 대해 POST /v1/embeddings를 제공할 수 있도록 합니다. 변경 사항을 적용하려면 모델을 다시 시작하세요.",
   "OllamaImportForm.description": "로컬 GGUF 파일 또는 Safetensors 폴더를 Ollama로 가져오기",
   "OllamaImportForm.pickGgufButton": "GGUF 파일…",
   "OllamaImportForm.pickSafetensorsButton": "Safetensors 폴더…",

@@ -164,6 +164,8 @@ export const hi: Record<string, string> = {
   "ModelManager.noModelsAvailable": "कोई मॉडल उपलब्ध नहीं है।",
   "ModelManager.customLocalModels": "कस्टम लोकल मॉडल",
   "ModelManager.addCustomModel": "कस्टम मॉडल जोड़ें",
+  "ModelManager.embeddingsToggleLabel": "एम्बेडिंग समर्थन के साथ शुरू करें",
+  "ModelManager.embeddingsToggleDescription": "llama-server को --embeddings के साथ लॉन्च करता है, ताकि लोकल API सर्वर इस मॉडल के लिए POST /v1/embeddings दे सके। बदलाव लागू करने के लिए मॉडल को फिर से शुरू करें।",
   "OllamaImportForm.description": "Ollama में कोई लोकल GGUF फ़ाइल या Safetensors फ़ोल्डर आयात करें",
   "OllamaImportForm.pickGgufButton": "GGUF फ़ाइल…",
   "OllamaImportForm.pickSafetensorsButton": "Safetensors फ़ोल्डर…",

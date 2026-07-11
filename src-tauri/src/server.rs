@@ -1,14 +1,17 @@
-//! Local OpenAI-compatible API server (phases 1-2 of the local-model-hub
+//! Local OpenAI-compatible API server (phases 1-3 of the local-model-hub
 //! roadmap item — see `docs/roadmap/p1-local-api-server.md`).
 //!
 //! This is a *routing reverse proxy*, not a new inference engine: it runs a
 //! small hyper-1 HTTP server on a tokio task, bound to `127.0.0.1` only (no
 //! LAN bind — that's an explicitly later, separately-gated phase), and
-//! exposes exactly four routes:
+//! exposes exactly five routes:
 //!
 //!   - `GET  /health`              — unauthenticated liveness probe
 //!   - `GET  /v1/models`           — merged list of servable models
-//!   - `POST /v1/chat/completions` — proxies to llama-server or Ollama
+//!   - `POST /v1/chat/completions` — proxies to llama-server, Ollama, or a
+//!                                   keychain-configured cloud provider
+//!   - `POST /v1/embeddings`       — proxies to Ollama, or to llama-server
+//!                                   only if it was started with `--embeddings`
 //!   - `OPTIONS /v1/*`             — CORS preflight (unauthenticated)
 //!   - everything else            — `404`
 //!
@@ -32,7 +35,32 @@
 //! `api_server.json` as a SHA-256 digest only — the plaintext never touches
 //! disk. Each token carries its own [`Scope`] (which routes it may call) and
 //! [`Backend`] (which upstream it may be routed to) restrictions, enforced
-//! per request in [`handle_models`]/[`handle_chat_completions`].
+//! per request in [`handle_models`]/[`handle_chat_completions`]/
+//! [`handle_embeddings`] — critically, a token missing `Backend::Providers`
+//! is rejected with `403` before a cloud-routed request is ever sent, even
+//! when `expose_providers` is globally on (the global toggle and the
+//! per-token scope are two independent gates, both must pass).
+//!
+//! Cloud provider routing (phase 3): `"{provider_id}/{model_id}"` ids route
+//! through `providers::read_key` (keychain) + `providers::resolve_base_url`/
+//! `providers::providers_list_presets`/`providers::read_custom_providers`
+//! (base URL resolution) — reused verbatim, unmodified. One deviation from
+//! the design doc's "drive `build_chat_request` verbatim" wording: that
+//! helper reconstructs a narrow messages/tools/effort-only request body and
+//! always forces `stream: true`, tailored to its one existing caller (the
+//! app's own internal streaming chat proxy in `providers.rs`). An external
+//! OpenAI-compatible client hitting this server sends an already-complete
+//! OpenAI-shaped body — including its own `stream: false`/`true` choice and
+//! whatever extra sampling parameters it wants — and dropping those to
+//! reuse `build_chat_request`'s fixed shape would silently break both.
+//! [`handle_chat_completions`] instead forwards the caller's body verbatim
+//! (only rewriting the `model` field from `"{provider_id}/{model_id}"` to
+//! the bare `model_id`) and reuses `providers::add_anthropic_headers` — a
+//! small helper factored out of `build_chat_request`'s/`fetch_models`'s
+//! previously-duplicated x-api-key/anthropic-version header logic — for the
+//! same Anthropic quirk. See [`ModelRoute::Providers`] and the comment at
+//! its construction site in [`handle_chat_completions`] for the full
+//! reasoning.
 //!
 //! Hot vs. restart-gated config: [`ServerRuntime`] snapshots `require_token`/
 //! `expose_ollama`/`expose_providers`/the bound port once, at
@@ -67,7 +95,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::{ollama, AppState};
+use crate::{ollama, providers, AppState};
 
 /// LM Studio-compatible default port, so drop-in clients that hardcode 1234
 /// need no configuration at all.
@@ -395,26 +423,52 @@ pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), Str
 // Model-id routing (pure, no I/O — directly unit-testable)
 // ---------------------------------------------------------------------
 
-/// Which upstream a `POST /v1/chat/completions` request's `model` field
-/// should be routed to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which upstream a `POST /v1/chat/completions` (or `/v1/embeddings`)
+/// request's `model` field should be routed to. `Providers` carries the
+/// split-out `"{provider_id}/{model_id}"` halves so the handler never has
+/// to re-parse the original id.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelRoute {
     Llama,
     Ollama,
+    Providers { provider_id: String, model_id: String },
     Unknown,
+}
+
+/// A configured cloud provider's routing-relevant fields — `id` (used to
+/// match a `"{provider_id}/..."` model id and to key `providers::read_key`)
+/// and `base_url` (where its `/chat/completions`/`/models` live). Built once
+/// per request from `providers::providers_list_presets` + the app's
+/// `providers.json` custom list — see [`build_provider_catalog`]. Never
+/// carries a key or a `has_key` probe: whether a provider is *usable* is
+/// decided lazily via `providers::read_key` at the point of use, not here —
+/// same "routing decision is separate from credential availability" stance
+/// [`route_model`]'s doc comment already takes for Ollama tags.
+#[derive(Debug, Clone)]
+pub struct ProviderSummary {
+    pub id: String,
+    pub base_url: String,
 }
 
 /// Pure routing decision, split out from [`handle_chat_completions`] so it's
 /// directly unit-testable with no I/O — same `*_impl`-style extraction as
 /// `web.rs::validate_fetch_url`. `model` is `Unknown` only when blank
 /// (missing/empty `model` field); a non-empty id that isn't the exact
-/// ready-llama filename stem is always assumed to be an Ollama tag — Ollama
-/// itself is the source of truth for whether that tag actually exists, and
-/// a wrong guess there surfaces as a `502` wrapping Ollama's own error
-/// rather than a possibly-stale local "unknown model" guess. Cloud-provider
-/// routing (`"{provider_id}/{model_id}"` ids) is phase 3 — not implemented
-/// here.
-pub fn route_model(model: &str, llama_ready: bool, llama_model_stem: Option<&str>) -> ModelRoute {
+/// ready-llama filename stem and isn't `"{known_provider_id}/..."` is always
+/// assumed to be an Ollama tag — Ollama itself is the source of truth for
+/// whether that tag actually exists, and a wrong guess there surfaces as a
+/// `502` wrapping Ollama's own error rather than a possibly-stale local
+/// "unknown model" guess. Whether a provider actually has a key saved is
+/// deliberately not checked here (that's `handle_chat_completions`'
+/// `providers::read_key` call, at the point the request would actually be
+/// sent) — this function only decides which *upstream* a request targets,
+/// mirroring how it never checks Ollama reachability either.
+pub fn route_model(
+    model: &str,
+    llama_ready: bool,
+    llama_model_stem: Option<&str>,
+    known_providers: &[ProviderSummary],
+) -> ModelRoute {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return ModelRoute::Unknown;
@@ -426,18 +480,25 @@ pub fn route_model(model: &str, llama_ready: bool, llama_model_stem: Option<&str
             }
         }
     }
+    if let Some((provider_id, model_id)) = trimmed.split_once('/') {
+        if known_providers.iter().any(|p| p.id == provider_id) {
+            return ModelRoute::Providers {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+            };
+        }
+    }
     ModelRoute::Ollama
 }
 
 /// Maps a routing decision to the [`Backend`] a token's `backends` list is
 /// checked against — `Unknown` never reaches here (handled earlier as a
-/// 404), and cloud-provider routing (`Backend::Providers`) has no
-/// corresponding `ModelRoute` variant yet (phase 3), so it can't be produced
-/// by [`route_model`] today.
-fn route_backend(route: ModelRoute) -> Option<Backend> {
+/// 404).
+fn route_backend(route: &ModelRoute) -> Option<Backend> {
     match route {
         ModelRoute::Llama => Some(Backend::Local),
         ModelRoute::Ollama => Some(Backend::Ollama),
+        ModelRoute::Providers { .. } => Some(Backend::Providers),
         ModelRoute::Unknown => None,
     }
 }
@@ -479,10 +540,22 @@ pub struct ServerDeps {
     pub llama_port: u16,
     pub llama_ready: bool,
     pub llama_model_stem: Option<String>,
+    /// Whether the currently-running llama-server process was launched with
+    /// `--embeddings` (`llama::LlamaState::embeddings_enabled`) — gates
+    /// `POST /v1/embeddings` routing to it (see [`handle_embeddings`]).
+    pub llama_embeddings_enabled: bool,
     pub ollama_base_url: String,
     pub require_token: bool,
     pub expose_ollama: bool,
     pub expose_providers: bool,
+    /// Configured cloud providers (presets + custom), for model-id routing
+    /// and `GET /v1/models` — loaded fresh per request (cheap: one static
+    /// slice + one small JSON file read) in [`build_deps`], same "never
+    /// stale" reasoning as `tokens` below. Populated regardless of
+    /// `expose_providers` so routing decisions stay consistent whether or
+    /// not the toggle is on (see [`route_model`]'s doc comment) — the toggle
+    /// only gates whether a `Providers` route is actually served.
+    pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
     pub client: reqwest::Client,
 }
@@ -654,6 +727,30 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
         }
     }
 
+    // Cloud provider models, only when the money-spending switch is on (see
+    // the design doc's Msty-reference note) — `owned_by` is set to the
+    // provider id itself (e.g. "openai", "anthropic") rather than "local"/
+    // "ollama", so a client immediately sees which entries in the merged
+    // list can incur billing. A provider with no key saved (`read_key` err)
+    // or unreachable (`fetch_models` err) is just omitted, same
+    // "unreachable is normal, don't fail the whole list" stance as Ollama
+    // above — a misconfigured provider shouldn't take `/v1/models` down for
+    // every other backend.
+    if deps.expose_providers {
+        for provider in &deps.providers {
+            let Ok(api_key) = providers::read_key(&provider.id) else { continue };
+            if let Ok(models) = providers::fetch_models(&provider.base_url, &provider.id, &api_key).await {
+                for model in models {
+                    data.push(json!({
+                        "id": format!("{}/{}", provider.id, model.id),
+                        "object": "model",
+                        "owned_by": provider.id,
+                    }));
+                }
+            }
+        }
+    }
+
     json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
 }
 
@@ -672,22 +769,27 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
     let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let stream = parsed.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref());
+    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref(), &deps.providers);
 
     if route == ModelRoute::Unknown {
         // Mirrors OpenAI's own wording for a request with no `model`.
         return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
     }
 
-    if route == ModelRoute::Ollama && !deps.expose_ollama {
-        // Same "only advertise/serve what's actually exposed" stance as
-        // `handle_models` — an Ollama-routed id must 404 exactly like an
-        // unknown one when the toggle is off, not silently proxy anyway.
+    // Same "only advertise/serve what's actually exposed" stance as
+    // `handle_models` — an Ollama- or provider-routed id must 404 exactly
+    // like an unknown one when its toggle is off, not silently proxy anyway.
+    let backend_disabled = match &route {
+        ModelRoute::Ollama => !deps.expose_ollama,
+        ModelRoute::Providers { .. } => !deps.expose_providers,
+        ModelRoute::Llama | ModelRoute::Unknown => false,
+    };
+    if backend_disabled {
         return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
     }
 
     if let Some(auth) = authed {
-        if let Some(backend) = route_backend(route) {
+        if let Some(backend) = route_backend(&route) {
             if !auth.backends.contains(&backend) {
                 return forbidden_response(&format!(
                     "This token isn't scoped for the '{}' backend.",
@@ -697,25 +799,58 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
         }
     }
 
-    let upstream_url = match route {
-        ModelRoute::Llama => format!("http://127.0.0.1:{}/v1/chat/completions", deps.llama_port),
-        ModelRoute::Ollama => format!("{}/v1/chat/completions", deps.ollama_base_url),
+    let request_builder = match &route {
+        ModelRoute::Llama => deps
+            .client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", deps.llama_port))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body),
+        ModelRoute::Ollama => deps
+            .client
+            .post(format!("{}/v1/chat/completions", deps.ollama_base_url))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body),
+        ModelRoute::Providers { provider_id, model_id } => {
+            // `provider_id` is guaranteed to match an entry in
+            // `deps.providers` — `route_model` only ever produces this
+            // variant for a known provider id — but a defensive `NOT_FOUND`
+            // beats an `unwrap` panic if that invariant is ever broken.
+            let Some(base_url) = deps.providers.iter().find(|p| &p.id == provider_id).map(|p| p.base_url.clone()) else {
+                return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+            };
+            let api_key = match providers::read_key(provider_id) {
+                Ok(key) => key,
+                Err(e) => return error_response(StatusCode::BAD_GATEWAY, &e, "provider_not_configured"),
+            };
+            // Forward the caller's own OpenAI-shaped body verbatim (their
+            // `stream`/`temperature`/etc. survive untouched) — only the
+            // `model` field is rewritten from `"{provider_id}/{model_id}"`
+            // to the bare `model_id` the provider itself expects.
+            // Deliberately NOT `providers::build_chat_request`: that helper
+            // reconstructs a narrow messages/tools/effort-only body and
+            // always forces `stream: true`, which fits its one existing
+            // caller (the app's own internal streaming chat proxy) but would
+            // silently drop an external caller's other fields and break
+            // `stream: false` requests here — a documented deviation from
+            // the design doc's "reuse build_chat_request verbatim" wording
+            // (see this module's doc comment). `providers::read_key` and
+            // `providers::add_anthropic_headers` (the x-api-key/
+            // anthropic-version quirk `build_chat_request` also uses) are
+            // reused verbatim, unmodified.
+            let mut outgoing = parsed.clone();
+            outgoing["model"] = json!(model_id);
+            let request = deps.client.post(format!("{base_url}/chat/completions")).bearer_auth(&api_key).json(&outgoing);
+            providers::add_anthropic_headers(request, provider_id, &api_key)
+        }
         ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let upstream = match deps
-        .client
-        .post(&upstream_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-    {
+    let upstream = match request_builder.send().await {
         Ok(resp) => resp,
         Err(e) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!("Failed to reach the local model server: {e}"),
+                &format!("Failed to reach the upstream model server: {e}"),
                 "upstream_unreachable",
             );
         }
@@ -756,9 +891,111 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
     }
 }
 
+/// `POST /v1/embeddings` — proxies to Ollama's OpenAI-compatible
+/// `/v1/embeddings` for Ollama tags (when `expose_ollama`), or to
+/// llama-server for the ready local model *only* if it was actually started
+/// with `--embeddings` (`deps.llama_embeddings_enabled`) — routing there
+/// otherwise would just surface llama-server's own less-clear error, so this
+/// returns a `501` up front instead, per the design doc. Cloud-provider
+/// embeddings aren't implemented (out of scope for this phase per the
+/// design doc's endpoint description, which only calls out Ollama +
+/// llama-server for `/v1/embeddings`) — a `"{provider_id}/{model_id}"` id
+/// here also `501`s rather than silently 404ing, so a caller can tell "not
+/// supported yet" apart from "unknown model". Not streamed — embeddings
+/// responses are always a single buffered JSON payload, unlike chat
+/// completions.
+async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: Bytes) -> Response<ResponseBody> {
+    if let Some(auth) = authed {
+        if !auth.scopes.contains(&Scope::Embeddings) {
+            return forbidden_response("This token isn't scoped for `embeddings`.");
+        }
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body", "invalid_request_error"),
+    };
+    let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref(), &deps.providers);
+
+    if route == ModelRoute::Unknown {
+        return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
+    }
+
+    if let ModelRoute::Providers { .. } = &route {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Embeddings via a cloud provider aren't supported yet — use a local llama-server model (started with --embeddings) or an Ollama tag.",
+            "embeddings_not_supported",
+        );
+    }
+
+    if route == ModelRoute::Ollama && !deps.expose_ollama {
+        return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+    }
+
+    if route == ModelRoute::Llama && !deps.llama_embeddings_enabled {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "This model wasn't started with embeddings support. Restart it with the \"Start with embeddings support\" option checked in the Models panel.",
+            "embeddings_not_enabled",
+        );
+    }
+
+    if let Some(auth) = authed {
+        if let Some(backend) = route_backend(&route) {
+            if !auth.backends.contains(&backend) {
+                return forbidden_response(&format!(
+                    "This token isn't scoped for the '{}' backend.",
+                    backend_label(backend)
+                ));
+            }
+        }
+    }
+
+    let upstream_url = match route {
+        ModelRoute::Llama => format!("http://127.0.0.1:{}/v1/embeddings", deps.llama_port),
+        ModelRoute::Ollama => format!("{}/v1/embeddings", deps.ollama_base_url),
+        ModelRoute::Providers { .. } | ModelRoute::Unknown => unreachable!("handled above"),
+    };
+
+    let upstream = match deps
+        .client
+        .post(&upstream_url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Failed to reach the upstream model server: {e}"),
+                "upstream_unreachable",
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    match upstream.bytes().await {
+        Ok(bytes) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full_body(bytes))
+            .expect("building a buffered response from an upstream status + fixed content-type never fails"),
+        Err(e) => error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("Failed to read the upstream model server's response: {e}"),
+            "upstream_error",
+        ),
+    }
+}
+
 /// The core router: a plain `match` on method + path, no framework — see the
 /// module doc's security note on why this surface must stay exactly these
-/// four routes. Returns the response to send *and*, when a token
+/// five routes. Returns the response to send *and*, when a token
 /// successfully authenticated the request (whether or not it then passed
 /// its scope/backend checks), that token's id — [`serve_one_request`]'s
 /// caller uses this to bump `last_used_at` without `handle_request` itself
@@ -787,6 +1024,7 @@ pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> (Response<
     let response = match (method, path.as_str()) {
         (Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
         (Method::POST, "/v1/chat/completions") => handle_chat_completions(deps, authed.as_ref(), body).await,
+        (Method::POST, "/v1/embeddings") => handle_embeddings(deps, authed.as_ref(), body).await,
         _ => not_found_response(),
     };
 
@@ -810,9 +1048,27 @@ struct ServerRuntime {
     expose_providers: bool,
 }
 
+/// Builds the routing catalog of configured cloud providers (built-in
+/// presets + custom OpenAI-compatible endpoints from `providers.json`) —
+/// `providers::providers_list_presets`/`providers::read_custom_providers`
+/// reused verbatim. A failure to read `providers.json` (corrupt file,
+/// permissions) just omits the custom entries rather than failing the
+/// whole request, same "best-effort, don't take routing down" stance as
+/// [`build_deps`]'s token load.
+fn build_provider_catalog(app: &AppHandle) -> Vec<ProviderSummary> {
+    let mut out: Vec<ProviderSummary> = providers::providers_list_presets()
+        .into_iter()
+        .map(|p| ProviderSummary { id: p.id, base_url: p.base_url })
+        .collect();
+    if let Ok(custom) = providers::read_custom_providers(app) {
+        out.extend(custom.into_iter().map(|c| ProviderSummary { id: c.id, base_url: c.base_url }));
+    }
+    out
+}
+
 fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
     let state = app.state::<AppState>();
-    let (llama_port, llama_ready, llama_model_stem) = {
+    let (llama_port, llama_ready, llama_model_stem, llama_embeddings_enabled) = {
         let llama = state.llama.lock().unwrap();
         let ready = llama.status == "ready";
         let stem = llama
@@ -820,7 +1076,7 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
             .as_deref()
             .and_then(|p| Path::new(p).file_stem())
             .map(|s| s.to_string_lossy().to_string());
-        (llama.port, ready, stem)
+        (llama.port, ready, stem, llama.embeddings_enabled)
     };
 
     // Re-read fresh from disk on every request (not cached in `runtime`) so
@@ -848,10 +1104,12 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
         llama_port,
         llama_ready,
         llama_model_stem,
+        llama_embeddings_enabled,
         ollama_base_url: runtime.ollama_base_url.clone(),
         require_token: runtime.require_token,
         expose_ollama: runtime.expose_ollama,
         expose_providers: runtime.expose_providers,
+        providers: build_provider_catalog(app),
         tokens,
         client: runtime.client.clone(),
     }
@@ -1224,15 +1482,21 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn test_provider(id: &str, base_url: &str) -> ProviderSummary {
+        ProviderSummary { id: id.to_string(), base_url: base_url.to_string() }
+    }
+
     fn test_deps(ollama_base_url: String) -> ServerDeps {
         ServerDeps {
             llama_port: 8090,
             llama_ready: true,
             llama_model_stem: Some("qwen2.5-7b-instruct".to_string()),
+            llama_embeddings_enabled: false,
             ollama_base_url,
             require_token: false,
             expose_ollama: true,
             expose_providers: false,
+            providers: vec![test_provider("openai", "https://api.openai.com/v1"), test_provider("anthropic", "https://api.anthropic.com/v1")],
             tokens: Vec::new(),
             client: reqwest::Client::new(),
         }
@@ -1279,31 +1543,67 @@ mod tests {
         std::env::temp_dir().join(format!("little_monkey_api_server_test_{}_{}_{}.json", std::process::id(), n, nanos))
     }
 
+    fn no_providers() -> Vec<ProviderSummary> {
+        Vec::new()
+    }
+
+    fn two_providers() -> Vec<ProviderSummary> {
+        vec![test_provider("openai", "https://api.openai.com/v1"), test_provider("anthropic", "https://api.anthropic.com/v1")]
+    }
+
     #[test]
     fn route_model_matches_llama_exactly() {
-        assert_eq!(route_model("qwen2.5-7b-instruct", true, Some("qwen2.5-7b-instruct")), ModelRoute::Llama);
+        assert_eq!(
+            route_model("qwen2.5-7b-instruct", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            ModelRoute::Llama
+        );
     }
 
     #[test]
     fn route_model_falls_back_to_ollama_for_any_other_nonempty_id() {
-        assert_eq!(route_model("llama3.1:8b", true, Some("qwen2.5-7b-instruct")), ModelRoute::Ollama);
+        assert_eq!(route_model("llama3.1:8b", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Ollama);
         // Even when llama isn't ready, a non-empty id is assumed to be an
         // Ollama tag — Ollama is the source of truth for whether it exists.
-        assert_eq!(route_model("qwen2.5-7b-instruct", false, Some("qwen2.5-7b-instruct")), ModelRoute::Ollama);
-        assert_eq!(route_model("anything", true, None), ModelRoute::Ollama);
+        assert_eq!(route_model("qwen2.5-7b-instruct", false, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Ollama);
+        assert_eq!(route_model("anything", true, None, &no_providers()), ModelRoute::Ollama);
     }
 
     #[test]
     fn route_model_is_unknown_only_when_blank() {
-        assert_eq!(route_model("", true, Some("qwen2.5-7b-instruct")), ModelRoute::Unknown);
-        assert_eq!(route_model("   ", true, Some("qwen2.5-7b-instruct")), ModelRoute::Unknown);
+        assert_eq!(route_model("", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Unknown);
+        assert_eq!(route_model("   ", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Unknown);
     }
 
     #[test]
-    fn route_backend_maps_llama_and_ollama_but_not_unknown() {
-        assert_eq!(route_backend(ModelRoute::Llama), Some(Backend::Local));
-        assert_eq!(route_backend(ModelRoute::Ollama), Some(Backend::Ollama));
-        assert_eq!(route_backend(ModelRoute::Unknown), None);
+    fn route_model_routes_a_known_provider_prefixed_id_to_providers() {
+        assert_eq!(
+            route_model("openai/gpt-4o", true, Some("qwen2.5-7b-instruct"), &two_providers()),
+            ModelRoute::Providers { provider_id: "openai".to_string(), model_id: "gpt-4o".to_string() }
+        );
+        assert_eq!(
+            route_model("anthropic/claude-opus-4-8", false, None, &two_providers()),
+            ModelRoute::Providers { provider_id: "anthropic".to_string(), model_id: "claude-opus-4-8".to_string() }
+        );
+    }
+
+    #[test]
+    fn route_model_falls_back_to_ollama_for_a_slash_id_with_an_unknown_provider_prefix() {
+        // "library/llama3" isn't a configured provider id, so it's treated
+        // as an Ollama tag (Ollama namespaced tags can themselves contain a
+        // slash) — exactly the design doc's "otherwise treat as Ollama tag"
+        // fallback.
+        assert_eq!(route_model("library/llama3", true, Some("qwen2.5-7b-instruct"), &two_providers()), ModelRoute::Ollama);
+    }
+
+    #[test]
+    fn route_backend_maps_every_known_route_but_not_unknown() {
+        assert_eq!(route_backend(&ModelRoute::Llama), Some(Backend::Local));
+        assert_eq!(route_backend(&ModelRoute::Ollama), Some(Backend::Ollama));
+        assert_eq!(
+            route_backend(&ModelRoute::Providers { provider_id: "openai".to_string(), model_id: "gpt-4o".to_string() }),
+            Some(Backend::Providers)
+        );
+        assert_eq!(route_backend(&ModelRoute::Unknown), None);
     }
 
     #[test]
@@ -1494,6 +1794,175 @@ mod tests {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_ollama = false;
         let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_404s_for_a_provider_routed_model_when_expose_providers_is_off() {
+        // `test_deps` defaults `expose_providers` to `false` — a
+        // provider-prefixed id must 404 exactly like an unexposed Ollama tag,
+        // never silently proxy anyway.
+        let deps = test_deps("http://127.0.0.1:1".to_string());
+        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The core phase-3 security property: a token missing `Backend::Providers`
+    /// must be rejected with `403` on a provider-routed request, even when
+    /// `expose_providers` is globally on — the global toggle and the
+    /// per-token scope are two independent gates. Critically, this check
+    /// must happen *before* any keychain lookup — the assertion here doesn't
+    /// depend on whether a real key happens to be configured for "openai" on
+    /// the machine running this test.
+    #[tokio::test]
+    async fn token_without_providers_backend_is_rejected_even_when_expose_providers_is_globally_on() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_providers = true;
+        deps.require_token = true;
+        deps.tokens = vec![stored_token(
+            "tok-no-providers",
+            "lmk-no-providers",
+            vec![Scope::Chat],
+            vec![Backend::Local, Backend::Ollama],
+        )];
+
+        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#), "lmk-no-providers");
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(matched.as_deref(), Some("tok-no-providers"));
+    }
+
+    /// The positive control for the test above: a token that *does* carry
+    /// `Backend::Providers` gets past the scope/backend gate (never a `403`)
+    /// once `expose_providers` is on — whatever happens next depends on
+    /// keychain state (a real key configured -> attempts the network call;
+    /// none configured -> `502 provider_not_configured`), but it must never
+    /// be blocked by scope.
+    #[tokio::test]
+    async fn token_with_providers_backend_is_not_blocked_by_scope_when_expose_providers_is_on() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_providers = true;
+        deps.require_token = true;
+        // A provider id that should never realistically have a real
+        // keychain entry on the machine running this test, so the outcome
+        // here is deterministic regardless of what's actually configured.
+        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.tokens = vec![stored_token(
+            "tok-with-providers",
+            "lmk-with-providers",
+            vec![Scope::Chat],
+            vec![Backend::Providers],
+        )];
+
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"zzz-test-provider-no-key/some-model"}"#),
+            "lmk-with-providers",
+        );
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "no key is configured for this fabricated provider id, so it must fail as 'not configured', not silently succeed");
+        assert_eq!(matched.as_deref(), Some("tok-with-providers"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_provider_route_reports_provider_not_configured_with_no_token_required() {
+        // A provider id with no saved key deterministically 502s before ever
+        // sending a request — this only exercises the routing decision (and
+        // that it's reachable with `require_token: false`, unlike the
+        // token-scoped variant above), not the actual proxying, which needs
+        // a real network call to a mock upstream to exercise.
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_providers = true;
+        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"zzz-test-provider-no-key/some-model"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "provider_not_configured");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_omits_provider_models_when_no_key_is_configured() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_providers = true;
+        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+
+        let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = value["data"].as_array().unwrap();
+        assert!(data.iter().all(|m| m["owned_by"] != "zzz-test-provider-no-key"));
+    }
+
+    #[tokio::test]
+    async fn embeddings_501s_when_llama_wasnt_started_with_embeddings() {
+        // `test_deps` defaults `llama_embeddings_enabled` to `false`.
+        let deps = test_deps("http://127.0.0.1:1".to_string());
+        let (resp, _) =
+            handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "embeddings_not_enabled");
+    }
+
+    #[tokio::test]
+    async fn embeddings_proxies_to_llama_when_embeddings_enabled() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"object":"list","data":[]}"#;
+                let response =
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.llama_port = addr.port();
+        deps.llama_embeddings_enabled = true;
+        let (resp, _) =
+            handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn embeddings_501s_for_a_provider_routed_model() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.expose_providers = true;
+        let (resp, _) = handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"openai/text-embedding-3-small"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "embeddings_not_supported");
+    }
+
+    #[tokio::test]
+    async fn embeddings_requires_the_embeddings_scope() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token("tok-chat-only", "lmk-chat-only", vec![Scope::Chat], vec![Backend::Local, Backend::Ollama])];
+
+        let req = with_bearer(post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#), "lmk-chat-only");
+        let (resp, _) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn embeddings_with_blank_model_returns_404() {
+        let deps = test_deps("http://127.0.0.1:1".to_string());
+        let (resp, _) = handle_request(&deps, post_request("/v1/embeddings", r#"{}"#)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

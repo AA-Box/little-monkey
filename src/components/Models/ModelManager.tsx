@@ -38,6 +38,8 @@ export function ModelManager() {
   const active = useModelStore((s) => s.active);
   const downloadProgress = useModelStore((s) => s.downloadProgress);
   const llamaStatus = useModelStore((s) => s.llamaStatus);
+  const embeddingsEnabled = useModelStore((s) => s.embeddingsEnabled);
+  const setEmbeddingsEnabled = useModelStore((s) => s.setEmbeddingsEnabled);
   const refresh = useModelStore((s) => s.refresh);
   const download = useModelStore((s) => s.download);
   const start = useModelStore((s) => s.start);
@@ -86,6 +88,19 @@ export function ModelManager() {
 
   return (
     <div className="flex flex-col gap-2 p-2">
+      <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border bg-background px-3 py-2.5">
+        <input
+          type="checkbox"
+          checked={embeddingsEnabled}
+          onChange={(event) => setEmbeddingsEnabled(event.target.checked)}
+          className="mt-0.5 accent-accent"
+        />
+        <span className="flex flex-col gap-0.5">
+          <span className="text-sm font-medium text-foreground">{t("ModelManager.embeddingsToggleLabel")}</span>
+          <span className="text-xs text-faint">{t("ModelManager.embeddingsToggleDescription")}</span>
+        </span>
+      </label>
+
       {models.length === 0 ? (
         <p className="p-3 text-center text-sm text-faint">{t("ModelManager.noModelsAvailable")}</p>
       ) : (

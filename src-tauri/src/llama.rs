@@ -21,6 +21,13 @@ pub struct LlamaState {
     pub port: u16,
     pub model_path: Option<String>,
     pub status: String,
+    /// Whether the currently-running (or most recently started) process was
+    /// launched with `--embeddings`. The local API server (`server.rs`,
+    /// phase 3) reads this to decide whether `POST /v1/embeddings` can
+    /// actually route to llama-server — routing there without this flag set
+    /// would just surface llama-server's own "embeddings not enabled" error,
+    /// so `server.rs` returns a clearer `501` up front instead.
+    pub embeddings_enabled: bool,
 }
 
 impl Default for LlamaState {
@@ -30,6 +37,7 @@ impl Default for LlamaState {
             port: 8090,
             model_path: None,
             status: "stopped".to_string(),
+            embeddings_enabled: false,
         }
     }
 }
@@ -83,6 +91,7 @@ pub async fn llama_start(
     model_path: String,
     ctx_size: u32,
     gpu_layers: i32,
+    embeddings: bool,
 ) -> Result<(), String> {
     // If a previous process is still running, stop it first so we don't leak
     // orphaned llama-server instances or leave a stale port bound.
@@ -100,12 +109,14 @@ pub async fn llama_start(
         let mut llama = state.llama.lock().map_err(|e| e.to_string())?;
         llama.status = "starting".to_string();
         llama.model_path = Some(model_path.clone());
+        llama.embeddings_enabled = embeddings;
         llama.port
     };
 
     emit_status(&app, "starting", port, &Some(model_path.clone()));
 
-    let spawn_result = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .arg("-m")
         .arg(&model_path)
         .arg("--host")
@@ -116,7 +127,11 @@ pub async fn llama_start(
         .arg(ctx_size.to_string())
         .arg("-ngl")
         .arg(gpu_layers.to_string())
-        .arg("--jinja")
+        .arg("--jinja");
+    if embeddings {
+        command.arg("--embeddings");
+    }
+    let spawn_result = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -218,10 +233,11 @@ pub async fn llama_stop(state: State<'_, AppState>) -> Result<(), String> {
         let _ = child.wait();
     }
     llama.status = "stopped".to_string();
+    llama.embeddings_enabled = false;
     Ok(())
 }
 
-/// Return the current status snapshot: `{status, port, model_path}`.
+/// Return the current status snapshot: `{status, port, model_path, embeddings_enabled}`.
 #[tauri::command]
 pub fn llama_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let llama = state.llama.lock().map_err(|e| e.to_string())?;
@@ -229,5 +245,6 @@ pub fn llama_status(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "status": llama.status,
         "port": llama.port,
         "model_path": llama.model_path,
+        "embeddings_enabled": llama.embeddings_enabled,
     }))
 }
