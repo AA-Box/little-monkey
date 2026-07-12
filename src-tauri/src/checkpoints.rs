@@ -45,6 +45,7 @@
 //! abandoned by a crash rather than genuinely still running.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tauri::Manager;
 
@@ -278,11 +279,35 @@ fn prune_old(base_dir: &Path, max_keep: usize) {
     }
 }
 
+/// Process-lifetime high-water mark for [`now_ms`] — see that function's own
+/// doc comment for why this exists.
+static LAST_NOW_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall-clock milliseconds since the epoch, but guaranteed strictly
+/// increasing across calls within this process (never ties, never goes
+/// backwards even across a clock adjustment). `begin_impl` stamps every
+/// checkpoint with this as `created_at_ms`, and `list_impl` sorts purely on
+/// that value for its newest-first ordering — millisecond wall-clock
+/// resolution is coarse enough that two checkpoints created back-to-back
+/// (routine in fast test runs, and possible on a fast enough machine in
+/// normal use) can land in the same millisecond. A tie there falls back to
+/// `std::fs::read_dir`'s iteration order, which is unspecified and differs
+/// by platform/filesystem — that's what made
+/// `list_exposes_prev_id_so_the_timeline_can_detect_a_pruned_gap` fail
+/// reliably on Linux CI runners while always passing locally on macOS.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+    let wall = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let mut last = LAST_NOW_MS.load(Ordering::SeqCst);
+    loop {
+        let next = wall.max(last + 1);
+        match LAST_NOW_MS.compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(actual) => last = actual,
+        }
+    }
 }
 
 /// Core begin logic, parameterized by base dir for testability. The metadata
