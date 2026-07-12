@@ -277,39 +277,38 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
           </div>
         </div>
 
-        <div className="relative flex min-w-0 flex-1 flex-col">
-          <IconButton
-            size="sm"
-            onClick={onClose}
-            aria-label={t("SettingsModal.closeSettingsAriaLabel")}
-            className="absolute right-4 top-4 z-10"
-          >
-            <X size={16} />
-          </IconButton>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center justify-between px-6 pb-4 pt-6">
+            <h2 className="text-lg font-semibold text-foreground">{activeLabel}</h2>
+            <IconButton size="sm" onClick={onClose} aria-label={t("SettingsModal.closeSettingsAriaLabel")}>
+              <X size={16} />
+            </IconButton>
+          </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto p-6">
-            <h2 className="mb-4 text-lg font-semibold text-foreground">{activeLabel}</h2>
-
-            {tab === "local" && <ModelManager />}
-            {tab === "ollama" && <OllamaPanel />}
-            {tab === "openrouter" && <OpenRouterModelsPanel />}
-            {tab === "providers" && (
-              <div className="flex flex-col gap-2">
-                {providers.map((provider) => (
-                  <ProviderCard key={provider.id} provider={provider} />
-                ))}
-                <AddCustomProviderForm />
-              </div>
-            )}
-            {tab === "knowledge" && <KnowledgePanel />}
-            {tab === "automation" && <AutomationPanel />}
-            {tab === "rules" && <RulesMemoryPanel />}
-            {tab === "mcp" && <McpPanel />}
-            {tab === "prompts" && <PromptLibraryPanel />}
-            {tab === "apiserver" && <ApiServerPanel />}
-            {tab === "shortcuts" && <KeyboardShortcutsPanel />}
-            {tab === "usage" && <UsagePanel />}
-            {tab === "tasks" && <ScheduledTasksPanel />}
+          <div className="relative min-h-0 flex-1">
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-4 bg-gradient-to-b from-background to-transparent" />
+            <div className="h-full overflow-y-auto px-6 pb-6">
+              {tab === "local" && <ModelManager />}
+              {tab === "ollama" && <OllamaPanel />}
+              {tab === "openrouter" && <OpenRouterModelsPanel />}
+              {tab === "providers" && (
+                <div className="flex flex-col gap-2">
+                  {providers.map((provider) => (
+                    <ProviderCard key={provider.id} provider={provider} />
+                  ))}
+                  <AddCustomProviderForm />
+                </div>
+              )}
+              {tab === "knowledge" && <KnowledgePanel />}
+              {tab === "automation" && <AutomationPanel />}
+              {tab === "rules" && <RulesMemoryPanel />}
+              {tab === "mcp" && <McpPanel />}
+              {tab === "prompts" && <PromptLibraryPanel />}
+              {tab === "apiserver" && <ApiServerPanel />}
+              {tab === "shortcuts" && <KeyboardShortcutsPanel />}
+              {tab === "usage" && <UsagePanel />}
+              {tab === "tasks" && <ScheduledTasksPanel />}
+            </div>
           </div>
         </div>
       </div>
