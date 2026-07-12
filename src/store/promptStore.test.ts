@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import canonicalEntryFixture from "../../src-tauri/fixtures/prompt-entry.canonical.json";
 
 const invokeMock = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
