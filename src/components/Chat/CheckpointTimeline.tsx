@@ -11,12 +11,18 @@ import {
   parseCheckpointNotice,
 } from "../../lib/agentLoop";
 import { selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
-import { selectSessionCheckpoints, useCheckpointStore, type CheckpointInfo } from "../../store/checkpointStore";
+import { useCheckpointStore, type CheckpointInfo } from "../../store/checkpointStore";
 
 /** The three restore scopes offered per row — same semantics as
  * `MessageList.tsx`'s `CheckpointRow` (Claude Code /rewind: code only /
  * conversation only / both). */
 type RestoreScope = "files" | "conversation" | "both";
+
+/** Stable fallback for "no checkpoints for this session yet". Must be a
+ * module-level constant, not `[]` inlined in the selector — a fresh array
+ * literal per call spins `useSyncExternalStore` into an infinite re-render
+ * loop that blanks the whole app (see ProviderCard's `EMPTY_MODELS`). */
+const EMPTY_CHECKPOINTS: CheckpointInfo[] = [];
 
 type Translate = ReturnType<typeof useT>["t"];
 
@@ -308,10 +314,7 @@ export function CheckpointTimeline({ sessionId }: { sessionId: string }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  // Not `s.bySession[sessionId] ?? []` inline: a fresh `[]` from getSnapshot
-  // on every call makes useSyncExternalStore re-render forever and crash the
-  // pane with "Maximum update depth exceeded".
-  const checkpoints = useCheckpointStore(selectSessionCheckpoints(sessionId));
+  const checkpoints = useCheckpointStore((s) => s.bySession[sessionId] ?? EMPTY_CHECKPOINTS);
   const loading = useCheckpointStore((s) => Boolean(s.loadingSessions[sessionId]));
   const listError = useCheckpointStore((s) => s.errorsBySession[sessionId] ?? null);
   const refresh = useCheckpointStore((s) => s.refresh);
