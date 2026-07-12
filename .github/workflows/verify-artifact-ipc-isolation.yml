@@ -51,16 +51,17 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          # Not 9: pnpm-workspace.yaml has no `packages:` field, which makes
+          # pnpm 9's install/store-path commands fail with "packages field
+          # missing or empty" (reproduced locally; fixed in pnpm 10+).
+          # Pre-existing repo config gap, out of scope for this workflow —
+          # release.yml pins the same v9 and will hit this identically.
+          version: 10
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          # No `cache: pnpm` here: pnpm-workspace.yaml has no `packages:` field,
-          # which makes `pnpm store path` (what the cache step shells out to)
-          # fail under the pinned pnpm 9 CLI with "packages field missing or
-          # empty" on Windows runners. Pre-existing repo config issue, out of
-          # scope for this workflow — see PR discussion.
+          cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
