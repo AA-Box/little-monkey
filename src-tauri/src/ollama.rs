@@ -346,6 +346,55 @@ pub fn ollama_example_cloud_tags() -> Vec<String> {
     OLLAMA_EXAMPLE_CLOUD_TAGS.iter().map(|s| s.to_string()).collect()
 }
 
+/// Shape of `POST /api/embed`'s response — a batch of embedding vectors, one
+/// per input string, in the same order.
+#[derive(Deserialize)]
+struct RawEmbedResponse {
+    #[serde(default)]
+    embeddings: Vec<Vec<f32>>,
+}
+
+/// Embed a batch of strings via Ollama's native `POST /api/embed` endpoint —
+/// the Ollama half of `stacks.rs`'s `embed_batch` dispatch (the other half,
+/// `llama.rs`'s managed `--embeddings` instance, goes through
+/// `/v1/embeddings` directly since it needs no daemon-reachability check).
+/// Not a `#[tauri::command]`: this is only ever called from Rust
+/// (`stacks::embed_batch`), never invoked directly from the frontend.
+pub async fn embed(model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+    let resp = client
+        .post(format!("{OLLAMA_BASE_URL}/api/embed"))
+        .json(&json!({ "model": model, "input": inputs }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Ollama for embeddings: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Ollama embedding request failed (HTTP {status}): {body}"));
+    }
+
+    let parsed: RawEmbedResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Ollama's embedding response: {e}"))?;
+
+    if parsed.embeddings.len() != inputs.len() {
+        return Err(format!(
+            "Ollama returned {} embeddings for {} inputs",
+            parsed.embeddings.len(),
+            inputs.len()
+        ));
+    }
+
+    Ok(parsed.embeddings)
+}
+
 /// Validates a model tag: non-empty after trimming, and restricted to a
 /// conservative charset. Defense in depth — `Command::arg` never invokes a
 /// shell, so this isn't a real injection vector, but a malformed tag should

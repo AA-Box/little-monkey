@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { textContent, type ChatMessage } from "../lib/llamaClient";
@@ -64,6 +64,45 @@ export interface ChatSession {
    * `resolvePersona`), so a deleted persona resolves to null instead of
    * leaving a session broken. */
   personaId: string | null;
+  /** ids of `KnowledgeStack`s (see `stackStore.ts`) attached to this session
+   * — set via `StackPicker.tsx`'s checkboxes, read by `agentLoop.ts` to
+   * decide whether `search_docs` is offered this turn (see `tools.ts`'s
+   * `buildTools`) and what the system prompt's stack-guidance line names.
+   * Opaque to the Rust side — the sessions blob is stored as-is, so this
+   * needed zero Rust changes, only `normalizeSession` filling in `[]` for
+   * sessions persisted before this field existed. Per-session (not global)
+   * so the split pane can attach different stacks to each transcript. */
+  attachedStackIds: string[];
+  /** Whether this session auto-retrieves top-k passages from its attached
+   * stacks before every user turn and instructs the model to cite them (see
+   * `agentLoop.ts`'s `runAgentTurnBody` doc-chat block, `SOURCES_NOTE_PREFIX`)
+   * — toggled via `StackPicker.tsx`'s doc-chat switch. Independent of
+   * `attachedStackIds` being non-empty (a session can have this on with no
+   * stacks attached yet), but has no effect until at least one is: the
+   * retrieval call is a no-op without stack ids to search. Defaulted `false`
+   * by `normalizeSession`, same "opaque to Rust, zero backend change" story
+   * as `attachedStackIds`. */
+  docChatMode: boolean;
+  /** Child transcripts from `task`-tool subagent runs, keyed by `taskId`
+   * (the originating `task` tool_call's `ToolCall.id` — see
+   * `subagentStore.ts`'s `SubagentRun.taskId` doc comment for why that id,
+   * not `runSubagentTask`'s Rust-facing turn id, is the correlation key).
+   * Written once by `setSubagentRun` when a subagent run finishes, so
+   * `SubagentRow.tsx` can still render the mini-transcript after a restart
+   * (`subagentStore.ts` itself is transient and empty on a fresh launch).
+   * Opaque to the Rust side exactly like `attachedStackIds`/`docChatMode` —
+   * `sessions.rs` stores the whole session blob as-is, so this needed zero
+   * Rust changes, only `normalizeSession` defaulting it to `{}` for sessions
+   * persisted before this field existed.
+   *
+   * CRITICAL: this field must NEVER be read when building a turn's wire
+   * history (only `messages` is — see `agentLoop.ts`'s `wireHistory`
+   * construction) — the whole point of subagents is that the child's full
+   * transcript stays out of the parent's context, with only the `task` tool
+   * result's report string ever entering `messages`. See
+   * `subagent.test.ts`'s wire-payload-isolation test.
+   */
+  subagentRuns: Record<string, ChatMessage[]>;
 }
 
 /** A user-defined grouping sessions can be filed under via the session
@@ -114,7 +153,9 @@ export interface SessionStore {
    * instead of silently dropping history; cleared by the next successful
    * save. */
   persistError: string | null;
-  /** Create a fresh empty session and make it active. */
+  /** Make a fresh blank session active. If the currently active session
+   * hasn't been sent to yet, replaces it rather than creating another one
+   * alongside it — see the implementation for why. */
   newSession: () => void;
   /** Make `id` the active session (no-op if it doesn't exist). Clears the
    * target's `unread` flag, mirroring "opening it marks it read". */
@@ -143,6 +184,19 @@ export interface SessionStore {
   /** Sets (or clears with `null`) the persona applied to `sessionId`'s system
    * prompt — see `ChatSession.personaId`. */
   setSessionPersona: (sessionId: string, personaId: string | null) => void;
+  /** Toggles whether `stackId` is attached to `sessionId` — see
+   * `ChatSession.attachedStackIds`. Called by `StackPicker.tsx`'s checkboxes. */
+  toggleAttachedStack: (sessionId: string, stackId: string) => void;
+  /** Toggles `sessionId`'s doc-chat mode — see `ChatSession.docChatMode`.
+   * Called by `StackPicker.tsx`'s doc-chat switch. */
+  toggleDocChatMode: (sessionId: string) => void;
+  /** Persists a finished subagent run's child transcript under
+   * `taskId` — see `ChatSession.subagentRuns`. Called once by
+   * `runSubagentTask` right before it returns (success, error, or
+   * cancellation alike), so the mini-transcript survives a restart even
+   * though `subagentStore`'s own copy is transient. No-ops if `sessionId`
+   * no longer exists (deleted mid-run). */
+  setSubagentRun: (sessionId: string, taskId: string, messages: ChatMessage[]) => void;
   /** Record whether an agent turn is in flight for `sessionId` — called
    * only by `runAgentTurn` (start/finally). */
   markTurnRunning: (sessionId: string, running: boolean) => void;
@@ -236,6 +290,14 @@ function createSession(): ChatSession {
     // id (its persona got deleted) resolves to "None" at turn time same as
     // any other persona reference — see `composeSystemPrompt`.
     personaId: usePromptStore.getState().defaultPersonaId,
+    // New sessions start with no stacks attached — the user opts in per
+    // session via `StackPicker.tsx`, there's no "default stack" concept.
+    attachedStackIds: [],
+    // New sessions start with doc-chat mode off, same opt-in reasoning.
+    docChatMode: false,
+    // No subagent runs yet — populated only once a `task` tool call in this
+    // session actually finishes (see `setSubagentRun`).
+    subagentRuns: {},
   };
 }
 
@@ -256,6 +318,9 @@ function cloneSessionAsFork(source: ChatSession): ChatSession {
     groupId: source.groupId,
     workspacePath: source.workspacePath,
     personaId: source.personaId,
+    attachedStackIds: [...source.attachedStackIds],
+    docChatMode: source.docChatMode,
+    subagentRuns: { ...source.subagentRuns },
   };
 }
 
@@ -290,10 +355,97 @@ function normalizeMessage(raw: unknown): ChatMessage | null {
   return null;
 }
 
+/** Content used for a `tool` message synthesized by `repairDanglingToolCalls`
+ * below — deliberately distinct from `turnEngine.ts`'s `CANCELLED_TOOL_RESULT`
+ * (not imported from there — see that module's own doc comment on why
+ * `subagent.ts`/`turnEngine.ts` consumers should stay a one-way dependency,
+ * and `sessionStore.ts` is lower-level still, loaded before either): a
+ * message repaired at hydrate time was never actually cancelled by the user,
+ * it's a transcript left dangling by an app crash/force-quit/power-loss
+ * mid-turn, so the model should be told the truth rather than a misleading
+ * "Cancelled by the user". */
+const ORPHANED_TOOL_CALL_RESULT = JSON.stringify({
+  error: "No result was recorded for this tool call — the app was closed or crashed before it finished.",
+});
+
+/**
+ * Repairs a hydrated `messages` array against the transcript-validity
+ * invariant every in-process code path (`turnEngine.ts`'s
+ * `CANCELLED_TOOL_RESULT` convention, `agentLoop.ts`'s Stop-button handling,
+ * `subagent.ts`'s own try/catch) upholds while the app is running: every
+ * assistant `tool_calls` entry must be immediately followed by one `tool`
+ * message per call, matched by `tool_call_id`. That invariant can still be
+ * violated on disk if the app crashes, is force-quit, or loses power WHILE a
+ * tool call (most plausibly a long-running `task`/subagent round trip, which
+ * can run for many seconds to minutes — see `subagent.ts`'s
+ * `MAX_SUBAGENT_ITERATIONS`) is still in flight: `updateLastMessage` commits
+ * the assistant's `tool_calls` entry (and the debounced `persist()` can flush
+ * it to disk) well before the matching `tool` results are appended. Nothing
+ * previously repaired this on the next load, so the next turn's
+ * `wireHistory` would send a provider a conversation with a dangling
+ * `tool_calls` entry — several providers reject that outright, permanently
+ * breaking the session until a manual edit/delete.
+ *
+ * Called once per session during `normalizeSession` (i.e. on every
+ * hydration, not just after a crash) — a single forward pass that returns
+ * `messages` itself, unchanged, whenever nothing turns out to be dangling
+ * (the overwhelmingly common case).
+ */
+function repairDanglingToolCalls(messages: ChatMessage[]): ChatMessage[] {
+  let mutated = false;
+  const result: ChatMessage[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const message = messages[i];
+    result.push(message);
+    i++;
+
+    if (message.role !== "assistant" || !message.tool_calls || message.tool_calls.length === 0) continue;
+
+    // Every `tool` message immediately following this assistant message
+    // (before the next non-`tool` message, i.e. this round's own results) —
+    // matches the exact shape `agentLoop.ts`/`subagent.ts` append in.
+    const satisfied = new Set<string>();
+    while (i < messages.length && messages[i].role === "tool") {
+      const toolMessage = messages[i];
+      result.push(toolMessage);
+      if (toolMessage.tool_call_id) satisfied.add(toolMessage.tool_call_id);
+      i++;
+    }
+
+    const missing = message.tool_calls.filter((call) => !satisfied.has(call.id));
+    if (missing.length === 0) continue;
+
+    mutated = true;
+    for (const call of missing) {
+      result.push({ role: "tool", tool_call_id: call.id, content: ORPHANED_TOOL_CALL_RESULT });
+    }
+  }
+
+  return mutated ? result : messages;
+}
+
+/** Fills in defaults for a persisted `subagentRuns` blob — same defensive
+ * shape as `normalizeMessage`/`messages` above: anything not matching the
+ * expected `Record<string, ChatMessage[]>` shape (missing field entirely on
+ * an old session, corrupt entry, non-array value) is dropped rather than
+ * left to crash a later `.map`/`.length` call on it. */
+function normalizeSubagentRuns(raw: unknown): Record<string, ChatMessage[]> {
+  if (!raw || typeof raw !== "object") return {};
+  const result: Record<string, ChatMessage[]> = {};
+  for (const [taskId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(value)) continue;
+    result[taskId] = value.map(normalizeMessage).filter((message): message is ChatMessage => message !== null);
+  }
+  return result;
+}
+
 function normalizeSession(raw: Partial<ChatSession>): ChatSession {
-  const messages = Array.isArray(raw.messages)
+  const parsedMessages = Array.isArray(raw.messages)
     ? raw.messages.map(normalizeMessage).filter((message): message is ChatMessage => message !== null)
     : [];
+  const messages = repairDanglingToolCalls(parsedMessages);
   return {
     id: raw.id as string,
     title: raw.title as string,
@@ -306,6 +458,11 @@ function normalizeSession(raw: Partial<ChatSession>): ChatSession {
     groupId: raw.groupId ?? null,
     workspacePath: raw.workspacePath ?? null,
     personaId: typeof raw.personaId === "string" ? raw.personaId : null,
+    attachedStackIds: Array.isArray(raw.attachedStackIds)
+      ? raw.attachedStackIds.filter((id): id is string => typeof id === "string")
+      : [],
+    docChatMode: raw.docChatMode === true,
+    subagentRuns: normalizeSubagentRuns(raw.subagentRuns),
   };
 }
 
@@ -368,6 +525,10 @@ function flushPersist(): void {
 }
 
 function persist(sessions: ChatSession[], activeSessionId: string, groups: SessionGroup[]): void {
+  // Plain-browser dev (`vite` without the Tauri shell) has no IPC bridge —
+  // sessions live in memory only, and attempting the invoke would surface a
+  // persist-error banner on every mutation.
+  if (!isTauri()) return;
   try {
     pendingPayload = JSON.stringify({ sessions, activeSessionId, groups });
   } catch (err) {
@@ -452,6 +613,9 @@ async function listenForOtherWindowSaves(): Promise<void> {
  * other windows' saves so multi-window use stays in sync.
  */
 export async function hydrateSessions(): Promise<void> {
+  // No Tauri shell (plain-browser dev): no sessions file to load and no
+  // window-event bus to subscribe to — keep the fresh in-memory session.
+  if (!isTauri()) return;
   // Subscribe before the initial load so a save landing in another window
   // during hydration isn't missed.
   void listenForOtherWindowSaves().catch((err: unknown) => {
@@ -544,10 +708,23 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   newSession: () => {
+    const state = get();
+    const active = state.sessions.find((s) => s.id === state.activeSessionId);
     const session = createSession();
-    set((state) => {
-      const sessions = [...state.sessions, session];
-      persist(sessions, session.id, state.groups);
+
+    // Mirrors Claude Desktop: the "New session" button always lands on a
+    // single blank compose slate. If the active session was never started
+    // (no messages sent yet), swap it out for the fresh one in place rather
+    // than stacking another empty session next to it — the id still
+    // changes (unlike a true in-place reset) so panes bound to it (see
+    // `ChatWindow`'s sessionId-keyed composer-reset effect) know to clear
+    // their draft state too.
+    set((s) => {
+      const sessions =
+        active && active.messages.length === 0
+          ? s.sessions.map((sess) => (sess.id === active.id ? session : sess))
+          : [...s.sessions, session];
+      persist(sessions, session.id, s.groups);
       return { sessions, activeSessionId: session.id, messages: session.messages };
     });
   },
@@ -681,6 +858,40 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   setSessionPersona: (sessionId, personaId) => {
     set((state) => {
       const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, personaId } : s));
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  toggleAttachedStack: (sessionId, stackId) => {
+    set((state) => {
+      const sessions = state.sessions.map((s) => {
+        if (s.id !== sessionId) return s;
+        const attachedStackIds = s.attachedStackIds.includes(stackId)
+          ? s.attachedStackIds.filter((id) => id !== stackId)
+          : [...s.attachedStackIds, stackId];
+        return { ...s, attachedStackIds };
+      });
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  toggleDocChatMode: (sessionId) => {
+    set((state) => {
+      const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, docChatMode: !s.docChatMode } : s));
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  setSubagentRun: (sessionId, taskId, messages) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target) return state;
+      const sessions = state.sessions.map((s) =>
+        s.id === sessionId ? { ...s, subagentRuns: { ...s.subagentRuns, [taskId]: messages } } : s
+      );
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
     });

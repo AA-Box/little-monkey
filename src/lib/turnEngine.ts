@@ -19,6 +19,7 @@ import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, ty
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
+import { runSubagentTask } from './subagent';
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -121,6 +122,23 @@ function invokeMcpTool(
   }).then(formatMcpCallToolResult, stringifyToolError);
 }
 
+/**
+ * Whether `toolCall` was actually among the tools offered to the model this
+ * turn/run. Lives here (rather than in `agentLoop.ts`, its original home)
+ * so `subagent.ts`'s own child tool-calling loop can enforce the exact same
+ * gate `agentLoop.ts`'s parent loop does — a real risk with local/quantized
+ * models that don't strictly respect the offered tool schema (e.g. an
+ * `explore`-profile subagent's model emitting a `write_file` call even
+ * though `toolsForProfile('explore')` never offered it). Building the
+ * per-turn/per-run tool list only shapes the *schema* sent to the model;
+ * this is the enforcement point that makes it an actual authorization
+ * boundary rather than a polite suggestion the model can ignore. Re-exported
+ * from `agentLoop.ts` for backward compatibility with existing imports/tests.
+ */
+export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
+  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
+}
+
 /** Tool names eligible for risk classification — see `RiskAnnotationContext`.
  * `run_shell` is included for DISPLAY purposes only (the permission modal can
  * show a badge on a shell prompt too) — see `permissions.rs`'s
@@ -154,6 +172,48 @@ export interface RiskAnnotationContext {
 }
 
 /**
+ * Everything `executeToolCall` needs to delegate a `task` tool call to
+ * `subagent.ts`'s `runSubagentTask` — built once per turn by
+ * `agentLoop.ts`'s `runAgentTurnBody` (mirrors `RiskAnnotationContext`'s
+ * "built once, passed down unchanged" shape) and passed through every
+ * `executeToolCall` call this turn, exactly like `risk`/`attachedStackNames`.
+ * Omitted entirely by callers that never offer the `task` tool (e.g. today's
+ * only other caller besides the main loop, if any existed) — a `task` call
+ * reaching `executeToolCall` with no context configured is defensively
+ * reported as a tool error rather than throwing.
+ */
+export interface SubagentContext {
+  /** Threaded through to `runSubagentTask` for `useUsageStore` keying — see
+   * that function's own doc comment for why child usage is never actually
+   * recorded under it (the whole point of `recordUsage: false`). */
+  sessionId: string;
+  /** THIS turn's already-resolved active target (see `ResolvedTarget`) —
+   * passed down rather than re-resolved, so a mid-turn manual model switch
+   * can never split the parent and child across different targets. */
+  target: ResolvedTarget;
+  effort?: string;
+  /** The parent turn's own risk-annotation context (built once by
+   * `agentLoop.ts`'s `runAgentTurnBody`, same object every `executeToolCall`
+   * this turn already receives via the `risk` parameter) — threaded through
+   * to `runSubagentTask` so a `code`-profile child's write_file/edit_file/
+   * run_shell calls get the SAME advisory risk classification (and share the
+   * same per-turn cache) the parent's own equivalent calls would, instead of
+   * silently skipping classification just because the mutation happened
+   * inside a subagent. `undefined` when the caller never built one (risk
+   * annotations off, or a future caller that doesn't offer `task` at all). */
+  risk?: RiskAnnotationContext;
+  /** Called once for every path a `code`-profile child successfully
+   * `write_file`/`edit_file`s, so the PARENT turn's own `mutatedFiles`
+   * tracking (see `agentLoop.ts`'s `runAgentTurnBody`) sees subagent-driven
+   * mutations too — without this, `runVerificationPhase` would never fire
+   * for a turn where every mutation happened inside a delegated `task` call,
+   * since the parent round's own `toolCalls` array only ever contains the
+   * single `task` entry, never the child's nested write_file/edit_file
+   * calls. `undefined` for a caller that doesn't track mutated files at all. */
+  onMutatedPath?: (path: string) => void;
+}
+
+/**
  * Executes a single model-requested tool call via the corresponding
  * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
  * `invokeMcpTool` above) and returns the string to use as the content of the
@@ -173,7 +233,19 @@ export async function executeToolCall(
   turnId: string,
   mcpRegistry: McpToolRegistry,
   signal?: AbortSignal,
-  risk?: RiskAnnotationContext
+  risk?: RiskAnnotationContext,
+  attachedStackNames?: string[],
+  subagent?: SubagentContext,
+  // Subagent-attribution label (slice 3) — see the injection site below.
+  // Threaded through to the Rust command as its own `agent_label` field,
+  // which `permissions::request_permission` forwards as its own
+  // `PermissionRequestPayload.agent_label` field (NOT folded into `detail`
+  // as a parsed-out-by-regex prefix — see that field's doc comment for why
+  // that earlier design was a spoofing/corruption bug). Undefined for every
+  // parent-turn call (`agentLoop.ts` never passes it); `subagent.ts`'s
+  // `runSubagentTask` passes its own `description` here for each of ITS
+  // child's tool calls.
+  agentLabel?: string
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
 
@@ -199,6 +271,15 @@ export async function executeToolCall(
   // change to `RISK_ELIGIBLE_TOOLS` — where a model-supplied value survives.
   delete args.risk_level;
   delete args.risk_reason;
+  // `agent_label` (slice 3) is the same story: purely frontend-injected
+  // subagent attribution, sent to the Rust side as its own field (never
+  // folded into the permission-prompt `detail` text — see
+  // `PermissionRequestPayload.agent_label`'s doc comment in `permissions.rs`)
+  // and never something the model itself may supply. Scrubbed unconditionally,
+  // before the injection below, so a `code`-profile subagent's own model can
+  // never forge a *different* subagent's attribution (or the parent's lack
+  // of one) on its write_file/edit_file/run_shell calls.
+  delete args.agent_label;
 
   // Classify (cached per turn) BEFORE the checkpoint_id/turn_id injection
   // below, so both the cache key and the judge prompt reflect only the
@@ -231,6 +312,21 @@ export async function executeToolCall(
   if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
     args.checkpoint_id = checkpointId;
   }
+  // `agent_label` (slice 3): injected ONLY when a caller supplied one — the
+  // parent turn's own tool calls never pass `agentLabel` at all, so this
+  // stays a no-op for them (no `agent_label` key at all, not even `undefined`
+  // — `tools.rs`'s `Option<String>` param treats an absent key the same as
+  // `null`/`None` either way). `subagent.ts`'s `runSubagentTask` is the one
+  // caller that passes its own `description` here, for every tool call ITS
+  // child model makes — forwarded all the way to
+  // `PermissionRequestPayload.agent_label`, its own serialized field, which
+  // `PermissionModal.tsx` reads directly (see that field's doc comment in
+  // `permissions.rs`). Purely cosmetic/informational: see that Rust
+  // function's doc comment for why it can never affect which mode
+  // auto-approves what.
+  if (agentLabel !== undefined && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
+    args.agent_label = agentLabel;
+  }
   // The turn id scopes permission prompts and shell/fetch cancellation to
   // THIS turn — Stop in one pane must not kill the other pane's command (or
   // in-flight fetch) or deny its prompt. Injected like checkpoint_id (never
@@ -254,6 +350,21 @@ export async function executeToolCall(
     args.turn_id = turnId;
   }
 
+  // `search_docs` is scoped to THIS session's actually-attached knowledge
+  // stacks server-side, never left to the model to declare — same treatment
+  // as `checkpoint_id`/`turn_id` above. Injected (and always overwritten,
+  // even if the model's JSON args somehow already had a same-named key)
+  // regardless of whether the model passed a `stack` argument: `stacks.rs`'s
+  // `resolve_search_stack_ids` uses this as the allow-list for BOTH the
+  // explicit-name case and the "omit stack" default-sweep case, so a
+  // compliant model that just omits `stack` (the tool description's stated
+  // default) can never sweep in a knowledge stack that exists and is indexed
+  // but was never attached to this session — see that Rust function's doc
+  // comment for the privacy gap this closes.
+  if (name === 'search_docs') {
+    args.allowed_stack_names = attachedStackNames ?? [];
+  }
+
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
   // doc comment): it never reaches Rust at all, checked BEFORE the
   // mcp__/tool_<name> dispatch below so this holds regardless of what future
@@ -261,6 +372,70 @@ export async function executeToolCall(
   // site in `agentLoop.ts`.
   if (name === 'present_plan') {
     return PRESENT_PLAN_RESULT;
+  }
+
+  // `task` is another frontend-only tool, same treatment as `present_plan`
+  // just above: it has no `tool_task` Rust command, so it's intercepted
+  // here, before the `invoke`/`mcp__` dispatch below, and delegated to
+  // `runSubagentTask` instead. This is the depth-cap-of-1 enforcement point
+  // in practice (not just by the schema omission in `toolsForProfile`): even
+  // if a future change somehow offered `task` to a subagent's own child
+  // loop, `runSubagentTask` builds the child's tool list via
+  // `toolsForProfile`, which never includes `task` — so there is no tool
+  // name here for a grandchild call to even be named after.
+  //
+  // The whole branch is wrapped in try/catch (rather than trusting
+  // `runSubagentTask`'s own internal one) so that ANY exception here —
+  // including a bug in argument parsing below, not just inside the child's
+  // own loop — can never propagate out of `executeToolCall` and leave this
+  // call's `tool_calls` entry without a matching `tool` result (the
+  // transcript-validity invariant every other branch in this function
+  // upholds the same way).
+  if (name === 'task') {
+    try {
+      if (!subagent) {
+        return stringifyToolError(new Error('The task tool has no subagent execution context configured for this turn.'));
+      }
+      const description = typeof args.description === 'string' ? args.description : 'Subagent task';
+      const taskPrompt = typeof args.prompt === 'string' ? args.prompt : '';
+      // Only 'explore' is offered by `TASK_TOOL`'s schema this slice (see
+      // `tools.ts`'s doc comment) — defensively re-validated here anyway,
+      // rather than trusting the model's own JSON, exactly like every other
+      // frontend-injected/validated field in this function.
+      const profile: 'explore' | 'code' = args.profile === 'code' ? 'code' : 'explore';
+      // The child's own turn id — NOT `turnId` (the parent's) — so its
+      // tool calls get their own entry in the Rust per-turn `tool_cancel`/
+      // permission maps (AppState, lib.rs), scoping Stop-button cancellation
+      // and permission prompts to just this subagent run rather than
+      // colliding with the parent turn's own. `checkpointId` (the parent's)
+      // is passed through UNCHANGED below, so any file the child mutates
+      // still lands in the parent turn's checkpoint manifest and is
+      // revertable via the existing CheckpointRow — see `runSubagentTask`'s
+      // doc comment for why this exact pairing (parent checkpoint id + own
+      // turn id) is the crux of what makes subagents safe.
+      const childTurnId = crypto.randomUUID();
+      return await runSubagentTask({
+        sessionId: subagent.sessionId,
+        parentCheckpointId: checkpointId,
+        parentSignal: signal,
+        taskId: childTurnId,
+        // The ORIGINATING `task` tool_call's own id — see
+        // `RunSubagentTaskParams.toolCallId`'s doc comment for why this is a
+        // deliberately separate id from `childTurnId` above: this is the
+        // `subagentStore`/`ChatSession.subagentRuns` key `MessageList.tsx`
+        // can actually correlate against the persisted transcript.
+        toolCallId: toolCall.id,
+        description,
+        prompt: taskPrompt,
+        profile,
+        target: subagent.target,
+        effort: subagent.effort,
+        risk: subagent.risk,
+        onMutatedPath: subagent.onMutatedPath,
+      });
+    } catch (err) {
+      return stringifyToolError(err);
+    }
   }
 
   const invocation = name.startsWith('mcp__')
@@ -285,6 +460,17 @@ interface AttemptResult {
   streamError: string | null;
   /** Whether any content/tool-call fragment arrived before `streamError` (if any) — the failover safety rule below only ever retries a *different* target when this is `false`, since a mid-stream error has already shown the user partial output that a retry could duplicate or contradict. */
   contentStarted: boolean;
+  /** The raw token counts from this attempt's own `usage` stream event, if
+   * one arrived — populated regardless of `recordUsage` (see that param's
+   * doc comment): `recordUsage` only gates whether `useUsageStore` gets
+   * written, it must never gate whether the CALLER can see its own attempt's
+   * usage. `subagent.ts`'s `runSubagentTask` is the one caller that reads
+   * this (slice 4, per-subagent token usage surfaced in `SubagentRow`) —
+   * every pre-existing caller already gets the same numbers via
+   * `useUsageStore` and simply ignores this field. `undefined` when no
+   * `usage` event arrived at all (e.g. a provider that doesn't report it, or
+   * a stream that errored before one showed up). */
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
 }
 
 /**
@@ -305,7 +491,18 @@ export async function attemptStream(
   signal: AbortSignal | undefined,
   effort: string | undefined,
   sessionId: string,
-  onDelta?: (content: string) => void
+  onDelta?: (content: string) => void,
+  // Whether a `usage` stream event gets written into `useUsageStore` under
+  // `sessionId` — true for every pre-existing caller (the main turn loop,
+  // context-trim summarization, the risk judge), so this parameter is
+  // additive and none of them had to change. `subagent.ts`'s
+  // `runSubagentTask` is the one caller that passes `false`: a child
+  // attempt's token usage is real (rateLimitTracker still records it via
+  // `recordRequest` below, unconditionally, since it IS a real provider
+  // request) but must never clobber the PARENT session's own context-usage
+  // ring — see the design doc's "usage clobbering" risk and
+  // `subagent.test.ts` for the test pinning this.
+  recordUsage: boolean = true
 ): Promise<AttemptResult> {
   if (target.kind === 'provider') recordRequest(target.providerId);
 
@@ -313,6 +510,7 @@ export async function attemptStream(
   const toolCalls: ToolCall[] = [];
   let streamError: string | null = null;
   let contentStarted = false;
+  let usage: AttemptResult['usage'];
 
   const events: AsyncGenerator<StreamEvent> =
     target.kind === 'provider'
@@ -329,11 +527,14 @@ export async function attemptStream(
         contentStarted = true;
         toolCalls.push(event.toolCall);
       } else if (event.type === 'usage') {
-        useUsageStore.getState().setUsage(sessionId, {
+        usage = {
           promptTokens: event.usage.prompt_tokens,
           completionTokens: event.usage.completion_tokens,
           totalTokens: event.usage.total_tokens,
-        });
+        };
+        if (recordUsage) {
+          useUsageStore.getState().setUsage(sessionId, usage);
+        }
       }
       // 'done' carries no data; the generator simply returns after it.
     }
@@ -341,5 +542,5 @@ export async function attemptStream(
     streamError = err instanceof Error ? err.message : String(err);
   }
 
-  return { content, toolCalls, streamError, contentStarted };
+  return { content, toolCalls, streamError, contentStarted, usage };
 }

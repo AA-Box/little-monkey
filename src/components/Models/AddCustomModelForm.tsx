@@ -61,6 +61,7 @@ export function AddCustomModelForm() {
       installed: false,
       path: null,
       is_external: false,
+      kind: "chat",
     };
     try {
       await download(model);

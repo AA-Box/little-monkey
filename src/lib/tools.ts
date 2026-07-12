@@ -243,6 +243,70 @@ export const TOOLS: ToolDef[] = [
 ];
 
 /**
+ * Builds the `search_docs` tool's description, naming the actual attached
+ * stacks so the model knows what's searchable without a separate lookup
+ * call — mirrors `stack: Option<String>`'s resolution in
+ * `stacks.rs::resolve_search_stack_ids`: pass one of these names to search
+ * just that stack, or omit it to search every indexed stack (the model's own
+ * visible universe here is exactly the attached stacks this description
+ * lists, even though the Rust side itself has no separate notion of
+ * "attached" — see that function's doc comment for why).
+ */
+function searchDocsDescription(attachedStackNames: string[]): string {
+  const stackList = attachedStackNames.join(', ');
+  return `Search the attached knowledge stack(s) for passages relevant to a query, returning the top matches with their source file path and a relevance score. Attached stacks: ${stackList}. Pass "stack" to search only one of them by name, or omit it to search across all of them. Cite source paths when using results in your answer.`;
+}
+
+/**
+ * A `search_docs` `ToolDef` naming `attachedStackNames` in its description —
+ * built fresh per turn (see `buildTools` below) rather than a fixed constant,
+ * since the whole point is that the model sees the actual current stack
+ * names, not a generic placeholder.
+ */
+function searchDocsTool(attachedStackNames: string[]): ToolDef {
+  return {
+    type: 'function',
+    function: {
+      name: 'search_docs',
+      description: searchDocsDescription(attachedStackNames),
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The search query — a question or phrase to find relevant passages for.',
+          },
+          stack: {
+            type: 'string',
+            description: 'Optional: the name of one specific attached stack to search. Omit to search across all attached stacks.',
+          },
+          max_results: {
+            type: 'integer',
+            description: 'Maximum number of passages to return (default 6).',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+/**
+ * Wraps the base `TOOLS` array with `search_docs` appended, ONLY when at
+ * least one knowledge stack is attached to the session (`attachedStackNames`
+ * non-empty) — an unattached session has nothing for the tool to search, so
+ * offering it would just invite a confusing "no stacks" error. Called once
+ * per turn by `agentLoop.ts`'s `runAgentTurnBody`, the same place
+ * `toolsForMode`/`toolsForSettings` already shape the per-turn tool list —
+ * see that module's doc comment for where this slots into the composition
+ * chain (`toolsForSettings(toolsForMode(buildTools(...), mode), ...)`).
+ */
+export function buildTools(attachedStackNames: string[]): ToolDef[] {
+  return attachedStackNames.length > 0 ? [...TOOLS, searchDocsTool(attachedStackNames)] : TOOLS;
+}
+
+/**
  * A frontend-only tool: presenting a structured plan for the user to
  * approve before switching out of Plan Mode (see `agentLoop.ts`'s
  * `toolsForMode`/`PLAN_NOTE_PREFIX`/`PlanNotice`). Deliberately kept OUT of
@@ -258,6 +322,80 @@ export const TOOLS: ToolDef[] = [
  * scanning tools.rs for `present_plan` and finding nothing should look here,
  * not assume a missing Rust command.
  */
+/**
+ * Tool names offered to a subagent's own tool-calling loop, keyed by
+ * `profile` — see `subagent.ts`'s `runSubagentTask` and the "Restricted tool
+ * sets" section of `docs/roadmap/p3-subagents.md`. `explore` is every
+ * ungated read-only tool (a subagent that can only read needs no new trust
+ * beyond what the parent already has); `code` (slice 3) adds the mutating
+ * tools, which still go through the exact same Rust commands and permission
+ * gate as the parent's own calls.
+ *
+ * CRITICAL: `'task'` must never appear in either list — this is what caps
+ * delegation depth at 1 structurally (a subagent can never spawn another
+ * subagent) rather than via a runtime recursion guard. `TASK_TOOL` is kept
+ * as its own constant below, deliberately never added to `TOOLS`, so there
+ * is no name in `TOOLS` for these filters to ever accidentally let through.
+ * See `tools.test.ts` for the test proving this by construction.
+ */
+const EXPLORE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set(['read_file', 'list_dir', 'glob', 'grep']);
+const CODE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set([...EXPLORE_PROFILE_TOOL_NAMES, 'write_file', 'edit_file', 'run_shell']);
+
+export function toolsForProfile(profile: 'explore' | 'code'): ToolDef[] {
+  const names = profile === 'code' ? CODE_PROFILE_TOOL_NAMES : EXPLORE_PROFILE_TOOL_NAMES;
+  return TOOLS.filter((tool) => names.has(tool.function.name));
+}
+
+/**
+ * The `task` tool: delegates a scoped subtask to a subagent that runs its
+ * own isolated tool-calling loop (see `subagent.ts`'s `runSubagentTask`) and
+ * returns only a final report to the parent turn — the child's own
+ * exploration noise never touches the parent's context. Deliberately kept
+ * OUT of the `TOOLS` array above (see `toolsForProfile`'s doc comment for
+ * why) and only appended to the per-turn tool list by `agentLoop.ts`'s
+ * `toolsForSettings` when `settingsStore.subagentsEnabled` is on — a weak
+ * local model that never had this toggle turned on should never even see
+ * the schema.
+ *
+ * `profile` allows both `'explore'` and `'code'` as of slice 3 — a `'code'`
+ * subagent can write/edit/run shell through the exact same permission gate
+ * and checkpoint hooks as the parent (see `executeToolCall`'s `task` branch
+ * and `subagent.ts`'s `runSubagentTask` for the parent-checkpoint-id +
+ * child-own-turn-id pairing that makes this safe). `executeToolCall`
+ * (`turnEngine.ts`) intercepts this name before the `invoke('tool_'+name)`
+ * dispatch, exactly like `present_plan` — it has no `tool_task` Rust command
+ * either.
+ */
+export const TASK_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'task',
+    description:
+      'Delegate a scoped subtask to a subagent with its own isolated tool-calling loop and restricted tool set. The subagent cannot see this conversation, so give it a fully self-contained prompt. Only its final report is returned to you — use this for broad exploration or an independent subtask you want kept out of your own context. Multiple task calls in the same turn may run in parallel.',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: {
+          type: 'string',
+          description: 'A short (3-6 word) label for this subtask, shown to the user.',
+        },
+        prompt: {
+          type: 'string',
+          description: "Full, self-contained instructions for the subagent — it has no access to this conversation, so include all necessary context (file paths, what to look for, what to report back).",
+        },
+        profile: {
+          type: 'string',
+          enum: ['explore', 'code'],
+          description:
+            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask.",
+        },
+      },
+      required: ['description', 'prompt', 'profile'],
+      additionalProperties: false,
+    },
+  },
+};
+
 export const PRESENT_PLAN_TOOL: ToolDef = {
   type: 'function',
   function: {

@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useUsageStore } from "./usageStore";
 
@@ -19,6 +19,8 @@ export interface ModelInfo {
   path: string | null;
   /** True for a model registered via `models_add_external` (a `.gguf` file outside the app's models dir) — the app never owns or deletes that file. */
   is_external: boolean;
+  /** "chat" (tool-calling instruct model) or "embedding" — see `models.rs::ModelKind`. Defaults to "chat" on the Rust side for pre-existing entries, so this is always present in practice. */
+  kind: "chat" | "embedding";
 }
 
 export type LlamaStatus = "stopped" | "starting" | "ready" | "error";
@@ -565,51 +567,55 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   },
 }));
 
-void listen<LlamaStatusEvent>("llama://status", (event) => {
-  useModelStore.setState((state) => ({
-    llamaStatus: event.payload.status,
-    active: event.payload.model_path
-      ? state.installed.find((m) => m.path === event.payload.model_path) ??
-        state.active
-      : state.active,
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for llama://status events", error);
-});
-
-void listen<DownloadProgressEvent>("models://download-progress", (event) => {
-  const { file, downloaded, total } = event.payload;
-  useModelStore.setState((state) => ({
-    downloadProgress: {
-      ...state.downloadProgress,
-      [file]: { downloaded, total },
-    },
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for models://download-progress events", error);
-});
-
-void listen<OllamaStatusEvent>("ollama://status", (event) => {
-  useModelStore.setState({
-    ollamaReachable: event.payload.reachable,
-    ollamaVersion: event.payload.version,
-    ollamaBinaryFound: event.payload.binary_found,
+// These backend events only exist under the Tauri shell — in plain-browser
+// dev (`vite` without it) `listen` itself throws, so don't subscribe at all.
+if (isTauri()) {
+  void listen<LlamaStatusEvent>("llama://status", (event) => {
+    useModelStore.setState((state) => ({
+      llamaStatus: event.payload.status,
+      active: event.payload.model_path
+        ? state.installed.find((m) => m.path === event.payload.model_path) ??
+          state.active
+        : state.active,
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for llama://status events", error);
   });
-}).catch((error) => {
-  console.error("Failed to listen for ollama://status events", error);
-});
 
-void listen<OllamaPullProgressEvent>("ollama://pull-progress", (event) => {
-  const { tag, line } = event.payload;
-  useModelStore.setState((state) => ({
-    ollamaPullProgress: {
-      ...state.ollamaPullProgress,
-      [tag]: line,
-    },
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for ollama://pull-progress events", error);
-});
+  void listen<DownloadProgressEvent>("models://download-progress", (event) => {
+    const { file, downloaded, total } = event.payload;
+    useModelStore.setState((state) => ({
+      downloadProgress: {
+        ...state.downloadProgress,
+        [file]: { downloaded, total },
+      },
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for models://download-progress events", error);
+  });
+
+  void listen<OllamaStatusEvent>("ollama://status", (event) => {
+    useModelStore.setState({
+      ollamaReachable: event.payload.reachable,
+      ollamaVersion: event.payload.version,
+      ollamaBinaryFound: event.payload.binary_found,
+    });
+  }).catch((error) => {
+    console.error("Failed to listen for ollama://status events", error);
+  });
+
+  void listen<OllamaPullProgressEvent>("ollama://pull-progress", (event) => {
+    const { tag, line } = event.payload;
+    useModelStore.setState((state) => ({
+      ollamaPullProgress: {
+        ...state.ollamaPullProgress,
+        [tag]: line,
+      },
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for ollama://pull-progress events", error);
+  });
+}
 
 /**
  * Fast, synchronous resolution of what `agentLoop.ts` should chat against

@@ -102,6 +102,7 @@ pub async fn run(
     mut options: chat::ChatOptions,
     initial_persona: Option<PromptEntry>,
     mcp_entries: &[McpServerEntry],
+    attached_stacks: &[String],
 ) {
     let mut reader = Reader::new();
     if reader.interactive() {
@@ -172,8 +173,18 @@ pub async fn run(
         if !keep_history {
             truncate_to_system(&mut history);
         }
-        if let Err(e) =
-            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, &text, mcp_entries).await
+        if let Err(e) = agent::run_turn(
+            client,
+            &target,
+            state,
+            &mut perms,
+            &mut history,
+            &options,
+            &text,
+            mcp_entries,
+            attached_stacks,
+        )
+        .await
         {
             eprintln!("\nError: {e}");
         }

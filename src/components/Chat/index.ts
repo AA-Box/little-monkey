@@ -10,6 +10,7 @@ export type { SlashCommandAutocompleteProps } from "./SlashCommandAutocomplete";
 export { default as ModeSelector } from "./ModeSelector";
 export { default as EffortSelector } from "./EffortSelector";
 export { default as PersonaSelector } from "./PersonaSelector";
+export { default as StackPicker } from "./StackPicker";
 export { default as ModelSwitcher } from "./ModelSwitcher";
 export { default as ContextUsageIndicator } from "./ContextUsageIndicator";
 export { default as CheckpointTimeline } from "./CheckpointTimeline";

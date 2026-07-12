@@ -1479,4 +1479,69 @@ mod tests {
         assert!(after_revert[0].reverted);
         assert!(after_revert[0].reapplyable, "revert_impl recorded a redo backup, so re-apply is now meaningful");
     }
+
+    /// Reproduces (and pins the fix for) the concurrent-write race a code
+    /// review flagged against `tool_write_file`/`tool_edit_file`: two
+    /// `code`-profile subagents (or any two concurrent mutating tool calls)
+    /// resolving to the SAME workspace path can, without serialization,
+    /// interleave past `record_original`'s dedup and each other's
+    /// `std::fs::write`, silently discarding one write. This mirrors the
+    /// review's own throwaway repro exactly — `record_original` followed by
+    /// a forced yield (standing in for `request_permission`'s real `.await`)
+    /// followed by `std::fs::write` — but now wrapped in `AppState::
+    /// file_write_lock` (see `tool_write_file`'s doc comment), the same lock
+    /// `tools.rs` now acquires around its own backup+write critical section.
+    /// Run across many trials on a genuinely multi-threaded runtime (real OS
+    /// parallelism, not just cooperative interleaving) so a regression that
+    /// reintroduces the race would show up as either a corrupted/mixed file
+    /// or more than one recorded checkpoint entry for the same path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_to_the_same_path_are_serialized_by_file_write_lock() {
+        use std::sync::Arc;
+
+        for _ in 0..50 {
+            let base = TempDir::new("base");
+            let ws = TempDir::new("ws");
+            let file = ws.path.join("shared.txt");
+            std::fs::write(&file, "original").unwrap();
+
+            let state = Arc::new(AppState::default());
+            let checkpoint_id = begin(&state, &base.path);
+
+            let run = |state: Arc<AppState>, checkpoint_id: String, file: PathBuf, content: &'static str| {
+                tokio::spawn(async move {
+                    // Force genuine interleaving opportunity across the two
+                    // tasks before either takes the lock — standing in for
+                    // `request_permission`'s real `.await` between path
+                    // resolution and the backup+write critical section.
+                    tokio::task::yield_now().await;
+
+                    let _guard = state.file_write_lock.lock().unwrap();
+                    record_original(&state, Some(&checkpoint_id), &file).unwrap();
+                    std::fs::write(&file, content).unwrap();
+                })
+            };
+
+            let a = run(state.clone(), checkpoint_id.clone(), file.clone(), "from writer A");
+            let b = run(state.clone(), checkpoint_id.clone(), file.clone(), "from writer B");
+            a.await.unwrap();
+            b.await.unwrap();
+
+            let final_content = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                final_content == "from writer A" || final_content == "from writer B",
+                "file content was corrupted/interleaved rather than a clean win by one writer: {final_content:?}"
+            );
+
+            // Only the FIRST writer's pre-mutation backup should ever be
+            // recorded for this path — serialization means the second
+            // writer's `record_original` call always sees an existing entry
+            // and skips (this dedup was always mutex-protected; the fix is
+            // that the two writers' backup+write pairs can no longer
+            // interleave with each other).
+            let entries = state.checkpoints.lock().unwrap()[&checkpoint_id].entries.clone();
+            let file_str = file.to_string_lossy().to_string();
+            assert_eq!(entries.iter().filter(|e| e.path == file_str).count(), 1);
+        }
+    }
 }

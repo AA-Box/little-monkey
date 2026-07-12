@@ -111,6 +111,14 @@ export function PermissionModal() {
   // `mcp_call_tool`'s `detail` construction) — friendlier than the raw
   // `mcp:<serverId>:<toolName>` permission-request string.
   const displayTool = isMcpTool ? pending.detail.split("\n", 1)[0] : pending.tool;
+  // Read directly off the payload's own `agent_label` field — a dedicated,
+  // separately-serialized field rather than something parsed back out of
+  // `detail` (see `permissionStore.ts`'s `PermissionRequest.agent_label` doc
+  // comment for why: a subagent's model-supplied `description` must never be
+  // able to forge/corrupt the shown detail text or spoof a different
+  // attribution).
+  const subagentDescription = pending.agent_label ?? null;
+  const displayDetail = pending.detail;
 
   return (
     <div
@@ -138,11 +146,17 @@ export function PermissionModal() {
           </div>
         </div>
 
+        {subagentDescription && (
+          <p className="mt-2 text-xs font-medium text-accent">
+            {t("PermissionModal.subagentAttribution", { description: subagentDescription })}
+          </p>
+        )}
+
         <RiskAnnotation pending={pending} t={t} />
 
         <div className="mt-4">
           <div className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-surface-2 p-2.5 font-mono text-xs text-muted">
-            {pending.detail}
+            {displayDetail}
           </div>
           {!canRememberForSession && (
             <p className="mt-2 text-xs text-faint">

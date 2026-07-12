@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { TOOLS, PRESENT_PLAN_TOOL } from './tools';
+import { PRESENT_PLAN_TOOL, TASK_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -35,10 +35,12 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
+  type SubagentContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
@@ -48,7 +50,7 @@ import {
   type DirEntry,
   type ResolvedTextReference,
 } from './mentions';
-import { currentSystemPrompt } from './systemPrompt';
+import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
@@ -56,6 +58,7 @@ import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
+import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
@@ -431,34 +434,194 @@ const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
 /**
  * Filters `remember` out of the tool list offered to the model this turn
  * when the settingsStore `memoryEnabled` toggle is off, and/or `web_fetch`
- * and `web_search` out when `webToolsEnabled` is off. This is the ONLY
- * effect of either toggle — rules and previously-saved facts are still
+ * and `web_search` out when `webToolsEnabled` is off, then APPENDS
+ * `TASK_TOOL` when `subagentsEnabled` is on. This is the ONLY effect of any
+ * of the three toggles — rules and previously-saved facts are still
  * injected into the system prompt unconditionally (see `runAgentTurnBody`'s
  * `useRulesStore.getState().refresh()` call); turning `memoryEnabled` off
  * stops the agent from saving *new* facts on its own, it is not amnesia.
  * Likewise, `webToolsEnabled` off just makes the two web tools invisible to
  * the model — it doesn't touch anything else.
+ *
+ * `subagentsEnabled` is deliberately handled in THIS function — the single
+ * existing per-turn tool-list composer both Plan/Act (`toolsForMode`'s
+ * `present_plan` append) and RAG (`buildTools`'s conditional `search_docs`
+ * append) already extended — rather than a new parallel "toolsForSubagents"
+ * filter: one composition chain
+ * (`toolsForSettings(toolsForMode([...buildTools(...), ...mcpDefs], mode), ...)`,
+ * see `runAgentTurnBody`) stays the one place to audit everything the model
+ * is offered. Default `false` mirrors every other call site that doesn't
+ * pass it, so `task` is never accidentally offered by an existing caller
+ * that hasn't been updated for it.
  */
-export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true): ToolDef[] {
-  return tools.filter((tool) => {
+export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true, subagentsEnabled = false): ToolDef[] {
+  const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
+  return subagentsEnabled ? [...filtered, TASK_TOOL] : filtered;
+}
+
+/** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
+ * `KnowledgeStack` — kept local (rather than importing the full interface)
+ * since only these three fields matter for the derived description. */
+interface AttachedStackLike {
+  name: string;
+  indexed_at: number | null;
+  chunk_count: number;
 }
 
 /**
- * Whether `toolCall` was actually among the tools offered to the model this
- * turn. `toolsForSettings` only shapes the *schema* sent to the model (e.g.
- * dropping `remember` when `memoryEnabled` is off) — nothing downstream of
- * that used to check it, so a model that still emitted a disabled or
- * hallucinated tool call (a real risk with local/quantized models that don't
- * strictly respect the offered tool schema) would have it executed anyway.
- * The tool-calling loop calls this before dispatch and rejects (without
- * executing) anything that fails it.
+ * Derives each attached stack's short prompt-facing `description` (see
+ * `systemPrompt.ts`'s `AttachedStackPromptInfo`) from its index status —
+ * `chunk_count` once indexed, or a "not indexed yet" note so the model
+ * doesn't expect `search_docs` to return anything for a stack that hasn't
+ * been indexed at all. Pure so it can be unit-tested independent of
+ * `stackStore`/`sessionStore`, same reasoning as `toolsForMode`/
+ * `toolsForSettings` above.
  */
-export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
-  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
+export function attachedStackPromptInfo(stacks: AttachedStackLike[]): AttachedStackPromptInfo[] {
+  return stacks.map((stack) => ({
+    name: stack.name,
+    description:
+      stack.indexed_at !== null ? `${stack.chunk_count} chunk${stack.chunk_count === 1 ? '' : 's'} indexed` : 'not indexed yet',
+  }));
+}
+
+/** Prefix identifying a synthetic notice inserted before the first model call
+ * of a turn when the session's doc-chat mode is on (see
+ * `ChatSession.docChatMode`, `StackPicker.tsx`) — cloned from the
+ * `CHECKPOINT_NOTE_PREFIX` pattern above. Carries the top-k passages
+ * `stacks_query` retrieved for the user's own message, so `MessageList` can
+ * render collapsible source chips and the model can answer with citations
+ * instead of needing to call `search_docs` itself first. Added to the
+ * transcript via the same `addMessage` every other notice in this module
+ * uses — never handled as a separate "wire-only" message — which is also
+ * what makes its token cost visible to `contextTrimmer.ts`'s
+ * `estimateHistoryTokens` for free: that function sums every message in
+ * history generically with no per-notice-type special-casing, so retrieved
+ * passages count toward compaction thresholds exactly like everything else
+ * already flowing through `addMessage` (the RAG design doc's context-bloat
+ * risk — see `contextTrimmer.test.ts`'s doc-chat coverage). */
+export const SOURCES_NOTE_PREFIX = '[Sources]';
+
+/** One retrieval hit inside a `SourcesNotice` — mirrors the fields of
+ * `stacks.rs`'s `StackQueryResult` (as returned by the `stacks_query`
+ * command) that the citation UI/prompt actually need, renamed to the design
+ * doc's `{path, stack, score, snippet}` shape rather than the wire's
+ * snake_case `source_path`/`stack_name`/`text` — see
+ * `runAgentTurnBody`'s doc-chat block for that mapping. */
+export interface SourcesNoticeResult {
+  path: string;
+  stack: string;
+  score: number;
+  snippet: string;
+}
+
+/** Payload embedded in a sources notice message. */
+export interface SourcesNotice {
+  results: SourcesNoticeResult[];
+}
+
+export function isSourcesNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SOURCES_NOTE_PREFIX);
+}
+
+/** Parses a sources notice's JSON payload; `null` for anything malformed. */
+export function parseSourcesNotice(message: ChatMessage): SourcesNotice | null {
+  if (!isSourcesNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(SOURCES_NOTE_PREFIX.length));
+    const results = (parsed as SourcesNotice | null)?.results;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      Array.isArray(results) &&
+      results.every(
+        (r): r is SourcesNoticeResult =>
+          Boolean(r) &&
+          typeof r === 'object' &&
+          typeof (r as SourcesNoticeResult).path === 'string' &&
+          typeof (r as SourcesNoticeResult).stack === 'string' &&
+          typeof (r as SourcesNoticeResult).score === 'number' &&
+          typeof (r as SourcesNoticeResult).snippet === 'string'
+      )
+    ) {
+      return parsed as SourcesNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a sources notice".
+  }
+  return null;
+}
+
+/** Serializes a sources notice back into message content. */
+export function formatSourcesNotice(notice: SourcesNotice): string {
+  return `${SOURCES_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+/**
+ * Re-exported for backward compatibility — `isToolCallAllowed` now lives in
+ * `turnEngine.ts` (see that module's doc comment) so `subagent.ts`'s own
+ * child tool-calling loop can reuse the exact same gate this loop's own
+ * dispatch below applies, rather than a parallel/duplicated check. Re-export
+ * of the binding already imported above (not a fresh `export ... from`) so
+ * this file's own use of it below and the public export are the same value.
+ */
+export { isToolCallAllowed };
+
+/**
+ * Runs one round's worth of model-requested tool calls, splitting `task`
+ * calls out to run CONCURRENTLY (bounded by `maxConcurrentSubagents`, the
+ * "builds on split-pane turn-safe concurrency" payoff called out in the
+ * design doc's Parallelism section — the Rust per-turn `tool_cancel`/
+ * permission-`pending` maps and the queued `PermissionModal` were already
+ * built for N concurrent turns, not just 2) while every other call stays
+ * strictly sequential, exactly as before this feature — a subagent's own
+ * tool calls are already serialized within `runSubagentTask`'s own loop, so
+ * only concurrency ACROSS multiple `task` calls in the same round is new.
+ *
+ * `results[i]` always corresponds to `toolCalls[i]` regardless of which
+ * call actually finished first — several providers reject a `tool_calls`
+ * round trip whose `tool` results don't come back in the same order the
+ * calls were requested in, so this ordering guarantee is load-bearing, not
+ * cosmetic. `runOne` is a plain callback (not baked in here) so this stays
+ * unit-testable with a fake, controllable-timing implementation instead of
+ * needing a real `executeToolCall`/Tauri `invoke`.
+ */
+export async function runToolCallsForRound(
+  toolCalls: ToolCall[],
+  maxConcurrentSubagents: number,
+  runOne: (toolCall: ToolCall) => Promise<string>
+): Promise<string[]> {
+  const results: string[] = new Array(toolCalls.length);
+  const taskIndices: number[] = [];
+  const sequentialIndices: number[] = [];
+  toolCalls.forEach((toolCall, index) => {
+    (toolCall.function.name === 'task' ? taskIndices : sequentialIndices).push(index);
+  });
+
+  const sequentialRun = (async () => {
+    for (const index of sequentialIndices) {
+      results[index] = await runOne(toolCalls[index]);
+    }
+  })();
+
+  // A small bounded worker pool over `taskIndices` only — `sequentialRun`
+  // above already owns every non-`task` index, so these two loops never
+  // touch the same slot and can safely run at the same time.
+  const poolSize = Math.max(1, Math.min(4, Math.floor(maxConcurrentSubagents) || 1, taskIndices.length || 1));
+  let nextTaskCursor = 0;
+  const workers = Array.from({ length: poolSize }, async () => {
+    while (nextTaskCursor < taskIndices.length) {
+      const index = taskIndices[nextTaskCursor++];
+      results[index] = await runOne(toolCalls[index]);
+    }
+  });
+
+  await Promise.all([sequentialRun, ...workers]);
+  return results;
 }
 
 /** Shape of a successful `tool_remember` result (the created/deduplicated
@@ -1202,10 +1365,62 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
+
+  // This session's attached knowledge stacks (see `ChatSession.attachedStackIds`,
+  // `StackPicker.tsx`), resolved against the current stack registry once per
+  // turn — same "computed once, not re-derived every round trip" stance as
+  // `mode`/`mcpDefs` above. Empty for the overwhelming majority of turns (no
+  // stacks attached), in which case `buildTools` returns the base list
+  // unchanged and the system prompt gets no stacks guidance line.
+  const attachedStackIds = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.attachedStackIds ?? [];
+  const attachedStacks =
+    attachedStackIds.length > 0
+      ? useStackStore.getState().stacks.filter((stack) => attachedStackIds.includes(stack.id))
+      : [];
+  const attachedStackNames = attachedStacks.map((stack) => stack.name);
+  const attachedStacksForPrompt = attachedStackPromptInfo(attachedStacks);
+
+  // This session's doc-chat toggle (see `ChatSession.docChatMode`,
+  // `StackPicker.tsx`) — read once per turn, same stance as `attachedStackIds`
+  // just above. Used both for the auto-retrieval block right below and for
+  // every iteration's system prompt (see `currentSystemPrompt`'s call inside
+  // the loop), so a toggle flipped mid-turn never changes behavior partway
+  // through this turn's own tool-calling loop.
+  const docChatMode = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.docChatMode ?? false;
+
+  // Doc-chat mode (RAG design doc slice 3): auto-retrieve the top-k passages
+  // for this turn's own message BEFORE the first model call below, so the
+  // model never has to remember to call `search_docs` itself. Gated on at
+  // least one attached stack — with none, there's nothing to search, and
+  // `stacks_query` would just error. The notice is appended via `addMessage`
+  // exactly like every other synthetic notice in this module (see
+  // `SOURCES_NOTE_PREFIX`'s doc comment for why this alone is enough to make
+  // it show up in every subsequent iteration's wire payload AND count toward
+  // `contextTrimmer.ts`'s token estimate). Retrieval failure — a stack mid-
+  // reindex, the embed server down, a corrupt index — must never block the
+  // turn, so it's swallowed silently: the model just proceeds without
+  // sources for this turn, same as an unattached session always has.
+  if (docChatMode && attachedStackIds.length > 0 && !signal?.aborted) {
+    try {
+      const hits = await invoke<StackQueryResult[]>('stacks_query', { stackIds: attachedStackIds, query: userText });
+      if (hits.length > 0) {
+        addMessage({
+          role: 'system',
+          content: formatSourcesNotice({
+            results: hits.map((hit) => ({ path: hit.source_path, stack: hit.stack_name, score: hit.score, snippet: hit.text })),
+          }),
+        });
+      }
+    } catch {
+      // See doc comment above — retrieval failure must never block the turn.
+    }
+  }
+
   const toolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...TOOLS, ...mcpDefs], mode),
+    toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
-    settings.webToolsEnabled
+    settings.webToolsEnabled,
+    settings.subagentsEnabled
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -1300,7 +1515,10 @@ async function runAgentTurnBody(
     // very next round trip, and a dangling id just resolves to no persona —
     // see `resolvePersona`).
     const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
-    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt(personaId) };
+    const systemMessage: ChatMessage = {
+      role: 'system',
+      content: currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+    };
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user
@@ -1388,7 +1606,11 @@ async function runAgentTurnBody(
     // before executing them and feeding results back.
     updateLastMessage({ content, tool_calls: toolCalls });
 
-    for (const toolCall of toolCalls) {
+    // Executes every call in this round — `task` calls run concurrently
+    // (bounded by `settings.maxConcurrentSubagents`), everything else stays
+    // sequential — see `runToolCallsForRound`'s own doc comment for why, and
+    // for the order-preservation guarantee the rest of this loop depends on.
+    const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
       // Reject (without executing) any call whose name wasn't actually
       // offered to the model this turn — e.g. `remember` after
       // `memoryEnabled` was turned off, or any other tool a local/quantized
@@ -1398,21 +1620,41 @@ async function runAgentTurnBody(
       // polite suggestion the model can ignore. Still gets a result message,
       // same invariant as the cancelled-call path below.
       if (!isToolCallAllowed(toolCall, toolsForTurn)) {
-        addMessage({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
-        });
-        continue;
+        return stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`));
       }
 
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
-      const resultContent = signal?.aborted
-        ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation);
+      // Built fresh per call (not hoisted once before the loop) so a `task`
+      // call always sees the CURRENT `target` — a failover switch earlier in
+      // this same iteration (or, in principle, an auto-vision switch on the
+      // next one) must never leave a subagent resolving a target the parent
+      // has since moved off of. See `SubagentContext`'s doc comment in
+      // `turnEngine.ts`.
+      if (signal?.aborted) return CANCELLED_TOOL_RESULT;
+      // `risk`/`onMutatedPath` thread THIS turn's own risk-annotation context
+      // and mutated-file tracking down into a `code`-profile child's own
+      // write_file/edit_file/run_shell calls — without these, a subagent's
+      // mutations would silently skip risk classification (even when the
+      // parent turn has it enabled) and never trip `runVerificationPhase`
+      // (since `mutatedFiles` below is otherwise only ever populated from
+      // this round's own top-level `toolCalls`, which for a `task` call is
+      // just the single `task` entry, never the child's nested writes).
+      const subagentContext: SubagentContext = {
+        sessionId,
+        target,
+        effort,
+        risk: riskAnnotation,
+        onMutatedPath: (path) => mutatedFiles.add(path),
+      };
+      return executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames, subagentContext);
+    });
+
+    for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex++) {
+      const toolCall = toolCalls[toolCallIndex];
+      const resultContent = results[toolCallIndex];
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,

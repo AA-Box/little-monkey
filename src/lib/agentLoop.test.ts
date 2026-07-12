@@ -1,15 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 
 import {
+  attachedStackPromptInfo,
   checkpointChainBlockReason,
   formatMemoryNotice,
   formatPlanNotice,
+  formatSourcesNotice,
   formatVerifyNotice,
   isMemoryNotice,
   isPlanNotice,
+  isSourcesNotice,
   isSuccessfulMutationResult,
   isToolCallAllowed,
   isVerifyFixNotice,
@@ -17,8 +20,10 @@ import {
   maybeAutoPreviewNewestArtifact,
   parseMemoryNotice,
   parsePlanNotice,
+  parseSourcesNotice,
   parseVerifyNotice,
   PLAN_NOTE_PREFIX,
+  runToolCallsForRound,
   runVerificationPhase,
   shouldFeedBackVerifyFailure,
   toolCallPathArg,
@@ -29,9 +34,11 @@ import {
   type CheckpointChainLink,
   type MemoryNotice,
   type PlanNotice,
+  type SourcesNotice,
   type VerifyFailure,
   type VerifyNotice,
 } from "./agentLoop";
+import { estimateHistoryTokens } from "./contextTrimmer";
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
@@ -165,6 +172,67 @@ describe("verify notices", () => {
   });
 });
 
+describe("sources notices", () => {
+  const notice: SourcesNotice = {
+    results: [
+      { path: "docs/guide.md", stack: "Docs", score: 0.87, snippet: "Install via pnpm install." },
+      { path: "docs/faq.md", stack: "Docs", score: 0.61, snippet: "See the FAQ for troubleshooting." },
+    ],
+  };
+
+  it("formats a notice as a [Sources]-prefixed JSON payload and round-trips it back", () => {
+    const formatted = formatSourcesNotice(notice);
+    expect(formatted.startsWith("[Sources]")).toBe(true);
+
+    const message: ChatMessage = { role: "system", content: formatted };
+    expect(isSourcesNotice(message)).toBe(true);
+    expect(parseSourcesNotice(message)).toEqual(notice);
+  });
+
+  it("round-trips an empty results list", () => {
+    const empty: SourcesNotice = { results: [] };
+    const message: ChatMessage = { role: "system", content: formatSourcesNotice(empty) };
+    expect(parseSourcesNotice(message)).toEqual(empty);
+  });
+
+  it("is not misidentified as a sources notice for other message shapes", () => {
+    expect(isSourcesNotice({ role: "system", content: "[Checkpoint]{}" })).toBe(false);
+    expect(isSourcesNotice({ role: "user", content: "[Sources]{}" })).toBe(false);
+    expect(parseSourcesNotice({ role: "assistant", content: "hello" })).toBeNull();
+  });
+
+  it("returns null for a malformed JSON payload instead of throwing", () => {
+    const message: ChatMessage = { role: "system", content: "[Sources]not-json" };
+    expect(parseSourcesNotice(message)).toBeNull();
+  });
+
+  it("returns null when a result entry is missing a required field", () => {
+    const message: ChatMessage = {
+      role: "system",
+      content: `[Sources]${JSON.stringify({ results: [{ path: "a.md", stack: "Docs", score: 0.5 }] })}`,
+    };
+    expect(parseSourcesNotice(message)).toBeNull();
+  });
+
+  it("counts toward contextTrimmer's token estimate like any other message (RAG design doc's context-bloat risk)", () => {
+    // A realistic doc-chat notice: 6 chunks at ~1600 chars each, per the
+    // design doc's own budget note (~2.4k tokens at 4 chars/token).
+    const bigNotice: SourcesNotice = {
+      results: Array.from({ length: 6 }, (_, i) => ({
+        path: `docs/file-${i}.md`,
+        stack: "Docs",
+        score: 0.9 - i * 0.05,
+        snippet: "x".repeat(1600),
+      })),
+    };
+    const message: ChatMessage = { role: "system", content: formatSourcesNotice(bigNotice) };
+    // No special-casing needed: estimateHistoryTokens sums every message's
+    // content length generically, so a large [Sources] notice already
+    // contributes to the total exactly like a long tool result would.
+    expect(estimateHistoryTokens([message])).toBeGreaterThan(2000);
+  });
+});
+
 describe("isSuccessfulMutationResult", () => {
   it("treats a plain-string success result (write_file/edit_file's actual shape) as successful", () => {
     expect(isSuccessfulMutationResult("Wrote 42 bytes to src/foo.ts")).toBe(true);
@@ -244,6 +312,21 @@ describe("toolsForSettings", () => {
     const all = [toolDef("remember"), toolDef("web_fetch"), toolDef("web_search"), toolDef("write_file")];
     expect(toolsForSettings(all, false, false).map((t) => t.function.name)).toEqual(["write_file"]);
   });
+
+  it("does not append the task tool when subagentsEnabled is false (or omitted) — a weak local model should never even see the schema", () => {
+    expect(toolsForSettings(tools, true, true).some((t) => t.function.name === "task")).toBe(false);
+    expect(toolsForSettings(tools, true, true, false).some((t) => t.function.name === "task")).toBe(false);
+  });
+
+  it("appends the task tool when subagentsEnabled is true, after every other filtering", () => {
+    const result = toolsForSettings(tools, true, true, true);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task"]);
+  });
+
+  it("still appends task even when memoryEnabled/webToolsEnabled filtered other tools out", () => {
+    const result = toolsForSettings(tools, false, true, true);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "run_shell", "task"]);
+  });
 });
 
 describe("isToolCallAllowed", () => {
@@ -275,6 +358,131 @@ describe("isToolCallAllowed", () => {
   });
 });
 
+// slice 3's parallelism: `task` calls in one round trip run concurrently
+// (bounded by `maxConcurrentSubagents`), everything else stays sequential —
+// see `runToolCallsForRound`'s own doc comment. These tests use a
+// controllable-timing fake `runOne` (never a real `executeToolCall`) so
+// completion ORDER can be deliberately scrambled while still asserting the
+// RESULT array comes back in the original `toolCalls` order — the actual
+// provider-API-correctness invariant this function exists to uphold.
+describe("runToolCallsForRound", () => {
+  function call(name: string, id: string): ToolCall {
+    return { id, type: "function", function: { name, arguments: "{}" } };
+  }
+
+  it("returns results in the original toolCalls order even when a later task call resolves before an earlier one", async () => {
+    const toolCalls = [call("task", "call-1"), call("read_file", "call-2"), call("task", "call-3")];
+
+    // call-1's task resolves LAST (100ms via a microtask chain), call-3's
+    // resolves FIRST — the results array must still put call-1's result at
+    // index 0 and call-3's at index 2, matching input order, not completion
+    // order.
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      if (toolCall.id === "call-1") {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        return "result-1";
+      }
+      if (toolCall.id === "call-3") {
+        return "result-3";
+      }
+      return "result-2";
+    });
+
+    const results = await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(results).toEqual(["result-1", "result-2", "result-3"]);
+  });
+
+  it("runs non-task calls strictly sequentially — the next one never starts before the previous resolves", async () => {
+    const toolCalls = [call("read_file", "call-1"), call("read_file", "call-2"), call("read_file", "call-3")];
+    const order: string[] = [];
+
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      order.push(`${toolCall.id}-start`);
+      await Promise.resolve();
+      await Promise.resolve();
+      order.push(`${toolCall.id}-end`);
+      return `result-${toolCall.id}`;
+    });
+
+    await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(order).toEqual(["call-1-start", "call-1-end", "call-2-start", "call-2-end", "call-3-start", "call-3-end"]);
+  });
+
+  it("bounds concurrent task-call execution to maxConcurrentSubagents", async () => {
+    const toolCalls = [call("task", "call-1"), call("task", "call-2"), call("task", "call-3"), call("task", "call-4")];
+    let active = 0;
+    let maxActive = 0;
+    const releasers: Array<() => void> = [];
+
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>((resolve) => releasers.push(resolve));
+      active -= 1;
+      return `result-${toolCall.id}`;
+    });
+
+    const roundPromise = runToolCallsForRound(toolCalls, 2, runOne);
+
+    // Give the pool's workers a chance to start as many task calls as the
+    // limit allows before any of them are released.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(active).toBe(2);
+
+    // Release everything so the round can finish.
+    while (releasers.length > 0) {
+      releasers.shift()!();
+      await Promise.resolve();
+    }
+    await roundPromise;
+
+    expect(maxActive).toBeLessThanOrEqual(2);
+  });
+
+  it("task calls run concurrently with the sequential group, not blocked behind it", async () => {
+    const toolCalls = [call("read_file", "call-seq"), call("task", "call-task")];
+    let sequentialResolved = false;
+    let taskStartedBeforeSequentialResolved = false;
+
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      if (toolCall.id === "call-seq") {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        sequentialResolved = true;
+        return "seq-result";
+      }
+      // The task call starts essentially immediately — before the slower
+      // sequential call above has resolved — proving the two groups run at
+      // the same time rather than the task group waiting its turn.
+      taskStartedBeforeSequentialResolved = !sequentialResolved;
+      return "task-result";
+    });
+
+    await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(taskStartedBeforeSequentialResolved).toBe(true);
+  });
+
+  it("returns an empty array for an empty round", async () => {
+    const results = await runToolCallsForRound([], 2, vi.fn());
+    expect(results).toEqual([]);
+  });
+
+  it("handles a round with only task calls (no sequential group at all)", async () => {
+    const toolCalls = [call("task", "call-1"), call("task", "call-2")];
+    const runOne = vi.fn(async (toolCall: ToolCall) => `result-${toolCall.id}`);
+
+    const results = await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(results).toEqual(["result-call-1", "result-call-2"]);
+  });
+});
+
 describe("toolsForMode", () => {
   function toolDef(name: string): ToolDef {
     return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
@@ -290,6 +498,35 @@ describe("toolsForMode", () => {
     for (const mode of ["manual", "acceptEdits", "smart", "auto", "bypass"] as const) {
       expect(toolsForMode(base, mode)).toBe(base);
     }
+  });
+});
+
+describe("attachedStackPromptInfo", () => {
+  it("reports chunk count for an indexed stack", () => {
+    const info = attachedStackPromptInfo([{ name: "Docs", indexed_at: 12345, chunk_count: 42 }]);
+    expect(info).toEqual([{ name: "Docs", description: "42 chunks indexed" }]);
+  });
+
+  it("uses singular phrasing for exactly one chunk", () => {
+    const info = attachedStackPromptInfo([{ name: "Docs", indexed_at: 1, chunk_count: 1 }]);
+    expect(info[0].description).toBe("1 chunk indexed");
+  });
+
+  it('reports "not indexed yet" for a stack that has never been indexed', () => {
+    const info = attachedStackPromptInfo([{ name: "New Stack", indexed_at: null, chunk_count: 0 }]);
+    expect(info).toEqual([{ name: "New Stack", description: "not indexed yet" }]);
+  });
+
+  it("maps multiple stacks in order", () => {
+    const info = attachedStackPromptInfo([
+      { name: "Docs", indexed_at: 1, chunk_count: 10 },
+      { name: "Notes", indexed_at: null, chunk_count: 0 },
+    ]);
+    expect(info.map((s) => s.name)).toEqual(["Docs", "Notes"]);
+  });
+
+  it("returns an empty array for no attached stacks", () => {
+    expect(attachedStackPromptInfo([])).toEqual([]);
   });
 });
 
@@ -677,6 +914,9 @@ describe("maybeAutoPreviewNewestArtifact", () => {
       groupId: null,
       workspacePath: null,
       personaId: null,
+      attachedStackIds: [],
+      docChatMode: false,
+      subagentRuns: {},
     };
     useSessionStore.setState((state) => ({
       sessions: [...state.sessions.filter((s) => s.id !== sessionId), session],

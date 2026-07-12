@@ -324,3 +324,157 @@ describe("settingsStore.artifactAutoPreview", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+describe("settingsStore.subagentsEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ subagentsEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as verifyEnabled's
+    // own default test above — `beforeEach` forces `false` regardless, so
+    // only a fresh module import actually covers `defaults()`. Defaults OFF,
+    // same posture as `verifyEnabled`: a weak local model may misuse or loop
+    // on the `task` tool, so delegation should be opt-in.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setSubagentsEnabled(true);
+    expect(useSettingsStore.getState().subagentsEnabled).toBe(true);
+    useSettingsStore.getState().setSubagentsEnabled(false);
+    expect(useSettingsStore.getState().subagentsEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSubagentsEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ subagentsEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.maxConcurrentSubagents", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ maxConcurrentSubagents: 2 });
+  });
+
+  it("defaults to 2 when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as verifyMaxRounds's
+    // own default test above — `beforeEach` forces `2` regardless, so only a
+    // fresh module import actually covers `defaults()`.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(2);
+  });
+
+  it("clamps below the 1-subagent floor", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(0);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(1);
+  });
+
+  it("clamps above the 4-subagent ceiling", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(10);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(4);
+  });
+
+  it("rounds fractional input", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(3.4);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(3);
+  });
+
+  it("accepts an in-range value unchanged", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(3);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(3);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setMaxConcurrentSubagents(4);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(4);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores an out-of-range persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ maxConcurrentSubagents: 99 }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(2);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+// Slice 4: optional per-profile model override — genuinely optional, so the
+// default (empty map) must mean "no override for either profile", exactly
+// what `subagent.ts`'s `resolveSubagentTarget` treats as "use the parent's
+// own target unchanged".
+describe("settingsStore.subagentProfileModels", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ subagentProfileModels: {} });
+  });
+
+  it("defaults to an empty map when nothing is persisted", async () => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({});
+  });
+
+  it("sets an override for one profile without touching the other", () => {
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    expect(useSettingsStore.getState().subagentProfileModels).toEqual({
+      explore: { providerId: "openrouter", model: "cheap-model" },
+    });
+    expect(useSettingsStore.getState().subagentProfileModels.code).toBeUndefined();
+  });
+
+  it("clears a previously-set override back to 'no override' for that profile", () => {
+    useSettingsStore.getState().setSubagentProfileModel("code", { providerId: "anthropic", model: "claude" });
+    useSettingsStore.getState().clearSubagentProfileModel("code");
+    expect(useSettingsStore.getState().subagentProfileModels.code).toBeUndefined();
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({
+      explore: { providerId: "openrouter", model: "cheap-model" },
+    });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("drops a malformed persisted entry (missing model) rather than corrupting the whole map", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ subagentProfileModels: { explore: { providerId: "openrouter" }, code: { providerId: "x", model: "y" } } }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({ code: { providerId: "x", model: "y" } });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
