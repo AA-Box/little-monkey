@@ -11,6 +11,7 @@ import { McpPanel } from "./McpPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
 import { WebPanel } from "./WebPanel";
 import { ApiServerPanel } from "./ApiServerPanel";
+import { KnowledgePanel } from "./KnowledgePanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -25,12 +26,13 @@ interface SettingsModalProps {
   initialTab?: SettingsTab;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver" | "knowledge";
 
 const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
   { id: "local", labelKey: "SettingsModal.tabLocalModels" },
   { id: "ollama", labelKey: "SettingsModal.tabOllama" },
   { id: "providers", labelKey: "SettingsModal.tabAiProviders" },
+  { id: "knowledge", labelKey: "SettingsModal.tabKnowledge" },
   { id: "automation", labelKey: "SettingsModal.tabAutomation" },
   { id: "rules", labelKey: "SettingsModal.tabRules" },
   { id: "mcp", labelKey: "SettingsModal.tabMcp" },
@@ -135,6 +137,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
               <AddCustomProviderForm />
             </div>
           )}
+          {tab === "knowledge" && <KnowledgePanel />}
           {tab === "automation" && <AutomationPanel />}
           {tab === "rules" && <RulesMemoryPanel />}
           {tab === "mcp" && <McpPanel />}

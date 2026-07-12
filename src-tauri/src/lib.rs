@@ -11,6 +11,10 @@ pub mod mcp;
 mod models;
 pub mod ollama;
 pub mod providers;
+// `pub` so a future `lm-cli` `Stacks` subcommand (RAG design doc, slice 4)
+// can call `stacks::list_impl`/`reindex_impl`/`query_impl` directly, the
+// same AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`.
+pub mod stacks;
 // `pub` so `lm-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
 pub mod prompts;
@@ -51,9 +55,20 @@ use tauri::Manager;
 
 /// Shared application state, managed by Tauri and accessed from every
 /// #[tauri::command] via `tauri::State<'_, AppState>`.
-#[derive(Default)]
+///
+/// No `#[derive(Default)]`: `embed_llama` needs a different starting port
+/// (8091) than `llama`'s (8090), which a derived `Default` (calling
+/// `LlamaState::default()` for both) can't express. See the manual `impl
+/// Default for AppState` below.
 pub struct AppState {
     pub llama: std::sync::Mutex<llama::LlamaState>,
+    /// The second, embeddings-only managed `llama-server` instance (port
+    /// 8091, started with `--embeddings --pooling mean`) used by
+    /// `stacks.rs`'s managed-llama embedding backend — a distinct
+    /// `LlamaState` from `llama` above (not one process serving both
+    /// roles), so a stack reindex never contends with the chat model for
+    /// the same server slot. See `llama::embed_server_start`.
+    pub embed_llama: std::sync::Mutex<llama::LlamaState>,
     pub ollama: std::sync::Mutex<ollama::OllamaState>,
     /// Attached workspace folders, primary first. Empty means no workspace
     /// is open. See `workspace.rs`.
@@ -142,6 +157,39 @@ pub struct AppState {
     /// registered below. See `artifacts.rs`'s module doc for the full
     /// security model; content lives only here in memory, never on disk.
     pub artifacts: std::sync::Mutex<std::collections::HashMap<String, artifacts::PublishedArtifact>>,
+    /// Lazily-loaded (chunks + vectors) cache for `stacks_query`, keyed by
+    /// stack id, invalidated (removed) whenever a stack is reindexed or
+    /// deleted — see `stacks.rs::load_stack_cached`.
+    pub stack_cache: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<stacks::LoadedStack>>>,
+    /// Cancellation handles for in-flight `stacks_reindex` calls, keyed by
+    /// stack id — mirrors `stream_cancels`/`tool_cancel` above. See
+    /// `stacks::stacks_cancel_index`.
+    pub index_cancels: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            llama: Default::default(),
+            embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
+            ollama: Default::default(),
+            workspace_roots: Default::default(),
+            permissions: Default::default(),
+            stream_cancels: Default::default(),
+            checkpoints: Default::default(),
+            checkpoint_locks: Default::default(),
+            tool_cancel: Default::default(),
+            memory_lock: Default::default(),
+            mcp_config_lock: Default::default(),
+            mcp: Default::default(),
+            web_settings_lock: Default::default(),
+            api_server: Default::default(),
+            api_server_config_lock: Default::default(),
+            artifacts: Default::default(),
+            stack_cache: Default::default(),
+            index_cancels: Default::default(),
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -185,6 +233,9 @@ pub fn run() {
             llama::llama_start,
             llama::llama_stop,
             llama::llama_status,
+            llama::embed_server_start,
+            llama::embed_server_stop,
+            llama::embed_server_status,
             server::api_server_start,
             server::api_server_stop,
             server::api_server_status,
@@ -281,6 +332,15 @@ pub fn run() {
             verify::verify_get_config,
             verify::verify_set_config,
             verify::verify_run,
+            stacks::stacks_list,
+            stacks::stacks_create,
+            stacks::stacks_delete,
+            stacks::stacks_rename,
+            stacks::stacks_add_source,
+            stacks::stacks_remove_source,
+            stacks::stacks_reindex,
+            stacks::stacks_cancel_index,
+            stacks::stacks_query,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

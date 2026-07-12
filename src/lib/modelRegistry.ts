@@ -19,6 +19,8 @@ export interface ModelInfo {
   path: string | null;
   /** True for a model registered via `models_add_external` (a `.gguf` file outside the app's models dir) — the app never owns or deletes that file. */
   is_external: boolean;
+  /** "chat" or "embedding" — see `models.rs::ModelKind`. Every entry in this frontend copy is a chat model; the two curated embedding models (nomic-embed-text-v1.5, bge-m3) are fetched live from the backend instead (see `stackStore.ts`), not duplicated here. */
+  kind: "chat" | "embedding";
 }
 
 /**
@@ -38,6 +40,7 @@ export const CURATED_MODELS: ModelInfo[] = [
     installed: false,
     path: null,
     is_external: false,
+    kind: "chat",
   },
   {
     id: "qwen2.5-coder-14b",
@@ -49,6 +52,7 @@ export const CURATED_MODELS: ModelInfo[] = [
     installed: false,
     path: null,
     is_external: false,
+    kind: "chat",
   },
   {
     id: "llama-3.1-8b",
@@ -60,6 +64,7 @@ export const CURATED_MODELS: ModelInfo[] = [
     installed: false,
     path: null,
     is_external: false,
+    kind: "chat",
   },
   {
     id: "hermes-3-8b",
@@ -71,6 +76,7 @@ export const CURATED_MODELS: ModelInfo[] = [
     installed: false,
     path: null,
     is_external: false,
+    kind: "chat",
   },
   {
     id: "mistral-nemo-12b",
@@ -82,6 +88,7 @@ export const CURATED_MODELS: ModelInfo[] = [
     installed: false,
     path: null,
     is_external: false,
+    kind: "chat",
   },
 ];
 

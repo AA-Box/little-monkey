@@ -28,7 +28,11 @@ const GREP_SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "dist"];
 /// Directory names that are never descended into by [`list_workspace_paths`]
 /// — VCS metadata, build output, and dependency/cache trees that would
 /// otherwise flood the "@"-mention autocomplete list with noise.
-const MENTION_SKIP_DIRS: [&str; 10] = [
+///
+/// `pub(crate)` (unlike `GREP_SKIP_DIRS` above) so `stacks.rs`'s source
+/// folder walker can reuse the exact same skip-dir philosophy instead of
+/// duplicating the list — see that module's `collect_source_files`.
+pub(crate) const MENTION_SKIP_DIRS: [&str; 10] = [
     ".git",
     "node_modules",
     "target",

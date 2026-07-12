@@ -14,6 +14,21 @@ use tokio::io::AsyncWriteExt;
 use crate::permissions;
 use crate::AppState;
 
+/// Whether a `ModelInfo` is a chat (tool-calling instruct) model or an
+/// embedding model — added for the RAG/Knowledge Stacks feature so
+/// `curated_models()` can list embedding models (nomic-embed-text,
+/// bge-m3) alongside the existing chat models without the Knowledge panel
+/// having to guess from the name. `#[serde(default)]` on `ModelInfo::kind`
+/// (via `#[default]` here) keeps any old persisted/cached JSON that predates
+/// this field parsing as `Chat`, the only kind that existed before.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    #[default]
+    Chat,
+    Embedding,
+}
+
 /// Metadata describing a single GGUF model, whether curated (remote) or
 /// discovered on disk (installed).
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -33,6 +48,12 @@ pub struct ModelInfo {
     /// reference) on the frontend.
     #[serde(default)]
     pub is_external: bool,
+    /// Chat vs. embedding model — see [`ModelKind`]. Defaults to `Chat` for
+    /// read-compatibility with anything serialized before this field existed
+    /// (there were no embedding entries before, so that default is always
+    /// correct for old data).
+    #[serde(default)]
+    pub kind: ModelKind,
 }
 
 /// The curated registry: a small, hand-picked set of instruct models known
@@ -49,6 +70,7 @@ fn curated_models() -> Vec<ModelInfo> {
             installed: false,
             path: None,
             is_external: false,
+            kind: ModelKind::Chat,
         },
         ModelInfo {
             id: "qwen2.5-coder-14b".to_string(),
@@ -60,6 +82,7 @@ fn curated_models() -> Vec<ModelInfo> {
             installed: false,
             path: None,
             is_external: false,
+            kind: ModelKind::Chat,
         },
         ModelInfo {
             id: "llama-3.1-8b".to_string(),
@@ -71,6 +94,7 @@ fn curated_models() -> Vec<ModelInfo> {
             installed: false,
             path: None,
             is_external: false,
+            kind: ModelKind::Chat,
         },
         ModelInfo {
             id: "hermes-3-8b".to_string(),
@@ -82,6 +106,7 @@ fn curated_models() -> Vec<ModelInfo> {
             installed: false,
             path: None,
             is_external: false,
+            kind: ModelKind::Chat,
         },
         ModelInfo {
             id: "mistral-nemo-12b".to_string(),
@@ -93,6 +118,42 @@ fn curated_models() -> Vec<ModelInfo> {
             installed: false,
             path: None,
             is_external: false,
+            kind: ModelKind::Chat,
+        },
+        // Embedding models for the RAG/Knowledge Stacks feature
+        // (stacks.rs) — the managed-llama embedding backend. Repo/file
+        // verified against huggingface.co at implementation time (both are
+        // real, currently-existing quant files, not guessed from the design
+        // doc's names).
+        ModelInfo {
+            id: "nomic-embed-text-v1.5".to_string(),
+            name: "Nomic Embed Text v1.5".to_string(),
+            repo: "nomic-ai/nomic-embed-text-v1.5-GGUF".to_string(),
+            file: "nomic-embed-text-v1.5.Q8_0.gguf".to_string(),
+            size_gb: 0.15,
+            tool_calling: false,
+            installed: false,
+            path: None,
+            is_external: false,
+            kind: ModelKind::Embedding,
+        },
+        // Design doc named "bge-m3" without pinning an exact repo/quant;
+        // `gpustack/bge-m3-GGUF` (a maintained third-party GGUF conversion —
+        // BAAI's own `BAAI/bge-m3` repo ships Safetensors only, no GGUF) is
+        // the closest real equivalent, verified against huggingface.co at
+        // implementation time. Q4_K_M chosen for a reasonable size/quality
+        // default, matching this registry's other Q4_K_M curated picks.
+        ModelInfo {
+            id: "bge-m3".to_string(),
+            name: "BGE-M3 (multilingual)".to_string(),
+            repo: "gpustack/bge-m3-GGUF".to_string(),
+            file: "bge-m3-Q4_K_M.gguf".to_string(),
+            size_gb: 0.44,
+            tool_calling: false,
+            installed: false,
+            path: None,
+            is_external: false,
+            kind: ModelKind::Embedding,
         },
     ]
 }
@@ -180,6 +241,7 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
                 installed: true,
                 path: Some(path.to_string_lossy().to_string()),
                 is_external: false,
+                kind: ModelKind::Chat,
             });
         }
     }
@@ -208,6 +270,7 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
             installed: true,
             path: Some(entry.path.clone()),
             is_external: true,
+            kind: ModelKind::Chat,
         });
         live_external.push(entry);
     }
@@ -305,6 +368,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
             installed: true,
             path: Some(canonical),
             is_external: true,
+            kind: ModelKind::Chat,
         });
     }
 
@@ -332,6 +396,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         installed: true,
         path: Some(canonical),
         is_external: true,
+        kind: ModelKind::Chat,
     })
 }
 
