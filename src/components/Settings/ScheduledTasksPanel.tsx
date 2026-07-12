@@ -277,9 +277,9 @@ export function ScheduledTasksPanel() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-muted">{t("ScheduledTasksPanel.description")}</p>
-        <Button size="sm" onClick={startNew}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="min-w-0 flex-1 text-xs text-muted">{t("ScheduledTasksPanel.description")}</p>
+        <Button size="sm" onClick={startNew} className="shrink-0 whitespace-nowrap">
           <Plus size={14} />
           {t("ScheduledTasksPanel.newRecipe")}
         </Button>
