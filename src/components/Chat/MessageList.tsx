@@ -32,16 +32,19 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isPlanNotice,
+  isSourcesNotice,
   isSwitchNotice,
   isVerifyFixNotice,
   isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
   parsePlanNotice,
+  parseSourcesNotice,
   parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
   type PlanNotice,
+  type SourcesNotice,
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
@@ -76,6 +79,7 @@ type TimelineItem =
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
+  | { kind: "sources"; key: string; notice: SourcesNotice }
   | { kind: "typing"; key: string };
 
 /**
@@ -88,7 +92,7 @@ type TimelineItem =
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
  *   synthetic notices (compaction, model switch, per-turn checkpoint,
- *   remembered fact, presented plan).
+ *   remembered fact, presented plan, doc-chat sources).
  */
 function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
@@ -173,6 +177,13 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         const notice = parseVerifyNotice(msg);
         if (notice) {
           items.push({ kind: "verify", key: `verify-${index}`, notice });
+        }
+        return;
+      }
+      if (isSourcesNotice(msg)) {
+        const notice = parseSourcesNotice(msg);
+        if (notice) {
+          items.push({ kind: "sources", key: `sources-${index}`, notice });
         }
         return;
       }
@@ -591,6 +602,69 @@ const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) 
   );
 });
 
+/**
+ * Renders a doc-chat `[Sources]` notice (see `SOURCES_NOTE_PREFIX`): the
+ * retrieved passages as collapsible chips, each showing the source file name
+ * and its stack badge collapsed, expanding to the full snippet on click —
+ * same collapse affordance as `ToolCallRow`/`VerifyRow`, just one toggle per
+ * chip instead of one for the whole row, since a doc-chat turn typically
+ * retrieves several passages at once and showing every snippet by default
+ * would dominate the transcript.
+ */
+const SourcesRow = memo(function SourcesRow({ notice }: { notice: SourcesNotice }) {
+  const { t } = useT();
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
+
+  if (notice.results.length === 0) return null;
+
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+        <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted">
+          <BookOpen size={13} className="shrink-0 text-faint" />
+          <span className="font-medium text-foreground">
+            {t("MessageList.sourcesHeading", { count: notice.results.length })}
+          </span>
+        </div>
+        <div className="flex flex-col gap-1 border-t border-border px-2 py-2">
+          {notice.results.map((result, i) => {
+            const fileName = result.path.split(/[\\/]/).filter(Boolean).pop() ?? result.path;
+            const open = openIndex === i;
+            return (
+              <div
+                key={`${result.path}-${i}`}
+                className="overflow-hidden rounded-md border border-border bg-background"
+              >
+                <button
+                  type="button"
+                  onClick={() => setOpenIndex(open ? null : i)}
+                  title={result.path}
+                  className="flex w-full cursor-pointer items-center gap-2 px-2 py-1 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+                >
+                  <ChevronRight
+                    size={11}
+                    className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+                  />
+                  <FileText size={12} className="shrink-0 text-faint" />
+                  <span className="truncate font-mono">{fileName}</span>
+                  <span className="ml-auto shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-faint">
+                    {result.stack}
+                  </span>
+                </button>
+                {open && (
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-border bg-surface-2 px-2 py-1.5 font-mono text-[11px] text-muted">
+                    {result.snippet}
+                  </pre>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
@@ -724,6 +798,9 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "verify") {
               return <VerifyRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "sources") {
+              return <SourcesRow key={item.key} notice={item.notice} />;
             }
             return <TypingIndicator key={item.key} />;
           })}

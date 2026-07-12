@@ -56,7 +56,7 @@ import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
-import { useStackStore } from '../store/stackStore';
+import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
@@ -472,6 +472,78 @@ export function attachedStackPromptInfo(stacks: AttachedStackLike[]): AttachedSt
     description:
       stack.indexed_at !== null ? `${stack.chunk_count} chunk${stack.chunk_count === 1 ? '' : 's'} indexed` : 'not indexed yet',
   }));
+}
+
+/** Prefix identifying a synthetic notice inserted before the first model call
+ * of a turn when the session's doc-chat mode is on (see
+ * `ChatSession.docChatMode`, `StackPicker.tsx`) — cloned from the
+ * `CHECKPOINT_NOTE_PREFIX` pattern above. Carries the top-k passages
+ * `stacks_query` retrieved for the user's own message, so `MessageList` can
+ * render collapsible source chips and the model can answer with citations
+ * instead of needing to call `search_docs` itself first. Added to the
+ * transcript via the same `addMessage` every other notice in this module
+ * uses — never handled as a separate "wire-only" message — which is also
+ * what makes its token cost visible to `contextTrimmer.ts`'s
+ * `estimateHistoryTokens` for free: that function sums every message in
+ * history generically with no per-notice-type special-casing, so retrieved
+ * passages count toward compaction thresholds exactly like everything else
+ * already flowing through `addMessage` (the RAG design doc's context-bloat
+ * risk — see `contextTrimmer.test.ts`'s doc-chat coverage). */
+export const SOURCES_NOTE_PREFIX = '[Sources]';
+
+/** One retrieval hit inside a `SourcesNotice` — mirrors the fields of
+ * `stacks.rs`'s `StackQueryResult` (as returned by the `stacks_query`
+ * command) that the citation UI/prompt actually need, renamed to the design
+ * doc's `{path, stack, score, snippet}` shape rather than the wire's
+ * snake_case `source_path`/`stack_name`/`text` — see
+ * `runAgentTurnBody`'s doc-chat block for that mapping. */
+export interface SourcesNoticeResult {
+  path: string;
+  stack: string;
+  score: number;
+  snippet: string;
+}
+
+/** Payload embedded in a sources notice message. */
+export interface SourcesNotice {
+  results: SourcesNoticeResult[];
+}
+
+export function isSourcesNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SOURCES_NOTE_PREFIX);
+}
+
+/** Parses a sources notice's JSON payload; `null` for anything malformed. */
+export function parseSourcesNotice(message: ChatMessage): SourcesNotice | null {
+  if (!isSourcesNotice(message)) return null;
+  try {
+    const parsed: unknown = JSON.parse((message.content as string).slice(SOURCES_NOTE_PREFIX.length));
+    const results = (parsed as SourcesNotice | null)?.results;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      Array.isArray(results) &&
+      results.every(
+        (r): r is SourcesNoticeResult =>
+          Boolean(r) &&
+          typeof r === 'object' &&
+          typeof (r as SourcesNoticeResult).path === 'string' &&
+          typeof (r as SourcesNoticeResult).stack === 'string' &&
+          typeof (r as SourcesNoticeResult).score === 'number' &&
+          typeof (r as SourcesNoticeResult).snippet === 'string'
+      )
+    ) {
+      return parsed as SourcesNotice;
+    }
+  } catch {
+    // Malformed payload — treat as "not a sources notice".
+  }
+  return null;
+}
+
+/** Serializes a sources notice back into message content. */
+export function formatSourcesNotice(notice: SourcesNotice): string {
+  return `${SOURCES_NOTE_PREFIX}${JSON.stringify(notice)}`;
 }
 
 /**
@@ -1244,6 +1316,42 @@ async function runAgentTurnBody(
   const attachedStackNames = attachedStacks.map((stack) => stack.name);
   const attachedStacksForPrompt = attachedStackPromptInfo(attachedStacks);
 
+  // This session's doc-chat toggle (see `ChatSession.docChatMode`,
+  // `StackPicker.tsx`) — read once per turn, same stance as `attachedStackIds`
+  // just above. Used both for the auto-retrieval block right below and for
+  // every iteration's system prompt (see `currentSystemPrompt`'s call inside
+  // the loop), so a toggle flipped mid-turn never changes behavior partway
+  // through this turn's own tool-calling loop.
+  const docChatMode = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.docChatMode ?? false;
+
+  // Doc-chat mode (RAG design doc slice 3): auto-retrieve the top-k passages
+  // for this turn's own message BEFORE the first model call below, so the
+  // model never has to remember to call `search_docs` itself. Gated on at
+  // least one attached stack — with none, there's nothing to search, and
+  // `stacks_query` would just error. The notice is appended via `addMessage`
+  // exactly like every other synthetic notice in this module (see
+  // `SOURCES_NOTE_PREFIX`'s doc comment for why this alone is enough to make
+  // it show up in every subsequent iteration's wire payload AND count toward
+  // `contextTrimmer.ts`'s token estimate). Retrieval failure — a stack mid-
+  // reindex, the embed server down, a corrupt index — must never block the
+  // turn, so it's swallowed silently: the model just proceeds without
+  // sources for this turn, same as an unattached session always has.
+  if (docChatMode && attachedStackIds.length > 0 && !signal?.aborted) {
+    try {
+      const hits = await invoke<StackQueryResult[]>('stacks_query', { stackIds: attachedStackIds, query: userText });
+      if (hits.length > 0) {
+        addMessage({
+          role: 'system',
+          content: formatSourcesNotice({
+            results: hits.map((hit) => ({ path: hit.source_path, stack: hit.stack_name, score: hit.score, snippet: hit.text })),
+          }),
+        });
+      }
+    } catch {
+      // See doc comment above — retrieval failure must never block the turn.
+    }
+  }
+
   const toolsForTurn: ToolDef[] = toolsForSettings(
     toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
@@ -1342,7 +1450,10 @@ async function runAgentTurnBody(
     // very next round trip, and a dangling id just resolves to no persona —
     // see `resolvePersona`).
     const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
-    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt(personaId, attachedStacksForPrompt) };
+    const systemMessage: ChatMessage = {
+      role: 'system',
+      content: currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+    };
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user

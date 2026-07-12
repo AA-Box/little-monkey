@@ -193,6 +193,32 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('search_docs');
     expect(prompt).toContain('cite source paths');
   });
+
+  it('omits the doc-chat citation instruction by default (docChatMode defaults to false)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [
+      { name: 'Docs', description: '42 chunks indexed' },
+    ]);
+    expect(prompt).not.toContain('Doc-chat mode is on');
+  });
+
+  it('adds the doc-chat citation instruction when docChatMode is true', () => {
+    const prompt = buildSystemPrompt(
+      [primary],
+      'macOS',
+      [],
+      [],
+      [],
+      true,
+      false,
+      'manual',
+      true,
+      [{ name: 'Docs', description: '42 chunks indexed' }],
+      true
+    );
+    expect(prompt).toContain('Doc-chat mode is on');
+    expect(prompt).toContain('[Sources]');
+    expect(prompt).toContain('citing the specific source path');
+  });
 });
 
 describe('composeSystemPrompt', () => {

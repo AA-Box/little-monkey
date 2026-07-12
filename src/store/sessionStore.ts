@@ -73,6 +73,16 @@ export interface ChatSession {
    * sessions persisted before this field existed. Per-session (not global)
    * so the split pane can attach different stacks to each transcript. */
   attachedStackIds: string[];
+  /** Whether this session auto-retrieves top-k passages from its attached
+   * stacks before every user turn and instructs the model to cite them (see
+   * `agentLoop.ts`'s `runAgentTurnBody` doc-chat block, `SOURCES_NOTE_PREFIX`)
+   * — toggled via `StackPicker.tsx`'s doc-chat switch. Independent of
+   * `attachedStackIds` being non-empty (a session can have this on with no
+   * stacks attached yet), but has no effect until at least one is: the
+   * retrieval call is a no-op without stack ids to search. Defaulted `false`
+   * by `normalizeSession`, same "opaque to Rust, zero backend change" story
+   * as `attachedStackIds`. */
+  docChatMode: boolean;
 }
 
 /** A user-defined grouping sessions can be filed under via the session
@@ -155,6 +165,9 @@ export interface SessionStore {
   /** Toggles whether `stackId` is attached to `sessionId` — see
    * `ChatSession.attachedStackIds`. Called by `StackPicker.tsx`'s checkboxes. */
   toggleAttachedStack: (sessionId: string, stackId: string) => void;
+  /** Toggles `sessionId`'s doc-chat mode — see `ChatSession.docChatMode`.
+   * Called by `StackPicker.tsx`'s doc-chat switch. */
+  toggleDocChatMode: (sessionId: string) => void;
   /** Record whether an agent turn is in flight for `sessionId` — called
    * only by `runAgentTurn` (start/finally). */
   markTurnRunning: (sessionId: string, running: boolean) => void;
@@ -251,6 +264,8 @@ function createSession(): ChatSession {
     // New sessions start with no stacks attached — the user opts in per
     // session via `StackPicker.tsx`, there's no "default stack" concept.
     attachedStackIds: [],
+    // New sessions start with doc-chat mode off, same opt-in reasoning.
+    docChatMode: false,
   };
 }
 
@@ -272,6 +287,7 @@ function cloneSessionAsFork(source: ChatSession): ChatSession {
     workspacePath: source.workspacePath,
     personaId: source.personaId,
     attachedStackIds: [...source.attachedStackIds],
+    docChatMode: source.docChatMode,
   };
 }
 
@@ -325,6 +341,7 @@ function normalizeSession(raw: Partial<ChatSession>): ChatSession {
     attachedStackIds: Array.isArray(raw.attachedStackIds)
       ? raw.attachedStackIds.filter((id): id is string => typeof id === "string")
       : [],
+    docChatMode: raw.docChatMode === true,
   };
 }
 
@@ -714,6 +731,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           : [...s.attachedStackIds, stackId];
         return { ...s, attachedStackIds };
       });
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  toggleDocChatMode: (sessionId) => {
+    set((state) => {
+      const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, docChatMode: !s.docChatMode } : s));
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
     });
