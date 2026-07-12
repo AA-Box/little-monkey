@@ -16,9 +16,11 @@
 import { detectOsLabel, buildSubagentSystemPrompt, type PromptWorkspaceRoot } from './systemPrompt';
 import { toolsForProfile } from './tools';
 import { attemptStream, executeToolCall, CANCELLED_TOOL_RESULT, stringifyToolError, type ResolvedTarget } from './turnEngine';
-import type { ChatMessage, ToolDef } from './llamaClient';
+import type { ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
 import { useWorkspaceStore } from '../store/workspaceStore';
+import { useSubagentStore } from '../store/subagentStore';
+import { useSessionStore } from '../store/sessionStore';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -36,6 +38,34 @@ const MAX_REPORT_CHARS = 8_000;
 function capReport(text: string): string {
   if (text.length <= MAX_REPORT_CHARS) return text;
   return `${text.slice(0, MAX_REPORT_CHARS)}\n\n[Report truncated — subagent's final reply exceeded ${MAX_REPORT_CHARS} characters]`;
+}
+
+/** Max length (chars, before an ellipsis) a `SubagentRun.lastActivity` label
+ * is truncated to — this is a one-line status shown next to a spinner in
+ * `SubagentRow.tsx`, not a place to dump a whole `write_file` body. */
+const MAX_ACTIVITY_CHARS = 60;
+
+/** Builds the short `name(args preview)` label `SubagentRow.tsx` shows next
+ * to the spinner while a child tool call is in flight — same idea as
+ * `MessageList.tsx`'s `ToolCallRow` preview, just single-line and capped
+ * shorter since this renders inline rather than in an expandable block. */
+function activityLabel(toolCall: ToolCall): string {
+  const { name, arguments: rawArguments } = toolCall.function;
+  let preview = '';
+  if (rawArguments) {
+    try {
+      const parsed: unknown = JSON.parse(rawArguments);
+      if (parsed && typeof parsed === 'object') {
+        preview = Object.values(parsed as Record<string, unknown>)
+          .map((v) => (typeof v === 'string' ? v : JSON.stringify(v)))
+          .join(', ');
+      }
+    } catch {
+      preview = rawArguments;
+    }
+  }
+  const truncated = preview.length > MAX_ACTIVITY_CHARS ? `${preview.slice(0, MAX_ACTIVITY_CHARS)}…` : preview;
+  return `${name}(${truncated})`;
 }
 
 /** No subagent profile offered in this slice ever includes an MCP tool (see
@@ -80,6 +110,19 @@ export interface RunSubagentTaskParams {
    * unused for that purpose in this slice, but threaded through now so that
    * addition doesn't need to change this signature. */
   taskId: string;
+  /** The originating `task` tool_call's own `ToolCall.id` — deliberately a
+   * SEPARATE id from `taskId` above, and used for a different purpose:
+   * `taskId` scopes Rust-side cancellation/permission state and must stay a
+   * `crypto.randomUUID()` (a `call_0`-style provider fallback id could
+   * collide across two concurrent turns' subagents), while THIS id is only
+   * ever used as the `subagentStore`/`ChatSession.subagentRuns` key —
+   * `MessageList.tsx`'s `buildTimeline` has this id on hand (it's right
+   * there in the transcript) but has no way to learn `taskId`, which is
+   * generated fresh inside `executeToolCall` and never written into the
+   * transcript. Optional (falls back to `taskId`) purely so existing tests
+   * that construct `RunSubagentTaskParams` by hand don't all need updating —
+   * every real caller (`turnEngine.ts`) always supplies it. */
+  toolCallId?: string;
   /** Short (3-6 word) label the model supplied — folded into the child's
    * system prompt so it knows what it's here to do. */
   description: string;
@@ -114,7 +157,38 @@ export interface RunSubagentTaskParams {
  * the invariant is owned here first).
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
-  const { sessionId, parentCheckpointId, parentSignal, taskId, description, prompt, profile, target, effort } = params;
+  const { sessionId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort } = params;
+
+  // The key `subagentStore`/`ChatSession.subagentRuns` are updated under —
+  // see `RunSubagentTaskParams.toolCallId`'s doc comment for why this must
+  // NOT be `taskId` itself (that id is Rust-turn-scoped, not transcript-
+  // correlatable).
+  const storeKey = toolCallId ?? taskId;
+
+  // The child's own local transcript — never written into `sessionStore`'s
+  // `messages` (the array `agentLoop.ts` actually feeds into `wireHistory`
+  // for the NEXT parent turn) — only ever into `subagentStore` (live) and
+  // `ChatSession.subagentRuns` (persisted) below, both of which are purely
+  // UI-side and never read when assembling a turn's wire payload. Declared
+  // here (before the try block) so `finish` can persist whatever the child
+  // produced even if something throws before the loop below completes.
+  let messages: ChatMessage[] = [{ role: 'user', content: prompt }];
+
+  // Registered immediately (before any streaming happens) so `SubagentRow`
+  // can render a spinner for this task the instant the parent turn
+  // dispatches it — not just once the first `attemptStream` call settles.
+  useSubagentStore.getState().start({ sessionId, taskId: storeKey, description, profile });
+
+  /** Marks this run terminal in both the live store and the persisted
+   * session field, then returns `result` unchanged — the single exit point
+   * every return statement below routes through, so every outcome (report,
+   * error, cancellation, iteration-cap) reliably finalizes both places
+   * exactly once. */
+  const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
+    useSubagentStore.getState().finish(storeKey, status);
+    useSessionStore.getState().setSubagentRun(sessionId, storeKey, messages);
+    return result;
+  };
 
   try {
     const roots: PromptWorkspaceRoot[] = useWorkspaceStore.getState().roots;
@@ -123,14 +197,8 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     const tools: ToolDef[] = toolsForProfile(profile);
     const mcpRegistry = emptyMcpRegistry();
 
-    // The child's own local transcript — never written into `sessionStore`,
-    // never shown to the user directly (slice 2 adds a live/collapsible
-    // view via `subagentStore`). Seeded with the task prompt as the sole
-    // user message, per the design doc's child-loop spec.
-    let messages: ChatMessage[] = [{ role: 'user', content: prompt }];
-
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
-      if (parentSignal?.aborted) return CANCELLED_TOOL_RESULT;
+      if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
 
@@ -141,34 +209,48 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       const attempt = await attemptStream(target, wireHistory, tools, parentSignal, effort, sessionId, undefined, false);
 
       if (attempt.streamError !== null) {
-        return stringifyToolError(new Error(attempt.streamError));
+        return finish('error', stringifyToolError(new Error(attempt.streamError)));
       }
 
       if (attempt.toolCalls.length === 0) {
-        if (parentSignal?.aborted && attempt.content.length === 0) return CANCELLED_TOOL_RESULT;
-        return capReport(attempt.content.trim() || '(subagent finished with no report)');
+        if (parentSignal?.aborted && attempt.content.length === 0) return finish('cancelled', CANCELLED_TOOL_RESULT);
+        const finalMessage: ChatMessage = { role: 'assistant', content: attempt.content };
+        messages = [...messages, finalMessage];
+        useSubagentStore.getState().appendMessage(storeKey, finalMessage);
+        return finish('done', capReport(attempt.content.trim() || '(subagent finished with no report)'));
       }
 
-      messages = [...messages, { role: 'assistant', content: attempt.content, tool_calls: attempt.toolCalls }];
+      const assistantMessage: ChatMessage = { role: 'assistant', content: attempt.content, tool_calls: attempt.toolCalls };
+      messages = [...messages, assistantMessage];
+      useSubagentStore.getState().appendMessage(storeKey, assistantMessage);
 
       for (const toolCall of attempt.toolCalls) {
         // Once Stop has fired, remaining calls are not executed — but every
         // one still gets a (cancelled) result message, same invariant
         // `runAgentTurnBody`'s own loop upholds for the parent's tool calls.
-        const resultContent = parentSignal?.aborted
+        const aborted = parentSignal?.aborted ?? false;
+        if (!aborted) {
+          useSubagentStore.getState().recordToolCall(storeKey, activityLabel(toolCall));
+        }
+        const resultContent = aborted
           ? CANCELLED_TOOL_RESULT
           : await executeToolCall(toolCall, parentCheckpointId, taskId, mcpRegistry, parentSignal);
-        messages = [...messages, { role: 'tool', tool_call_id: toolCall.id, content: resultContent }];
+        const toolMessage: ChatMessage = { role: 'tool', tool_call_id: toolCall.id, content: resultContent };
+        messages = [...messages, toolMessage];
+        useSubagentStore.getState().appendMessage(storeKey, toolMessage);
       }
 
-      if (parentSignal?.aborted) return CANCELLED_TOOL_RESULT;
+      if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
       // Loop again: the child model gets its own tool results appended.
     }
 
-    return stringifyToolError(
-      new Error(`Subagent stopped after reaching the safety limit of ${MAX_SUBAGENT_ITERATIONS} tool-calling iterations without a final answer.`)
+    return finish(
+      'error',
+      stringifyToolError(
+        new Error(`Subagent stopped after reaching the safety limit of ${MAX_SUBAGENT_ITERATIONS} tool-calling iterations without a final answer.`)
+      )
     );
   } catch (err) {
-    return stringifyToolError(err);
+    return finish('error', stringifyToolError(err));
   }
 }

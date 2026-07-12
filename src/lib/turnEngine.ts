@@ -349,6 +349,12 @@ export async function executeToolCall(
         parentCheckpointId: checkpointId,
         parentSignal: signal,
         taskId: childTurnId,
+        // The ORIGINATING `task` tool_call's own id — see
+        // `RunSubagentTaskParams.toolCallId`'s doc comment for why this is a
+        // deliberately separate id from `childTurnId` above: this is the
+        // `subagentStore`/`ChatSession.subagentRuns` key `MessageList.tsx`
+        // can actually correlate against the persisted transcript.
+        toolCallId: toolCall.id,
         description,
         prompt: taskPrompt,
         profile,
