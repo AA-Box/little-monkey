@@ -551,30 +551,15 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
   },
 }));
 
-/** Memoizes a `.filter()` selector on the identity of `state.entries` (safe
- * because every store action replaces `entries` immutably), so the same
- * array reference comes back until the library actually changes. Without
- * this, passing the selector straight to `usePromptStore` makes getSnapshot
- * return a fresh array every call and useSyncExternalStore re-renders
- * forever — "Maximum update depth exceeded", which crashed `PersonaSelector`
- * and with it the whole ChatWindow pane. */
-function memoEntriesFilter(predicate: (e: PromptEntry) => boolean) {
-  let lastEntries: PromptEntry[] | undefined;
-  let lastResult: PromptEntry[] = [];
-  return (state: PromptStore): PromptEntry[] => {
-    if (state.entries !== lastEntries) {
-      lastEntries = state.entries;
-      lastResult = state.entries.filter(predicate);
-    }
-    return lastResult;
-  };
+/** Zustand selector: every saved persona, in library order. */
+export function selectPersonas(state: PromptStore): PromptEntry[] {
+  return state.entries.filter((e) => e.kind === "persona");
 }
 
-/** Zustand selector: every saved persona, in library order. */
-export const selectPersonas = memoEntriesFilter((e) => e.kind === "persona");
-
 /** Zustand selector: every saved snippet, in library order. */
-export const selectSnippets = memoEntriesFilter((e) => e.kind === "snippet");
+export function selectSnippets(state: PromptStore): PromptEntry[] {
+  return state.entries.filter((e) => e.kind === "snippet");
+}
 
 /** Finds the entry (if any) whose `command` matches exactly — used for
  * slash-command exact lookup and for the create/edit form's uniqueness
