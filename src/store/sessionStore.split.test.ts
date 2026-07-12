@@ -28,6 +28,7 @@ function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSess
     workspacePath: null,
     personaId: null,
     attachedStackIds: [],
+    docChatMode: false,
     ...overrides,
   };
 }
@@ -230,6 +231,57 @@ describe("toggleAttachedStack", () => {
   it("only affects the targeted session", () => {
     useSessionStore.getState().toggleAttachedStack("a", "stack-1");
     expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.attachedStackIds).toEqual([]);
+  });
+});
+
+describe("toggleDocChatMode", () => {
+  it("turns doc-chat mode on for a session that starts with it off", () => {
+    useSessionStore.getState().toggleDocChatMode("a");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.docChatMode).toBe(true);
+  });
+
+  it("turns it back off on a second toggle", () => {
+    useSessionStore.getState().toggleDocChatMode("a");
+    useSessionStore.getState().toggleDocChatMode("a");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.docChatMode).toBe(false);
+  });
+
+  it("only affects the targeted session", () => {
+    useSessionStore.getState().toggleDocChatMode("a");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.docChatMode).toBe(false);
+  });
+});
+
+describe("hydrateSessions docChatMode default", () => {
+  it("defaults docChatMode to false for a persisted session predating the field", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            personaId: null,
+            attachedStackIds: [],
+            // No `docChatMode` field at all — simulates a blob saved before
+            // this feature existed.
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.docChatMode).toBe(false);
   });
 });
 

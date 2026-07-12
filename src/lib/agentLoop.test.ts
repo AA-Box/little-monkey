@@ -8,9 +8,11 @@ import {
   checkpointChainBlockReason,
   formatMemoryNotice,
   formatPlanNotice,
+  formatSourcesNotice,
   formatVerifyNotice,
   isMemoryNotice,
   isPlanNotice,
+  isSourcesNotice,
   isSuccessfulMutationResult,
   isToolCallAllowed,
   isVerifyFixNotice,
@@ -18,6 +20,7 @@ import {
   maybeAutoPreviewNewestArtifact,
   parseMemoryNotice,
   parsePlanNotice,
+  parseSourcesNotice,
   parseVerifyNotice,
   PLAN_NOTE_PREFIX,
   runVerificationPhase,
@@ -30,9 +33,11 @@ import {
   type CheckpointChainLink,
   type MemoryNotice,
   type PlanNotice,
+  type SourcesNotice,
   type VerifyFailure,
   type VerifyNotice,
 } from "./agentLoop";
+import { estimateHistoryTokens } from "./contextTrimmer";
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
 import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
@@ -163,6 +168,67 @@ describe("verify notices", () => {
   it("returns null when the payload is missing required fields", () => {
     const message: ChatMessage = { role: "system", content: `[Verify]${JSON.stringify({ label: "only-label" })}` };
     expect(parseVerifyNotice(message)).toBeNull();
+  });
+});
+
+describe("sources notices", () => {
+  const notice: SourcesNotice = {
+    results: [
+      { path: "docs/guide.md", stack: "Docs", score: 0.87, snippet: "Install via pnpm install." },
+      { path: "docs/faq.md", stack: "Docs", score: 0.61, snippet: "See the FAQ for troubleshooting." },
+    ],
+  };
+
+  it("formats a notice as a [Sources]-prefixed JSON payload and round-trips it back", () => {
+    const formatted = formatSourcesNotice(notice);
+    expect(formatted.startsWith("[Sources]")).toBe(true);
+
+    const message: ChatMessage = { role: "system", content: formatted };
+    expect(isSourcesNotice(message)).toBe(true);
+    expect(parseSourcesNotice(message)).toEqual(notice);
+  });
+
+  it("round-trips an empty results list", () => {
+    const empty: SourcesNotice = { results: [] };
+    const message: ChatMessage = { role: "system", content: formatSourcesNotice(empty) };
+    expect(parseSourcesNotice(message)).toEqual(empty);
+  });
+
+  it("is not misidentified as a sources notice for other message shapes", () => {
+    expect(isSourcesNotice({ role: "system", content: "[Checkpoint]{}" })).toBe(false);
+    expect(isSourcesNotice({ role: "user", content: "[Sources]{}" })).toBe(false);
+    expect(parseSourcesNotice({ role: "assistant", content: "hello" })).toBeNull();
+  });
+
+  it("returns null for a malformed JSON payload instead of throwing", () => {
+    const message: ChatMessage = { role: "system", content: "[Sources]not-json" };
+    expect(parseSourcesNotice(message)).toBeNull();
+  });
+
+  it("returns null when a result entry is missing a required field", () => {
+    const message: ChatMessage = {
+      role: "system",
+      content: `[Sources]${JSON.stringify({ results: [{ path: "a.md", stack: "Docs", score: 0.5 }] })}`,
+    };
+    expect(parseSourcesNotice(message)).toBeNull();
+  });
+
+  it("counts toward contextTrimmer's token estimate like any other message (RAG design doc's context-bloat risk)", () => {
+    // A realistic doc-chat notice: 6 chunks at ~1600 chars each, per the
+    // design doc's own budget note (~2.4k tokens at 4 chars/token).
+    const bigNotice: SourcesNotice = {
+      results: Array.from({ length: 6 }, (_, i) => ({
+        path: `docs/file-${i}.md`,
+        stack: "Docs",
+        score: 0.9 - i * 0.05,
+        snippet: "x".repeat(1600),
+      })),
+    };
+    const message: ChatMessage = { role: "system", content: formatSourcesNotice(bigNotice) };
+    // No special-casing needed: estimateHistoryTokens sums every message's
+    // content length generically, so a large [Sources] notice already
+    // contributes to the total exactly like a long tool result would.
+    expect(estimateHistoryTokens([message])).toBeGreaterThan(2000);
   });
 });
 
@@ -708,6 +774,7 @@ describe("maybeAutoPreviewNewestArtifact", () => {
       workspacePath: null,
       personaId: null,
       attachedStackIds: [],
+      docChatMode: false,
     };
     useSessionStore.setState((state) => ({
       sessions: [...state.sessions.filter((s) => s.id !== sessionId), session],

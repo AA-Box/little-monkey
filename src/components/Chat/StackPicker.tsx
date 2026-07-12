@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Library } from "lucide-react";
+import { BookOpen, Library } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 
 import { useSessionStore } from "../../store/sessionStore";
@@ -30,6 +30,8 @@ export function StackPicker({ sessionId }: StackPickerProps) {
     (state) => state.sessions.find((s) => s.id === sessionId)?.attachedStackIds ?? []
   );
   const toggleAttachedStack = useSessionStore((state) => state.toggleAttachedStack);
+  const docChatMode = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.docChatMode ?? false);
+  const toggleDocChatMode = useSessionStore((state) => state.toggleDocChatMode);
 
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -66,7 +68,7 @@ export function StackPicker({ sessionId }: StackPickerProps) {
         aria-expanded={open}
         className="inline-flex items-center gap-1.5 rounded-full bg-surface-2 px-2.5 py-1 text-xs font-medium text-muted transition-colors duration-150 cursor-pointer hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
-        <Library size={13} className="shrink-0" />
+        {docChatMode ? <BookOpen size={13} className="shrink-0" /> : <Library size={13} className="shrink-0" />}
         <span className="max-w-[10rem] truncate">
           {attachedCount > 0 ? t("StackPicker.attachedCount", { count: attachedCount }) : t("StackPicker.noneLabel")}
         </span>
@@ -102,6 +104,18 @@ export function StackPicker({ sessionId }: StackPickerProps) {
               );
             })
           )}
+          <label className="flex w-full cursor-pointer items-start gap-2 border-t border-border px-3 py-2 text-left hover:bg-surface-2">
+            <input
+              type="checkbox"
+              checked={docChatMode}
+              onChange={() => toggleDocChatMode(sessionId)}
+              className="mt-0.5 shrink-0 cursor-pointer accent-accent"
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-medium text-foreground">{t("StackPicker.docChatToggleLabel")}</span>
+              <span className="block text-xs text-muted">{t("StackPicker.docChatToggleDescription")}</span>
+            </span>
+          </label>
         </div>
       )}
     </div>

@@ -161,7 +161,19 @@ export function buildSystemPrompt(
   // only when the `search_docs` tool is actually being offered this turn too
   // (see `agentLoop.ts`'s `buildTools` call), so the guidance line and the
   // tool's own availability never drift out of sync.
-  attachedStacks: AttachedStackPromptInfo[] = []
+  attachedStacks: AttachedStackPromptInfo[] = [],
+  // Whether the session's doc-chat mode (see `ChatSession.docChatMode`,
+  // `StackPicker.tsx`) is on — adds a citation instruction beyond the plain
+  // `stacksLines` mention above, since doc-chat retrieves passages
+  // automatically (as a `[Sources]` notice, see `agentLoop.ts`) rather than
+  // relying on the model to call `search_docs` itself. Kept as its own
+  // condition instead of folding into `attachedStacks.length > 0` so a
+  // `docChatMode` toggle left on after every stack was detached from the
+  // session degrades to no citation instruction rather than a dangling one —
+  // `runAgentTurnBody` never actually retrieves anything in that case either
+  // (see its `attachedStackIds.length > 0` gate), so the two stay in sync.
+  // Defaults to `false` so every pre-existing call site/test is unaffected.
+  docChatMode: boolean = false
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -272,6 +284,17 @@ export function buildSystemPrompt(
         ]
       : [];
 
+  // One conditional line, on top of `stacksLines` above, telling the model
+  // that doc-chat mode auto-retrieves passages before every reply — see the
+  // `docChatMode` param doc for why this is its own condition rather than
+  // folded into `stacksLines`.
+  const docChatLines = docChatMode
+    ? [
+        '',
+        'Doc-chat mode is on: before each of your replies, the most relevant passages from the attached knowledge stack(s) are retrieved automatically and added as a "[Sources]" system notice — read them and answer using only what they (or the rest of the conversation) actually support, citing the specific source path for every claim drawn from them. If they don\'t contain the answer, say so instead of guessing.',
+      ]
+    : [];
+
   const planModeLines =
     mode === 'plan'
       ? [
@@ -301,6 +324,7 @@ export function buildSystemPrompt(
     ...verifyGuidanceLines,
     ...artifactGuidanceLines,
     ...stacksLines,
+    ...docChatLines,
     ...planModeLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
@@ -319,7 +343,11 @@ export function currentSystemPrompt(
   // here — this module has no `sessionId` to key a per-session lookup by,
   // unlike `personaId` which the caller already resolves from the session
   // itself before calling this. See `AttachedStackPromptInfo`'s doc comment.
-  attachedStacks: AttachedStackPromptInfo[] = []
+  attachedStacks: AttachedStackPromptInfo[] = [],
+  // Passed in by `agentLoop.ts` from the session's `ChatSession.docChatMode`
+  // — same "no sessionId here, caller resolves it" reasoning as
+  // `attachedStacks` above.
+  docChatMode: boolean = false
 ): string {
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
@@ -354,7 +382,8 @@ export function currentSystemPrompt(
     verifyGuidanceAvailable,
     mode,
     true,
-    attachedStacks
+    attachedStacks,
+    docChatMode
   );
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
