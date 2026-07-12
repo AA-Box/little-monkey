@@ -20,6 +20,7 @@ use crate::checkpoints_cli;
 use crate::chat::{self, Target};
 use crate::mcp_cli;
 use crate::permission::{self, PermissionMode, TerminalPermissions};
+use crate::stacks_cli;
 use crate::tools_cli;
 use crate::tools_def::{self, McpToolRegistry};
 use crate::verify_cli;
@@ -235,6 +236,7 @@ async fn execute_tool_call(
     checkpoint_id: Option<&str>,
     mcp_entries: &[McpServerEntry],
     mcp_registry: &McpToolRegistry,
+    attached_stacks: &[String],
 ) -> String {
     let args: serde_json::Value = if raw_arguments.trim().is_empty() {
         serde_json::json!({})
@@ -377,6 +379,23 @@ async fn execute_tool_call(
                 Err(e) => Err(e),
             }
         }
+        // Read-only, so — like `read_file`/`grep`/`list_dir` above — never
+        // goes through `perms.request`: unaffected by permission mode,
+        // including Plan Mode's hard block (see `stacks.rs::tool_search_docs`'s
+        // own doc comment for the full reasoning, which applies verbatim
+        // here). `stacks_cli::search_docs` resolves the model's `stack` name
+        // argument through the same `stacks::resolve_search_stack_ids` the
+        // desktop app's Tauri command uses, over the same `stacks::query_impl`
+        // ranking, so this and the GUI's `search_docs` produce identically
+        // shaped results for the same stack/query.
+        "search_docs" => {
+            let query = args["query"].as_str().unwrap_or_default().to_string();
+            let stack = args["stack"].as_str().map(str::to_string);
+            let max_results = args["max_results"].as_u64().map(|v| v as u32);
+            stacks_cli::search_docs(state, query, stack, max_results, attached_stacks)
+                .await
+                .and_then(|results| serde_json::to_value(results).map_err(|e| e.to_string()))
+        }
         other => Err(format!("Unknown tool \"{other}\"")),
     };
 
@@ -479,6 +498,7 @@ pub async fn run_turn(
     options: &chat::ChatOptions,
     user_text: &str,
     mcp_entries: &[McpServerEntry],
+    attached_stacks: &[String],
 ) -> Result<(), String> {
     if let Some(system) = &options.system {
         apply_system_prompt(history, system);
@@ -495,8 +515,18 @@ pub async fn run_turn(
             .ok()
     });
 
-    let result =
-        run_tool_loop(client, target, state, perms, history, options, checkpoint_id.as_deref(), mcp_entries).await;
+    let result = run_tool_loop(
+        client,
+        target,
+        state,
+        perms,
+        history,
+        options,
+        checkpoint_id.as_deref(),
+        mcp_entries,
+        attached_stacks,
+    )
+    .await;
 
     if let Some(id) = &checkpoint_id {
         let _ = checkpoints::end_impl(state, id);
@@ -517,6 +547,7 @@ async fn run_tool_loop(
     options: &chat::ChatOptions,
     checkpoint_id: Option<&str>,
     mcp_entries: &[McpServerEntry],
+    attached_stacks: &[String],
 ) -> Result<(), String> {
     // Built once per turn (mirroring `agentLoop.ts`'s two `attemptStream`
     // call sites recomputing `mcpToolDefs()` per turn, not per streaming
@@ -531,6 +562,13 @@ async fn run_tool_loop(
     // turn rather than disappearing out from under an in-flight model reply.
     if perms.mode() == PermissionMode::Plan {
         tools_vec.push(tools_def::present_plan_tool_def());
+    }
+    // `search_docs` is offered only when at least one `--stack` was given —
+    // mirrors the desktop app's `buildTools(attachedStackNames)`, which only
+    // offers the tool when a stack is actually attached to the session (see
+    // `tools_def::search_docs_tool_def`'s doc comment).
+    if !attached_stacks.is_empty() {
+        tools_vec.push(tools_def::search_docs_tool_def(attached_stacks));
     }
     let native = target.is_native();
 
@@ -619,9 +657,17 @@ async fn run_tool_loop(
 
         for call in &result.tool_calls {
             println!("\n[tool] {}({})", call.name, call.arguments);
-            let content =
-                execute_tool_call(state, perms, &call.name, &call.arguments, checkpoint_id, mcp_entries, &mcp_registry)
-                    .await;
+            let content = execute_tool_call(
+                state,
+                perms,
+                &call.name,
+                &call.arguments,
+                checkpoint_id,
+                mcp_entries,
+                &mcp_registry,
+                attached_stacks,
+            )
+            .await;
             println!("[tool result] {}", preview(&content, 300));
 
             // Track this turn's file mutations for `run_verification_phase`
@@ -688,7 +734,8 @@ mod tests {
             PermissionMode::Bypass,
         ] {
             let mut perms = TerminalPermissions::new(mode);
-            let content = execute_tool_call(&state, &mut perms, "present_plan", args, None, &[], &registry).await;
+            let content =
+                execute_tool_call(&state, &mut perms, "present_plan", args, None, &[], &registry, &[]).await;
             let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert!(parsed["error"].as_str().unwrap().contains("Plan Mode"), "mode {mode:?} should reject present_plan");
             // The guard must reject BEFORE flipping anything — mode stays

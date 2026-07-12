@@ -569,6 +569,7 @@ export const id: Record<string, string> = {
   "KnowledgePanel.phaseDone": "Terindeks",
   "KnowledgePanel.neverIndexed": "Belum diindeks",
   "KnowledgePanel.indexedAt": "Diindeks {{when}} · {{count}} potongan",
+  "KnowledgePanel.staleIndexBadge": "Perlu diindeks ulang",
   "KnowledgePanel.testSearchHeading": "Uji pencarian",
   "KnowledgePanel.notIndexedForSearch": "Indeks stack ini sebelum mencari.",
   "KnowledgePanel.searchPlaceholder": "Cari di stack ini…",

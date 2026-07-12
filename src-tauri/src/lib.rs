@@ -6,7 +6,14 @@
 pub mod artifacts;
 pub mod checkpoints;
 mod git;
-mod llama;
+// `pub` so `lm-cli`'s `embed_cli` module (RAG design doc slice 4 CLI parity)
+// can reuse `find_llama_server_binary`/`embed_server_args`/`EMBED_PORT`/
+// `LlamaState::for_embeddings` directly instead of re-implementing the
+// embeddings-only `llama-server` process's binary discovery and flags — the
+// same AppHandle-free-core reasoning as `stacks`/`checkpoints`/`rules` below,
+// just exposing a few specific items rather than a `*_impl` set (the rest of
+// this module's Tauri-command surface stays desktop-app-only).
+pub mod llama;
 pub mod mcp;
 mod models;
 pub mod ollama;
@@ -162,9 +169,15 @@ pub struct AppState {
     /// deleted — see `stacks.rs::load_stack_cached`.
     pub stack_cache: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<stacks::LoadedStack>>>,
     /// Cancellation handles for in-flight `stacks_reindex` calls, keyed by
-    /// stack id — mirrors `stream_cancels`/`tool_cancel` above. See
-    /// `stacks::stacks_cancel_index`.
-    pub index_cancels: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// stack id — mirrors `stream_cancels`/`tool_cancel` above, but a
+    /// `tokio_util::sync::CancellationToken` rather than a plain
+    /// `tokio::sync::Notify`: a `CancellationToken`'s cancelled state is
+    /// persisted, so a cancel request is never silently lost just because it
+    /// arrived before anything happened to be awaiting it (`Notify`'s
+    /// `notify_waiters()` has exactly that gap — see
+    /// `stacks::reindex_impl`'s doc comment for the failure mode this
+    /// avoids). See `stacks::stacks_cancel_index`.
+    pub index_cancels: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>>,
 }
 
 impl Default for AppState {
@@ -341,6 +354,7 @@ pub fn run() {
             stacks::stacks_reindex,
             stacks::stacks_cancel_index,
             stacks::stacks_query,
+            stacks::stacks_is_stale,
             stacks::tool_search_docs,
         ])
         .build(tauri::generate_context!())
@@ -352,15 +366,21 @@ pub fn run() {
         // (see its own doc comment), which skips Rust's Drop-based cleanup
         // entirely. That means any live MCP stdio child process (held in
         // `AppState::mcp`, cleaned up only via `McpConnection::service`'s
-        // `Drop`/`.cancel()`) would otherwise be silently orphaned on every
-        // normal app quit. `RunEvent::Exit` fires synchronously on the main
-        // thread right before that happens, so blocking here on
-        // `mcp::disconnect_all` (bounded and best-effort — see its own doc
-        // comment) is the only chance those child processes get to actually
-        // be killed before the process itself exits.
+        // `Drop`/`.cancel()`) — and either managed `llama-server` child
+        // process (`AppState::llama`/`AppState::embed_llama`, neither of
+        // which has a `Drop` impl either) — would otherwise be silently
+        // orphaned on every normal app quit. `RunEvent::Exit` fires
+        // synchronously on the main thread right before that happens, so
+        // doing both kinds of cleanup here — `mcp::disconnect_all` (bounded
+        // and best-effort — see its own doc comment) and
+        // `llama::stop_all_blocking` (synchronous, no `AppHandle`/async
+        // runtime required, since a plain `std::process::Child::kill` is all
+        // either process needs) — is the only chance those child processes
+        // get to actually be killed before the process itself exits.
         if let tauri::RunEvent::Exit = event {
             let state = app_handle.state::<AppState>();
             tauri::async_runtime::block_on(mcp::disconnect_all(state.inner()));
+            llama::stop_all_blocking(state.inner());
         }
     });
 }

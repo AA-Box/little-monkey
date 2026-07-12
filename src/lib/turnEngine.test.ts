@@ -53,6 +53,56 @@ describe("executeToolCall / present_plan", () => {
   });
 });
 
+// `allowed_stack_names` is the server-side enforcement point for
+// `search_docs`'s session scoping (see `stacks.rs`'s
+// `resolve_search_stack_ids` doc comment for the privacy gap this closes):
+// it must always be injected with THIS turn's actual attached-stack names,
+// regardless of what (if anything) the model itself passed.
+describe("executeToolCall / search_docs stack scoping", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue([]);
+  });
+
+  it("injects the session's attached stack names as allowed_stack_names", async () => {
+    await executeToolCall(
+      call("search_docs", { query: "budget planning" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      ["Work Docs", "Wiki"]
+    );
+
+    const [command, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(command).toBe("tool_search_docs");
+    expect(sentArgs.allowed_stack_names).toEqual(["Work Docs", "Wiki"]);
+  });
+
+  it("defaults allowed_stack_names to an empty array when no attached names are supplied", async () => {
+    await executeToolCall(call("search_docs", { query: "anything" }), null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.allowed_stack_names).toEqual([]);
+  });
+
+  it("overwrites a model-supplied allowed_stack_names — the model can never widen its own scope", async () => {
+    await executeToolCall(
+      call("search_docs", { query: "q", allowed_stack_names: ["Diary"] }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      ["Work Docs"]
+    );
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.allowed_stack_names).toEqual(["Work Docs"]);
+  });
+});
+
 // IPC-level tests pinning the risk_level/risk_reason scrub-then-overwrite
 // invariant — mirrors the spirit of tools.rs's
 // `edit_file_ipc_accepts_snake_case_argument_keys` test, but on the frontend

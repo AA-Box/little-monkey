@@ -569,6 +569,7 @@ export const ko: Record<string, string> = {
   "KnowledgePanel.phaseDone": "인덱싱됨",
   "KnowledgePanel.neverIndexed": "아직 인덱싱되지 않음",
   "KnowledgePanel.indexedAt": "{{when}}에 인덱싱됨 · {{count}}개 청크",
+  "KnowledgePanel.staleIndexBadge": "재인덱싱 필요",
   "KnowledgePanel.testSearchHeading": "테스트 검색",
   "KnowledgePanel.notIndexedForSearch": "검색하기 전에 이 스택을 인덱싱하세요.",
   "KnowledgePanel.searchPlaceholder": "이 스택에서 검색…",

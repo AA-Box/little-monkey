@@ -173,7 +173,8 @@ export async function executeToolCall(
   turnId: string,
   mcpRegistry: McpToolRegistry,
   signal?: AbortSignal,
-  risk?: RiskAnnotationContext
+  risk?: RiskAnnotationContext,
+  attachedStackNames?: string[]
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
 
@@ -252,6 +253,21 @@ export async function executeToolCall(
     name === 'web_search'
   ) {
     args.turn_id = turnId;
+  }
+
+  // `search_docs` is scoped to THIS session's actually-attached knowledge
+  // stacks server-side, never left to the model to declare — same treatment
+  // as `checkpoint_id`/`turn_id` above. Injected (and always overwritten,
+  // even if the model's JSON args somehow already had a same-named key)
+  // regardless of whether the model passed a `stack` argument: `stacks.rs`'s
+  // `resolve_search_stack_ids` uses this as the allow-list for BOTH the
+  // explicit-name case and the "omit stack" default-sweep case, so a
+  // compliant model that just omits `stack` (the tool description's stated
+  // default) can never sweep in a knowledge stack that exists and is indexed
+  // but was never attached to this session — see that Rust function's doc
+  // comment for the privacy gap this closes.
+  if (name === 'search_docs') {
+    args.allowed_stack_names = attachedStackNames ?? [];
   }
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`

@@ -38,7 +38,9 @@ export function KnowledgePanel() {
   const stacks = useStackStore((s) => s.stacks);
   const indexProgress = useStackStore((s) => s.indexProgress);
   const reindexError = useStackStore((s) => s.reindexError);
+  const staleById = useStackStore((s) => s.staleById);
   const refresh = useStackStore((s) => s.refresh);
+  const refreshStale = useStackStore((s) => s.refreshStale);
   const createStack = useStackStore((s) => s.create);
   const removeStack = useStackStore((s) => s.remove);
   const renameStack = useStackStore((s) => s.rename);
@@ -62,10 +64,10 @@ export function KnowledgePanel() {
   const downloadModel = useModelStore((s) => s.download);
 
   useEffect(() => {
-    void refresh();
+    void refresh().then(() => void refreshStale());
     void refreshModels();
     void refreshEmbedStatus();
-  }, [refresh, refreshModels, refreshEmbedStatus]);
+  }, [refresh, refreshStale, refreshModels, refreshEmbedStatus]);
 
   const embeddingModels = useMemo(
     () => (curatedModels.length > 0 ? curatedModels : []).filter((m) => m.kind === "embedding"),
@@ -340,6 +342,7 @@ export function KnowledgePanel() {
               onCancelIndex={() => void cancelIndex(stack.id)}
               progress={indexProgress[stack.id]}
               error={reindexError[stack.id]}
+              stale={staleById[stack.id] ?? false}
               onQuery={queryStack}
             />
           ))
@@ -362,6 +365,10 @@ interface StackRowProps {
   onCancelIndex: () => void;
   progress?: { files_done: number; files_total: number; chunks: number; phase: string };
   error?: string;
+  /** True when `stacks_is_stale` reports a source file modified after this
+   * stack's `indexed_at` — renders a small warning badge next to the
+   * indexed-at line prompting a reindex (RAG design doc slice 4). */
+  stale?: boolean;
   onQuery: (stackIds: string[], query: string, k?: number) => Promise<StackQueryResult[]>;
 }
 
@@ -378,6 +385,7 @@ function StackRow({
   onCancelIndex,
   progress,
   error,
+  stale,
   onQuery,
 }: StackRowProps) {
   const { t } = useT();
@@ -431,6 +439,9 @@ function StackRow({
                 : t("KnowledgePanel.neverIndexed")}
             </p>
           </div>
+          {stale && !isIndexing && (
+            <StatusPill tone="warning">{t("KnowledgePanel.staleIndexBadge")}</StatusPill>
+          )}
         </div>
         <span className="shrink-0 font-mono text-[11px] text-faint">{stack.embedding.model_id_or_tag}</span>
       </button>
