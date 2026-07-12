@@ -196,6 +196,39 @@ pub fn read_key(provider_id: &str) -> Result<String, String> {
     })
 }
 
+/// Converts a provider id into its env-var name for [`read_key_with_env`]:
+/// `openrouter` -> `LITTLE_MONKEY_API_KEY_OPENROUTER`. Non-alphanumeric
+/// characters (a custom provider id could contain `-`) become `_`, matching
+/// standard env-var naming.
+fn provider_env_var_name(provider_id: &str) -> String {
+    let upper: String = provider_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    format!("LITTLE_MONKEY_API_KEY_{upper}")
+}
+
+/// `read_key`, but tried only after two env-var fallbacks that don't exist
+/// for the keychain-only path: `LITTLE_MONKEY_API_KEY_<PROVIDER_ID_UPPER>`
+/// first, then the generic `LITTLE_MONKEY_API_KEY` — for `monkey-cli task
+/// run` in CI, where there is no OS keychain to read from at all (design doc
+/// slice 1). Scoped to reading only (never persisted anywhere), and the GUI
+/// never calls this — `read_key` itself, and its keychain-only behavior when
+/// neither env var is set, are both completely unchanged.
+pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
+    if let Ok(key) = std::env::var(provider_env_var_name(provider_id)) {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    if let Ok(key) = std::env::var("LITTLE_MONKEY_API_KEY") {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    read_key(provider_id)
+}
+
 fn remove_key_impl(provider_id: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, provider_id)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
@@ -702,6 +735,20 @@ mod tests {
         assert!(validate_base_url("api.openai.com/v1").is_err());
         assert!(validate_base_url("").is_err());
         assert!(validate_base_url("https://").is_err());
+    }
+
+    #[test]
+    fn provider_env_var_name_upcases_and_prefixes() {
+        assert_eq!(provider_env_var_name("openrouter"), "LITTLE_MONKEY_API_KEY_OPENROUTER");
+        assert_eq!(provider_env_var_name("anthropic"), "LITTLE_MONKEY_API_KEY_ANTHROPIC");
+    }
+
+    #[test]
+    fn provider_env_var_name_replaces_non_alphanumeric_chars() {
+        // A custom provider id could contain a hyphen — standard env-var
+        // naming replaces it with an underscore rather than dropping it
+        // (dropping could collide two distinct provider ids onto one var).
+        assert_eq!(provider_env_var_name("my-custom-provider"), "LITTLE_MONKEY_API_KEY_MY_CUSTOM_PROVIDER");
     }
 
     #[test]

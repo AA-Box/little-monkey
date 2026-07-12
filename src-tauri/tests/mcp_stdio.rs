@@ -154,7 +154,7 @@ async fn disconnect_all_clears_every_connected_server() {
 }
 
 /// `connect_impl` itself has no internal timeout (see its own doc comment) —
-/// `mcp_connect`/lm-cli's `connect_all` are responsible for bounding it. This
+/// `mcp_connect`/monkey-cli's `connect_all` are responsible for bounding it. This
 /// proves the mechanism they use (wrapping the call in an external
 /// `tokio::time::timeout`) actually works against a real child process that
 /// spawns successfully but never speaks the MCP protocol at all (a stand-in

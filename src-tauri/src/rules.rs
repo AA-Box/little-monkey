@@ -14,7 +14,7 @@
 //!
 //! Follows the `checkpoints.rs`/`sessions.rs` AppHandle-free `*_impl` split:
 //! [`read_rules_impl`] takes plain paths so it's directly unit-testable and
-//! reusable from `lm-cli` (slice 5), while [`rules_read`] is the thin
+//! reusable from `monkey-cli` (slice 5), while [`rules_read`] is the thin
 //! `#[tauri::command]` wrapper that resolves the global path and the
 //! attached roots.
 
@@ -65,7 +65,7 @@ fn read_rule_file(path: &Path) -> Option<(String, bool)> {
 
 /// Core logic behind [`rules_read`], parameterized by plain paths so it
 /// needs no `AppHandle`/`State` and is directly unit-testable (and reusable
-/// from `lm-cli`). `global_path` is the full path to the global MONKEY.md
+/// from `monkey-cli`). `global_path` is the full path to the global MONKEY.md
 /// (not just its directory); `roots` mirrors [`workspace::all_roots`]'s
 /// `(canonical_path, label, is_primary)` triples, primary first. Order of
 /// the returned list is global first, then roots in the order given (which

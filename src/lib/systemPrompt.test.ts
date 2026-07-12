@@ -79,7 +79,7 @@ describe('buildSystemPrompt', () => {
       truncated: false,
     };
 
-    const prompt = buildSystemPrompt([primary, secondary], 'macOS', [globalRule, projectRule]);
+    const prompt = buildSystemPrompt([primary, secondary], 'macOS', { rules: [globalRule, projectRule] });
 
     expect(prompt).toContain('## Project instructions (MONKEY.md)');
     expect(prompt).toContain('From global:');
@@ -95,22 +95,22 @@ describe('buildSystemPrompt', () => {
       { id: '1', text: 'Uses pnpm, not npm.', source: 'user', created_at: '2026-01-01T00:00:00Z' },
     ];
 
-    const withFacts = buildSystemPrompt([primary], 'macOS', [], facts);
+    const withFacts = buildSystemPrompt([primary], 'macOS', { facts });
     expect(withFacts).toContain('## Remembered facts');
     expect(withFacts).toContain('- Uses pnpm, not npm.');
 
-    const withoutFacts = buildSystemPrompt([primary], 'macOS', [], []);
+    const withoutFacts = buildSystemPrompt([primary], 'macOS', { facts: [] });
     expect(withoutFacts).not.toContain('Remembered facts');
   });
 
   it('appends each connected MCP server\'s instructions, and omits the section when there are none', () => {
     const mcpServers: McpServerPromptInfo[] = [{ label: 'GitHub', instructions: 'Use search_repositories before cloning.' }];
 
-    const withMcp = buildSystemPrompt([primary], 'macOS', [], [], mcpServers);
+    const withMcp = buildSystemPrompt([primary], 'macOS', { mcpServers });
     expect(withMcp).toContain('## Connected MCP servers');
     expect(withMcp).toContain("MCP server 'GitHub': Use search_repositories before cloning.");
 
-    const withoutMcp = buildSystemPrompt([primary], 'macOS', [], [], []);
+    const withoutMcp = buildSystemPrompt([primary], 'macOS', { mcpServers: [] });
     expect(withoutMcp).not.toContain('Connected MCP servers');
   });
 
@@ -118,7 +118,7 @@ describe('buildSystemPrompt', () => {
     const longInstructions = 'x'.repeat(1500);
     const mcpServers: McpServerPromptInfo[] = [{ label: 'Verbose', instructions: longInstructions }];
 
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], mcpServers);
+    const prompt = buildSystemPrompt([primary], 'macOS', { mcpServers });
 
     expect(prompt).toContain(`MCP server 'Verbose': ${'x'.repeat(1000)}…`);
     expect(prompt).not.toContain('x'.repeat(1001));
@@ -131,7 +131,7 @@ describe('buildSystemPrompt', () => {
   });
 
   it('omits the web tools guidance line (both web_fetch and web_search) when webToolsAvailable is false', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], false);
+    const prompt = buildSystemPrompt([primary], 'macOS', { webToolsAvailable: false });
     expect(prompt).not.toContain('web_fetch');
     expect(prompt).not.toContain('web_search');
   });
@@ -142,7 +142,7 @@ describe('buildSystemPrompt', () => {
   });
 
   it('includes the verification guidance line only when verifyGuidanceAvailable is true', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, true);
+    const prompt = buildSystemPrompt([primary], 'macOS', { verifyGuidanceAvailable: true });
     expect(prompt).toContain('Configured verification commands run automatically after your edits; fix any failures they report.');
   });
 
@@ -154,16 +154,23 @@ describe('buildSystemPrompt', () => {
 
   it('omits the Plan Mode section for every non-"plan" mode', () => {
     for (const mode of ['manual', 'acceptEdits', 'smart', 'auto', 'bypass'] as const) {
-      const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, mode);
+      const prompt = buildSystemPrompt([primary], 'macOS', { mode });
       expect(prompt).not.toContain('## Plan Mode');
     }
   });
 
   it('includes the Plan Mode section, steering the model toward present_plan and away from mutating tools, only when mode is "plan"', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'plan');
+    const prompt = buildSystemPrompt([primary], 'macOS', { mode: 'plan' });
     expect(prompt).toContain('## Plan Mode');
     expect(prompt).toContain('present_plan');
-    expect(prompt).toContain('every mutating tool (write_file, edit_file, run_shell, remember) is blocked');
+    expect(prompt).toContain(
+      'every other tool call — including write_file, edit_file, run_shell, remember, web_fetch, and web_search — is blocked',
+    );
+  });
+
+  it('does not claim web_fetch/web_search "work normally" in Plan Mode, since they are actually blocked like every other non-read-only tool', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', { mode: 'plan' });
+    expect(prompt).not.toContain('web_fetch, web_search) work normally');
   });
 
   it('nudges the model to tag html/svg/mermaid fences by default (artifactGuidanceAvailable defaults to true)', () => {
@@ -172,7 +179,7 @@ describe('buildSystemPrompt', () => {
   });
 
   it('omits the artifact guidance line when artifactGuidanceAvailable is false', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', false);
+    const prompt = buildSystemPrompt([primary], 'macOS', { artifactGuidanceAvailable: false });
     expect(prompt).not.toContain('tagged html/svg/mermaid');
   });
 
@@ -183,10 +190,12 @@ describe('buildSystemPrompt', () => {
   });
 
   it('names every attached stack and its description, and points the model at search_docs', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [
-      { name: 'Docs', description: '42 chunks indexed' },
-      { name: 'Release Notes', description: 'not indexed yet' },
-    ]);
+    const prompt = buildSystemPrompt([primary], 'macOS', {
+      attachedStacks: [
+        { name: 'Docs', description: '42 chunks indexed' },
+        { name: 'Release Notes', description: 'not indexed yet' },
+      ],
+    });
     expect(prompt).toContain('Knowledge stacks attached');
     expect(prompt).toContain('"Docs" (42 chunks indexed)');
     expect(prompt).toContain('"Release Notes" (not indexed yet)');
@@ -195,26 +204,17 @@ describe('buildSystemPrompt', () => {
   });
 
   it('omits the doc-chat citation instruction by default (docChatMode defaults to false)', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [
-      { name: 'Docs', description: '42 chunks indexed' },
-    ]);
+    const prompt = buildSystemPrompt([primary], 'macOS', {
+      attachedStacks: [{ name: 'Docs', description: '42 chunks indexed' }],
+    });
     expect(prompt).not.toContain('Doc-chat mode is on');
   });
 
   it('adds the doc-chat citation instruction when docChatMode is true', () => {
-    const prompt = buildSystemPrompt(
-      [primary],
-      'macOS',
-      [],
-      [],
-      [],
-      true,
-      false,
-      'manual',
-      true,
-      [{ name: 'Docs', description: '42 chunks indexed' }],
-      true
-    );
+    const prompt = buildSystemPrompt([primary], 'macOS', {
+      attachedStacks: [{ name: 'Docs', description: '42 chunks indexed' }],
+      docChatMode: true,
+    });
     expect(prompt).toContain('Doc-chat mode is on');
     expect(prompt).toContain('[Sources]');
     expect(prompt).toContain('citing the specific source path');
@@ -226,7 +226,7 @@ describe('buildSystemPrompt', () => {
   });
 
   it('adds the subagent delegation guidance line when subagentGuidanceAvailable is true', () => {
-    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [], false, true);
+    const prompt = buildSystemPrompt([primary], 'macOS', { subagentGuidanceAvailable: true });
     expect(prompt).toContain('task tool');
     expect(prompt).toContain("profile 'explore'");
   });

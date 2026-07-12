@@ -54,6 +54,7 @@ import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPromp
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
+import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
@@ -90,6 +91,41 @@ export const MENTION_NOTE_PREFIX = '[Mentions]';
 
 export function isMentionNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MENTION_NOTE_PREFIX);
+}
+
+/**
+ * Builds the `{is, parse, format}` trio every `[Prefix]{json}` synthetic
+ * notice below (Checkpoint/Plan/Memory/Verify/Sources) needs — before this
+ * factory each of those five was an independent hand-rolled copy of the same
+ * three functions (a `startsWith` check, a `JSON.parse` wrapped in a
+ * try/catch that degrades to `null` on anything malformed, and a
+ * `JSON.stringify` back onto the prefix). `isValid` — the payload's own
+ * shape check — is the only thing that actually varies per notice type; it's
+ * supplied as a type guard so `parse`'s return type narrows to `T` without a
+ * cast at every call site. Plain-text notices with no JSON payload
+ * (`SWITCH_NOTE_PREFIX`/`MENTION_NOTE_PREFIX` above, `VERIFY_FIX_NOTE_PREFIX`
+ * below) deliberately stay outside this factory — there's no payload to
+ * parse, so wrapping them here would just be a `parse`/`format` pair nobody
+ * calls.
+ */
+function makeNotice<T>(prefix: string, isValid: (value: unknown) => value is T) {
+  function is(message: ChatMessage): boolean {
+    return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(prefix);
+  }
+  function parse(message: ChatMessage): T | null {
+    if (!is(message)) return null;
+    try {
+      const parsed: unknown = JSON.parse((message.content as string).slice(prefix.length));
+      if (isValid(parsed)) return parsed;
+    } catch {
+      // Malformed payload — treat as "not this notice type".
+    }
+    return null;
+  }
+  function format(notice: T): string {
+    return `${prefix}${JSON.stringify(notice)}`;
+  }
+  return { is, parse, format };
 }
 
 /** Prefix identifying a synthetic per-turn checkpoint notice inserted into
@@ -181,34 +217,23 @@ export function checkpointChainBlockReason(checkpoints: CheckpointChainLink[], t
   return null;
 }
 
-export function isCheckpointNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(CHECKPOINT_NOTE_PREFIX);
+function isCheckpointPayload(value: unknown): value is CheckpointNotice {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as CheckpointNotice).id === 'string' &&
+    Array.isArray((value as CheckpointNotice).files)
+  );
 }
 
+const checkpointNoticeCodec = makeNotice<CheckpointNotice>(CHECKPOINT_NOTE_PREFIX, isCheckpointPayload);
+
+export const isCheckpointNotice = checkpointNoticeCodec.is;
 /** Parses a checkpoint notice's JSON payload; `null` for anything malformed. */
-export function parseCheckpointNotice(message: ChatMessage): CheckpointNotice | null {
-  if (!isCheckpointNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(CHECKPOINT_NOTE_PREFIX.length));
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as CheckpointNotice).id === 'string' &&
-      Array.isArray((parsed as CheckpointNotice).files)
-    ) {
-      return parsed as CheckpointNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a checkpoint notice".
-  }
-  return null;
-}
-
+export const parseCheckpointNotice = checkpointNoticeCodec.parse;
 /** Serializes a checkpoint notice back into message content — used both when
  * the notice is first added and when the Revert button marks it reverted. */
-export function formatCheckpointNotice(notice: CheckpointNotice): string {
-  return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatCheckpointNotice = checkpointNoticeCodec.format;
 
 /** Prefix identifying a synthetic notice inserted after a `present_plan` tool
  * call (Plan Mode only — see `toolsForMode`) — cloned from the
@@ -232,43 +257,31 @@ export interface PlanNotice {
   status: 'proposed' | 'approved' | 'dismissed';
 }
 
-export function isPlanNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PLAN_NOTE_PREFIX);
+function isPlanPayload(value: unknown): value is PlanNotice {
+  const openQuestions = (value as PlanNotice | null)?.openQuestions;
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as PlanNotice).id === 'string' &&
+      typeof (value as PlanNotice).title === 'string' &&
+      typeof (value as PlanNotice).plan === 'string' &&
+      typeof (value as PlanNotice).status === 'string' &&
+      // openQuestions is optional, but if present it must actually be a
+      // string[], or PlanCard's `.map()` over it throws at render time (e.g.
+      // a persisted/hand-edited session whose payload sets it to a truthy
+      // non-array like a string).
+      (openQuestions === undefined || (Array.isArray(openQuestions) && openQuestions.every((q) => typeof q === 'string'))),
+  );
 }
 
+const planNoticeCodec = makeNotice<PlanNotice>(PLAN_NOTE_PREFIX, isPlanPayload);
+
+export const isPlanNotice = planNoticeCodec.is;
 /** Parses a plan notice's JSON payload; `null` for anything malformed. */
-export function parsePlanNotice(message: ChatMessage): PlanNotice | null {
-  if (!isPlanNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(PLAN_NOTE_PREFIX.length));
-    const openQuestions = (parsed as PlanNotice | null)?.openQuestions;
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as PlanNotice).id === 'string' &&
-      typeof (parsed as PlanNotice).title === 'string' &&
-      typeof (parsed as PlanNotice).plan === 'string' &&
-      typeof (parsed as PlanNotice).status === 'string' &&
-      // Mirrors parseCheckpointNotice's Array.isArray(files) check just
-      // above — openQuestions is optional, but if present it must actually
-      // be a string[], or PlanCard's `.map()` over it throws at render time
-      // (e.g. a persisted/hand-edited session whose payload sets it to a
-      // truthy non-array like a string).
-      (openQuestions === undefined || (Array.isArray(openQuestions) && openQuestions.every((q) => typeof q === 'string')))
-    ) {
-      return parsed as PlanNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a plan notice".
-  }
-  return null;
-}
-
+export const parsePlanNotice = planNoticeCodec.parse;
 /** Serializes a plan notice back into message content — used both when the
  * notice is first added and when Approve/Keep planning rewrite its status. */
-export function formatPlanNotice(notice: PlanNotice): string {
-  return `${PLAN_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatPlanNotice = planNoticeCodec.format;
 
 /**
  * Extracts a `present_plan` tool call's arguments into the fields a
@@ -327,34 +340,23 @@ export interface MemoryNotice {
   forgotten?: boolean;
 }
 
-export function isMemoryNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MEMORY_NOTE_PREFIX);
+function isMemoryPayload(value: unknown): value is MemoryNotice {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as MemoryNotice).id === 'string' &&
+    typeof (value as MemoryNotice).text === 'string'
+  );
 }
 
+const memoryNoticeCodec = makeNotice<MemoryNotice>(MEMORY_NOTE_PREFIX, isMemoryPayload);
+
+export const isMemoryNotice = memoryNoticeCodec.is;
 /** Parses a memory notice's JSON payload; `null` for anything malformed. */
-export function parseMemoryNotice(message: ChatMessage): MemoryNotice | null {
-  if (!isMemoryNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(MEMORY_NOTE_PREFIX.length));
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as MemoryNotice).id === 'string' &&
-      typeof (parsed as MemoryNotice).text === 'string'
-    ) {
-      return parsed as MemoryNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a memory notice".
-  }
-  return null;
-}
-
+export const parseMemoryNotice = memoryNoticeCodec.parse;
 /** Serializes a memory notice back into message content — used both when the
  * notice is first added and when the Forget button marks it forgotten. */
-export function formatMemoryNotice(notice: MemoryNotice): string {
-  return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatMemoryNotice = memoryNoticeCodec.format;
 
 /** Prefix identifying a synthetic notice inserted after a turn that mutated
  * files ran the workspace's configured verification commands (see
@@ -382,33 +384,22 @@ export interface VerifyNotice {
   durationMs: number;
 }
 
-export function isVerifyNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_NOTE_PREFIX);
+function isVerifyPayload(value: unknown): value is VerifyNotice {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as VerifyNotice).label === 'string' &&
+    typeof (value as VerifyNotice).ok === 'boolean'
+  );
 }
 
+const verifyNoticeCodec = makeNotice<VerifyNotice>(VERIFY_NOTE_PREFIX, isVerifyPayload);
+
+export const isVerifyNotice = verifyNoticeCodec.is;
 /** Parses a verify notice's JSON payload; `null` for anything malformed. */
-export function parseVerifyNotice(message: ChatMessage): VerifyNotice | null {
-  if (!isVerifyNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(VERIFY_NOTE_PREFIX.length));
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as VerifyNotice).label === 'string' &&
-      typeof (parsed as VerifyNotice).ok === 'boolean'
-    ) {
-      return parsed as VerifyNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a verify notice".
-  }
-  return null;
-}
-
+export const parseVerifyNotice = verifyNoticeCodec.parse;
 /** Serializes a verify notice back into message content. */
-export function formatVerifyNotice(notice: VerifyNotice): string {
-  return `${VERIFY_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatVerifyNotice = verifyNoticeCodec.format;
 
 /** Prefix identifying the plain-text "fix this" instruction appended to the
  * transcript when a verification failure triggers a feed-back round (see
@@ -524,19 +515,11 @@ export interface SourcesNotice {
   results: SourcesNoticeResult[];
 }
 
-export function isSourcesNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SOURCES_NOTE_PREFIX);
-}
-
-/** Parses a sources notice's JSON payload; `null` for anything malformed. */
-export function parseSourcesNotice(message: ChatMessage): SourcesNotice | null {
-  if (!isSourcesNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(SOURCES_NOTE_PREFIX.length));
-    const results = (parsed as SourcesNotice | null)?.results;
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
+function isSourcesPayload(value: unknown): value is SourcesNotice {
+  const results = (value as SourcesNotice | null)?.results;
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
       Array.isArray(results) &&
       results.every(
         (r): r is SourcesNoticeResult =>
@@ -545,21 +528,47 @@ export function parseSourcesNotice(message: ChatMessage): SourcesNotice | null {
           typeof (r as SourcesNoticeResult).path === 'string' &&
           typeof (r as SourcesNoticeResult).stack === 'string' &&
           typeof (r as SourcesNoticeResult).score === 'number' &&
-          typeof (r as SourcesNoticeResult).snippet === 'string'
-      )
-    ) {
-      return parsed as SourcesNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a sources notice".
-  }
-  return null;
+          typeof (r as SourcesNoticeResult).snippet === 'string',
+      ),
+  );
 }
 
+const sourcesNoticeCodec = makeNotice<SourcesNotice>(SOURCES_NOTE_PREFIX, isSourcesPayload);
+
+export const isSourcesNotice = sourcesNoticeCodec.is;
+/** Parses a sources notice's JSON payload; `null` for anything malformed. */
+export const parseSourcesNotice = sourcesNoticeCodec.parse;
 /** Serializes a sources notice back into message content. */
-export function formatSourcesNotice(notice: SourcesNotice): string {
-  return `${SOURCES_NOTE_PREFIX}${JSON.stringify(notice)}`;
+export const formatSourcesNotice = sourcesNoticeCodec.format;
+
+/** Prefix identifying a synthetic notice inserted at the start of a session
+ * created by `recipeRunner.ts`'s "Run now" (design doc:
+ * docs/roadmap/p3-scheduled-automation.md, slice 2) — the 6th notice type
+ * anticipated by ROADMAP.md §3.4, and the first to use `makeNotice` from
+ * day one rather than being a 6th hand-rolled copy. Marks the session as
+ * recipe-originated so `MessageList` can show which recipe (and, once
+ * slice 3 ships, whether it was a scheduled run) started it. */
+export const RECIPE_NOTE_PREFIX = '[Recipe]';
+
+/** Payload embedded in a recipe notice message. */
+export interface RecipeNotice {
+  name: string;
+  /** Absolute path the recipe was loaded from, if known — omitted for a
+   * recipe resolved only by name (the common case; see `recipesStore.ts`). */
+  path?: string;
 }
+
+function isRecipePayload(value: unknown): value is RecipeNotice {
+  return !!value && typeof value === 'object' && typeof (value as RecipeNotice).name === 'string';
+}
+
+const recipeNoticeCodec = makeNotice<RecipeNotice>(RECIPE_NOTE_PREFIX, isRecipePayload);
+
+export const isRecipeNotice = recipeNoticeCodec.is;
+/** Parses a recipe notice's JSON payload; `null` for anything malformed. */
+export const parseRecipeNotice = recipeNoticeCodec.parse;
+/** Serializes a recipe notice back into message content. */
+export const formatRecipeNotice = recipeNoticeCodec.format;
 
 /**
  * Re-exported for backward compatibility — `isToolCallAllowed` now lives in
@@ -799,6 +808,7 @@ export async function runVerificationPhase(
     // never leaves a stale "running" row behind.
     useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
     try {
+      useUsageHistoryStore.getState().recordVerifyRun();
       const invocation = invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
       const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
 
@@ -1145,11 +1155,13 @@ export async function runAgentTurn(
   }
   turnControllers.set(sessionId, controller);
   useSessionStore.getState().markTurnRunning(sessionId, true);
+  const startedAt = Date.now();
   try {
     await runTurnGuarded(sessionId, userText, attachments, controller.signal);
   } finally {
     turnControllers.delete(sessionId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
+    useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
   }
 }
 

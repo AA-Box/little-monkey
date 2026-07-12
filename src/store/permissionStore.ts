@@ -60,7 +60,10 @@ export type ActPermissionMode = "manual" | "acceptEdits" | "smart" | "auto";
 const PERMISSION_MODE_STORAGE_KEY = "little-monkey-permission-mode";
 const LAST_ACT_MODE_STORAGE_KEY = "little-monkey-last-act-mode";
 
-const VALID_PERMISSION_MODES: PermissionMode[] = ["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
+// Exported so `recipeRunner.ts` can validate a recipe's own `permission_mode`
+// field against the same source of truth, rather than a second hand-copied
+// list that could drift (mirrors `permissions.rs::VALID_MODES`'s reasoning).
+export const VALID_PERMISSION_MODES: PermissionMode[] = ["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
 const ACT_PERMISSION_MODES: ActPermissionMode[] = ["manual", "acceptEdits", "smart", "auto"];
 
 /**

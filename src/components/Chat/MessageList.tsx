@@ -12,6 +12,7 @@ import {
   FileText,
   Folder,
   Globe,
+  ListChecks,
   MessageSquareX,
   Plug,
   RefreshCw,
@@ -33,6 +34,7 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isPlanNotice,
+  isRecipeNotice,
   isSourcesNotice,
   isSwitchNotice,
   isVerifyFixNotice,
@@ -40,11 +42,13 @@ import {
   parseCheckpointNotice,
   parseMemoryNotice,
   parsePlanNotice,
+  parseRecipeNotice,
   parseSourcesNotice,
   parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
   type PlanNotice,
+  type RecipeNotice,
   type SourcesNotice,
   type VerifyNotice,
 } from "../../lib/agentLoop";
@@ -83,6 +87,7 @@ type TimelineItem =
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
   | { kind: "sources"; key: string; notice: SourcesNotice }
+  | { kind: "recipe"; key: string; notice: RecipeNotice }
   | { kind: "typing"; key: string };
 
 /**
@@ -203,6 +208,13 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         const notice = parseSourcesNotice(msg);
         if (notice) {
           items.push({ kind: "sources", key: `sources-${index}`, notice });
+        }
+        return;
+      }
+      if (isRecipeNotice(msg)) {
+        const notice = parseRecipeNotice(msg);
+        if (notice) {
+          items.push({ kind: "recipe", key: `recipe-${index}`, notice });
         }
         return;
       }
@@ -582,6 +594,22 @@ const MemoryRow = memo(function MemoryRow({
   );
 });
 
+/** Renders one `[Recipe]` notice — purely informational, no action to take
+ * (unlike `MemoryRow`'s Forget button): just marks that this session was
+ * started by `recipeRunner.ts`'s "Run now" (design doc slice 2), naming
+ * which recipe. */
+const RecipeRow = memo(function RecipeRow({ notice }: { notice: RecipeNotice }) {
+  const { t } = useT();
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] items-center gap-2 rounded-md bg-surface-2 px-3 py-1.5 text-center text-xs text-faint">
+        <ListChecks size={12} className="shrink-0" />
+        <span>{t("MessageList.recipeStarted", { name: notice.name })}</span>
+      </div>
+    </div>
+  );
+});
+
 /** Renders one `[Verify]` notice: the configured command's label, a
  * pass/fail `StatusPill`, its duration, and a collapsible output block —
  * reuses `ToolCallRow`'s collapse affordance rather than introducing a new
@@ -831,6 +859,9 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "sources") {
               return <SourcesRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "recipe") {
+              return <RecipeRow key={item.key} notice={item.notice} />;
             }
             return <TypingIndicator key={item.key} />;
           })}

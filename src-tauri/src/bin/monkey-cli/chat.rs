@@ -204,7 +204,11 @@ pub async fn stream_turn(
             // attached without widening the GUI-shared helper.
             let custom = crate::providers_cli::load_custom_providers();
             let base_url = little_monkey_lib::providers::resolve_base_url(provider_id, &custom)?;
-            let api_key = little_monkey_lib::providers::read_key(provider_id)?;
+            // `_with_env` so `monkey-cli task run` works in CI, where
+            // there's no OS keychain — see `providers::read_key_with_env`'s
+            // doc comment. Behavior is unchanged when neither env var is
+            // set: falls straight through to the same keychain read.
+            let api_key = little_monkey_lib::providers::read_key_with_env(provider_id)?;
             let mut body = serde_json::json!({
                 "messages": messages,
                 "tools": tools,
@@ -426,7 +430,7 @@ async fn stream_turn_native(
 /// optional `<tool_call>`/`</tool_call>` wrappers — into tool calls, for
 /// when Ollama's own parser misses it and the block leaks into `content`.
 /// Returns `None` (parse nothing, print verbatim) unless the entire text is
-/// such a block; parameter values stay strings (all of lm-cli's own tools
+/// such a block; parameter values stay strings (all of monkey-cli's own tools
 /// take strings).
 fn parse_leaked_tool_calls(content: &str) -> Option<Vec<ollama_api::NativeToolCall>> {
     let text = content.trim();
@@ -589,7 +593,7 @@ mod tests {
         let schema = parse_format_flag(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#).unwrap();
         assert_eq!(schema["type"], "object");
 
-        let dir = std::env::temp_dir().join("lm_cli_chat_test_format");
+        let dir = std::env::temp_dir().join("monkey_cli_chat_test_format");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("schema.json");
         std::fs::write(&file, r#"{"type":"object"}"#).unwrap();
@@ -617,7 +621,7 @@ mod tests {
 
     #[test]
     fn extract_image_paths_finds_existing_images_only() {
-        let dir = std::env::temp_dir().join("lm_cli_chat_test_images");
+        let dir = std::env::temp_dir().join("monkey_cli_chat_test_images");
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("cat.png");
         std::fs::write(&img, [0x89u8, b'P', b'N', b'G']).unwrap();

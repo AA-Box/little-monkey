@@ -17,6 +17,7 @@ import { detectOsLabel, buildSubagentSystemPrompt, type PromptWorkspaceRoot } fr
 import { toolsForProfile } from './tools';
 import {
   attemptStream,
+  describeUsageTarget,
   executeToolCall,
   isToolCallAllowed,
   CANCELLED_TOOL_RESULT,
@@ -30,6 +31,7 @@ import { useWorkspaceStore } from '../store/workspaceStore';
 import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
+import { useUsageHistoryStore } from '../store/usageHistoryStore';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -235,6 +237,7 @@ export interface RunSubagentTaskParams {
  * the invariant is owned here first).
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
+  useUsageHistoryStore.getState().recordSubagentTaskStarted();
   const { sessionId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort, risk, onMutatedPath } =
     params;
 
@@ -295,6 +298,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
 
       if (attempt.usage) {
         useSubagentStore.getState().accumulateUsage(storeKey, attempt.usage);
+        useUsageHistoryStore.getState().recordUsage(describeUsageTarget(resolvedTarget), attempt.usage);
       }
 
       if (attempt.streamError !== null) {

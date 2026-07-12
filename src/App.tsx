@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PanelRight, PanelRightClose, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow } from "./components/Chat";
@@ -14,7 +15,18 @@ import { useWorkspaceStore } from "./store/workspaceStore";
 import { useModelStore } from "./store/modelStore";
 import { useMcpStore } from "./store/mcpStore";
 import { useArtifactStore } from "./store/artifactStore";
+import { usePermissionStore } from "./store/permissionStore";
+import { useShortcutStore } from "./store/shortcutStore";
+import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
+import { hydrateAutomations } from "./store/automationsStore";
+import { startScheduler } from "./lib/scheduler";
 import { useT } from "./lib/i18n";
+import {
+  shortcutIdForEvent,
+  shouldHandleGlobalShortcut,
+  usesMacShortcuts,
+  type ShortcutIdForScope,
+} from "./lib/shortcuts";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
  * (captured the moment it was opened) so edits made by the agent afterwards
@@ -38,6 +50,7 @@ function formatError(err: unknown): string {
 function App() {
   const { t } = useT();
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const newSession = useSessionStore((s) => s.newSession);
   const splitSessionId = useSessionStore((s) => s.splitSessionId);
   const splitTitle = useSessionStore((s) =>
     s.splitSessionId === null ? null : s.sessions.find((x) => x.id === s.splitSessionId)?.title ?? null
@@ -49,9 +62,11 @@ function App() {
   const refreshModels = useModelStore((s) => s.refresh);
   const refreshOllama = useModelStore((s) => s.refreshOllama);
   const refreshProviders = useModelStore((s) => s.refreshProviders);
+  const refreshRecipes = useRecipeStore((s) => s.refresh);
   const refreshMcp = useMcpStore((s) => s.refresh);
   const connectMcp = useMcpStore((s) => s.connect);
   const activeArtifact = useArtifactStore((s) => s.active);
+  const permissionPending = usePermissionStore((s) => s.pending !== null);
 
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
@@ -66,11 +81,57 @@ function App() {
   // one-off deep link doesn't stick around and hijack every later normal
   // open too.
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>(undefined);
+  // A sequence number makes repeated requests for the same tab observable
+  // even while Settings is already open and the user has navigated away.
+  const [settingsTabRequest, setSettingsTabRequest] = useState(0);
 
-  const handleManagePrompts = useCallback(() => {
-    setSettingsInitialTab("prompts");
+  const openSettingsTab = useCallback((tab: SettingsTab) => {
+    setSettingsInitialTab(tab);
+    setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
   }, []);
+
+  const handleManagePrompts = useCallback(() => {
+    openSettingsTab("prompts");
+  }, [openSettingsTab]);
+
+  // App-wide accelerators. The same definitions are rendered by the
+  // Keyboard Shortcuts Settings panel, so a displayed binding always has a
+  // live handler behind it on both macOS (Command) and Windows/Linux (Ctrl).
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      // Read at event time rather than closing over a render-time snapshot:
+      // edits made in Settings take effect on the very next keydown. Recording
+      // must suspend dispatch because this capture listener runs before the
+      // recorder's target-level key handler can cancel an existing shortcut.
+      const { overrides, recordingId } = useShortcutStore.getState();
+      if (!shouldHandleGlobalShortcut(event, permissionPending, recordingId !== null)) return;
+      const shortcut = shortcutIdForEvent(event, "global", usesMacShortcuts(), overrides);
+      if (!shortcut) return;
+
+      const actions: Record<ShortcutIdForScope<"global">, () => void> = {
+        newSession: () => {
+          setSettingsOpen(false);
+          setSettingsInitialTab(undefined);
+          newSession();
+        },
+        openSettings: () => {
+          setSettingsInitialTab(undefined);
+          setSettingsOpen(true);
+        },
+        openShortcuts: () => openSettingsTab("shortcuts"),
+        toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
+      };
+
+      event.preventDefault();
+      actions[shortcut]();
+    }
+
+    // Capture keeps native-style app commands available even inside inputs
+    // that stop bubbling for their own local Enter/Escape handling.
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [newSession, openSettingsTab, permissionPending]);
 
   useEffect(() => {
     void refreshRoots();
@@ -79,6 +140,27 @@ function App() {
     void refreshOllama();
     void refreshProviders();
   }, [refreshRoots, refreshRecent, refreshModels, refreshOllama, refreshProviders]);
+
+  useEffect(() => {
+    void refreshRecipes();
+    void subscribeToRecipeChanges();
+  }, [refreshRecipes]);
+
+  // The scheduler tick loop (design doc slice 3) must run in exactly one
+  // place — every window shares the same `automations.json`/recipes, so
+  // running it in a secondary session window too (see
+  // `system::open_session_window`) would fire each due entry twice. Tauri
+  // defaults the first window's label to "main" (see tauri.conf.json's
+  // unlabeled window entry); secondary windows are labeled `session-<id>`.
+  // `getCurrentWindow()` throws outside the Tauri shell (plain-browser dev
+  // has no `window.__TAURI_INTERNALS__`) — guarded the same way every other
+  // store's boot hydration already guards its own Tauri-only calls.
+  useEffect(() => {
+    void hydrateAutomations();
+    if (isTauri() && getCurrentWindow().label === "main") {
+      startScheduler();
+    }
+  }, []);
 
   // Eager connect-on-startup for MCP servers: load the configured list, then
   // kick off `mcp_connect` for every enabled-but-not-yet-connected one so
@@ -249,6 +331,7 @@ function App() {
           setSettingsInitialTab(undefined);
         }}
         initialTab={settingsInitialTab}
+        initialTabRequest={settingsTabRequest}
       />
     </div>
   );

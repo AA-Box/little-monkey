@@ -22,18 +22,12 @@ use little_monkey_lib::AppState;
 
 use crate::permission::TerminalPermissions;
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
-/// hardcoded-identifier app-data resolution as `providers_cli.rs`/
-/// `checkpoints_cli.rs` (duplicated per module rather than shared, following
-/// their precedent).
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 /// Default per-call timeout when a server entry doesn't override it via
 /// `timeout_secs` — matches `mcp.rs::DEFAULT_TIMEOUT_SECS`.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 fn config_path() -> Option<std::path::PathBuf> {
-    Some(dirs::data_dir()?.join(APP_IDENTIFIER).join("mcp_servers.json"))
+    Some(little_monkey_lib::app_paths::data_dir()?.join("mcp_servers.json"))
 }
 
 /// Core logic behind [`load_enabled_servers`], parameterized by path for
@@ -226,7 +220,7 @@ mod tests {
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "lm_cli_mcp_cli_test_{}_{}_{}",
+            "monkey_cli_mcp_cli_test_{}_{}_{}",
             std::process::id(),
             name,
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
