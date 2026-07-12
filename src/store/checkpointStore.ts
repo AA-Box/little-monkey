@@ -72,4 +72,17 @@ export const useCheckpointStore = create<CheckpointStoreState>((set) => ({
   },
 }));
 
+/** Stable empty list so `selectSessionCheckpoints` never returns a fresh
+ * `[]` from getSnapshot — React's useSyncExternalStore re-renders forever
+ * (then trips "Maximum update depth exceeded") when the snapshot reference
+ * changes on every call. Mirrors `sessionStore`'s `EMPTY_MESSAGES`. */
+const EMPTY_CHECKPOINTS: CheckpointInfo[] = [];
+
+/** Zustand selector factory (same shape as `selectSessionMessages`):
+ * `useCheckpointStore(selectSessionCheckpoints(sessionId))`. */
+export function selectSessionCheckpoints(sessionId: string) {
+  return (state: CheckpointStoreState): CheckpointInfo[] =>
+    state.bySession[sessionId] ?? EMPTY_CHECKPOINTS;
+}
+
 export default useCheckpointStore;
