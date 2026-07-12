@@ -19,6 +19,8 @@ export interface ModelInfo {
   path: string | null;
   /** True for a model registered via `models_add_external` (a `.gguf` file outside the app's models dir) — the app never owns or deletes that file. */
   is_external: boolean;
+  /** "chat" (tool-calling instruct model) or "embedding" — see `models.rs::ModelKind`. Defaults to "chat" on the Rust side for pre-existing entries, so this is always present in practice. */
+  kind: "chat" | "embedding";
 }
 
 export type LlamaStatus = "stopped" | "starting" | "ready" | "error";

@@ -25,6 +25,7 @@ function makeModel(overrides: Partial<ModelInfo> = {}): ModelInfo {
     installed: true,
     path: "/models/qwen2.5-7b-instruct.gguf",
     is_external: false,
+    kind: "chat",
     ...overrides,
   };
 }
