@@ -210,6 +210,8 @@ export function AutomationPanel() {
   const setArtifactAutoPreview = useSettingsStore((s) => s.setArtifactAutoPreview);
   const riskAnnotationsEnabled = useSettingsStore((s) => s.riskAnnotationsEnabled);
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
+  const subagentsEnabled = useSettingsStore((s) => s.subagentsEnabled);
+  const setSubagentsEnabled = useSettingsStore((s) => s.setSubagentsEnabled);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
@@ -374,6 +376,18 @@ export function AutomationPanel() {
             onChange={setArtifactAutoPreview}
             label={t("AutomationPanel.artifactAutoPreviewLabel")}
             description={t("AutomationPanel.artifactAutoPreviewDescription")}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.subagentsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={subagentsEnabled}
+            onChange={setSubagentsEnabled}
+            label={t("AutomationPanel.subagentsEnabledLabel")}
+            description={t("AutomationPanel.subagentsEnabledDescription")}
           />
         </div>
       </section>

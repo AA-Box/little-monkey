@@ -322,6 +322,76 @@ export function buildTools(attachedStackNames: string[]): ToolDef[] {
  * scanning tools.rs for `present_plan` and finding nothing should look here,
  * not assume a missing Rust command.
  */
+/**
+ * Tool names offered to a subagent's own tool-calling loop, keyed by
+ * `profile` — see `subagent.ts`'s `runSubagentTask` and the "Restricted tool
+ * sets" section of `docs/roadmap/p3-subagents.md`. `explore` is every
+ * ungated read-only tool (a subagent that can only read needs no new trust
+ * beyond what the parent already has); `code` (slice 3) adds the mutating
+ * tools, which still go through the exact same Rust commands and permission
+ * gate as the parent's own calls.
+ *
+ * CRITICAL: `'task'` must never appear in either list — this is what caps
+ * delegation depth at 1 structurally (a subagent can never spawn another
+ * subagent) rather than via a runtime recursion guard. `TASK_TOOL` is kept
+ * as its own constant below, deliberately never added to `TOOLS`, so there
+ * is no name in `TOOLS` for these filters to ever accidentally let through.
+ * See `tools.test.ts` for the test proving this by construction.
+ */
+const EXPLORE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set(['read_file', 'list_dir', 'glob', 'grep']);
+const CODE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set([...EXPLORE_PROFILE_TOOL_NAMES, 'write_file', 'edit_file', 'run_shell']);
+
+export function toolsForProfile(profile: 'explore' | 'code'): ToolDef[] {
+  const names = profile === 'code' ? CODE_PROFILE_TOOL_NAMES : EXPLORE_PROFILE_TOOL_NAMES;
+  return TOOLS.filter((tool) => names.has(tool.function.name));
+}
+
+/**
+ * The `task` tool: delegates a scoped subtask to a subagent that runs its
+ * own isolated tool-calling loop (see `subagent.ts`'s `runSubagentTask`) and
+ * returns only a final report to the parent turn — the child's own
+ * exploration noise never touches the parent's context. Deliberately kept
+ * OUT of the `TOOLS` array above (see `toolsForProfile`'s doc comment for
+ * why) and only appended to the per-turn tool list by `agentLoop.ts`'s
+ * `toolsForSettings` when `settingsStore.subagentsEnabled` is on — a weak
+ * local model that never had this toggle turned on should never even see
+ * the schema.
+ *
+ * `profile` only allows `'explore'` in this slice — `'code'` (subagents that
+ * can write/edit/run shell, landing writes in the parent's checkpoint) is
+ * slice 3. `executeToolCall` (`turnEngine.ts`) intercepts this name before
+ * the `invoke('tool_'+name)` dispatch, exactly like `present_plan` — it has
+ * no `tool_task` Rust command either.
+ */
+export const TASK_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'task',
+    description:
+      'Delegate a scoped subtask to a subagent with its own isolated tool-calling loop and restricted tool set. The subagent cannot see this conversation, so give it a fully self-contained prompt. Only its final report is returned to you — use this for broad exploration or an independent subtask you want kept out of your own context.',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: {
+          type: 'string',
+          description: 'A short (3-6 word) label for this subtask, shown to the user.',
+        },
+        prompt: {
+          type: 'string',
+          description: "Full, self-contained instructions for the subagent — it has no access to this conversation, so include all necessary context (file paths, what to look for, what to report back).",
+        },
+        profile: {
+          type: 'string',
+          enum: ['explore'],
+          description: "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation.",
+        },
+      },
+      required: ['description', 'prompt', 'profile'],
+      additionalProperties: false,
+    },
+  },
+};
+
 export const PRESENT_PLAN_TOOL: ToolDef = {
   type: 'function',
   function: {

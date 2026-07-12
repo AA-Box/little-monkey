@@ -1,12 +1,34 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 
-import { executeToolCall, PRESENT_PLAN_RESULT, type RiskAnnotationContext } from "./turnEngine";
+// `executeToolCall`'s `task` branch delegates to `subagent.ts`'s
+// `runSubagentTask` — mocked out entirely here so these tests can pin the
+// DELEGATION contract (which params get threaded through, error handling)
+// without also having to drive a real child model-streaming loop; the child
+// loop itself is covered by `subagent.test.ts`.
+const runSubagentTaskMock = vi.fn();
+vi.mock("./subagent", () => ({ runSubagentTask: (...args: unknown[]) => runSubagentTaskMock(...args) }));
+
+// `attemptStream`'s `recordUsage` tests below need a controllable stream —
+// mocked here rather than hitting a real provider.
+const streamProviderChatMock = vi.fn();
+vi.mock("./providerClient", () => ({ streamProviderChat: (...args: unknown[]) => streamProviderChatMock(...args) }));
+
+import {
+  attemptStream,
+  executeToolCall,
+  PRESENT_PLAN_RESULT,
+  stringifyToolError,
+  type ResolvedTarget,
+  type RiskAnnotationContext,
+  type SubagentContext,
+} from "./turnEngine";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
-import type { ToolCall } from "./llamaClient";
+import type { StreamEvent, ToolCall } from "./llamaClient";
+import { useUsageStore } from "../store/usageStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -224,5 +246,156 @@ describe("executeToolCall / risk_level and risk_reason scrubbing", () => {
     const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
     expect(sentArgs.risk_level).toBeUndefined();
     expect(sentArgs.risk_reason).toBeUndefined();
+  });
+});
+
+// `task` is another frontend-only tool, same treatment as `present_plan`
+// above — it has no `tool_task` Rust command, so `invoke` must never be
+// called for it either. These tests also pin the delegation contract that
+// makes subagents safe: the PARENT's checkpoint id passed straight through,
+// but a brand-new (never the parent's) turn id for the child, and the
+// transcript-validity invariant (a `task` call always gets SOME string
+// result, even when `runSubagentTask` itself throws).
+describe("executeToolCall / task delegation", () => {
+  const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    runSubagentTaskMock.mockReset();
+  });
+
+  it("never reaches invoke for a task tool call", async () => {
+    runSubagentTaskMock.mockResolvedValue("a report");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+    const result = await executeToolCall(
+      call("task", { description: "find X", prompt: "find every caller of X", profile: "explore" }),
+      "checkpoint-1",
+      "parent-turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(result).toBe("a report");
+  });
+
+  it("returns a tool-error result without calling runSubagentTask when no subagent context is configured", async () => {
+    const result = await executeToolCall(call("task", { description: "d", prompt: "p", profile: "explore" }), null, "turn-1", emptyMcpRegistry);
+
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toHaveProperty("error");
+  });
+
+  it("passes the PARENT's checkpoint id through unchanged, but a brand-new turn id for the child (never the parent's)", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget, effort: "high" };
+
+    await executeToolCall(
+      call("task", { description: "find X", prompt: "find every caller of X", profile: "explore" }),
+      "parent-checkpoint-123",
+      "parent-turn-abc",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    expect(runSubagentTaskMock).toHaveBeenCalledTimes(1);
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.parentCheckpointId).toBe("parent-checkpoint-123");
+    expect(params.taskId).not.toBe("parent-turn-abc");
+    expect(typeof params.taskId).toBe("string");
+    expect(params.taskId.length).toBeGreaterThan(0);
+    expect(params.sessionId).toBe("session-1");
+    expect(params.target).toBe(fakeTarget);
+    expect(params.effort).toBe("high");
+    expect(params.description).toBe("find X");
+    expect(params.prompt).toBe("find every caller of X");
+    expect(params.profile).toBe("explore");
+  });
+
+  it("gives each task call its own distinct turn id, even across two calls in the same tool round trip", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    await executeToolCall(call("task", { description: "a", prompt: "p", profile: "explore" }), null, "parent-turn", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+    await executeToolCall(call("task", { description: "b", prompt: "p", profile: "explore" }), null, "parent-turn", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    const firstTaskId = runSubagentTaskMock.mock.calls[0][0].taskId;
+    const secondTaskId = runSubagentTaskMock.mock.calls[1][0].taskId;
+    expect(firstTaskId).not.toBe(secondTaskId);
+  });
+
+  it("defaults a missing/invalid profile to 'explore' rather than passing the model's raw value through", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    await executeToolCall(call("task", { description: "d", prompt: "p" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    expect(runSubagentTaskMock.mock.calls[0][0].profile).toBe("explore");
+  });
+
+  // The transcript-validity invariant this whole feature depends on: a
+  // `task` call must ALWAYS get a tool result, even when the child loop
+  // blows up unexpectedly — `executeToolCall`'s own try/catch around the
+  // `task` branch must swallow it, not let it propagate to the caller
+  // (`runAgentTurnBody`'s tool-calling loop), which would otherwise crash
+  // the whole turn on an exception from deep inside a subagent.
+  it("never propagates an exception thrown by runSubagentTask — returns a stringifyToolError-shaped result instead", async () => {
+    runSubagentTaskMock.mockRejectedValue(new Error("child loop exploded"));
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    const result = await executeToolCall(
+      call("task", { description: "d", prompt: "p", profile: "explore" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    expect(result).toBe(stringifyToolError(new Error("child loop exploded")));
+  });
+});
+
+// `recordUsage` (attemptStream's newest parameter) is what stops a
+// subagent's own model calls from clobbering the PARENT session's
+// context-usage ring in `useUsageStore` — see `subagent.ts`'s
+// `runSubagentTask`, the one caller that passes `false`. These tests pin the
+// parameter's behavior directly against a controllable fake stream.
+describe("attemptStream / recordUsage", () => {
+  const fakeTarget: ResolvedTarget = { kind: "provider", providerId: "openai", model: "gpt-test" };
+
+  async function* fakeUsageStream(): AsyncGenerator<StreamEvent> {
+    yield { type: "usage", usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
+    yield { type: "done" };
+  }
+
+  beforeEach(() => {
+    streamProviderChatMock.mockReset();
+    streamProviderChatMock.mockImplementation(() => fakeUsageStream());
+    useUsageStore.setState({ usageBySession: {}, contextLimit: null });
+  });
+
+  it("records usage into useUsageStore by default (recordUsage defaults to true — every pre-existing caller is unaffected)", async () => {
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1");
+
+    expect(useUsageStore.getState().usageBySession["session-1"]).toEqual({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+    });
+  });
+
+  it("does not record usage into useUsageStore when recordUsage is false — a subagent child call must never clobber the parent session's usage ring", async () => {
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1", undefined, false);
+
+    expect(useUsageStore.getState().usageBySession["session-1"]).toBeUndefined();
   });
 });

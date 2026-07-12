@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 
 import {
   attachedStackPromptInfo,
@@ -310,6 +310,21 @@ describe("toolsForSettings", () => {
   it("applies the memoryEnabled and webToolsEnabled filters independently", () => {
     const all = [toolDef("remember"), toolDef("web_fetch"), toolDef("web_search"), toolDef("write_file")];
     expect(toolsForSettings(all, false, false).map((t) => t.function.name)).toEqual(["write_file"]);
+  });
+
+  it("does not append the task tool when subagentsEnabled is false (or omitted) — a weak local model should never even see the schema", () => {
+    expect(toolsForSettings(tools, true, true).some((t) => t.function.name === "task")).toBe(false);
+    expect(toolsForSettings(tools, true, true, false).some((t) => t.function.name === "task")).toBe(false);
+  });
+
+  it("appends the task tool when subagentsEnabled is true, after every other filtering", () => {
+    const result = toolsForSettings(tools, true, true, true);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task"]);
+  });
+
+  it("still appends task even when memoryEnabled/webToolsEnabled filtered other tools out", () => {
+    const result = toolsForSettings(tools, false, true, true);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "run_shell", "task"]);
   });
 });
 

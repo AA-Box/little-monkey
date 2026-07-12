@@ -19,6 +19,7 @@ import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, ty
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
+import { runSubagentTask } from './subagent';
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -154,6 +155,29 @@ export interface RiskAnnotationContext {
 }
 
 /**
+ * Everything `executeToolCall` needs to delegate a `task` tool call to
+ * `subagent.ts`'s `runSubagentTask` — built once per turn by
+ * `agentLoop.ts`'s `runAgentTurnBody` (mirrors `RiskAnnotationContext`'s
+ * "built once, passed down unchanged" shape) and passed through every
+ * `executeToolCall` call this turn, exactly like `risk`/`attachedStackNames`.
+ * Omitted entirely by callers that never offer the `task` tool (e.g. today's
+ * only other caller besides the main loop, if any existed) — a `task` call
+ * reaching `executeToolCall` with no context configured is defensively
+ * reported as a tool error rather than throwing.
+ */
+export interface SubagentContext {
+  /** Threaded through to `runSubagentTask` for `useUsageStore` keying — see
+   * that function's own doc comment for why child usage is never actually
+   * recorded under it (the whole point of `recordUsage: false`). */
+  sessionId: string;
+  /** THIS turn's already-resolved active target (see `ResolvedTarget`) —
+   * passed down rather than re-resolved, so a mid-turn manual model switch
+   * can never split the parent and child across different targets. */
+  target: ResolvedTarget;
+  effort?: string;
+}
+
+/**
  * Executes a single model-requested tool call via the corresponding
  * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
  * `invokeMcpTool` above) and returns the string to use as the content of the
@@ -174,7 +198,8 @@ export async function executeToolCall(
   mcpRegistry: McpToolRegistry,
   signal?: AbortSignal,
   risk?: RiskAnnotationContext,
-  attachedStackNames?: string[]
+  attachedStackNames?: string[],
+  subagent?: SubagentContext
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
 
@@ -279,6 +304,62 @@ export async function executeToolCall(
     return PRESENT_PLAN_RESULT;
   }
 
+  // `task` is another frontend-only tool, same treatment as `present_plan`
+  // just above: it has no `tool_task` Rust command, so it's intercepted
+  // here, before the `invoke`/`mcp__` dispatch below, and delegated to
+  // `runSubagentTask` instead. This is the depth-cap-of-1 enforcement point
+  // in practice (not just by the schema omission in `toolsForProfile`): even
+  // if a future change somehow offered `task` to a subagent's own child
+  // loop, `runSubagentTask` builds the child's tool list via
+  // `toolsForProfile`, which never includes `task` — so there is no tool
+  // name here for a grandchild call to even be named after.
+  //
+  // The whole branch is wrapped in try/catch (rather than trusting
+  // `runSubagentTask`'s own internal one) so that ANY exception here —
+  // including a bug in argument parsing below, not just inside the child's
+  // own loop — can never propagate out of `executeToolCall` and leave this
+  // call's `tool_calls` entry without a matching `tool` result (the
+  // transcript-validity invariant every other branch in this function
+  // upholds the same way).
+  if (name === 'task') {
+    try {
+      if (!subagent) {
+        return stringifyToolError(new Error('The task tool has no subagent execution context configured for this turn.'));
+      }
+      const description = typeof args.description === 'string' ? args.description : 'Subagent task';
+      const taskPrompt = typeof args.prompt === 'string' ? args.prompt : '';
+      // Only 'explore' is offered by `TASK_TOOL`'s schema this slice (see
+      // `tools.ts`'s doc comment) — defensively re-validated here anyway,
+      // rather than trusting the model's own JSON, exactly like every other
+      // frontend-injected/validated field in this function.
+      const profile: 'explore' | 'code' = args.profile === 'code' ? 'code' : 'explore';
+      // The child's own turn id — NOT `turnId` (the parent's) — so its
+      // tool calls get their own entry in the Rust per-turn `tool_cancel`/
+      // permission maps (AppState, lib.rs), scoping Stop-button cancellation
+      // and permission prompts to just this subagent run rather than
+      // colliding with the parent turn's own. `checkpointId` (the parent's)
+      // is passed through UNCHANGED below, so any file the child mutates
+      // still lands in the parent turn's checkpoint manifest and is
+      // revertable via the existing CheckpointRow — see `runSubagentTask`'s
+      // doc comment for why this exact pairing (parent checkpoint id + own
+      // turn id) is the crux of what makes subagents safe.
+      const childTurnId = crypto.randomUUID();
+      return await runSubagentTask({
+        sessionId: subagent.sessionId,
+        parentCheckpointId: checkpointId,
+        parentSignal: signal,
+        taskId: childTurnId,
+        description,
+        prompt: taskPrompt,
+        profile,
+        target: subagent.target,
+        effort: subagent.effort,
+      });
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+  }
+
   const invocation = name.startsWith('mcp__')
     ? invokeMcpTool(name, args, turnId, mcpRegistry)
     : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
@@ -321,7 +402,18 @@ export async function attemptStream(
   signal: AbortSignal | undefined,
   effort: string | undefined,
   sessionId: string,
-  onDelta?: (content: string) => void
+  onDelta?: (content: string) => void,
+  // Whether a `usage` stream event gets written into `useUsageStore` under
+  // `sessionId` — true for every pre-existing caller (the main turn loop,
+  // context-trim summarization, the risk judge), so this parameter is
+  // additive and none of them had to change. `subagent.ts`'s
+  // `runSubagentTask` is the one caller that passes `false`: a child
+  // attempt's token usage is real (rateLimitTracker still records it via
+  // `recordRequest` below, unconditionally, since it IS a real provider
+  // request) but must never clobber the PARENT session's own context-usage
+  // ring — see the design doc's "usage clobbering" risk and
+  // `subagent.test.ts` for the test pinning this.
+  recordUsage: boolean = true
 ): Promise<AttemptResult> {
   if (target.kind === 'provider') recordRequest(target.providerId);
 
@@ -345,11 +437,13 @@ export async function attemptStream(
         contentStarted = true;
         toolCalls.push(event.toolCall);
       } else if (event.type === 'usage') {
-        useUsageStore.getState().setUsage(sessionId, {
-          promptTokens: event.usage.prompt_tokens,
-          completionTokens: event.usage.completion_tokens,
-          totalTokens: event.usage.total_tokens,
-        });
+        if (recordUsage) {
+          useUsageStore.getState().setUsage(sessionId, {
+            promptTokens: event.usage.prompt_tokens,
+            completionTokens: event.usage.completion_tokens,
+            totalTokens: event.usage.total_tokens,
+          });
+        }
       }
       // 'done' carries no data; the generator simply returns after it.
     }

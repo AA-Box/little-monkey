@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { PRESENT_PLAN_TOOL, buildTools } from './tools';
+import { PRESENT_PLAN_TOOL, TASK_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -39,6 +39,7 @@ import {
   stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
+  type SubagentContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
@@ -432,20 +433,33 @@ const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
 /**
  * Filters `remember` out of the tool list offered to the model this turn
  * when the settingsStore `memoryEnabled` toggle is off, and/or `web_fetch`
- * and `web_search` out when `webToolsEnabled` is off. This is the ONLY
- * effect of either toggle — rules and previously-saved facts are still
+ * and `web_search` out when `webToolsEnabled` is off, then APPENDS
+ * `TASK_TOOL` when `subagentsEnabled` is on. This is the ONLY effect of any
+ * of the three toggles — rules and previously-saved facts are still
  * injected into the system prompt unconditionally (see `runAgentTurnBody`'s
  * `useRulesStore.getState().refresh()` call); turning `memoryEnabled` off
  * stops the agent from saving *new* facts on its own, it is not amnesia.
  * Likewise, `webToolsEnabled` off just makes the two web tools invisible to
  * the model — it doesn't touch anything else.
+ *
+ * `subagentsEnabled` is deliberately handled in THIS function — the single
+ * existing per-turn tool-list composer both Plan/Act (`toolsForMode`'s
+ * `present_plan` append) and RAG (`buildTools`'s conditional `search_docs`
+ * append) already extended — rather than a new parallel "toolsForSubagents"
+ * filter: one composition chain
+ * (`toolsForSettings(toolsForMode([...buildTools(...), ...mcpDefs], mode), ...)`,
+ * see `runAgentTurnBody`) stays the one place to audit everything the model
+ * is offered. Default `false` mirrors every other call site that doesn't
+ * pass it, so `task` is never accidentally offered by an existing caller
+ * that hasn't been updated for it.
  */
-export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true): ToolDef[] {
-  return tools.filter((tool) => {
+export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true, subagentsEnabled = false): ToolDef[] {
+  const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
+  return subagentsEnabled ? [...filtered, TASK_TOOL] : filtered;
 }
 
 /** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
@@ -1355,7 +1369,8 @@ async function runAgentTurnBody(
   const toolsForTurn: ToolDef[] = toolsForSettings(
     toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
-    settings.webToolsEnabled
+    settings.webToolsEnabled,
+    settings.subagentsEnabled
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -1563,9 +1578,16 @@ async function runAgentTurnBody(
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
+      // Built fresh on every call (not hoisted once before the loop) so a
+      // `task` call always sees the CURRENT `target` — a failover switch
+      // earlier in this same iteration (or, in principle, an auto-vision
+      // switch on the next one) must never leave a subagent resolving a
+      // target the parent has since moved off of. See `SubagentContext`'s
+      // doc comment in `turnEngine.ts`.
+      const subagentContext: SubagentContext = { sessionId, target, effort };
       const resultContent = signal?.aborted
         ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames);
+        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames, subagentContext);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
