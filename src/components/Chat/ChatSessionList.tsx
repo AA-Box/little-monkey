@@ -30,8 +30,12 @@ export default function ChatSessionList() {
 
   const byUpdatedDesc = (a: ChatSession, b: ChatSession) => b.updatedAt - a.updatedAt;
 
-  const active = sessions.filter((s) => !s.archived);
-  const archivedSessions = sessions.filter((s) => s.archived).sort(byUpdatedDesc);
+  // Unstarted sessions (no messages yet — see `newSession`'s reset-in-place
+  // logic) stay out of the sidebar entirely, same as Claude Desktop: a "New
+  // session" only earns a row once the user actually sends something.
+  const started = sessions.filter((s) => s.messages.length > 0);
+  const active = started.filter((s) => !s.archived);
+  const archivedSessions = started.filter((s) => s.archived).sort(byUpdatedDesc);
   const pinned = active.filter((s) => s.pinned).sort(byUpdatedDesc);
   const groupedSections = groups
     .map((group) => ({
