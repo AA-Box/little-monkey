@@ -802,7 +802,7 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
     <div
       ref={containerRef}
       onScroll={handleScroll}
-      className="min-h-0 flex-1 overflow-y-auto bg-background px-4 py-6"
+      className="min-h-0 flex-1 overflow-y-auto bg-background px-4 py-6 [overscroll-behavior:contain]"
     >
       {items.length === 0 ? (
         <EmptyState />

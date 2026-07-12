@@ -248,7 +248,7 @@ function App() {
           above the chat input (see ChatWindow). */}
       <aside className="flex w-72 shrink-0 flex-col border-r border-border bg-surface">
         <div data-tauri-drag-region className="h-11 shrink-0" />
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="min-h-0 flex-1 overflow-y-auto [overscroll-behavior:contain]">
           <ChatSessionList />
         </div>
         <AppMenu onOpenSettings={() => setSettingsOpen(true)} />
@@ -331,7 +331,7 @@ function App() {
                 </Button>
               </div>
               {diffError && <p className="px-3 pt-1.5 text-xs text-danger">{diffError}</p>}
-              <div className="min-h-0 flex-1 overflow-auto p-2">
+              <div className="min-h-0 flex-1 overflow-auto p-2 [overscroll-behavior:contain]">
                 {selectedFile ? (
                   <DiffViewer
                     fileName={selectedFile.path}
