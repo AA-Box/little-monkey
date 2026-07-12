@@ -324,3 +324,48 @@ describe("settingsStore.artifactAutoPreview", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+describe("settingsStore.subagentsEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ subagentsEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as verifyEnabled's
+    // own default test above — `beforeEach` forces `false` regardless, so
+    // only a fresh module import actually covers `defaults()`. Defaults OFF,
+    // same posture as `verifyEnabled`: a weak local model may misuse or loop
+    // on the `task` tool, so delegation should be opt-in.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setSubagentsEnabled(true);
+    expect(useSettingsStore.getState().subagentsEnabled).toBe(true);
+    useSettingsStore.getState().setSubagentsEnabled(false);
+    expect(useSettingsStore.getState().subagentsEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSubagentsEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ subagentsEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});

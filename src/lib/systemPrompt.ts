@@ -173,7 +173,14 @@ export function buildSystemPrompt(
   // `runAgentTurnBody` never actually retrieves anything in that case either
   // (see its `attachedStackIds.length > 0` gate), so the two stay in sync.
   // Defaults to `false` so every pre-existing call site/test is unaffected.
-  docChatMode: boolean = false
+  docChatMode: boolean = false,
+  // Whether the `task` tool is being offered this turn — wired by
+  // `currentSystemPrompt` from the settingsStore `subagentsEnabled` toggle
+  // (see `agentLoop.ts`'s `toolsForSettings`, the actual tool-list filter
+  // this guidance line just describes in prose). Defaults to `false` so
+  // every pre-existing call site/test is unaffected, same posture as
+  // `verifyGuidanceAvailable`.
+  subagentGuidanceAvailable: boolean = false
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -295,6 +302,16 @@ export function buildSystemPrompt(
       ]
     : [];
 
+  // One conditional line pointing the model at the `task` tool for
+  // delegation — only present when it's actually being offered this turn
+  // (see `subagentGuidanceAvailable`'s param doc above).
+  const subagentGuidanceLines = subagentGuidanceAvailable
+    ? [
+        '',
+        "For broad multi-file exploration or an independent scoped subtask, delegate via the task tool (profile 'explore' for read-only research; give it a fully self-contained prompt — it cannot see this conversation).",
+      ]
+    : [];
+
   const planModeLines =
     mode === 'plan'
       ? [
@@ -325,6 +342,7 @@ export function buildSystemPrompt(
     ...artifactGuidanceLines,
     ...stacksLines,
     ...docChatLines,
+    ...subagentGuidanceLines,
     ...planModeLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
@@ -372,6 +390,7 @@ export function currentSystemPrompt(
   const verifyGuidanceAvailable =
     useSettingsStore.getState().verifyEnabled && useVerifyStore.getState().config.commands.some((c) => c.enabled);
   const mode = usePermissionStore.getState().mode;
+  const subagentGuidanceAvailable = useSettingsStore.getState().subagentsEnabled;
   const base = buildSystemPrompt(
     roots,
     osLabel,
@@ -383,8 +402,64 @@ export function currentSystemPrompt(
     mode,
     true,
     attachedStacks,
-    docChatMode
+    docChatMode,
+    subagentGuidanceAvailable
   );
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
+}
+
+/**
+ * The system prompt seeded into a subagent's own local (never
+ * `sessionStore`-backed) message history — see `subagent.ts`'s
+ * `runSubagentTask`. Shares the same workspace-facts derivation as
+ * `buildSystemPrompt` (primary/secondary root lines) but is otherwise a
+ * distinct, much shorter prompt: a subagent needs none of the parent's
+ * MONKEY.md rules/remembered-facts/MCP-server/verify/artifact guidance —
+ * just enough to know where it is, what its one task is, which tools it has
+ * (per `profile`), and how it must end (a final report, never a question,
+ * per the design doc's "subagent replies with a report, not to the user"
+ * contract). Pure and synchronous, same "buildSystemPrompt is pure so it can
+ * be unit-tested" rationale as the rest of this module.
+ */
+export function buildSubagentSystemPrompt(
+  roots: PromptWorkspaceRoot[],
+  osLabel: string,
+  profile: 'explore' | 'code',
+  description: string
+): string {
+  const primary = roots.find((r) => r.is_primary) ?? null;
+  const secondaries = roots.filter((r) => !r.is_primary);
+
+  const workspaceLines = primary
+    ? [
+        `The primary workspace folder is "${primary.path}". Tool paths are relative to it.`,
+        ...(secondaries.length > 0
+          ? [
+              `Additional attached folders (address them by prefixing paths with their label): ${secondaries
+                .map((r) => `"${r.label}" (${r.path})`)
+                .join(', ')}.`,
+            ]
+          : []),
+      ]
+    : ['No workspace folder is open yet. Tools will fail until the user opens one — say so in your report instead of retrying.'];
+
+  const toolLines =
+    profile === 'code'
+      ? [
+          'You have read-only tools (read_file, list_dir, glob, grep) plus write_file, edit_file, and run_shell to make changes. Mutating tools may prompt the user for permission and can be denied — if denied, stop and report that instead of retrying.',
+        ]
+      : ['You have read-only tools only: read_file, list_dir, glob, grep. You cannot write or edit files, or run shell commands.'];
+
+  return [
+    "You are a subagent spawned by a coordinating AI agent to complete one scoped task, running inside a desktop app on the user's machine.",
+    `The user's operating system is ${osLabel}.`,
+    '',
+    ...workspaceLines,
+    '',
+    `Your task: ${description}`,
+    ...toolLines,
+    '',
+    'Complete the task, then reply with a final report of what you found or did. Your reply is returned to the coordinating agent, not shown directly to the user — do not ask questions; if you get blocked, report what you found and why you stopped, then stop.',
+  ].join('\n');
 }

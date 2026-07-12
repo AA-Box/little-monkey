@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   BookmarkX,
   BookOpen,
+  Bot,
   Brain,
   ChevronRight,
   ClipboardCheck,
@@ -225,6 +226,10 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   web_fetch: Globe,
   web_search: Search,
   search_docs: BookOpen,
+  // Slice 1: `task` (subagent delegation) renders as an ordinary
+  // collapsible `ToolCallRow` like every other tool — a dedicated
+  // `SubagentRow` (live status + expandable child transcript) is slice 2.
+  task: Bot,
 };
 
 function toolIcon(name: string): LucideIcon {

@@ -52,6 +52,15 @@ export interface SettingsState {
   artifactScriptsEnabled: boolean;
   /** Whether `runTurnGuarded` (see `agentLoop.ts`) auto-opens the newest previewable artifact from a just-finished turn in `ArtifactPane`. Default false, mirroring `verifyEnabled`'s "automatically doing something on the user's behalf should be opt-in" posture — a user who didn't ask for a preview shouldn't have the workspace panel commandeered out from under them. Only artifacts produced by the turn that just completed are considered, never ones already sitting earlier in the transcript. */
   artifactAutoPreview: boolean;
+  /** Whether the `task` tool (subagent delegation — see `subagent.ts`'s
+   * `runSubagentTask`) is offered to the model this turn (see
+   * `agentLoop.ts`'s `toolsForSettings` filter). Default false: a weak local
+   * model may misuse or loop on it, so this ships default-off exactly like
+   * `verifyEnabled` — "automatically doing something on the model's own
+   * initiative should be opt-in". Turning it off makes `task` invisible to
+   * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
+   * not offered" treatment of `remember`. */
+  subagentsEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -74,6 +83,7 @@ export interface SettingsState {
   setRiskAnnotationsEnabled: (value: boolean) => void;
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
+  setSubagentsEnabled: (value: boolean) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -123,6 +133,7 @@ interface PersistedShape {
   riskAnnotationsEnabled: boolean;
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
+  subagentsEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -144,6 +155,7 @@ function defaults(): PersistedShape {
     riskAnnotationsEnabled: false,
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
+    subagentsEnabled: false,
   };
 }
 
@@ -211,6 +223,7 @@ function hydrate(): PersistedShape {
         typeof parsed.artifactScriptsEnabled === "boolean" ? parsed.artifactScriptsEnabled : fallback.artifactScriptsEnabled,
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
+      subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
     };
   } catch {
     return fallback;
@@ -354,6 +367,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setArtifactAutoPreview: (value) => {
     set({ artifactAutoPreview: value });
+    persist({ ...get() });
+  },
+
+  setSubagentsEnabled: (value) => {
+    set({ subagentsEnabled: value });
     persist({ ...get() });
   },
 }));
