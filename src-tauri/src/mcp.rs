@@ -29,7 +29,7 @@
 //! Follows the `checkpoints.rs`/`sessions.rs`/`memory.rs`/`rules.rs`
 //! AppHandle-free `*_impl` split: config load/save and connect/call are all
 //! plain functions taking `&Path`/`&AppState`, directly unit-testable (see
-//! the bottom of this file) and reusable from `lm-cli` later, while the
+//! the bottom of this file) and reusable from `monkey-cli` later, while the
 //! `#[tauri::command]`s are thin wrappers that resolve the config path,
 //! gate permission, and emit `mcp://status` events.
 
@@ -58,7 +58,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 /// Bound on how long connecting to (spawning/dialing, handshaking, and
 /// listing tools for) a single MCP server may take before both
-/// [`mcp_connect`] and lm-cli's `connect_all` give up and report an
+/// [`mcp_connect`] and monkey-cli's `connect_all` give up and report an
 /// error/timeout — `connect_impl` itself has no internal timeout (see its
 /// own doc comment), so a server whose process spawns (or whose HTTP
 /// endpoint accepts the connection) but never completes the `initialize`
@@ -327,7 +327,7 @@ pub struct McpConnection {
 /// Deliberately does NOT itself apply a timeout — a server whose process
 /// spawns (or endpoint accepts the connection) but never completes the
 /// `initialize` handshake would otherwise hang this `await` forever. See
-/// [`mcp_connect`] (and lm-cli's `connect_all`) for that, which wrap this
+/// [`mcp_connect`] (and monkey-cli's `connect_all`) for that, which wrap this
 /// call in [`CONNECT_TIMEOUT_SECS`] — the same division of labor
 /// [`call_tool_with_cancel_impl`] documents for permission/timeout/
 /// cancellation around a tool call.
@@ -577,7 +577,7 @@ pub async fn call_tool_with_cancel_impl(
 
 /// [`call_tool_with_cancel_impl`] with a `cancel` that never resolves — the
 /// entry point for callers that don't need real mid-call cancellation: this
-/// module's own tests (below) and lm-cli's `mcp_cli::call`, which only ever
+/// module's own tests (below) and monkey-cli's `mcp_cli::call`, which only ever
 /// wraps this in a plain `tokio::time::timeout` (see that function's own doc
 /// comment on why the CLI, unlike the GUI, has no concurrent "Stop"
 /// affordance to wire a genuine cancel signal from).

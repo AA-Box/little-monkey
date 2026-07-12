@@ -1,8 +1,8 @@
 //! LM's terminal agent: same sandboxed file/shell tools and permission
 //! model as the desktop app (reused directly from `little_monkey_lib`), driven from
 //! a shell instead of a WebView. Supports both a one-shot invocation
-//! (`lm-cli "prompt"`) and an interactive REPL (`lm-cli`, no prompt), plus
-//! Ollama-CLI-style model management subcommands (`lm-cli list/pull/run/...`)
+//! (`monkey-cli "prompt"`) and an interactive REPL (`monkey-cli`, no prompt), plus
+//! Ollama-CLI-style model management subcommands (`monkey-cli list/pull/run/...`)
 //! spoken directly to the daemon's HTTP API.
 
 mod agent;
@@ -18,6 +18,7 @@ mod providers_cli;
 mod repl;
 mod sse;
 mod stacks_cli;
+mod task;
 mod tools_cli;
 mod tools_def;
 mod verify_cli;
@@ -34,10 +35,10 @@ use little_monkey_lib::{memory, rules, AppState};
 use permission::{PermissionMode, TerminalPermissions};
 
 #[derive(Parser, Debug)]
-#[command(name = "lm-cli", version, about)]
+#[command(name = "monkey-cli", version, about)]
 struct Cli {
     /// Ollama-style model management subcommand. Note: a bare first argument
-    /// matching a subcommand name (e.g. `lm-cli list`) parses as that
+    /// matching a subcommand name (e.g. `monkey-cli list`) parses as that
     /// subcommand, not as a prompt — quote-and-rephrase such prompts.
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -342,6 +343,50 @@ enum Cmd {
     /// create/delete/add-source here.
     #[command(subcommand)]
     Stacks(StacksCmd),
+    /// Saved recipe (YAML/JSON) headless runner — CI-suitable, machine
+    /// readable output, deterministic exit codes. Design doc:
+    /// docs/roadmap/p3-scheduled-automation.md.
+    #[command(subcommand)]
+    Task(TaskCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskCmd {
+    /// Runs a saved recipe (by name, resolved via `.littlemonkey/recipes/`
+    /// in the current directory or the global recipes directory, or a
+    /// direct file path) headlessly. Exit codes: 0 success, 1
+    /// config/transport error, 2 permission-denied or Plan-Mode-blocked, 3
+    /// timeout or iteration-cap reached.
+    Run {
+        /// Recipe name or file path.
+        name_or_path: String,
+        /// Parameter override in `key=value` form — repeatable. Must match
+        /// a param the recipe actually declares.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        param: Vec<String>,
+        /// Emit a single JSON result object on stdout instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Parses and validates a recipe file without running it.
+    Validate {
+        /// Path to the recipe file.
+        path: String,
+    },
+    /// Lists every recipe visible from the current directory (its own
+    /// `.littlemonkey/recipes/`) plus the global recipes directory.
+    List,
+    /// Emits a ready-to-install launchd plist (macOS) or crontab line for
+    /// running this recipe on a schedule outside the app — always prints,
+    /// never installs anything itself (design doc slice 4, optional;
+    /// ROADMAP.md §4 explicitly rules out the app self-daemonizing).
+    Schedule {
+        /// Recipe name or file path.
+        name_or_path: String,
+        /// Cron expression (croner syntax — see `automations::cron_validate`).
+        #[arg(long)]
+        cron: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -367,7 +412,7 @@ enum StacksCmd {
 enum EmbedServerCmd {
     /// Start the embeddings server against a downloaded GGUF model file,
     /// waiting until it's healthy and verified before returning. Leaves the
-    /// process running in the background for subsequent `lm-cli` invocations.
+    /// process running in the background for subsequent `monkey-cli` invocations.
     Start {
         /// Path to a downloaded embedding model's GGUF file (e.g. one
         /// downloaded via the desktop app's Settings > Knowledge tab).
@@ -427,14 +472,8 @@ fn build_state(workspace: &Option<PathBuf>) -> Result<AppState, String> {
     Ok(state)
 }
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
-/// hardcoded-identifier app-data resolution as `providers_cli.rs`/
-/// `checkpoints_cli.rs` (duplicated per module rather than shared, following
-/// their precedent).
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 fn app_data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_IDENTIFIER))
+    little_monkey_lib::app_paths::data_dir()
 }
 
 /// The outer shape of `prompts.json` — this CLI path only ever reads as far
@@ -743,13 +782,26 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             StacksCmd::EmbedServer(EmbedServerCmd::Stop) => embed_cli::stop(),
             StacksCmd::EmbedServer(EmbedServerCmd::Status) => embed_cli::status(),
         },
+        Cmd::Task(action) => match action {
+            // `task run` has its own exit-code discipline (0/1/2/3, design
+            // doc slice 1) — it can't go through the shared `fail()` (always
+            // exit 1) below, so it exits directly here instead of returning
+            // into the `result` match.
+            TaskCmd::Run { name_or_path, param, json } => {
+                let code = task::run(cli, client, name_or_path, param, *json).await;
+                std::process::exit(code);
+            }
+            TaskCmd::Validate { path } => task::validate(path),
+            TaskCmd::List => task::list(),
+            TaskCmd::Schedule { name_or_path, cron } => task::schedule(name_or_path, cron),
+        },
     };
     if let Err(e) = result {
         fail(&e);
     }
 }
 
-/// `lm-cli api-serve`'s setup: resolves `api_server.json` at the same
+/// `monkey-cli api-serve`'s setup: resolves `api_server.json` at the same
 /// hardcoded-identifier app-data path every other `_cli.rs` module uses,
 /// reads its saved port (falling back to `--port`, then the file's own
 /// default), and hands off to `little_monkey_lib::server::run_cli_server` —
@@ -766,7 +818,7 @@ async fn run_api_serve(port_override: Option<u16>) -> Result<(), String> {
 
 /// Runs the chat side — a one-shot turn, or the interactive REPL when no
 /// prompt is given — against an already-resolved target. Both the classic
-/// flat invocation and `lm-cli run` land here. `options.system` going in is
+/// flat invocation and `monkey-cli run` land here. `options.system` going in is
 /// the rules/facts + `--system` text WITHOUT any persona folded in yet (see
 /// `chat_setup`); `persona` carries the resolved `--persona` entry, if any,
 /// as structured data. The two paths recompose them differently: a one-shot
@@ -837,7 +889,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("lm_cli_main_test_{}_{}_{}", std::process::id(), n, nanos));
+            let path = std::env::temp_dir().join(format!("monkey_cli_main_test_{}_{}_{}", std::process::id(), n, nanos));
             std::fs::create_dir_all(&path).unwrap();
             TempDir { path }
         }
@@ -1115,7 +1167,7 @@ mod tests {
         assert!(both.find("Be brief.").unwrap() < both.find("Only system.").unwrap());
     }
 
-    /// Regression test for a bug where `lm-cli --persona <cmd> run <model>
+    /// Regression test for a bug where `monkey-cli --persona <cmd> run <model>
     /// --system <text>` silently dropped the persona instead of layering it
     /// (see `chat_setup`'s doc comment and `Cmd::Run`'s arm in
     /// `run_subcommand`). Since `chat_setup` no longer folds the persona

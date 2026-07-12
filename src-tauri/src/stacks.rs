@@ -10,7 +10,7 @@
 //! the binary layout). Written like `checkpoints.rs`: every `*_impl`
 //! function here is `AppHandle`-free (parameterized on a base dir instead),
 //! with thin `#[tauri::command]` wrappers resolving the real app-data path —
-//! this is what would make a future `lm-cli` `Stacks` subcommand (slice 4)
+//! this is what would make a future `monkey-cli` `Stacks` subcommand (slice 4)
 //! nearly free, the same reasoning as `checkpoints`/`rules`/`memory`.
 //!
 //! Retrieval is brute-force dot product over L2-normalized vectors —
@@ -34,7 +34,7 @@
 //! and `query_impl` take a plain `base: &Path` (not an `AppHandle`) — the
 //! Tauri command wrappers resolve that path and, for `reindex_impl`, supply a
 //! progress callback instead of emitting the `stacks://index-progress` event
-//! directly — so `lm-cli`'s `Stacks` subcommand (`stacks_cli.rs`) can call
+//! directly — so `monkey-cli`'s `Stacks` subcommand (`stacks_cli.rs`) can call
 //! them exactly like the desktop app does, just rendering progress to the
 //! terminal instead of a Tauri event.
 
@@ -595,7 +595,7 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
         .map_err(|e| {
             format!(
                 "Failed to reach the embedding server: {e} — start it first from the desktop app's Settings > \
-                 Knowledge tab, or (from a terminal) `lm-cli stacks embed-server start --model-path <path>`."
+                 Knowledge tab, or (from a terminal) `monkey-cli stacks embed-server start --model-path <path>`."
             )
         })?;
 
@@ -1098,7 +1098,7 @@ fn plan_reindex(
 /// registry's `indexed_at`/`chunk_count` on success. Reports progress via
 /// `on_progress(files_done, files_total, chunks, phase)` — the Tauri command
 /// wrapper (`stacks_reindex`) turns that into `stacks://index-progress`
-/// events; `lm-cli`'s `stacks_cli::reindex` renders it to the terminal
+/// events; `monkey-cli`'s `stacks_cli::reindex` renders it to the terminal
 /// instead. Cancellable via the `CancellationToken` registered in
 /// `AppState::index_cancels` under `stack_id` (see `stacks_cancel_index`):
 /// unlike `tokio::sync::Notify::notify_waiters()` (which only wakes a task
@@ -1333,7 +1333,7 @@ fn partition_indexed_stacks<'a>(
 /// [`partition_indexed_stacks`]'s doc comment for exactly when this still
 /// errors) and returns the combined top-`k` hits across all of them, highest
 /// score first. Takes `base: &Path` (not an `AppHandle`) like every other
-/// `*_impl` here — `lm-cli`'s `stacks_cli::search_docs` calls this directly
+/// `*_impl` here — `monkey-cli`'s `stacks_cli::search_docs` calls this directly
 /// with its own resolved app-data path.
 pub async fn query_impl(
     base: &Path,
@@ -1543,10 +1543,10 @@ fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
 /// resolution below (both the explicit-name and the default-sweep case) to
 /// just the registry entries whose name case-insensitively matches one of
 /// `names` — this is how a session's actually-attached stacks (or, for
-/// `lm-cli`, the stacks named via `--stack`) keep a `search_docs` call from
+/// `monkey-cli`, the stacks named via `--stack`) keep a `search_docs` call from
 /// reaching a knowledge stack that was never granted to this
 /// session/invocation, even one that happens to be indexed. `None` means "no
-/// restriction, consider the whole registry" — used only by `lm-cli` when it
+/// restriction, consider the whole registry" — used only by `monkey-cli` when it
 /// has no `--stack` at all to scope by (see `stacks_cli::search_docs`); the
 /// desktop app's `tool_search_docs` below always passes `Some(...)` (an empty
 /// `Vec` when nothing is attached), never `None`, so a hallucinated call in a
@@ -1565,7 +1565,7 @@ fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
 ///   that message stays in exactly one place.
 /// - `stack: None` — every IN-SCOPE stack that HAS been indexed.
 ///
-/// `pub` (not module-private) so `lm-cli`'s `stacks_cli::search_docs` (slice
+/// `pub` (not module-private) so `monkey-cli`'s `stacks_cli::search_docs` (slice
 /// 4 CLI parity) can resolve a `--stack`-style name argument through the
 /// exact same logic `tool_search_docs` uses below, rather than re-implementing
 /// name matching a second time.
@@ -2093,7 +2093,7 @@ mod tests {
 
     #[test]
     fn resolve_search_stack_ids_no_allow_list_is_unrestricted() {
-        // `None` (used by `lm-cli` when no `--stack` was given at all) keeps
+        // `None` (used by `monkey-cli` when no `--stack` was given at all) keeps
         // the pre-fix "search the whole registry" behavior.
         let registry = vec![test_stack("Docs", true), test_stack("Notes", true)];
         let mut ids = resolve_search_stack_ids(&registry, None, None).unwrap();

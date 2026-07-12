@@ -6,11 +6,8 @@
 
 use little_monkey_lib::providers::CustomProviderEntry;
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json`.
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 fn providers_file_path() -> Option<std::path::PathBuf> {
-    Some(dirs::data_dir()?.join(APP_IDENTIFIER).join("providers.json"))
+    Some(little_monkey_lib::app_paths::data_dir()?.join("providers.json"))
 }
 
 /// Best-effort: an unreadable/missing/malformed file just means "no custom

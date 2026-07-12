@@ -25,7 +25,7 @@
 //! Structured like `checkpoints.rs`/`web.rs`: an `AppHandle`-free,
 //! independently testable core ([`handle_request`], [`route_model`]) plus a
 //! thin `#[tauri::command]` layer that owns the actual listening socket and
-//! `AppState` bookkeeping. `pub` (not `mod`) so a future `lm-cli` `api-serve`
+//! `AppState` bookkeeping. `pub` (not `mod`) so a future `monkey-cli` `api-serve`
 //! subcommand (design doc phase 4) can reuse [`handle_request`] directly,
 //! the same reasoning as `web`/`prompts`/`rules` above it in `lib.rs`.
 //!
@@ -416,7 +416,7 @@ impl From<&ApiServerConfig> for ApiServerConfigView {
 
 /// Resolves (and creates, if missing) `<app_data_dir>/api_server.json`'s
 /// path — same shape as `providers.rs::providers_file_path`/
-/// `web.rs::settings_file_path`. `pub` so a future `lm-cli` `api-serve`
+/// `web.rs::settings_file_path`. `pub` so a future `monkey-cli` `api-serve`
 /// subcommand (phase 4) can resolve the same path with its own
 /// APP_IDENTIFIER, the same config-drift concern the design doc flags.
 pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -432,7 +432,7 @@ pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Core load logic, parameterized by path so it needs no `AppHandle` —
-/// directly unit-testable and reusable from `lm-cli`. A missing file (the
+/// directly unit-testable and reusable from `monkey-cli`. A missing file (the
 /// common case — nothing configured yet) is simply [`ApiServerConfig::default`],
 /// never an error, same stance as `web.rs::load_settings_impl`.
 pub fn load_config_impl(path: &Path) -> Result<ApiServerConfig, String> {
@@ -569,7 +569,7 @@ struct StoredToken {
 /// and a small JSON file read — see [`build_deps`]) so llama's live
 /// port/status/model *and* the current token list are never stale mid-
 /// connection. No `AppHandle` here by design — this is what makes
-/// [`handle_request`] directly unit-testable and, later, `lm-cli`-reusable.
+/// [`handle_request`] directly unit-testable and, later, `monkey-cli`-reusable.
 #[derive(Clone)]
 pub struct ServerDeps {
     pub llama_port: u16,
@@ -1131,7 +1131,7 @@ struct ServerRuntime {
 
 /// Pure merge of built-in presets + a caller-supplied custom-provider list
 /// into the routing catalog — split out from [`build_provider_catalog`] so
-/// `lm-cli`'s `api-serve` subcommand (design doc phase 4) can build the same
+/// `monkey-cli`'s `api-serve` subcommand (design doc phase 4) can build the same
 /// catalog from its own `AppHandle`-free custom-provider loader
 /// (`providers_cli::load_custom_providers`) without duplicating the
 /// preset+custom merge logic. See [`run_cli_server`].
@@ -1214,7 +1214,7 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
 /// Probes the managed llama-server process's readiness and reports the
 /// model id it advertises — the CLI-context substitute for reading
 /// `AppState::llama` in-process (which only exists inside the GUI). Used
-/// exclusively by [`run_cli_server`]: `lm-cli api-serve` runs as its own OS
+/// exclusively by [`run_cli_server`]: `monkey-cli api-serve` runs as its own OS
 /// process with no Tauri `AppState`, but llama-server (if the GUI already
 /// started it) is a plain independent TCP listener on `port` that anyone on
 /// loopback can reach, so a `/health` + `/v1/models` probe is a faithful
@@ -1407,13 +1407,13 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 }
 
 // ---------------------------------------------------------------------
-// lm-cli `api-serve` (design doc phase 4): the SAME routing/proxy core
+// monkey-cli `api-serve` (design doc phase 4): the SAME routing/proxy core
 // (`ServerDeps`/`serve_one_request`/`handle_request`/`bind_listener`/
 // `load_config_impl`) the GUI uses, with no `AppHandle`/`AppState` at all —
 // only the surrounding bookkeeping differs (stdout/stderr logging instead
 // of `apiserver://status` events, an `AtomicU64` instead of
 // `AppState::api_server.request_count`, an HTTP probe instead of reading
-// `AppState::llama` in-process). `lm-cli`'s `main.rs` resolves the
+// `AppState::llama` in-process). `monkey-cli`'s `main.rs` resolves the
 // `api_server.json`/`providers.json` paths itself (the same
 // `APP_IDENTIFIER`-hardcoding technique `providers_cli.rs`/
 // `checkpoints_cli.rs` already use) and hands them in here — see the design
@@ -1425,7 +1425,7 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 /// Runs the local API server as a blocking, headless accept loop — never
 /// returns on success (Ctrl+C/SIGINT ends the process the same way `ollama
 /// serve`'s passthrough does); returns `Err` only for a bind failure, so
-/// `lm-cli`'s `main` can print it and exit non-zero exactly like every other
+/// `monkey-cli`'s `main` can print it and exit non-zero exactly like every other
 /// subcommand's error path (`fail()`).
 ///
 /// `load_custom_providers` is re-invoked on every accepted connection (not
@@ -2629,7 +2629,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Phase 4: lm-cli `api-serve` reuse (`provider_catalog_from`,
+    // Phase 4: monkey-cli `api-serve` reuse (`provider_catalog_from`,
     // `tokens_from_config`, `probe_llama_server`)
     // -------------------------------------------------------------
 
@@ -2726,10 +2726,10 @@ mod tests {
     }
 
     /// Regression guard for the phase-4 CLI reuse: `run_cli_server` must
-    /// still surface a conflicting port as an `Err` (so `lm-cli`'s `fail()`
+    /// still surface a conflicting port as an `Err` (so `monkey-cli`'s `fail()`
     /// prints it and exits non-zero) rather than hanging or panicking —
     /// mirrors `config_triggered_restart_onto_an_already_taken_port_...`
-    /// above, but through the actual public entry point `lm-cli` calls.
+    /// above, but through the actual public entry point `monkey-cli` calls.
     #[tokio::test]
     async fn run_cli_server_reports_a_bind_conflict_as_an_error() {
         let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

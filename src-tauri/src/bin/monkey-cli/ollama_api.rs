@@ -2,7 +2,7 @@
 //! (tags/ps/show/pull/push/create/delete/copy) plus the native chat stream.
 //! Unlike the GUI's `little_monkey_lib::ollama` (which shells out to the
 //! `ollama` binary for pull/create), everything here speaks the daemon's
-//! HTTP API directly, so lm-cli only needs a reachable daemon. All endpoints
+//! HTTP API directly, so monkey-cli only needs a reachable daemon. All endpoints
 //! resolve their base URL through `host()`, honoring `OLLAMA_HOST`.
 use futures_util::StreamExt;
 use little_monkey_lib::providers::Utf8ChunkAccumulator;

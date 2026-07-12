@@ -8,7 +8,7 @@
 //! } }`, keyed by the canonical primary-root path (no hashing needed — one
 //! file, atomic temp+rename writes exactly like `sessions.rs`'s `save_to`).
 //! Caps are enforced here, Rust-side, so both `tool_remember` and (in a later
-//! slice) `lm-cli` share the same guarantees: [`MAX_FACTS_PER_PROJECT`] facts
+//! slice) `monkey-cli` share the same guarantees: [`MAX_FACTS_PER_PROJECT`] facts
 //! per project, [`MAX_FACT_CHARS`] characters per fact, and an exact-duplicate
 //! fact text is treated as an already-successful remember (silent success —
 //! the existing fact is returned, not a second copy or an error).
@@ -16,7 +16,7 @@
 //! Follows the `checkpoints.rs`/`sessions.rs`/`rules.rs` AppHandle-free
 //! `*_impl` split: [`load_impl`]/[`save_impl`]/[`add_fact_impl`]/
 //! [`delete_fact_impl`] take plain paths so they're directly unit-testable
-//! and reusable from `lm-cli` (slice 5), while `memory_list`/`memory_add`/
+//! and reusable from `monkey-cli` (slice 5), while `memory_list`/`memory_add`/
 //! `memory_delete` are the thin `#[tauri::command]` wrappers.
 
 use std::collections::HashMap;
@@ -147,7 +147,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Core add-fact logic behind `tool_remember`/`memory_add`, parameterized by
 /// plain path + root string so it's directly unit-testable and reusable from
-/// `lm-cli`. Validates the cap/length rules described in the module docs:
+/// `monkey-cli`. Validates the cap/length rules described in the module docs:
 /// - An exact-duplicate `text` already recorded for `root` is a silent
 ///   success — the existing fact is returned rather than erroring or
 ///   inserting a second copy (weak models retrying "did that stick?" must
@@ -338,6 +338,21 @@ mod tests {
             n,
             nanos
         ))
+    }
+
+    /// Shared with `rulesStore.test.ts`'s canonical-fixture test (which reads
+    /// the same file via a JSON import) — a single fixture, not two
+    /// independently hand-typed literals, is what actually pins the
+    /// TS<->Rust `Fact` schema against drift, per ROADMAP.md §3.6.
+    const CANONICAL_FACT_JSON: &str = include_str!("../fixtures/memory-fact.canonical.json");
+
+    #[test]
+    fn fact_deserializes_canonical_fixture() {
+        let fact: Fact = serde_json::from_str(CANONICAL_FACT_JSON).unwrap();
+        assert_eq!(fact.id, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(fact.text, "This project uses pnpm, not npm, for all package management.");
+        assert_eq!(fact.source, "agent");
+        assert_eq!(fact.created_at, "2026-01-01T00:00:00.000Z");
     }
 
     #[test]

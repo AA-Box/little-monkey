@@ -11,6 +11,7 @@ import { textContent } from "../../lib/llamaClient";
 import { selectSessionMessages, selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
 import { usePromptStore } from "../../store/promptStore";
+import { useShortcutStore } from "../../store/shortcutStore";
 import type { PromptEntry } from "../../store/promptStore";
 import MessageList from "./MessageList";
 import { MentionAutocomplete } from "./MentionAutocomplete";
@@ -27,6 +28,7 @@ import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
 import { WorkspaceBar } from "../Workspace";
 import { useT } from "../../lib/i18n";
+import { shortcutIdForEvent, usesMacShortcuts } from "../../lib/shortcuts";
 
 const MAX_TEXTAREA_HEIGHT_PX = 192;
 
@@ -500,20 +502,28 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Enter confirms an active IME composition on CJK and other input
+    // methods; it must not choose a suggestion or send the message too.
+    if (event.nativeEvent.isComposing) return;
+    // Resolve from the store on every event so an edit in Settings is live
+    // without remounting the composer (including in a secondary window).
+    const { overrides } = useShortcutStore.getState();
+    const isMac = usesMacShortcuts();
+    const suggestionShortcut = shortcutIdForEvent(event, "suggestions", isMac, overrides);
     if (mentionQuery !== null) {
-      if (event.key === "ArrowDown") {
+      if (suggestionShortcut === "nextSuggestion") {
         event.preventDefault();
         setMentionActiveIndex((prev) => (mentionEntries.length === 0 ? 0 : (prev + 1) % mentionEntries.length));
         return;
       }
-      if (event.key === "ArrowUp") {
+      if (suggestionShortcut === "previousSuggestion") {
         event.preventDefault();
         setMentionActiveIndex((prev) =>
           mentionEntries.length === 0 ? 0 : (prev - 1 + mentionEntries.length) % mentionEntries.length
         );
         return;
       }
-      if (event.key === "Enter" || event.key === "Tab") {
+      if (suggestionShortcut === "chooseSuggestion") {
         event.preventDefault();
         const entry = mentionEntries[mentionActiveIndex];
         if (entry) {
@@ -523,7 +533,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
         }
         return;
       }
-      if (event.key === "Escape") {
+      if (suggestionShortcut === "closeSuggestions") {
         event.preventDefault();
         closeMentionPopup();
         return;
@@ -531,17 +541,17 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
     }
 
     if (slashQuery !== null) {
-      if (event.key === "ArrowDown") {
+      if (suggestionShortcut === "nextSuggestion") {
         event.preventDefault();
         setSlashActiveIndex((prev) => (slashEntries.length === 0 ? 0 : (prev + 1) % slashEntries.length));
         return;
       }
-      if (event.key === "ArrowUp") {
+      if (suggestionShortcut === "previousSuggestion") {
         event.preventDefault();
         setSlashActiveIndex((prev) => (slashEntries.length === 0 ? 0 : (prev - 1 + slashEntries.length) % slashEntries.length));
         return;
       }
-      if (event.key === "Enter" || event.key === "Tab") {
+      if (suggestionShortcut === "chooseSuggestion") {
         event.preventDefault();
         const entry = slashEntries[slashActiveIndex];
         if (entry) {
@@ -551,17 +561,47 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
         }
         return;
       }
-      if (event.key === "Escape") {
+      if (suggestionShortcut === "closeSuggestions") {
         event.preventDefault();
         closeSlashPopup();
         return;
       }
     }
 
-    if (event.key === "Enter" && !event.shiftKey) {
+    const composerShortcut = shortcutIdForEvent(event, "composer", isMac, overrides);
+    if (composerShortcut === "sendMessage") {
       event.preventDefault();
       handleSend();
+      return;
     }
+
+    if (composerShortcut === "insertLineBreak") {
+      event.preventDefault();
+
+      const textarea = event.currentTarget;
+      const currentValue = textarea.value;
+      const selectionStart = textarea.selectionStart ?? currentValue.length;
+      const selectionEnd = textarea.selectionEnd ?? selectionStart;
+      const nextValue =
+        currentValue.slice(0, selectionStart) + "\n" + currentValue.slice(selectionEnd);
+      const nextCaret = selectionStart + 1;
+
+      setInput(nextValue);
+      closeMentionPopup();
+      closeSlashPopup();
+      requestAnimationFrame(() => {
+        const node = textareaRef.current;
+        if (!node) return;
+        node.focus();
+        node.setSelectionRange(nextCaret, nextCaret);
+        resizeTextarea();
+      });
+      return;
+    }
+
+    // Once Enter/Shift+Enter is reassigned, do not let the textarea's native
+    // newline behavior keep the old binding alive behind the registry's back.
+    if (event.key === "Enter") event.preventDefault();
   };
 
   return (

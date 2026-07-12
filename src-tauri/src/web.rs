@@ -5,7 +5,7 @@
 //! testable core (`validate_fetch_url`, `fetch_impl`) plus a thin
 //! `#[tauri::command]` wrapper (`tool_web_fetch`) that adds the permission
 //! gate and Stop-button cancellation. The AppHandle-free split matters for
-//! the same reason it does there — `lm-cli` (phase 4) reuses `fetch_impl`
+//! the same reason it does there — `monkey-cli` (phase 4) reuses `fetch_impl`
 //! directly instead of duplicating the fetch pipeline.
 //!
 //! SSRF GUARD. [`validate_fetch_url`] plus [`SsrfGuardedResolver`] together
@@ -162,7 +162,7 @@ fn settings_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// (nothing configured yet, the common case) is simply [`WebSettings::default`],
 /// never an error, same stance as `mcp.rs::load_config_impl`. `pub` (rather
 /// than private, like most other `*_impl` load fns in this module) because
-/// lm-cli's `web_cli.rs` (phase 4) calls this directly with its own
+/// monkey-cli's `web_cli.rs` (phase 4) calls this directly with its own
 /// APP_IDENTIFIER-resolved path — same reuse-the-lib-fn-directly shape as
 /// `checkpoints_cli.rs` calling `checkpoints::begin_impl`.
 pub fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
@@ -231,7 +231,7 @@ pub fn has_brave_key() -> bool {
 }
 
 /// Reads the saved Brave API key, for `search_impl`'s Brave branch (via
-/// `tool_web_search`) and lm-cli's shared `web::read_brave_key()` (phase 4).
+/// `tool_web_search`) and monkey-cli's shared `web::read_brave_key()` (phase 4).
 pub fn read_brave_key() -> Result<String, String> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
@@ -652,7 +652,7 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
 /// `settings` supplies the real, user-configured `allow_local_network` and
 /// (as the fallback when the model omits `max_chars`) `fetch_max_chars` —
 /// phases 1-2 hardcoded both via module constants; this is the phase-3
-/// settings-driven version `tool_web_fetch` (and lm-cli, phase 4) call with
+/// settings-driven version `tool_web_fetch` (and monkey-cli, phase 4) call with
 /// whatever `web_settings.json` currently holds.
 pub async fn fetch_impl(
     settings: &WebSettings,
@@ -1082,7 +1082,7 @@ async fn searxng_search(base_url: &str, query: &str, count: usize) -> Result<Vec
 ///
 /// `brave_key` is passed in rather than read from the keychain here, so this
 /// function stays free of any keychain access of its own — [`tool_web_search`]
-/// (and lm-cli's shared call site, phase 4) resolve it via [`read_brave_key`]
+/// (and monkey-cli's shared call site, phase 4) resolve it via [`read_brave_key`]
 /// and pass the result through, keeping `search_impl` trivially testable
 /// without touching the real OS keychain.
 ///

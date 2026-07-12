@@ -8,7 +8,7 @@
 //! second session window rehydrates instead of last-writer-clobbering.
 //!
 //! Unlike `sessions.rs`, the core `load_impl`/`save_impl` pair here is `pub`
-//! (not private) and a `pub PromptEntry` struct is exposed too, so `lm-cli`
+//! (not private) and a `pub PromptEntry` struct is exposed too, so `monkey-cli`
 //! can read personas straight out of this module without an `AppHandle` —
 //! same seam as `checkpoints.rs`/`rules.rs` already provide for CLI reuse.
 
@@ -69,7 +69,7 @@ fn prompts_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Core load logic, parameterized by path so it needs no `AppHandle` —
-/// directly unit-testable and reusable from `lm-cli`.
+/// directly unit-testable and reusable from `monkey-cli`.
 pub fn load_impl(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(raw) => Ok(Some(raw)),
@@ -188,7 +188,7 @@ mod tests {
     /// `PromptEntry` changes shape, this test and `promptStore.test.ts`'s
     /// both read the exact same bytes, so only a genuine cross-language
     /// disagreement about the shared shape can make one fail without the
-    /// other. Matters because `lm-cli` reads `PromptEntry` directly out of
+    /// other. Matters because `monkey-cli` reads `PromptEntry` directly out of
     /// `prompts.json` without going through the frontend at all.
     const CANONICAL_ENTRY_JSON: &str = include_str!("../fixtures/prompt-entry.canonical.json");
 

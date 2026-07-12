@@ -80,12 +80,24 @@ export function PermissionModal() {
   useEffect(() => {
     if (!pending) return;
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") {
+      if (
+        e.key === "Escape" &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.repeat &&
+        !e.isComposing
+      ) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
         respond(false, false);
       }
     }
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    // Capture gives a visible permission prompt first ownership of Escape;
+    // lower Settings/session-menu listeners must not react to the same key.
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [pending, respond]);
 
   // Small mount transition (opacity/scale) — duration collapses to ~0 under
@@ -173,7 +185,7 @@ export function PermissionModal() {
             type="button"
             variant="primary"
             onClick={() => respond(true, false)}
-            autoFocus={!canRememberForSession}
+            autoFocus
           >
             {t("PermissionModal.allowOnceButton")}
           </Button>
@@ -183,7 +195,6 @@ export function PermissionModal() {
               variant="secondary"
               className="border-warning/40 text-warning hover:bg-warning-soft"
               onClick={() => respond(true, true)}
-              autoFocus
             >
               {t("PermissionModal.allowForSessionButton")}
             </Button>

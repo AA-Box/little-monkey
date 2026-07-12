@@ -69,29 +69,29 @@ pnpm test:rust
 
 ## CLI
 
-Little Monkey has a terminal agent. The intended installed command is `lm`:
+Little Monkey has a terminal agent. The intended installed command is `monkey`:
 
 ```sh
-lm --help
+monkey --help
 ```
 
 One-shot chat examples:
 
 ```sh
 # Chat with an Ollama model
-lm --ollama llama3.2 "Summarize this project"
+monkey --ollama llama3.2 "Summarize this project"
 
 # Chat with a local OpenAI-compatible server such as llama-server
-lm --local-url http://127.0.0.1:8090 "Inspect the workspace"
+monkey --local-url http://127.0.0.1:8090 "Inspect the workspace"
 
 # Chat with a configured cloud provider key from the desktop app
-lm --provider openai --model <model-id> "Review this codebase"
+monkey --provider openai --model <model-id> "Review this codebase"
 ```
 
 Omit the prompt to start the interactive REPL:
 
 ```sh
-lm --ollama llama3.2
+monkey --ollama llama3.2
 ```
 
 Useful global chat flags:
@@ -107,31 +107,31 @@ Useful global chat flags:
 Ollama-compatible model commands:
 
 ```sh
-lm list
-lm ps
-lm pull <model>
-lm run <model> "Prompt text"
-lm rm <model> [model...]
-lm cp <source> <destination>
-lm show <model>
-lm stop <model>
-lm push <model>
-lm create <model> --file Modelfile
-lm signin
-lm signout
-lm serve
+monkey list
+monkey ps
+monkey pull <model>
+monkey run <model> "Prompt text"
+monkey rm <model> [model...]
+monkey cp <source> <destination>
+monkey show <model>
+monkey stop <model>
+monkey push <model>
+monkey create <model> --file Modelfile
+monkey signin
+monkey signout
+monkey serve
 ```
 
 Inside the REPL, use `/help` to list slash commands. Supported commands include `/set`, `/show`, `/save <model>`, `/load <model>`, `/clear`, and `/bye`.
 
-Developer note: the source tree currently builds the CLI from `src-tauri/src/bin/lm-cli/`. If you are running from a checkout before an installer has put `lm` on your `PATH`, use the same arguments after Cargo's `--` separator:
+Developer note: the source tree currently builds the CLI from `src-tauri/src/bin/monkey-cli/`. If you are running from a checkout before an installer has put `monkey` on your `PATH`, use the same arguments after Cargo's `--` separator:
 
 ```sh
-cargo run --manifest-path src-tauri/Cargo.toml --bin lm-cli -- --help
-cargo run --manifest-path src-tauri/Cargo.toml --bin lm-cli -- --ollama llama3.2 "Summarize this project"
+cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- --help
+cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- --ollama llama3.2 "Summarize this project"
 ```
 
-The current Tauri bundle configuration does not yet install a global `lm` PATH shim by itself; release packaging needs to include that step.
+The current Tauri bundle configuration does not yet install a global `monkey` PATH shim by itself; release packaging needs to include that step.
 
 ## Model Setup
 
@@ -171,7 +171,7 @@ Shell commands run inside the workspace, have a 120 second timeout, and can be c
 
 - `src/` - React frontend, Zustand stores, chat loop, model/provider clients, and UI components.
 - `src-tauri/` - Tauri 2 Rust backend, model process management, provider proxying, workspace tools, permissions, sessions, and git/system commands.
-- `src-tauri/src/bin/lm-cli/` - CLI-oriented support code.
+- `src-tauri/src/bin/monkey-cli/` - CLI-oriented support code.
 - `public/` and `src/assets/` - static frontend assets.
 
 ## Useful Commands

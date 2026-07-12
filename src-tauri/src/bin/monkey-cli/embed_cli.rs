@@ -1,7 +1,7 @@
 //! CLI-side lifecycle for the embeddings-only `llama-server` instance (RAG
 //! design doc slice 4, CLI parity for the `llama` embedding backend).
 //!
-//! Before this module existed, nothing in `lm-cli` could ever start this
+//! Before this module existed, nothing in `monkey-cli` could ever start this
 //! process at all: `stacks::embed_via_llama` (`stacks.rs`) just POSTs to
 //! `http://127.0.0.1:{EMBED_PORT}/v1/embeddings` with no fallback, so any
 //! `llama`-backend stack (the curated/default backend — see
@@ -9,9 +9,9 @@
 //! app happened to already have its embeddings server running. The desktop
 //! app's equivalent (`llama::embed_server_start`) keeps the spawned
 //! `std::process::Child` inside its own long-running `AppState`, so a later
-//! Tauri command can find and kill it — `lm-cli` has no such thing: every
+//! Tauri command can find and kill it — `monkey-cli` has no such thing: every
 //! invocation is its own short-lived process, so there is nothing for a
-//! later `lm-cli` invocation to hold onto in memory. Lifecycle here is
+//! later `monkey-cli` invocation to hold onto in memory. Lifecycle here is
 //! therefore pid-file based instead: `start` spawns `llama-server`, waits for
 //! it to become healthy (reusing `llama::find_llama_server_binary`/
 //! `llama::embed_server_args` so the actual binary/flags never drift from the
@@ -62,14 +62,14 @@ fn process_is_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// `lm-cli stacks embed-server start --model-path <path>` — spawns the
+/// `monkey-cli stacks embed-server start --model-path <path>` — spawns the
 /// embeddings-only `llama-server` instance against `model_path` (the same
 /// argument shape as the desktop app's manual "Start" button in the
 /// Knowledge panel: this module doesn't attempt to resolve a stack's
 /// `model_id_or_tag` to a model file automatically, matching that the GUI
 /// doesn't either), waits for it to become healthy and verified, then
 /// returns, leaving the process running in the background for subsequent
-/// `lm-cli stacks reindex`/`search_docs` calls to use.
+/// `monkey-cli stacks reindex`/`search_docs` calls to use.
 pub async fn start(model_path: String) -> Result<(), String> {
     if let Some(pid) = read_pid() {
         if process_is_alive(pid) {
@@ -134,7 +134,7 @@ pub async fn start(model_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// `lm-cli stacks embed-server stop` — kills the process recorded in the pid
+/// `monkey-cli stacks embed-server stop` — kills the process recorded in the pid
 /// file, if it's still alive, and clears the pid file either way.
 pub fn stop() -> Result<(), String> {
     match read_pid() {
@@ -152,7 +152,7 @@ pub fn stop() -> Result<(), String> {
     Ok(())
 }
 
-/// `lm-cli stacks embed-server status` — prints whether the pid file's
+/// `monkey-cli stacks embed-server status` — prints whether the pid file's
 /// process is actually still alive (a stale pid file left behind by a
 /// process that died without `stop` being called reports "not running").
 pub fn status() -> Result<(), String> {

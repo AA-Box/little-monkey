@@ -117,6 +117,24 @@ rand = "0.10.2"
 # 0.12.0 verified current on crates.io (`cargo add pdf-extract --dry-run`) at
 # implementation time; the design doc didn't pin a version.
 pdf-extract = { version = "0.12", optional = true }
+# recipes.rs: YAML recipe parsing (docs/roadmap/p3-scheduled-automation.md).
+# serde_yaml has been deprecated since March 2024 (see
+# https://users.rust-lang.org/t/serde-yaml-deprecation-alternatives/108868);
+# serde-saphyr is the maintained, pure-Rust successor for typed
+# `from_str::<T>` deserialization, exactly this use case. 0.0.29 verified
+# current on crates.io (`cargo add serde-saphyr --dry-run`) at implementation
+# time.
+serde-saphyr = "0.0.29"
+# automations.rs: cron expression validation/next-run computation for the
+# in-app scheduler (design doc slice 3). Actively maintained, POSIX weekday
+# numbering, timezone-aware, seconds-optional — preferred over the older
+# `cron` crate, which uses Quartz (1-7 = Sun-Sat shifted) weekday numbering
+# that would silently mismatch user expectations. 3.0.1 verified current on
+# crates.io (`cargo add croner --dry-run`) at implementation time. Kept
+# Rust-side only (no frontend cron dependency) so `cron_validate`/`cron_next`
+# are the only new date-parsing surface this feature adds.
+croner = "3.0.1"
+chrono = { version = "0.4.45", features = ["serde"] }
 
 [features]
 default = ["pdf-extraction"]

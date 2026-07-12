@@ -528,7 +528,7 @@ const REDO_DIR: &str = "redo";
 /// sites can otherwise reach this: `CheckpointTimeline.tsx`'s "Restore to
 /// here" re-reverts every checkpoint newest→target unconditionally
 /// (including ones the user already reverted individually earlier), and the
-/// CLI's `/revert`/`lm revert` can simply be invoked twice on the same id.
+/// CLI's `/revert`/`monkey revert` can simply be invoked twice on the same id.
 pub fn revert_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     validate_id(id)?;
 

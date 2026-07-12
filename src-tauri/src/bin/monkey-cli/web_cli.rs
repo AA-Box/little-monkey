@@ -9,13 +9,8 @@
 
 use little_monkey_lib::web::{self, WebSettings};
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
-/// hardcoded-identifier app-data resolution as every other `*_cli.rs`
-/// module.
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 fn settings_file_path() -> Option<std::path::PathBuf> {
-    Some(dirs::data_dir()?.join(APP_IDENTIFIER).join("web_settings.json"))
+    Some(little_monkey_lib::app_paths::data_dir()?.join("web_settings.json"))
 }
 
 /// Loads `web_settings.json`, falling back to `WebSettings::default()` when

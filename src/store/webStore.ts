@@ -24,7 +24,7 @@ export interface WebSettings {
   searxng_base_url: string | null;
   /** Whether `web_fetch`/`web_search` may target a loopback/private/
    * link-local host (llama-server, Ollama, ...). Defaults to `false` — see
-   * `WebPanel.tsx`'s warning copy for this toggle. */
+   * `AutomationPanel.tsx`'s Web section's warning copy for this toggle. */
   allow_local_network: boolean;
   /** Char-window size `web_fetch` uses when the model doesn't pass its own
    * `max_chars`. */
@@ -52,10 +52,10 @@ export interface WebStore {
    * own persisted state). */
   settings: WebSettings;
   /** Live OS-keychain probe — never the Brave key itself — refreshed
-   * alongside `settings` so `WebPanel.tsx`'s Brave key field always reflects
+   * alongside `settings` so `AutomationPanel.tsx`'s Web section's Brave key field always reflects
    * reality, mirroring `ProviderCard`'s `provider.has_key` pattern. */
   hasBraveKey: boolean;
-  /** Whether `refresh()` has resolved at least once, so `WebPanel.tsx` can
+  /** Whether `refresh()` has resolved at least once, so `AutomationPanel.tsx`'s Web section can
    * avoid flashing "no key saved" before the first load completes. */
   loaded: boolean;
 
