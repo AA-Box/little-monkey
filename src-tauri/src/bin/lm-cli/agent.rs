@@ -28,6 +28,206 @@ use crate::web_cli;
 
 const MAX_ITERATIONS: usize = 25;
 
+/// Cap on how many model/tool round trips a `task`-delegated subagent (see
+/// [`run_subagent_turn`]) may take before it's forced to stop and report
+/// whatever it has — a Rust port of `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS`
+/// (docs/roadmap/p3-subagents.md). Smaller than [`MAX_ITERATIONS`] because a
+/// subagent's job is one scoped, disjoint task, not an open-ended session.
+const MAX_SUBAGENT_ITERATIONS: usize = 15;
+
+/// Cap on a subagent's final report returned as the `task` tool's result —
+/// mirrors the design doc's "Context/report bloat" risk (and
+/// `subagent.ts`'s own cap): one chatty child's report shouldn't be able to
+/// blow up the parent turn's own context on its own.
+const SUBAGENT_REPORT_CHAR_CAP: usize = 8000;
+
+/// Truncates `report` to [`SUBAGENT_REPORT_CHAR_CAP`] chars, keeping the head
+/// (a subagent's report usually leads with its conclusion) and appending a
+/// marker noting how much was cut, rather than silently dropping the tail.
+fn truncate_report(report: &str) -> String {
+    if report.chars().count() <= SUBAGENT_REPORT_CHAR_CAP {
+        return report.to_string();
+    }
+    let truncated: String = report.chars().take(SUBAGENT_REPORT_CHAR_CAP).collect();
+    format!("{truncated}\n… (truncated, {} more chars)", report.chars().count() - SUBAGENT_REPORT_CHAR_CAP)
+}
+
+/// The `task` tool's allowed profile on the CLI — always `"explore"` (see
+/// [`execute_tool_call`]'s `"task"` arm doc comment for why `"code"` is
+/// rejected here rather than supported).
+const CLI_SUBAGENT_PROFILE: &str = "explore";
+
+/// The exact tool names offered to a `task` subagent's own tool-calling loop
+/// on the CLI — the read-only subset of [`tool_definitions`]'s base list.
+/// Deliberately an ALLOWLIST filtered out of the same list every top-level
+/// turn uses (not a denylist over some larger set), so there is no way for a
+/// gated or mutating tool — or `task` itself — to end up in it by omission.
+/// `tool_definitions()` never includes `"task"` (it's a per-turn-only
+/// addition the desktop app's `toolsForSettings` makes; here it's handled
+/// directly in [`execute_tool_call`], never added to any list at all), so
+/// this filter structurally cannot let it through either.
+///
+/// Note this is one tool short of the desktop app's `explore` profile
+/// (`read_file`/`list_dir`/`glob`/`grep`): `tool_definitions()` has no `glob`
+/// tool at all yet (a pre-existing CLI/GUI parity gap, not introduced here),
+/// so the CLI subagent's explore set is `read_file`/`list_dir`/`grep`.
+const EXPLORE_TOOL_NAMES: [&str; 3] = ["read_file", "list_dir", "grep"];
+
+/// Builds the subagent's own per-turn tool list: [`tool_definitions`]'s base
+/// array filtered down to [`EXPLORE_TOOL_NAMES`]. This is the ONLY tool list
+/// ever handed to a subagent's model calls in [`run_subagent_turn`] — the
+/// depth-1 cap on delegation (a subagent can never spawn another subagent)
+/// falls directly out of `"task"` never appearing in this allowlist, with no
+/// separate runtime recursion guard needed. See `tests::` below for the
+/// construction proof.
+fn explore_tool_definitions() -> Vec<serde_json::Value> {
+    tools_def::tool_definitions()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|def| {
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            EXPLORE_TOOL_NAMES.contains(&name)
+        })
+        .collect()
+}
+
+/// Executes one tool call from inside a `task` subagent's own loop —
+/// deliberately a SEPARATE, much smaller dispatcher from the top-level
+/// [`execute_tool_call`] rather than a recursive call into it: it implements
+/// only the three [`EXPLORE_TOOL_NAMES`] arms, so `write_file`/`edit_file`/
+/// `run_shell`/`task` (and anything else) fall straight to the `other` arm's
+/// "Unknown tool" error no matter what a model hallucinates into the
+/// `function.name` field — the shell/write path, and further delegation, are
+/// categorically unreachable here by construction, not by a mode/permission
+/// check that could have an exception carved into it later. None of
+/// `EXPLORE_TOOL_NAMES`'s tools are permission-gated (see `tools_cli.rs`'s
+/// `read_file`/`list_dir`/`grep`, which take no `TerminalPermissions` at
+/// all), so this needs no `perms` parameter and never prompts.
+async fn execute_subagent_tool_call(state: &AppState, name: &str, raw_arguments: &str) -> String {
+    let args: serde_json::Value = if raw_arguments.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(raw_arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({
+                    "error": format!("Invalid tool call arguments JSON for \"{name}\": {e}")
+                })
+                .to_string()
+            }
+        }
+    };
+
+    let result: Result<serde_json::Value, String> = match name {
+        "read_file" => tools_cli::read_file(state, args["path"].as_str().unwrap_or_default())
+            .map(serde_json::Value::String),
+        "list_dir" => tools_cli::list_dir(state, args["path"].as_str().unwrap_or_default())
+            .map(serde_json::Value::Array),
+        "grep" => tools_cli::grep(state, args["pattern"].as_str().unwrap_or_default(), args["path"].as_str())
+            .map(serde_json::Value::Array),
+        other => Err(format!(
+            "Unknown tool \"{other}\" — this subagent only has read-only explore tools (read_file, list_dir, grep) and cannot spawn further subagents."
+        )),
+    };
+
+    match result {
+        Ok(serde_json::Value::String(s)) => s,
+        Ok(other) => other.to_string(),
+        Err(err) => serde_json::json!({ "error": err }).to_string(),
+    }
+}
+
+/// Runs one `task`-delegated subagent to completion and returns its final
+/// report as the string to use for the parent's `task` tool-call result —
+/// mirrors `subagent.ts`'s `runSubagentTask`, minus the GUI's live
+/// `subagentStore` status (there is no timeline here; the `println!`s below
+/// are the terminal's equivalent "don't look hung" signal) and minus any
+/// checkpoint/turn_id threading (explore-only tools never mutate, so there is
+/// nothing to checkpoint or cancel-scope).
+///
+/// Seeds a brand-new, local message history — never touching the parent
+/// turn's `history` — with a subagent system prompt plus `prompt` as the user
+/// message, then loops model→tools→model up to [`MAX_SUBAGENT_ITERATIONS`]
+/// times using [`explore_tool_definitions`] and [`execute_subagent_tool_call`]
+/// exclusively. Never propagates an error out to the caller: a model-call
+/// failure or the iteration cap becomes a `{"error": ...}` string result
+/// instead, exactly like every other tool result — so a subagent that stalls
+/// or the provider that errors out still yields a well-formed tool message
+/// for the parent's history (the transcript-validity invariant: every
+/// `task` tool_call must get a matching tool result).
+async fn run_subagent_turn(
+    client: &reqwest::Client,
+    target: &Target,
+    options: &chat::ChatOptions,
+    state: &AppState,
+    description: &str,
+    prompt: &str,
+) -> String {
+    let system = format!(
+        "You are a subagent completing one scoped task: \"{description}\". You have read-only tools only \
+         (read_file, list_dir, grep) — you cannot write, edit, run shell commands, or delegate to a further \
+         subagent. Investigate, then reply with a final report; your reply is returned to the coordinating \
+         agent, not shown directly to the user. Do not ask questions — if blocked, report what you found and \
+         why you stopped."
+    );
+    let mut history = vec![
+        serde_json::json!({ "role": "system", "content": system }),
+        serde_json::json!({ "role": "user", "content": prompt }),
+    ];
+    let tools_vec = explore_tool_definitions();
+    let native = target.is_native();
+
+    for _ in 0..MAX_SUBAGENT_ITERATIONS {
+        let result = match chat::stream_turn(client, target, history.as_slice(), &tools_vec, options).await {
+            Ok(r) => r,
+            Err(e) => return serde_json::json!({ "error": e }).to_string(),
+        };
+        println!();
+
+        let mut assistant_message = serde_json::json!({ "role": "assistant", "content": result.content });
+
+        if result.tool_calls.is_empty() {
+            return truncate_report(&result.content);
+        }
+
+        assistant_message["tool_calls"] = serde_json::json!(result
+            .tool_calls
+            .iter()
+            .map(|c| if native {
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&c.arguments).unwrap_or_else(|_| serde_json::json!({}));
+                serde_json::json!({ "function": { "name": c.name, "arguments": arguments } })
+            } else {
+                serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect::<Vec<_>>());
+        history.push(assistant_message);
+
+        for call in &result.tool_calls {
+            println!("\n[subagent tool] {}({})", call.name, call.arguments);
+            let content = execute_subagent_tool_call(state, &call.name, &call.arguments).await;
+            println!("[subagent tool result] {}", preview(&content, 300));
+
+            history.push(if native {
+                serde_json::json!({ "role": "tool", "tool_name": call.name, "content": content })
+            } else {
+                serde_json::json!({ "role": "tool", "tool_call_id": call.id, "content": content })
+            });
+        }
+    }
+
+    serde_json::json!({
+        "error": format!("Subagent \"{description}\" exceeded {MAX_SUBAGENT_ITERATIONS} tool-calling iterations without a final answer.")
+    })
+    .to_string()
+}
+
 /// Prefix identifying a synthetic `[Verify]` notice pushed into `history` —
 /// a Rust port of `agentLoop.ts`'s `VERIFY_NOTE_PREFIX`/`formatVerifyNotice`.
 /// Unlike the desktop app there's no `MessageList` to render these as a
@@ -229,6 +429,9 @@ async fn present_plan(perms: &mut TerminalPermissions, args: &serde_json::Value)
 /// a hard failure — the model sees it as a JSON `{"error": ...}` payload
 /// instead, so it can react and retry rather than crashing the whole turn.
 async fn execute_tool_call(
+    client: &reqwest::Client,
+    target: &Target,
+    options: &chat::ChatOptions,
     state: &AppState,
     perms: &mut TerminalPermissions,
     name: &str,
@@ -269,6 +472,45 @@ async fn execute_tool_call(
             present_plan(perms, &args).await;
             PRESENT_PLAN_RESULT.to_string()
         };
+    }
+
+    // `task` delegates a scoped subtask to a subagent with its own isolated
+    // tool-calling loop (see `run_subagent_turn`/`explore_tool_definitions`/
+    // `execute_subagent_tool_call` above) — a Rust port of `turnEngine.ts`'s
+    // `executeToolCall` `"task"` branch, checked before the `mcp__`/built-in
+    // dispatch below exactly like `present_plan` is. CLI parity is
+    // deliberately EXPLORE-ONLY (slice 5 of docs/roadmap/p3-subagents.md):
+    // the desktop app's `code` profile relies on injecting the *parent's*
+    // checkpoint_id into the child's mutating tool calls so subagent writes
+    // land in the parent turn's revertable checkpoint manifest, but the CLI
+    // has no checkpoints at all (`checkpoints_cli`'s begin/end pair exists
+    // only for the top-level turn in `run_turn`) — there is nothing safe to
+    // revert a subagent's shell command or file write into here, so `"code"`
+    // is rejected outright rather than silently downgraded or run unguarded.
+    // Depth is capped at 1 by construction: `run_subagent_turn` only ever
+    // offers `explore_tool_definitions()` to the child model and only ever
+    // dispatches through `execute_subagent_tool_call`, which has no `"task"`
+    // arm at all — there is no code path from inside a subagent back into
+    // this function, so a subagent spawning another subagent is
+    // structurally unreachable, not merely guarded by a runtime counter.
+    if name == "task" {
+        let description = args["description"].as_str().unwrap_or("(untitled subtask)").to_string();
+        let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
+        let profile = args["profile"].as_str().unwrap_or(CLI_SUBAGENT_PROFILE);
+        if profile != CLI_SUBAGENT_PROFILE {
+            return serde_json::json!({
+                "error": format!(
+                    "lm-cli only supports the 'explore' subagent profile (got '{profile}') — there are no \
+                     checkpoints here to safely land a 'code'-profile subagent's mutations into; see \
+                     docs/roadmap/p3-subagents.md slice 5."
+                )
+            })
+            .to_string();
+        }
+        println!("\n[subagent: {description}] starting…");
+        let report = run_subagent_turn(client, target, options, state, &description, &prompt).await;
+        println!("[subagent: {description}] done.");
+        return report;
     }
 
     // `mcp__<serverId>__<toolName>`-named calls dispatch to the connected
@@ -570,6 +812,13 @@ async fn run_tool_loop(
     if !attached_stacks.is_empty() {
         tools_vec.push(tools_def::search_docs_tool_def(attached_stacks));
     }
+    // `task` is offered only when `--subagents` was given — mirrors the
+    // desktop app's `subagentsEnabled` toggle (default off) and the
+    // `present_plan`/`search_docs` per-turn-conditional pattern just above.
+    // See `execute_tool_call`'s `"task"` arm for the dispatch and depth cap.
+    if options.subagents {
+        tools_vec.push(tools_def::task_tool_def());
+    }
     let native = target.is_native();
 
     // Absolute (or workspace-relative, as given by the model) paths this
@@ -658,6 +907,9 @@ async fn run_tool_loop(
         for call in &result.tool_calls {
             println!("\n[tool] {}({})", call.name, call.arguments);
             let content = execute_tool_call(
+                client,
+                target,
+                options,
                 state,
                 perms,
                 &call.name,
@@ -720,11 +972,20 @@ mod tests {
     /// in, say, `"auto"` mode could pop an unexpected "switch to act mode?"
     /// prompt. Every other mode used here is asserted, not just `"manual"`,
     /// so a future mode addition can't silently widen the guard by accident.
+    /// A `Target`/`ChatOptions`/`reqwest::Client` fixture for `execute_tool_call`
+    /// tests below that never actually need to reach the network (every case
+    /// here is rejected, or dispatched, before any model call would happen).
+    fn dummy_target_and_options() -> (reqwest::Client, Target, chat::ChatOptions) {
+        let target = Target::Local { base_url: "http://127.0.0.1:0".to_string(), model: None, native_ollama: false };
+        (reqwest::Client::new(), target, chat::ChatOptions::default())
+    }
+
     #[tokio::test]
     async fn present_plan_is_rejected_outside_plan_mode() {
         let state = AppState::default();
         let registry = McpToolRegistry(std::collections::HashMap::new());
         let args = r#"{"title":"t","plan":"p"}"#;
+        let (client, target, options) = dummy_target_and_options();
 
         for mode in [
             PermissionMode::Manual,
@@ -734,14 +995,107 @@ mod tests {
             PermissionMode::Bypass,
         ] {
             let mut perms = TerminalPermissions::new(mode);
-            let content =
-                execute_tool_call(&state, &mut perms, "present_plan", args, None, &[], &registry, &[]).await;
+            let content = execute_tool_call(
+                &client, &target, &options, &state, &mut perms, "present_plan", args, None, &[], &registry, &[],
+            )
+            .await;
             let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert!(parsed["error"].as_str().unwrap().contains("Plan Mode"), "mode {mode:?} should reject present_plan");
             // The guard must reject BEFORE flipping anything — mode stays
             // exactly what it was.
             assert_eq!(perms.mode(), mode);
         }
+    }
+
+    /// A `task` call requesting the `"code"` profile must be rejected outright
+    /// (not silently downgraded to `"explore"`) — the CLI has no checkpoints
+    /// to safely land a mutating subagent's writes into (design doc slice 5).
+    /// Asserted across every permission mode, including `bypass`: this is a
+    /// profile-support rejection, not a permission decision, so no mode
+    /// should ever let it through.
+    #[tokio::test]
+    async fn task_rejects_code_profile_in_every_mode() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let args = r#"{"description":"d","prompt":"p","profile":"code"}"#;
+        let (client, target, options) = dummy_target_and_options();
+
+        for mode in [PermissionMode::Manual, PermissionMode::Bypass, PermissionMode::Auto] {
+            let mut perms = TerminalPermissions::new(mode);
+            let content =
+                execute_tool_call(&client, &target, &options, &state, &mut perms, "task", args, None, &[], &registry, &[])
+                    .await;
+            let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                parsed["error"].as_str().unwrap().contains("explore"),
+                "mode {mode:?} should reject the 'code' subagent profile"
+            );
+        }
+    }
+
+    /// The depth-1 cap on subagent delegation: `explore_tool_definitions()`
+    /// (the ONLY tool list ever handed to a `task` subagent's own model
+    /// calls) must never include `"task"` itself — verified by construction,
+    /// not merely by a runtime counter, per the design doc's invariant that a
+    /// subagent can never spawn another subagent.
+    #[test]
+    fn explore_tool_definitions_never_includes_task_or_mutating_tools() {
+        let defs = explore_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["read_file", "list_dir", "grep"]);
+        assert!(!names.contains(&"task"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"run_shell"));
+    }
+
+    /// The shell/write path (and further delegation) must be categorically
+    /// unreachable from inside a subagent's own tool dispatch — not merely
+    /// absent from the tool list offered to the model, since a model can
+    /// hallucinate a function name it was never offered. Exercises every
+    /// dangerous name directly against `execute_subagent_tool_call`, which
+    /// takes no `TerminalPermissions` at all (nothing here should ever need
+    /// to prompt), confirming each falls to the "Unknown tool" arm rather
+    /// than being dispatched.
+    #[tokio::test]
+    async fn subagent_dispatch_cannot_reach_write_shell_or_task() {
+        let state = AppState::default();
+        for (name, args) in [
+            ("write_file", r#"{"path":"x","content":"y"}"#),
+            ("edit_file", r#"{"path":"x","old_string":"a","new_string":"b"}"#),
+            ("run_shell", r#"{"command":"echo hi"}"#),
+            ("task", r#"{"description":"d","prompt":"p","profile":"explore"}"#),
+            ("remember", r#"{"text":"x"}"#),
+        ] {
+            let content = execute_subagent_tool_call(&state, name, args).await;
+            let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                parsed["error"].as_str().unwrap().contains("Unknown tool"),
+                "{name} should be unreachable from a subagent's own dispatch"
+            );
+        }
+    }
+
+    /// A subagent's final plain-text answer (no further tool calls) becomes
+    /// the `task` tool's result verbatim when under the report cap — no
+    /// wrapping, no truncation marker.
+    #[test]
+    fn truncate_report_passes_short_reports_through_unchanged() {
+        assert_eq!(truncate_report("short report"), "short report");
+    }
+
+    /// A report over `SUBAGENT_REPORT_CHAR_CAP` chars is truncated with a
+    /// marker noting how much was cut, rather than silently dropped or
+    /// returned in full (the "context/report bloat" risk the design doc
+    /// calls out) — mirrors `build_verify_output_caps_and_keeps_the_tail`'s
+    /// shape above.
+    #[test]
+    fn truncate_report_caps_long_reports_with_a_marker() {
+        let long = "z".repeat(SUBAGENT_REPORT_CHAR_CAP + 200);
+        let truncated = truncate_report(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.starts_with('z'));
     }
 
     #[test]
