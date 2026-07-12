@@ -415,6 +415,17 @@ interface AttemptResult {
   streamError: string | null;
   /** Whether any content/tool-call fragment arrived before `streamError` (if any) — the failover safety rule below only ever retries a *different* target when this is `false`, since a mid-stream error has already shown the user partial output that a retry could duplicate or contradict. */
   contentStarted: boolean;
+  /** The raw token counts from this attempt's own `usage` stream event, if
+   * one arrived — populated regardless of `recordUsage` (see that param's
+   * doc comment): `recordUsage` only gates whether `useUsageStore` gets
+   * written, it must never gate whether the CALLER can see its own attempt's
+   * usage. `subagent.ts`'s `runSubagentTask` is the one caller that reads
+   * this (slice 4, per-subagent token usage surfaced in `SubagentRow`) —
+   * every pre-existing caller already gets the same numbers via
+   * `useUsageStore` and simply ignores this field. `undefined` when no
+   * `usage` event arrived at all (e.g. a provider that doesn't report it, or
+   * a stream that errored before one showed up). */
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
 }
 
 /**
@@ -454,6 +465,7 @@ export async function attemptStream(
   const toolCalls: ToolCall[] = [];
   let streamError: string | null = null;
   let contentStarted = false;
+  let usage: AttemptResult['usage'];
 
   const events: AsyncGenerator<StreamEvent> =
     target.kind === 'provider'
@@ -470,12 +482,13 @@ export async function attemptStream(
         contentStarted = true;
         toolCalls.push(event.toolCall);
       } else if (event.type === 'usage') {
+        usage = {
+          promptTokens: event.usage.prompt_tokens,
+          completionTokens: event.usage.completion_tokens,
+          totalTokens: event.usage.total_tokens,
+        };
         if (recordUsage) {
-          useUsageStore.getState().setUsage(sessionId, {
-            promptTokens: event.usage.prompt_tokens,
-            completionTokens: event.usage.completion_tokens,
-            totalTokens: event.usage.total_tokens,
-          });
+          useUsageStore.getState().setUsage(sessionId, usage);
         }
       }
       // 'done' carries no data; the generator simply returns after it.
@@ -484,5 +497,5 @@ export async function attemptStream(
     streamError = err instanceof Error ? err.message : String(err);
   }
 
-  return { content, toolCalls, streamError, contentStarted };
+  return { content, toolCalls, streamError, contentStarted, usage };
 }

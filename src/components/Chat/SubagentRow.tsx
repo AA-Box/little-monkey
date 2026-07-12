@@ -9,6 +9,11 @@ import { StatusPill, type PillTone } from "../ui";
 import { useT } from "../../lib/i18n";
 import { ToolCallRow, resultLooksLikeError } from "./MessageList";
 
+/** Same `en-US` grouping-separator formatting `ContextUsageIndicator.tsx` uses for the parent session's own token count — kept local (rather than shared) since the two components have no other coupling and this is a one-line function. */
+function formatTokenCount(value: number): string {
+  return value.toLocaleString("en-US");
+}
+
 export interface SubagentRowProps {
   /** The session this `task` tool_call belongs to — used only to look up
    * `ChatSession.subagentRuns` as a fallback once `subagentStore`'s
@@ -170,6 +175,11 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
             {t(profile === "code" ? "SubagentRow.profileCode" : "SubagentRow.profileExplore")}
           </span>
           <StatusPill tone={tone}>{t(statusLabelKey(status))}</StatusPill>
+          {live?.usage && (
+            <span className="shrink-0 font-mono text-[10px] text-faint">
+              {t("SubagentRow.tokenUsage", { count: formatTokenCount(live.usage.totalTokens) })}
+            </span>
+          )}
           {running && live?.lastActivity && (
             <span className="ml-auto flex min-w-0 shrink items-center gap-1 truncate text-faint">
               <span className="flex items-center gap-1">
@@ -183,7 +193,15 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
         </button>
         {open && (
           <div className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
-            <div className="text-faint">{t("SubagentRow.toolCallCount", { count: toolCallCount })}</div>
+            <div className="flex items-center gap-2 text-faint">
+              <span>{t("SubagentRow.toolCallCount", { count: toolCallCount })}</span>
+              {live?.usage && (
+                <>
+                  <span>·</span>
+                  <span>{t("SubagentRow.tokenUsage", { count: formatTokenCount(live.usage.totalTokens) })}</span>
+                </>
+              )}
+            </div>
             {childToolCalls.length === 0 ? (
               <div className="text-faint">{t("SubagentRow.noActivity")}</div>
             ) : (

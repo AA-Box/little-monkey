@@ -21,6 +21,7 @@ import type { McpToolRegistry } from './mcpTools';
 import { useWorkspaceStore } from '../store/workspaceStore';
 import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
+import { useSettingsStore } from '../store/settingsStore';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -78,6 +79,26 @@ function activityLabel(toolCall: ToolCall): string {
  * populated either way. */
 function emptyMcpRegistry(): McpToolRegistry {
   return new Map();
+}
+
+/**
+ * Applies the optional per-profile model override (slice 4,
+ * `settingsStore.subagentProfileModels`) on top of the parent's own
+ * already-resolved `target`, if the user configured one for this specific
+ * `profile` — e.g. running every `explore` subagent on a cheap/local model
+ * while the parent conversation stays on something stronger. Off by default
+ * (`subagentProfileModels` starts empty): when nothing is configured for
+ * `profile`, this returns `target` unchanged, so a fresh install behaves
+ * exactly like slices 1-3 with zero new surface. Only ever swaps to another
+ * PROVIDER target (see that setting's own doc comment for why) — never
+ * re-resolves the parent's own target, so a mid-turn manual model switch in
+ * the parent still can't split-brain a turn (the design doc's own
+ * `resolveTarget`-once invariant, preserved here for the override path too).
+ */
+function resolveSubagentTarget(target: ResolvedTarget, profile: 'explore' | 'code'): ResolvedTarget {
+  const override = useSettingsStore.getState().subagentProfileModels[profile];
+  if (!override) return target;
+  return { kind: 'provider', providerId: override.providerId, model: override.model };
 }
 
 /** Everything `runSubagentTask` needs to drive one subagent run — see
@@ -196,6 +217,12 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     const systemPrompt = buildSubagentSystemPrompt(roots, osLabel, profile, description);
     const tools: ToolDef[] = toolsForProfile(profile);
     const mcpRegistry = emptyMcpRegistry();
+    // Resolved once, up front — not re-checked every iteration — for the
+    // same "never split-brain mid-run" reason `target` itself is passed down
+    // rather than re-resolved (see `RunSubagentTaskParams.target`'s doc
+    // comment): a settings change mid-run shouldn't retarget an
+    // already-running subagent partway through its own loop.
+    const resolvedTarget = resolveSubagentTarget(target, profile);
 
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
       if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
@@ -206,7 +233,11 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       // child attempt's usage must never clobber the PARENT session's
       // context-usage ring. `onDelta` is omitted: nothing renders the
       // child's in-progress streaming content anywhere in this slice.
-      const attempt = await attemptStream(target, wireHistory, tools, parentSignal, effort, sessionId, undefined, false);
+      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, parentSignal, effort, sessionId, undefined, false);
+
+      if (attempt.usage) {
+        useSubagentStore.getState().accumulateUsage(storeKey, attempt.usage);
+      }
 
       if (attempt.streamError !== null) {
         return finish('error', stringifyToolError(new Error(attempt.streamError)));
