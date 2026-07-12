@@ -18,6 +18,8 @@ import { streamProviderChat } from './providerClient';
 import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
+import { useUsageHistoryStore } from '../store/usageHistoryStore';
+import { useModelStore } from '../store/modelStore';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
 import { runSubagentTask } from './subagent';
 
@@ -30,6 +32,17 @@ export type ResolvedTarget =
   | { kind: 'local'; baseUrl: string }
   | { kind: 'ollama'; baseUrl: string; model: string }
   | { kind: 'provider'; providerId: string; model: string };
+
+/** Human-readable label identifying which model a `usage` event belongs to,
+ * for the Settings "Usage" tab's per-model breakdown. Local llama.cpp
+ * targets carry no model name of their own (see `ResolvedTarget`), so the
+ * active model's display name is read from `modelStore` at the moment usage
+ * arrives; Ollama/provider targets already carry a model id. */
+export function describeUsageTarget(target: ResolvedTarget): string {
+  if (target.kind === 'local') return useModelStore.getState().active?.name ?? 'Local model';
+  if (target.kind === 'ollama') return `Ollama · ${target.model}`;
+  return `${target.providerId} · ${target.model}`;
+}
 
 /** Stringifies a tool invocation's result (or error) for use as tool-message content. */
 function stringifyToolResult(result: unknown): string {
@@ -247,6 +260,7 @@ export async function executeToolCall(
   // child's tool calls.
   agentLabel?: string
 ): Promise<string> {
+  useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
 
   let args: Record<string, unknown> = {};
@@ -534,6 +548,7 @@ export async function attemptStream(
         };
         if (recordUsage) {
           useUsageStore.getState().setUsage(sessionId, usage);
+          useUsageHistoryStore.getState().recordUsage(describeUsageTarget(target), usage);
         }
       }
       // 'done' carries no data; the generator simply returns after it.

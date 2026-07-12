@@ -7,7 +7,7 @@
 //!
 //! Every CLI-originated checkpoint is tagged with the fixed `"cli"` session
 //! id (there is no real per-window session here — CLI history is in-memory
-//! only), which also lets `/revert` and `lm revert` find "the most recent CLI
+//! only), which also lets `/revert` and `monkey revert` find "the most recent CLI
 //! checkpoint" without mixing in the desktop app's own per-window checkpoints
 //! that happen to live in the same directory.
 //!
@@ -18,9 +18,6 @@ use std::path::PathBuf;
 
 use little_monkey_lib::checkpoints;
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json`.
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 /// Session id every CLI turn's checkpoint is stamped with.
 pub const CLI_SESSION_ID: &str = "cli";
 
@@ -29,7 +26,7 @@ pub const CLI_SESSION_ID: &str = "cli";
 /// (e.g. a read-only home) — callers degrade to "no checkpoint this turn"
 /// rather than failing the turn.
 pub fn base_dir() -> Option<PathBuf> {
-    let dir = dirs::data_dir()?.join(APP_IDENTIFIER).join("checkpoints");
+    let dir = little_monkey_lib::app_paths::data_dir()?.join("checkpoints");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

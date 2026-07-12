@@ -1,4 +1,4 @@
-//! Modelfile parser for `lm-cli create`: turns the Ollama Modelfile format
+//! Modelfile parser for `monkey-cli create`: turns the Ollama Modelfile format
 //! (FROM/PARAMETER/TEMPLATE/SYSTEM/ADAPTER/LICENSE/MESSAGE, `#` comments,
 //! triple-quoted `"""..."""` multiline values) into the daemon's
 //! `POST /api/create` request shape. File-based imports (FROM/ADAPTER
@@ -98,13 +98,13 @@ pub fn to_create_request(
         .ok_or("Modelfile has no FROM instruction".to_string())?;
     if std::path::Path::new(&from).exists() {
         return Err(format!(
-            "FROM '{from}' points at a local file/directory. GGUF/safetensors import via lm-cli create \
+            "FROM '{from}' points at a local file/directory. GGUF/safetensors import via monkey-cli create \
              requires FROM <existing-model>; use `ollama create` for file imports."
         ));
     }
     if parsed.adapter.is_some() {
         return Err(
-            "ADAPTER requires uploading local files, which lm-cli create doesn't support; \
+            "ADAPTER requires uploading local files, which monkey-cli create doesn't support; \
              use `ollama create` instead."
                 .to_string(),
         );

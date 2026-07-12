@@ -11,14 +11,8 @@ use std::path::{Path, PathBuf};
 
 use little_monkey_lib::verify::{self, VerifyCommand};
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
-/// hardcoded-identifier app-data resolution as `providers_cli.rs`/
-/// `checkpoints_cli.rs`/`tools_cli.rs` (duplicated per module rather than
-/// shared, following their precedent).
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 fn verify_configs_path() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join(APP_IDENTIFIER).join("verify_configs.json"))
+    Some(little_monkey_lib::app_paths::data_dir()?.join("verify_configs.json"))
 }
 
 /// Core lookup, parameterized by `configs_path` so it's directly testable

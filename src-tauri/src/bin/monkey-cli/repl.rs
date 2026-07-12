@@ -1,9 +1,9 @@
 //! The interactive REPL — an `ollama run`-style chat prompt: rustyline line
-//! editing with persistent history in `~/.lm_cli_history`, a `>>> ` prompt,
+//! editing with persistent history in `~/.monkey_cli_history`, a `>>> ` prompt,
 //! `"""` multi-line messages, and slash commands (`/set`, `/show`, `/save`,
 //! `/load`, `/revert`, `/clear`, `/bye`, `/?`) that mutate the live session. When stdin
 //! is not a TTY the whole thing falls back to a plain `read_line` loop with
-//! no prompts or banner, so piped input (`echo hi | lm-cli --ollama X`)
+//! no prompts or banner, so piped input (`echo hi | monkey-cli --ollama X`)
 //! keeps working.
 
 use std::io::IsTerminal;
@@ -40,7 +40,7 @@ impl Reader {
     fn new() -> Self {
         if std::io::stdin().is_terminal() {
             if let Ok(mut editor) = rustyline::DefaultEditor::new() {
-                let path = dirs::home_dir().map(|h| h.join(".lm_cli_history"));
+                let path = dirs::home_dir().map(|h| h.join(".monkey_cli_history"));
                 if let Some(path) = &path {
                     let _ = editor.load_history(path);
                 }
@@ -639,7 +639,7 @@ async fn handle_load(
     let tags = ollama_api::tags(client).await?;
     let want = if name.contains(':') { name.to_string() } else { format!("{name}:latest") };
     if !tags.models.iter().any(|m| m.name == want) {
-        return Err(format!("model '{name}' not found — run: lm-cli pull {name}"));
+        return Err(format!("model '{name}' not found — run: monkey-cli pull {name}"));
     }
     *model = Some(want.clone());
     println!("Loading model '{want}'");
@@ -699,7 +699,7 @@ fn print_shortcuts() {
   Ctrl + l         Clear the screen
   Ctrl + c         Cancel the current input
   Ctrl + d         Exit (on an empty line)
-  Up / Down        Walk the input history (~/.lm_cli_history)"
+  Up / Down        Walk the input history (~/.monkey_cli_history)"
     );
 }
 

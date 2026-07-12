@@ -1,4 +1,9 @@
-// `pub` so a future `lm-cli` parity command (matching `checkpoints`/`rules`/
+// `pub` so every module below (and `monkey-cli`, which has no `AppHandle`)
+// resolves the app-data directory through one shared `data_dir()` instead of
+// each hardcoding the same identifier string independently — see the module
+// doc for the drift risk this replaces.
+pub mod app_paths;
+// `pub` so a future `monkey-cli` parity command (matching `checkpoints`/`rules`/
 // `memory`/`web`/`verify` above) could reuse `publish_impl`/`remove_impl`
 // directly — no such command exists yet (rendering has no terminal surface,
 // per the design doc's phase-4 note), but there's no reason to make this one
@@ -6,7 +11,7 @@
 pub mod artifacts;
 pub mod checkpoints;
 mod git;
-// `pub` so `lm-cli`'s `embed_cli` module (RAG design doc slice 4 CLI parity)
+// `pub` so `monkey-cli`'s `embed_cli` module (RAG design doc slice 4 CLI parity)
 // can reuse `find_llama_server_binary`/`embed_server_args`/`EMBED_PORT`/
 // `LlamaState::for_embeddings` directly instead of re-implementing the
 // embeddings-only `llama-server` process's binary discovery and flags — the
@@ -18,42 +23,53 @@ pub mod mcp;
 mod models;
 pub mod ollama;
 pub mod providers;
-// `pub` so a future `lm-cli` `Stacks` subcommand (RAG design doc, slice 4)
+// `pub` so a future `monkey-cli` `Stacks` subcommand (RAG design doc, slice 4)
 // can call `stacks::list_impl`/`reindex_impl`/`query_impl` directly, the
 // same AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`.
 pub mod stacks;
-// `pub` so `lm-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
+// `pub` so `monkey-cli` (slice 4) can reuse `load_impl`/`PromptEntry` directly,
 // the same reasoning as `rules`/`checkpoints` above.
 pub mod prompts;
 mod sessions;
 mod system;
 mod tools;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
-// `lm-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
+// `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
 // `"smart"` mode — the same AppHandle-free-core reasoning as `web`/`rules`/
 // `memory`/`verify` above. Every other item in this module (the Tauri
 // commands, `PermissionState`, `request_permission`) stays reachable too,
 // but is only ever actually called from `main.rs`'s own Tauri app wiring,
-// not from `lm-cli`.
+// not from `monkey-cli`.
 pub mod permissions;
-// `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `lm-cli`
+// `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `monkey-cli`
 // (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
 // from `little_monkey_lib`, the same way it already reuses `checkpoints`.
 pub mod rules;
 pub mod memory;
 pub mod workspace;
-// `pub` so `lm-cli` (phase 4) can call `web::fetch_impl` directly, the same
+// `pub` so `monkey-cli` (phase 4) can call `web::fetch_impl` directly, the same
 // AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory` above.
 pub mod web;
-// `pub` so a future `lm-cli` `api-serve` subcommand (design doc phase 4) can
+// `pub` so a future `monkey-cli` `api-serve` subcommand (design doc phase 4) can
 // call `server::handle_request` directly for headless use, the same
 // AppHandle-free-core reasoning as `web`/`rules`/`memory` above.
 pub mod server;
-// `pub` so `lm-cli` (a later slice) can call `verify::run_command_impl`
+// `pub` so `monkey-cli` (a later slice) can call `verify::run_command_impl`
 // directly, the same AppHandle-free-core reasoning as `web`/`rules`/`memory`
 // above.
 pub mod verify;
+// `pub` so `monkey-cli`'s `task.rs` (design doc slice 1) can call
+// `parse_recipe`/`render_recipe`/`discover_recipes`/`resolve_recipe`
+// directly, the same AppHandle-free-core reasoning as every other module
+// above.
+pub mod recipes;
+// `pub` so a future `monkey-cli` `task schedule` subcommand could reuse
+// `validate_cron_impl`/`next_occurrences_impl` directly, the same
+// AppHandle-free-core reasoning as every other module above — no such
+// subcommand exists yet (it emits a launchd/crontab line, no in-process
+// scheduling), but there's no reason to make this one module-private either.
+pub mod automations;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -303,6 +319,8 @@ pub fn run() {
             permissions::permission_respond,
             permissions::set_permission_mode,
             permissions::get_permission_mode,
+            permissions::set_permission_mode_for_turn,
+            permissions::clear_permission_mode_for_turn,
             tools::tool_read_file,
             tools::tool_list_dir,
             tools::tool_grep,
@@ -376,6 +394,18 @@ pub fn run() {
             stacks::stacks_query,
             stacks::stacks_is_stale,
             stacks::tool_search_docs,
+            recipes::recipes_list,
+            recipes::recipes_read,
+            recipes::recipes_read_raw,
+            recipes::recipes_render,
+            recipes::recipes_save,
+            recipes::recipes_delete,
+            recipes::recipes_validate,
+            automations::automations_load,
+            automations::automations_save,
+            automations::cron_validate,
+            automations::cron_next,
+            automations::cron_previous,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

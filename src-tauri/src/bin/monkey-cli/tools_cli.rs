@@ -19,18 +19,12 @@ const GREP_SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "dist"];
 const GREP_MAX_MATCHES: usize = 200;
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json` — same
-/// hardcoded-identifier app-data resolution as `providers_cli.rs`/
-/// `checkpoints_cli.rs` (duplicated per module rather than shared, following
-/// their precedent).
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 /// Resolves (creating the app-data dir if necessary) `<app-data>/memories.json`
 /// — the same file `memory.rs::memories_file_path` resolves via an
 /// `AppHandle`. `None` only when the OS data dir can't be resolved or
 /// created, mirroring `checkpoints_cli::base_dir`'s tolerance.
 fn memories_file_path() -> Option<std::path::PathBuf> {
-    let dir = dirs::data_dir()?.join(APP_IDENTIFIER);
+    let dir = little_monkey_lib::app_paths::data_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("memories.json"))
 }

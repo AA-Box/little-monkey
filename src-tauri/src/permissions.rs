@@ -234,6 +234,18 @@ pub struct PermissionState {
     /// frontend is responsible for pushing a restored non-"manual" mode back
     /// to [`set_permission_mode`] itself, once, at startup.
     pub mode: Mutex<String>,
+    /// `turn_id -> mode`, consulted by [`request_permission`] (via
+    /// [`effective_mode`]) *before* falling back to the global `mode` above.
+    /// This is the turn-scoped counterpart to `pending`'s existing turn-id
+    /// keying (see that field's doc comment) — a scheduled automation run
+    /// (or any other single turn that needs its own mode) can set an
+    /// override for just its own turn id via [`set_permission_mode_for_turn`]
+    /// and clear it via [`clear_permission_mode_for_turn`] when done, without
+    /// racing a concurrent split-pane turn's global mode. Purely additive:
+    /// nothing that doesn't set an override is affected, so every existing
+    /// Plan/Act/smart-mode call site keeps using the global `mode` exactly
+    /// as before.
+    pub turn_mode_overrides: Mutex<HashMap<String, String>>,
 }
 
 impl Default for PermissionState {
@@ -242,6 +254,7 @@ impl Default for PermissionState {
             pending: Mutex::new(HashMap::new()),
             session_allow: Mutex::new(HashSet::new()),
             mode: Mutex::new("manual".to_string()),
+            turn_mode_overrides: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -258,7 +271,10 @@ const NO_SESSION_REMEMBER: &[&str] = &["run_shell"];
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Every valid permission mode identifier, shared verbatim with the frontend.
-const VALID_MODES: &[&str] = &["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
+/// `pub(crate)` so `recipes.rs`'s `validate_recipe` can check a recipe's
+/// `permission_mode` field against exactly this list — one source of truth
+/// instead of a second hand-copied list that could drift.
+pub(crate) const VALID_MODES: &[&str] = &["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
 
 /// Mode-based short-circuit decision for [`request_permission`]:
 /// `Some(result)` means the mode decides on its own without prompting;
@@ -350,6 +366,26 @@ fn mode_short_circuit(mode: &str, tool: &str, risk: Option<&RiskAssessment>) -> 
 /// session", resolves `Ok(())` immediately without prompting; otherwise emits
 /// a `permission://request` event and awaits the user's decision (or the
 /// timeout, which counts as a denial).
+/// Resolves the mode that should govern a given permission request: a
+/// turn-scoped override (see [`PermissionState::turn_mode_overrides`]) wins
+/// when `turn` is `Some` and one was set for that exact turn id, otherwise
+/// falls back to the global `mode`. Factored out (like [`mode_short_circuit`])
+/// so it's directly testable without a Tauri `AppHandle`.
+fn effective_mode(state: &AppState, turn: Option<&str>) -> String {
+    if let Some(turn_id) = turn {
+        if let Some(overridden) = state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .get(turn_id)
+        {
+            return overridden.clone();
+        }
+    }
+    state.permissions.mode.lock().unwrap().clone()
+}
+
 pub async fn request_permission<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
@@ -359,7 +395,7 @@ pub async fn request_permission<R: tauri::Runtime>(
     risk: Option<RiskAssessment>,
     agent_label: Option<&str>,
 ) -> Result<(), String> {
-    let mode = state.permissions.mode.lock().unwrap().clone();
+    let mode = effective_mode(state, turn);
 
     if let Some(decision) = mode_short_circuit(&mode, tool, risk.as_ref()) {
         return decision;
@@ -450,6 +486,48 @@ pub fn get_permission_mode(state: tauri::State<'_, AppState>) -> Result<String, 
 /// exercised directly in tests without standing up a full Tauri app/window.
 fn get_permission_mode_impl(state: &AppState) -> String {
     state.permissions.mode.lock().unwrap().clone()
+}
+
+/// Sets a turn-scoped mode override, consulted by [`effective_mode`] before
+/// the global mode for any [`request_permission`] call carrying this exact
+/// `turn_id`. First real consumer: a scheduled automation run applying its
+/// recipe's `permission_mode` to just its own turn, without touching (or
+/// racing) whatever mode a concurrent split-pane turn is using.
+#[tauri::command]
+pub fn set_permission_mode_for_turn(
+    state: tauri::State<'_, AppState>,
+    turn_id: String,
+    mode: String,
+) -> Result<(), String> {
+    set_permission_mode_for_turn_impl(state.inner(), turn_id, mode)
+}
+
+fn set_permission_mode_for_turn_impl(state: &AppState, turn_id: String, mode: String) -> Result<(), String> {
+    if !VALID_MODES.contains(&mode.as_str()) {
+        return Err("Unknown permission mode".to_string());
+    }
+    state
+        .permissions
+        .turn_mode_overrides
+        .lock()
+        .unwrap()
+        .insert(turn_id, mode);
+    Ok(())
+}
+
+/// Removes a turn-scoped mode override, if any — [`effective_mode`] falls
+/// back to the global mode for that turn id again immediately. Callers
+/// should always clear their override when their turn ends (success,
+/// failure, or cancellation) so the map doesn't accumulate stale entries.
+#[tauri::command]
+pub fn clear_permission_mode_for_turn(state: tauri::State<'_, AppState>, turn_id: String) -> Result<(), String> {
+    state
+        .permissions
+        .turn_mode_overrides
+        .lock()
+        .unwrap()
+        .remove(&turn_id);
+    Ok(())
 }
 
 /// Called by the frontend (PermissionModal) once the user makes a decision.
@@ -1112,5 +1190,77 @@ mod tests {
 
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json.get("agent_label").is_none(), "agent_label should be omitted, not null, when absent");
+    }
+
+    #[test]
+    fn effective_mode_falls_back_to_the_global_mode_when_no_turn_is_given() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "acceptEdits".to_string()).unwrap();
+        assert_eq!(effective_mode(&state, None), "acceptEdits");
+    }
+
+    #[test]
+    fn effective_mode_falls_back_to_the_global_mode_when_the_turn_has_no_override() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "acceptEdits".to_string()).unwrap();
+        assert_eq!(effective_mode(&state, Some("turn-a")), "acceptEdits");
+    }
+
+    #[test]
+    fn effective_mode_prefers_a_turn_scoped_override_over_the_global_mode() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "manual".to_string()).unwrap();
+        set_permission_mode_for_turn_impl(&state, "turn-a".to_string(), "bypass".to_string()).unwrap();
+
+        assert_eq!(effective_mode(&state, Some("turn-a")), "bypass");
+        // A concurrent turn with no override of its own is unaffected.
+        assert_eq!(effective_mode(&state, Some("turn-b")), "manual");
+        assert_eq!(effective_mode(&state, None), "manual");
+    }
+
+    #[test]
+    fn set_permission_mode_for_turn_impl_rejects_an_unknown_mode() {
+        let state = AppState::default();
+        let err = set_permission_mode_for_turn_impl(&state, "turn-a".to_string(), "yolo".to_string()).unwrap_err();
+        assert_eq!(err, "Unknown permission mode");
+        assert!(state.permissions.turn_mode_overrides.lock().unwrap().get("turn-a").is_none());
+    }
+
+    #[test]
+    fn clearing_a_turns_override_falls_back_to_the_global_mode_again() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "manual".to_string()).unwrap();
+        set_permission_mode_for_turn_impl(&state, "turn-a".to_string(), "bypass".to_string()).unwrap();
+        assert_eq!(effective_mode(&state, Some("turn-a")), "bypass");
+
+        // `clear_permission_mode_for_turn`'s `#[tauri::command]` wrapper is a
+        // one-line passthrough to this same map removal — exercised directly
+        // here rather than through a mocked `tauri::State`, matching every
+        // other command in this module's test style.
+        state.permissions.turn_mode_overrides.lock().unwrap().remove("turn-a");
+
+        assert_eq!(effective_mode(&state, Some("turn-a")), "manual");
+    }
+
+    #[test]
+    fn clear_permission_mode_for_turn_impl_removes_only_the_named_turns_override() {
+        let state = AppState::default();
+        state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .insert("turn-a".to_string(), "bypass".to_string());
+        state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .insert("turn-b".to_string(), "auto".to_string());
+
+        state.permissions.turn_mode_overrides.lock().unwrap().remove("turn-a");
+
+        assert_eq!(effective_mode(&state, Some("turn-a")), "manual");
+        assert_eq!(effective_mode(&state, Some("turn-b")), "auto");
     }
 }

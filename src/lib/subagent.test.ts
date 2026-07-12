@@ -22,6 +22,8 @@ vi.mock("./turnEngine", () => ({
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
   stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+  describeUsageTarget: (target: ResolvedTarget) =>
+    target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
 
 import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, type RunSubagentTaskParams } from "./subagent";

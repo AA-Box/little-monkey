@@ -29,19 +29,19 @@ use crate::AppState;
 pub(crate) const CHAT_PORT: u16 = 8090;
 /// Port the managed embeddings-only `llama-server` instance listens on —
 /// see `stacks.rs`'s `embed_via_llama`, which talks to this port directly.
-/// `pub` (not `pub(crate)`) so `lm-cli`'s `embed_cli.rs` (RAG design doc slice
+/// `pub` (not `pub(crate)`) so `monkey-cli`'s `embed_cli.rs` (RAG design doc slice
 /// 4, CLI parity for the llama embedding backend) can poll/target the same
 /// port from outside this crate.
 pub const EMBED_PORT: u16 = 8091;
 /// Context size (and `-ub` ubatch size) the embeddings instance is started
 /// with. Not user-configurable in slice 1 — 2048 tokens comfortably covers
 /// `KnowledgeStack::chunk_chars` (1600 chars is well under 2048 tokens). `pub`
-/// so `lm-cli`'s `embed_cli::start` can build the exact same args via
+/// so `monkey-cli`'s `embed_cli::start` can build the exact same args via
 /// [`embed_server_args`].
 pub const EMBED_CTX: u32 = 2048;
 
 /// Builds the embeddings-only `llama-server` process's argument list for
-/// `model_path` — factored out of [`embed_server_start`] so `lm-cli`'s
+/// `model_path` — factored out of [`embed_server_start`] so `monkey-cli`'s
 /// `embed_cli::start` (RAG design doc slice 4 CLI parity: see that module's
 /// doc comment for why the CLI needs its own process lifecycle rather than
 /// reusing `embed_server_start` directly) launches the exact same flags
@@ -96,7 +96,7 @@ impl LlamaState {
     /// identical to `Default::default()` except for the port, so
     /// `AppState`'s own `Default` impl (see `lib.rs`) can give
     /// `embed_llama` a distinct starting port from the chat instance's.
-    /// `pub` so `lm-cli`'s `embed_cli` module can build its own throwaway
+    /// `pub` so `monkey-cli`'s `embed_cli` module can build its own throwaway
     /// `LlamaState` for the one-off spawn it performs per CLI invocation.
     pub fn for_embeddings() -> Self {
         LlamaState { port: EMBED_PORT, ..Self::default() }
@@ -105,7 +105,7 @@ impl LlamaState {
 
 /// Locate the `llama-server` binary: first on PATH (via `which`), then in the
 /// common Homebrew install locations. `pub` (not module-private) so
-/// `lm-cli`'s `embed_cli::start` (RAG design doc slice 4 CLI parity) can
+/// `monkey-cli`'s `embed_cli::start` (RAG design doc slice 4 CLI parity) can
 /// resolve the same binary without re-implementing this search.
 pub fn find_llama_server_binary() -> Result<String, String> {
     if let Ok(output) = Command::new("which").arg("llama-server").output() {
