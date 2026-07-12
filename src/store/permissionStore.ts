@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /**
@@ -245,13 +245,16 @@ export const usePermissionStore = create<PermissionStore>((set, get) => ({
   },
 }));
 
-void listen<PermissionRequest>("permission://request", (event) => {
-  usePermissionStore.setState((state) => {
-    // Duplicate delivery of an id already queued — keep state as is.
-    if (state.queue.some((r) => r.id === event.payload.id)) return state;
-    const queue = [...state.queue, event.payload];
-    return { queue, pending: state.pending ?? event.payload };
+// Tauri-shell only: in plain-browser dev `listen` itself throws.
+if (isTauri()) {
+  void listen<PermissionRequest>("permission://request", (event) => {
+    usePermissionStore.setState((state) => {
+      // Duplicate delivery of an id already queued — keep state as is.
+      if (state.queue.some((r) => r.id === event.payload.id)) return state;
+      const queue = [...state.queue, event.payload];
+      return { queue, pending: state.pending ?? event.payload };
+    });
+  }).catch((error) => {
+    console.error("Failed to listen for permission://request events", error);
   });
-}).catch((error) => {
-  console.error("Failed to listen for permission://request events", error);
-});
+}
