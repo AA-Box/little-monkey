@@ -122,6 +122,23 @@ function invokeMcpTool(
   }).then(formatMcpCallToolResult, stringifyToolError);
 }
 
+/**
+ * Whether `toolCall` was actually among the tools offered to the model this
+ * turn/run. Lives here (rather than in `agentLoop.ts`, its original home)
+ * so `subagent.ts`'s own child tool-calling loop can enforce the exact same
+ * gate `agentLoop.ts`'s parent loop does — a real risk with local/quantized
+ * models that don't strictly respect the offered tool schema (e.g. an
+ * `explore`-profile subagent's model emitting a `write_file` call even
+ * though `toolsForProfile('explore')` never offered it). Building the
+ * per-turn/per-run tool list only shapes the *schema* sent to the model;
+ * this is the enforcement point that makes it an actual authorization
+ * boundary rather than a polite suggestion the model can ignore. Re-exported
+ * from `agentLoop.ts` for backward compatibility with existing imports/tests.
+ */
+export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
+  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
+}
+
 /** Tool names eligible for risk classification — see `RiskAnnotationContext`.
  * `run_shell` is included for DISPLAY purposes only (the permission modal can
  * show a badge on a shell prompt too) — see `permissions.rs`'s
@@ -175,6 +192,25 @@ export interface SubagentContext {
    * can never split the parent and child across different targets. */
   target: ResolvedTarget;
   effort?: string;
+  /** The parent turn's own risk-annotation context (built once by
+   * `agentLoop.ts`'s `runAgentTurnBody`, same object every `executeToolCall`
+   * this turn already receives via the `risk` parameter) — threaded through
+   * to `runSubagentTask` so a `code`-profile child's write_file/edit_file/
+   * run_shell calls get the SAME advisory risk classification (and share the
+   * same per-turn cache) the parent's own equivalent calls would, instead of
+   * silently skipping classification just because the mutation happened
+   * inside a subagent. `undefined` when the caller never built one (risk
+   * annotations off, or a future caller that doesn't offer `task` at all). */
+  risk?: RiskAnnotationContext;
+  /** Called once for every path a `code`-profile child successfully
+   * `write_file`/`edit_file`s, so the PARENT turn's own `mutatedFiles`
+   * tracking (see `agentLoop.ts`'s `runAgentTurnBody`) sees subagent-driven
+   * mutations too — without this, `runVerificationPhase` would never fire
+   * for a turn where every mutation happened inside a delegated `task` call,
+   * since the parent round's own `toolCalls` array only ever contains the
+   * single `task` entry, never the child's nested write_file/edit_file
+   * calls. `undefined` for a caller that doesn't track mutated files at all. */
+  onMutatedPath?: (path: string) => void;
 }
 
 /**
@@ -200,10 +236,15 @@ export async function executeToolCall(
   risk?: RiskAnnotationContext,
   attachedStackNames?: string[],
   subagent?: SubagentContext,
-  // Subagent-attribution label (slice 3) — see the injection site below and
-  // `with_agent_label` in `tools.rs`. Undefined for every parent-turn call
-  // (`agentLoop.ts` never passes it); `subagent.ts`'s `runSubagentTask`
-  // passes its own `description` here for each of ITS child's tool calls.
+  // Subagent-attribution label (slice 3) — see the injection site below.
+  // Threaded through to the Rust command as its own `agent_label` field,
+  // which `permissions::request_permission` forwards as its own
+  // `PermissionRequestPayload.agent_label` field (NOT folded into `detail`
+  // as a parsed-out-by-regex prefix — see that field's doc comment for why
+  // that earlier design was a spoofing/corruption bug). Undefined for every
+  // parent-turn call (`agentLoop.ts` never passes it); `subagent.ts`'s
+  // `runSubagentTask` passes its own `description` here for each of ITS
+  // child's tool calls.
   agentLabel?: string
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
@@ -231,12 +272,13 @@ export async function executeToolCall(
   delete args.risk_level;
   delete args.risk_reason;
   // `agent_label` (slice 3) is the same story: purely frontend-injected
-  // attribution — "Subagent '<description>'" — prefixed into the Rust-side
-  // permission-prompt detail (see `tools.rs`'s `with_agent_label`), never
-  // something the model itself may supply. Scrubbed unconditionally, before
-  // the injection below, so a `code`-profile subagent's own model can never
-  // forge a *different* subagent's attribution (or the parent's lack of one)
-  // on its write_file/edit_file/run_shell calls.
+  // subagent attribution, sent to the Rust side as its own field (never
+  // folded into the permission-prompt `detail` text — see
+  // `PermissionRequestPayload.agent_label`'s doc comment in `permissions.rs`)
+  // and never something the model itself may supply. Scrubbed unconditionally,
+  // before the injection below, so a `code`-profile subagent's own model can
+  // never forge a *different* subagent's attribution (or the parent's lack
+  // of one) on its write_file/edit_file/run_shell calls.
   delete args.agent_label;
 
   // Classify (cached per turn) BEFORE the checkpoint_id/turn_id injection
@@ -276,9 +318,10 @@ export async function executeToolCall(
   // — `tools.rs`'s `Option<String>` param treats an absent key the same as
   // `null`/`None` either way). `subagent.ts`'s `runSubagentTask` is the one
   // caller that passes its own `description` here, for every tool call ITS
-  // child model makes — see `with_agent_label` in `tools.rs` for how this
-  // becomes the "Subagent '<description>':" prefix `PermissionModal.tsx`
-  // detects and renders. Purely cosmetic/informational: see that Rust
+  // child model makes — forwarded all the way to
+  // `PermissionRequestPayload.agent_label`, its own serialized field, which
+  // `PermissionModal.tsx` reads directly (see that field's doc comment in
+  // `permissions.rs`). Purely cosmetic/informational: see that Rust
   // function's doc comment for why it can never affect which mode
   // auto-approves what.
   if (agentLabel !== undefined && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
@@ -387,6 +430,8 @@ export async function executeToolCall(
         profile,
         target: subagent.target,
         effort: subagent.effort,
+        risk: subagent.risk,
+        onMutatedPath: subagent.onMutatedPath,
       });
     } catch (err) {
       return stringifyToolError(err);

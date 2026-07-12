@@ -20,6 +20,7 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
@@ -28,7 +29,7 @@ import {
 } from "./turnEngine";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
-import type { StreamEvent, ToolCall } from "./llamaClient";
+import type { StreamEvent, ToolCall, ToolDef } from "./llamaClient";
 import { useUsageStore } from "../store/usageStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
@@ -375,14 +376,54 @@ describe("executeToolCall / task delegation", () => {
 
     expect(result).toBe(stringifyToolError(new Error("child loop exploded")));
   });
+
+  // Review findings: a code-profile subagent's mutations must get the same
+  // risk classification the parent's own calls would, and must be able to
+  // report mutated paths back into the parent's own `mutatedFiles` tracking
+  // (see `SubagentContext.risk`/`onMutatedPath`'s doc comments) — both
+  // threaded straight through to `runSubagentTask`'s params.
+  it("threads SubagentContext.risk and onMutatedPath through to runSubagentTask's params unchanged", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify: vi.fn() };
+    const onMutatedPath = vi.fn();
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget, risk, onMutatedPath };
+
+    await executeToolCall(
+      call("task", { description: "d", prompt: "p", profile: "code" }),
+      "checkpoint-1",
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.risk).toBe(risk);
+    expect(params.onMutatedPath).toBe(onMutatedPath);
+  });
+
+  it("passes risk/onMutatedPath through as undefined when SubagentContext never set them", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    await executeToolCall(call("task", { description: "d", prompt: "p", profile: "explore" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.risk).toBeUndefined();
+    expect(params.onMutatedPath).toBeUndefined();
+  });
 });
 
 // slice 3: `code`-profile subagents mean `write_file`/`edit_file`/`run_shell`
 // can now be dispatched from INSIDE `subagent.ts`'s `runSubagentTask`, not
 // just the parent turn — these tests pin the two invariants that make that
-// safe: (1) `agent_label` (subagent attribution, purely cosmetic — see
-// `tools.rs`'s `with_agent_label`) is never model-suppliable, mirroring the
-// `risk_level`/`risk_reason` scrub tests above; (2) a mutating call routed
+// safe: (1) `agent_label` (subagent attribution, purely cosmetic — forwarded
+// to Rust as its own field, see `permissions.rs`'s
+// `PermissionRequestPayload.agent_label`) is never model-suppliable,
+// mirroring the `risk_level`/`risk_reason` scrub tests above; (2) a mutating
+// call routed
 // through `executeToolCall` with the PARENT's checkpoint id but the CHILD's
 // own turn id (exactly how `subagent.ts` calls it) forwards both correctly
 // and distinctly — the crux pairing the design doc calls out.
@@ -598,5 +639,25 @@ describe("attemptStream / recordUsage", () => {
     const result = await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1");
 
     expect(result.usage).toBeUndefined();
+  });
+});
+
+// `isToolCallAllowed` now lives here (moved from `agentLoop.ts`, which
+// re-exports it for backward compatibility — see that module's own doc
+// comment) specifically so `subagent.ts`'s child tool-calling loop can reuse
+// the exact same gate `agentLoop.ts`'s parent loop applies, rather than a
+// parallel/duplicated check. `agentLoop.test.ts` still separately covers
+// this via its own import (proving the re-export is the same function).
+describe("isToolCallAllowed", () => {
+  function toolDef(name: string): ToolDef {
+    return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
+  }
+
+  it("returns true when the tool call's name matches one of the offered tools", () => {
+    expect(isToolCallAllowed(call("write_file"), [toolDef("write_file")])).toBe(true);
+  });
+
+  it("returns false when the tool call's name was never offered", () => {
+    expect(isToolCallAllowed(call("write_file"), [toolDef("read_file")])).toBe(false);
   });
 });

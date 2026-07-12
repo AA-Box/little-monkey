@@ -35,6 +35,7 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
@@ -561,18 +562,14 @@ export function formatSourcesNotice(notice: SourcesNotice): string {
 }
 
 /**
- * Whether `toolCall` was actually among the tools offered to the model this
- * turn. `toolsForSettings` only shapes the *schema* sent to the model (e.g.
- * dropping `remember` when `memoryEnabled` is off) — nothing downstream of
- * that used to check it, so a model that still emitted a disabled or
- * hallucinated tool call (a real risk with local/quantized models that don't
- * strictly respect the offered tool schema) would have it executed anyway.
- * The tool-calling loop calls this before dispatch and rejects (without
- * executing) anything that fails it.
+ * Re-exported for backward compatibility — `isToolCallAllowed` now lives in
+ * `turnEngine.ts` (see that module's doc comment) so `subagent.ts`'s own
+ * child tool-calling loop can reuse the exact same gate this loop's own
+ * dispatch below applies, rather than a parallel/duplicated check. Re-export
+ * of the binding already imported above (not a fresh `export ... from`) so
+ * this file's own use of it below and the public export are the same value.
  */
-export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
-  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
-}
+export { isToolCallAllowed };
 
 /**
  * Runs one round's worth of model-requested tool calls, splitting `task`
@@ -1637,7 +1634,21 @@ async function runAgentTurnBody(
       // has since moved off of. See `SubagentContext`'s doc comment in
       // `turnEngine.ts`.
       if (signal?.aborted) return CANCELLED_TOOL_RESULT;
-      const subagentContext: SubagentContext = { sessionId, target, effort };
+      // `risk`/`onMutatedPath` thread THIS turn's own risk-annotation context
+      // and mutated-file tracking down into a `code`-profile child's own
+      // write_file/edit_file/run_shell calls — without these, a subagent's
+      // mutations would silently skip risk classification (even when the
+      // parent turn has it enabled) and never trip `runVerificationPhase`
+      // (since `mutatedFiles` below is otherwise only ever populated from
+      // this round's own top-level `toolCalls`, which for a `task` call is
+      // just the single `task` entry, never the child's nested writes).
+      const subagentContext: SubagentContext = {
+        sessionId,
+        target,
+        effort,
+        risk: riskAnnotation,
+        onMutatedPath: (path) => mutatedFiles.add(path),
+      };
       return executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames, subagentContext);
     });
 

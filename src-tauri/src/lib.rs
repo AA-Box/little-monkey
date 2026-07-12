@@ -123,6 +123,25 @@ pub struct AppState {
     /// `load_config_impl`/`save_config_impl` pair with no `.await` in
     /// between, so there's nothing async to ever hold it across.
     pub mcp_config_lock: std::sync::Mutex<()>,
+    /// Serializes the permission-granted mutation itself (checkpoint backup +
+    /// the actual file write) in `tool_write_file`/`tool_edit_file` — same
+    /// "two unsynchronized concurrent writers can silently clobber each
+    /// other" reasoning as `memory_lock` above, now reachable from ordinary
+    /// agent use since subagents (p3) let multiple `code`-profile `task`
+    /// calls run genuinely concurrently in the same round
+    /// (`agentLoop.ts::runToolCallsForRound`) and share the parent turn's
+    /// checkpoint id. Without this, two concurrent calls that both resolve to
+    /// the SAME workspace path can interleave past `request_permission`'s
+    /// `.await` and race on `checkpoints::record_original` + the mutation
+    /// itself, silently discarding whichever write lands first with no error
+    /// surfaced to either caller. Acquired only around the synchronous
+    /// backup+write critical section (after permission has already been
+    /// granted) — never across an `.await` — so a plain `std::sync::Mutex` is
+    /// enough, same as `mcp_config_lock`/`web_settings_lock`. A single
+    /// workspace-wide lock (not keyed per-path) is deliberately simpler than a
+    /// per-path lock map: file writes are fast, and correctness here matters
+    /// far more than intra-turn write parallelism.
+    pub file_write_lock: std::sync::Mutex<()>,
     /// Live MCP server connections, keyed by server id (see `mcp.rs`). A
     /// `tokio::sync::Mutex` — unlike every other map here — because
     /// connecting and calling a tool are both `.await`-ing operations; every
@@ -194,6 +213,7 @@ impl Default for AppState {
             tool_cancel: Default::default(),
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
+            file_write_lock: Default::default(),
             mcp: Default::default(),
             web_settings_lock: Default::default(),
             api_server: Default::default(),

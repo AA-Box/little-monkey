@@ -14,12 +14,18 @@ const executeToolCallMock = vi.fn();
 vi.mock("./turnEngine", () => ({
   attemptStream: (...args: unknown[]) => attemptStreamMock(...args),
   executeToolCall: (...args: unknown[]) => executeToolCallMock(...args),
+  // The REAL implementation (not a spy) — this is a pure function, and the
+  // allowlist-enforcement tests below need `runSubagentTask` to apply the
+  // exact same logic `agentLoop.ts`'s parent loop does, not a mock that
+  // always says "allowed".
+  isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
+    toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
   stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
 }));
 
 import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, type RunSubagentTaskParams } from "./subagent";
-import type { ResolvedTarget } from "./turnEngine";
+import type { ResolvedTarget, RiskAnnotationContext } from "./turnEngine";
 import type { ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
@@ -234,8 +240,8 @@ describe("runSubagentTask / sequential execution", () => {
 // parent turn's checkpoint) but THIS run's own turn id (so Rust's per-turn
 // cancellation/permission maps scope to the subagent, not the parent), and
 // its `description` threaded through as `agentLabel` for permission-prompt
-// attribution (see `turnEngine.ts`'s `executeToolCall` and `tools.rs`'s
-// `with_agent_label`).
+// attribution (see `turnEngine.ts`'s `executeToolCall` and `permissions.rs`'s
+// `PermissionRequestPayload.agent_label`).
 describe("runSubagentTask / code-profile checkpoint_id + turn_id + agent_label pairing", () => {
   beforeEach(() => {
     attemptStreamMock.mockReset();
@@ -465,5 +471,209 @@ describe("runSubagentTask / per-profile model override (slice 4)", () => {
     await runSubagentTask(baseParams({ profile: "explore" }));
 
     expect(attemptStreamMock.mock.calls[0][0]).toBe(fakeTarget);
+  });
+});
+
+// Review finding: a child model that emits a tool_call name outside its
+// profile's own offered tool list (`toolsForProfile`) must never have it
+// actually dispatched — the exact same `isToolCallAllowed` gate
+// `agentLoop.ts`'s parent loop applies, reused here. Without this, a real
+// risk with local/quantized models that don't strictly respect the offered
+// tool schema (the same risk `agentLoop.ts`'s own `isToolCallAllowed` doc
+// comment calls out) would let an 'explore'-profile subagent's model
+// hallucinate a `write_file`/`edit_file`/`run_shell` call and have it
+// actually executed.
+describe("runSubagentTask / tool allowlist enforcement", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("rejects (without executing) a write_file call from an explore-profile subagent", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file", "call-rogue")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(result).toBe("done");
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+  });
+
+  it("still feeds the rejected call a tool-error result — the transcript-validity invariant holds even for a disallowed call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("run_shell", "call-rogue")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore", toolCallId: "call-allowlist-1" }));
+
+    const run = selectSubagentRun("call-allowlist-1")(useSubagentStore.getState());
+    const toolMessage = run?.liveMessages.find((m) => m.role === "tool" && m.tool_call_id === "call-rogue");
+    expect(toolMessage).toBeDefined();
+    const parsed = JSON.parse(toolMessage!.content as string) as { error: string };
+    expect(parsed.error).toContain("run_shell");
+    expect(parsed.error).toContain("explore");
+  });
+
+  it("still allows an in-profile call through for the same run that also rejects an out-of-profile one", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [toolCall("grep", "call-ok"), toolCall("write_file", "call-rogue")],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("grep result");
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(executeToolCallMock).toHaveBeenCalledTimes(1);
+    expect(executeToolCallMock.mock.calls[0][0]).toEqual(toolCall("grep", "call-ok"));
+  });
+
+  it("allows write_file/edit_file/run_shell for a code-profile subagent — the allowlist gate is profile-aware, not a blanket rejection", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file", "call-w")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("Wrote 3 bytes to a.txt");
+
+    await runSubagentTask(baseParams({ profile: "code" }));
+
+    expect(executeToolCallMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Review finding: a code-profile subagent's mutating tool calls must get the
+// same advisory risk classification the parent turn's own equivalent calls
+// would — threaded through via `RunSubagentTaskParams.risk`.
+describe("runSubagentTask / risk-annotation threading", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("passes the given risk context through to every child executeToolCall call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file", "call-w")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("Wrote 3 bytes to a.txt");
+    const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify: vi.fn() };
+
+    await runSubagentTask(baseParams({ profile: "code", risk }));
+
+    expect(executeToolCallMock).toHaveBeenCalledTimes(1);
+    // executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, risk, attachedStackNames, subagent, agentLabel)
+    expect(executeToolCallMock.mock.calls[0][5]).toBe(risk);
+  });
+
+  it("passes undefined risk through unchanged when the caller never built one (risk annotations off)", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file", "call-w")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("Wrote 3 bytes to a.txt");
+
+    await runSubagentTask(baseParams({ profile: "code" }));
+
+    expect(executeToolCallMock.mock.calls[0][5]).toBeUndefined();
+  });
+});
+
+// Review finding: without this, `runVerificationPhase` in `agentLoop.ts`
+// never fires for a turn where every mutation happened inside a delegated
+// `task` call, since that round's own top-level `toolCalls` only ever
+// contains the single `task` entry.
+describe("runSubagentTask / onMutatedPath reporting", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("reports the path of a successful write_file call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [{ id: "call-w", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "a.txt", content: "x" }) } }],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("Wrote 1 bytes to a.txt");
+    const onMutatedPath = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "code", onMutatedPath }));
+
+    expect(onMutatedPath).toHaveBeenCalledTimes(1);
+    expect(onMutatedPath).toHaveBeenCalledWith("a.txt");
+  });
+
+  it("reports the path of a successful edit_file call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [
+          {
+            id: "call-e",
+            type: "function",
+            function: { name: "edit_file", arguments: JSON.stringify({ path: "b.txt", old_string: "x", new_string: "y" }) },
+          },
+        ],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("Edited b.txt");
+    const onMutatedPath = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "code", onMutatedPath }));
+
+    expect(onMutatedPath).toHaveBeenCalledTimes(1);
+    expect(onMutatedPath).toHaveBeenCalledWith("b.txt");
+  });
+
+  it("does not report a failed write_file call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [{ id: "call-w", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "a.txt", content: "x" }) } }],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue(JSON.stringify({ error: "Permission denied" }));
+    const onMutatedPath = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "code", onMutatedPath }));
+
+    expect(onMutatedPath).not.toHaveBeenCalled();
+  });
+
+  it("does not report a read-only tool call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("grep", "call-g")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("grep result");
+    const onMutatedPath = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "code", onMutatedPath }));
+
+    expect(onMutatedPath).not.toHaveBeenCalled();
+  });
+
+  it("does not report a write_file call rejected by the allowlist gate", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [{ id: "call-rogue", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "a.txt", content: "x" }) } }],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    const onMutatedPath = vi.fn();
+
+    await runSubagentTask(baseParams({ profile: "explore", onMutatedPath }));
+
+    expect(executeToolCallMock).not.toHaveBeenCalled();
+    expect(onMutatedPath).not.toHaveBeenCalled();
   });
 });
