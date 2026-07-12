@@ -369,3 +369,59 @@ describe("settingsStore.subagentsEnabled", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+describe("settingsStore.maxConcurrentSubagents", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ maxConcurrentSubagents: 2 });
+  });
+
+  it("defaults to 2 when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as verifyMaxRounds's
+    // own default test above — `beforeEach` forces `2` regardless, so only a
+    // fresh module import actually covers `defaults()`.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(2);
+  });
+
+  it("clamps below the 1-subagent floor", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(0);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(1);
+  });
+
+  it("clamps above the 4-subagent ceiling", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(10);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(4);
+  });
+
+  it("rounds fractional input", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(3.4);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(3);
+  });
+
+  it("accepts an in-range value unchanged", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(3);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(3);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setMaxConcurrentSubagents(4);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(4);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores an out-of-range persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ maxConcurrentSubagents: 99 }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(2);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});

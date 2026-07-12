@@ -18,6 +18,7 @@ vi.mock("./providerClient", () => ({ streamProviderChat: (...args: unknown[]) =>
 
 import {
   attemptStream,
+  CANCELLED_TOOL_RESULT,
   executeToolCall,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
@@ -373,6 +374,174 @@ describe("executeToolCall / task delegation", () => {
     );
 
     expect(result).toBe(stringifyToolError(new Error("child loop exploded")));
+  });
+});
+
+// slice 3: `code`-profile subagents mean `write_file`/`edit_file`/`run_shell`
+// can now be dispatched from INSIDE `subagent.ts`'s `runSubagentTask`, not
+// just the parent turn — these tests pin the two invariants that make that
+// safe: (1) `agent_label` (subagent attribution, purely cosmetic — see
+// `tools.rs`'s `with_agent_label`) is never model-suppliable, mirroring the
+// `risk_level`/`risk_reason` scrub tests above; (2) a mutating call routed
+// through `executeToolCall` with the PARENT's checkpoint id but the CHILD's
+// own turn id (exactly how `subagent.ts` calls it) forwards both correctly
+// and distinctly — the crux pairing the design doc calls out.
+describe("executeToolCall / agent_label scrubbing (subagent attribution, slice 3)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("ok");
+  });
+
+  it("strips a model-supplied agent_label before dispatch — the model can never forge its own subagent attribution", async () => {
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x", agent_label: "totally not a subagent" }), null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBeUndefined();
+  });
+
+  it("injects the caller-supplied agentLabel, overwriting whatever the model tried to pass", async () => {
+    await executeToolCall(
+      call("write_file", { path: "a.txt", content: "x", agent_label: "model-forged label" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "refactor auth"
+    );
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBe("refactor auth");
+  });
+
+  it("never adds an agent_label key at all for an ordinary parent-turn call (no agentLabel supplied)", async () => {
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBeUndefined();
+  });
+
+  it("only injects agent_label for write_file/edit_file/run_shell, never for a read-only tool", async () => {
+    await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, "some label");
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBeUndefined();
+  });
+
+  it("applies to edit_file and run_shell too, not just write_file", async () => {
+    await executeToolCall(
+      call("edit_file", { path: "a.txt", old_string: "a", new_string: "b" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "edit label"
+    );
+    await executeToolCall(call("run_shell", { command: "ls" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, "shell label");
+
+    const [, editArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    const [, shellArgs] = invokeMock.mock.calls[1] as [string, Record<string, unknown>];
+    expect(editArgs.agent_label).toBe("edit label");
+    expect(shellArgs.agent_label).toBe("shell label");
+  });
+});
+
+// The other half of "get this pairing exactly right" (design doc, slice 3):
+// a `code`-profile subagent's own mutating tool calls must carry the
+// PARENT's checkpoint id (so writes land in the parent turn's checkpoint,
+// revertable via the existing CheckpointRow) but a DISTINCT, child-owned
+// turn id (so Rust's per-turn `tool_cancel`/permission-`pending` maps scope
+// cancellation and prompts to the subagent, not the parent's own in-flight
+// call). `subagent.ts`'s `runSubagentTask` calls `executeToolCall` with
+// exactly `(toolCall, parentCheckpointId, taskId, ...)` — this test exercises
+// `executeToolCall` directly with that same argument shape.
+describe("executeToolCall / checkpoint_id + turn_id pairing for a code-profile subagent's tool call", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("Wrote 2 bytes to a.txt");
+  });
+
+  it("forwards the PARENT's checkpoint id but the CHILD's own (distinct) turn id for a write_file call", async () => {
+    const parentCheckpointId = "parent-checkpoint-123";
+    const parentTurnId = "parent-turn-abc";
+    const childTurnId = "child-turn-xyz";
+
+    await executeToolCall(call("write_file", { path: "a.txt", content: "hi" }), parentCheckpointId, childTurnId, emptyMcpRegistry);
+
+    const [command, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(command).toBe("tool_write_file");
+    expect(sentArgs.checkpoint_id).toBe(parentCheckpointId);
+    expect(sentArgs.turn_id).toBe(childTurnId);
+    expect(sentArgs.turn_id).not.toBe(parentTurnId);
+  });
+
+  it("same pairing holds for edit_file and run_shell", async () => {
+    const parentCheckpointId = "parent-checkpoint-456";
+    const childTurnId = "child-turn-789";
+
+    await executeToolCall(call("edit_file", { path: "a.txt", old_string: "a", new_string: "b" }), parentCheckpointId, childTurnId, emptyMcpRegistry);
+    await executeToolCall(call("run_shell", { command: "ls" }), parentCheckpointId, childTurnId, emptyMcpRegistry);
+
+    const [, editArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    const [, shellArgs] = invokeMock.mock.calls[1] as [string, Record<string, unknown>];
+    expect(editArgs.checkpoint_id).toBe(parentCheckpointId);
+    expect(editArgs.turn_id).toBe(childTurnId);
+    expect(shellArgs.checkpoint_id).toBe(parentCheckpointId);
+    expect(shellArgs.turn_id).toBe(childTurnId);
+  });
+});
+
+// Stop-button scoping for a subagent tree (design doc: "Stop in the parent
+// pane cancels the whole tree, Stop in the OTHER split pane touches
+// nothing"). `subagent.ts` passes the PARENT's own `AbortSignal` straight
+// through to `executeToolCall` as `signal`, but with the CHILD's own turn id
+// — so on abort, `tools_cancel_running` must be called with the CHILD's turn
+// id, and a different turn's own (unrelated) AbortController aborting must
+// never trigger it at all.
+describe("executeToolCall / Stop-button cancellation scoping (subagent tree)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("cancels via tools_cancel_running scoped to the CHILD's own turn id when the (parent's) signal aborts mid-invocation", async () => {
+    let rejectInvoke: (reason?: unknown) => void = () => {};
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "tool_run_shell") {
+        return new Promise((_resolve, reject) => {
+          rejectInvoke = reject;
+        });
+      }
+      return Promise.resolve(undefined); // tools_cancel_running
+    });
+
+    const parentSignalStandIn = new AbortController();
+    const childTurnId = "child-turn-1";
+    const resultPromise = executeToolCall(call("run_shell", { command: "sleep 10" }), null, childTurnId, emptyMcpRegistry, parentSignalStandIn.signal);
+
+    parentSignalStandIn.abort();
+    const result = await resultPromise;
+    rejectInvoke(new Error("aborted (unused)"));
+
+    expect(result).toBe(CANCELLED_TOOL_RESULT);
+    expect(invokeMock).toHaveBeenCalledWith("tools_cancel_running", { turnId: childTurnId });
+  });
+
+  it("a DIFFERENT (unrelated) turn's own AbortController aborting never cancels this call or touches its turn id", async () => {
+    invokeMock.mockImplementation((cmd: string) => (cmd === "tool_run_shell" ? Promise.resolve({ stdout: "ok" }) : Promise.resolve(undefined)));
+
+    const thisCallsOwnController = new AbortController(); // never aborted — "the parent pane's own turn"
+    const otherPaneController = new AbortController(); // "the other split pane's turn"
+    otherPaneController.abort();
+
+    const result = await executeToolCall(call("run_shell", { command: "echo hi" }), null, "this-turn", emptyMcpRegistry, thisCallsOwnController.signal);
+
+    expect(JSON.parse(result)).toEqual({ stdout: "ok" });
+    expect(invokeMock).not.toHaveBeenCalledWith("tools_cancel_running", expect.anything());
   });
 });
 

@@ -199,7 +199,12 @@ export async function executeToolCall(
   signal?: AbortSignal,
   risk?: RiskAnnotationContext,
   attachedStackNames?: string[],
-  subagent?: SubagentContext
+  subagent?: SubagentContext,
+  // Subagent-attribution label (slice 3) — see the injection site below and
+  // `with_agent_label` in `tools.rs`. Undefined for every parent-turn call
+  // (`agentLoop.ts` never passes it); `subagent.ts`'s `runSubagentTask`
+  // passes its own `description` here for each of ITS child's tool calls.
+  agentLabel?: string
 ): Promise<string> {
   const { name, arguments: rawArguments } = toolCall.function;
 
@@ -225,6 +230,14 @@ export async function executeToolCall(
   // change to `RISK_ELIGIBLE_TOOLS` — where a model-supplied value survives.
   delete args.risk_level;
   delete args.risk_reason;
+  // `agent_label` (slice 3) is the same story: purely frontend-injected
+  // attribution — "Subagent '<description>'" — prefixed into the Rust-side
+  // permission-prompt detail (see `tools.rs`'s `with_agent_label`), never
+  // something the model itself may supply. Scrubbed unconditionally, before
+  // the injection below, so a `code`-profile subagent's own model can never
+  // forge a *different* subagent's attribution (or the parent's lack of one)
+  // on its write_file/edit_file/run_shell calls.
+  delete args.agent_label;
 
   // Classify (cached per turn) BEFORE the checkpoint_id/turn_id injection
   // below, so both the cache key and the judge prompt reflect only the
@@ -256,6 +269,20 @@ export async function executeToolCall(
   // (old_string, new_string) match without translation.
   if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
     args.checkpoint_id = checkpointId;
+  }
+  // `agent_label` (slice 3): injected ONLY when a caller supplied one — the
+  // parent turn's own tool calls never pass `agentLabel` at all, so this
+  // stays a no-op for them (no `agent_label` key at all, not even `undefined`
+  // — `tools.rs`'s `Option<String>` param treats an absent key the same as
+  // `null`/`None` either way). `subagent.ts`'s `runSubagentTask` is the one
+  // caller that passes its own `description` here, for every tool call ITS
+  // child model makes — see `with_agent_label` in `tools.rs` for how this
+  // becomes the "Subagent '<description>':" prefix `PermissionModal.tsx`
+  // detects and renders. Purely cosmetic/informational: see that Rust
+  // function's doc comment for why it can never affect which mode
+  // auto-approves what.
+  if (agentLabel !== undefined && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
+    args.agent_label = agentLabel;
   }
   // The turn id scopes permission prompts and shell/fetch cancellation to
   // THIS turn — Stop in one pane must not kill the other pane's command (or

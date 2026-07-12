@@ -78,8 +78,8 @@ describe("TASK_TOOL", () => {
     expect(TOOLS).not.toContain(TASK_TOOL);
   });
 
-  it("only allows the explore profile in this slice", () => {
+  it("allows both the explore and code profiles as of slice 3", () => {
     const profileParam = (TASK_TOOL.function.parameters as { properties: { profile: { enum: string[] } } }).properties.profile;
-    expect(profileParam.enum).toEqual(["explore"]);
+    expect(profileParam.enum).toEqual(["explore", "code"]);
   });
 });

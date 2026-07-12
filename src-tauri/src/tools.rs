@@ -270,6 +270,31 @@ fn glob_impl(
     Ok(matches.into_iter().map(|(_, path)| path).collect())
 }
 
+/// Prefixes a permission-prompt `detail` string with "Subagent
+/// '<agent_label>': " when `agent_label` is `Some` (a `code`-profile
+/// subagent's tool call — see `turnEngine.ts`'s `executeToolCall` injection
+/// site and `subagent.ts`'s `runSubagentTask`, which passes its own
+/// `description` for this), so `PermissionModal.tsx` can attribute the
+/// prompt to the subagent that asked for it (`find race conditions`, say)
+/// rather than leaving the user to guess which of several concurrent
+/// subagents is asking. Returns `detail` unchanged when `agent_label` is
+/// `None` — every parent-turn call, and today's only `explore`-profile
+/// subagents (which never call a tool this param reaches).
+///
+/// Deliberately just string formatting: `agent_label`, like `checkpoint_id`/
+/// `turn_id`, is injected by the frontend and never model-suppliable (the
+/// model's own JSON arguments are scrubbed of any `agent_label` key before
+/// this point — see `turnEngine.ts`), but even so, this function itself has
+/// NO path into `permissions::compute_risk`, `mode_short_circuit`, or any
+/// other decision that governs whether the call is auto-approved — it only
+/// ever changes what text `request_permission`'s prompt payload shows.
+fn with_agent_label(detail: String, agent_label: Option<&str>) -> String {
+    match agent_label {
+        Some(label) => format!("Subagent '{}': {}", label, detail),
+        None => detail,
+    }
+}
+
 /// Write (overwrite/create) a text file in the workspace. Permission-gated.
 /// `checkpoint_id` is injected by the frontend agent loop (not the model) so
 /// the pre-mutation backup lands in the calling turn's own checkpoint.
@@ -279,7 +304,9 @@ fn glob_impl(
 /// contain before ever setting these): the optional LLM risk-judge
 /// classification for this call, combined here with the authoritative
 /// `permissions::path_risk_floor` (which always wins) into the
-/// `RiskAssessment` shown on the permission prompt.
+/// `RiskAssessment` shown on the permission prompt. `agent_label` is the same
+/// story — frontend-injected only, see [`with_agent_label`] — purely
+/// cosmetic attribution text, never a permission-decision input.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -295,6 +322,7 @@ pub async fn tool_write_file(
     turn_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
+    agent_label: Option<String>,
 ) -> Result<String, String> {
     // Resolved BEFORE the permission prompt (unlike this function's
     // pre-Phase-2 ordering) so `path_risk_floor` can be checked against the
@@ -303,7 +331,7 @@ pub async fn tool_write_file(
     let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
-    let detail = format!("Write {} bytes to {}", content.len(), path);
+    let detail = with_agent_label(format!("Write {} bytes to {}", content.len(), path), agent_label.as_deref());
     permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref(), risk)
         .await?;
 
@@ -361,8 +389,8 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
 /// is found more than once (to avoid ambiguous edits). `checkpoint_id` is
 /// injected by the frontend agent loop (not the model) so the pre-mutation
 /// backup lands in the calling turn's own checkpoint. `risk_level`/
-/// `risk_reason` are likewise frontend-injected — see `tool_write_file`'s doc
-/// comment, identical treatment here.
+/// `risk_reason`/`agent_label` are likewise frontend-injected — see
+/// `tool_write_file`'s doc comment, identical treatment here.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -379,6 +407,7 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     turn_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
+    agent_label: Option<String>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
@@ -406,7 +435,7 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
     let preview = build_diff_preview(&old_string, &new_string);
-    let detail = format!("Edit {}\n{}", path, preview);
+    let detail = with_agent_label(format!("Edit {}\n{}", path, preview), agent_label.as_deref());
 
     permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref(), risk)
         .await?;
@@ -432,7 +461,9 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 /// `permissions.rs`'s module doc comment and `mode_short_circuit` — it can
 /// NEVER be threaded into anything that decides whether this call is
 /// auto-approved. `run_shell` always falls through to a real prompt in every
-/// mode below `"bypass"`, full stop.
+/// mode below `"bypass"`, full stop. `agent_label` is prefixed onto the
+/// prompt `detail` via [`with_agent_label`] — same cosmetic-only treatment,
+/// and the same "never affects auto-approval" guarantee applies to it too.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
@@ -443,9 +474,11 @@ pub async fn tool_run_shell(
     turn_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
+    agent_label: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
-    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref(), risk)
+    let detail = with_agent_label(command.clone(), agent_label.as_deref());
+    permissions::request_permission(&app, state.inner(), "run_shell", detail, turn_id.as_deref(), risk)
         .await?;
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
@@ -700,6 +733,36 @@ mod tests {
         let preview = build_diff_preview("old line", "new line");
         assert!(preview.contains("- old line"));
         assert!(preview.contains("+ new line"));
+    }
+
+    // `with_agent_label` — slice 3's one Rust change. Pinned as an in-module
+    // test on the pure helper itself (rather than a full IPC round trip)
+    // since request_permission's prompt is only observable through an event
+    // channel that a real permission mode would have to await — the
+    // formatting logic is what's actually new here, so that's what's tested
+    // directly.
+    #[test]
+    fn with_agent_label_prefixes_the_detail_when_a_label_is_given() {
+        let detail = with_agent_label("Write 3 bytes to a.txt".to_string(), Some("find race conditions"));
+        assert_eq!(detail, "Subagent 'find race conditions': Write 3 bytes to a.txt");
+    }
+
+    #[test]
+    fn with_agent_label_leaves_detail_unchanged_when_no_label_is_given() {
+        // Every parent-turn tool call (and today's explore-profile subagent
+        // tools, which never even reach a mutating command) passes `None`
+        // here — the detail shown must be byte-identical to pre-slice-3
+        // behavior, not just "no visible difference".
+        let detail = with_agent_label("Write 3 bytes to a.txt".to_string(), None);
+        assert_eq!(detail, "Write 3 bytes to a.txt");
+    }
+
+    #[test]
+    fn with_agent_label_applies_to_a_run_shell_style_detail_too() {
+        // `tool_run_shell`'s detail is just the raw command string (no
+        // "Write .../Edit ..." wrapper) — same prefixing still applies.
+        let detail = with_agent_label("cargo test".to_string(), Some("run the test suite"));
+        assert_eq!(detail, "Subagent 'run the test suite': cargo test");
     }
 
     struct TempTree {

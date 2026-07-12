@@ -3,8 +3,10 @@ import { Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
+  MAX_MAX_CONCURRENT_SUBAGENTS,
   MAX_VERIFY_MAX_ROUNDS,
   MIN_CHECKPOINT_RETENTION,
+  MIN_MAX_CONCURRENT_SUBAGENTS,
   MIN_VERIFY_MAX_ROUNDS,
   useSettingsStore,
   type ContextTrimStrategy,
@@ -212,6 +214,8 @@ export function AutomationPanel() {
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
   const subagentsEnabled = useSettingsStore((s) => s.subagentsEnabled);
   const setSubagentsEnabled = useSettingsStore((s) => s.setSubagentsEnabled);
+  const maxConcurrentSubagents = useSettingsStore((s) => s.maxConcurrentSubagents);
+  const setMaxConcurrentSubagents = useSettingsStore((s) => s.setMaxConcurrentSubagents);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
@@ -389,6 +393,20 @@ export function AutomationPanel() {
             label={t("AutomationPanel.subagentsEnabledLabel")}
             description={t("AutomationPanel.subagentsEnabledDescription")}
           />
+          <label className="flex items-center justify-between gap-3 border-t border-border py-2.5 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.maxConcurrentSubagentsLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.maxConcurrentSubagentsDescription")}</span>
+            </span>
+            <input
+              type="number"
+              min={MIN_MAX_CONCURRENT_SUBAGENTS}
+              max={MAX_MAX_CONCURRENT_SUBAGENTS}
+              value={maxConcurrentSubagents}
+              onChange={(event) => setMaxConcurrentSubagents(Number(event.target.value))}
+              className="h-8 w-16 shrink-0 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+          </label>
         </div>
       </section>
 

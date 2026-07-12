@@ -357,18 +357,21 @@ export function toolsForProfile(profile: 'explore' | 'code'): ToolDef[] {
  * local model that never had this toggle turned on should never even see
  * the schema.
  *
- * `profile` only allows `'explore'` in this slice — `'code'` (subagents that
- * can write/edit/run shell, landing writes in the parent's checkpoint) is
- * slice 3. `executeToolCall` (`turnEngine.ts`) intercepts this name before
- * the `invoke('tool_'+name)` dispatch, exactly like `present_plan` — it has
- * no `tool_task` Rust command either.
+ * `profile` allows both `'explore'` and `'code'` as of slice 3 — a `'code'`
+ * subagent can write/edit/run shell through the exact same permission gate
+ * and checkpoint hooks as the parent (see `executeToolCall`'s `task` branch
+ * and `subagent.ts`'s `runSubagentTask` for the parent-checkpoint-id +
+ * child-own-turn-id pairing that makes this safe). `executeToolCall`
+ * (`turnEngine.ts`) intercepts this name before the `invoke('tool_'+name)`
+ * dispatch, exactly like `present_plan` — it has no `tool_task` Rust command
+ * either.
  */
 export const TASK_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'task',
     description:
-      'Delegate a scoped subtask to a subagent with its own isolated tool-calling loop and restricted tool set. The subagent cannot see this conversation, so give it a fully self-contained prompt. Only its final report is returned to you — use this for broad exploration or an independent subtask you want kept out of your own context.',
+      'Delegate a scoped subtask to a subagent with its own isolated tool-calling loop and restricted tool set. The subagent cannot see this conversation, so give it a fully self-contained prompt. Only its final report is returned to you — use this for broad exploration or an independent subtask you want kept out of your own context. Multiple task calls in the same turn may run in parallel.',
     parameters: {
       type: 'object',
       properties: {
@@ -382,8 +385,9 @@ export const TASK_TOOL: ToolDef = {
         },
         profile: {
           type: 'string',
-          enum: ['explore'],
-          description: "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation.",
+          enum: ['explore', 'code'],
+          description:
+            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask.",
         },
       },
       required: ['description', 'prompt', 'profile'],
