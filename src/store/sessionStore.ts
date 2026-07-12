@@ -153,7 +153,9 @@ export interface SessionStore {
    * instead of silently dropping history; cleared by the next successful
    * save. */
   persistError: string | null;
-  /** Create a fresh empty session and make it active. */
+  /** Make a fresh blank session active. If the currently active session
+   * hasn't been sent to yet, replaces it rather than creating another one
+   * alongside it — see the implementation for why. */
   newSession: () => void;
   /** Make `id` the active session (no-op if it doesn't exist). Clears the
    * target's `unread` flag, mirroring "opening it marks it read". */
@@ -706,10 +708,23 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   newSession: () => {
+    const state = get();
+    const active = state.sessions.find((s) => s.id === state.activeSessionId);
     const session = createSession();
-    set((state) => {
-      const sessions = [...state.sessions, session];
-      persist(sessions, session.id, state.groups);
+
+    // Mirrors Claude Desktop: the "New session" button always lands on a
+    // single blank compose slate. If the active session was never started
+    // (no messages sent yet), swap it out for the fresh one in place rather
+    // than stacking another empty session next to it — the id still
+    // changes (unlike a true in-place reset) so panes bound to it (see
+    // `ChatWindow`'s sessionId-keyed composer-reset effect) know to clear
+    // their draft state too.
+    set((s) => {
+      const sessions =
+        active && active.messages.length === 0
+          ? s.sessions.map((sess) => (sess.id === active.id ? session : sess))
+          : [...s.sessions, session];
+      persist(sessions, session.id, s.groups);
       return { sessions, activeSessionId: session.id, messages: session.messages };
     });
   },

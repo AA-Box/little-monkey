@@ -211,6 +211,21 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
     el.style.height = `${Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT_PX)}px`;
   }, []);
 
+  // Composer state (draft text, attachments, error banner, @/ popups) is
+  // pane-local, not session-local — nothing else keys it to `sessionId`. A
+  // brand new `sessionId` (switching panes, or `newSession` handing this
+  // pane a freshly reset session) means a blank compose slate.
+  useEffect(() => {
+    setInput("");
+    setError(null);
+    setAttachments([]);
+    setMentionQuery(null);
+    mentionStartRef.current = null;
+    setSlashQuery(null);
+    slashStartRef.current = null;
+    requestAnimationFrame(resizeTextarea);
+  }, [sessionId, resizeTextarea]);
+
   const loadWorkspacePaths = useCallback((): Promise<MentionEntry[]> => {
     if (workspacePathsRef.current) return Promise.resolve(workspacePathsRef.current);
     if (!workspacePathsPromiseRef.current) {
