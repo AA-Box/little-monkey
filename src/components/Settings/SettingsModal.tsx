@@ -102,14 +102,14 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
       role="dialog"
       aria-modal="true"
       aria-labelledby="settings-modal-title"
       onClick={onClose}
     >
       <div
-        className="flex h-[85vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-background shadow-xl"
+        className="flex h-full w-full flex-col bg-background"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-3.5">
