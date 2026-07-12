@@ -58,6 +58,12 @@ pub struct ChatOptions {
     /// collects, rather than threading a separate parameter through
     /// `chat_setup`/`chat_loop`/`repl::run`.
     pub verify: bool,
+    /// `--subagents` — offers the `task` tool this turn (explore-profile
+    /// only; see `tools_def::task_tool_def`/`agent.rs`'s `"task"` arm).
+    /// Mirrors the desktop app's `subagentsEnabled` setting: off by default,
+    /// same "a weak local model should never even see the schema unless
+    /// asked for" posture (docs/roadmap/p3-subagents.md).
+    pub subagents: bool,
 }
 
 /// Parses a `--format` value: `json`, an inline JSON schema, or `@path` to a

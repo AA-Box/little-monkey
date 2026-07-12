@@ -228,6 +228,44 @@ pub fn search_docs_tool_def(stack_names: &[String]) -> serde_json::Value {
     })
 }
 
+/// The `task` tool — delegates a scoped subtask to a subagent with its own
+/// isolated tool-calling loop and restricted (explore-only) tool set (CLI
+/// parity, docs/roadmap/p3-subagents.md slice 5) — a Rust port of
+/// `src/lib/tools.ts`'s `TASK_TOOL`. Like [`present_plan_tool_def`] and
+/// [`search_docs_tool_def`], deliberately excluded from [`tool_definitions`]'s
+/// base array (and from [`merged_tool_definitions`]'s output): `agent.rs`'s
+/// `run_tool_loop` only appends it when `--subagents` was passed, mirroring
+/// the desktop app's `subagentsEnabled` toggle (default off — a weak local
+/// model that never had this turned on should never even see the schema).
+/// `agent.rs::execute_tool_call` intercepts the name before the built-in
+/// dispatch, exactly like `present_plan`; there is no `tool_task` Rust
+/// command. The CLI only accepts `profile: "explore"` — see that function's
+/// `"task"` arm doc comment for why `"code"` is rejected rather than
+/// supported (no checkpoints exist here to land its mutations into safely).
+pub fn task_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Delegate a scoped subtask to a subagent with its own isolated tool-calling loop and restricted tool set. The subagent cannot see this conversation, so give it a fully self-contained prompt. Only its final report is returned to you — use this for broad exploration or an independent subtask you want kept out of your own context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string", "description": "A short (3-6 word) label for this subtask, shown to the user." },
+                    "prompt": { "type": "string", "description": "Full, self-contained instructions for the subagent — it has no access to this conversation, so include all necessary context (file paths, what to look for, what to report back)." },
+                    "profile": {
+                        "type": "string",
+                        "enum": ["explore"],
+                        "description": "Tool access profile for the subagent. Only 'explore' (read-only: read_file, list_dir, grep) is supported on the CLI — there are no checkpoints here to safely land a mutating subagent's writes into."
+                    }
+                },
+                "required": ["description", "prompt", "profile"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// Composite `mcp__<serverId>__<toolName>` tool name mapped to the exact
 /// server id and tool name it was built from, returned by
 /// [`merged_tool_definitions`] alongside the tool defs themselves. Mirrors
@@ -384,6 +422,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t["function"]["name"] == "search_docs"));
+    }
+
+    #[test]
+    fn task_tool_def_only_offers_the_explore_profile_and_is_excluded_from_the_base_list() {
+        let def = task_tool_def();
+        assert_eq!(def["function"]["name"], "task");
+        let profile_enum = def["function"]["parameters"]["properties"]["profile"]["enum"].as_array().unwrap();
+        assert_eq!(profile_enum, &vec![serde_json::Value::String("explore".to_string())]);
+        assert!(!profile_enum.iter().any(|v| v == "code"));
+
+        // Only ever appended per-turn by `agent.rs::run_tool_loop` when
+        // `--subagents` was given — never part of the base list, and the
+        // base list never contains "task" either (agent.rs's depth-1 cap
+        // relies on that).
+        assert!(!tool_definitions().as_array().unwrap().iter().any(|t| t["function"]["name"] == "task"));
     }
 
     #[tokio::test]

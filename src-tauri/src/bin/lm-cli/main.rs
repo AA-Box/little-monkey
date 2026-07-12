@@ -207,6 +207,18 @@ struct ChatFlags {
     /// shell alias); redundant with the default otherwise.
     #[arg(long = "no-verify", global = true)]
     no_verify: bool,
+
+    /// Offer the `task` tool this turn, letting the model delegate a scoped
+    /// subtask to a subagent with its own restricted (explore-only:
+    /// read_file/list_dir/grep) tool-calling loop — CLI parity for the
+    /// desktop app's Subagents feature (docs/roadmap/p3-subagents.md slice
+    /// 5). Off by default, same posture as `--verify`/the GUI's
+    /// `subagentsEnabled` toggle: running an extra model-initiated loop
+    /// should be opt-in. Only the `explore` profile is supported here — the
+    /// CLI has no per-turn checkpoints to safely land a mutating subagent's
+    /// writes into.
+    #[arg(long, global = true)]
+    subagents: bool,
 }
 
 impl ChatFlags {
@@ -227,6 +239,7 @@ impl ChatFlags {
             verbose: self.verbose,
             attach_images: self.attach_images,
             verify: self.verify && !self.no_verify,
+            subagents: self.subagents,
         })
     }
 }
@@ -956,6 +969,7 @@ mod tests {
                 attach_images: false,
                 verify: false,
                 no_verify: false,
+                subagents: false,
             },
         };
 
@@ -1170,6 +1184,7 @@ mod tests {
                 attach_images: false,
                 verify: false,
                 no_verify: false,
+                subagents: false,
             },
         };
         match chat_setup(&cli) {
