@@ -160,10 +160,10 @@ describe("shortcutStore persistence and mutations", () => {
 
   it("caps the number of alternative bindings", () => {
     for (const key of ["g", "h", "i"]) {
-      expect(useShortcutStore.getState().addBinding("sessionTogglePin", { key }, true)).toEqual({ ok: true });
+      expect(useShortcutStore.getState().addBinding("sessionDelete", { key }, true)).toEqual({ ok: true });
     }
-    expect(useShortcutStore.getState().overrides.sessionTogglePin).toHaveLength(MAX_SHORTCUT_BINDINGS);
-    expect(useShortcutStore.getState().addBinding("sessionTogglePin", { key: "j" }, true)).toEqual({
+    expect(useShortcutStore.getState().overrides.sessionDelete).toHaveLength(MAX_SHORTCUT_BINDINGS);
+    expect(useShortcutStore.getState().addBinding("sessionDelete", { key: "j" }, true)).toEqual({
       ok: false,
       reason: "maxBindings",
     });
