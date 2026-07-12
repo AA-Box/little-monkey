@@ -739,7 +739,7 @@ pub async fn tool_web_fetch(
     start_index: Option<usize>,
     turn_id: Option<String>,
 ) -> Result<FetchResult, String> {
-    permissions::request_permission(&app, state.inner(), "web_fetch", url.clone(), turn_id.as_deref(), None)
+    permissions::request_permission(&app, state.inner(), "web_fetch", url.clone(), turn_id.as_deref(), None, None)
         .await?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
@@ -1143,7 +1143,7 @@ pub async fn tool_web_search(
     count: Option<usize>,
     turn_id: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
-    permissions::request_permission(&app, state.inner(), "web_search", query.clone(), turn_id.as_deref(), None)
+    permissions::request_permission(&app, state.inner(), "web_search", query.clone(), turn_id.as_deref(), None, None)
         .await?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;

@@ -5,7 +5,7 @@ const invokeMock = vi.fn();
 // stashed via `vi.hoisted` rather than a plain outer-scope variable — a
 // normal `let`/`var` closed over by a hoisted `vi.mock` factory is a
 // *different* binding than the one this file's test bodies read later.
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: () => Promise.resolve(() => {}),
 }));
@@ -25,6 +25,7 @@ function makeModel(overrides: Partial<ModelInfo> = {}): ModelInfo {
     installed: true,
     path: "/models/qwen2.5-7b-instruct.gguf",
     is_external: false,
+    kind: "chat",
     ...overrides,
   };
 }

@@ -9,6 +9,7 @@ mod agent;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
+mod embed_cli;
 mod mcp_cli;
 mod modelfile;
 mod ollama_api;
@@ -16,6 +17,7 @@ mod permission;
 mod providers_cli;
 mod repl;
 mod sse;
+mod stacks_cli;
 mod tools_cli;
 mod tools_def;
 mod verify_cli;
@@ -108,6 +110,15 @@ struct Cli {
     #[arg(long, global = true)]
     persona: Option<String>,
 
+    /// Attach a knowledge stack (by name, as created in the desktop app's
+    /// Settings > Knowledge tab) so the agent gains the `search_docs` tool
+    /// this turn — repeatable for more than one. Mirrors the desktop app's
+    /// `StackPicker` attachment: the tool is only offered at all when at
+    /// least one `--stack` is given (see `tools_def::search_docs_tool_def`),
+    /// and its description lists exactly the names given here.
+    #[arg(long = "stack", global = true, value_name = "NAME")]
+    stack: Vec<String>,
+
     #[command(flatten)]
     chat: ChatFlags,
 }
@@ -196,6 +207,18 @@ struct ChatFlags {
     /// shell alias); redundant with the default otherwise.
     #[arg(long = "no-verify", global = true)]
     no_verify: bool,
+
+    /// Offer the `task` tool this turn, letting the model delegate a scoped
+    /// subtask to a subagent with its own restricted (explore-only:
+    /// read_file/list_dir/grep) tool-calling loop — CLI parity for the
+    /// desktop app's Subagents feature (docs/roadmap/p3-subagents.md slice
+    /// 5). Off by default, same posture as `--verify`/the GUI's
+    /// `subagentsEnabled` toggle: running an extra model-initiated loop
+    /// should be opt-in. Only the `explore` profile is supported here — the
+    /// CLI has no per-turn checkpoints to safely land a mutating subagent's
+    /// writes into.
+    #[arg(long, global = true)]
+    subagents: bool,
 }
 
 impl ChatFlags {
@@ -216,6 +239,7 @@ impl ChatFlags {
             verbose: self.verbose,
             attach_images: self.attach_images,
             verify: self.verify && !self.no_verify,
+            subagents: self.subagents,
         })
     }
 }
@@ -312,6 +336,48 @@ enum Cmd {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Knowledge Stacks parity (RAG design doc, slice 4): list stacks
+    /// created in the desktop app's Settings > Knowledge tab, or reindex
+    /// one by name. Read-only management stays in the GUI — no
+    /// create/delete/add-source here.
+    #[command(subcommand)]
+    Stacks(StacksCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum StacksCmd {
+    /// List every knowledge stack: name, source count, chunk/indexed state,
+    /// and embedding model.
+    List,
+    /// Reindex a stack by name, incrementally skipping any file whose
+    /// content hasn't changed since the last index.
+    Reindex {
+        /// Stack name, matched case-insensitively.
+        name: String,
+    },
+    /// Manage the embeddings-only `llama-server` instance a `llama`-backend
+    /// stack's `reindex`/`search_docs` needs reachable on port 8091 — see
+    /// `embed_cli.rs`'s module doc for why this exists as a pid-file-based
+    /// subcommand rather than reusing the desktop app's in-memory lifecycle.
+    #[command(subcommand)]
+    EmbedServer(EmbedServerCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum EmbedServerCmd {
+    /// Start the embeddings server against a downloaded GGUF model file,
+    /// waiting until it's healthy and verified before returning. Leaves the
+    /// process running in the background for subsequent `lm-cli` invocations.
+    Start {
+        /// Path to a downloaded embedding model's GGUF file (e.g. one
+        /// downloaded via the desktop app's Settings > Knowledge tab).
+        #[arg(long = "model-path")]
+        model_path: String,
+    },
+    /// Stop the embeddings server, if running.
+    Stop,
+    /// Report whether the embeddings server is currently running.
+    Status,
 }
 
 fn resolve_target(cli: &Cli) -> Result<chat::Target, String> {
@@ -611,7 +677,7 @@ async fn main() {
         Err(e) => fail(&e),
     };
     let mcp_entries = resolve_mcp_entries(&cli, &state).await;
-    chat_loop(&client, target, &state, mode, options, persona, cli.prompt.as_deref(), &mcp_entries).await;
+    chat_loop(&client, target, &state, mode, options, persona, cli.prompt.as_deref(), &mcp_entries, &cli.stack).await;
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -658,7 +724,8 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 native_ollama: true,
             };
             let mcp_entries = resolve_mcp_entries(cli, &state).await;
-            chat_loop(client, target, &state, mode, options, persona, prompt.as_deref(), &mcp_entries).await;
+            chat_loop(client, target, &state, mode, options, persona, prompt.as_deref(), &mcp_entries, &cli.stack)
+                .await;
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -669,6 +736,13 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             Err(e) => Err(e),
         },
         Cmd::ApiServe { port } => run_api_serve(*port).await,
+        Cmd::Stacks(action) => match action {
+            StacksCmd::List => stacks_cli::list(),
+            StacksCmd::Reindex { name } => stacks_cli::reindex(name).await,
+            StacksCmd::EmbedServer(EmbedServerCmd::Start { model_path }) => embed_cli::start(model_path.clone()).await,
+            StacksCmd::EmbedServer(EmbedServerCmd::Stop) => embed_cli::stop(),
+            StacksCmd::EmbedServer(EmbedServerCmd::Status) => embed_cli::status(),
+        },
     };
     if let Err(e) = result {
         fail(&e);
@@ -712,6 +786,7 @@ async fn chat_loop(
     persona: Option<PromptEntry>,
     prompt: Option<&str>,
     mcp_entries: &[McpServerEntry],
+    attached_stacks: &[String],
 ) {
     if !target.is_native()
         && (options.num_ctx.is_some() || options.keep_alive.is_some() || options.think.is_some())
@@ -723,8 +798,18 @@ async fn chat_loop(
         options.system = compose_persona_and_system(persona.as_ref(), options.system.as_deref());
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
-        if let Err(e) =
-            agent::run_turn(client, &target, state, &mut perms, &mut history, &options, prompt, mcp_entries).await
+        if let Err(e) = agent::run_turn(
+            client,
+            &target,
+            state,
+            &mut perms,
+            &mut history,
+            &options,
+            prompt,
+            mcp_entries,
+            attached_stacks,
+        )
+        .await
         {
             eprintln!("\nError: {e}");
             std::process::exit(1);
@@ -732,7 +817,7 @@ async fn chat_loop(
         return;
     }
 
-    repl::run(client, target, state, mode, options, persona, mcp_entries).await;
+    repl::run(client, target, state, mode, options, persona, mcp_entries, attached_stacks).await;
 }
 
 #[cfg(test)]
@@ -867,6 +952,7 @@ mod tests {
             no_rules: true,
             no_mcp: false,
             persona: None,
+            stack: Vec::new(),
             chat: ChatFlags {
                 temperature: None,
                 top_p: None,
@@ -883,6 +969,7 @@ mod tests {
                 attach_images: false,
                 verify: false,
                 no_verify: false,
+                subagents: false,
             },
         };
 
@@ -1080,6 +1167,7 @@ mod tests {
             no_rules: true,
             no_mcp: false,
             persona: Some("definitely-not-a-real-persona-command".to_string()),
+            stack: Vec::new(),
             chat: ChatFlags {
                 temperature: None,
                 top_p: None,
@@ -1096,6 +1184,7 @@ mod tests {
                 attach_images: false,
                 verify: false,
                 no_verify: false,
+                subagents: false,
             },
         };
         match chat_setup(&cli) {

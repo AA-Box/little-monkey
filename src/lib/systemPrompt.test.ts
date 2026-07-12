@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSystemPrompt, composeSystemPrompt, detectOsLabel, resolvePersona, type McpServerPromptInfo } from './systemPrompt';
+import { buildSubagentSystemPrompt, buildSystemPrompt, composeSystemPrompt, detectOsLabel, resolvePersona, type McpServerPromptInfo } from './systemPrompt';
 import type { MemoryFact, RuleFile } from '../store/rulesStore';
 import type { PromptEntry } from '../store/promptStore';
 
@@ -174,6 +174,105 @@ describe('buildSystemPrompt', () => {
   it('omits the artifact guidance line when artifactGuidanceAvailable is false', () => {
     const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', false);
     expect(prompt).not.toContain('tagged html/svg/mermaid');
+  });
+
+  it('omits the knowledge stacks line when no stacks are attached (the default)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('Knowledge stacks attached');
+    expect(prompt).not.toContain('search_docs');
+  });
+
+  it('names every attached stack and its description, and points the model at search_docs', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [
+      { name: 'Docs', description: '42 chunks indexed' },
+      { name: 'Release Notes', description: 'not indexed yet' },
+    ]);
+    expect(prompt).toContain('Knowledge stacks attached');
+    expect(prompt).toContain('"Docs" (42 chunks indexed)');
+    expect(prompt).toContain('"Release Notes" (not indexed yet)');
+    expect(prompt).toContain('search_docs');
+    expect(prompt).toContain('cite source paths');
+  });
+
+  it('omits the doc-chat citation instruction by default (docChatMode defaults to false)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [
+      { name: 'Docs', description: '42 chunks indexed' },
+    ]);
+    expect(prompt).not.toContain('Doc-chat mode is on');
+  });
+
+  it('adds the doc-chat citation instruction when docChatMode is true', () => {
+    const prompt = buildSystemPrompt(
+      [primary],
+      'macOS',
+      [],
+      [],
+      [],
+      true,
+      false,
+      'manual',
+      true,
+      [{ name: 'Docs', description: '42 chunks indexed' }],
+      true
+    );
+    expect(prompt).toContain('Doc-chat mode is on');
+    expect(prompt).toContain('[Sources]');
+    expect(prompt).toContain('citing the specific source path');
+  });
+
+  it('omits the subagent delegation guidance line by default (subagentGuidanceAvailable defaults to false)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('task tool');
+  });
+
+  it('adds the subagent delegation guidance line when subagentGuidanceAvailable is true', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [], false, true);
+    expect(prompt).toContain('task tool');
+    expect(prompt).toContain("profile 'explore'");
+  });
+});
+
+// `buildSubagentSystemPrompt` seeds a subagent's own LOCAL message history
+// (see `subagent.ts`'s `runSubagentTask`) — a distinct, much shorter prompt
+// than `buildSystemPrompt`'s, but sharing the same workspace-facts
+// derivation.
+describe('buildSubagentSystemPrompt', () => {
+  const primary = { path: '/home/me/project', label: 'project', is_primary: true };
+  const secondary = { path: '/home/me/notes', label: 'notes', is_primary: false };
+
+  it('names the primary workspace, the OS, and the task description', () => {
+    const prompt = buildSubagentSystemPrompt([primary], 'macOS', 'explore', 'find every caller of X');
+    expect(prompt).toContain('/home/me/project');
+    expect(prompt).toContain('macOS');
+    expect(prompt).toContain('find every caller of X');
+  });
+
+  it('names secondary folders by label when attached', () => {
+    const prompt = buildSubagentSystemPrompt([primary, secondary], 'macOS', 'explore', 'd');
+    expect(prompt).toContain('"notes"');
+    expect(prompt).toContain('/home/me/notes');
+  });
+
+  it('handles no workspace open without throwing', () => {
+    const prompt = buildSubagentSystemPrompt([], 'macOS', 'explore', 'd');
+    expect(prompt).toContain('No workspace folder is open yet');
+  });
+
+  it('describes only read-only tools for the explore profile', () => {
+    const prompt = buildSubagentSystemPrompt([primary], 'macOS', 'explore', 'd');
+    expect(prompt).toContain('read-only tools only');
+    expect(prompt).not.toContain('write_file, edit_file, and run_shell to make changes');
+  });
+
+  it('describes read-write tools for the code profile', () => {
+    const prompt = buildSubagentSystemPrompt([primary], 'macOS', 'code', 'd');
+    expect(prompt).toContain('write_file, edit_file, and run_shell to make changes');
+  });
+
+  it('instructs the subagent to report back rather than ask questions', () => {
+    const prompt = buildSubagentSystemPrompt([primary], 'macOS', 'explore', 'd');
+    expect(prompt).toContain('final report');
+    expect(prompt).toContain('do not ask questions');
   });
 });
 

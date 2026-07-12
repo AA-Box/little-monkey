@@ -52,6 +52,39 @@ export interface SettingsState {
   artifactScriptsEnabled: boolean;
   /** Whether `runTurnGuarded` (see `agentLoop.ts`) auto-opens the newest previewable artifact from a just-finished turn in `ArtifactPane`. Default false, mirroring `verifyEnabled`'s "automatically doing something on the user's behalf should be opt-in" posture — a user who didn't ask for a preview shouldn't have the workspace panel commandeered out from under them. Only artifacts produced by the turn that just completed are considered, never ones already sitting earlier in the transcript. */
   artifactAutoPreview: boolean;
+  /** Whether the `task` tool (subagent delegation — see `subagent.ts`'s
+   * `runSubagentTask`) is offered to the model this turn (see
+   * `agentLoop.ts`'s `toolsForSettings` filter). Default false: a weak local
+   * model may misuse or loop on it, so this ships default-off exactly like
+   * `verifyEnabled` — "automatically doing something on the model's own
+   * initiative should be opt-in". Turning it off makes `task` invisible to
+   * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
+   * not offered" treatment of `remember`. */
+  subagentsEnabled: boolean;
+  /** How many `task` tool calls in the same round trip `runToolCallsForRound`
+   * (see `agentLoop.ts`) will run concurrently via its bounded promise pool —
+   * every other tool call in the round stays sequential regardless of this
+   * value (see that function's own doc comment). Range 1-4, default 2:
+   * mirrors `verifyMaxRounds`'s small-integer-range pattern. A value of 1
+   * behaves like slice 1/2 (subagents never overlap); permission-prompt
+   * storms from several concurrent `code`-profile subagents in manual mode
+   * are the reason this stays capped at 4 rather than "however many the
+   * model asks for" — see the design doc's "Permission-prompt storms" risk. */
+  maxConcurrentSubagents: number;
+  /** Optional per-profile provider-model override for subagent runs (slice
+   * 4) — resolved in `subagent.ts`'s `runSubagentTask`, which uses it INSTEAD
+   * of the parent turn's own resolved target for that one profile, e.g.
+   * running every `explore` subagent on a cheap/fast model while the parent
+   * conversation stays on something stronger. Keyed by profile; a profile
+   * absent from this map (the default, empty map) means "same target as the
+   * parent turn", exactly like slices 1-3 behaved before this setting
+   * existed. Deliberately provider-only (never `'local'`/`'ollama'`, unlike
+   * `ResolvedTarget` generally) — restricting the override to provider
+   * targets keeps the settings-panel picker to the same
+   * provider-then-model dropdown pair `visionOverrides` already uses,
+   * rather than a three-way target-kind picker for a minor v1 win (see the
+   * design doc's "keep this genuinely optional... don't force a UI" note). */
+  subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -74,6 +107,16 @@ export interface SettingsState {
   setRiskAnnotationsEnabled: (value: boolean) => void;
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
+  setSubagentsEnabled: (value: boolean) => void;
+  setMaxConcurrentSubagents: (value: number) => void;
+  setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
+  clearSubagentProfileModel: (profile: 'explore' | 'code') => void;
+}
+
+/** A single per-profile subagent model override — see `subagentProfileModels`'s own doc comment. */
+export interface SubagentModelOverride {
+  providerId: string;
+  model: string;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -104,6 +147,10 @@ export const MAX_CHECKPOINT_RETENTION = 100;
 const DEFAULT_VERIFY_MAX_ROUNDS = 1;
 export const MIN_VERIFY_MAX_ROUNDS = 0;
 export const MAX_VERIFY_MAX_ROUNDS = 3;
+/** See `maxConcurrentSubagents`'s own doc comment for why this range. */
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2;
+export const MIN_MAX_CONCURRENT_SUBAGENTS = 1;
+export const MAX_MAX_CONCURRENT_SUBAGENTS = 4;
 
 interface PersistedShape {
   autoFailoverEnabled: boolean;
@@ -123,6 +170,9 @@ interface PersistedShape {
   riskAnnotationsEnabled: boolean;
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
+  subagentsEnabled: boolean;
+  maxConcurrentSubagents: number;
+  subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
 }
 
 function defaults(): PersistedShape {
@@ -144,7 +194,25 @@ function defaults(): PersistedShape {
     riskAnnotationsEnabled: false,
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
+    subagentsEnabled: false,
+    maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+    subagentProfileModels: {},
   };
+}
+
+/** Defensive per-entry validation for a persisted `subagentProfileModels` blob — same posture as `sanitizeProviderModelFilters` just above: one malformed/hand-edited entry must not corrupt the rest or crash hydration. */
+function sanitizeSubagentProfileModels(raw: unknown): Partial<Record<'explore' | 'code', SubagentModelOverride>> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Partial<Record<'explore' | 'code', SubagentModelOverride>> = {};
+  for (const profile of ['explore', 'code'] as const) {
+    const entry = (raw as Record<string, unknown>)[profile];
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as Partial<SubagentModelOverride>;
+    if (typeof candidate.providerId === "string" && candidate.providerId && typeof candidate.model === "string" && candidate.model) {
+      out[profile] = { providerId: candidate.providerId, model: candidate.model };
+    }
+  }
+  return out;
 }
 
 /** Defensive per-entry validation for a persisted `providerModelFilters` blob — one malformed entry (e.g. hand-edited localStorage) must not corrupt the rest. */
@@ -211,6 +279,14 @@ function hydrate(): PersistedShape {
         typeof parsed.artifactScriptsEnabled === "boolean" ? parsed.artifactScriptsEnabled : fallback.artifactScriptsEnabled,
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
+      subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      maxConcurrentSubagents:
+        typeof parsed.maxConcurrentSubagents === "number" &&
+        parsed.maxConcurrentSubagents >= MIN_MAX_CONCURRENT_SUBAGENTS &&
+        parsed.maxConcurrentSubagents <= MAX_MAX_CONCURRENT_SUBAGENTS
+          ? Math.round(parsed.maxConcurrentSubagents)
+          : fallback.maxConcurrentSubagents,
+      subagentProfileModels: sanitizeSubagentProfileModels(parsed.subagentProfileModels),
     };
   } catch {
     return fallback;
@@ -354,6 +430,30 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setArtifactAutoPreview: (value) => {
     set({ artifactAutoPreview: value });
+    persist({ ...get() });
+  },
+
+  setSubagentsEnabled: (value) => {
+    set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setMaxConcurrentSubagents: (value) => {
+    const clamped = Math.min(MAX_MAX_CONCURRENT_SUBAGENTS, Math.max(MIN_MAX_CONCURRENT_SUBAGENTS, Math.round(value)));
+    set({ maxConcurrentSubagents: clamped });
+    persist({ ...get() });
+  },
+
+  setSubagentProfileModel: (profile, override) => {
+    set((state) => ({ subagentProfileModels: { ...state.subagentProfileModels, [profile]: override } }));
+    persist({ ...get() });
+  },
+
+  clearSubagentProfileModel: (profile) => {
+    set((state) => {
+      const { [profile]: _discard, ...rest } = state.subagentProfileModels;
+      return { subagentProfileModels: rest };
+    });
     persist({ ...get() });
   },
 }));

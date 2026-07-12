@@ -1005,6 +1005,7 @@ pub async fn mcp_call_tool(
         detail,
         turn_id.as_deref(),
         None,
+        None,
     )
     .await?;
 

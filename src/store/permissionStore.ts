@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /**
@@ -23,6 +23,14 @@ export interface PermissionRequest {
    * un-overridable `path_risk_floor` rather than the LLM judge — lets the
    * modal show a stronger "sensitive path" warning. */
   risk_floored?: boolean;
+  /** The description of the `code`-profile subagent (p3) this call
+   * originated from, if any — a dedicated field (NOT parsed back out of
+   * `detail`, the pre-fix design) so a subagent's own model-supplied
+   * `description` can never forge/corrupt the shown `detail` or spoof a
+   * different attribution — see `tools.rs`'s `PermissionRequestPayload.
+   * agent_label` doc comment. `undefined` for every parent-turn call and any
+   * `explore`-profile subagent. */
+  agent_label?: string;
 }
 
 /**
@@ -245,13 +253,16 @@ export const usePermissionStore = create<PermissionStore>((set, get) => ({
   },
 }));
 
-void listen<PermissionRequest>("permission://request", (event) => {
-  usePermissionStore.setState((state) => {
-    // Duplicate delivery of an id already queued — keep state as is.
-    if (state.queue.some((r) => r.id === event.payload.id)) return state;
-    const queue = [...state.queue, event.payload];
-    return { queue, pending: state.pending ?? event.payload };
+// Tauri-shell only: in plain-browser dev `listen` itself throws.
+if (isTauri()) {
+  void listen<PermissionRequest>("permission://request", (event) => {
+    usePermissionStore.setState((state) => {
+      // Duplicate delivery of an id already queued — keep state as is.
+      if (state.queue.some((r) => r.id === event.payload.id)) return state;
+      const queue = [...state.queue, event.payload];
+      return { queue, pending: state.pending ?? event.payload };
+    });
+  }).catch((error) => {
+    console.error("Failed to listen for permission://request events", error);
   });
-}).catch((error) => {
-  console.error("Failed to listen for permission://request events", error);
-});
+}

@@ -1,6 +1,21 @@
 import { useEffect, useState } from "react";
-import { X } from "lucide-react";
-import { IconButton, Tabs } from "../ui";
+import {
+  BookOpen,
+  Cloud,
+  Cpu,
+  Globe,
+  MessageSquare,
+  Plug,
+  ScrollText,
+  Search,
+  Server,
+  Sparkles,
+  Terminal,
+  X,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
+import { IconButton } from "../ui";
 import { useModelStore } from "../../store/modelStore";
 import { ProviderCard } from "./ProviderCard";
 import { AddCustomProviderForm } from "./AddCustomProviderForm";
@@ -11,6 +26,7 @@ import { McpPanel } from "./McpPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
 import { WebPanel } from "./WebPanel";
 import { ApiServerPanel } from "./ApiServerPanel";
+import { KnowledgePanel } from "./KnowledgePanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -25,19 +41,39 @@ interface SettingsModalProps {
   initialTab?: SettingsTab;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver" | "knowledge";
 
-const TAB_KEYS: { id: Exclude<SettingsTab, "openrouter">; labelKey: string }[] = [
-  { id: "local", labelKey: "SettingsModal.tabLocalModels" },
-  { id: "ollama", labelKey: "SettingsModal.tabOllama" },
-  { id: "providers", labelKey: "SettingsModal.tabAiProviders" },
-  { id: "automation", labelKey: "SettingsModal.tabAutomation" },
-  { id: "rules", labelKey: "SettingsModal.tabRules" },
-  { id: "mcp", labelKey: "SettingsModal.tabMcp" },
-  { id: "prompts", labelKey: "SettingsModal.tabPrompts" },
-  { id: "web", labelKey: "SettingsModal.tabWeb" },
-  { id: "apiserver", labelKey: "SettingsModal.tabApiServer" },
+const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
+  local: Cpu,
+  ollama: Server,
+  providers: Cloud,
+  knowledge: BookOpen,
+  automation: Zap,
+  rules: ScrollText,
+  mcp: Plug,
+  prompts: MessageSquare,
+  web: Globe,
+  apiserver: Terminal,
+};
+
+const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
+  { labelKey: "SettingsModal.groupModels", ids: ["local", "ollama", "providers"] },
+  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["mcp", "prompts", "web", "apiserver"] },
 ];
+
+const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
+  local: "SettingsModal.tabLocalModels",
+  ollama: "SettingsModal.tabOllama",
+  providers: "SettingsModal.tabAiProviders",
+  knowledge: "SettingsModal.tabKnowledge",
+  automation: "SettingsModal.tabAutomation",
+  rules: "SettingsModal.tabRules",
+  mcp: "SettingsModal.tabMcp",
+  prompts: "SettingsModal.tabPrompts",
+  web: "SettingsModal.tabWeb",
+  apiserver: "SettingsModal.tabApiServer",
+};
 
 /**
  * App-wide Settings: one model-provider surface per tab (local llama.cpp,
@@ -51,23 +87,36 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
   const providers = useModelStore((s) => s.providers);
 
   const [tab, setTab] = useState<SettingsTab>("local");
+  const [query, setQuery] = useState("");
   const { t } = useT();
 
   const openrouterProvider = providers.find((p) => p.id === "openrouter");
   const openrouterConnected = openrouterProvider?.has_key ?? false;
 
-  // A dedicated tab named after the provider, inserted right before "AI
+  // A dedicated nav item named after the provider, inserted right before "AI
   // Providers" — only while OpenRouter is connected. OpenRouter alone
   // returns 400+ models (see `ProviderCard.tsx`'s `FILTER_THRESHOLD`), so it
   // gets its own curation surface instead of dumping everything into the
   // chat toolbar's model switcher unfiltered.
-  const TABS: { id: SettingsTab; label: string }[] = [];
-  for (const { id, labelKey } of TAB_KEYS) {
-    if (id === "providers" && openrouterConnected) {
-      TABS.push({ id: "openrouter", label: openrouterProvider?.label ?? "OpenRouter" });
-    }
-    TABS.push({ id, label: t(labelKey) });
-  }
+  const navGroups = GROUPS.map((group) => ({
+    label: t(group.labelKey),
+    items: group.ids.flatMap((id) => {
+      const items: { id: SettingsTab; label: string; icon: LucideIcon }[] = [];
+      if (id === "providers" && openrouterConnected) {
+        items.push({ id: "openrouter", label: openrouterProvider?.label ?? "OpenRouter", icon: Sparkles });
+      }
+      items.push({ id, label: t(LABEL_KEYS[id]), icon: ICONS[id] });
+      return items;
+    }),
+  }))
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => item.label.toLowerCase().includes(query.trim().toLowerCase())),
+    }))
+    .filter((group) => group.items.length > 0);
+
+  const activeLabel =
+    navGroups.flatMap((group) => group.items).find((item) => item.id === tab)?.label ?? t(LABEL_KEYS[tab === "openrouter" ? "providers" : tab]);
 
   useEffect(() => {
     if (!open) return;
@@ -100,47 +149,92 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
       role="dialog"
       aria-modal="true"
       aria-labelledby="settings-modal-title"
       onClick={onClose}
     >
       <div
-        className="flex h-[85vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-background shadow-xl"
+        className="flex h-full w-full flex-col bg-background"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-3.5">
-          <h2 id="settings-modal-title" className="text-sm font-semibold text-foreground">
-            {t("SettingsModal.title")}
-          </h2>
-          <IconButton size="sm" onClick={onClose} aria-label={t("SettingsModal.closeSettingsAriaLabel")}>
+        <div className="flex w-64 shrink-0 flex-col border-r border-border bg-surface">
+          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3">
+            <div className="relative">
+              <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+              <input
+                type="text"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={t("SettingsModal.searchPlaceholder")}
+                className="w-full rounded-lg border border-border bg-surface-2 py-1.5 pl-8 pr-3 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+            </div>
+
+            <p id="settings-modal-title" className="px-1 text-sm font-semibold text-foreground">
+              {t("SettingsModal.title")}
+            </p>
+
+            {navGroups.map((group) => (
+              <div key={group.label} className="flex flex-col gap-0.5">
+                <p className="px-2 pb-1 text-xs font-medium uppercase tracking-wide text-faint">{group.label}</p>
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const isActive = item.id === tab;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setTab(item.id)}
+                      className={`flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm transition-colors ${
+                        isActive
+                          ? "bg-surface-2 font-medium text-foreground"
+                          : "text-muted hover:bg-surface-2 hover:text-foreground"
+                      }`}
+                    >
+                      <Icon size={16} className="shrink-0" />
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="relative flex min-w-0 flex-1 flex-col">
+          <IconButton
+            size="sm"
+            onClick={onClose}
+            aria-label={t("SettingsModal.closeSettingsAriaLabel")}
+            className="absolute right-4 top-4 z-10"
+          >
             <X size={16} />
           </IconButton>
-        </div>
 
-        <div className="shrink-0 px-3">
-          <Tabs tabs={TABS} active={tab} onChange={(id) => setTab(id as SettingsTab)} />
-        </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-6">
+            <h2 className="mb-4 text-lg font-semibold text-foreground">{activeLabel}</h2>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          {tab === "local" && <ModelManager />}
-          {tab === "ollama" && <OllamaPanel />}
-          {tab === "openrouter" && <OpenRouterModelsPanel />}
-          {tab === "providers" && (
-            <div className="flex flex-col gap-2 p-2">
-              {providers.map((provider) => (
-                <ProviderCard key={provider.id} provider={provider} />
-              ))}
-              <AddCustomProviderForm />
-            </div>
-          )}
-          {tab === "automation" && <AutomationPanel />}
-          {tab === "rules" && <RulesMemoryPanel />}
-          {tab === "mcp" && <McpPanel />}
-          {tab === "prompts" && <PromptLibraryPanel />}
-          {tab === "web" && <WebPanel />}
-          {tab === "apiserver" && <ApiServerPanel />}
+            {tab === "local" && <ModelManager />}
+            {tab === "ollama" && <OllamaPanel />}
+            {tab === "openrouter" && <OpenRouterModelsPanel />}
+            {tab === "providers" && (
+              <div className="flex flex-col gap-2">
+                {providers.map((provider) => (
+                  <ProviderCard key={provider.id} provider={provider} />
+                ))}
+                <AddCustomProviderForm />
+              </div>
+            )}
+            {tab === "knowledge" && <KnowledgePanel />}
+            {tab === "automation" && <AutomationPanel />}
+            {tab === "rules" && <RulesMemoryPanel />}
+            {tab === "mcp" && <McpPanel />}
+            {tab === "prompts" && <PromptLibraryPanel />}
+            {tab === "web" && <WebPanel />}
+            {tab === "apiserver" && <ApiServerPanel />}
+          </div>
         </div>
       </div>
     </div>

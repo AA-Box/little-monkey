@@ -3,8 +3,10 @@ import { Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
+  MAX_MAX_CONCURRENT_SUBAGENTS,
   MAX_VERIFY_MAX_ROUNDS,
   MIN_CHECKPOINT_RETENTION,
+  MIN_MAX_CONCURRENT_SUBAGENTS,
   MIN_VERIFY_MAX_ROUNDS,
   useSettingsStore,
   type ContextTrimStrategy,
@@ -173,6 +175,76 @@ function VerifyCommandRow({ command }: { command: VerifyCommand }) {
 }
 
 /**
+ * One profile's optional model override row (slice 4): a provider+model
+ * picker that, once both are chosen, calls `onSet` immediately — no separate
+ * "apply" button, since (unlike the vision-override list below, which
+ * accumulates many entries) there is only ever one value per profile, so
+ * committing on the second selection is the least surprising behavior. Shows
+ * a "Same as parent" badge when nothing is configured for this profile —
+ * the actual default, since an absent entry in `subagentProfileModels` means
+ * exactly that (see that setting's own doc comment).
+ */
+function SubagentModelOverrideRow({
+  labelKey,
+  override,
+  connectedProviders,
+  providerModels,
+  onSet,
+  onClear,
+}: {
+  labelKey: string;
+  override: { providerId: string; model: string } | undefined;
+  connectedProviders: { id: string; label: string }[];
+  providerModels: Record<string, { id: string }[]>;
+  onSet: (providerId: string, model: string) => void;
+  onClear: () => void;
+}) {
+  const { t } = useT();
+  const [providerId, setProviderId] = useState(override?.providerId ?? "");
+  const models = providerId ? providerModels[providerId] ?? [] : [];
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-border py-2.5 first:border-t-0">
+      <span className="w-28 shrink-0 text-sm text-foreground">{t(labelKey)}</span>
+      <select
+        value={providerId}
+        onChange={(event) => setProviderId(event.target.value)}
+        className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+      >
+        <option value="">{t("AutomationPanel.providerPlaceholderOption")}</option>
+        {connectedProviders.map((provider) => (
+          <option key={provider.id} value={provider.id}>
+            {provider.label}
+          </option>
+        ))}
+      </select>
+      <select
+        value={override?.providerId === providerId ? override.model : ""}
+        onChange={(event) => {
+          if (event.target.value) onSet(providerId, event.target.value);
+        }}
+        disabled={!providerId}
+        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed"
+      >
+        <option value="">{t("AutomationPanel.modelPlaceholderOption")}</option>
+        {models.map((model) => (
+          <option key={model.id} value={model.id}>
+            {model.id}
+          </option>
+        ))}
+      </select>
+      {override ? (
+        <button type="button" onClick={onClear} className="shrink-0 cursor-pointer text-xs text-faint hover:text-danger">
+          {t("AutomationPanel.clearButton")}
+        </button>
+      ) : (
+        <StatusPill tone="neutral">{t("AutomationPanel.subagentModelOverrideDefaultBadge")}</StatusPill>
+      )}
+    </div>
+  );
+}
+
+/**
  * Settings tab for the client-side reliability behaviors this app ported
  * from the idea of a server-side multi-provider gateway: auto-failover,
  * vision-aware model auto-switch, adaptive context compaction, and
@@ -210,6 +282,13 @@ export function AutomationPanel() {
   const setArtifactAutoPreview = useSettingsStore((s) => s.setArtifactAutoPreview);
   const riskAnnotationsEnabled = useSettingsStore((s) => s.riskAnnotationsEnabled);
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
+  const subagentsEnabled = useSettingsStore((s) => s.subagentsEnabled);
+  const setSubagentsEnabled = useSettingsStore((s) => s.setSubagentsEnabled);
+  const maxConcurrentSubagents = useSettingsStore((s) => s.maxConcurrentSubagents);
+  const setMaxConcurrentSubagents = useSettingsStore((s) => s.setMaxConcurrentSubagents);
+  const subagentProfileModels = useSettingsStore((s) => s.subagentProfileModels);
+  const setSubagentProfileModel = useSettingsStore((s) => s.setSubagentProfileModel);
+  const clearSubagentProfileModel = useSettingsStore((s) => s.clearSubagentProfileModel);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
@@ -374,6 +453,51 @@ export function AutomationPanel() {
             onChange={setArtifactAutoPreview}
             label={t("AutomationPanel.artifactAutoPreviewLabel")}
             description={t("AutomationPanel.artifactAutoPreviewDescription")}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.subagentsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={subagentsEnabled}
+            onChange={setSubagentsEnabled}
+            label={t("AutomationPanel.subagentsEnabledLabel")}
+            description={t("AutomationPanel.subagentsEnabledDescription")}
+          />
+          <label className="flex items-center justify-between gap-3 border-t border-border py-2.5 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.maxConcurrentSubagentsLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.maxConcurrentSubagentsDescription")}</span>
+            </span>
+            <input
+              type="number"
+              min={MIN_MAX_CONCURRENT_SUBAGENTS}
+              max={MAX_MAX_CONCURRENT_SUBAGENTS}
+              value={maxConcurrentSubagents}
+              onChange={(event) => setMaxConcurrentSubagents(Number(event.target.value))}
+              className="h-8 w-16 shrink-0 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+          </label>
+        </div>
+        <p className="mb-1 mt-3 text-xs text-muted">{t("AutomationPanel.subagentModelOverrideIntro")}</p>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <SubagentModelOverrideRow
+            labelKey="AutomationPanel.subagentModelOverrideExploreLabel"
+            override={subagentProfileModels.explore}
+            connectedProviders={connectedProviders}
+            providerModels={providerModels}
+            onSet={(providerId, model) => setSubagentProfileModel("explore", { providerId, model })}
+            onClear={() => clearSubagentProfileModel("explore")}
+          />
+          <SubagentModelOverrideRow
+            labelKey="AutomationPanel.subagentModelOverrideCodeLabel"
+            override={subagentProfileModels.code}
+            connectedProviders={connectedProviders}
+            providerModels={providerModels}
+            onSet={(providerId, model) => setSubagentProfileModel("code", { providerId, model })}
+            onClear={() => clearSubagentProfileModel("code")}
           />
         </div>
       </section>

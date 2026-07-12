@@ -2,6 +2,8 @@ import { memo, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   BookmarkX,
+  BookOpen,
+  Bot,
   Brain,
   ChevronRight,
   ClipboardCheck,
@@ -31,16 +33,19 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isPlanNotice,
+  isSourcesNotice,
   isSwitchNotice,
   isVerifyFixNotice,
   isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
   parsePlanNotice,
+  parseSourcesNotice,
   parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
   type PlanNotice,
+  type SourcesNotice,
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
@@ -49,6 +54,7 @@ import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
 import PlanCard from "./PlanCard";
+import SubagentRow from "./SubagentRow";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
@@ -70,11 +76,13 @@ export interface MessageListProps {
 type TimelineItem =
   | { kind: "bubble"; key: string; message: ChatMessage; index: number }
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
+  | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
+  | { kind: "sources"; key: string; notice: SourcesNotice }
   | { kind: "typing"; key: string };
 
 /**
@@ -87,7 +95,7 @@ type TimelineItem =
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
  *   synthetic notices (compaction, model switch, per-turn checkpoint,
- *   remembered fact, presented plan).
+ *   remembered fact, presented plan, doc-chat sources).
  */
 function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
@@ -118,6 +126,22 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
 
       for (const toolCall of toolCalls) {
         renderedCallIds.add(toolCall.id);
+        // A `task` call gets its own dedicated `SubagentRow` (live status +
+        // expandable child transcript) rather than the generic `ToolCallRow`
+        // every other tool renders as — see `SubagentRow.tsx`. `toolCall.id`
+        // is what `subagentStore`/`ChatSession.subagentRuns` are keyed by
+        // (see `subagent.ts`'s `RunSubagentTaskParams.toolCallId` doc
+        // comment for why THIS id, not the Rust-facing turn id).
+        if (toolCall.function.name === "task") {
+          items.push({
+            kind: "subagent",
+            key: `subagent-${toolCall.id}`,
+            taskId: toolCall.id,
+            args: toolCall.function.arguments,
+            result: resultByCallId.get(toolCall.id),
+          });
+          continue;
+        }
         items.push({
           kind: "tool",
           key: `tool-${toolCall.id}`,
@@ -175,6 +199,13 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         }
         return;
       }
+      if (isSourcesNotice(msg)) {
+        const notice = parseSourcesNotice(msg);
+        if (notice) {
+          items.push({ kind: "sources", key: `sources-${index}`, notice });
+        }
+        return;
+      }
       if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg) || isVerifyFixNotice(msg)) {
         items.push({ kind: "notice", key: `notice-${index}`, text: textContent(msg.content) });
       }
@@ -192,7 +223,7 @@ function formatJson(raw: string): string {
   }
 }
 
-function resultLooksLikeError(raw: string): boolean {
+export function resultLooksLikeError(raw: string): boolean {
   try {
     const parsed: unknown = JSON.parse(raw);
     return typeof parsed === "object" && parsed !== null && "error" in parsed;
@@ -212,6 +243,13 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   remember: Brain,
   web_fetch: Globe,
   web_search: Search,
+  search_docs: BookOpen,
+  // `task` (subagent delegation) is special-cased in `buildTimeline` to
+  // render as a dedicated `SubagentRow` instead of a plain `ToolCallRow` —
+  // kept here anyway as the icon for the "orphaned tool result" fallback
+  // path (a persisted transcript with a `task` result but no matching
+  // `tool_calls` entry, e.g. after history truncation).
+  task: Bot,
 };
 
 function toolIcon(name: string): LucideIcon {
@@ -225,7 +263,7 @@ function toolIcon(name: string): LucideIcon {
 /** Memoized like `MessageBubble`: props are plain strings (stable for every
  * settled call), so streaming deltas to the transcript's last message don't
  * re-render the (potentially long) tool-call history. */
-const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
+export const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
   const pending = result === undefined;
@@ -589,6 +627,69 @@ const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) 
   );
 });
 
+/**
+ * Renders a doc-chat `[Sources]` notice (see `SOURCES_NOTE_PREFIX`): the
+ * retrieved passages as collapsible chips, each showing the source file name
+ * and its stack badge collapsed, expanding to the full snippet on click —
+ * same collapse affordance as `ToolCallRow`/`VerifyRow`, just one toggle per
+ * chip instead of one for the whole row, since a doc-chat turn typically
+ * retrieves several passages at once and showing every snippet by default
+ * would dominate the transcript.
+ */
+const SourcesRow = memo(function SourcesRow({ notice }: { notice: SourcesNotice }) {
+  const { t } = useT();
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
+
+  if (notice.results.length === 0) return null;
+
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+        <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted">
+          <BookOpen size={13} className="shrink-0 text-faint" />
+          <span className="font-medium text-foreground">
+            {t("MessageList.sourcesHeading", { count: notice.results.length })}
+          </span>
+        </div>
+        <div className="flex flex-col gap-1 border-t border-border px-2 py-2">
+          {notice.results.map((result, i) => {
+            const fileName = result.path.split(/[\\/]/).filter(Boolean).pop() ?? result.path;
+            const open = openIndex === i;
+            return (
+              <div
+                key={`${result.path}-${i}`}
+                className="overflow-hidden rounded-md border border-border bg-background"
+              >
+                <button
+                  type="button"
+                  onClick={() => setOpenIndex(open ? null : i)}
+                  title={result.path}
+                  className="flex w-full cursor-pointer items-center gap-2 px-2 py-1 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+                >
+                  <ChevronRight
+                    size={11}
+                    className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+                  />
+                  <FileText size={12} className="shrink-0 text-faint" />
+                  <span className="truncate font-mono">{fileName}</span>
+                  <span className="ml-auto shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-faint">
+                    {result.stack}
+                  </span>
+                </button>
+                {open && (
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-border bg-surface-2 px-2 py-1.5 font-mono text-[11px] text-muted">
+                    {result.snippet}
+                  </pre>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
@@ -696,6 +797,11 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             if (item.kind === "tool") {
               return <ToolCallRow key={item.key} name={item.name} args={item.args} result={item.result} />;
             }
+            if (item.kind === "subagent") {
+              return (
+                <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
+              );
+            }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;
             }
@@ -722,6 +828,9 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "verify") {
               return <VerifyRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "sources") {
+              return <SourcesRow key={item.key} notice={item.notice} />;
             }
             return <TypingIndicator key={item.key} />;
           })}
