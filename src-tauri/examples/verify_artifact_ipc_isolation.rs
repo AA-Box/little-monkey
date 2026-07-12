@@ -197,7 +197,17 @@ window.addEventListener('message', function (e) {{
     // happen from wherever the decision is actually made, which is here.
     let app_handle = app.handle().clone();
     std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Overridable via VERIFY_ARTIFACT_TIMEOUT_SECS: a cold CI VM's first
+        // WebView2 environment initialization (no warm user-data-dir cache)
+        // can plausibly take longer than a fixed 10s allows, which would
+        // otherwise misreport as the "no bound GUI session" inconclusive
+        // case documented in this file's header rather than a real timing
+        // issue. Default stays 10s so local/interactive runs are unaffected.
+        let timeout_secs = std::env::var("VERIFY_ARTIFACT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
         loop {
             if std::time::Instant::now() > deadline {
                 eprintln!(

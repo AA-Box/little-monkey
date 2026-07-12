@@ -80,3 +80,9 @@ jobs:
       - name: Run artifact IPC isolation check
         run: cargo run --manifest-path src-tauri/Cargo.toml --example verify_artifact_ipc_isolation --target ${{ matrix.target }}
         shell: bash
+        env:
+          # 60s instead of the 10s default: rule out "cold CI VM's first
+          # WebView2 init is just slow" before concluding the runner lacks a
+          # usable GUI session entirely.
+          VERIFY_ARTIFACT_TIMEOUT_SECS: "60"
+          VERIFY_ARTIFACT_DEBUG: "1"
