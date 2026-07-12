@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /** Mirrors the Rust `ApiServerStatusPayload` struct (src-tauri/src/server.rs)
@@ -148,10 +148,13 @@ export const useApiServerStore = create<ApiServerStore>((set) => ({
 
 // Keeps `status` live without polling — same event-listen pattern as
 // `modelStore.ts`'s `llama://status`/`ollama://status` subscriptions.
-void listen<ApiServerStatus>("apiserver://status", (event) => {
-  useApiServerStore.setState({ status: event.payload });
-}).catch((error) => {
-  console.error("Failed to listen for apiserver://status events", error);
-});
+// Tauri-shell only: in plain-browser dev `listen` itself throws.
+if (isTauri()) {
+  void listen<ApiServerStatus>("apiserver://status", (event) => {
+    useApiServerStore.setState({ status: event.payload });
+  }).catch((error) => {
+    console.error("Failed to listen for apiserver://status events", error);
+  });
+}
 
 export default useApiServerStore;

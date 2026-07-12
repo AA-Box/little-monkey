@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /**
@@ -151,34 +151,37 @@ export const useMcpStore = create<McpStore>((set, get) => ({
   },
 }));
 
-void listen<McpStatusEvent>("mcp://status", (event) => {
-  const { serverId, status, error } = event.payload;
+// Tauri-shell only: in plain-browser dev `listen` itself throws.
+if (isTauri()) {
+  void listen<McpStatusEvent>("mcp://status", (event) => {
+    const { serverId, status, error } = event.payload;
 
-  if (status === "connected") {
-    // The event doesn't carry the full tool list (just a count) — refresh
-    // to pick up what `mcp_connect` just cached, same reasoning as
-    // modelStore's `llama://status` handler re-deriving `active` from a
-    // fresh list rather than trusting a partial event payload.
-    void useMcpStore.getState().refresh();
-    return;
-  }
+    if (status === "connected") {
+      // The event doesn't carry the full tool list (just a count) — refresh
+      // to pick up what `mcp_connect` just cached, same reasoning as
+      // modelStore's `llama://status` handler re-deriving `active` from a
+      // fresh list rather than trusting a partial event payload.
+      void useMcpStore.getState().refresh();
+      return;
+    }
 
-  useMcpStore.setState((state) => ({
-    servers: state.servers.map((server) =>
-      server.id === serverId
-        ? {
-            ...server,
-            status,
-            error,
-            // A disconnect (manual or from disabling the server) invalidates
-            // the cached tool list on the Rust side too — mirror that here
-            // so `mcpTools.ts` never offers a stale tool from a server that
-            // isn't actually reachable anymore.
-            ...(status === "disconnected" ? { tools: [], instructions: null } : {}),
-          }
-        : server
-    ),
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for mcp://status events", error);
-});
+    useMcpStore.setState((state) => ({
+      servers: state.servers.map((server) =>
+        server.id === serverId
+          ? {
+              ...server,
+              status,
+              error,
+              // A disconnect (manual or from disabling the server) invalidates
+              // the cached tool list on the Rust side too — mirror that here
+              // so `mcpTools.ts` never offers a stale tool from a server that
+              // isn't actually reachable anymore.
+              ...(status === "disconnected" ? { tools: [], instructions: null } : {}),
+            }
+          : server
+      ),
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for mcp://status events", error);
+  });
+}
