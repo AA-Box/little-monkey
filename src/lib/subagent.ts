@@ -15,7 +15,15 @@
  */
 import { detectOsLabel, buildSubagentSystemPrompt, type PromptWorkspaceRoot } from './systemPrompt';
 import { toolsForProfile } from './tools';
-import { attemptStream, executeToolCall, CANCELLED_TOOL_RESULT, stringifyToolError, type ResolvedTarget } from './turnEngine';
+import {
+  attemptStream,
+  executeToolCall,
+  isToolCallAllowed,
+  CANCELLED_TOOL_RESULT,
+  stringifyToolError,
+  type ResolvedTarget,
+  type RiskAnnotationContext,
+} from './turnEngine';
 import type { ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
 import { useWorkspaceStore } from '../store/workspaceStore';
@@ -67,6 +75,38 @@ function activityLabel(toolCall: ToolCall): string {
   }
   const truncated = preview.length > MAX_ACTIVITY_CHARS ? `${preview.slice(0, MAX_ACTIVITY_CHARS)}…` : preview;
   return `${name}(${truncated})`;
+}
+
+/** Whether a `write_file`/`edit_file` tool result string represents success
+ * rather than the `{"error": ...}` shape `stringifyToolError` produces —
+ * used only to decide whether to report a mutated path via
+ * `RunSubagentTaskParams.onMutatedPath`. Structurally identical to
+ * `agentLoop.ts`'s `isSuccessfulMutationResult`, kept as its own tiny copy
+ * here (rather than a shared import) so this module never depends on
+ * `agentLoop.ts` — see `turnEngine.ts`'s module doc comment for why that
+ * dependency direction must stay one-way (subagents/verify/Plan-Act consume
+ * `turnEngine.ts`'s primitives without depending on `agentLoop.ts`'s own
+ * orchestration layer). */
+function isSuccessfulMutationResult(resultContent: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(resultContent);
+    return !(parsed && typeof parsed === 'object' && 'error' in parsed);
+  } catch {
+    return true;
+  }
+}
+
+/** Extracts the `path` argument from a `write_file`/`edit_file` tool call —
+ * same tiny-copy reasoning as `isSuccessfulMutationResult` above, mirroring
+ * `agentLoop.ts`'s `toolCallPathArg`. */
+function toolCallPathArg(toolCall: ToolCall): string | null {
+  try {
+    const parsed: unknown = JSON.parse(toolCall.function.arguments || '{}');
+    const path = (parsed as { path?: unknown } | null)?.path;
+    return typeof path === 'string' ? path : null;
+  } catch {
+    return null;
+  }
 }
 
 /** No subagent profile offered in this slice ever includes an MCP tool (see
@@ -157,6 +197,23 @@ export interface RunSubagentTaskParams {
    * split the parent and child across different targets mid-turn. */
   target: ResolvedTarget;
   effort?: string;
+  /** The PARENT turn's own risk-annotation context (see
+   * `turnEngine.ts`'s `SubagentContext.risk` doc comment) — threaded
+   * straight through to every `executeToolCall` this run makes, so a
+   * `code`-profile child's write_file/edit_file/run_shell calls get the same
+   * advisory risk classification (and share the same per-turn cache) the
+   * parent's own equivalent calls would, instead of silently skipping
+   * classification just because the mutation happened inside a subagent.
+   * `undefined` when the parent turn never built one (risk annotations off). */
+  risk?: RiskAnnotationContext;
+  /** Called once per path this run's `code`-profile child successfully
+   * `write_file`/`edit_file`s — see `turnEngine.ts`'s
+   * `SubagentContext.onMutatedPath` doc comment for why this exists: without
+   * it, the parent's own `mutatedFiles` tracking never learns about a
+   * subagent's mutations, so `runVerificationPhase` silently never fires for
+   * a turn where every mutation happened inside a delegated `task` call.
+   * `undefined` for a caller that doesn't track mutated files at all. */
+  onMutatedPath?: (path: string) => void;
 }
 
 /**
@@ -178,7 +235,8 @@ export interface RunSubagentTaskParams {
  * the invariant is owned here first).
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
-  const { sessionId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort } = params;
+  const { sessionId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort, risk, onMutatedPath } =
+    params;
 
   // The key `subagentStore`/`ChatSession.subagentRuns` are updated under —
   // see `RunSubagentTaskParams.toolCallId`'s doc comment for why this must
@@ -263,26 +321,62 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         if (!aborted) {
           useSubagentStore.getState().recordToolCall(storeKey, activityLabel(toolCall));
         }
-        // `parentCheckpointId` + `taskId` is the crux pairing that makes
-        // `code`-profile subagents safe (see `RunSubagentTaskParams`'s doc
-        // comments on those two fields): the PARENT's checkpoint id so any
-        // write/edit lands in the parent turn's own checkpoint manifest, but
-        // this run's OWN turn id so Rust's per-turn `tool_cancel`/permission-
-        // `pending` maps scope cancellation and prompts to just this
-        // subagent — never the parent's own in-flight tool call, and never
-        // some other concurrent turn's. `description` is threaded through as
-        // `agentLabel` (slice 3) so a `code`-profile child's write_file/
-        // edit_file/run_shell permission prompt is attributed to THIS
-        // subagent (see `turnEngine.ts`'s `executeToolCall` injection site
-        // and `tools.rs`'s `with_agent_label`) — harmless for `explore`
-        // children too, since none of their tools are permission-gated
-        // mutations that read it.
+        // Reject (without executing) any call whose name isn't actually
+        // among the tools THIS profile was offered — the same
+        // `isToolCallAllowed` gate `agentLoop.ts`'s parent loop applies to
+        // its own tool calls, reused here rather than a parallel check.
+        // Without this, an `explore`-profile child driven by a
+        // local/quantized model that doesn't strictly respect the offered
+        // tool schema could still have a hallucinated `write_file`/
+        // `edit_file`/`run_shell` call actually dispatched and executed —
+        // `toolsForProfile` only shapes what's *offered*; this is the
+        // enforcement point that makes it an actual authorization boundary.
+        const allowed = isToolCallAllowed(toolCall, tools);
         const resultContent = aborted
           ? CANCELLED_TOOL_RESULT
-          : await executeToolCall(toolCall, parentCheckpointId, taskId, mcpRegistry, parentSignal, undefined, undefined, undefined, description);
+          : !allowed
+            ? stringifyToolError(
+                new Error(`Tool "${toolCall.function.name}" was not offered to this ${profile}-profile subagent and was not executed.`)
+              )
+            : // `parentCheckpointId` + `taskId` is the crux pairing that makes
+              // `code`-profile subagents safe (see `RunSubagentTaskParams`'s
+              // doc comments on those two fields): the PARENT's checkpoint id
+              // so any write/edit lands in the parent turn's own checkpoint
+              // manifest, but this run's OWN turn id so Rust's per-turn
+              // `tool_cancel`/permission-`pending` maps scope cancellation and
+              // prompts to just this subagent — never the parent's own
+              // in-flight tool call, and never some other concurrent turn's.
+              // `risk` is the parent turn's own risk-annotation context (see
+              // `RunSubagentTaskParams.risk`'s doc comment), so a `code`-
+              // profile child's mutations get classified exactly like the
+              // parent's own. `description` is threaded through as
+              // `agentLabel` (slice 3) so a `code`-profile child's write_file/
+              // edit_file/run_shell permission prompt is attributed to THIS
+              // subagent (see `turnEngine.ts`'s `executeToolCall` injection
+              // site and `permissions.rs`'s `PermissionRequestPayload.
+              // agent_label`) — harmless for `explore` children too, since
+              // none of their tools are permission-gated mutations that
+              // read it.
+              await executeToolCall(toolCall, parentCheckpointId, taskId, mcpRegistry, parentSignal, risk, undefined, undefined, description);
         const toolMessage: ChatMessage = { role: 'tool', tool_call_id: toolCall.id, content: resultContent };
         messages = [...messages, toolMessage];
         useSubagentStore.getState().appendMessage(storeKey, toolMessage);
+
+        // Surface a successful `code`-profile mutation to the PARENT's own
+        // `mutatedFiles` tracking (see `RunSubagentTaskParams.onMutatedPath`'s
+        // doc comment) — without this, `runVerificationPhase` never fires for
+        // a turn where every mutation happened inside a delegated `task`
+        // call, since the parent round's own `toolCalls` only ever contains
+        // the single `task` entry.
+        if (
+          !aborted &&
+          allowed &&
+          (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file') &&
+          isSuccessfulMutationResult(resultContent)
+        ) {
+          const path = toolCallPathArg(toolCall);
+          if (path) onMutatedPath?.(path);
+        }
       }
 
       if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);

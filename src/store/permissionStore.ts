@@ -23,6 +23,14 @@ export interface PermissionRequest {
    * un-overridable `path_risk_floor` rather than the LLM judge — lets the
    * modal show a stronger "sensitive path" warning. */
   risk_floored?: boolean;
+  /** The description of the `code`-profile subagent (p3) this call
+   * originated from, if any — a dedicated field (NOT parsed back out of
+   * `detail`, the pre-fix design) so a subagent's own model-supplied
+   * `description` can never forge/corrupt the shown `detail` or spoof a
+   * different attribution — see `tools.rs`'s `PermissionRequestPayload.
+   * agent_label` doc comment. `undefined` for every parent-turn call and any
+   * `explore`-profile subagent. */
+  agent_label?: string;
 }
 
 /**

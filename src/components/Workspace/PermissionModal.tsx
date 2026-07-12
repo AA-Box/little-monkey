@@ -32,24 +32,6 @@ const TOOL_ICONS: Record<string, typeof AlertTriangle> = {
 };
 
 /**
- * `tools.rs`'s `with_agent_label` prefixes a `code`-profile subagent's
- * mutating-tool `detail` string with exactly `Subagent '<description>': ` —
- * see that function's doc comment. Split out here (rather than shown as
- * part of the raw detail box) so it renders as its own small attribution
- * line, the same "don't just dump backend-formatted text" treatment the MCP
- * `displayTool` split above gets. Returns `null`/the original `detail`
- * unchanged when the prefix isn't present (every parent-turn call, and any
- * `explore`-profile subagent's read-only tools, which never carry one).
- */
-const SUBAGENT_DETAIL_PREFIX = /^Subagent '([^']*)':\s/;
-
-function splitSubagentAttribution(detail: string): { description: string | null; detail: string } {
-  const match = detail.match(SUBAGENT_DETAIL_PREFIX);
-  if (!match) return { description: null, detail };
-  return { description: match[1], detail: detail.slice(match[0].length) };
-}
-
-/**
  * The advisory risk badge/reason/floored-warning block (Phase 2 of the
  * Plan/Act + risk-adaptive permissions design —
  * docs/roadmap/p2-plan-act-safety.md), rendered only when `pending.risk_level`
@@ -129,7 +111,14 @@ export function PermissionModal() {
   // `mcp_call_tool`'s `detail` construction) — friendlier than the raw
   // `mcp:<serverId>:<toolName>` permission-request string.
   const displayTool = isMcpTool ? pending.detail.split("\n", 1)[0] : pending.tool;
-  const { description: subagentDescription, detail: displayDetail } = splitSubagentAttribution(pending.detail);
+  // Read directly off the payload's own `agent_label` field — a dedicated,
+  // separately-serialized field rather than something parsed back out of
+  // `detail` (see `permissionStore.ts`'s `PermissionRequest.agent_label` doc
+  // comment for why: a subagent's model-supplied `description` must never be
+  // able to forge/corrupt the shown detail text or spoof a different
+  // attribution).
+  const subagentDescription = pending.agent_label ?? null;
+  const displayDetail = pending.detail;
 
   return (
     <div

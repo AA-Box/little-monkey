@@ -39,6 +39,23 @@ pub struct PermissionRequestPayload {
     /// stronger "sensitive path" warning instead of an ordinary risk badge.
     /// Always `false` when `risk_level` is `None`.
     pub risk_floored: bool,
+    /// The description of the `code`-profile subagent (p3) this call
+    /// originated from, if any — a dedicated, separately-serialized field
+    /// (NOT folded into `detail` as a parsed-out-by-regex prefix, the
+    /// pre-fix design) so the frontend never has to reparse free-text the
+    /// model itself ultimately controls (the subagent's `description` comes
+    /// straight from the model's own `task` tool-call arguments). Whatever
+    /// characters (quotes, newlines, a fake "Subagent '...':`-looking
+    /// string) the description contains, `PermissionModal.tsx` renders it
+    /// verbatim in its own attribution line and `detail` is never touched —
+    /// there is no delimiter for a crafted description to escape or forge a
+    /// decoy line ahead of. `None` for every parent-turn call and any
+    /// `explore`-profile subagent (mirrors `with_agent_label`'s old `None`
+    /// case). Purely cosmetic/informational, same as before: this field has
+    /// no path into [`compute_risk`]/`mode_short_circuit`/any auto-approval
+    /// decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 /// A risk annotation attached to a permission prompt — either computed
@@ -340,6 +357,7 @@ pub async fn request_permission<R: tauri::Runtime>(
     detail: String,
     turn: Option<&str>,
     risk: Option<RiskAssessment>,
+    agent_label: Option<&str>,
 ) -> Result<(), String> {
     let mode = state.permissions.mode.lock().unwrap().clone();
 
@@ -374,6 +392,7 @@ pub async fn request_permission<R: tauri::Runtime>(
         risk_level: risk.as_ref().map(|r| r.level.clone()),
         risk_reason: risk.as_ref().map(|r| r.reason.clone()),
         risk_floored: risk.as_ref().map(|r| r.floored).unwrap_or(false),
+        agent_label: agent_label.map(str::to_string),
     };
 
     if app.emit("permission://request", payload).is_err() {
@@ -1047,5 +1066,51 @@ mod tests {
         let assessment = compute_risk(None, Some("high".to_string()), Some("deletes files".to_string())).unwrap();
         assert_eq!(assessment.level, "high");
         assert!(!assessment.floored);
+    }
+
+    // `PermissionRequestPayload.agent_label` (the fix for the review finding
+    // that flagged `tools.rs`'s old `with_agent_label` detail-prefixing as
+    // spoofable/corruptible by a crafted subagent description or command
+    // string): the subagent attribution is now carried as its OWN
+    // serialized field, entirely independent of `detail`, so there is no
+    // string for a model-supplied description/command to forge a prefix
+    // into. Pinned here as a plain serde round-trip on the payload shape
+    // itself — `request_permission`'s actual emit path is covered
+    // end-to-end via `tools.rs`'s IPC-level tests instead, since exercising
+    // the emitted event itself needs a real window/listener this module's
+    // other tests deliberately avoid setting up.
+    #[test]
+    fn permission_request_payload_serializes_agent_label_as_its_own_field_when_present() {
+        let payload = PermissionRequestPayload {
+            id: "req-1".to_string(),
+            tool: "write_file".to_string(),
+            detail: "Write 12 bytes to a.txt".to_string(),
+            risk_level: None,
+            risk_reason: None,
+            risk_floored: false,
+            agent_label: Some("fix user's login bug".to_string()),
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["agent_label"], "fix user's login bug");
+        // The detail string is untouched by the label — no "Subagent '...'"
+        // prefix baked into it, unlike the pre-fix `with_agent_label` design.
+        assert_eq!(json["detail"], "Write 12 bytes to a.txt");
+    }
+
+    #[test]
+    fn permission_request_payload_omits_agent_label_when_absent() {
+        let payload = PermissionRequestPayload {
+            id: "req-2".to_string(),
+            tool: "write_file".to_string(),
+            detail: "Write 3 bytes to b.txt".to_string(),
+            risk_level: None,
+            risk_reason: None,
+            risk_floored: false,
+            agent_label: None,
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("agent_label").is_none(), "agent_label should be omitted, not null, when absent");
     }
 }

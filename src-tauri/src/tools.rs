@@ -270,31 +270,6 @@ fn glob_impl(
     Ok(matches.into_iter().map(|(_, path)| path).collect())
 }
 
-/// Prefixes a permission-prompt `detail` string with "Subagent
-/// '<agent_label>': " when `agent_label` is `Some` (a `code`-profile
-/// subagent's tool call — see `turnEngine.ts`'s `executeToolCall` injection
-/// site and `subagent.ts`'s `runSubagentTask`, which passes its own
-/// `description` for this), so `PermissionModal.tsx` can attribute the
-/// prompt to the subagent that asked for it (`find race conditions`, say)
-/// rather than leaving the user to guess which of several concurrent
-/// subagents is asking. Returns `detail` unchanged when `agent_label` is
-/// `None` — every parent-turn call, and today's only `explore`-profile
-/// subagents (which never call a tool this param reaches).
-///
-/// Deliberately just string formatting: `agent_label`, like `checkpoint_id`/
-/// `turn_id`, is injected by the frontend and never model-suppliable (the
-/// model's own JSON arguments are scrubbed of any `agent_label` key before
-/// this point — see `turnEngine.ts`), but even so, this function itself has
-/// NO path into `permissions::compute_risk`, `mode_short_circuit`, or any
-/// other decision that governs whether the call is auto-approved — it only
-/// ever changes what text `request_permission`'s prompt payload shows.
-fn with_agent_label(detail: String, agent_label: Option<&str>) -> String {
-    match agent_label {
-        Some(label) => format!("Subagent '{}': {}", label, detail),
-        None => detail,
-    }
-}
-
 /// Write (overwrite/create) a text file in the workspace. Permission-gated.
 /// `checkpoint_id` is injected by the frontend agent loop (not the model) so
 /// the pre-mutation backup lands in the calling turn's own checkpoint.
@@ -305,8 +280,25 @@ fn with_agent_label(detail: String, agent_label: Option<&str>) -> String {
 /// classification for this call, combined here with the authoritative
 /// `permissions::path_risk_floor` (which always wins) into the
 /// `RiskAssessment` shown on the permission prompt. `agent_label` is the same
-/// story — frontend-injected only, see [`with_agent_label`] — purely
-/// cosmetic attribution text, never a permission-decision input.
+/// story — frontend-injected only — but is passed straight through to
+/// [`permissions::request_permission`] as its own field rather than folded
+/// into `detail`: see that field's doc comment on
+/// `PermissionRequestPayload` for why detail-prefixing was the bug (a
+/// `code`-profile subagent's `description` is itself model-supplied text,
+/// and folding it into a string the frontend later re-parses by regex let a
+/// crafted description forge/corrupt the shown detail).
+///
+/// `file_write_lock` (see `AppState`'s doc comment on that field) is
+/// acquired AFTER permission is granted, held across the checkpoint backup
+/// and the write itself, and released before returning — the whole point is
+/// to serialize the backup+write pair for a given path against another
+/// concurrent `write_file`/`edit_file` call (most plausibly two `code`-
+/// profile subagents in the same round, see
+/// `agentLoop.ts::runToolCallsForRound`) that resolves to the SAME path,
+/// which could otherwise race past `record_original`'s dedup and interleave
+/// with this call's own `std::fs::write`, silently discarding one write with
+/// no error. Never held across an `.await` (permission is requested BEFORE
+/// acquiring it), so a plain `std::sync::Mutex` guard is safe to hold here.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -331,9 +323,19 @@ pub async fn tool_write_file(
     let (resolved, root) = workspace::resolve_path_and_root(state.inner(), &path)?;
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
-    let detail = with_agent_label(format!("Write {} bytes to {}", content.len(), path), agent_label.as_deref());
-    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref(), risk)
+    let detail = format!("Write {} bytes to {}", content.len(), path);
+    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref(), risk, agent_label.as_deref())
         .await?;
+
+    // Serializes the backup+write critical section against any other
+    // concurrent write_file/edit_file targeting the same path — see this
+    // function's own doc comment above for the race this closes. Dropped
+    // automatically at the end of this synchronous block (no `.await` while
+    // held).
+    let _write_guard = state
+        .file_write_lock
+        .lock()
+        .map_err(|_| "File-write lock poisoned".to_string())?;
 
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
@@ -392,6 +394,18 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
 /// `risk_reason`/`agent_label` are likewise frontend-injected — see
 /// `tool_write_file`'s doc comment, identical treatment here.
 ///
+/// The initial `current`/`occurrences` check below (before the permission
+/// prompt) is a best-effort pre-check only, purely to build the diff preview
+/// and reject an obviously-bad call before ever prompting. The content it
+/// actually mutates is RE-READ fresh from disk after `file_write_lock` is
+/// acquired (see `tool_write_file`'s doc comment on that field/lock) and the
+/// occurrence check is redone against that fresh read — so if another
+/// concurrent `write_file`/`edit_file` call for the SAME path completed in
+/// between (most plausibly two `code`-profile subagents in the same round —
+/// see `agentLoop.ts::runToolCallsForRound`), this call correctly errors
+/// (`old_string` no longer found/unique) instead of silently clobbering that
+/// other call's write with a `replacen` computed against stale content.
+///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
 /// through verbatim, so the invoke payload must be matched by snake_case
@@ -435,14 +449,41 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
     let preview = build_diff_preview(&old_string, &new_string);
-    let detail = with_agent_label(format!("Edit {}\n{}", path, preview), agent_label.as_deref());
+    let detail = format!("Edit {}\n{}", path, preview);
 
-    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref(), risk)
+    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref(), risk, agent_label.as_deref())
         .await?;
+
+    // Serializes the re-read+backup+write critical section against any
+    // other concurrent write_file/edit_file targeting the same path — see
+    // this function's own doc comment above and `tool_write_file`'s for the
+    // race this closes.
+    let _write_guard = state
+        .file_write_lock
+        .lock()
+        .map_err(|_| "File-write lock poisoned".to_string())?;
+
+    // Re-read fresh, now that we hold the lock: `current` above may already
+    // be stale if another call mutated this same path while this call's own
+    // permission prompt was pending.
+    let fresh = std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let fresh_occurrences = fresh.matches(old_string.as_str()).count();
+    if fresh_occurrences == 0 {
+        return Err(format!(
+            "old_string not found in '{}' — the file changed since this edit was prepared (likely a concurrent edit).",
+            path
+        ));
+    }
+    if fresh_occurrences > 1 {
+        return Err(format!(
+            "old_string appears {} times in '{}'; it must be unique. Include more surrounding context.",
+            fresh_occurrences, path
+        ));
+    }
 
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
-    let updated = current.replacen(old_string.as_str(), new_string.as_str(), 1);
+    let updated = fresh.replacen(old_string.as_str(), new_string.as_str(), 1);
     std::fs::write(&resolved, &updated).map_err(|e| format!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Edited {}", path))
@@ -461,9 +502,16 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 /// `permissions.rs`'s module doc comment and `mode_short_circuit` — it can
 /// NEVER be threaded into anything that decides whether this call is
 /// auto-approved. `run_shell` always falls through to a real prompt in every
-/// mode below `"bypass"`, full stop. `agent_label` is prefixed onto the
-/// prompt `detail` via [`with_agent_label`] — same cosmetic-only treatment,
-/// and the same "never affects auto-approval" guarantee applies to it too.
+/// mode below `"bypass"`, full stop. `agent_label` is passed straight through
+/// to `request_permission` as its own field (see that field's doc comment on
+/// `PermissionRequestPayload`) — same cosmetic-only treatment, and the same
+/// "never affects auto-approval" guarantee applies to it too. Deliberately
+/// NOT folded into `detail`: `command` here is the raw, fully model-supplied
+/// shell command text, and a detail-string prefix a model could itself
+/// mimic (e.g. a command literally containing `"Subagent 'x': ..."`) would
+/// let a crafted command spoof/misattribute an ordinary parent-turn command
+/// as a vetted subagent's — passing `agent_label` as its own field instead
+/// of text `detail` shares means there is nothing for `command` to forge.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
@@ -477,8 +525,7 @@ pub async fn tool_run_shell(
     agent_label: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
-    let detail = with_agent_label(command.clone(), agent_label.as_deref());
-    permissions::request_permission(&app, state.inner(), "run_shell", detail, turn_id.as_deref(), risk)
+    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref(), risk, agent_label.as_deref())
         .await?;
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
@@ -588,7 +635,7 @@ pub async fn tool_remember(
     text: String,
     turn_id: Option<String>,
 ) -> Result<memory::Fact, String> {
-    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref(), None)
+    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref(), None, None)
         .await?;
 
     let root = workspace::primary_root_canon(state.inner())?;
@@ -733,36 +780,6 @@ mod tests {
         let preview = build_diff_preview("old line", "new line");
         assert!(preview.contains("- old line"));
         assert!(preview.contains("+ new line"));
-    }
-
-    // `with_agent_label` — slice 3's one Rust change. Pinned as an in-module
-    // test on the pure helper itself (rather than a full IPC round trip)
-    // since request_permission's prompt is only observable through an event
-    // channel that a real permission mode would have to await — the
-    // formatting logic is what's actually new here, so that's what's tested
-    // directly.
-    #[test]
-    fn with_agent_label_prefixes_the_detail_when_a_label_is_given() {
-        let detail = with_agent_label("Write 3 bytes to a.txt".to_string(), Some("find race conditions"));
-        assert_eq!(detail, "Subagent 'find race conditions': Write 3 bytes to a.txt");
-    }
-
-    #[test]
-    fn with_agent_label_leaves_detail_unchanged_when_no_label_is_given() {
-        // Every parent-turn tool call (and today's explore-profile subagent
-        // tools, which never even reach a mutating command) passes `None`
-        // here — the detail shown must be byte-identical to pre-slice-3
-        // behavior, not just "no visible difference".
-        let detail = with_agent_label("Write 3 bytes to a.txt".to_string(), None);
-        assert_eq!(detail, "Write 3 bytes to a.txt");
-    }
-
-    #[test]
-    fn with_agent_label_applies_to_a_run_shell_style_detail_too() {
-        // `tool_run_shell`'s detail is just the raw command string (no
-        // "Write .../Edit ..." wrapper) — same prefixing still applies.
-        let detail = with_agent_label("cargo test".to_string(), Some("run the test suite"));
-        assert_eq!(detail, "Subagent 'run the test suite': cargo test");
     }
 
     struct TempTree {
@@ -965,5 +982,68 @@ mod tests {
             std::fs::read_to_string(tree.path.join("hello.txt")).unwrap(),
             "hello old world"
         );
+    }
+
+    /// Reproduces (and pins the fix for) the `tool_edit_file` half of the
+    /// review-flagged concurrent-write race: two concurrent edits targeting
+    /// the SAME path, both prepared against the same pre-existing
+    /// `old_string`, driven through the real command function (not just the
+    /// underlying primitives — see `checkpoints.rs`'s own concurrency test
+    /// for that side) via genuine tokio multi-thread parallelism. Without
+    /// `file_write_lock` and the fresh re-read/re-check performed under it
+    /// (see `tool_edit_file`'s doc comment), both calls could see
+    /// `old_string` present in their own pre-permission read and both
+    /// blindly `replacen` + write, silently discarding one edit with no
+    /// error. With the fix, exactly one call wins and the other correctly
+    /// errors (`old_string` no longer present) instead of corrupting the
+    /// file or losing a write silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_edit_file_calls_to_the_same_path_never_silently_lose_a_write() {
+        use tauri::Manager;
+
+        for _ in 0..20 {
+            let tree = TempTree::new();
+            std::fs::write(tree.path.join("shared.txt"), "hello OLD world").unwrap();
+
+            let app = mock_app_with_workspace(&tree.path);
+            let handle = app.handle().clone();
+
+            let run = |handle: tauri::AppHandle<tauri::test::MockRuntime>, new_value: &'static str| {
+                tokio::spawn(async move {
+                    // Widen the window for the two calls to genuinely
+                    // overlap before either takes the file-write lock.
+                    tokio::task::yield_now().await;
+                    let state = handle.state::<crate::AppState>();
+                    tool_edit_file(
+                        handle.clone(),
+                        state,
+                        "shared.txt".to_string(),
+                        "OLD".to_string(),
+                        new_value.to_string(),
+                        Some("test-checkpoint".to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                })
+            };
+
+            let a = run(handle.clone(), "FROM_A");
+            let b = run(handle.clone(), "FROM_B");
+            let (result_a, result_b) = tokio::join!(a, b);
+            let result_a = result_a.unwrap();
+            let result_b = result_b.unwrap();
+
+            let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
+            assert_eq!(successes, 1, "expected exactly one edit to win, got: {result_a:?} / {result_b:?}");
+
+            let final_content = std::fs::read_to_string(tree.path.join("shared.txt")).unwrap();
+            assert!(
+                final_content == "hello FROM_A world" || final_content == "hello FROM_B world",
+                "file content corrupted rather than a clean win by one editor: {final_content:?}"
+            );
+        }
     }
 }

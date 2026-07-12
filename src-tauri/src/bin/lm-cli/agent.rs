@@ -494,6 +494,23 @@ async fn execute_tool_call(
     // this function, so a subagent spawning another subagent is
     // structurally unreachable, not merely guarded by a runtime counter.
     if name == "task" {
+        // Re-checked here, at dispatch time — same defense-in-depth posture
+        // as `present_plan`'s `perms.mode()` re-check just above: `task` is
+        // only appended to `tools_vec` when `--subagents` was given (see
+        // `run_tool_loop`), but `tools_vec` only shapes what's *offered* to
+        // the model, not what actually gets dispatched here. Without this
+        // check, a model that hallucinates a `task` call outside
+        // `--subagents` (the exact "weak local model may misuse the task
+        // tool" risk this flag ships opt-in specifically to guard against —
+        // see docs/roadmap/p3-subagents.md) would still have it executed,
+        // spinning up a full extra model-calling loop the operator never
+        // opted into.
+        if !options.subagents {
+            return serde_json::json!({
+                "error": "The task tool is not enabled for this session — pass --subagents to allow subagent delegation."
+            })
+            .to_string();
+        }
         let description = args["description"].as_str().unwrap_or("(untitled subtask)").to_string();
         let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
         let profile = args["profile"].as_str().unwrap_or(CLI_SUBAGENT_PROFILE);
@@ -1018,7 +1035,12 @@ mod tests {
         let state = AppState::default();
         let registry = McpToolRegistry(std::collections::HashMap::new());
         let args = r#"{"description":"d","prompt":"p","profile":"code"}"#;
-        let (client, target, options) = dummy_target_and_options();
+        let (client, target, mut options) = dummy_target_and_options();
+        // This test exercises the profile-rejection branch specifically, so
+        // `--subagents` must be on — otherwise the new `options.subagents`
+        // gate (see `task_is_rejected_without_subagents_enabled` below)
+        // would reject the call first, for an unrelated reason.
+        options.subagents = true;
 
         for mode in [PermissionMode::Manual, PermissionMode::Bypass, PermissionMode::Auto] {
             let mut perms = TerminalPermissions::new(mode);
@@ -1031,6 +1053,36 @@ mod tests {
                 "mode {mode:?} should reject the 'code' subagent profile"
             );
         }
+    }
+
+    /// `task` must be rejected at DISPATCH time when `--subagents` was never
+    /// given — mirrors `present_plan_is_rejected_outside_plan_mode`'s
+    /// re-check-at-dispatch posture: `tools_vec` only controls what's
+    /// *offered* to the model (see `run_tool_loop`'s `if options.subagents`
+    /// gate), so a model that hallucinates a `task` call anyway (the exact
+    /// "weak local model may misuse the task tool" risk `--subagents` ships
+    /// opt-in to guard against) must not have it dispatched to
+    /// `run_subagent_turn`. `dummy_target_and_options()`'s `ChatOptions::
+    /// default()` already has `subagents: false`, so this exercises the
+    /// default, no-flag case explicitly.
+    #[tokio::test]
+    async fn task_is_rejected_without_subagents_enabled() {
+        let state = AppState::default();
+        let registry = McpToolRegistry(std::collections::HashMap::new());
+        let args = r#"{"description":"d","prompt":"p","profile":"explore"}"#;
+        let (client, target, options) = dummy_target_and_options();
+        assert!(!options.subagents, "this test relies on the default being off");
+
+        let mut perms = TerminalPermissions::new(PermissionMode::Bypass);
+        let content =
+            execute_tool_call(&client, &target, &options, &state, &mut perms, "task", args, None, &[], &registry, &[])
+                .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            parsed["error"].as_str().unwrap().contains("--subagents"),
+            "expected a subagents-disabled error, got: {content}"
+        );
     }
 
     /// The depth-1 cap on subagent delegation: `explore_tool_definitions()`

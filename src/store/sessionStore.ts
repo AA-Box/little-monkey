@@ -353,6 +353,77 @@ function normalizeMessage(raw: unknown): ChatMessage | null {
   return null;
 }
 
+/** Content used for a `tool` message synthesized by `repairDanglingToolCalls`
+ * below — deliberately distinct from `turnEngine.ts`'s `CANCELLED_TOOL_RESULT`
+ * (not imported from there — see that module's own doc comment on why
+ * `subagent.ts`/`turnEngine.ts` consumers should stay a one-way dependency,
+ * and `sessionStore.ts` is lower-level still, loaded before either): a
+ * message repaired at hydrate time was never actually cancelled by the user,
+ * it's a transcript left dangling by an app crash/force-quit/power-loss
+ * mid-turn, so the model should be told the truth rather than a misleading
+ * "Cancelled by the user". */
+const ORPHANED_TOOL_CALL_RESULT = JSON.stringify({
+  error: "No result was recorded for this tool call — the app was closed or crashed before it finished.",
+});
+
+/**
+ * Repairs a hydrated `messages` array against the transcript-validity
+ * invariant every in-process code path (`turnEngine.ts`'s
+ * `CANCELLED_TOOL_RESULT` convention, `agentLoop.ts`'s Stop-button handling,
+ * `subagent.ts`'s own try/catch) upholds while the app is running: every
+ * assistant `tool_calls` entry must be immediately followed by one `tool`
+ * message per call, matched by `tool_call_id`. That invariant can still be
+ * violated on disk if the app crashes, is force-quit, or loses power WHILE a
+ * tool call (most plausibly a long-running `task`/subagent round trip, which
+ * can run for many seconds to minutes — see `subagent.ts`'s
+ * `MAX_SUBAGENT_ITERATIONS`) is still in flight: `updateLastMessage` commits
+ * the assistant's `tool_calls` entry (and the debounced `persist()` can flush
+ * it to disk) well before the matching `tool` results are appended. Nothing
+ * previously repaired this on the next load, so the next turn's
+ * `wireHistory` would send a provider a conversation with a dangling
+ * `tool_calls` entry — several providers reject that outright, permanently
+ * breaking the session until a manual edit/delete.
+ *
+ * Called once per session during `normalizeSession` (i.e. on every
+ * hydration, not just after a crash) — a single forward pass that returns
+ * `messages` itself, unchanged, whenever nothing turns out to be dangling
+ * (the overwhelmingly common case).
+ */
+function repairDanglingToolCalls(messages: ChatMessage[]): ChatMessage[] {
+  let mutated = false;
+  const result: ChatMessage[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const message = messages[i];
+    result.push(message);
+    i++;
+
+    if (message.role !== "assistant" || !message.tool_calls || message.tool_calls.length === 0) continue;
+
+    // Every `tool` message immediately following this assistant message
+    // (before the next non-`tool` message, i.e. this round's own results) —
+    // matches the exact shape `agentLoop.ts`/`subagent.ts` append in.
+    const satisfied = new Set<string>();
+    while (i < messages.length && messages[i].role === "tool") {
+      const toolMessage = messages[i];
+      result.push(toolMessage);
+      if (toolMessage.tool_call_id) satisfied.add(toolMessage.tool_call_id);
+      i++;
+    }
+
+    const missing = message.tool_calls.filter((call) => !satisfied.has(call.id));
+    if (missing.length === 0) continue;
+
+    mutated = true;
+    for (const call of missing) {
+      result.push({ role: "tool", tool_call_id: call.id, content: ORPHANED_TOOL_CALL_RESULT });
+    }
+  }
+
+  return mutated ? result : messages;
+}
+
 /** Fills in defaults for a persisted `subagentRuns` blob — same defensive
  * shape as `normalizeMessage`/`messages` above: anything not matching the
  * expected `Record<string, ChatMessage[]>` shape (missing field entirely on
@@ -369,9 +440,10 @@ function normalizeSubagentRuns(raw: unknown): Record<string, ChatMessage[]> {
 }
 
 function normalizeSession(raw: Partial<ChatSession>): ChatSession {
-  const messages = Array.isArray(raw.messages)
+  const parsedMessages = Array.isArray(raw.messages)
     ? raw.messages.map(normalizeMessage).filter((message): message is ChatMessage => message !== null)
     : [];
+  const messages = repairDanglingToolCalls(parsedMessages);
   return {
     id: raw.id as string,
     title: raw.title as string,
