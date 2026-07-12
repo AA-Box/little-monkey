@@ -158,9 +158,9 @@ describe("shortcut matching", () => {
   });
 
   it("does not treat modified session-menu letters as bare mnemonics", () => {
-    expect(shortcutIdForEvent(keyboardEvent({ key: "p", code: "KeyP" }), "sessionMenu", true)).toBe("sessionTogglePin");
+    expect(shortcutIdForEvent(keyboardEvent({ key: "d", code: "KeyD" }), "sessionMenu", true)).toBe("sessionDelete");
     expect(
-      shortcutIdForEvent(keyboardEvent({ key: "p", code: "KeyP", metaKey: true }), "sessionMenu", true),
+      shortcutIdForEvent(keyboardEvent({ key: "d", code: "KeyD", metaKey: true }), "sessionMenu", true),
     ).toBeNull();
   });
 
@@ -282,7 +282,7 @@ describe("shortcut recording and validation", () => {
     const overrides: ShortcutOverrides = {
       openSettings: [{ key: "k", primary: true }],
       sendMessage: [{ key: "F8" }],
-      sessionRename: [{ key: "F9" }],
+      sessionOpenSplit: [{ key: "F9" }],
     };
     expect(findShortcutConflict("newSession", { key: "k", primary: true }, overrides)).toBe("openSettings");
     expect(findShortcutConflict("insertLineBreak", { key: "F8" }, overrides)).toBe("sendMessage");
