@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MoreVertical, Plus } from "lucide-react";
 
 import { type ChatSession, useSessionStore } from "../../store/sessionStore";
@@ -20,6 +20,8 @@ export default function ChatSessionList() {
   const newSession = useSessionStore((state) => state.newSession);
   const switchSession = useSessionStore((state) => state.switchSession);
   const renameSession = useSessionStore((state) => state.renameSession);
+  const renameRequestId = useSessionStore((state) => state.renameRequestId);
+  const clearRenameRequest = useSessionStore((state) => state.clearRenameRequest);
   const { t } = useT();
 
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
@@ -54,6 +56,23 @@ export default function ChatSessionList() {
     if (renamingId) renameSession(renamingId, renameValue);
     setRenamingId(null);
   };
+
+  // The global "Rename" shortcut (App.tsx) sets `renameRequestId` on the
+  // store rather than reaching into this component's local rename state
+  // directly — pick it up here and hand off to the same inline input the
+  // kebab menu's "Rename" uses.
+  useEffect(() => {
+    if (!renameRequestId) return;
+    const target = sessions.find((s) => s.id === renameRequestId);
+    if (target) {
+      startRename(target);
+      // The row only exists in the DOM once its section is open — an
+      // archived active session would otherwise start renaming invisibly.
+      if (target.archived) setArchivedOpen(true);
+    }
+    clearRenameRequest();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renameRequestId]);
 
   const renderRow = (session: ChatSession) => {
     const isActive = session.id === activeSessionId;

@@ -11,7 +11,7 @@ import type { SettingsTab } from "./components/Settings";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
-import { useWorkspaceStore } from "./store/workspaceStore";
+import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { useModelStore } from "./store/modelStore";
 import { useMcpStore } from "./store/mcpStore";
 import { useArtifactStore } from "./store/artifactStore";
@@ -109,6 +109,20 @@ function App() {
       const shortcut = shortcutIdForEvent(event, "global", usesMacShortcuts(), overrides);
       if (!shortcut) return;
 
+      // Session-scoped commands (pin/rename/fork/archive/open-in-X) act on
+      // whichever session is active — read fresh rather than via a selector
+      // so a session switch made without a re-render of this effect is still
+      // picked up on the very next keydown.
+      const session = useSessionStore.getState();
+      const activeSession = session.sessions.find((s) => s.id === session.activeSessionId) ?? null;
+      const resolveWorkspacePath = () =>
+        activeSession?.workspacePath ?? primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null;
+      const openInEditor = (editor: "cursor" | "vscode") => {
+        const path = resolveWorkspacePath();
+        if (!path) return;
+        void invoke("open_in_editor", { path, editor }).catch((err) => console.error(err));
+      };
+
       const actions: Record<ShortcutIdForScope<"global">, () => void> = {
         newSession: () => {
           setSettingsOpen(false);
@@ -121,6 +135,24 @@ function App() {
         },
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
+        sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
+        sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
+        sessionRename: () => activeSession && session.requestRename(activeSession.id),
+        sessionFork: () => activeSession && session.forkSession(activeSession.id),
+        sessionArchive: () =>
+          activeSession &&
+          (activeSession.archived ? session.unarchiveSession : session.archiveSession)(activeSession.id),
+        sessionOpenWindow: () => {
+          if (!activeSession) return;
+          void invoke("open_session_window", { sessionId: activeSession.id }).catch((err) => console.error(err));
+        },
+        sessionOpenCursor: () => openInEditor("cursor"),
+        sessionOpenVsCode: () => openInEditor("vscode"),
+        sessionRevealFinder: () => {
+          const path = resolveWorkspacePath();
+          if (!path) return;
+          void invoke("reveal_in_finder", { path }).catch((err) => console.error(err));
+        },
       };
 
       event.preventDefault();

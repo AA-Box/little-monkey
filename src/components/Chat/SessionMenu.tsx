@@ -59,13 +59,18 @@ const submenuClass =
  * Claude-Desktop-style kebab dropdown for a `ChatSessionList` row. "Open in"
  * and "Move to group" are nested panels opened on hover via Tailwind named
  * groups (`group/openin`, `group/movegroup`) — no JS hover state needed.
- * Every top-level action also has a real single-letter/digit shortcut that
- * fires while the menu is open (see the keydown listener below), matching
- * the mnemonics shown on the right of each row.
+ * Most actions are global shortcuts (see App.tsx) that act on the active
+ * session, so their `kbd` hint only renders on the active session's own
+ * menu — showing it on another row's menu would imply the chord affects
+ * that row, when it actually always targets whatever session is active.
+ * "Open side task", "Delete", and "Close menu" have no active-session
+ * equivalent and keep their menu-only mnemonic regardless.
  */
 export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionMenuProps) {
   const { t } = useT();
   const groups = useSessionStore((s) => s.groups);
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const isActiveSession = session.id === activeSessionId;
   const togglePin = useSessionStore((s) => s.togglePin);
   const toggleUnread = useSessionStore((s) => s.toggleUnread);
   const forkSession = useSessionStore((s) => s.forkSession);
@@ -158,20 +163,12 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
         action();
         onClose();
       };
+      // Pin/unread/rename/fork/archive/open-in-X are global shortcuts now
+      // (see App.tsx) — the block above already closes this menu for them.
+      // Only the actions with no active-session equivalent stay here.
       const actions: Record<ShortcutIdForScope<"sessionMenu">, () => void> = {
         sessionCloseMenu: onClose,
         sessionOpenSplit: runAndClose(openSplit),
-        sessionOpenWindow: runAndClose(openWindow),
-        sessionOpenCursor: runAndClose(() => openEditor("cursor")),
-        sessionOpenVsCode: runAndClose(() => openEditor("vscode")),
-        sessionRevealFinder: runAndClose(openFinder),
-        sessionTogglePin: runAndClose(() => togglePin(session.id)),
-        sessionToggleUnread: runAndClose(() => toggleUnread(session.id)),
-        sessionRename: runAndClose(onRename),
-        sessionFork: runAndClose(() => forkSession(session.id)),
-        sessionArchive: runAndClose(() =>
-          (session.archived ? unarchiveSession : archiveSession)(session.id),
-        ),
         sessionDelete: runAndClose(() => deleteSession(session.id)),
       };
 
@@ -226,28 +223,28 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
               <AppWindow size={14} className="text-faint" />
               {t("SessionMenu.newWindow")}
             </span>
-            <kbd className="text-xs text-faint">{shortcutLabel("sessionOpenWindow")}</kbd>
+            {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionOpenWindow")}</kbd>}
           </button>
           <button type="button" onClick={() => { openEditor("cursor"); onClose(); }} className={itemClass}>
             <span className="flex items-center gap-2">
               <Code2 size={14} className="text-faint" />
               {t("SessionMenu.cursor")}
             </span>
-            <kbd className="text-xs text-faint">{shortcutLabel("sessionOpenCursor")}</kbd>
+            {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionOpenCursor")}</kbd>}
           </button>
           <button type="button" onClick={() => { openEditor("vscode"); onClose(); }} className={itemClass}>
             <span className="flex items-center gap-2">
               <Code2 size={14} className="text-faint" />
               {t("SessionMenu.vscode")}
             </span>
-            <kbd className="text-xs text-faint">{shortcutLabel("sessionOpenVsCode")}</kbd>
+            {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionOpenVsCode")}</kbd>}
           </button>
           <button type="button" onClick={() => { openFinder(); onClose(); }} className={itemClass}>
             <span className="flex items-center gap-2">
               <FolderOpen size={14} className="text-faint" />
               {t("SessionMenu.finder")}
             </span>
-            <kbd className="text-xs text-faint">{shortcutLabel("sessionRevealFinder")}</kbd>
+            {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionRevealFinder")}</kbd>}
           </button>
         </div>
       </div>
@@ -259,7 +256,7 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
           {session.pinned ? <PinOff size={14} className="text-faint" /> : <Pin size={14} className="text-faint" />}
           {session.pinned ? t("SessionMenu.unpin") : t("SessionMenu.pin")}
         </span>
-        <kbd className="text-xs text-faint">{shortcutLabel("sessionTogglePin")}</kbd>
+        {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionTogglePin")}</kbd>}
       </button>
       <button type="button" onClick={() => { toggleUnread(session.id); onClose(); }} className={itemClass}>
         <span className="flex items-center gap-2">
@@ -270,21 +267,21 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
           )}
           {session.unread ? t("SessionMenu.markAsRead") : t("SessionMenu.markAsUnread")}
         </span>
-        <kbd className="text-xs text-faint">{shortcutLabel("sessionToggleUnread")}</kbd>
+        {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionToggleUnread")}</kbd>}
       </button>
       <button type="button" onClick={() => { onRename(); onClose(); }} className={itemClass}>
         <span className="flex items-center gap-2">
           <Pencil size={14} className="text-faint" />
           {t("SessionMenu.rename")}
         </span>
-        <kbd className="text-xs text-faint">{shortcutLabel("sessionRename")}</kbd>
+        {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionRename")}</kbd>}
       </button>
       <button type="button" onClick={() => { forkSession(session.id); onClose(); }} className={itemClass}>
         <span className="flex items-center gap-2">
           <GitFork size={14} className="text-faint" />
           {t("SessionMenu.fork")}
         </span>
-        <kbd className="text-xs text-faint">{shortcutLabel("sessionFork")}</kbd>
+        {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionFork")}</kbd>}
       </button>
 
       <div className="my-1 border-t border-border" />
@@ -358,7 +355,7 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
           )}
           {session.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
         </span>
-        <kbd className="text-xs text-faint">{shortcutLabel("sessionArchive")}</kbd>
+        {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionArchive")}</kbd>}
       </button>
       <button
         type="button"

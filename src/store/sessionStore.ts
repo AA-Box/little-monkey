@@ -141,6 +141,13 @@ export interface SessionStore {
   /** id of the session shown in the split pane, or null when no split is
    * open. Per-window UI state — never persisted. */
   splitSessionId: string | null;
+  /** id of the session whose sidebar row should enter rename mode, or null.
+   * Set by the global "Rename" shortcut (App.tsx) so it can trigger the
+   * inline rename input that `ChatSessionList` owns locally without reaching
+   * into that component's state directly. Cleared once the row picks it up
+   * — see `requestRename`/`clearRenameRequest`. Per-window UI state, never
+   * persisted. */
+  renameRequestId: string | null;
   /** Session ids with an agent turn currently in flight (either pane, or a
    * turn orphaned by a pane switch that is still streaming). Keyed by
    * session — NOT by pane — so a pane landing on a session mid-turn shows
@@ -212,6 +219,11 @@ export interface SessionStore {
   openSplit: (id: string) => void;
   /** Close the split pane. */
   closeSplit: () => void;
+  /** Requests that `id`'s sidebar row enter rename mode — see
+   * `renameRequestId`. */
+  requestRename: (id: string) => void;
+  /** Clears a pending rename request once the sidebar row has consumed it. */
+  clearRenameRequest: () => void;
 
   /** Append a new message (user, assistant, or tool) to `sessionId`'s
    * transcript. No-ops if the session no longer exists (deleted while a
@@ -682,6 +694,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   groups: [],
   activeSessionId: initialSession.id,
   splitSessionId: null,
+  renameRequestId: null,
   messages: initialSession.messages,
   runningTurns: {},
   runningVerifyLabel: {},
@@ -914,6 +927,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
   closeSplit: () => {
     set({ splitSessionId: null });
+  },
+
+  requestRename: (id) => {
+    set({ renameRequestId: id });
+  },
+
+  clearRenameRequest: () => {
+    set({ renameRequestId: null });
   },
 
   addMessage: (sessionId, msg) => {
