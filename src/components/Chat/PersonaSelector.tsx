@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { UserCog } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
 
 import { selectPersonas, usePromptStore } from "../../store/promptStore";
 import { useSessionStore } from "../../store/sessionStore";
@@ -23,7 +24,11 @@ interface PersonaSelectorProps {
  * that opens Settings on the Prompts tab instead of managing personas here.
  */
 export function PersonaSelector({ sessionId, onManagePrompts }: PersonaSelectorProps) {
-  const personas = usePromptStore(selectPersonas);
+  // `useShallow` is load-bearing: `selectPersonas` filters `entries` into a
+  // fresh array on every call, and an unwrapped fresh-reference snapshot
+  // spins `useSyncExternalStore` into an infinite re-render loop that blanks
+  // the whole app (same trap documented in ProviderCard's EMPTY_MODELS).
+  const personas = usePromptStore(useShallow(selectPersonas));
   const personaId = useSessionStore(
     (state) => state.sessions.find((s) => s.id === sessionId)?.personaId ?? null
   );
