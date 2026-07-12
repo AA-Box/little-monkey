@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ChatMessage } from "../lib/llamaClient";
+import type { UsageInfo } from "./usageStore";
 
 /** Mirrors `runSubagentTask`'s own possible outcomes (see subagent.ts):
  * `'running'` while the child's model->tools->model loop is still going,
@@ -30,6 +31,19 @@ export interface SubagentRun {
   /** Short label for the child's most recent action, e.g. `grep("resolveTarget")` — blank until the first tool call. */
   lastActivity: string;
   toolCallCount: number;
+  /** Running total of token usage across every model attempt this subagent's
+   * own loop has made so far (slice 4) — accumulated, not "most recent",
+   * unlike `useUsageStore`'s per-session number: a subagent's own internal
+   * iterations aren't separate "turns" from the parent's perspective, so
+   * summing gives "how many tokens did this whole delegated task cost" that
+   * a per-attempt-only number wouldn't. `undefined` until the child's first
+   * `attemptStream` call reports a `usage` event (some providers/local
+   * models never do). Never written to `useUsageStore` itself — see
+   * `attemptStream`'s `recordUsage: false` doc comment for why child usage
+   * must never touch the PARENT session's own context-usage ring; this
+   * field is a parallel, subagent-scoped accounting the parent's ring never
+   * sees. */
+  usage?: UsageInfo;
   /** The child's own growing transcript (seed user prompt, then
    * assistant/tool messages as its loop progresses) — used to render the
    * expandable mini-transcript. Never written into `sessionStore`'s
@@ -56,6 +70,13 @@ interface SubagentStoreState {
    * `runSubagentTask` for every assistant/tool message the child's loop
    * produces, so the mini-transcript can render mid-run. */
   appendMessage: (taskId: string, message: ChatMessage) => void;
+  /** Adds one `attemptStream` call's reported usage onto `taskId`'s running
+   * `usage` total (see that field's own doc comment for why this
+   * accumulates rather than replaces) — called once per iteration of
+   * `runSubagentTask`'s loop that reports a `usage` event. No-ops if
+   * `taskId` was never `start`-ed, same defensive posture as
+   * `recordToolCall`. */
+  accumulateUsage: (taskId: string, usage: UsageInfo) => void;
   /** Marks a run terminal (`'done' | 'error' | 'cancelled'`) — called once,
    * when `runSubagentTask` is about to return. */
   finish: (taskId: string, status: "done" | "error" | "cancelled") => void;
@@ -68,7 +89,7 @@ export const useSubagentStore = create<SubagentStoreState>((set) => ({
     set((state) => ({
       runs: {
         ...state.runs,
-        [taskId]: { sessionId, taskId, description, profile, status: "running", lastActivity: "", toolCallCount: 0, liveMessages: [] },
+        [taskId]: { sessionId, taskId, description, profile, status: "running", lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
       },
     }));
   },
@@ -88,6 +109,22 @@ export const useSubagentStore = create<SubagentStoreState>((set) => ({
       const existing = state.runs[taskId];
       if (!existing) return state;
       return { runs: { ...state.runs, [taskId]: { ...existing, liveMessages: [...existing.liveMessages, message] } } };
+    });
+  },
+
+  accumulateUsage: (taskId, usage) => {
+    set((state) => {
+      const existing = state.runs[taskId];
+      if (!existing) return state;
+      const prior = existing.usage;
+      const merged: UsageInfo = prior
+        ? {
+            promptTokens: prior.promptTokens + usage.promptTokens,
+            completionTokens: prior.completionTokens + usage.completionTokens,
+            totalTokens: prior.totalTokens + usage.totalTokens,
+          }
+        : usage;
+      return { runs: { ...state.runs, [taskId]: { ...existing, usage: merged } } };
     });
   },
 

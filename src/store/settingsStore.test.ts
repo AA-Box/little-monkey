@@ -425,3 +425,56 @@ describe("settingsStore.maxConcurrentSubagents", () => {
     localStorage.removeItem(STORAGE_KEY);
   });
 });
+
+// Slice 4: optional per-profile model override — genuinely optional, so the
+// default (empty map) must mean "no override for either profile", exactly
+// what `subagent.ts`'s `resolveSubagentTarget` treats as "use the parent's
+// own target unchanged".
+describe("settingsStore.subagentProfileModels", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ subagentProfileModels: {} });
+  });
+
+  it("defaults to an empty map when nothing is persisted", async () => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({});
+  });
+
+  it("sets an override for one profile without touching the other", () => {
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    expect(useSettingsStore.getState().subagentProfileModels).toEqual({
+      explore: { providerId: "openrouter", model: "cheap-model" },
+    });
+    expect(useSettingsStore.getState().subagentProfileModels.code).toBeUndefined();
+  });
+
+  it("clears a previously-set override back to 'no override' for that profile", () => {
+    useSettingsStore.getState().setSubagentProfileModel("code", { providerId: "anthropic", model: "claude" });
+    useSettingsStore.getState().clearSubagentProfileModel("code");
+    expect(useSettingsStore.getState().subagentProfileModels.code).toBeUndefined();
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({
+      explore: { providerId: "openrouter", model: "cheap-model" },
+    });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("drops a malformed persisted entry (missing model) rather than corrupting the whole map", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ subagentProfileModels: { explore: { providerId: "openrouter" }, code: { providerId: "x", model: "y" } } }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({ code: { providerId: "x", model: "y" } });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});

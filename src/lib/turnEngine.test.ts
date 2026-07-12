@@ -579,4 +579,24 @@ describe("attemptStream / recordUsage", () => {
 
     expect(useUsageStore.getState().usageBySession["session-1"]).toBeUndefined();
   });
+
+  // Slice 4 (per-subagent token usage in SubagentRow): `recordUsage: false`
+  // must only gate the `useUsageStore` write above, never the CALLER's own
+  // visibility into its attempt's usage — `subagent.ts`'s `runSubagentTask`
+  // reads this field to accumulate a per-subagent total.
+  it("still returns the attempt's own usage on the result even when recordUsage is false", async () => {
+    const result = await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1", undefined, false);
+
+    expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+  });
+
+  it("returns usage undefined when no usage event ever arrives", async () => {
+    streamProviderChatMock.mockImplementation(async function* (): AsyncGenerator<StreamEvent> {
+      yield { type: "done" };
+    });
+
+    const result = await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1");
+
+    expect(result.usage).toBeUndefined();
+  });
 });

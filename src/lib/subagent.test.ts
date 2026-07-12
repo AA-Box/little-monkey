@@ -23,6 +23,7 @@ import type { ResolvedTarget } from "./turnEngine";
 import type { ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
+import { useSettingsStore } from "../store/settingsStore";
 
 const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
 
@@ -384,5 +385,85 @@ describe("runSubagentTask / subagentStore + sessionStore integration", () => {
     const persisted = session?.subagentRuns["call-store-3"];
     expect(persisted).toBeDefined();
     expect(persisted?.some((m) => m.role === "assistant" && m.content === "All done.")).toBe(true);
+  });
+});
+
+// Slice 4: per-subagent token usage — every `attemptStream` call's own
+// `usage` (populated regardless of `recordUsage: false`, see that field's
+// doc comment on `AttemptResult`) must accumulate into `subagentStore`, not
+// just be discarded now that `recordUsage` keeps it out of `useUsageStore`.
+describe("runSubagentTask / per-subagent usage accounting (slice 4)", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("accumulates usage from every attemptStream call into subagentStore, keyed the same as the run", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [toolCall("read_file")],
+        streamError: null,
+        contentStarted: true,
+        usage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 },
+      })
+      .mockResolvedValueOnce({
+        content: "done",
+        toolCalls: [],
+        streamError: null,
+        contentStarted: true,
+        usage: { promptTokens: 50, completionTokens: 10, totalTokens: 60 },
+      });
+    executeToolCallMock.mockResolvedValue("file contents");
+
+    await runSubagentTask(baseParams({ toolCallId: "call-usage-1" }));
+
+    const run = selectSubagentRun("call-usage-1")(useSubagentStore.getState());
+    expect(run?.usage).toEqual({ promptTokens: 150, completionTokens: 30, totalTokens: 180 });
+  });
+
+  it("leaves usage undefined when no attemptStream call ever reports one", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ toolCallId: "call-usage-2" }));
+
+    expect(selectSubagentRun("call-usage-2")(useSubagentStore.getState())?.usage).toBeUndefined();
+  });
+});
+
+// Slice 4: optional per-profile model override — `resolveSubagentTarget`
+// (private to subagent.ts) is exercised indirectly here through what target
+// actually reaches `attemptStream`.
+describe("runSubagentTask / per-profile model override (slice 4)", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    useSettingsStore.setState({ subagentProfileModels: {} });
+  });
+
+  it("uses the parent's own target unchanged when no override is configured for the profile", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(attemptStreamMock.mock.calls[0][0]).toBe(fakeTarget);
+  });
+
+  it("swaps in the configured override target for a matching profile", async () => {
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(attemptStreamMock.mock.calls[0][0]).toEqual({ kind: "provider", providerId: "openrouter", model: "cheap-model" });
+  });
+
+  it("does not apply an override configured for a different profile", async () => {
+    useSettingsStore.getState().setSubagentProfileModel("code", { providerId: "openrouter", model: "cheap-model" });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    await runSubagentTask(baseParams({ profile: "explore" }));
+
+    expect(attemptStreamMock.mock.calls[0][0]).toBe(fakeTarget);
   });
 });

@@ -72,6 +72,23 @@ describe("subagentStore", () => {
     expect(run?.profile).toBe("code");
   });
 
+  it("accumulateUsage sums onto a running total across multiple calls (slice 4)", () => {
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "find X", profile: "explore" });
+
+    useSubagentStore.getState().accumulateUsage("t1", { promptTokens: 100, completionTokens: 20, totalTokens: 120 });
+    let run = selectSubagentRun("t1")(useSubagentStore.getState());
+    expect(run?.usage).toEqual({ promptTokens: 100, completionTokens: 20, totalTokens: 120 });
+
+    useSubagentStore.getState().accumulateUsage("t1", { promptTokens: 50, completionTokens: 10, totalTokens: 60 });
+    run = selectSubagentRun("t1")(useSubagentStore.getState());
+    expect(run?.usage).toEqual({ promptTokens: 150, completionTokens: 30, totalTokens: 180 });
+  });
+
+  it("accumulateUsage is a no-op for an unregistered taskId", () => {
+    useSubagentStore.getState().accumulateUsage("missing", { promptTokens: 1, completionTokens: 1, totalTokens: 2 });
+    expect(selectSubagentRun("missing")(useSubagentStore.getState())).toBeUndefined();
+  });
+
   it("tracks multiple concurrent runs independently, keyed by taskId", () => {
     useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "task one", profile: "explore" });
     useSubagentStore.getState().start({ sessionId: "s1", taskId: "t2", description: "task two", profile: "code" });
