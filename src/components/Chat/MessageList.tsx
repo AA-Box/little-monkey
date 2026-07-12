@@ -54,6 +54,7 @@ import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
 import PlanCard from "./PlanCard";
+import SubagentRow from "./SubagentRow";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
@@ -75,6 +76,7 @@ export interface MessageListProps {
 type TimelineItem =
   | { kind: "bubble"; key: string; message: ChatMessage; index: number }
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
+  | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
@@ -124,6 +126,22 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
 
       for (const toolCall of toolCalls) {
         renderedCallIds.add(toolCall.id);
+        // A `task` call gets its own dedicated `SubagentRow` (live status +
+        // expandable child transcript) rather than the generic `ToolCallRow`
+        // every other tool renders as — see `SubagentRow.tsx`. `toolCall.id`
+        // is what `subagentStore`/`ChatSession.subagentRuns` are keyed by
+        // (see `subagent.ts`'s `RunSubagentTaskParams.toolCallId` doc
+        // comment for why THIS id, not the Rust-facing turn id).
+        if (toolCall.function.name === "task") {
+          items.push({
+            kind: "subagent",
+            key: `subagent-${toolCall.id}`,
+            taskId: toolCall.id,
+            args: toolCall.function.arguments,
+            result: resultByCallId.get(toolCall.id),
+          });
+          continue;
+        }
         items.push({
           kind: "tool",
           key: `tool-${toolCall.id}`,
@@ -205,7 +223,7 @@ function formatJson(raw: string): string {
   }
 }
 
-function resultLooksLikeError(raw: string): boolean {
+export function resultLooksLikeError(raw: string): boolean {
   try {
     const parsed: unknown = JSON.parse(raw);
     return typeof parsed === "object" && parsed !== null && "error" in parsed;
@@ -226,9 +244,11 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   web_fetch: Globe,
   web_search: Search,
   search_docs: BookOpen,
-  // Slice 1: `task` (subagent delegation) renders as an ordinary
-  // collapsible `ToolCallRow` like every other tool — a dedicated
-  // `SubagentRow` (live status + expandable child transcript) is slice 2.
+  // `task` (subagent delegation) is special-cased in `buildTimeline` to
+  // render as a dedicated `SubagentRow` instead of a plain `ToolCallRow` —
+  // kept here anyway as the icon for the "orphaned tool result" fallback
+  // path (a persisted transcript with a `task` result but no matching
+  // `tool_calls` entry, e.g. after history truncation).
   task: Bot,
 };
 
@@ -243,7 +263,7 @@ function toolIcon(name: string): LucideIcon {
 /** Memoized like `MessageBubble`: props are plain strings (stable for every
  * settled call), so streaming deltas to the transcript's last message don't
  * re-render the (potentially long) tool-call history. */
-const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
+export const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
   const pending = result === undefined;
@@ -776,6 +796,11 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "tool") {
               return <ToolCallRow key={item.key} name={item.name} args={item.args} result={item.result} />;
+            }
+            if (item.kind === "subagent") {
+              return (
+                <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
+              );
             }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;

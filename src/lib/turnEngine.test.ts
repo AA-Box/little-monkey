@@ -318,6 +318,18 @@ describe("executeToolCall / task delegation", () => {
     expect(params.profile).toBe("explore");
   });
 
+  it("passes the originating tool_call's own id as toolCallId — the subagentStore/ChatSession.subagentRuns correlation key, distinct from taskId", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+    const toolCall = call("task", { description: "find X", prompt: "p", profile: "explore" });
+
+    await executeToolCall(toolCall, null, "parent-turn", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.toolCallId).toBe(toolCall.id);
+    expect(params.toolCallId).not.toBe(params.taskId);
+  });
+
   it("gives each task call its own distinct turn id, even across two calls in the same tool round trip", async () => {
     runSubagentTaskMock.mockResolvedValue("done");
     const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };

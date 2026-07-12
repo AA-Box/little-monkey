@@ -790,6 +790,7 @@ describe("maybeAutoPreviewNewestArtifact", () => {
       personaId: null,
       attachedStackIds: [],
       docChatMode: false,
+      subagentRuns: {},
     };
     useSessionStore.setState((state) => ({
       sessions: [...state.sessions.filter((s) => s.id !== sessionId), session],
