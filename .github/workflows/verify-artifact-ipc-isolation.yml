@@ -56,7 +56,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
+          # No `cache: pnpm` here: pnpm-workspace.yaml has no `packages:` field,
+          # which makes `pnpm store path` (what the cache step shells out to)
+          # fail under the pinned pnpm 9 CLI with "packages field missing or
+          # empty" on Windows runners. Pre-existing repo config issue, out of
+          # scope for this workflow — see PR discussion.
 
       - uses: dtolnay/rust-toolchain@stable
         with:
