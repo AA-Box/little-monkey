@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { textContent, type ChatMessage } from "../lib/llamaClient";
@@ -404,6 +404,10 @@ function flushPersist(): void {
 }
 
 function persist(sessions: ChatSession[], activeSessionId: string, groups: SessionGroup[]): void {
+  // Plain-browser dev (`vite` without the Tauri shell) has no IPC bridge —
+  // sessions live in memory only, and attempting the invoke would surface a
+  // persist-error banner on every mutation.
+  if (!isTauri()) return;
   try {
     pendingPayload = JSON.stringify({ sessions, activeSessionId, groups });
   } catch (err) {
@@ -488,6 +492,9 @@ async function listenForOtherWindowSaves(): Promise<void> {
  * other windows' saves so multi-window use stays in sync.
  */
 export async function hydrateSessions(): Promise<void> {
+  // No Tauri shell (plain-browser dev): no sessions file to load and no
+  // window-event bus to subscribe to — keep the fresh in-memory session.
+  if (!isTauri()) return;
   // Subscribe before the initial load so a save landing in another window
   // during hydration isn't missed.
   void listenForOtherWindowSaves().catch((err: unknown) => {

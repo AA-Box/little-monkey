@@ -8,7 +8,7 @@ const invokeMock = vi.fn();
 // the factory is a *different* binding than the one this file's test bodies
 // read later, since Vitest's hoisting transform isolates them.
 const statusHandlerRef = vi.hoisted(() => ({ current: null as ((event: { payload: unknown }) => void) | null }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (_name: string, handler: (event: { payload: unknown }) => void) => {
     statusHandlerRef.current = handler;

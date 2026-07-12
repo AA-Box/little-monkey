@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -351,6 +351,10 @@ function flushPersist(): void {
 }
 
 function persist(entries: PromptEntry[], defaultPersonaId: string | null, hasSeededDefaults: boolean): void {
+  // Plain-browser dev (`vite` without the Tauri shell) has no IPC bridge —
+  // the library lives in memory only, and attempting the invoke would
+  // surface a persist-error banner on every mutation.
+  if (!isTauri()) return;
   try {
     pendingPayload = JSON.stringify({ version: 1, entries, defaultPersonaId, hasSeededDefaults });
   } catch (err) {
@@ -414,34 +418,39 @@ async function listenForOtherWindowSaves(): Promise<void> {
  * in sync.
  */
 export async function hydratePrompts(): Promise<void> {
-  // Subscribe before the initial load so a save landing in another window
-  // during hydration isn't missed.
-  void listenForOtherWindowSaves().catch((err: unknown) => {
-    console.error("Failed to subscribe to cross-window prompt-library sync", err);
-  });
-
-  let fromFile: PersistedShape | null = null;
-  try {
-    const raw = await invoke<string | null>("prompts_load");
-    fromFile = parsePersisted(raw);
-  } catch (err) {
-    // Read failure (not "file missing" — that returns null). Keep the empty
-    // in-memory library and surface the error; the file on disk is left
-    // untouched until the user actually does something worth saving.
-    usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
-    return;
-  }
-
-  if (fromFile) {
-    usePromptStore.setState({
-      entries: fromFile.entries,
-      defaultPersonaId: fromFile.defaultPersonaId,
-      hasSeededDefaults: fromFile.hasSeededDefaults,
+  // File persistence and cross-window sync only exist under the Tauri
+  // shell; in plain-browser dev the library is memory-only, but the
+  // starter-persona seeding below still runs so the UI isn't empty.
+  if (isTauri()) {
+    // Subscribe before the initial load so a save landing in another window
+    // during hydration isn't missed.
+    void listenForOtherWindowSaves().catch((err: unknown) => {
+      console.error("Failed to subscribe to cross-window prompt-library sync", err);
     });
+
+    let fromFile: PersistedShape | null = null;
+    try {
+      const raw = await invoke<string | null>("prompts_load");
+      fromFile = parsePersisted(raw);
+    } catch (err) {
+      // Read failure (not "file missing" — that returns null). Keep the empty
+      // in-memory library and surface the error; the file on disk is left
+      // untouched until the user actually does something worth saving.
+      usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
+    if (fromFile) {
+      usePromptStore.setState({
+        entries: fromFile.entries,
+        defaultPersonaId: fromFile.defaultPersonaId,
+        hasSeededDefaults: fromFile.hasSeededDefaults,
+      });
+    }
+    // No file yet (first run) — keep the empty initial state. Unlike
+    // `sessionStore.ts` there's no legacy localStorage blob to migrate from:
+    // this feature never persisted anywhere before this file existed.
   }
-  // No file yet (first run) — keep the empty initial state. Unlike
-  // `sessionStore.ts` there's no legacy localStorage blob to migrate from:
-  // this feature never persisted anywhere before this file existed.
 
   // First-ever hydration (this device has never seeded the starter personas,
   // whether because the file is brand new or predates this field): add them
