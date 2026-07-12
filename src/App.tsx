@@ -4,6 +4,7 @@ import { PanelRight, PanelRightClose, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
@@ -143,7 +144,12 @@ function App() {
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div data-tauri-drag-region className="h-11 shrink-0" />
         <SessionGrantBanner />
-        <ChatWindow sessionId={activeSessionId} onManagePrompts={handleManagePrompts} />
+        {/* Per-pane boundary so one pane crashing doesn't take down the other
+            (or the sidebar/workspace). `resetKey` clears a shown error on
+            session switch — the replacement session gets a fresh render. */}
+        <ErrorBoundary resetKey={activeSessionId}>
+          <ChatWindow sessionId={activeSessionId} onManagePrompts={handleManagePrompts} />
+        </ErrorBoundary>
       </div>
 
       {/* Split pane: a second, fully independent chat opened via the session
@@ -160,7 +166,9 @@ function App() {
               <X size={16} />
             </IconButton>
           </div>
-          <ChatWindow sessionId={splitSessionId} onManagePrompts={handleManagePrompts} />
+          <ErrorBoundary resetKey={splitSessionId}>
+            <ChatWindow sessionId={splitSessionId} onManagePrompts={handleManagePrompts} />
+          </ErrorBoundary>
         </div>
       )}
 

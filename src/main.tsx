@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
 import { applyTheme, getStoredTheme } from "./lib/theme";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
@@ -26,9 +27,13 @@ void Promise.all([hydrateSessions(), hydratePrompts()]).finally(() => {
     useSessionStore.getState().switchSession(preselectedSessionId);
   }
 
+  // Top-level boundary: without it a render error anywhere unmounts the
+  // entire tree and the window goes blank with no way back but a restart.
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <App />
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
     </React.StrictMode>,
   );
 });
