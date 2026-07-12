@@ -569,6 +569,7 @@ export const ja: Record<string, string> = {
   "KnowledgePanel.phaseDone": "インデックス済み",
   "KnowledgePanel.neverIndexed": "未インデックス",
   "KnowledgePanel.indexedAt": "{{when}} にインデックス済み · {{count}} チャンク",
+  "KnowledgePanel.staleIndexBadge": "再インデックスが必要",
   "KnowledgePanel.testSearchHeading": "テスト検索",
   "KnowledgePanel.notIndexedForSearch": "検索する前にこのスタックをインデックスしてください。",
   "KnowledgePanel.searchPlaceholder": "このスタックを検索…",

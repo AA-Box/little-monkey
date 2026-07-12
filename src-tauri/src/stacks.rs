@@ -24,17 +24,28 @@
 //! <https://github.com/asg017/sqlite-vec>) — deliberately not taken as a
 //! dependency in this slice.
 //!
-//! This is slice 1 of the RAG design doc: stacks + local indexing +
-//! `stacks_query` for a settings-panel test-search box. No agent wiring
-//! (`tool_search_docs`, doc-chat mode) exists yet — that's slice 2/3.
+//! Slices 1-3 of the RAG design doc (stacks + local indexing, the
+//! `search_docs` agent tool, and doc-chat mode) are already in place. This
+//! module also carries slice 4 (hardening + parity): incremental reindex via
+//! a `file_index.json` content-hash map (see `plan_reindex`), optional
+//! pure-Rust PDF text extraction (see `read_indexable_pdf`, feature-gated
+//! behind the `pdf-extraction` Cargo feature), and a stale-index check (see
+//! `is_stale_impl`) backing `KnowledgePanel.tsx`'s stale badge. `reindex_impl`
+//! and `query_impl` take a plain `base: &Path` (not an `AppHandle`) — the
+//! Tauri command wrappers resolve that path and, for `reindex_impl`, supply a
+//! progress callback instead of emitting the `stacks://index-progress` event
+//! directly — so `lm-cli`'s `Stacks` subcommand (`stacks_cli.rs`) can call
+//! them exactly like the desktop app does, just rendering progress to the
+//! terminal instead of a Tauri event.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::AppState;
@@ -141,15 +152,17 @@ pub struct KnowledgeStack {
 
 /// One chunk's metadata, one per line of `<stack_dir>/chunks.jsonl`. Row `i`
 /// here corresponds to row `i` in the stack's `vectors.bin`.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ChunkMeta {
     pub source_path: String,
     pub ordinal: usize,
     pub text: String,
-    /// SHA-256 hex digest of the *whole source file's* content at the time
-    /// it was chunked — not currently consulted for incremental reindex
-    /// (that's slice 4's `file_index.json`), but recorded now so slice 4
-    /// doesn't need a schema migration to add it.
+    /// SHA-256 hex digest of the source file's content at the time it was
+    /// chunked (for a PDF, the digest is of the *extracted text*, not the
+    /// raw PDF bytes — there's no other stable string to hash). Compared
+    /// against the sibling `file_index.json` on every reindex (see
+    /// `plan_reindex`): an unchanged hash means this file's rows can be
+    /// carried over verbatim instead of being re-chunked and re-embedded.
     pub content_hash: String,
     #[serde(default)]
     pub heading: Option<String>,
@@ -579,7 +592,12 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
         .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
-        .map_err(|e| format!("Failed to reach the embedding server: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to reach the embedding server: {e} — start it first from the desktop app's Settings > \
+                 Knowledge tab, or (from a terminal) `lm-cli stacks embed-server start --model-path <path>`."
+            )
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -598,6 +616,20 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
 
     let parsed: EmbeddingResponse =
         resp.json().await.map_err(|e| format!("Failed to parse embedding response: {e}"))?;
+
+    // Mirrors `ollama::embed`'s own count check: a backend that silently
+    // returns fewer (or more) embeddings than texts requested must be a hard
+    // error here, not an unfilled `vector_slots` entry that later panics via
+    // `.expect(...)` in `reindex_impl` — see that `.expect` call's own doc
+    // comment for why every slot is guaranteed filled ONLY if this holds.
+    if parsed.data.len() != texts.len() {
+        return Err(format!(
+            "Embedding server returned {} embeddings for {} inputs",
+            parsed.data.len(),
+            texts.len()
+        ));
+    }
+
     Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
 }
 
@@ -651,12 +683,64 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|&b| b == 0)
 }
 
-/// Reads `path` as an indexable text file, or returns `None` if it should
-/// be skipped: wrong extension, too large, empty, binary, or not valid
-/// UTF-8. Returns `(canonical path string, content)`.
+/// Extracts a PDF's text via the pure-Rust `pdf-extract` crate — gated
+/// behind the `pdf-extraction` Cargo feature (on by default; see
+/// `Cargo.toml`'s `[features]` section) so PDF support is an
+/// optional/gracefully-degrading addition, not a hard new dependency for
+/// users who never index PDFs: a build with the feature disabled simply
+/// never matches `.pdf` in [`read_indexable_file`] below, the same as any
+/// other unsupported extension, and this function doesn't even exist in
+/// that build. Returns `None` (skip, like any other unreadable/empty file)
+/// on oversized files, read failures, extraction failures (e.g. an
+/// encrypted or malformed PDF), or a PDF whose extracted text is blank
+/// (scanned-image-only PDFs have no text layer to extract).
+#[cfg(feature = "pdf-extraction")]
+fn read_indexable_pdf(path: &Path) -> Option<(String, String)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let text = pdf_extract::extract_text_from_mem(&bytes).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some((path.to_string_lossy().to_string(), text))
+}
+
+/// True for an extension `read_indexable_file` would ever actually read
+/// (`.pdf` when the `pdf-extraction` feature is compiled in, or anything in
+/// [`ALLOWED_EXTENSIONS`]) — factored out so [`source_has_newer_mtime`] can
+/// apply the exact same extension gate without duplicating (and risking
+/// drifting from) `read_indexable_file`'s own check.
+fn is_indexable_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_lowercase();
+
+    #[cfg(feature = "pdf-extraction")]
+    if ext == "pdf" {
+        return true;
+    }
+
+    ALLOWED_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// Reads `path` as an indexable file, or returns `None` if it should be
+/// skipped: wrong extension, too large, empty, binary, or not valid UTF-8
+/// (PDFs are the one exception — handled by [`read_indexable_pdf`] instead,
+/// only when the `pdf-extraction` feature is compiled in). Returns
+/// `(canonical path string, content)`.
 fn read_indexable_file(path: &Path) -> Option<(String, String)> {
     let ext = path.extension().and_then(|e| e.to_str())?.to_lowercase();
-    if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+
+    #[cfg(feature = "pdf-extraction")]
+    if ext == "pdf" {
+        return read_indexable_pdf(path);
+    }
+
+    if !is_indexable_extension(path) {
         return None;
     }
     let metadata = std::fs::metadata(path).ok()?;
@@ -677,9 +761,21 @@ fn read_indexable_file(path: &Path) -> Option<(String, String)> {
 /// (`tools::MENTION_SKIP_DIRS`) — this is exactly the "point at a folder, it
 /// finds the real files" philosophy the design doc calls out, reused rather
 /// than reinvented.
-fn collect_source_files(sources: &[StackSource]) -> Vec<(String, String)> {
+/// `cancel` is checked between every source and, for a folder source, between
+/// every directory entry — a stack pointed at a large/slow-to-walk tree could
+/// otherwise spend a long time in this fully-synchronous function with no
+/// chance for `reindex_impl`'s cancellation to take effect until it returns
+/// (see that function's doc comment for the cancellation model this is part
+/// of). Returns whatever was collected so far the moment cancellation is
+/// observed — the caller checks `cancel.is_cancelled()` right after calling
+/// this and discards the (possibly partial) result either way, so an early
+/// return here is never mistaken for "the real, complete file list".
+fn collect_source_files(sources: &[StackSource], cancel: &CancellationToken) -> Vec<(String, String)> {
     let mut files = Vec::new();
-    for source in sources {
+    'sources: for source in sources {
+        if cancel.is_cancelled() {
+            break;
+        }
         let path = Path::new(&source.path);
         match source.kind {
             SourceKind::File => {
@@ -697,6 +793,9 @@ fn collect_source_files(sources: &[StackSource]) -> Vec<(String, String)> {
                     true
                 });
                 for entry in walker {
+                    if cancel.is_cancelled() {
+                        break 'sources;
+                    }
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(_) => continue,
@@ -754,23 +853,272 @@ fn emit_progress(app: &AppHandle, stack_id: &str, files_done: usize, files_total
     );
 }
 
+fn file_index_path(stack_dir: &Path) -> PathBuf {
+    stack_dir.join("file_index.json")
+}
+
+/// Reads `<stack_dir>/file_index.json` — canonical source path -> SHA-256
+/// hex digest of that file's content as of the last successful reindex — the
+/// map [`plan_reindex`] diffs against to decide which files can skip
+/// re-chunking/re-embedding. Missing, unreadable, or corrupt all degrade to
+/// an empty map (same "nothing to reuse yet" fallback `plan_reindex` already
+/// applies when the sibling `vectors.bin` doesn't line up): incremental
+/// reindex is a pure optimization, never a correctness requirement, so a
+/// problem reading this file just means the next reindex re-embeds
+/// everything instead of failing.
+fn read_file_index(stack_dir: &Path) -> HashMap<String, String> {
+    let Ok(raw) = std::fs::read_to_string(file_index_path(stack_dir)) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Atomic write, same temp-file-then-rename idiom as `save_registry`/
+/// `write_chunks_jsonl`.
+fn write_file_index(stack_dir: &Path, index: &HashMap<String, String>) -> Result<(), String> {
+    let path = file_index_path(stack_dir);
+    let payload = serde_json::to_string_pretty(index).map_err(|e| format!("Failed to serialize file index: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, payload).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Stack-directory staging + atomic swap
+//
+// `chunks.jsonl`/`vectors.bin`/`file_index.json` must all reflect the SAME
+// reindex run — `load_stack_cached`'s only cross-check is a row-count
+// comparison, so if these three files were each independently
+// temp-write-then-rename'd directly into the live stack directory (as they
+// used to be), a crash/error between two of those renames could leave the
+// stack with (for example) a brand new `chunks.jsonl` paired with the OLD
+// `vectors.bin` — same chunk COUNT, silently mismatched CONTENT, which
+// `load_stack_cached` would then load and search without ever erroring. The
+// fix: build the whole new directory contents in a staging directory, then
+// swap it in with two directory-level `rename`s (`stack_dir` -> `stack_dir
+// + ".old"`, `staging_dir` -> `stack_dir`) — each individual rename is still
+// atomic, but by the time either one lands, the whole write set behind it is
+// already complete, so there is no window where a *partial* set of the three
+// files is visible under `stack_dir`. A crash between the two renames leaves
+// `stack_dir` entirely missing (loud — every read errors "not found") rather
+// than silently mismatched; [`recover_stack_dir`] heals exactly that case.
+// ---------------------------------------------------------------------
+
+fn staging_dir_path(base: &Path, stack_id: &str) -> PathBuf {
+    base.join(format!("{stack_id}.reindex-tmp"))
+}
+
+fn backup_dir_path(base: &Path, stack_id: &str) -> PathBuf {
+    base.join(format!("{stack_id}.old"))
+}
+
+/// Self-heals a stack directory left in the narrow "mid-swap" state a crash
+/// between [`swap_stack_dir`]'s two renames would produce: if `stack_dir` is
+/// missing but its `.old` backup still exists, the backup IS the last known-
+/// good, fully-consistent state, so it's restored. Also clears out any
+/// leftover staging directory from an interrupted run — always rebuilt from
+/// scratch on the next reindex, so a stale one is never reused. Called at the
+/// top of both [`reindex_impl`] (before it reads the "old" state to diff
+/// against) and [`load_stack_cached`] (before any query ever reads the
+/// directory), so this narrow window is closed on every entry point, not
+/// just the one that happened to cause it.
+fn recover_stack_dir(base: &Path, stack_id: &str) {
+    let stack_dir = base.join(stack_id);
+    let backup_dir = backup_dir_path(base, stack_id);
+    if !stack_dir.exists() && backup_dir.exists() {
+        let _ = std::fs::rename(&backup_dir, &stack_dir);
+    }
+    let _ = std::fs::remove_dir_all(staging_dir_path(base, stack_id));
+}
+
+/// Atomically replaces `stack_dir` (`base/stack_id`) with `staging_dir`'s
+/// contents via two directory renames (see this section's module doc for
+/// why one rename per file isn't enough). `staging_dir` must already contain
+/// the complete, self-consistent new `chunks.jsonl` + `vectors.bin` +
+/// `file_index.json` — nothing is written here.
+fn swap_stack_dir(base: &Path, stack_id: &str, staging_dir: &Path) -> Result<(), String> {
+    let stack_dir = base.join(stack_id);
+    let backup_dir = backup_dir_path(base, stack_id);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+
+    let had_previous = stack_dir.exists();
+    if had_previous {
+        std::fs::rename(&stack_dir, &backup_dir)
+            .map_err(|e| format!("Failed to stage previous stack directory for replacement: {e}"))?;
+    }
+    if let Err(e) = std::fs::rename(staging_dir, &stack_dir) {
+        // Best-effort restore so a failure here doesn't leave the stack
+        // directory missing when the previous state was still perfectly
+        // good and available right next to it.
+        if had_previous {
+            let _ = std::fs::rename(&backup_dir, &stack_dir);
+        }
+        return Err(format!("Failed to finalize stack directory: {e}"));
+    }
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Reindex pipeline
 // ---------------------------------------------------------------------
 
-/// Walks `stack`'s sources, chunks every indexable file, embeds every chunk
-/// (batched), and atomically writes `chunks.jsonl` + `vectors.bin`, updating
-/// the registry's `indexed_at`/`chunk_count` on success. Streams
-/// `stacks://index-progress` events throughout. Cancellable via the
-/// `Notify` registered in `AppState::index_cancels` under `stack_id` (see
-/// `stacks_cancel_index`) — checked between embedding batches, the only
-/// genuinely slow step (network round-trips), via `tokio::select!` racing
-/// the cancellation against each batch's embed call, mirroring how
+/// The pure "what needs (re-)embedding" decision behind incremental
+/// reindex, factored out of `reindex_impl` so it's unit-testable without any
+/// network/embedding call: given the current file list and the previous
+/// run's `file_index.json`/`chunks.jsonl`/`vectors.bin`, decides — per file —
+/// whether its rows can be carried over verbatim (`vector_slots[i] =
+/// Some(old_vector)`, nothing added to `to_embed_texts`) or must be
+/// (re-)chunked and queued for embedding (`vector_slots[i] = None`, its text
+/// appended to `to_embed_texts`). `reindex_impl` only ever calls
+/// `embed_batch` on `to_embed_texts` — see this struct's fields for exactly
+/// what it needs to do that and then reassemble the final `chunks.jsonl`/
+/// `vectors.bin` in the same pass.
+struct ReindexPlan {
+    /// The stack's full new chunk list, in final on-disk order. Row `i` here
+    /// is row `i` of `vector_slots` below and (once every `None` is filled
+    /// in) of the new `vectors.bin`.
+    all_chunks: Vec<ChunkMeta>,
+    /// Parallel to `all_chunks`: `Some(vector)` for a row carried over from
+    /// the previous index, `None` for a row still awaiting embedding.
+    vector_slots: Vec<Option<Vec<f32>>>,
+    /// Indices into `all_chunks`/`vector_slots` that are still `None`, in
+    /// the same order as `to_embed_texts` — `to_embed_indices[i]`'s text is
+    /// `to_embed_texts[i]`, so a returned embedding can be written straight
+    /// back to `vector_slots[to_embed_indices[i]]`.
+    to_embed_indices: Vec<usize>,
+    /// The chunk text needing embedding, in `all_chunks` order. Empty when
+    /// every current file's content hash matched `file_index.json` — the
+    /// "mostly-static folder" case this whole mechanism exists for.
+    to_embed_texts: Vec<String>,
+    /// This run's new `file_index.json` contents — every current file's
+    /// path mapped to its just-computed content hash, superseding whatever
+    /// was read in as `old_file_index`.
+    new_file_index: HashMap<String, String>,
+}
+
+/// Builds a [`ReindexPlan`] for `stack` from its current `files` (as
+/// `collect_source_files` returns them) plus the previous run's on-disk
+/// state. `old_vectors` is `Some((dim, count, flat))` only when the sibling
+/// `vectors.bin` was readable — reuse additionally requires `dim` to match
+/// `stack.embedding.dim` and `count` to match `old_chunks.len()`; either
+/// mismatch (a spec change, a hand-edited/corrupt file, or simply no
+/// previous index at all) falls back to treating every file as needing
+/// embedding, exactly like a first-ever index — `content_hash` still gets
+/// computed and recorded either way, so the *next* reindex after a spec
+/// change is incremental again. `on_file_done(files_done, files_total,
+/// chunks_so_far)` is called once per file purely for progress reporting;
+/// tests pass a no-op closure. `cancel` is checked once per file (hashing a
+/// large file's content is real CPU work, same reasoning as
+/// `collect_source_files`'s per-entry check) — like that function, a
+/// cancelled run simply returns whatever's built so far; the caller checks
+/// `cancel.is_cancelled()` right after and discards the (possibly partial)
+/// plan either way.
+fn plan_reindex(
+    stack: &KnowledgeStack,
+    files: &[(String, String)],
+    old_file_index: &HashMap<String, String>,
+    old_chunks: &[ChunkMeta],
+    old_vectors: Option<(u32, u32, &[f32])>,
+    cancel: &CancellationToken,
+    mut on_file_done: impl FnMut(usize, usize, usize),
+) -> ReindexPlan {
+    let dim = stack.embedding.dim as usize;
+    let reuse_old = old_vectors
+        .map(|(old_dim, old_count, _)| old_dim == stack.embedding.dim && old_count as usize == old_chunks.len())
+        .unwrap_or(false);
+    let old_flat: &[f32] = old_vectors.map(|(_, _, flat)| flat).unwrap_or(&[]);
+
+    // Every old row for a given source path, in original (ordinal) order —
+    // popped from the front as they're claimed below, so a file that used to
+    // produce N chunks and still does gets its N old rows back in order.
+    let mut old_rows_by_path: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    if reuse_old {
+        for (row, chunk) in old_chunks.iter().enumerate() {
+            old_rows_by_path.entry(chunk.source_path.as_str()).or_default().push_back(row);
+        }
+    }
+
+    let mut all_chunks: Vec<ChunkMeta> = Vec::new();
+    let mut vector_slots: Vec<Option<Vec<f32>>> = Vec::new();
+    let mut to_embed_indices: Vec<usize> = Vec::new();
+    let mut to_embed_texts: Vec<String> = Vec::new();
+    let mut new_file_index: HashMap<String, String> = HashMap::with_capacity(files.len());
+
+    for (i, (source_path, content)) in files.iter().enumerate() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let content_hash = sha256_hex(content);
+        new_file_index.insert(source_path.clone(), content_hash.clone());
+        let unchanged = reuse_old && old_file_index.get(source_path) == Some(&content_hash);
+
+        if unchanged {
+            // This file's content (and therefore its chunk boundaries)
+            // hasn't changed since the last index — carry its previous rows
+            // over untouched rather than re-chunking/re-embedding them. A
+            // file present in `file_index.json` but with zero rows in
+            // `old_chunks` (shouldn't normally happen, but not fatal) simply
+            // contributes nothing here, same as if it were empty.
+            if let Some(rows) = old_rows_by_path.get_mut(source_path.as_str()) {
+                while let Some(row) = rows.pop_front() {
+                    all_chunks.push(old_chunks[row].clone());
+                    vector_slots.push(Some(old_flat[row * dim..(row + 1) * dim].to_vec()));
+                }
+            }
+        } else {
+            for (ordinal, chunk) in
+                chunk_text(content, stack.chunk_chars, stack.chunk_overlap).into_iter().enumerate()
+            {
+                all_chunks.push(ChunkMeta {
+                    source_path: source_path.clone(),
+                    ordinal,
+                    text: chunk.text.clone(),
+                    content_hash: content_hash.clone(),
+                    heading: chunk.heading,
+                });
+                to_embed_indices.push(all_chunks.len() - 1);
+                to_embed_texts.push(chunk.text);
+                vector_slots.push(None);
+            }
+        }
+
+        on_file_done(i + 1, files.len(), all_chunks.len());
+    }
+
+    ReindexPlan { all_chunks, vector_slots, to_embed_indices, to_embed_texts, new_file_index }
+}
+
+/// Walks `stack`'s sources, incrementally re-chunks/re-embeds only the files
+/// that changed since the last reindex (see [`plan_reindex`]), and atomically
+/// swaps in a new stack directory containing `chunks.jsonl` + `vectors.bin` +
+/// `file_index.json` as a single consistent set (see the "Stack-directory
+/// staging + atomic swap" section above [`swap_stack_dir`]), updating the
+/// registry's `indexed_at`/`chunk_count` on success. Reports progress via
+/// `on_progress(files_done, files_total, chunks, phase)` — the Tauri command
+/// wrapper (`stacks_reindex`) turns that into `stacks://index-progress`
+/// events; `lm-cli`'s `stacks_cli::reindex` renders it to the terminal
+/// instead. Cancellable via the `CancellationToken` registered in
+/// `AppState::index_cancels` under `stack_id` (see `stacks_cancel_index`):
+/// unlike `tokio::sync::Notify::notify_waiters()` (which only wakes a task
+/// already parked in `.notified().await` and forgets the signal otherwise —
+/// dropping a cancel request that arrives before the embed loop's first
+/// `select!` even exists), a `CancellationToken`'s cancelled state is
+/// persisted, so it's checked directly (`cancel.is_cancelled()`) right after
+/// the walking and chunking phases too, in addition to the `tokio::select!`
+/// racing it against each embed batch below (the only step actually worth
+/// interrupting mid-await, since it's a network round-trip) — mirroring how
 /// `tool_run_shell` races its own cancellation against the child process.
-pub async fn reindex_impl(app: &AppHandle, state: &AppState, stack_id: &str) -> Result<KnowledgeStack, String> {
+pub async fn reindex_impl(
+    base: &Path,
+    state: &AppState,
+    stack_id: &str,
+    mut on_progress: impl FnMut(usize, usize, usize, &str),
+) -> Result<KnowledgeStack, String> {
     validate_id(stack_id)?;
-    let base = stacks_base_dir(app)?;
-    let mut registry = load_registry(&base)?;
+    recover_stack_dir(base, stack_id);
+    let mut registry = load_registry(base)?;
     let idx = registry
         .iter()
         .position(|s| s.id == stack_id)
@@ -782,68 +1130,94 @@ pub async fn reindex_impl(app: &AppHandle, state: &AppState, stack_id: &str) -> 
             .index_cancels
             .lock()
             .map_err(|_| "Index-cancel lock poisoned".to_string())?;
-        cancels.entry(stack_id.to_string()).or_insert_with(|| Arc::new(Notify::new())).clone()
+        cancels.entry(stack_id.to_string()).or_insert_with(|| Arc::new(CancellationToken::new())).clone()
     };
     // RAII-style cleanup so the cancel handle never lingers past this run,
     // whether it finishes normally, errors, or is cancelled.
     let _cleanup = CancelCleanup { state, stack_id: stack_id.to_string() };
 
-    emit_progress(app, stack_id, 0, 0, 0, "walking");
-    let files = collect_source_files(&stack.sources);
+    on_progress(0, 0, 0, "walking");
+    let files = collect_source_files(&stack.sources, &cancel);
+    if cancel.is_cancelled() {
+        return Err("Indexing cancelled".to_string());
+    }
     let files_total = files.len();
     if files_total == 0 {
         return Err("No indexable files found in this stack's sources".to_string());
     }
 
-    let mut all_chunks: Vec<ChunkMeta> = Vec::new();
-    for (i, (source_path, content)) in files.iter().enumerate() {
-        let content_hash = sha256_hex(content);
-        for (ordinal, chunk) in chunk_text(content, stack.chunk_chars, stack.chunk_overlap).into_iter().enumerate() {
-            all_chunks.push(ChunkMeta {
-                source_path: source_path.clone(),
-                ordinal,
-                text: chunk.text,
-                content_hash: content_hash.clone(),
-                heading: chunk.heading,
-            });
-        }
-        emit_progress(app, stack_id, i + 1, files_total, all_chunks.len(), "chunking");
+    let stack_dir = base.join(stack_id);
+    let old_file_index = read_file_index(&stack_dir);
+    let old_chunks = read_chunks_jsonl(&stack_dir).unwrap_or_default();
+    let old_vectors_owned = read_vectors_bin(&stack_dir.join("vectors.bin")).ok();
+    let old_vectors_ref = old_vectors_owned.as_ref().map(|(d, c, flat)| (*d, *c, flat.as_slice()));
+
+    let plan = plan_reindex(
+        &stack,
+        &files,
+        &old_file_index,
+        &old_chunks,
+        old_vectors_ref,
+        &cancel,
+        |done, total, chunks| {
+            on_progress(done, total, chunks, "chunking");
+        },
+    );
+    if cancel.is_cancelled() {
+        return Err("Indexing cancelled".to_string());
     }
 
-    if all_chunks.len() > MAX_CHUNKS_PER_STACK {
+    if plan.all_chunks.len() > MAX_CHUNKS_PER_STACK {
         return Err(format!(
             "This stack would produce {} chunks, over the {} limit — narrow its sources or split it into multiple stacks",
-            all_chunks.len(),
+            plan.all_chunks.len(),
             MAX_CHUNKS_PER_STACK
         ));
     }
 
-    let texts: Vec<String> = all_chunks.iter().map(|c| c.text.clone()).collect();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    let mut vector_slots = plan.vector_slots;
+    let reused_count = plan.all_chunks.len() - plan.to_embed_texts.len();
     let mut embedded_so_far = 0usize;
-    for batch in texts.chunks(EMBED_BATCH_SIZE) {
-        let batch_vec = batch.to_vec();
+    for start in (0..plan.to_embed_texts.len()).step_by(EMBED_BATCH_SIZE) {
+        let end = (start + EMBED_BATCH_SIZE).min(plan.to_embed_texts.len());
+        let batch_texts = plan.to_embed_texts[start..end].to_vec();
         tokio::select! {
             biased;
-            _ = cancel.notified() => {
+            _ = cancel.cancelled() => {
                 return Err("Indexing cancelled".to_string());
             }
-            result = embed_batch(&stack.embedding, &batch_vec, false) => {
-                vectors.extend(result?);
+            result = embed_batch(&stack.embedding, &batch_texts, false) => {
+                let vecs = result?;
+                for (slot_idx, vec) in plan.to_embed_indices[start..end].iter().zip(vecs.into_iter()) {
+                    vector_slots[*slot_idx] = Some(vec);
+                }
             }
         }
-        embedded_so_far += batch.len();
-        emit_progress(app, stack_id, files_total, files_total, embedded_so_far, "embedding");
+        embedded_so_far += end - start;
+        on_progress(files_total, files_total, reused_count + embedded_so_far, "embedding");
     }
 
-    let stack_dir = base.join(stack_id);
-    std::fs::create_dir_all(&stack_dir).map_err(|e| format!("Failed to create stack directory: {e}"))?;
-    write_chunks_jsonl(&stack_dir, &all_chunks)?;
-    write_vectors_bin(&stack_dir.join("vectors.bin"), stack.embedding.dim, &vectors)?;
+    let vectors: Vec<Vec<f32>> = vector_slots
+        .into_iter()
+        .map(|v| v.expect("plan_reindex must fill every chunk slot via reuse or embedding"))
+        .collect();
+
+    // Build the complete new directory contents in a staging directory, then
+    // swap it in with one atomic directory-level replace — see the
+    // "Stack-directory staging + atomic swap" section above for why writing
+    // straight into `stack_dir` (as this used to) risks a partial write set
+    // becoming visible to a concurrent/later load.
+    let staging_dir = staging_dir_path(base, stack_id);
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    std::fs::create_dir_all(&staging_dir).map_err(|e| format!("Failed to create staging directory: {e}"))?;
+    write_chunks_jsonl(&staging_dir, &plan.all_chunks)?;
+    write_vectors_bin(&staging_dir.join("vectors.bin"), stack.embedding.dim, &vectors)?;
+    write_file_index(&staging_dir, &plan.new_file_index)?;
+    swap_stack_dir(base, stack_id, &staging_dir)?;
 
     registry[idx].indexed_at = Some(now_ms());
-    registry[idx].chunk_count = all_chunks.len();
-    save_registry(&base, &registry)?;
+    registry[idx].chunk_count = plan.all_chunks.len();
+    save_registry(base, &registry)?;
 
     state
         .stack_cache
@@ -851,7 +1225,7 @@ pub async fn reindex_impl(app: &AppHandle, state: &AppState, stack_id: &str) -> 
         .map_err(|_| "Stack-cache lock poisoned".to_string())?
         .remove(stack_id);
 
-    emit_progress(app, stack_id, files_total, files_total, all_chunks.len(), "done");
+    on_progress(files_total, files_total, plan.all_chunks.len(), "done");
 
     Ok(registry[idx].clone())
 }
@@ -891,6 +1265,7 @@ fn load_stack_cached(state: &AppState, base: &Path, stack: &KnowledgeStack) -> R
         }
     }
 
+    recover_stack_dir(base, &stack.id);
     let stack_dir = base.join(&stack.id);
     let chunks = read_chunks_jsonl(&stack_dir)?;
     let (dim, count, vectors) = read_vectors_bin(&stack_dir.join("vectors.bin"))?;
@@ -910,31 +1285,70 @@ fn load_stack_cached(state: &AppState, base: &Path, stack: &KnowledgeStack) -> R
     Ok(loaded)
 }
 
-/// Embeds `query` against each of `stack_ids` (a stack that hasn't been
-/// indexed yet is a hard error, not an empty result) and returns the
-/// combined top-`k` hits across all of them, highest score first.
-pub async fn query_impl(
-    app: &AppHandle,
-    state: &AppState,
+/// Splits `stack_ids` into the subset that's actually indexed (and therefore
+/// searchable) — factored out of `query_impl` so the "skip the unindexed
+/// ones instead of aborting the whole multi-stack query" decision is
+/// unit-testable without a live embedding server. A `stack_id` that isn't in
+/// the registry at all is still a hard, immediate error (a real bug — a
+/// caller passed a bogus id — not a staleness state). If NONE of `stack_ids`
+/// turn out to be indexed, this is also a hard error (nothing usable to
+/// search at all) naming every unindexed stack — the same "has not been
+/// indexed yet" signal a single named, unindexed stack has always surfaced
+/// (see `resolve_search_stack_ids`'s doc comment) is preserved for that case.
+/// But when at least one requested stack IS indexed, an unindexed sibling
+/// among the rest is simply skipped rather than discarding every already-
+/// computed result from the good ones — see `query_impl`'s doc comment for
+/// the failure mode this avoids.
+fn partition_indexed_stacks<'a>(
+    registry: &'a [KnowledgeStack],
     stack_ids: &[String],
-    query: &str,
-    k: usize,
-) -> Result<Vec<StackQueryResult>, String> {
-    let base = stacks_base_dir(app)?;
-    let registry = load_registry(&base)?;
-
-    let mut all_results: Vec<StackQueryResult> = Vec::new();
+) -> Result<Vec<&'a KnowledgeStack>, String> {
+    let mut indexed = Vec::new();
+    let mut unindexed_names = Vec::new();
 
     for stack_id in stack_ids {
         let stack = registry
             .iter()
             .find(|s| &s.id == stack_id)
             .ok_or_else(|| format!("Stack '{}' not found", stack_id))?;
-        if stack.indexed_at.is_none() {
-            return Err(format!("Stack '{}' has not been indexed yet", stack.name));
+        if stack.indexed_at.is_some() {
+            indexed.push(stack);
+        } else {
+            unindexed_names.push(stack.name.clone());
         }
+    }
 
-        let loaded = load_stack_cached(state, &base, stack)?;
+    if indexed.is_empty() && !unindexed_names.is_empty() {
+        return Err(format!(
+            "Stack{} not indexed yet: {}",
+            if unindexed_names.len() > 1 { "s" } else { "" },
+            unindexed_names.join(", ")
+        ));
+    }
+    Ok(indexed)
+}
+
+/// Embeds `query` against every INDEXED stack among `stack_ids` (an
+/// unindexed one among several is skipped, not a hard abort — see
+/// [`partition_indexed_stacks`]'s doc comment for exactly when this still
+/// errors) and returns the combined top-`k` hits across all of them, highest
+/// score first. Takes `base: &Path` (not an `AppHandle`) like every other
+/// `*_impl` here — `lm-cli`'s `stacks_cli::search_docs` calls this directly
+/// with its own resolved app-data path.
+pub async fn query_impl(
+    base: &Path,
+    state: &AppState,
+    stack_ids: &[String],
+    query: &str,
+    k: usize,
+) -> Result<Vec<StackQueryResult>, String> {
+    let registry = load_registry(base)?;
+    let indexed_stacks = partition_indexed_stacks(&registry, stack_ids)?;
+
+    let mut all_results: Vec<StackQueryResult> = Vec::new();
+
+    for stack in indexed_stacks {
+        let loaded = load_stack_cached(state, base, stack)?;
 
         let query_vectors = embed_batch(&stack.embedding, &[query.to_string()], true).await?;
         let query_vec = query_vectors.into_iter().next().ok_or_else(|| "Failed to embed query".to_string())?;
@@ -1001,16 +1415,40 @@ pub fn stacks_remove_source(app: AppHandle, id: String, path: String) -> Result<
 
 #[tauri::command]
 pub async fn stacks_reindex(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<KnowledgeStack, String> {
-    reindex_impl(&app, state.inner(), &id).await
+    let base = stacks_base_dir(&app)?;
+    let app_for_progress = app.clone();
+    let progress_id = id.clone();
+    reindex_impl(&base, state.inner(), &id, move |files_done, files_total, chunks, phase| {
+        emit_progress(&app_for_progress, &progress_id, files_done, files_total, chunks, phase);
+    })
+    .await
+}
+
+/// Backs `KnowledgePanel.tsx`'s stale-index badge: true when any of `id`'s
+/// source files (or, for a folder source, any file the same walk
+/// `collect_source_files` uses would find) has a filesystem mtime newer than
+/// the stack's `indexed_at` — see `is_stale_impl`. A stack that has never
+/// been indexed is never "stale" (its row already shows "not indexed" rather
+/// than a staleness badge).
+#[tauri::command]
+pub fn stacks_is_stale(app: AppHandle, id: String) -> Result<bool, String> {
+    let base = stacks_base_dir(&app)?;
+    let registry = load_registry(&base)?;
+    let stack = registry.iter().find(|s| s.id == id).ok_or_else(|| format!("Stack '{}' not found", id))?;
+    Ok(is_stale_impl(stack))
 }
 
 /// Best-effort cancellation, like `tools_cancel_running`: if no reindex is
 /// currently running for `id`, this is simply a no-op (nothing to cancel).
+/// Uses `CancellationToken::cancel()` (a persisted flag), not
+/// `tokio::sync::Notify::notify_waiters()` (a fire-and-forget wakeup that's
+/// silently lost if nothing happens to be awaiting it at this exact moment)
+/// — see `reindex_impl`'s doc comment for why that distinction matters.
 #[tauri::command]
 pub fn stacks_cancel_index(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let cancels = state.index_cancels.lock().map_err(|_| "Index-cancel lock poisoned".to_string())?;
-    if let Some(notify) = cancels.get(&id) {
-        notify.notify_waiters();
+    if let Some(token) = cancels.get(&id) {
+        token.cancel();
     }
     Ok(())
 }
@@ -1023,47 +1461,144 @@ pub async fn stacks_query(
     query: String,
     k: Option<u32>,
 ) -> Result<Vec<StackQueryResult>, String> {
-    query_impl(&app, state.inner(), &stack_ids, &query, k.unwrap_or(DEFAULT_QUERY_K as u32) as usize).await
+    let base = stacks_base_dir(&app)?;
+    query_impl(&base, state.inner(), &stack_ids, &query, k.unwrap_or(DEFAULT_QUERY_K as u32) as usize).await
+}
+
+// ---------------------------------------------------------------------
+// Staleness check
+// ---------------------------------------------------------------------
+
+/// True if any of `stack`'s source files has a filesystem mtime newer than
+/// its `indexed_at` — a stack that's never been indexed is never stale (see
+/// `stacks_is_stale`). A source that can no longer be `stat`-ed at all (e.g.
+/// deleted since indexing) counts as stale too, so a broken source surfaces
+/// via the same badge instead of silently being skipped.
+fn is_stale_impl(stack: &KnowledgeStack) -> bool {
+    let Some(indexed_at) = stack.indexed_at else { return false };
+    stack.sources.iter().any(|source| source_has_newer_mtime(Path::new(&source.path), indexed_at))
+}
+
+fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+}
+
+/// True if `path` itself (a file source) or any file reachable under it (a
+/// folder source, walked the same way `collect_source_files` does) has an
+/// mtime after `indexed_at_ms`.
+fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+
+    if !metadata.is_dir() {
+        return mtime_ms(&metadata).map(|mtime| mtime > indexed_at_ms).unwrap_or(true);
+    }
+
+    let walker = WalkDir::new(path).follow_links(false).into_iter().filter_entry(|entry| {
+        if entry.depth() > 0 && entry.file_type().is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+            }
+        }
+        true
+    });
+    for entry in walker {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Match `collect_source_files`/`read_indexable_file`'s own
+        // extension-allowlist and size-cap gates — a touched file that
+        // indexing would never actually look at (wrong extension, an
+        // oversized log file, etc.) must not flip the stale badge, or
+        // reindexing would be "recommended" for a change that produces zero
+        // new/changed chunks. Skipped here on metadata alone (no content
+        // read), so this stays a cheap `stat`-only check like the rest of
+        // this function; the binary-content-sniff/UTF-8-validity gates
+        // `read_indexable_file` also applies aren't replicated since those
+        // require reading the file, which this check deliberately doesn't do.
+        if !is_indexable_extension(entry.path()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        if mtime_ms(&metadata).map(|mtime| mtime > indexed_at_ms).unwrap_or(true) {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------
 // Agent retrieval tool (RAG design doc slice 2)
 // ---------------------------------------------------------------------
 
-/// Resolves which stack ids [`tool_search_docs`] should actually search:
+/// Resolves which stack ids [`tool_search_docs`] should actually search.
 ///
-/// - `stack: Some(name)` — the single stack whose name matches `name`
-///   case-insensitively (trimmed first, since a model may pad its argument
-///   with whitespace). A name that matches nothing is a hard error rather
-///   than an empty result, so the model learns immediately that it
-///   mistyped/hallucinated a stack name instead of silently getting zero
-///   hits back. If the matched stack hasn't been indexed yet, this still
-///   returns its id — `query_impl` is what surfaces the "has not been
-///   indexed yet" error, so that message stays in exactly one place.
-/// - `stack: None` — every stack in the registry that HAS been indexed.
-///   There is deliberately no notion of "attached stacks" on the Rust side:
-///   `buildTools` (src/lib/tools.ts) only ever offers this tool, and only
-///   ever names, the stacks actually attached to the session — so "no name
-///   given" from a well-behaved model already means "search whichever of
-///   those you think is relevant", and the tool's description lists exactly
-///   those names. A stack outside that session's attachments could still be
-///   matched by explicit name (or swept in via the "search everything
-///   indexed" default) since nothing upstream threads an attached-id list
-///   through the tool call — see this module's top doc comment and the
-///   slice 2 summary for why this is a documented, deliberate deviation from
-///   a literal reading of "dot-products across the attached stack(s)".
-fn resolve_search_stack_ids(registry: &[KnowledgeStack], stack: Option<&str>) -> Result<Vec<String>, String> {
+/// `allowed_names` is the scoping boundary: `Some(names)` restricts EVERY
+/// resolution below (both the explicit-name and the default-sweep case) to
+/// just the registry entries whose name case-insensitively matches one of
+/// `names` — this is how a session's actually-attached stacks (or, for
+/// `lm-cli`, the stacks named via `--stack`) keep a `search_docs` call from
+/// reaching a knowledge stack that was never granted to this
+/// session/invocation, even one that happens to be indexed. `None` means "no
+/// restriction, consider the whole registry" — used only by `lm-cli` when it
+/// has no `--stack` at all to scope by (see `stacks_cli::search_docs`); the
+/// desktop app's `tool_search_docs` below always passes `Some(...)` (an empty
+/// `Vec` when nothing is attached), never `None`, so a hallucinated call in a
+/// session with nothing attached fails closed rather than sweeping in every
+/// indexed stack on the machine — see this module's top doc comment and the
+/// slice 2 summary for the privacy gap this closes.
+///
+/// - `stack: Some(name)` — the single (in-scope) stack whose name matches
+///   `name` case-insensitively (trimmed first, since a model may pad its
+///   argument with whitespace). A name that matches nothing IN SCOPE is a
+///   hard error rather than an empty result, so the model learns immediately
+///   that it mistyped/hallucinated a stack name (or named one outside this
+///   session's attachments) instead of silently getting zero hits back. If
+///   the matched stack hasn't been indexed yet, this still returns its id —
+///   `query_impl` is what surfaces the "has not been indexed yet" error, so
+///   that message stays in exactly one place.
+/// - `stack: None` — every IN-SCOPE stack that HAS been indexed.
+///
+/// `pub` (not module-private) so `lm-cli`'s `stacks_cli::search_docs` (slice
+/// 4 CLI parity) can resolve a `--stack`-style name argument through the
+/// exact same logic `tool_search_docs` uses below, rather than re-implementing
+/// name matching a second time.
+pub fn resolve_search_stack_ids(
+    registry: &[KnowledgeStack],
+    allowed_names: Option<&[String]>,
+    stack: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let in_scope = |s: &KnowledgeStack| {
+        allowed_names
+            .map(|names| names.iter().any(|n| n.trim().eq_ignore_ascii_case(s.name.trim())))
+            .unwrap_or(true)
+    };
+
     match stack {
         Some(name) => {
             let trimmed = name.trim();
             registry
                 .iter()
+                .filter(|s| in_scope(s))
                 .find(|s| s.name.eq_ignore_ascii_case(trimmed))
                 .map(|s| vec![s.id.clone()])
-                .ok_or_else(|| format!("No knowledge stack named '{}'", trimmed))
+                .ok_or_else(|| {
+                    format!(
+                        "No knowledge stack named '{}'{}",
+                        trimmed,
+                        if allowed_names.is_some() { " attached to this session" } else { "" }
+                    )
+                })
         }
         None => {
-            let ids: Vec<String> = registry.iter().filter(|s| s.indexed_at.is_some()).map(|s| s.id.clone()).collect();
+            let ids: Vec<String> =
+                registry.iter().filter(|s| in_scope(s) && s.indexed_at.is_some()).map(|s| s.id.clone()).collect();
             if ids.is_empty() {
                 Err("No indexed knowledge stacks are available to search".to_string())
             } else {
@@ -1081,6 +1616,20 @@ fn resolve_search_stack_ids(registry: &[KnowledgeStack], stack: Option<&str>) ->
 /// hood, just with a model-facing argument shape (`stack` by name, not by
 /// id; `max_results` not `k`) and its own name-resolution step.
 ///
+/// `allowed_stack_names` is injected by `turnEngine.ts`'s `executeToolCall`
+/// on EVERY call (never left to the model to supply — same treatment as
+/// `checkpoint_id`/`turn_id` on the mutating tools) with this session's
+/// actual attached-stack names, so `resolve_search_stack_ids` above always
+/// scopes to them regardless of what (if anything) the model itself passed
+/// for `stack`. `rename_all = "snake_case"` (like `tool_write_file`/
+/// `tool_edit_file`/`tool_run_shell` in `tools.rs`) so `max_results`/
+/// `allowed_stack_names` bind correctly — their arguments arrive with
+/// snake_case keys from the model's tool call (`max_results`) or from
+/// `executeToolCall`'s own injection (`allowed_stack_names`), and without
+/// this attribute Tauri's default camelCase matching would silently fail to
+/// bind either one (see `tools.rs`'s doc comments on the same attribute for
+/// why a mismatch here fails silent, not loud).
+///
 /// Deliberately **not** permission-gated: like `tool_read_file`/`tool_glob`/
 /// `tool_grep` (see `tools.rs`), this never calls
 /// `permissions::request_permission`, so it is entirely unaffected by
@@ -1091,19 +1640,26 @@ fn resolve_search_stack_ids(registry: &[KnowledgeStack], stack: Option<&str>) ->
 /// `edit_file`/`run_shell`. A read-only lookup over user-selected local
 /// files needs no confirmation, exactly like the other read-only tools it's
 /// modeled on.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tool_search_docs(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     query: String,
     stack: Option<String>,
     max_results: Option<u32>,
+    allowed_stack_names: Option<Vec<String>>,
 ) -> Result<Vec<StackQueryResult>, String> {
     let base = stacks_base_dir(&app)?;
     let registry = load_registry(&base)?;
-    let stack_ids = resolve_search_stack_ids(&registry, stack.as_deref())?;
+    // Always `Some(...)` here (an empty `Vec` when the caller sent nothing),
+    // never `None` — see this function's and `resolve_search_stack_ids`'s doc
+    // comments for why the desktop app must fail closed (scope to nothing)
+    // rather than fail open (scope to everything) if this ever arrives
+    // unset.
+    let allowed = allowed_stack_names.unwrap_or_default();
+    let stack_ids = resolve_search_stack_ids(&registry, Some(&allowed), stack.as_deref())?;
     let k = max_results.unwrap_or(DEFAULT_QUERY_K as u32) as usize;
-    query_impl(&app, state.inner(), &stack_ids, &query, k).await
+    query_impl(&base, state.inner(), &stack_ids, &query, k).await
 }
 
 #[cfg(test)]
@@ -1338,17 +1894,17 @@ mod tests {
         assert!(err.contains("reindex required"), "unexpected error: {err}");
     }
 
-    // --- index cancellation via Notify ---
+    // --- index cancellation via CancellationToken ---
 
     #[tokio::test]
-    async fn select_on_notify_short_circuits_a_pending_future() {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = notify.clone();
+    async fn select_on_cancellation_token_short_circuits_a_pending_future() {
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
 
         // Signal cancellation shortly after this task starts waiting.
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            notify_clone.notify_waiters();
+            token_clone.cancel();
         });
 
         let long_running = async {
@@ -1358,11 +1914,32 @@ mod tests {
 
         let cancelled = tokio::select! {
             biased;
-            _ = notify.notified() => true,
+            _ = token.cancelled() => true,
             _ = long_running => false,
         };
 
-        assert!(cancelled, "notify_waiters() must short-circuit the pending select! before the long future completes");
+        assert!(cancelled, "cancel() must short-circuit the pending select! before the long future completes");
+    }
+
+    /// The actual bug `tokio::sync::Notify::notify_waiters()` had (see
+    /// `reindex_impl`'s doc comment): a cancel signal sent before anyone is
+    /// awaiting it is silently lost, so a later `select!` on a freshly
+    /// created `.notified()` future never sees it. `CancellationToken` fixes
+    /// this by persisting the cancelled state — this test would FAIL if
+    /// `cancel()`/`cancelled()` had `Notify`'s fire-and-forget semantics
+    /// instead.
+    #[tokio::test]
+    async fn cancellation_token_short_circuits_even_when_cancelled_before_anyone_is_waiting() {
+        let token = CancellationToken::new();
+        token.cancel(); // Cancelled BEFORE anything ever awaits it.
+
+        let cancelled = tokio::select! {
+            biased;
+            _ = token.cancelled() => true,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => false,
+        };
+
+        assert!(cancelled, "a token cancelled before any waiter existed must still short-circuit a later select!");
     }
 
     // --- registry CRUD ---
@@ -1440,14 +2017,14 @@ mod tests {
     #[test]
     fn resolve_search_stack_ids_matches_named_stack_case_insensitively() {
         let registry = vec![test_stack("Docs", true), test_stack("Notes", true)];
-        let ids = resolve_search_stack_ids(&registry, Some("  docs  ")).unwrap();
+        let ids = resolve_search_stack_ids(&registry, None, Some("  docs  ")).unwrap();
         assert_eq!(ids, vec!["id-Docs".to_string()]);
     }
 
     #[test]
     fn resolve_search_stack_ids_errors_for_an_unknown_name() {
         let registry = vec![test_stack("Docs", true)];
-        let err = resolve_search_stack_ids(&registry, Some("Nonexistent")).unwrap_err();
+        let err = resolve_search_stack_ids(&registry, None, Some("Nonexistent")).unwrap_err();
         assert!(err.contains("Nonexistent"), "unexpected error: {err}");
     }
 
@@ -1457,14 +2034,14 @@ mod tests {
         // `query_impl` (not this function) is what surfaces "has not been
         // indexed yet", so that message stays in exactly one place.
         let registry = vec![test_stack("Docs", false)];
-        let ids = resolve_search_stack_ids(&registry, Some("Docs")).unwrap();
+        let ids = resolve_search_stack_ids(&registry, None, Some("Docs")).unwrap();
         assert_eq!(ids, vec!["id-Docs".to_string()]);
     }
 
     #[test]
     fn resolve_search_stack_ids_defaults_to_every_indexed_stack_when_no_name_given() {
         let registry = vec![test_stack("Docs", true), test_stack("Notes", false), test_stack("Wiki", true)];
-        let mut ids = resolve_search_stack_ids(&registry, None).unwrap();
+        let mut ids = resolve_search_stack_ids(&registry, None, None).unwrap();
         ids.sort();
         assert_eq!(ids, vec!["id-Docs".to_string(), "id-Wiki".to_string()]);
     }
@@ -1472,13 +2049,539 @@ mod tests {
     #[test]
     fn resolve_search_stack_ids_errors_when_nothing_is_indexed_and_no_name_given() {
         let registry = vec![test_stack("Docs", false)];
-        let err = resolve_search_stack_ids(&registry, None).unwrap_err();
+        let err = resolve_search_stack_ids(&registry, None, None).unwrap_err();
         assert!(err.contains("No indexed"), "unexpected error: {err}");
     }
 
     #[test]
     fn resolve_search_stack_ids_errors_on_an_empty_registry_with_no_name_given() {
         let registry: Vec<KnowledgeStack> = Vec::new();
-        assert!(resolve_search_stack_ids(&registry, None).is_err());
+        assert!(resolve_search_stack_ids(&registry, None, None).is_err());
+    }
+
+    // --- resolve_search_stack_ids allow-list scoping (privacy fix) ---
+
+    #[test]
+    fn resolve_search_stack_ids_default_sweep_is_scoped_to_the_allow_list_only() {
+        let registry = vec![test_stack("Work Docs", true), test_stack("Diary", true), test_stack("Wiki", true)];
+        let allowed = vec!["Work Docs".to_string()];
+        let ids = resolve_search_stack_ids(&registry, Some(&allowed), None).unwrap();
+        // "Diary" and "Wiki" are indexed too, but NOT in the allow list — an
+        // omitted `stack` argument must never sweep them in.
+        assert_eq!(ids, vec!["id-Work Docs".to_string()]);
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_explicit_name_outside_the_allow_list_is_rejected() {
+        let registry = vec![test_stack("Work Docs", true), test_stack("Diary", true)];
+        let allowed = vec!["Work Docs".to_string()];
+        // The model (or a CLI caller) naming a real, indexed stack that just
+        // isn't in scope must still be refused — explicit naming must never
+        // bypass the allow list.
+        let err = resolve_search_stack_ids(&registry, Some(&allowed), Some("Diary")).unwrap_err();
+        assert!(err.contains("Diary"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_empty_allow_list_matches_nothing() {
+        let registry = vec![test_stack("Docs", true)];
+        // An empty allow list (a session with nothing attached) must fail
+        // closed — scope to nothing — not fail open to the whole registry.
+        assert!(resolve_search_stack_ids(&registry, Some(&[]), None).is_err());
+        assert!(resolve_search_stack_ids(&registry, Some(&[]), Some("Docs")).is_err());
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_no_allow_list_is_unrestricted() {
+        // `None` (used by `lm-cli` when no `--stack` was given at all) keeps
+        // the pre-fix "search the whole registry" behavior.
+        let registry = vec![test_stack("Docs", true), test_stack("Notes", true)];
+        let mut ids = resolve_search_stack_ids(&registry, None, None).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["id-Docs".to_string(), "id-Notes".to_string()]);
+    }
+
+    // --- query_impl partial-failure handling (partition_indexed_stacks) ---
+
+    #[test]
+    fn partition_indexed_stacks_errors_immediately_for_an_unknown_id() {
+        let registry = vec![test_stack("Docs", true)];
+        let err = partition_indexed_stacks(&registry, &["no-such-id".to_string()]).unwrap_err();
+        assert!(err.contains("no-such-id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn partition_indexed_stacks_errors_when_every_requested_stack_is_unindexed() {
+        let registry = vec![test_stack("Docs", false), test_stack("Notes", false)];
+        let ids = vec!["id-Docs".to_string(), "id-Notes".to_string()];
+        let err = partition_indexed_stacks(&registry, &ids).unwrap_err();
+        assert!(err.contains("Docs") && err.contains("Notes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn partition_indexed_stacks_skips_unindexed_siblings_instead_of_aborting() {
+        // The regression this guards: a mixed indexed+unindexed request must
+        // return just the indexed ones, not discard everything the moment it
+        // hits one unindexed stack among several — see `query_impl`'s doc
+        // comment.
+        let registry = vec![test_stack("Docs", true), test_stack("Notes", false), test_stack("Wiki", true)];
+        let ids = vec!["id-Docs".to_string(), "id-Notes".to_string(), "id-Wiki".to_string()];
+        let indexed = partition_indexed_stacks(&registry, &ids).unwrap();
+        let mut names: Vec<&str> = indexed.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["Docs", "Wiki"]);
+    }
+
+    #[test]
+    fn partition_indexed_stacks_returns_everything_when_all_are_indexed() {
+        let registry = vec![test_stack("Docs", true), test_stack("Wiki", true)];
+        let ids = vec!["id-Docs".to_string(), "id-Wiki".to_string()];
+        let indexed = partition_indexed_stacks(&registry, &ids).unwrap();
+        assert_eq!(indexed.len(), 2);
+    }
+
+    // --- stack-directory staging + atomic swap ---
+
+    #[test]
+    fn swap_stack_dir_replaces_the_live_directory_atomically() {
+        let base = TempDir::new("swap_replace");
+        let stack_id = "swap-test";
+        let live_dir = base.path.join(stack_id);
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::write(live_dir.join("chunks.jsonl"), "old").unwrap();
+
+        let staging_dir = staging_dir_path(&base.path, stack_id);
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(staging_dir.join("chunks.jsonl"), "new").unwrap();
+
+        swap_stack_dir(&base.path, stack_id, &staging_dir).unwrap();
+
+        assert_eq!(std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(), "new");
+        assert!(!staging_dir.exists(), "the staging dir must be consumed by the swap");
+        assert!(!backup_dir_path(&base.path, stack_id).exists(), "the backup dir must be cleaned up on success");
+    }
+
+    #[test]
+    fn swap_stack_dir_works_with_no_previous_directory() {
+        let base = TempDir::new("swap_first_time");
+        let stack_id = "swap-first";
+        let staging_dir = staging_dir_path(&base.path, stack_id);
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(staging_dir.join("chunks.jsonl"), "content").unwrap();
+
+        swap_stack_dir(&base.path, stack_id, &staging_dir).unwrap();
+
+        assert_eq!(std::fs::read_to_string(base.path.join(stack_id).join("chunks.jsonl")).unwrap(), "content");
+    }
+
+    #[test]
+    fn recover_stack_dir_restores_the_backup_when_the_live_directory_is_missing() {
+        // Simulates a crash exactly between `swap_stack_dir`'s two renames:
+        // the live directory is gone, but the ".old" backup (the last known-
+        // good, fully-consistent state) is still there.
+        let base = TempDir::new("recover_mid_swap");
+        let stack_id = "recover-test";
+        let backup_dir = backup_dir_path(&base.path, stack_id);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("chunks.jsonl"), "last-good").unwrap();
+
+        recover_stack_dir(&base.path, stack_id);
+
+        let live_dir = base.path.join(stack_id);
+        assert_eq!(std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(), "last-good");
+        assert!(!backup_dir.exists(), "the backup must be consumed by the restore");
+    }
+
+    #[test]
+    fn recover_stack_dir_clears_a_stale_staging_directory() {
+        let base = TempDir::new("recover_stale_staging");
+        let stack_id = "recover-staging";
+        let staging_dir = staging_dir_path(&base.path, stack_id);
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(staging_dir.join("chunks.jsonl"), "half-written").unwrap();
+
+        recover_stack_dir(&base.path, stack_id);
+
+        assert!(!staging_dir.exists(), "a leftover staging dir from an interrupted run must be cleared");
+    }
+
+    #[test]
+    fn recover_stack_dir_is_a_no_op_when_everything_is_already_consistent() {
+        let base = TempDir::new("recover_noop");
+        let stack_id = "recover-clean";
+        let live_dir = base.path.join(stack_id);
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::write(live_dir.join("chunks.jsonl"), "fine").unwrap();
+
+        recover_stack_dir(&base.path, stack_id);
+
+        assert_eq!(std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(), "fine");
+    }
+
+    // --- stale-index false positives (extension/size gate) ---
+
+    #[test]
+    fn source_has_newer_mtime_ignores_a_touched_file_with_a_non_indexable_extension() {
+        let dir = TempDir::new("stale_extension_gate");
+        let indexed_file = dir.path.join("doc.txt");
+        std::fs::write(&indexed_file, "hello").unwrap();
+        let indexed_at = now_ms() + 60_000; // "indexed in the future" relative to doc.txt
+
+        // A non-indexable file (wrong extension) with a genuinely newer
+        // mtime must NOT flip the stale badge — indexing would never look at
+        // it in the first place (see `read_indexable_file`/`ALLOWED_EXTENSIONS`).
+        let image_file = dir.path.join("screenshot.png");
+        std::fs::write(&image_file, [0u8; 16]).unwrap();
+
+        assert!(
+            !source_has_newer_mtime(&dir.path, indexed_at),
+            "a touched file indexing would skip by extension must not count as stale"
+        );
+    }
+
+    #[test]
+    fn source_has_newer_mtime_ignores_an_oversized_touched_file() {
+        let dir = TempDir::new("stale_size_gate");
+        let indexed_file = dir.path.join("doc.txt");
+        std::fs::write(&indexed_file, "hello").unwrap();
+        let indexed_at = now_ms() + 60_000;
+
+        // An indexable-extension file that's over MAX_FILE_BYTES must also
+        // be excluded — `read_indexable_file` would skip it too.
+        let huge_file = dir.path.join("huge.txt");
+        std::fs::write(&huge_file, vec![b'x'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
+
+        assert!(
+            !source_has_newer_mtime(&dir.path, indexed_at),
+            "a touched file over the size cap must not count as stale"
+        );
+    }
+
+    #[test]
+    fn source_has_newer_mtime_still_flags_a_genuinely_indexable_change() {
+        let dir = TempDir::new("stale_real_change");
+        std::fs::write(dir.path.join("doc.txt"), "hello").unwrap();
+        let indexed_at = now_ms();
+        // Touch the file with fresh content strictly after `indexed_at`.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(dir.path.join("doc.txt"), "hello again, changed").unwrap();
+
+        assert!(
+            source_has_newer_mtime(&dir.path, indexed_at),
+            "a real change to an indexable file must still flag staleness"
+        );
+    }
+
+    // --- incremental reindex planning (slice 4) ---
+
+    fn plan_test_stack(dim: u32) -> KnowledgeStack {
+        KnowledgeStack {
+            id: "plan-test".to_string(),
+            name: "Plan Test".to_string(),
+            sources: Vec::new(),
+            embedding: test_spec(dim),
+            chunk_chars: DEFAULT_CHUNK_CHARS,
+            chunk_overlap: DEFAULT_CHUNK_OVERLAP,
+            indexed_at: Some(1),
+            chunk_count: 0,
+        }
+    }
+
+    #[test]
+    fn plan_reindex_skips_reembedding_unchanged_files_but_reembeds_changed_and_new_ones() {
+        let stack = plan_test_stack(4);
+        let a_content = "alpha content";
+        let a_hash = sha256_hex(a_content);
+        let old_chunks = vec![ChunkMeta {
+            source_path: "a.txt".to_string(),
+            ordinal: 0,
+            text: a_content.to_string(),
+            content_hash: a_hash.clone(),
+            heading: None,
+        }];
+        let old_vectors_flat = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let old_file_index: HashMap<String, String> =
+            [("a.txt".to_string(), a_hash.clone()), ("b.txt".to_string(), "stale-hash".to_string())]
+                .into_iter()
+                .collect();
+
+        // Current files: a.txt unchanged, b.txt changed (hash mismatch),
+        // c.txt brand new (not in old_file_index at all).
+        let files = vec![
+            ("a.txt".to_string(), a_content.to_string()),
+            ("b.txt".to_string(), "beta content, now different".to_string()),
+            ("c.txt".to_string(), "gamma content".to_string()),
+        ];
+
+        let mut progress_calls = 0;
+        let plan = plan_reindex(
+            &stack,
+            &files,
+            &old_file_index,
+            &old_chunks,
+            Some((4, 1, &old_vectors_flat)),
+            &CancellationToken::new(),
+            |_, _, _| progress_calls += 1,
+        );
+
+        assert_eq!(progress_calls, 3, "on_file_done must be called once per file");
+
+        // a.txt's row was carried over verbatim — not queued for embedding.
+        let a_idx = plan.all_chunks.iter().position(|c| c.source_path == "a.txt").expect("a.txt chunk present");
+        assert!(!plan.to_embed_indices.contains(&a_idx), "unchanged file must not be queued for re-embedding");
+        assert_eq!(plan.vector_slots[a_idx], Some(vec![1.0, 0.0, 0.0, 0.0]));
+
+        // b.txt (changed) and c.txt (new) must both be queued for embedding.
+        let embedded_paths: Vec<&str> =
+            plan.to_embed_indices.iter().map(|&i| plan.all_chunks[i].source_path.as_str()).collect();
+        assert!(embedded_paths.contains(&"b.txt"));
+        assert!(embedded_paths.contains(&"c.txt"));
+        assert_eq!(plan.to_embed_texts.len(), embedded_paths.len(), "exactly one chunk per short changed/new file here");
+
+        // The key assertion this test exists for: re-embedding work only
+        // covers the changed/new files, not the whole stack — i.e. the
+        // "re-embed call count" actually shrinks when most files are
+        // unchanged, rather than every reindex re-embedding everything.
+        assert!(
+            plan.to_embed_texts.len() < plan.all_chunks.len(),
+            "unchanged file's chunk must be skipped, not re-embedded"
+        );
+
+        // new_file_index reflects every CURRENT file's hash, including ones
+        // absent from the old index.
+        assert_eq!(plan.new_file_index.get("a.txt"), Some(&a_hash));
+        assert!(plan.new_file_index.contains_key("b.txt"));
+        assert!(plan.new_file_index.contains_key("c.txt"));
+    }
+
+    #[test]
+    fn plan_reindex_drops_rows_for_sources_no_longer_present() {
+        let stack = plan_test_stack(4);
+        let old_chunks = vec![ChunkMeta {
+            source_path: "deleted.txt".to_string(),
+            ordinal: 0,
+            text: "gone".to_string(),
+            content_hash: sha256_hex("gone"),
+            heading: None,
+        }];
+        let old_vectors_flat = vec![0.5_f32, 0.5, 0.5, 0.5];
+        let old_file_index: HashMap<String, String> =
+            [("deleted.txt".to_string(), sha256_hex("gone"))].into_iter().collect();
+
+        // `deleted.txt` no longer appears in the current file list at all —
+        // its source was removed, or the file itself was deleted.
+        let files = vec![("kept.txt".to_string(), "still here".to_string())];
+
+        let plan = plan_reindex(
+            &stack,
+            &files,
+            &old_file_index,
+            &old_chunks,
+            Some((4, 1, &old_vectors_flat)),
+            &CancellationToken::new(),
+            |_, _, _| {},
+        );
+
+        assert!(
+            !plan.all_chunks.iter().any(|c| c.source_path == "deleted.txt"),
+            "a no-longer-present source's rows must be dropped, not carried over"
+        );
+        assert!(plan.all_chunks.iter().any(|c| c.source_path == "kept.txt"));
+    }
+
+    #[test]
+    fn plan_reindex_falls_back_to_full_reembed_when_old_vectors_dim_mismatches() {
+        let stack = plan_test_stack(4); // stack now expects 4 dims…
+        let content = "same content";
+        let hash = sha256_hex(content);
+        let old_chunks = vec![ChunkMeta {
+            source_path: "a.txt".to_string(),
+            ordinal: 0,
+            text: content.to_string(),
+            content_hash: hash.clone(),
+            heading: None,
+        }];
+        // …but the previous vectors.bin was written for an 8-dim model —
+        // an embedding-spec change since the last index.
+        let old_vectors_flat = vec![0.0_f32; 8];
+        let old_file_index: HashMap<String, String> = [("a.txt".to_string(), hash)].into_iter().collect();
+        let files = vec![("a.txt".to_string(), content.to_string())];
+
+        let plan = plan_reindex(
+            &stack,
+            &files,
+            &old_file_index,
+            &old_chunks,
+            Some((8, 1, &old_vectors_flat)),
+            &CancellationToken::new(),
+            |_, _, _| {},
+        );
+
+        assert_eq!(
+            plan.to_embed_texts.len(),
+            1,
+            "a dim mismatch must force re-embedding even for an otherwise-unchanged file"
+        );
+        assert!(plan.vector_slots.iter().all(|v| v.is_none()));
+    }
+
+    #[test]
+    fn plan_reindex_with_no_previous_index_queues_every_file_for_embedding() {
+        let stack = plan_test_stack(4);
+        let files = vec![("a.txt".to_string(), "alpha".to_string()), ("b.txt".to_string(), "beta".to_string())];
+
+        let plan = plan_reindex(&stack, &files, &HashMap::new(), &[], None, &CancellationToken::new(), |_, _, _| {});
+
+        assert_eq!(plan.to_embed_texts.len(), plan.all_chunks.len());
+        assert!(plan.vector_slots.iter().all(|v| v.is_none()));
+    }
+
+    #[test]
+    fn plan_reindex_stops_early_once_cancelled() {
+        let stack = plan_test_stack(4);
+        let files = vec![
+            ("a.txt".to_string(), "alpha".to_string()),
+            ("b.txt".to_string(), "beta".to_string()),
+            ("c.txt".to_string(), "gamma".to_string()),
+        ];
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut progress_calls = 0;
+        let plan = plan_reindex(&stack, &files, &HashMap::new(), &[], None, &cancel, |_, _, _| progress_calls += 1);
+
+        assert_eq!(progress_calls, 0, "an already-cancelled token must stop before the first file is processed");
+        assert!(plan.all_chunks.is_empty());
+    }
+
+    // --- file_index.json roundtrip ---
+
+    #[test]
+    fn file_index_roundtrips_and_defaults_to_empty_when_missing() {
+        let dir = TempDir::new("file_index");
+        assert!(read_file_index(&dir.path).is_empty(), "missing file_index.json must default to empty, not error");
+
+        let mut index = HashMap::new();
+        index.insert("a.txt".to_string(), "hash-a".to_string());
+        index.insert("b.txt".to_string(), "hash-b".to_string());
+        write_file_index(&dir.path, &index).unwrap();
+
+        let read_back = read_file_index(&dir.path);
+        assert_eq!(read_back, index);
+    }
+
+    // --- stale-index badge ---
+
+    #[test]
+    fn is_stale_impl_is_false_for_a_never_indexed_stack() {
+        let mut stack = test_stack("Docs", false);
+        stack.sources = vec![StackSource { path: "/nonexistent/path/at/all".to_string(), kind: SourceKind::File }];
+        assert!(!is_stale_impl(&stack), "a stack with no indexed_at is never stale");
+    }
+
+    #[test]
+    fn is_stale_impl_is_true_when_a_source_file_is_missing() {
+        let mut stack = test_stack("Docs", true);
+        stack.indexed_at = Some(now_ms());
+        stack.sources = vec![StackSource { path: "/definitely/does/not/exist.txt".to_string(), kind: SourceKind::File }];
+        assert!(is_stale_impl(&stack), "an unreadable source counts as stale");
+    }
+
+    #[test]
+    fn is_stale_impl_is_false_when_the_source_file_predates_indexed_at() {
+        let dir = TempDir::new("stale_check_false");
+        let file_path = dir.path.join("doc.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let mut stack = test_stack("Docs", true);
+        // Indexed "in the future" relative to the file we just wrote.
+        stack.indexed_at = Some(now_ms() + 60_000);
+        stack.sources = vec![StackSource { path: file_path.to_string_lossy().to_string(), kind: SourceKind::File }];
+
+        assert!(!is_stale_impl(&stack));
+    }
+
+    #[test]
+    fn is_stale_impl_is_true_when_the_source_file_was_modified_after_indexed_at() {
+        let dir = TempDir::new("stale_check_true");
+        let file_path = dir.path.join("doc.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let mut stack = test_stack("Docs", true);
+        // Indexed "in the past" relative to the file we just wrote.
+        stack.indexed_at = Some(0);
+        stack.sources = vec![StackSource { path: file_path.to_string_lossy().to_string(), kind: SourceKind::File }];
+
+        assert!(is_stale_impl(&stack));
+    }
+
+    // --- PDF extraction (feature-gated, slice 4) ---
+
+    /// Hand-assembled minimal single-page PDF ("Hello World" text drawn via
+    /// a content stream) with a byte-accurate xref table — built
+    /// programmatically (rather than as a checked-in binary fixture) so the
+    /// exact object offsets always match the bytes actually written.
+    #[cfg(feature = "pdf-extraction")]
+    fn minimal_pdf_fixture_bytes() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        let mut offsets = [0usize; 6]; // 1-indexed; offsets[0] unused
+
+        offsets[1] = buf.len();
+        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offsets[2] = buf.len();
+        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offsets[3] = buf.len();
+        buf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> \
+/MediaBox [0 0 612 792] /Contents 5 0 R >>\nendobj\n",
+        );
+
+        offsets[4] = buf.len();
+        buf.extend_from_slice(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+
+        let stream_content = b"BT /F1 24 Tf 100 700 Td (Hello World) Tj ET";
+        offsets[5] = buf.len();
+        buf.extend_from_slice(format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_content.len()).as_bytes());
+        buf.extend_from_slice(stream_content);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = buf.len();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            xref.push_str(&format!("{:010} 00000 n \n", offset));
+        }
+        buf.extend_from_slice(xref.as_bytes());
+        buf.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\n");
+        buf.extend_from_slice(format!("startxref\n{xref_offset}\n").as_bytes());
+        buf.extend_from_slice(b"%%EOF");
+
+        buf
+    }
+
+    #[cfg(feature = "pdf-extraction")]
+    #[test]
+    fn read_indexable_pdf_extracts_text_from_a_minimal_fixture() {
+        let dir = TempDir::new("pdf_fixture");
+        let pdf_path = dir.path.join("fixture.pdf");
+        std::fs::write(&pdf_path, minimal_pdf_fixture_bytes()).unwrap();
+
+        let (path, text) = read_indexable_pdf(&pdf_path).expect("a well-formed minimal PDF must extract text");
+        assert!(path.ends_with("fixture.pdf"));
+        assert!(text.contains("Hello World"), "unexpected extracted text: {text:?}");
+    }
+
+    #[cfg(feature = "pdf-extraction")]
+    #[test]
+    fn read_indexable_file_routes_pdf_extension_through_the_pdf_extractor() {
+        let dir = TempDir::new("pdf_via_read_indexable_file");
+        let pdf_path = dir.path.join("doc.pdf");
+        std::fs::write(&pdf_path, minimal_pdf_fixture_bytes()).unwrap();
+
+        let (_, text) = read_indexable_file(&pdf_path).expect("read_indexable_file must handle .pdf");
+        assert!(text.contains("Hello World"));
     }
 }

@@ -1565,7 +1565,7 @@ async function runAgentTurnBody(
       // (several providers reject such a history on the next turn).
       const resultContent = signal?.aborted
         ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation);
+        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames);
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,

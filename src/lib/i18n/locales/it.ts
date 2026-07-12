@@ -569,6 +569,7 @@ export const it: Record<string, string> = {
   "KnowledgePanel.phaseDone": "Indicizzato",
   "KnowledgePanel.neverIndexed": "Non ancora indicizzato",
   "KnowledgePanel.indexedAt": "Indicizzato {{when}} · {{count}} sezioni",
+  "KnowledgePanel.staleIndexBadge": "Richiede reindicizzazione",
   "KnowledgePanel.testSearchHeading": "Ricerca di prova",
   "KnowledgePanel.notIndexedForSearch": "Indicizza questo stack prima di cercare.",
   "KnowledgePanel.searchPlaceholder": "Cerca in questo stack…",

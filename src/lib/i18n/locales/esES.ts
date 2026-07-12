@@ -569,6 +569,7 @@ export const esES: Record<string, string> = {
   "KnowledgePanel.phaseDone": "Indexado",
   "KnowledgePanel.neverIndexed": "Todavía no indexado",
   "KnowledgePanel.indexedAt": "Indexado {{when}} · {{count}} fragmentos",
+  "KnowledgePanel.staleIndexBadge": "Requiere reindexar",
   "KnowledgePanel.testSearchHeading": "Búsqueda de prueba",
   "KnowledgePanel.notIndexedForSearch": "Indexa este stack antes de buscar.",
   "KnowledgePanel.searchPlaceholder": "Buscar en este stack…",

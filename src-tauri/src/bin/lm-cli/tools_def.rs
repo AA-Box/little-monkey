@@ -195,6 +195,39 @@ pub fn present_plan_tool_def() -> serde_json::Value {
     })
 }
 
+/// The agent's read-only knowledge-stack retrieval tool (RAG design doc
+/// slice 4, `lm-cli` parity) — a Rust port of `src/lib/tools.ts`'s
+/// `search_docs` `ToolDef`. Like [`present_plan_tool_def`] above,
+/// deliberately excluded from [`tool_definitions`]'s base array (and from
+/// [`merged_tool_definitions`]'s output): `agent.rs::run_tool_loop` only
+/// appends it when at least one `--stack <name>` was given on the command
+/// line, mirroring the desktop app's `buildTools(attachedStackNames)` (the
+/// tool is only offered once a stack is actually attached). `stack_names`
+/// is embedded directly into the description — same "the model sees exactly
+/// what's searchable" property the GUI's per-turn tool list has.
+pub fn search_docs_tool_def(stack_names: &[String]) -> serde_json::Value {
+    let names = stack_names.join(", ");
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": format!(
+                "Search the attached knowledge stack(s) ({names}) for passages relevant to a query. Returns the top matching chunks, each with its source file path and a relevance score. Cite source paths when you use a result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The natural-language search query." },
+                    "stack": { "type": "string", "description": "Optional stack name to restrict the search to; defaults to searching every attached stack." },
+                    "max_results": { "type": "integer", "description": "Maximum number of results to return (default 6)." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// Composite `mcp__<serverId>__<toolName>` tool name mapped to the exact
 /// server id and tool name it was built from, returned by
 /// [`merged_tool_definitions`] alongside the tool defs themselves. Mirrors
@@ -333,6 +366,24 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t["function"]["name"] == "present_plan"));
+    }
+
+    #[test]
+    fn search_docs_tool_def_embeds_stack_names_and_is_excluded_from_the_base_list() {
+        let names = vec!["Docs".to_string(), "Notes".to_string()];
+        let def = search_docs_tool_def(&names);
+        assert_eq!(def["function"]["name"], "search_docs");
+        assert!(def["function"]["description"].as_str().unwrap().contains("Docs, Notes"));
+        let required = def["function"]["parameters"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "query"));
+
+        // Only ever appended per-turn by `agent.rs::run_tool_loop` when
+        // `--stack` was given — never part of the base list.
+        assert!(!tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "search_docs"));
     }
 
     #[tokio::test]

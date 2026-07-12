@@ -569,6 +569,7 @@ export const hi: Record<string, string> = {
   "KnowledgePanel.phaseDone": "इंडेक्स हो गया",
   "KnowledgePanel.neverIndexed": "अभी तक इंडेक्स नहीं हुआ",
   "KnowledgePanel.indexedAt": "{{when}} को इंडेक्स किया गया · {{count}} खंड",
+  "KnowledgePanel.staleIndexBadge": "पुनः इंडेक्स आवश्यक",
   "KnowledgePanel.testSearchHeading": "परीक्षण खोज",
   "KnowledgePanel.notIndexedForSearch": "खोजने से पहले इस स्टैक को इंडेक्स करें।",
   "KnowledgePanel.searchPlaceholder": "इस स्टैक में खोजें…",
