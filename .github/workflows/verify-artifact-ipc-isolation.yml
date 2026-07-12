@@ -86,3 +86,11 @@ jobs:
           # usable GUI session entirely.
           VERIFY_ARTIFACT_TIMEOUT_SECS: "60"
           VERIFY_ARTIFACT_DEBUG: "1"
+          # Prior run: binary starts fine, no crash, but the artifact
+          # iframe's script never posts its result back even after 60s —
+          # consistent with the webview creating but never actually
+          # painting/executing JS, a well-known symptom of no GPU/ANGLE
+          # renderer being available on virtualized CI VMs. This is the
+          # documented WebView2 escape hatch for that:
+          # https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--disable-gpu"
