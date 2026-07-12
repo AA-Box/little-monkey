@@ -1,4 +1,4 @@
-//! `lm-cli stacks` subcommand parity, plus the `search_docs` tool's CLI-side
+//! `monkey-cli stacks` subcommand parity, plus the `search_docs` tool's CLI-side
 //! support code (`agent.rs::execute_tool_call` calls [`search_docs`] below).
 //! Reuses `little_monkey_lib::stacks`'s `AppHandle`-free `list_impl`/
 //! `reindex_impl`/`query_impl`/`resolve_search_stack_ids` directly — the same
@@ -13,17 +13,13 @@ use std::path::PathBuf;
 use little_monkey_lib::stacks::{self, KnowledgeStack, StackQueryResult};
 use little_monkey_lib::AppState;
 
-/// Must match `identifier` in `src-tauri/tauri.conf.json` — same hardcoded
-/// convention every other `_cli.rs` module uses.
-const APP_IDENTIFIER: &str = "com.littlemonkey.app";
-
 /// Resolves (creating if necessary) `<app-data>/stacks` — the exact
 /// directory `stacks.rs::stacks_base_dir` resolves via
 /// `AppHandle::path().app_data_dir()`, so a stack created in the desktop
 /// app's Knowledge settings tab is immediately visible here, and a reindex
 /// run from here is immediately visible there.
 pub fn base_dir() -> Option<PathBuf> {
-    let dir = dirs::data_dir()?.join(APP_IDENTIFIER).join("stacks");
+    let dir = little_monkey_lib::app_paths::data_dir()?.join("stacks");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -33,7 +29,7 @@ fn find_by_name(registry: &[KnowledgeStack], name: &str) -> Option<KnowledgeStac
     registry.iter().find(|s| s.name.eq_ignore_ascii_case(trimmed)).cloned()
 }
 
-/// `lm-cli stacks list` — one line per stack: name, source count, chunk
+/// `monkey-cli stacks list` — one line per stack: name, source count, chunk
 /// count/indexed state, and embedding model.
 pub fn list() -> Result<(), String> {
     let base = base_dir().ok_or("Could not resolve the app data directory")?;
@@ -58,7 +54,7 @@ pub fn list() -> Result<(), String> {
     Ok(())
 }
 
-/// `lm-cli stacks reindex <name>` — resolves `name` case-insensitively
+/// `monkey-cli stacks reindex <name>` — resolves `name` case-insensitively
 /// against the registry, then calls `stacks::reindex_impl` directly,
 /// rendering its progress callback to a single `\r`-updating terminal line
 /// (the CLI's equivalent of the desktop app's progress bar, which instead

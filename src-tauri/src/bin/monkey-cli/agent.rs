@@ -28,6 +28,14 @@ use crate::web_cli;
 
 const MAX_ITERATIONS: usize = 25;
 
+/// Prefix of the message pushed to history (and printed) when the
+/// tool-calling loop hits its iteration cap without a final answer — the
+/// loop still returns `Ok(())` in that case (an ordinary, if incomplete,
+/// chat turn), so `task.rs`'s `task run` checks the last history entry
+/// against this prefix to tell "hit the cap" apart from "answered normally"
+/// for its own exit-code discipline (design doc slice 1: exit 3).
+pub(crate) const ITERATION_CAP_MESSAGE_PREFIX: &str = "Stopped after reaching the safety limit of";
+
 /// Cap on how many model/tool round trips a `task`-delegated subagent (see
 /// [`run_subagent_turn`]) may take before it's forced to stop and report
 /// whatever it has — a Rust port of `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS`
@@ -517,7 +525,7 @@ async fn execute_tool_call(
         if profile != CLI_SUBAGENT_PROFILE {
             return serde_json::json!({
                 "error": format!(
-                    "lm-cli only supports the 'explore' subagent profile (got '{profile}') — there are no \
+                    "monkey-cli only supports the 'explore' subagent profile (got '{profile}') — there are no \
                      checkpoints here to safely land a 'code'-profile subagent's mutations into; see \
                      docs/roadmap/p3-subagents.md slice 5."
                 )
@@ -758,7 +766,32 @@ pub async fn run_turn(
     user_text: &str,
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    run_turn_with_max_iterations(client, target, state, perms, history, options, user_text, mcp_entries, attached_stacks, None)
+        .await
+}
+
+/// Same as [`run_turn`], but lets a caller cap the tool-calling loop below
+/// (or, in principle, above) the default [`MAX_ITERATIONS`] — `monkey-cli
+/// task run` uses this to honor a recipe's own `max_iterations` field
+/// (design doc slice 1). `None` behaves exactly like plain `run_turn`.
+/// Returns the checkpoint's recorded files-changed list (empty when no
+/// checkpoint was recorded, e.g. the app-data dir couldn't be resolved) —
+/// `task run --json`'s `files_changed` field (existing callers that only
+/// check `if let Err(e) = ...` are unaffected by this Ok payload).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_with_max_iterations(
+    client: &reqwest::Client,
+    target: &Target,
+    state: &AppState,
+    perms: &mut TerminalPermissions,
+    history: &mut Vec<serde_json::Value>,
+    options: &chat::ChatOptions,
+    user_text: &str,
+    mcp_entries: &[McpServerEntry],
+    attached_stacks: &[String],
+    max_iterations_override: Option<usize>,
+) -> Result<Vec<String>, String> {
     if let Some(system) = &options.system {
         apply_system_prompt(history, system);
     }
@@ -784,19 +817,19 @@ pub async fn run_turn(
         checkpoint_id.as_deref(),
         mcp_entries,
         attached_stacks,
+        max_iterations_override,
     )
     .await;
 
-    if let Some(id) = &checkpoint_id {
-        let _ = checkpoints::end_impl(state, id);
-    }
+    let files_changed = checkpoint_id.as_deref().and_then(|id| checkpoints::end_impl(state, id).ok()).map(|summary| summary.files).unwrap_or_default();
 
-    result
+    result.map(|()| files_changed)
 }
 
 /// The tool-calling loop itself, factored out of `run_turn` so the
 /// checkpoint's `end_impl` above can run unconditionally regardless of how
 /// this returns (a model error via `?`, the safety cap, or a plain answer).
+#[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
     client: &reqwest::Client,
     target: &Target,
@@ -807,6 +840,7 @@ async fn run_tool_loop(
     checkpoint_id: Option<&str>,
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
+    max_iterations_override: Option<usize>,
 ) -> Result<(), String> {
     // Built once per turn (mirroring `agentLoop.ts`'s two `attemptStream`
     // call sites recomputing `mcpToolDefs()` per turn, not per streaming
@@ -851,7 +885,8 @@ async fn run_tool_loop(
     // `agentLoop.ts`'s `verifyRound`/`settings.verifyMaxRounds`.
     let mut verify_round: u32 = 0;
 
-    for _ in 0..MAX_ITERATIONS {
+    let max_iterations = max_iterations_override.unwrap_or(MAX_ITERATIONS);
+    for _ in 0..max_iterations {
         let result = chat::stream_turn(client, target, history.as_slice(), &tools_vec, options).await?;
         println!();
         if let (true, Some(metrics)) = (options.verbose, &result.metrics) {
@@ -958,9 +993,8 @@ async fn run_tool_loop(
         }
     }
 
-    let message = format!(
-        "Stopped after reaching the safety limit of {MAX_ITERATIONS} tool-calling iterations without a final answer."
-    );
+    let message =
+        format!("{ITERATION_CAP_MESSAGE_PREFIX} {max_iterations} tool-calling iterations without a final answer.");
     history.push(serde_json::json!({ "role": "assistant", "content": message }));
     println!("\n{message}");
 

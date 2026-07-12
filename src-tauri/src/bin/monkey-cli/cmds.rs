@@ -1,4 +1,4 @@
-//! Implementations of lm-cli's Ollama-parity subcommands (list/ps/pull/rm/
+//! Implementations of monkey-cli's Ollama-parity subcommands (list/ps/pull/rm/
 //! cp/show/stop/push/create): terminal rendering — aligned tables, rewriting
 //! progress lines — on top of the `ollama_api` client, plus passthroughs to
 //! the `ollama` binary for the account/daemon commands the HTTP API doesn't
@@ -143,7 +143,7 @@ pub async fn create(
 pub fn passthrough(subcommand: &str) -> Result<(), String> {
     let status = std::process::Command::new("ollama").arg(subcommand).status().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            format!("`lm-cli {subcommand}` requires the ollama binary, which was not found on PATH")
+            format!("`monkey-cli {subcommand}` requires the ollama binary, which was not found on PATH")
         } else {
             format!("Failed to run `ollama {subcommand}`: {e}")
         }

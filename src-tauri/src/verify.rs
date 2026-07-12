@@ -147,7 +147,7 @@ fn resolve_root_key(state: &AppState, workspace_path: Option<&str>) -> Result<St
 /// disk, given an already-resolved `configs_path` and the workspace's
 /// canonicalized `root` — the same key shape `resolve_root_key` produces
 /// (`root.to_string_lossy()`), just without needing an `AppState`/`AppHandle`
-/// to derive either from. `lm-cli` (`verify_cli.rs`) computes `configs_path`
+/// to derive either from. `monkey-cli` (`verify_cli.rs`) computes `configs_path`
 /// via the same hardcoded-identifier app-data convention `providers_cli.rs`
 /// uses for `providers.json`, so both binaries read the exact same
 /// `verify_configs.json` the desktop app's Settings > Verification tab
@@ -188,7 +188,7 @@ fn cap_output(s: String) -> String {
 /// this module's doc comment for why verify commands are deliberately never
 /// permission-gated) and minus checkpoint recording (verify commands aren't
 /// model tool calls, so there's no `checkpoint_id` to thread through).
-/// `AppHandle`-free so `lm-cli` (a later slice) can call this directly, the
+/// `AppHandle`-free so `monkey-cli` (a later slice) can call this directly, the
 /// same `begin_impl`/`end_impl` split `checkpoints.rs` uses.
 ///
 /// Mirrors `tool_run_shell`'s `tokio::select!` over: the command completing,
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(round_tripped.timeout_secs, Some(45));
     }
 
-    /// `lm-cli` (`verify_cli.rs`) is the only consumer of this — it never
+    /// `monkey-cli` (`verify_cli.rs`) is the only consumer of this — it never
     /// has an `AppState`/`AppHandle` to derive `resolve_root_key` through,
     /// only a plain `configs_path` and its own canonicalized workspace root.
     #[test]

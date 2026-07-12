@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  BarChart3,
   BookOpen,
   Cloud,
   Cpu,
-  Globe,
+  Keyboard,
+  ListChecks,
   MessageSquare,
   Plug,
   ScrollText,
@@ -24,9 +26,11 @@ import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { McpPanel } from "./McpPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
-import { WebPanel } from "./WebPanel";
 import { ApiServerPanel } from "./ApiServerPanel";
 import { KnowledgePanel } from "./KnowledgePanel";
+import { KeyboardShortcutsPanel } from "./KeyboardShortcutsPanel";
+import { ScheduledTasksPanel } from "./ScheduledTasksPanel";
+import { UsagePanel } from "./UsagePanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -39,9 +43,12 @@ interface SettingsModalProps {
    * anything else that wants to jump straight to a tab) uses, via App.tsx.
    * Left unset for the normal "open on whatever tab was last active" case. */
   initialTab?: SettingsTab;
+  /** Changes for every deep-link request, including repeated requests for
+   * the same tab while Settings is already open. */
+  initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "web" | "apiserver" | "knowledge";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -52,14 +59,17 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   rules: ScrollText,
   mcp: Plug,
   prompts: MessageSquare,
-  web: Globe,
   apiserver: Terminal,
+  shortcuts: Keyboard,
+  usage: BarChart3,
+  tasks: ListChecks,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
+  { labelKey: "SettingsModal.groupApplication", ids: ["shortcuts", "usage"] },
   { labelKey: "SettingsModal.groupModels", ids: ["local", "ollama", "providers"] },
-  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["mcp", "prompts", "web", "apiserver"] },
+  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["mcp", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
@@ -71,9 +81,20 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   rules: "SettingsModal.tabRules",
   mcp: "SettingsModal.tabMcp",
   prompts: "SettingsModal.tabPrompts",
-  web: "SettingsModal.tabWeb",
   apiserver: "SettingsModal.tabApiServer",
+  shortcuts: "SettingsModal.tabKeyboardShortcuts",
+  usage: "SettingsModal.tabUsage",
+  tasks: "SettingsModal.tabTasks",
 };
+
+const FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "a[href]",
+  'input:not([type="hidden"]):not([disabled])',
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
 
 /**
  * App-wide Settings: one model-provider surface per tab (local llama.cpp,
@@ -82,13 +103,17 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
  * (`ModelManager`, `OllamaPanel`) so switching tabs is just a render swap,
  * no extra fetching logic here.
  */
-export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps) {
+export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0 }: SettingsModalProps) {
   const refreshProviders = useModelStore((s) => s.refreshProviders);
   const providers = useModelStore((s) => s.providers);
 
   const [tab, setTab] = useState<SettingsTab>("local");
   const [query, setQuery] = useState("");
   const { t } = useT();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   const openrouterProvider = providers.find((p) => p.id === "openrouter");
   const openrouterConnected = openrouterProvider?.has_key ?? false;
@@ -133,29 +158,78 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
   // deep link still lands on the right tab even if the modal already
   // remembers a different one from last time.
   useEffect(() => {
-    if (open && initialTab) setTab(initialTab);
-  }, [open, initialTab]);
+    if (open && initialTab) {
+      setTab(initialTab);
+      setQuery("");
+    }
+  }, [open, initialTab, initialTabRequest]);
 
   useEffect(() => {
     if (!open) return;
+
+    previouslyFocusedRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const focusFrame = requestAnimationFrame(() => {
+      const dialog = dialogRef.current;
+      if (!dialog || dialog.contains(document.activeElement)) return;
+      const preferred = dialog.querySelector<HTMLElement>("[data-settings-autofocus]");
+      (preferred ?? dialog).focus();
+    });
+
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !e.defaultPrevented) {
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== "Tab") return;
+
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (element) => element.tabIndex >= 0 && element.getClientRects().length > 0,
+      );
+      if (focusable.length === 0) {
+        e.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || !dialog.contains(active))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || active === dialog || !dialog.contains(active))) {
+        e.preventDefault();
+        first.focus();
+      }
     }
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose]);
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", handleKeyDown);
+      const previous = previouslyFocusedRef.current;
+      if (previous?.isConnected) previous.focus();
+      previouslyFocusedRef.current = null;
+    };
+  }, [open]);
 
   if (!open) return null;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-modal-title"
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-modal-title"
+        tabIndex={-1}
         className="flex h-[85vh] w-[90vw] max-w-5xl overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
@@ -232,8 +306,10 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
             {tab === "rules" && <RulesMemoryPanel />}
             {tab === "mcp" && <McpPanel />}
             {tab === "prompts" && <PromptLibraryPanel />}
-            {tab === "web" && <WebPanel />}
             {tab === "apiserver" && <ApiServerPanel />}
+            {tab === "shortcuts" && <KeyboardShortcutsPanel />}
+            {tab === "usage" && <UsagePanel />}
+            {tab === "tasks" && <ScheduledTasksPanel />}
           </div>
         </div>
       </div>

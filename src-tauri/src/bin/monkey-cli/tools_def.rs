@@ -196,7 +196,7 @@ pub fn present_plan_tool_def() -> serde_json::Value {
 }
 
 /// The agent's read-only knowledge-stack retrieval tool (RAG design doc
-/// slice 4, `lm-cli` parity) — a Rust port of `src/lib/tools.ts`'s
+/// slice 4, `monkey-cli` parity) — a Rust port of `src/lib/tools.ts`'s
 /// `search_docs` `ToolDef`. Like [`present_plan_tool_def`] above,
 /// deliberately excluded from [`tool_definitions`]'s base array (and from
 /// [`merged_tool_definitions`]'s output): `agent.rs::run_tool_loop` only

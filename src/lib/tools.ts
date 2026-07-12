@@ -315,7 +315,7 @@ export function buildTools(attachedStackNames: string[]): ToolDef[] {
  * entry in `TOOLS`, it has NO `tool_present_plan` counterpart in
  * `src-tauri/src/tools.rs`: `turnEngine.ts`'s `executeToolCall` short-circuits
  * this name before it ever reaches `invoke`. This is an intentional
- * three-way-registry-drift exception (TS tools.ts / Rust tools.rs / lm-cli
+ * three-way-registry-drift exception (TS tools.ts / Rust tools.rs / monkey-cli
  * tools_def.rs normally mirror each other 1:1 — see this module's top
  * doc comment) called out explicitly in the Plan/Act design doc
  * (docs/roadmap/p2-plan-act-safety.md) as a known, accepted risk: a reader

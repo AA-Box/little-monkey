@@ -8,7 +8,7 @@
 //! that module for the terminal-side approve flow.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use little_monkey_lib::permissions::path_risk_floor;
@@ -55,7 +55,7 @@ fn mode_short_circuit(mode: PermissionMode, tool: &str, floored: bool) -> Option
     match mode {
         PermissionMode::Bypass => Some(Ok(())),
         PermissionMode::Plan => Some(Err(format!(
-            "Blocked: lm-cli is in Plan Mode. Describe your plan instead of using {tool} — call the present_plan tool with your proposed plan, then approve it (\"y\" at its prompt) to switch to Act mode before making changes."
+            "Blocked: monkey-cli is in Plan Mode. Describe your plan instead of using {tool} — call the present_plan tool with your proposed plan, then approve it (\"y\" at its prompt) to switch to Act mode before making changes."
         ))),
         // `run_shell` is never auto-approved outside of bypass — same rule as
         // the GUI's `permissions.rs::mode_short_circuit` — so both
@@ -151,6 +151,18 @@ impl TerminalPermissions {
             return Ok(());
         }
 
+        // Fail closed instead of blocking forever when nothing can answer
+        // this prompt: a piped/non-interactive stdin (CI, `task run`, a
+        // recipe invoked from a script) would otherwise hang on
+        // `read_line_blocking` indefinitely, or silently consume stray piped
+        // bytes as if they were a "y". Checked here (after every mode that
+        // can decide without prompting has already had its chance above) so
+        // `bypass`/`acceptEdits`/`auto`/`smart`'s auto-approved calls and
+        // `plan`'s block are completely unaffected by this guard.
+        if !std::io::stdin().is_terminal() {
+            return Err(non_interactive_denial(tool));
+        }
+
         println!("\n--- Permission requested: {tool} ---\n{detail}\n");
         let remember_hint = if tool == "run_shell" { "" } else { " / [s]ession" };
         print!("Allow? [y]es / [N]o{remember_hint}: ");
@@ -167,6 +179,15 @@ impl TerminalPermissions {
             _ => Err("Permission denied".to_string()),
         }
     }
+}
+
+/// Message for the non-interactive-stdin fail-closed guard in
+/// `request_inner`. Factored out (like `mode_short_circuit`) so its content
+/// is directly testable without needing to fake `IsTerminal` in a unit test.
+fn non_interactive_denial(tool: &str) -> String {
+    format!(
+        "Permission denied: {tool} requires an interactive terminal to approve, but stdin is not a TTY (non-interactive or piped input). Re-run in an interactive shell, or choose a permission mode that never prompts for this tool (bypass, or acceptEdits/auto for write_file/edit_file/remember)."
+    )
 }
 
 /// Blocks on a line of stdin off the async executor's blocking pool. `pub(crate)`
@@ -261,6 +282,20 @@ mod tests {
     fn manual_never_short_circuits_anything() {
         assert_eq!(mode_short_circuit(PermissionMode::Manual, "write_file", false), None);
         assert_eq!(mode_short_circuit(PermissionMode::Manual, "run_shell", false), None);
+    }
+
+    #[test]
+    fn non_interactive_denial_names_the_tool_and_explains_why() {
+        let msg = non_interactive_denial("write_file");
+        assert!(msg.contains("write_file"));
+        assert!(msg.contains("interactive terminal"));
+        assert!(msg.contains("not a TTY"));
+    }
+
+    #[test]
+    fn non_interactive_denial_suggests_a_mode_that_never_prompts() {
+        let msg = non_interactive_denial("run_shell");
+        assert!(msg.contains("bypass"));
     }
 
     #[test]

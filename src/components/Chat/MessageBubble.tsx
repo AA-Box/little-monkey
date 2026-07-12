@@ -198,6 +198,7 @@ function UserBubble({
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 commit();
