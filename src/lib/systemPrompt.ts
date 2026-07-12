@@ -103,6 +103,18 @@ export function resolvePersona(entries: PromptEntry[], personaId: string | null)
   return entry ? { name: entry.name, content: entry.content } : null;
 }
 
+/** One attached knowledge stack's prompt-facing summary — mirrors the subset
+ * of `stackStore.ts`'s `KnowledgeStack` that `buildSystemPrompt`'s guidance
+ * line actually needs. `description` is a short human-readable status (e.g.
+ * "1,234 chunks indexed" or "not indexed yet") computed by the caller
+ * (`agentLoop.ts`) from the stack's `chunk_count`/`indexed_at`, since
+ * `KnowledgeStack` itself carries no free-text description field for a
+ * stack — see that call site for the exact derivation. */
+export interface AttachedStackPromptInfo {
+  name: string;
+  description: string;
+}
+
 export function buildSystemPrompt(
   roots: PromptWorkspaceRoot[],
   osLabel: string,
@@ -141,7 +153,15 @@ export function buildSystemPrompt(
   // (`webToolsLines`/`verifyGuidanceLines` below), so a later phase can wire
   // in a real toggle (or turn it off in plan mode, say) without changing
   // this function's shape again.
-  artifactGuidanceAvailable: boolean = true
+  artifactGuidanceAvailable: boolean = true,
+  // Knowledge stacks attached to this session (see `ChatSession.attachedStackIds`,
+  // `StackPicker.tsx`) — empty for the overwhelming majority of turns (no
+  // stacks attached, or the feature unused), in which case this contributes
+  // nothing, same "absence is fine" stance as `rules`/`facts` above. Non-empty
+  // only when the `search_docs` tool is actually being offered this turn too
+  // (see `agentLoop.ts`'s `buildTools` call), so the guidance line and the
+  // tool's own availability never drift out of sync.
+  attachedStacks: AttachedStackPromptInfo[] = []
 ): string {
   const primary = roots.find((r) => r.is_primary) ?? null;
   const secondaries = roots.filter((r) => !r.is_primary);
@@ -241,6 +261,17 @@ export function buildSystemPrompt(
   // ever offered to the model while `mode === 'plan'` (see `toolsForMode` in
   // agentLoop.ts), so this section and that tool's availability are always
   // in sync.
+  // One conditional line naming the stacks attached to this session and
+  // pointing the model at `search_docs` — see the `attachedStacks` param doc
+  // above for why this stays empty for almost every turn.
+  const stacksLines =
+    attachedStacks.length > 0
+      ? [
+          '',
+          `Knowledge stacks attached: ${attachedStacks.map((s) => `"${s.name}" (${s.description})`).join(', ')}. Use search_docs to consult them, and cite source paths when you use what it returns.`,
+        ]
+      : [];
+
   const planModeLines =
     mode === 'plan'
       ? [
@@ -269,6 +300,7 @@ export function buildSystemPrompt(
     ...webToolsLines,
     ...verifyGuidanceLines,
     ...artifactGuidanceLines,
+    ...stacksLines,
     ...planModeLines,
     '',
     'Keep answers concise. Reference files by their workspace-relative path. When a task is complete, summarize what changed and stop calling tools.',
@@ -280,7 +312,15 @@ export function buildSystemPrompt(
  * via `composeSystemPrompt`/`resolvePersona`. Called once per agent-loop
  * iteration (see `agentLoop.ts`), so a persona switched mid-turn — or a
  * persona deleted out from under a session — is always resolved fresh. */
-export function currentSystemPrompt(personaId: string | null = null): string {
+export function currentSystemPrompt(
+  personaId: string | null = null,
+  // Passed in by `agentLoop.ts` (derived from the session's
+  // `attachedStackIds` against `stackStore.ts`) rather than read from a store
+  // here — this module has no `sessionId` to key a per-session lookup by,
+  // unlike `personaId` which the caller already resolves from the session
+  // itself before calling this. See `AttachedStackPromptInfo`'s doc comment.
+  attachedStacks: AttachedStackPromptInfo[] = []
+): string {
   const roots = useWorkspaceStore.getState().roots;
   const osLabel = detectOsLabel(typeof navigator !== 'undefined' ? navigator.platform : '');
   const { rules, facts } = useRulesStore.getState();
@@ -304,7 +344,18 @@ export function currentSystemPrompt(personaId: string | null = null): string {
   const verifyGuidanceAvailable =
     useSettingsStore.getState().verifyEnabled && useVerifyStore.getState().config.commands.some((c) => c.enabled);
   const mode = usePermissionStore.getState().mode;
-  const base = buildSystemPrompt(roots, osLabel, rules, facts, mcpServers, webToolsAvailable, verifyGuidanceAvailable, mode);
+  const base = buildSystemPrompt(
+    roots,
+    osLabel,
+    rules,
+    facts,
+    mcpServers,
+    webToolsAvailable,
+    verifyGuidanceAvailable,
+    mode,
+    true,
+    attachedStacks
+  );
   const persona = resolvePersona(usePromptStore.getState().entries, personaId);
   return composeSystemPrompt(base, persona);
 }

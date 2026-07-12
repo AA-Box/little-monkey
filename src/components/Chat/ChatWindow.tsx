@@ -19,6 +19,7 @@ import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
 import { ModeSelector } from "./ModeSelector";
 import { EffortSelector } from "./EffortSelector";
 import { PersonaSelector } from "./PersonaSelector";
+import { StackPicker } from "./StackPicker";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
@@ -651,6 +652,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
           </div>
           <div className="flex items-center gap-3">
             <ModelSwitcher />
+            <StackPicker sessionId={sessionId} />
             <EffortSelector />
             <CheckpointTimeline sessionId={sessionId} />
             <ContextUsageIndicator sessionId={sessionId} />

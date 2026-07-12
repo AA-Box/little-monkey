@@ -64,6 +64,15 @@ export interface ChatSession {
    * `resolvePersona`), so a deleted persona resolves to null instead of
    * leaving a session broken. */
   personaId: string | null;
+  /** ids of `KnowledgeStack`s (see `stackStore.ts`) attached to this session
+   * — set via `StackPicker.tsx`'s checkboxes, read by `agentLoop.ts` to
+   * decide whether `search_docs` is offered this turn (see `tools.ts`'s
+   * `buildTools`) and what the system prompt's stack-guidance line names.
+   * Opaque to the Rust side — the sessions blob is stored as-is, so this
+   * needed zero Rust changes, only `normalizeSession` filling in `[]` for
+   * sessions persisted before this field existed. Per-session (not global)
+   * so the split pane can attach different stacks to each transcript. */
+  attachedStackIds: string[];
 }
 
 /** A user-defined grouping sessions can be filed under via the session
@@ -143,6 +152,9 @@ export interface SessionStore {
   /** Sets (or clears with `null`) the persona applied to `sessionId`'s system
    * prompt — see `ChatSession.personaId`. */
   setSessionPersona: (sessionId: string, personaId: string | null) => void;
+  /** Toggles whether `stackId` is attached to `sessionId` — see
+   * `ChatSession.attachedStackIds`. Called by `StackPicker.tsx`'s checkboxes. */
+  toggleAttachedStack: (sessionId: string, stackId: string) => void;
   /** Record whether an agent turn is in flight for `sessionId` — called
    * only by `runAgentTurn` (start/finally). */
   markTurnRunning: (sessionId: string, running: boolean) => void;
@@ -236,6 +248,9 @@ function createSession(): ChatSession {
     // id (its persona got deleted) resolves to "None" at turn time same as
     // any other persona reference — see `composeSystemPrompt`.
     personaId: usePromptStore.getState().defaultPersonaId,
+    // New sessions start with no stacks attached — the user opts in per
+    // session via `StackPicker.tsx`, there's no "default stack" concept.
+    attachedStackIds: [],
   };
 }
 
@@ -256,6 +271,7 @@ function cloneSessionAsFork(source: ChatSession): ChatSession {
     groupId: source.groupId,
     workspacePath: source.workspacePath,
     personaId: source.personaId,
+    attachedStackIds: [...source.attachedStackIds],
   };
 }
 
@@ -306,6 +322,9 @@ function normalizeSession(raw: Partial<ChatSession>): ChatSession {
     groupId: raw.groupId ?? null,
     workspacePath: raw.workspacePath ?? null,
     personaId: typeof raw.personaId === "string" ? raw.personaId : null,
+    attachedStackIds: Array.isArray(raw.attachedStackIds)
+      ? raw.attachedStackIds.filter((id): id is string => typeof id === "string")
+      : [],
   };
 }
 
@@ -681,6 +700,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   setSessionPersona: (sessionId, personaId) => {
     set((state) => {
       const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, personaId } : s));
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  toggleAttachedStack: (sessionId, stackId) => {
+    set((state) => {
+      const sessions = state.sessions.map((s) => {
+        if (s.id !== sessionId) return s;
+        const attachedStackIds = s.attachedStackIds.includes(stackId)
+          ? s.attachedStackIds.filter((id) => id !== stackId)
+          : [...s.attachedStackIds, stackId];
+        return { ...s, attachedStackIds };
+      });
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
     });

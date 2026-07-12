@@ -243,6 +243,70 @@ export const TOOLS: ToolDef[] = [
 ];
 
 /**
+ * Builds the `search_docs` tool's description, naming the actual attached
+ * stacks so the model knows what's searchable without a separate lookup
+ * call — mirrors `stack: Option<String>`'s resolution in
+ * `stacks.rs::resolve_search_stack_ids`: pass one of these names to search
+ * just that stack, or omit it to search every indexed stack (the model's own
+ * visible universe here is exactly the attached stacks this description
+ * lists, even though the Rust side itself has no separate notion of
+ * "attached" — see that function's doc comment for why).
+ */
+function searchDocsDescription(attachedStackNames: string[]): string {
+  const stackList = attachedStackNames.join(', ');
+  return `Search the attached knowledge stack(s) for passages relevant to a query, returning the top matches with their source file path and a relevance score. Attached stacks: ${stackList}. Pass "stack" to search only one of them by name, or omit it to search across all of them. Cite source paths when using results in your answer.`;
+}
+
+/**
+ * A `search_docs` `ToolDef` naming `attachedStackNames` in its description —
+ * built fresh per turn (see `buildTools` below) rather than a fixed constant,
+ * since the whole point is that the model sees the actual current stack
+ * names, not a generic placeholder.
+ */
+function searchDocsTool(attachedStackNames: string[]): ToolDef {
+  return {
+    type: 'function',
+    function: {
+      name: 'search_docs',
+      description: searchDocsDescription(attachedStackNames),
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The search query — a question or phrase to find relevant passages for.',
+          },
+          stack: {
+            type: 'string',
+            description: 'Optional: the name of one specific attached stack to search. Omit to search across all attached stacks.',
+          },
+          max_results: {
+            type: 'integer',
+            description: 'Maximum number of passages to return (default 6).',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+/**
+ * Wraps the base `TOOLS` array with `search_docs` appended, ONLY when at
+ * least one knowledge stack is attached to the session (`attachedStackNames`
+ * non-empty) — an unattached session has nothing for the tool to search, so
+ * offering it would just invite a confusing "no stacks" error. Called once
+ * per turn by `agentLoop.ts`'s `runAgentTurnBody`, the same place
+ * `toolsForMode`/`toolsForSettings` already shape the per-turn tool list —
+ * see that module's doc comment for where this slots into the composition
+ * chain (`toolsForSettings(toolsForMode(buildTools(...), mode), ...)`).
+ */
+export function buildTools(attachedStackNames: string[]): ToolDef[] {
+  return attachedStackNames.length > 0 ? [...TOOLS, searchDocsTool(attachedStackNames)] : TOOLS;
+}
+
+/**
  * A frontend-only tool: presenting a structured plan for the user to
  * approve before switching out of Plan Mode (see `agentLoop.ts`'s
  * `toolsForMode`/`PLAN_NOTE_PREFIX`/`PlanNotice`). Deliberately kept OUT of

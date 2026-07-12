@@ -27,6 +27,7 @@ function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSess
     groupId: null,
     workspacePath: null,
     personaId: null,
+    attachedStackIds: [],
     ...overrides,
   };
 }
@@ -205,5 +206,93 @@ describe("hydrateSessions persona default", () => {
     await hydrateSessions();
 
     expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.personaId).toBeNull();
+  });
+});
+
+describe("toggleAttachedStack", () => {
+  it("attaches a stack id not yet attached", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.attachedStackIds).toEqual(["stack-1"]);
+  });
+
+  it("detaches an already-attached stack id", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.attachedStackIds).toEqual([]);
+  });
+
+  it("supports multiple attached stacks at once", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    useSessionStore.getState().toggleAttachedStack("a", "stack-2");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.attachedStackIds).toEqual(["stack-1", "stack-2"]);
+  });
+
+  it("only affects the targeted session", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.attachedStackIds).toEqual([]);
+  });
+});
+
+describe("hydrateSessions attachedStackIds default", () => {
+  it("defaults attachedStackIds to [] for a persisted session predating the field", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            personaId: null,
+            // No `attachedStackIds` field at all — simulates a blob saved
+            // before this feature existed.
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.attachedStackIds).toEqual([]);
+  });
+
+  it("drops non-string entries from a corrupt persisted attachedStackIds array", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            personaId: null,
+            attachedStackIds: ["stack-1", 42, null, "stack-2"],
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.attachedStackIds).toEqual([
+      "stack-1",
+      "stack-2",
+    ]);
   });
 });

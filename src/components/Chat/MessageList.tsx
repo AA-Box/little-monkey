@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   BookmarkX,
+  BookOpen,
   Brain,
   ChevronRight,
   ClipboardCheck,
@@ -212,6 +213,7 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   remember: Brain,
   web_fetch: Globe,
   web_search: Search,
+  search_docs: BookOpen,
 };
 
 function toolIcon(name: string): LucideIcon {

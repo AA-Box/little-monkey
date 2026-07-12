@@ -341,6 +341,7 @@ pub fn run() {
             stacks::stacks_reindex,
             stacks::stacks_cancel_index,
             stacks::stacks_query,
+            stacks::tool_search_docs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { TOOLS, PRESENT_PLAN_TOOL } from './tools';
+import { PRESENT_PLAN_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -48,7 +48,7 @@ import {
   type DirEntry,
   type ResolvedTextReference,
 } from './mentions';
-import { currentSystemPrompt } from './systemPrompt';
+import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
@@ -56,6 +56,7 @@ import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
+import { useStackStore } from '../store/stackStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
@@ -445,6 +446,32 @@ export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webTo
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
+}
+
+/** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
+ * `KnowledgeStack` — kept local (rather than importing the full interface)
+ * since only these three fields matter for the derived description. */
+interface AttachedStackLike {
+  name: string;
+  indexed_at: number | null;
+  chunk_count: number;
+}
+
+/**
+ * Derives each attached stack's short prompt-facing `description` (see
+ * `systemPrompt.ts`'s `AttachedStackPromptInfo`) from its index status —
+ * `chunk_count` once indexed, or a "not indexed yet" note so the model
+ * doesn't expect `search_docs` to return anything for a stack that hasn't
+ * been indexed at all. Pure so it can be unit-tested independent of
+ * `stackStore`/`sessionStore`, same reasoning as `toolsForMode`/
+ * `toolsForSettings` above.
+ */
+export function attachedStackPromptInfo(stacks: AttachedStackLike[]): AttachedStackPromptInfo[] {
+  return stacks.map((stack) => ({
+    name: stack.name,
+    description:
+      stack.indexed_at !== null ? `${stack.chunk_count} chunk${stack.chunk_count === 1 ? '' : 's'} indexed` : 'not indexed yet',
+  }));
 }
 
 /**
@@ -1202,8 +1229,23 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
+
+  // This session's attached knowledge stacks (see `ChatSession.attachedStackIds`,
+  // `StackPicker.tsx`), resolved against the current stack registry once per
+  // turn — same "computed once, not re-derived every round trip" stance as
+  // `mode`/`mcpDefs` above. Empty for the overwhelming majority of turns (no
+  // stacks attached), in which case `buildTools` returns the base list
+  // unchanged and the system prompt gets no stacks guidance line.
+  const attachedStackIds = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.attachedStackIds ?? [];
+  const attachedStacks =
+    attachedStackIds.length > 0
+      ? useStackStore.getState().stacks.filter((stack) => attachedStackIds.includes(stack.id))
+      : [];
+  const attachedStackNames = attachedStacks.map((stack) => stack.name);
+  const attachedStacksForPrompt = attachedStackPromptInfo(attachedStacks);
+
   const toolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...TOOLS, ...mcpDefs], mode),
+    toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
     settings.webToolsEnabled
   );
@@ -1300,7 +1342,7 @@ async function runAgentTurnBody(
     // very next round trip, and a dangling id just resolves to no persona —
     // see `resolvePersona`).
     const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
-    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt(personaId) };
+    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt(personaId, attachedStacksForPrompt) };
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user
