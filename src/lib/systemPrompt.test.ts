@@ -175,6 +175,24 @@ describe('buildSystemPrompt', () => {
     const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', false);
     expect(prompt).not.toContain('tagged html/svg/mermaid');
   });
+
+  it('omits the knowledge stacks line when no stacks are attached (the default)', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).not.toContain('Knowledge stacks attached');
+    expect(prompt).not.toContain('search_docs');
+  });
+
+  it('names every attached stack and its description, and points the model at search_docs', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS', [], [], [], true, false, 'manual', true, [
+      { name: 'Docs', description: '42 chunks indexed' },
+      { name: 'Release Notes', description: 'not indexed yet' },
+    ]);
+    expect(prompt).toContain('Knowledge stacks attached');
+    expect(prompt).toContain('"Docs" (42 chunks indexed)');
+    expect(prompt).toContain('"Release Notes" (not indexed yet)');
+    expect(prompt).toContain('search_docs');
+    expect(prompt).toContain('cite source paths');
+  });
 });
 
 describe('composeSystemPrompt', () => {

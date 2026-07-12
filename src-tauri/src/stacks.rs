@@ -1026,6 +1026,86 @@ pub async fn stacks_query(
     query_impl(&app, state.inner(), &stack_ids, &query, k.unwrap_or(DEFAULT_QUERY_K as u32) as usize).await
 }
 
+// ---------------------------------------------------------------------
+// Agent retrieval tool (RAG design doc slice 2)
+// ---------------------------------------------------------------------
+
+/// Resolves which stack ids [`tool_search_docs`] should actually search:
+///
+/// - `stack: Some(name)` — the single stack whose name matches `name`
+///   case-insensitively (trimmed first, since a model may pad its argument
+///   with whitespace). A name that matches nothing is a hard error rather
+///   than an empty result, so the model learns immediately that it
+///   mistyped/hallucinated a stack name instead of silently getting zero
+///   hits back. If the matched stack hasn't been indexed yet, this still
+///   returns its id — `query_impl` is what surfaces the "has not been
+///   indexed yet" error, so that message stays in exactly one place.
+/// - `stack: None` — every stack in the registry that HAS been indexed.
+///   There is deliberately no notion of "attached stacks" on the Rust side:
+///   `buildTools` (src/lib/tools.ts) only ever offers this tool, and only
+///   ever names, the stacks actually attached to the session — so "no name
+///   given" from a well-behaved model already means "search whichever of
+///   those you think is relevant", and the tool's description lists exactly
+///   those names. A stack outside that session's attachments could still be
+///   matched by explicit name (or swept in via the "search everything
+///   indexed" default) since nothing upstream threads an attached-id list
+///   through the tool call — see this module's top doc comment and the
+///   slice 2 summary for why this is a documented, deliberate deviation from
+///   a literal reading of "dot-products across the attached stack(s)".
+fn resolve_search_stack_ids(registry: &[KnowledgeStack], stack: Option<&str>) -> Result<Vec<String>, String> {
+    match stack {
+        Some(name) => {
+            let trimmed = name.trim();
+            registry
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(trimmed))
+                .map(|s| vec![s.id.clone()])
+                .ok_or_else(|| format!("No knowledge stack named '{}'", trimmed))
+        }
+        None => {
+            let ids: Vec<String> = registry.iter().filter(|s| s.indexed_at.is_some()).map(|s| s.id.clone()).collect();
+            if ids.is_empty() {
+                Err("No indexed knowledge stacks are available to search".to_string())
+            } else {
+                Ok(ids)
+            }
+        }
+    }
+}
+
+/// The agent's read-only retrieval tool (RAG design doc slice 2): embeds
+/// `query` with the resolved stack(s)' embedding spec (see
+/// [`resolve_search_stack_ids`]) and returns the combined top-`max_results`
+/// chunks across them, highest score first — the exact same ranking
+/// `stacks_query` (the settings panel's test-search box) uses under the
+/// hood, just with a model-facing argument shape (`stack` by name, not by
+/// id; `max_results` not `k`) and its own name-resolution step.
+///
+/// Deliberately **not** permission-gated: like `tool_read_file`/`tool_glob`/
+/// `tool_grep` (see `tools.rs`), this never calls
+/// `permissions::request_permission`, so it is entirely unaffected by
+/// permission mode — including Plan Mode's hard block, which only fires
+/// for tools that actually reach `request_permission` (see
+/// `permissions::mode_short_circuit`'s `"plan"` arm) — and by "smart"
+/// mode's risk-floor logic, which only ever looks at `write_file`/
+/// `edit_file`/`run_shell`. A read-only lookup over user-selected local
+/// files needs no confirmation, exactly like the other read-only tools it's
+/// modeled on.
+#[tauri::command]
+pub async fn tool_search_docs(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    query: String,
+    stack: Option<String>,
+    max_results: Option<u32>,
+) -> Result<Vec<StackQueryResult>, String> {
+    let base = stacks_base_dir(&app)?;
+    let registry = load_registry(&base)?;
+    let stack_ids = resolve_search_stack_ids(&registry, stack.as_deref())?;
+    let k = max_results.unwrap_or(DEFAULT_QUERY_K as u32) as usize;
+    query_impl(&app, state.inner(), &stack_ids, &query, k).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,5 +1420,65 @@ mod tests {
         let state = AppState::default();
         let cancels = state.index_cancels.lock().unwrap();
         assert!(cancels.get("no-such-stack").is_none());
+    }
+
+    // --- tool_search_docs stack-name resolution ---
+
+    fn test_stack(name: &str, indexed: bool) -> KnowledgeStack {
+        KnowledgeStack {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            sources: Vec::new(),
+            embedding: test_spec(768),
+            chunk_chars: DEFAULT_CHUNK_CHARS,
+            chunk_overlap: DEFAULT_CHUNK_OVERLAP,
+            indexed_at: if indexed { Some(1) } else { None },
+            chunk_count: if indexed { 10 } else { 0 },
+        }
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_matches_named_stack_case_insensitively() {
+        let registry = vec![test_stack("Docs", true), test_stack("Notes", true)];
+        let ids = resolve_search_stack_ids(&registry, Some("  docs  ")).unwrap();
+        assert_eq!(ids, vec!["id-Docs".to_string()]);
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_errors_for_an_unknown_name() {
+        let registry = vec![test_stack("Docs", true)];
+        let err = resolve_search_stack_ids(&registry, Some("Nonexistent")).unwrap_err();
+        assert!(err.contains("Nonexistent"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_matches_an_unindexed_named_stack_leaving_the_not_indexed_error_to_query_impl() {
+        // The name resolves fine even though it hasn't been indexed yet —
+        // `query_impl` (not this function) is what surfaces "has not been
+        // indexed yet", so that message stays in exactly one place.
+        let registry = vec![test_stack("Docs", false)];
+        let ids = resolve_search_stack_ids(&registry, Some("Docs")).unwrap();
+        assert_eq!(ids, vec!["id-Docs".to_string()]);
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_defaults_to_every_indexed_stack_when_no_name_given() {
+        let registry = vec![test_stack("Docs", true), test_stack("Notes", false), test_stack("Wiki", true)];
+        let mut ids = resolve_search_stack_ids(&registry, None).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["id-Docs".to_string(), "id-Wiki".to_string()]);
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_errors_when_nothing_is_indexed_and_no_name_given() {
+        let registry = vec![test_stack("Docs", false)];
+        let err = resolve_search_stack_ids(&registry, None).unwrap_err();
+        assert!(err.contains("No indexed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_search_stack_ids_errors_on_an_empty_registry_with_no_name_given() {
+        let registry: Vec<KnowledgeStack> = Vec::new();
+        assert!(resolve_search_stack_ids(&registry, None).is_err());
     }
 }

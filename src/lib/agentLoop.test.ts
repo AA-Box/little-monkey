@@ -4,6 +4,7 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
 import {
+  attachedStackPromptInfo,
   checkpointChainBlockReason,
   formatMemoryNotice,
   formatPlanNotice,
@@ -290,6 +291,35 @@ describe("toolsForMode", () => {
     for (const mode of ["manual", "acceptEdits", "smart", "auto", "bypass"] as const) {
       expect(toolsForMode(base, mode)).toBe(base);
     }
+  });
+});
+
+describe("attachedStackPromptInfo", () => {
+  it("reports chunk count for an indexed stack", () => {
+    const info = attachedStackPromptInfo([{ name: "Docs", indexed_at: 12345, chunk_count: 42 }]);
+    expect(info).toEqual([{ name: "Docs", description: "42 chunks indexed" }]);
+  });
+
+  it("uses singular phrasing for exactly one chunk", () => {
+    const info = attachedStackPromptInfo([{ name: "Docs", indexed_at: 1, chunk_count: 1 }]);
+    expect(info[0].description).toBe("1 chunk indexed");
+  });
+
+  it('reports "not indexed yet" for a stack that has never been indexed', () => {
+    const info = attachedStackPromptInfo([{ name: "New Stack", indexed_at: null, chunk_count: 0 }]);
+    expect(info).toEqual([{ name: "New Stack", description: "not indexed yet" }]);
+  });
+
+  it("maps multiple stacks in order", () => {
+    const info = attachedStackPromptInfo([
+      { name: "Docs", indexed_at: 1, chunk_count: 10 },
+      { name: "Notes", indexed_at: null, chunk_count: 0 },
+    ]);
+    expect(info.map((s) => s.name)).toEqual(["Docs", "Notes"]);
+  });
+
+  it("returns an empty array for no attached stacks", () => {
+    expect(attachedStackPromptInfo([])).toEqual([]);
   });
 });
 
@@ -677,6 +707,7 @@ describe("maybeAutoPreviewNewestArtifact", () => {
       groupId: null,
       workspacePath: null,
       personaId: null,
+      attachedStackIds: [],
     };
     useSessionStore.setState((state) => ({
       sessions: [...state.sessions.filter((s) => s.id !== sessionId), session],
