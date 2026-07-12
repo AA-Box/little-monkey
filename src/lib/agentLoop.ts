@@ -574,6 +574,59 @@ export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): 
   return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
 }
 
+/**
+ * Runs one round's worth of model-requested tool calls, splitting `task`
+ * calls out to run CONCURRENTLY (bounded by `maxConcurrentSubagents`, the
+ * "builds on split-pane turn-safe concurrency" payoff called out in the
+ * design doc's Parallelism section — the Rust per-turn `tool_cancel`/
+ * permission-`pending` maps and the queued `PermissionModal` were already
+ * built for N concurrent turns, not just 2) while every other call stays
+ * strictly sequential, exactly as before this feature — a subagent's own
+ * tool calls are already serialized within `runSubagentTask`'s own loop, so
+ * only concurrency ACROSS multiple `task` calls in the same round is new.
+ *
+ * `results[i]` always corresponds to `toolCalls[i]` regardless of which
+ * call actually finished first — several providers reject a `tool_calls`
+ * round trip whose `tool` results don't come back in the same order the
+ * calls were requested in, so this ordering guarantee is load-bearing, not
+ * cosmetic. `runOne` is a plain callback (not baked in here) so this stays
+ * unit-testable with a fake, controllable-timing implementation instead of
+ * needing a real `executeToolCall`/Tauri `invoke`.
+ */
+export async function runToolCallsForRound(
+  toolCalls: ToolCall[],
+  maxConcurrentSubagents: number,
+  runOne: (toolCall: ToolCall) => Promise<string>
+): Promise<string[]> {
+  const results: string[] = new Array(toolCalls.length);
+  const taskIndices: number[] = [];
+  const sequentialIndices: number[] = [];
+  toolCalls.forEach((toolCall, index) => {
+    (toolCall.function.name === 'task' ? taskIndices : sequentialIndices).push(index);
+  });
+
+  const sequentialRun = (async () => {
+    for (const index of sequentialIndices) {
+      results[index] = await runOne(toolCalls[index]);
+    }
+  })();
+
+  // A small bounded worker pool over `taskIndices` only — `sequentialRun`
+  // above already owns every non-`task` index, so these two loops never
+  // touch the same slot and can safely run at the same time.
+  const poolSize = Math.max(1, Math.min(4, Math.floor(maxConcurrentSubagents) || 1, taskIndices.length || 1));
+  let nextTaskCursor = 0;
+  const workers = Array.from({ length: poolSize }, async () => {
+    while (nextTaskCursor < taskIndices.length) {
+      const index = taskIndices[nextTaskCursor++];
+      results[index] = await runOne(toolCalls[index]);
+    }
+  });
+
+  await Promise.all([sequentialRun, ...workers]);
+  return results;
+}
+
 /** Shape of a successful `tool_remember` result (the created/deduplicated
  * fact) — checked structurally against the tool's stringified result so an
  * error payload (`{ error: string }`) never gets misread as one. */
@@ -1556,7 +1609,11 @@ async function runAgentTurnBody(
     // before executing them and feeding results back.
     updateLastMessage({ content, tool_calls: toolCalls });
 
-    for (const toolCall of toolCalls) {
+    // Executes every call in this round — `task` calls run concurrently
+    // (bounded by `settings.maxConcurrentSubagents`), everything else stays
+    // sequential — see `runToolCallsForRound`'s own doc comment for why, and
+    // for the order-preservation guarantee the rest of this loop depends on.
+    const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
       // Reject (without executing) any call whose name wasn't actually
       // offered to the model this turn — e.g. `remember` after
       // `memoryEnabled` was turned off, or any other tool a local/quantized
@@ -1566,28 +1623,27 @@ async function runAgentTurnBody(
       // polite suggestion the model can ignore. Still gets a result message,
       // same invariant as the cancelled-call path below.
       if (!isToolCallAllowed(toolCall, toolsForTurn)) {
-        addMessage({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
-        });
-        continue;
+        return stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`));
       }
 
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
-      // Built fresh on every call (not hoisted once before the loop) so a
-      // `task` call always sees the CURRENT `target` — a failover switch
-      // earlier in this same iteration (or, in principle, an auto-vision
-      // switch on the next one) must never leave a subagent resolving a
-      // target the parent has since moved off of. See `SubagentContext`'s
-      // doc comment in `turnEngine.ts`.
+      // Built fresh per call (not hoisted once before the loop) so a `task`
+      // call always sees the CURRENT `target` — a failover switch earlier in
+      // this same iteration (or, in principle, an auto-vision switch on the
+      // next one) must never leave a subagent resolving a target the parent
+      // has since moved off of. See `SubagentContext`'s doc comment in
+      // `turnEngine.ts`.
+      if (signal?.aborted) return CANCELLED_TOOL_RESULT;
       const subagentContext: SubagentContext = { sessionId, target, effort };
-      const resultContent = signal?.aborted
-        ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames, subagentContext);
+      return executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames, subagentContext);
+    });
+
+    for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex++) {
+      const toolCall = toolCalls[toolCallIndex];
+      const resultContent = results[toolCallIndex];
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,

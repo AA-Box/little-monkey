@@ -61,6 +61,16 @@ export interface SettingsState {
    * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
    * not offered" treatment of `remember`. */
   subagentsEnabled: boolean;
+  /** How many `task` tool calls in the same round trip `runToolCallsForRound`
+   * (see `agentLoop.ts`) will run concurrently via its bounded promise pool —
+   * every other tool call in the round stays sequential regardless of this
+   * value (see that function's own doc comment). Range 1-4, default 2:
+   * mirrors `verifyMaxRounds`'s small-integer-range pattern. A value of 1
+   * behaves like slice 1/2 (subagents never overlap); permission-prompt
+   * storms from several concurrent `code`-profile subagents in manual mode
+   * are the reason this stays capped at 4 rather than "however many the
+   * model asks for" — see the design doc's "Permission-prompt storms" risk. */
+  maxConcurrentSubagents: number;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -84,6 +94,7 @@ export interface SettingsState {
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
   setSubagentsEnabled: (value: boolean) => void;
+  setMaxConcurrentSubagents: (value: number) => void;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -114,6 +125,10 @@ export const MAX_CHECKPOINT_RETENTION = 100;
 const DEFAULT_VERIFY_MAX_ROUNDS = 1;
 export const MIN_VERIFY_MAX_ROUNDS = 0;
 export const MAX_VERIFY_MAX_ROUNDS = 3;
+/** See `maxConcurrentSubagents`'s own doc comment for why this range. */
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2;
+export const MIN_MAX_CONCURRENT_SUBAGENTS = 1;
+export const MAX_MAX_CONCURRENT_SUBAGENTS = 4;
 
 interface PersistedShape {
   autoFailoverEnabled: boolean;
@@ -134,6 +149,7 @@ interface PersistedShape {
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
   subagentsEnabled: boolean;
+  maxConcurrentSubagents: number;
 }
 
 function defaults(): PersistedShape {
@@ -156,6 +172,7 @@ function defaults(): PersistedShape {
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
     subagentsEnabled: false,
+    maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
   };
 }
 
@@ -224,6 +241,12 @@ function hydrate(): PersistedShape {
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
       subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      maxConcurrentSubagents:
+        typeof parsed.maxConcurrentSubagents === "number" &&
+        parsed.maxConcurrentSubagents >= MIN_MAX_CONCURRENT_SUBAGENTS &&
+        parsed.maxConcurrentSubagents <= MAX_MAX_CONCURRENT_SUBAGENTS
+          ? Math.round(parsed.maxConcurrentSubagents)
+          : fallback.maxConcurrentSubagents,
     };
   } catch {
     return fallback;
@@ -372,6 +395,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setSubagentsEnabled: (value) => {
     set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setMaxConcurrentSubagents: (value) => {
+    const clamped = Math.min(MAX_MAX_CONCURRENT_SUBAGENTS, Math.max(MIN_MAX_CONCURRENT_SUBAGENTS, Math.round(value)));
+    set({ maxConcurrentSubagents: clamped });
     persist({ ...get() });
   },
 }));

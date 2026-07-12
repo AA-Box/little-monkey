@@ -23,6 +23,7 @@ import {
   parseSourcesNotice,
   parseVerifyNotice,
   PLAN_NOTE_PREFIX,
+  runToolCallsForRound,
   runVerificationPhase,
   shouldFeedBackVerifyFailure,
   toolCallPathArg,
@@ -354,6 +355,131 @@ describe("isToolCallAllowed", () => {
 
   it("rejects a hallucinated tool name that was never offered at all", () => {
     expect(isToolCallAllowed(call("delete_everything"), toolsForTurn)).toBe(false);
+  });
+});
+
+// slice 3's parallelism: `task` calls in one round trip run concurrently
+// (bounded by `maxConcurrentSubagents`), everything else stays sequential —
+// see `runToolCallsForRound`'s own doc comment. These tests use a
+// controllable-timing fake `runOne` (never a real `executeToolCall`) so
+// completion ORDER can be deliberately scrambled while still asserting the
+// RESULT array comes back in the original `toolCalls` order — the actual
+// provider-API-correctness invariant this function exists to uphold.
+describe("runToolCallsForRound", () => {
+  function call(name: string, id: string): ToolCall {
+    return { id, type: "function", function: { name, arguments: "{}" } };
+  }
+
+  it("returns results in the original toolCalls order even when a later task call resolves before an earlier one", async () => {
+    const toolCalls = [call("task", "call-1"), call("read_file", "call-2"), call("task", "call-3")];
+
+    // call-1's task resolves LAST (100ms via a microtask chain), call-3's
+    // resolves FIRST — the results array must still put call-1's result at
+    // index 0 and call-3's at index 2, matching input order, not completion
+    // order.
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      if (toolCall.id === "call-1") {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        return "result-1";
+      }
+      if (toolCall.id === "call-3") {
+        return "result-3";
+      }
+      return "result-2";
+    });
+
+    const results = await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(results).toEqual(["result-1", "result-2", "result-3"]);
+  });
+
+  it("runs non-task calls strictly sequentially — the next one never starts before the previous resolves", async () => {
+    const toolCalls = [call("read_file", "call-1"), call("read_file", "call-2"), call("read_file", "call-3")];
+    const order: string[] = [];
+
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      order.push(`${toolCall.id}-start`);
+      await Promise.resolve();
+      await Promise.resolve();
+      order.push(`${toolCall.id}-end`);
+      return `result-${toolCall.id}`;
+    });
+
+    await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(order).toEqual(["call-1-start", "call-1-end", "call-2-start", "call-2-end", "call-3-start", "call-3-end"]);
+  });
+
+  it("bounds concurrent task-call execution to maxConcurrentSubagents", async () => {
+    const toolCalls = [call("task", "call-1"), call("task", "call-2"), call("task", "call-3"), call("task", "call-4")];
+    let active = 0;
+    let maxActive = 0;
+    const releasers: Array<() => void> = [];
+
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>((resolve) => releasers.push(resolve));
+      active -= 1;
+      return `result-${toolCall.id}`;
+    });
+
+    const roundPromise = runToolCallsForRound(toolCalls, 2, runOne);
+
+    // Give the pool's workers a chance to start as many task calls as the
+    // limit allows before any of them are released.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(active).toBe(2);
+
+    // Release everything so the round can finish.
+    while (releasers.length > 0) {
+      releasers.shift()!();
+      await Promise.resolve();
+    }
+    await roundPromise;
+
+    expect(maxActive).toBeLessThanOrEqual(2);
+  });
+
+  it("task calls run concurrently with the sequential group, not blocked behind it", async () => {
+    const toolCalls = [call("read_file", "call-seq"), call("task", "call-task")];
+    let sequentialResolved = false;
+    let taskStartedBeforeSequentialResolved = false;
+
+    const runOne = vi.fn(async (toolCall: ToolCall) => {
+      if (toolCall.id === "call-seq") {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        sequentialResolved = true;
+        return "seq-result";
+      }
+      // The task call starts essentially immediately — before the slower
+      // sequential call above has resolved — proving the two groups run at
+      // the same time rather than the task group waiting its turn.
+      taskStartedBeforeSequentialResolved = !sequentialResolved;
+      return "task-result";
+    });
+
+    await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(taskStartedBeforeSequentialResolved).toBe(true);
+  });
+
+  it("returns an empty array for an empty round", async () => {
+    const results = await runToolCallsForRound([], 2, vi.fn());
+    expect(results).toEqual([]);
+  });
+
+  it("handles a round with only task calls (no sequential group at all)", async () => {
+    const toolCalls = [call("task", "call-1"), call("task", "call-2")];
+    const runOne = vi.fn(async (toolCall: ToolCall) => `result-${toolCall.id}`);
+
+    const results = await runToolCallsForRound(toolCalls, 2, runOne);
+
+    expect(results).toEqual(["result-call-1", "result-call-2"]);
   });
 });
 

@@ -232,9 +232,23 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         if (!aborted) {
           useSubagentStore.getState().recordToolCall(storeKey, activityLabel(toolCall));
         }
+        // `parentCheckpointId` + `taskId` is the crux pairing that makes
+        // `code`-profile subagents safe (see `RunSubagentTaskParams`'s doc
+        // comments on those two fields): the PARENT's checkpoint id so any
+        // write/edit lands in the parent turn's own checkpoint manifest, but
+        // this run's OWN turn id so Rust's per-turn `tool_cancel`/permission-
+        // `pending` maps scope cancellation and prompts to just this
+        // subagent — never the parent's own in-flight tool call, and never
+        // some other concurrent turn's. `description` is threaded through as
+        // `agentLabel` (slice 3) so a `code`-profile child's write_file/
+        // edit_file/run_shell permission prompt is attributed to THIS
+        // subagent (see `turnEngine.ts`'s `executeToolCall` injection site
+        // and `tools.rs`'s `with_agent_label`) — harmless for `explore`
+        // children too, since none of their tools are permission-gated
+        // mutations that read it.
         const resultContent = aborted
           ? CANCELLED_TOOL_RESULT
-          : await executeToolCall(toolCall, parentCheckpointId, taskId, mcpRegistry, parentSignal);
+          : await executeToolCall(toolCall, parentCheckpointId, taskId, mcpRegistry, parentSignal, undefined, undefined, undefined, description);
         const toolMessage: ChatMessage = { role: 'tool', tool_call_id: toolCall.id, content: resultContent };
         messages = [...messages, toolMessage];
         useSubagentStore.getState().appendMessage(storeKey, toolMessage);

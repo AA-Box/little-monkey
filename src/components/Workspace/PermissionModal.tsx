@@ -32,6 +32,24 @@ const TOOL_ICONS: Record<string, typeof AlertTriangle> = {
 };
 
 /**
+ * `tools.rs`'s `with_agent_label` prefixes a `code`-profile subagent's
+ * mutating-tool `detail` string with exactly `Subagent '<description>': ` —
+ * see that function's doc comment. Split out here (rather than shown as
+ * part of the raw detail box) so it renders as its own small attribution
+ * line, the same "don't just dump backend-formatted text" treatment the MCP
+ * `displayTool` split above gets. Returns `null`/the original `detail`
+ * unchanged when the prefix isn't present (every parent-turn call, and any
+ * `explore`-profile subagent's read-only tools, which never carry one).
+ */
+const SUBAGENT_DETAIL_PREFIX = /^Subagent '([^']*)':\s/;
+
+function splitSubagentAttribution(detail: string): { description: string | null; detail: string } {
+  const match = detail.match(SUBAGENT_DETAIL_PREFIX);
+  if (!match) return { description: null, detail };
+  return { description: match[1], detail: detail.slice(match[0].length) };
+}
+
+/**
  * The advisory risk badge/reason/floored-warning block (Phase 2 of the
  * Plan/Act + risk-adaptive permissions design —
  * docs/roadmap/p2-plan-act-safety.md), rendered only when `pending.risk_level`
@@ -111,6 +129,7 @@ export function PermissionModal() {
   // `mcp_call_tool`'s `detail` construction) — friendlier than the raw
   // `mcp:<serverId>:<toolName>` permission-request string.
   const displayTool = isMcpTool ? pending.detail.split("\n", 1)[0] : pending.tool;
+  const { description: subagentDescription, detail: displayDetail } = splitSubagentAttribution(pending.detail);
 
   return (
     <div
@@ -138,11 +157,17 @@ export function PermissionModal() {
           </div>
         </div>
 
+        {subagentDescription && (
+          <p className="mt-2 text-xs font-medium text-accent">
+            {t("PermissionModal.subagentAttribution", { description: subagentDescription })}
+          </p>
+        )}
+
         <RiskAnnotation pending={pending} t={t} />
 
         <div className="mt-4">
           <div className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-surface-2 p-2.5 font-mono text-xs text-muted">
-            {pending.detail}
+            {displayDetail}
           </div>
           {!canRememberForSession && (
             <p className="mt-2 text-xs text-faint">

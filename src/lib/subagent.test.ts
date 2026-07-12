@@ -226,6 +226,60 @@ describe("runSubagentTask / sequential execution", () => {
   });
 });
 
+// Slice 3: `code`-profile subagents can call write_file/edit_file/run_shell —
+// this is the crux pairing that makes that safe (see the design doc and
+// `RunSubagentTaskParams`'s own doc comments): every one of the child's own
+// tool calls must carry the PARENT's checkpoint id (so writes land in the
+// parent turn's checkpoint) but THIS run's own turn id (so Rust's per-turn
+// cancellation/permission maps scope to the subagent, not the parent), and
+// its `description` threaded through as `agentLabel` for permission-prompt
+// attribution (see `turnEngine.ts`'s `executeToolCall` and `tools.rs`'s
+// `with_agent_label`).
+describe("runSubagentTask / code-profile checkpoint_id + turn_id + agent_label pairing", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+  });
+
+  it("passes the PARENT's checkpoint id, this run's OWN turn id, and its description as agentLabel to every child tool call", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("write_file", "call-w")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("Wrote 3 bytes to a.txt");
+
+    await runSubagentTask(
+      baseParams({
+        profile: "code",
+        parentCheckpointId: "parent-checkpoint-1",
+        taskId: "child-turn-1",
+        description: "refactor auth",
+      })
+    );
+
+    expect(executeToolCallMock).toHaveBeenCalledTimes(1);
+    const args = executeToolCallMock.mock.calls[0];
+    // executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, risk, attachedStackNames, subagent, agentLabel)
+    expect(args[1]).toBe("parent-checkpoint-1");
+    expect(args[2]).toBe("child-turn-1");
+    expect(args[2]).not.toBe(args[1]);
+    expect(args[8]).toBe("refactor auth");
+  });
+
+  it("still passes the same pairing through for an explore-profile run (harmless — none of its tools are permission-gated mutations)", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({ content: "", toolCalls: [toolCall("grep", "call-g")], streamError: null, contentStarted: true })
+      .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+    executeToolCallMock.mockResolvedValue("grep result");
+
+    await runSubagentTask(baseParams({ profile: "explore", parentCheckpointId: "parent-checkpoint-2", taskId: "child-turn-2", description: "find X" }));
+
+    const args = executeToolCallMock.mock.calls[0];
+    expect(args[1]).toBe("parent-checkpoint-2");
+    expect(args[2]).toBe("child-turn-2");
+    expect(args[8]).toBe("find X");
+  });
+});
+
 // Slice 2: `runSubagentTask` drives `subagentStore` (live status for
 // `SubagentRow`) and `sessionStore.setSubagentRun` (persistence across a
 // restart) as it streams — see `subagentStore.test.ts` for the store's own
