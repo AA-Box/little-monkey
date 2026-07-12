@@ -156,7 +156,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
       onClick={onClose}
     >
       <div
-        className="flex h-full w-full flex-col bg-background"
+        className="flex h-[85vh] w-[90vw] max-w-5xl overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex w-64 shrink-0 flex-col border-r border-border bg-surface">
