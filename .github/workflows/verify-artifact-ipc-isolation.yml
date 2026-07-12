@@ -1,0 +1,77 @@
+name: Verify Artifact IPC Isolation
+
+# Runs the tier-2 artifact:// sandbox check (src-tauri/examples/verify_artifact_ipc_isolation.rs)
+# on real Windows runners. This check's own doc comment explains why it matters
+# specifically on Windows: wry's WebView2 backend injects init scripts into every
+# subframe regardless of Tauri's for_main_frame_only flag, and Tauri's
+# is_local_url treats any registered custom-protocol response as "local" on
+# Windows (shared http://<scheme>.localhost address space) — a combination that
+# could make the Tauri IPC bridge reachable from inside the sandboxed
+# artifact:// iframe. A pass on macOS/Linux does not establish this also passes
+# on Windows, so this workflow is the authoritative gate for that platform.
+#
+# Exit codes from the example: 0 = isolated (PASS), 1 = IPC bridge reachable
+# (CONFIRMED VULNERABILITY), 2 = inconclusive/timeout (no verdict reached —
+# treated as a failure here too, since it means the check didn't run for real).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src-tauri/src/artifacts.rs"
+      - "src-tauri/examples/verify_artifact_ipc_isolation.rs"
+      - "src-tauri/capabilities/**"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/Cargo.toml"
+      - "src/components/Workspace/ArtifactPane.tsx"
+      - ".github/workflows/verify-artifact-ipc-isolation.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src-tauri/src/artifacts.rs"
+      - "src-tauri/examples/verify_artifact_ipc_isolation.rs"
+      - "src-tauri/capabilities/**"
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (generate_context! needs dist/ to exist)
+        run: pnpm build
+
+      - name: Run artifact IPC isolation check
+        run: cargo run --manifest-path src-tauri/Cargo.toml --example verify_artifact_ipc_isolation --target ${{ matrix.target }}
+        shell: bash
