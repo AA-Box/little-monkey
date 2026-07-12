@@ -18,6 +18,12 @@ import { useCheckpointStore, type CheckpointInfo } from "../../store/checkpointS
  * conversation only / both). */
 type RestoreScope = "files" | "conversation" | "both";
 
+/** Stable fallback for "no checkpoints for this session yet". Must be a
+ * module-level constant, not `[]` inlined in the selector — a fresh array
+ * literal per call spins `useSyncExternalStore` into an infinite re-render
+ * loop that blanks the whole app (see ProviderCard's `EMPTY_MODELS`). */
+const EMPTY_CHECKPOINTS: CheckpointInfo[] = [];
+
 type Translate = ReturnType<typeof useT>["t"];
 
 /** Coarse "N minute(s)/hour(s)/day(s) ago" label — matches this app's
@@ -308,7 +314,7 @@ export function CheckpointTimeline({ sessionId }: { sessionId: string }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  const checkpoints = useCheckpointStore((s) => s.bySession[sessionId] ?? []);
+  const checkpoints = useCheckpointStore((s) => s.bySession[sessionId] ?? EMPTY_CHECKPOINTS);
   const loading = useCheckpointStore((s) => Boolean(s.loadingSessions[sessionId]));
   const listError = useCheckpointStore((s) => s.errorsBySession[sessionId] ?? null);
   const refresh = useCheckpointStore((s) => s.refresh);
