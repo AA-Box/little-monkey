@@ -82,8 +82,16 @@
 
 html, body, #root { height: 100%; }
 
+html {
+  background-color: var(--color-background);
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 body {
   margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
   background-color: var(--color-background);
   color: var(--color-foreground);
   font-family: var(--font-sans);
