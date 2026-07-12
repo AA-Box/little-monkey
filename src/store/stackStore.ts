@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /** Mirrors the Rust `EmbeddingBackend` enum (src-tauri/src/stacks.rs) exactly. */
@@ -250,20 +250,24 @@ export const useStackStore = create<StackStore>((set, get) => ({
   },
 }));
 
-void listen<IndexProgressEvent>("stacks://index-progress", (event) => {
-  useStackStore.setState((state) => ({
-    indexProgress: { ...state.indexProgress, [event.payload.stack_id]: event.payload },
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for stacks://index-progress events", error);
-});
-
-void listen<EmbedStatusEvent>("embed://status", (event) => {
-  useStackStore.setState({
-    embedStatus: event.payload.status,
-    embedPort: event.payload.port,
-    embedModelPath: event.payload.model_path,
+// These backend events only exist under the Tauri shell — in plain-browser
+// dev (`vite` without it) `listen` itself throws, so don't subscribe at all.
+if (isTauri()) {
+  void listen<IndexProgressEvent>("stacks://index-progress", (event) => {
+    useStackStore.setState((state) => ({
+      indexProgress: { ...state.indexProgress, [event.payload.stack_id]: event.payload },
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for stacks://index-progress events", error);
   });
-}).catch((error) => {
-  console.error("Failed to listen for embed://status events", error);
-});
+
+  void listen<EmbedStatusEvent>("embed://status", (event) => {
+    useStackStore.setState({
+      embedStatus: event.payload.status,
+      embedPort: event.payload.port,
+      embedModelPath: event.payload.model_path,
+    });
+  }).catch((error) => {
+    console.error("Failed to listen for embed://status events", error);
+  });
+}

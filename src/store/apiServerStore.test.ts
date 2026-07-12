@@ -6,7 +6,7 @@ const invokeMock = vi.fn();
 // normal `let`/`var` closed over by a hoisted `vi.mock` factory is a
 // *different* binding than the one this file's test bodies read later.
 const statusHandlerRef = vi.hoisted(() => ({ current: null as ((event: { payload: unknown }) => void) | null }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (_name: string, handler: (event: { payload: unknown }) => void) => {
     statusHandlerRef.current = handler;
