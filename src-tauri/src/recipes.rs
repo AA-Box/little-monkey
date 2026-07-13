@@ -114,9 +114,18 @@ fn is_valid_recipe_name(name: &str) -> bool {
 
 /// Full validation beyond what `serde` already enforces (required fields
 /// present, right types): schema version supported, name is a valid slug,
-/// target's XOR constraint, and `permission_mode` is one of the six real
-/// modes — reusing `permissions::VALID_MODES` directly so this can never
-/// drift from what the permission gate itself accepts.
+/// target's XOR constraint, and `permission_mode` is a real mode per
+/// `permissions::VALID_MODES` — reusing that list directly so this can never
+/// drift from what the permission gate itself accepts — MINUS `bypass`,
+/// rejected separately below. A recipe can run fully unattended (croner-
+/// scheduled by `scheduler.ts`, or via `monkey-cli task run` in CI), and
+/// `bypass` short-circuits every tool prompt, `run_shell` included (see
+/// `permissions::mode_short_circuit`'s `bypass` arm) — allowing it here would
+/// let a scheduled/imported recipe execute arbitrary shell commands with no
+/// human ever present to catch it, silently contradicting the "run_shell is
+/// never auto-approved regardless of mode" invariant the rest of the app
+/// holds to. Every other real mode still degrades safely unattended: it
+/// prompts, gets no answer, and the run times out/fails instead of acting.
 pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
     if recipe.version != RECIPE_SCHEMA_VERSION {
         return Err(format!(
@@ -128,6 +137,14 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
         return Err(format!("recipe name '{}' must match [a-z0-9-]+", recipe.name));
     }
     recipe.target.validate()?;
+    if recipe.permission_mode == "bypass" {
+        return Err(
+            "recipe permission_mode 'bypass' is not allowed — recipes can run unattended, \
+             and bypass auto-approves every tool (including run_shell) with nobody present \
+             to catch it; pick a mode that still prompts or only auto-approves edits"
+                .to_string(),
+        );
+    }
     if !crate::permissions::VALID_MODES.contains(&recipe.permission_mode.as_str()) {
         return Err(format!(
             "recipe permission_mode '{}' is invalid (expected one of {:?})",
@@ -528,6 +545,39 @@ mod tests {
         assert!(t.validate().is_ok());
     }
 
+    /// Shared with `recipeStore.test.ts`'s canonical-fixture test — a single
+    /// fixture read by both a Rust unit test and a vitest test, not two
+    /// independently hand-typed literals, is what actually pins the
+    /// TS<->Rust schema against drift (ROADMAP.md §3 item 6). Recipes are
+    /// the schema most likely to be hand-edited by users (YAML files
+    /// authored outside either language), which makes this the fixture
+    /// pair with the most to protect. Exercises both `Option<T>` branches
+    /// (`workspace`/`system`/`max_iterations` absent, `description`/
+    /// `timeout_seconds` present) alongside `#[serde(default)]` leniency.
+    const CANONICAL_RECIPE_JSON: &str = include_str!("../fixtures/recipe.canonical.json");
+
+    #[test]
+    fn recipe_deserializes_canonical_fixture() {
+        let recipe: Recipe = serde_json::from_str(CANONICAL_RECIPE_JSON).unwrap();
+        assert_eq!(recipe.version, 1);
+        assert_eq!(recipe.name, "nightly-deps-audit");
+        assert_eq!(recipe.description.as_deref(), Some("Audit dependencies for known vulnerabilities and file a report"));
+        assert_eq!(recipe.target.provider.as_deref(), Some("openrouter"));
+        assert_eq!(recipe.target.model.as_deref(), Some("anthropic/claude-sonnet"));
+        assert_eq!(recipe.target.ollama, None);
+        assert_eq!(recipe.target.local_url, None);
+        assert_eq!(recipe.workspace, None);
+        assert_eq!(recipe.permission_mode, "acceptEdits");
+        assert_eq!(recipe.system, None);
+        assert_eq!(recipe.prompt, "Check {{manifest}} for outdated or vulnerable dependencies and summarize findings.");
+        assert_eq!(recipe.params.get("manifest"), Some(&Some("package.json".to_string())));
+        assert_eq!(recipe.max_iterations, None);
+        assert_eq!(recipe.timeout_seconds, Some(900));
+        assert!(!recipe.output.json);
+        // The fixture is a well-formed recipe, not just a well-formed shape.
+        assert!(validate_recipe(&recipe).is_ok());
+    }
+
     // --- validate_recipe ---
 
     #[test]
@@ -559,12 +609,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_recipe_accepts_every_real_permission_mode() {
+    fn validate_recipe_accepts_every_real_permission_mode_except_bypass() {
         for mode in crate::permissions::VALID_MODES {
             let mut r = valid_recipe();
             r.permission_mode = mode.to_string();
-            assert!(validate_recipe(&r).is_ok(), "expected '{mode}' to be accepted");
+            if *mode == "bypass" {
+                assert!(validate_recipe(&r).is_err(), "expected 'bypass' to be rejected");
+            } else {
+                assert!(validate_recipe(&r).is_ok(), "expected '{mode}' to be accepted");
+            }
         }
+    }
+
+    #[test]
+    fn validate_recipe_rejects_bypass_permission_mode() {
+        let mut r = valid_recipe();
+        r.permission_mode = "bypass".to_string();
+        let err = validate_recipe(&r).unwrap_err();
+        assert!(err.contains("bypass"), "error should mention bypass: {err}");
+        assert!(err.contains("unattended"), "error should explain why: {err}");
     }
 
     #[test]

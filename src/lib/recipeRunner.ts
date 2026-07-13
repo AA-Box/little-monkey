@@ -9,7 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { useModelStore } from "../store/modelStore";
 import { useSessionStore } from "../store/sessionStore";
-import { usePermissionStore, VALID_PERMISSION_MODES, type PermissionMode } from "../store/permissionStore";
+import { VALID_PERMISSION_MODES, type PermissionMode } from "../store/permissionStore";
 import type { Recipe } from "../store/recipeStore";
 import { formatRecipeNotice, runAgentTurn } from "./agentLoop";
 
@@ -46,18 +46,31 @@ function applyRecipeTarget(recipe: Recipe): void {
 
 /** Validates a recipe's `permission_mode` (or a scheduler override) against
  * the same source of truth `permissionStore.ts` itself uses, narrowing the
- * type on success. */
+ * type on success — then separately rejects `bypass`, exactly like
+ * `recipes.rs`'s `validate_recipe` does for the recipe's own field. That
+ * Rust check guards `recipe.permission_mode` at parse time, but
+ * `permissionModeOverride` (the scheduler's escape hatch, set outside any
+ * recipe file) never passes through `validate_recipe` at all — this is the
+ * only gate it gets, so it has to hold the same line: a recipe can run
+ * fully unattended, and `bypass` would auto-approve every tool, `run_shell`
+ * included, with nobody present to catch it. */
 function assertValidMode(mode: string): asserts mode is PermissionMode {
   if (!VALID_PERMISSION_MODES.includes(mode as PermissionMode)) {
     throw new Error(`Recipe permission_mode '${mode}' is not a valid mode (expected one of ${VALID_PERMISSION_MODES.join(", ")}).`);
+  }
+  if (mode === "bypass") {
+    throw new Error(
+      "Recipe permission_mode 'bypass' is not allowed — recipes can run unattended, and bypass auto-approves every tool (including run_shell) with nobody present to catch it.",
+    );
   }
 }
 
 /** What `runRecipeNow` hands back: `sessionId` is available immediately (so
  * the UI can switch to it and watch the turn stream in, same as any other
  * new session) while `done` resolves only once the underlying turn — and
- * this run's permission-mode restore — actually finish. UI callers ignore
- * `done`; `scheduler.ts` awaits it before recording the run's outcome. */
+ * this run's turn-scoped permission-mode override — actually clear. UI
+ * callers ignore `done`; `scheduler.ts` awaits it before recording the run's
+ * outcome. */
 export interface RecipeRunHandle {
   sessionId: string;
   done: Promise<void>;
@@ -67,23 +80,23 @@ export interface RecipeRunHandle {
  * Runs `recipe` now: renders its `{{param}}` placeholders server-side (via
  * `recipes_render` — the same substitution `recipes::render_recipe` does for
  * `monkey-cli task run`, so there is exactly one implementation, not two
- * independently maintained ones), applies its target and permission mode
- * (`permissionModeOverride`, if given — the scheduler's use — otherwise the
- * recipe's own `permission_mode`, restored once the turn finishes — see
- * `RecipeRunHandle`'s doc comment for why that isn't awaited here), and
- * creates a new tagged session with a `[Recipe]` notice marking where it
- * came from before starting the turn.
+ * independently maintained ones), applies its target, and creates a new
+ * tagged session with a `[Recipe]` notice marking where it came from before
+ * starting the turn under its own permission mode (`permissionModeOverride`,
+ * if given — the scheduler's use — otherwise the recipe's own
+ * `permission_mode`).
  *
- * The permission-mode swap uses the app's global mode, restored in a
- * `finally` once the turn settles — not the turn-scoped override
- * (`permissions.rs`'s `set_permission_mode_for_turn`, Phase 2b), which would
- * need `runAgentTurn` to expose its internally-generated turn id to callers;
- * it doesn't today, and changing that is out of scope for this pass (see
- * ROADMAP.md §3.10's own framing of the turn-scoped fix as "the eventual
- * correct fix" over this global set/restore dance). Concretely: a
- * concurrent split-pane turn in a DIFFERENT session could race the global
- * mode while this run is in flight — a known, accepted limitation, not a
- * silent one.
+ * The permission mode is applied via a turn-scoped override
+ * (`permissions.rs`'s `set_permission_mode_for_turn`/
+ * `clear_permission_mode_for_turn`, Phase 2b) rather than the app's single
+ * global mode: a turn id is minted here (instead of letting `runAgentTurn`
+ * generate its own) specifically so the override can be set *before* the
+ * turn's first tool call and cleared once `done` settles, with no window
+ * where this run's mode leaks into a concurrent turn in a different
+ * split-pane session, and no global mode left changed behind it. `recipe`
+ * validation already rejects `permission_mode: bypass` (see
+ * `recipes.rs`'s `validate_recipe`) — this scheduled/headless path never
+ * short-circuits every prompt with nobody present to catch it.
  */
 export async function runRecipeNow(
   recipe: Recipe,
@@ -103,8 +116,8 @@ export async function runRecipeNow(
 
   applyRecipeTarget(recipe);
 
-  const previousMode = usePermissionStore.getState().mode;
-  await usePermissionStore.getState().setMode(mode);
+  const turnId = crypto.randomUUID();
+  await invoke("set_permission_mode_for_turn", { turnId, mode });
 
   useSessionStore.getState().newSession();
   const sessionId = useSessionStore.getState().activeSessionId;
@@ -125,8 +138,8 @@ export async function runRecipeNow(
   // across further turns in the tagged session).
   const promptWithSystem = rendered.system ? `${rendered.system}\n\n${rendered.prompt}` : rendered.prompt;
 
-  const done = runAgentTurn(sessionId, promptWithSystem).finally(() => {
-    void usePermissionStore.getState().setMode(previousMode);
+  const done = runAgentTurn(sessionId, promptWithSystem, [], undefined, turnId).finally(() => {
+    void invoke("clear_permission_mode_for_turn", { turnId }).catch(() => {});
   });
 
   return { sessionId, done };

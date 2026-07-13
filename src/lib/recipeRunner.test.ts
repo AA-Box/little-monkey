@@ -5,10 +5,14 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
-const runAgentTurnMock = vi.fn(async (_sessionId: string, _userText: string) => {});
+const runAgentTurnMock = vi.fn(async (_sessionId: string, _userText: string, _attachments?: unknown[], _signal?: AbortSignal, _turnId?: string) => {});
 vi.mock("./agentLoop", async () => {
   const actual = await vi.importActual<typeof import("./agentLoop")>("./agentLoop");
-  return { ...actual, runAgentTurn: (sessionId: string, userText: string) => runAgentTurnMock(sessionId, userText) };
+  return {
+    ...actual,
+    runAgentTurn: (sessionId: string, userText: string, attachments?: unknown[], signal?: AbortSignal, turnId?: string) =>
+      runAgentTurnMock(sessionId, userText, attachments, signal, turnId),
+  };
 });
 
 import { runRecipeNow } from "./recipeRunner";
@@ -54,7 +58,10 @@ describe("runRecipeNow", () => {
     expect(session?.title).toBe("nightly-deps-audit");
     expect(session?.messages.some((m) => isRecipeNotice(m) && parseRecipeNotice(m)?.name === "nightly-deps-audit")).toBe(true);
 
-    expect(runAgentTurnMock).toHaveBeenCalledWith(sessionId, "Check package.json for outdated deps.");
+    const setCall = invokeMock.mock.calls.find(([cmd]) => cmd === "set_permission_mode_for_turn");
+    const turnId = (setCall?.[1] as { turnId: string } | undefined)?.turnId;
+    expect(turnId).toEqual(expect.any(String));
+    expect(runAgentTurnMock).toHaveBeenCalledWith(sessionId, "Check package.json for outdated deps.", [], undefined, turnId);
   });
 
   it("switches to a provider target when the recipe declares provider+model", async () => {
@@ -75,7 +82,9 @@ describe("runRecipeNow", () => {
     const { sessionId, done } = await runRecipeNow(recipe);
     await done;
 
-    expect(runAgentTurnMock).toHaveBeenCalledWith(sessionId, "You are auditing package.json.\n\nDo the thing.");
+    const setCall = invokeMock.mock.calls.find(([cmd]) => cmd === "set_permission_mode_for_turn");
+    const turnId = (setCall?.[1] as { turnId: string } | undefined)?.turnId;
+    expect(runAgentTurnMock).toHaveBeenCalledWith(sessionId, "You are auditing package.json.\n\nDo the thing.", [], undefined, turnId);
   });
 
   it("rejects a local_url target with a message pointing at monkey-cli task run, without touching the model store or starting a turn", async () => {
@@ -108,17 +117,27 @@ describe("runRecipeNow", () => {
     expect(runAgentTurnMock).not.toHaveBeenCalled();
   });
 
-  it("applies the recipe's own permission_mode before the turn starts, and restores the previous mode once it finishes", async () => {
+  it("applies the recipe's own permission_mode via a turn-scoped override before the turn starts, clears it once the turn finishes, and never touches the global mode", async () => {
     invokeMock.mockResolvedValueOnce({ prompt: "Do the thing.", system: null });
-    const recipe = makeRecipe({ permission_mode: "bypass" });
-    expect(usePermissionStore.getState().mode).toBe("manual");
+    const recipe = makeRecipe({ permission_mode: "acceptEdits" });
 
     const { done } = await runRecipeNow(recipe);
-    // The mode must already be applied by the time `runAgentTurn` is called,
-    // not just eventually — a permission prompt mid-turn depends on it.
-    expect(usePermissionStore.getState().mode).toBe("bypass");
+
+    const setCall = invokeMock.mock.calls.find(([cmd]) => cmd === "set_permission_mode_for_turn");
+    expect(setCall).toBeDefined();
+    const turnId = (setCall![1] as { turnId: string }).turnId;
+    expect(setCall![1]).toEqual({ turnId, mode: "acceptEdits" });
+    // The override must already be set by the time `runAgentTurn` is called —
+    // not just eventually — since a permission prompt mid-turn depends on it.
+    expect(runAgentTurnMock).toHaveBeenCalledWith(expect.any(String), "Do the thing.", [], undefined, turnId);
+    // Crucially: the app's single global mode is never touched by a recipe
+    // run — this is exactly the split-pane race the turn-scoped override
+    // replaces the old global set/restore dance to avoid.
+    expect(usePermissionStore.getState().mode).toBe("manual");
 
     await done;
+
+    expect(invokeMock).toHaveBeenCalledWith("clear_permission_mode_for_turn", { turnId });
     expect(usePermissionStore.getState().mode).toBe("manual");
   });
 
@@ -127,7 +146,9 @@ describe("runRecipeNow", () => {
     const recipe = makeRecipe({ permission_mode: "manual" });
 
     const { done } = await runRecipeNow(recipe, {}, "acceptEdits");
-    expect(usePermissionStore.getState().mode).toBe("acceptEdits");
+
+    const setCall = invokeMock.mock.calls.find(([cmd]) => cmd === "set_permission_mode_for_turn");
+    expect(setCall?.[1]).toMatchObject({ mode: "acceptEdits" });
 
     await done;
   });
@@ -138,5 +159,21 @@ describe("runRecipeNow", () => {
     await expect(runRecipeNow(recipe)).rejects.toThrow("not a valid mode");
     expect(invokeMock).not.toHaveBeenCalled();
     expect(usePermissionStore.getState().mode).toBe("manual");
+  });
+
+  it("rejects a recipe whose own permission_mode is 'bypass' before rendering or touching any store", async () => {
+    const recipe = makeRecipe({ permission_mode: "bypass" });
+
+    await expect(runRecipeNow(recipe)).rejects.toThrow("not allowed");
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(runAgentTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a scheduler permissionModeOverride of 'bypass' the same way, even when the recipe's own mode is safe", async () => {
+    const recipe = makeRecipe({ permission_mode: "manual" });
+
+    await expect(runRecipeNow(recipe, {}, "bypass")).rejects.toThrow("not allowed");
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(runAgentTurnMock).not.toHaveBeenCalled();
   });
 });

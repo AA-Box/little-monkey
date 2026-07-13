@@ -6,6 +6,9 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
 import { useRecipeStore, type DiscoveredRecipe, type Recipe } from "./recipeStore";
+// Shared with `recipes.rs`'s `recipe_deserializes_canonical_fixture` Rust
+// test — see that test's doc comment (ROADMAP.md §3 item 6).
+import canonicalRecipeFixture from "../../src-tauri/fixtures/recipe.canonical.json";
 
 function makeRecipe(overrides: Partial<Recipe> = {}): Recipe {
   return {
@@ -67,6 +70,21 @@ describe("recipeStore.refresh", () => {
     await useRecipeStore.getState().refresh();
 
     expect(useRecipeStore.getState().recipes).toEqual([broken]);
+  });
+
+  /** Reads the exact same file `recipes.rs`'s
+   * `recipe_deserializes_canonical_fixture` Rust test reads via
+   * `include_str!` — a single shared fixture, not two independently
+   * hand-typed literals, is what actually pins the TS<->Rust schema against
+   * drift (ROADMAP.md §3 item 6). `monkey-cli` reads `Recipe` directly out
+   * of a recipe file without going through this store at all. */
+  it("caches the same canonical recipe the Rust unit test pins", async () => {
+    const discovered = makeDiscovered({ recipe: canonicalRecipeFixture as unknown as Recipe });
+    invokeMock.mockResolvedValueOnce([discovered]);
+
+    await useRecipeStore.getState().refresh();
+
+    expect(useRecipeStore.getState().recipes).toEqual([discovered]);
   });
 });
 

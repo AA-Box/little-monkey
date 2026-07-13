@@ -1,0 +1,23 @@
+{
+    "version": 1,
+    "name": "nightly-deps-audit",
+    "description": "Audit dependencies for known vulnerabilities and file a report",
+    "target": {
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet",
+        "ollama": null,
+        "local_url": null
+    },
+    "workspace": null,
+    "permission_mode": "acceptEdits",
+    "system": null,
+    "prompt": "Check {{manifest}} for outdated or vulnerable dependencies and summarize findings.",
+    "params": {
+        "manifest": "package.json"
+    },
+    "max_iterations": null,
+    "timeout_seconds": 900,
+    "output": {
+        "json": false
+    }
+}

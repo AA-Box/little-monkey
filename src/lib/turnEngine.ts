@@ -160,6 +160,88 @@ export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): 
  * anything else) gets auto-approved. */
 const RISK_ELIGIBLE_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
 
+/** Same three tools, under the name that reads right at each of this
+ * argument-table's other call sites below (checkpoint_id/agent_label are
+ * about "this mutates," not "this gets a risk badge" — they're the same set
+ * today, but for a different reason). */
+const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
+
+/** Tools whose calls are permission-gated and therefore need `turn_id`, so
+ * Rust can scope a permission prompt (and, for run_shell/web_fetch, Stop-button
+ * cancellation) to the right in-flight turn. */
+const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
+
+/** Per-call context `RESERVED_ARGS`' `resolve` functions read from — one
+ * object built fresh by `executeToolCall` for each tool call, after risk
+ * classification has run (so `riskClassification` reflects this call). */
+interface ReservedArgContext {
+  name: string;
+  checkpointId: string | null;
+  turnId: string;
+  agentLabel?: string;
+  attachedStackNames?: string[];
+  riskClassification: RiskClassification | null;
+}
+
+/**
+ * The injected-args registry (ROADMAP.md §3 item 3): one table describing
+ * every tool-call argument that is frontend-owned — the model must never be
+ * able to supply or influence these itself (a model that always claimed
+ * "low" risk for its own edits, or forged another subagent's `agent_label`,
+ * would defeat the entire point of each being independently controlled).
+ * `scrubReservedArgs` deletes every one of these keys unconditionally, for
+ * every tool call, before anything (including risk classification) reads
+ * `args`; `injectReservedArgs`, called once the risk classification (if any)
+ * is known, sets back in only the keys whose `resolve` yields a defined
+ * value for this particular call. Replaces what used to be five independent
+ * hand-rolled scrub/inject blocks inline in `executeToolCall`.
+ */
+const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgContext) => unknown }> = [
+  // Computed just above the call to `injectReservedArgs` in `executeToolCall`
+  // — these two entries just re-attach that result under its two field names.
+  { key: 'risk_level', resolve: (ctx) => ctx.riskClassification?.level },
+  { key: 'risk_reason', resolve: (ctx) => ctx.riskClassification?.reason },
+  // Purely cosmetic subagent attribution (permissions.rs's
+  // `PermissionRequestPayload.agent_label`) — never affects which mode
+  // auto-approves what (see that field's own doc comment). Only meaningful
+  // for the three mutating tools, and only when a caller (`subagent.ts`)
+  // actually supplied one — every parent-turn call leaves `agentLabel`
+  // `undefined`, so this resolves to `undefined` too and the key is never
+  // added at all, not even as an explicit `null`.
+  { key: 'agent_label', resolve: (ctx) => (MUTATING_TOOLS.has(ctx.name) ? ctx.agentLabel : undefined) },
+  // Pins a pre-mutation backup to the right turn's own checkpoint — the
+  // split pane may hold its own concurrent one. `run_shell` doesn't snapshot
+  // anything but still gets the id so `record_shell` can flag `shell_ran`.
+  {
+    key: 'checkpoint_id',
+    resolve: (ctx) => (MUTATING_TOOLS.has(ctx.name) && ctx.checkpointId !== null ? ctx.checkpointId : undefined),
+  },
+  // Scopes permission prompts and shell/fetch cancellation to THIS turn —
+  // Stop in one pane must never touch the other pane's command or prompt.
+  { key: 'turn_id', resolve: (ctx) => (PERMISSION_GATED_TOOLS.has(ctx.name) ? ctx.turnId : undefined) },
+  // `search_docs` is scoped to THIS session's attached knowledge stacks
+  // server-side, never left to the model to declare — always overwritten
+  // (even with an empty array), never left merely scrubbed, so a compliant
+  // model that omits `stack` still gets the correct default-sweep allow-list
+  // (see `stacks.rs`'s `resolve_search_stack_ids` doc comment).
+  { key: 'allowed_stack_names', resolve: (ctx) => (ctx.name === 'search_docs' ? ctx.attachedStackNames ?? [] : undefined) },
+];
+
+function scrubReservedArgs(args: Record<string, unknown>): void {
+  for (const { key } of RESERVED_ARGS) {
+    delete args[key];
+  }
+}
+
+function injectReservedArgs(args: Record<string, unknown>, ctx: ReservedArgContext): void {
+  for (const { key, resolve } of RESERVED_ARGS) {
+    const value = resolve(ctx);
+    if (value !== undefined) {
+      args[key] = value;
+    }
+  }
+}
+
 /**
  * Everything `executeToolCall` needs to attach an advisory risk annotation to
  * a mutating tool call — see `riskJudge.ts`'s module doc comment for why
@@ -275,109 +357,30 @@ export async function executeToolCall(
     }
   }
 
-  // `risk_level`/`risk_reason` are frontend-owned, exactly like
-  // `checkpoint_id`/`turn_id` below — the model must never be able to smuggle
-  // its own risk rating through its tool-call arguments (a model that always
-  // claimed "low" for its own edits would defeat the entire point of an
-  // independent judge). Unconditionally deleted here, BEFORE anything else
-  // touches `args`, regardless of tool name or whether risk annotations are
-  // even enabled this turn, so there is no code path — now or from a future
-  // change to `RISK_ELIGIBLE_TOOLS` — where a model-supplied value survives.
-  delete args.risk_level;
-  delete args.risk_reason;
-  // `agent_label` (slice 3) is the same story: purely frontend-injected
-  // subagent attribution, sent to the Rust side as its own field (never
-  // folded into the permission-prompt `detail` text — see
-  // `PermissionRequestPayload.agent_label`'s doc comment in `permissions.rs`)
-  // and never something the model itself may supply. Scrubbed unconditionally,
-  // before the injection below, so a `code`-profile subagent's own model can
-  // never forge a *different* subagent's attribution (or the parent's lack
-  // of one) on its write_file/edit_file/run_shell calls.
-  delete args.agent_label;
+  // See `RESERVED_ARGS`'s doc comment: every frontend-owned key is scrubbed
+  // unconditionally, for every tool, before anything else (including risk
+  // classification below) ever reads `args` — so there is no code path where
+  // a model-supplied value for any of them survives.
+  scrubReservedArgs(args);
 
-  // Classify (cached per turn) BEFORE the checkpoint_id/turn_id injection
-  // below, so both the cache key and the judge prompt reflect only the
-  // model's actual call — not internal bookkeeping fields it never provided.
+  // Classify (cached per turn) on the now-scrubbed args, BEFORE
+  // `injectReservedArgs` below, so both the cache key and the judge prompt
+  // reflect only the model's actual call — not internal bookkeeping fields
+  // it never provided.
+  let riskClassification: RiskClassification | null = null;
   if (RISK_ELIGIBLE_TOOLS.has(name) && risk?.enabled) {
     const key = riskCacheKey(name, args);
-    let classification: RiskClassification | null;
     if (risk.cache.has(key)) {
-      classification = risk.cache.get(key) ?? null;
+      riskClassification = risk.cache.get(key) ?? null;
     } else {
-      classification = await risk.classify(name, args);
-      risk.cache.set(key, classification);
-    }
-    if (classification) {
-      args.risk_level = classification.level;
-      args.risk_reason = classification.reason;
+      riskClassification = await risk.classify(name, args);
+      risk.cache.set(key, riskClassification);
     }
   }
 
-  // File-mutating tools record a pre-mutation backup into this turn's own
-  // checkpoint — with the split pane, another turn (with its own checkpoint)
-  // may be running concurrently, so the id pins the backup to the right one.
-  // run_shell doesn't snapshot anything, but gets the same injected id so
-  // `record_shell` can flag the owning checkpoint's `shell_ran` — the
-  // revert-coverage caveat the UI shows. Injected here rather than exposed in
-  // the tool schema: the model must never pick (or fabricate) a checkpoint
-  // id. snake_case key — write_file/edit_file/run_shell all use
-  // `rename_all = "snake_case"` so the model's snake_case tool arguments
-  // (old_string, new_string) match without translation.
-  if (checkpointId !== null && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
-    args.checkpoint_id = checkpointId;
-  }
-  // `agent_label` (slice 3): injected ONLY when a caller supplied one — the
-  // parent turn's own tool calls never pass `agentLabel` at all, so this
-  // stays a no-op for them (no `agent_label` key at all, not even `undefined`
-  // — `tools.rs`'s `Option<String>` param treats an absent key the same as
-  // `null`/`None` either way). `subagent.ts`'s `runSubagentTask` is the one
-  // caller that passes its own `description` here, for every tool call ITS
-  // child model makes — forwarded all the way to
-  // `PermissionRequestPayload.agent_label`, its own serialized field, which
-  // `PermissionModal.tsx` reads directly (see that field's doc comment in
-  // `permissions.rs`). Purely cosmetic/informational: see that Rust
-  // function's doc comment for why it can never affect which mode
-  // auto-approves what.
-  if (agentLabel !== undefined && (name === 'write_file' || name === 'edit_file' || name === 'run_shell')) {
-    args.agent_label = agentLabel;
-  }
-  // The turn id scopes permission prompts and shell/fetch cancellation to
-  // THIS turn — Stop in one pane must not kill the other pane's command (or
-  // in-flight fetch) or deny its prompt. Injected like checkpoint_id (never
-  // model-supplied). All six commands use `rename_all = "snake_case"`, so
-  // all take the snake_case key. `remember`/`web_fetch`/`web_search` don't
-  // take a checkpoint_id (see tool_remember's/tool_web_fetch's/
-  // tool_web_search's doc comments in tools.rs/web.rs — none snapshots a
-  // workspace file), but all three are still permission-gated and need the
-  // turn id for that prompt (and, for web_fetch only, for Stop-button
-  // cancellation of the in-flight request — web_search's request is short
-  // and fixed-endpoint, so it gets `remember`'s simpler "turn id for the
-  // prompt only" treatment, see tool_web_search's doc comment).
-  if (
-    name === 'write_file' ||
-    name === 'edit_file' ||
-    name === 'run_shell' ||
-    name === 'remember' ||
-    name === 'web_fetch' ||
-    name === 'web_search'
-  ) {
-    args.turn_id = turnId;
-  }
-
-  // `search_docs` is scoped to THIS session's actually-attached knowledge
-  // stacks server-side, never left to the model to declare — same treatment
-  // as `checkpoint_id`/`turn_id` above. Injected (and always overwritten,
-  // even if the model's JSON args somehow already had a same-named key)
-  // regardless of whether the model passed a `stack` argument: `stacks.rs`'s
-  // `resolve_search_stack_ids` uses this as the allow-list for BOTH the
-  // explicit-name case and the "omit stack" default-sweep case, so a
-  // compliant model that just omits `stack` (the tool description's stated
-  // default) can never sweep in a knowledge stack that exists and is indexed
-  // but was never attached to this session — see that Rust function's doc
-  // comment for the privacy gap this closes.
-  if (name === 'search_docs') {
-    args.allowed_stack_names = attachedStackNames ?? [];
-  }
+  // Sets back in only the keys that apply to this tool call, from the
+  // frontend's own sources of truth — see `RESERVED_ARGS`.
+  injectReservedArgs(args, { name, checkpointId, turnId, agentLabel, attachedStackNames, riskClassification });
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
   // doc comment): it never reaches Rust at all, checked BEFORE the
