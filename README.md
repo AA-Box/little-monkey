@@ -1,6 +1,6 @@
-# Little Monkey
+# <img width="50" height="51" alt="LM-logo" src="https://github.com/user-attachments/assets/84651d01-f18b-4c49-b203-8d1b7e8f16b6" /> Little Monkey
 
-Little Monkey is a Tauri desktop app for running an agentic AI coding chat against local models, Ollama models, or OpenAI-compatible cloud providers. It combines a React chat UI with a Rust backend that manages model processes, workspace access, permissions, sessions, tool execution, and a growing set of agentic-coding staples (checkpoints, MCP, RAG, subagents, automations) — see [ROADMAP.md](ROADMAP.md) for what shipped in each milestone.
+Little Monkey is a Tauri desktop app for running an agentic AI coding chat against local models, Ollama models, or OpenAI-compatible cloud providers. It combines a React chat UI with a Rust backend that manages model processes, workspace access, permissions, sessions, tool execution, and a growing set of agentic-coding staples (checkpoints, MCP, RAG, subagents, automations).
 
 ## Features
 
