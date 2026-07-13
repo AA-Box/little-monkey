@@ -15,6 +15,7 @@ import { useModelStore } from "../../store/modelStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { useVerifyStore, type VerifyCommand, type VerifyCommandKind } from "../../store/verifyStore";
 import { useWebStore, type SearchProvider } from "../../store/webStore";
+import { useCliInstallStore } from "../../store/cliInstallStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
 
@@ -462,6 +463,75 @@ function WebSettingsSection() {
 }
 
 /**
+ * Controls the `monkey` terminal CLI's auto-install-onto-`PATH` behavior
+ * (cli_install.rs) — on by default. Turning it off doesn't just stop future
+ * auto-installs, it immediately uninstalls (removes the symlink/registry
+ * entry); turning it back on immediately reinstalls — see
+ * `cli_install_set_enabled`'s doc comment for why the toggle and reality are
+ * kept from ever visibly disagreeing. `status.error` surfaces a failed
+ * install/uninstall attempt (e.g. no writable PATH directory found) inline
+ * rather than only in a console log, since this runs silently at every
+ * launch otherwise and a stuck-off/stuck-on state would be invisible.
+ */
+function CliInstallSection() {
+  const { t } = useT();
+  const status = useCliInstallStore((s) => s.status);
+  const loaded = useCliInstallStore((s) => s.loaded);
+  const updating = useCliInstallStore((s) => s.updating);
+  const refresh = useCliInstallStore((s) => s.refresh);
+  const setEnabled = useCliInstallStore((s) => s.setEnabled);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const [toggleError, setToggleError] = useState<string | null>(null);
+
+  async function handleToggle(value: boolean) {
+    setToggleError(null);
+    try {
+      await setEnabled(value);
+    } catch (err) {
+      setToggleError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <section className="mt-5">
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("CliInstallSection.heading")}</h3>
+      <p className="mb-2 text-xs text-muted">{t("CliInstallSection.description")}</p>
+      <div className="rounded-lg border border-border bg-background px-3">
+        <Toggle
+          checked={status.enabled}
+          onChange={(value) => void handleToggle(value)}
+          label={t("CliInstallSection.toggleLabel")}
+          description={t("CliInstallSection.toggleDescription")}
+        />
+      </div>
+
+      {loaded && (
+        <div className="mt-2 flex items-center gap-2 text-xs">
+          {status.installed && status.install_path ? (
+            <>
+              <StatusPill tone={status.on_path ? "success" : "warning"}>
+                {status.on_path ? t("CliInstallSection.installedOnPath") : t("CliInstallSection.installedNotOnPath")}
+              </StatusPill>
+              <span className="truncate font-mono text-faint">{status.install_path}</span>
+            </>
+          ) : (
+            <StatusPill tone="neutral">
+              {status.enabled ? t("CliInstallSection.notInstalled") : t("CliInstallSection.disabled")}
+            </StatusPill>
+          )}
+          {updating && <span className="text-faint">{t("CliInstallSection.updating")}</span>}
+        </div>
+      )}
+      {(status.error || toggleError) && <p className="mt-1.5 text-xs text-danger">{status.error ?? toggleError}</p>}
+    </section>
+  );
+}
+
+/**
  * Settings tab for the client-side reliability behaviors this app ported
  * from the idea of a server-side multi-provider gateway: auto-failover,
  * vision-aware model auto-switch, adaptive context compaction, and
@@ -860,6 +930,7 @@ export function AutomationPanel() {
       </section>
 
       <WebSettingsSection />
+      <CliInstallSection />
     </div>
   );
 }

@@ -415,7 +415,7 @@ export const ja: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "記憶した事実",
   "RulesMemoryPanel.memoryToggleLabel": "エージェントに事実を記憶させる",
   "RulesMemoryPanel.memoryToggleDescription": "オフにすると、エージェントはrememberツールで新しい事実を保存できなくなります。既存の事実は引き続き適用されます — 記憶喪失にはなりません。",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "記憶した事実を表示するにはプロジェクトフォルダを開いてください。",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "プロジェクト固有の事実を追加または削除するにはプロジェクトフォルダを開いてください。",
   "RulesMemoryPanel.memoryEmpty": "まだ記憶された事実はありません。",
   "RulesMemoryPanel.memorySourceAgent": "エージェント",
   "RulesMemoryPanel.memorySourceUser": "ユーザー",

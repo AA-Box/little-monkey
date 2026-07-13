@@ -58,6 +58,11 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      - name: Build and stage monkey-cli sidecar
+        run: pnpm stage:cli
+        env:
+          CLI_SIDECAR_TARGET: ${{ matrix.target }}
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

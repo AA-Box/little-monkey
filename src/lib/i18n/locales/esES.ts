@@ -415,7 +415,7 @@ export const esES: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "Hechos recordados",
   "RulesMemoryPanel.memoryToggleLabel": "Permitir que el agente recuerde hechos",
   "RulesMemoryPanel.memoryToggleDescription": "Si está desactivado, el agente no puede guardar hechos nuevos con la herramienta remember. Los hechos existentes se siguen aplicando; esto no es amnesia.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Abre una carpeta de proyecto para ver sus hechos recordados.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Abre una carpeta de proyecto para añadir o borrar hechos específicos del proyecto.",
   "RulesMemoryPanel.memoryEmpty": "Todavía no se ha recordado ningún hecho.",
   "RulesMemoryPanel.memorySourceAgent": "agente",
   "RulesMemoryPanel.memorySourceUser": "usuario",

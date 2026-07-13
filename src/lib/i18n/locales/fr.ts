@@ -415,7 +415,7 @@ export const fr: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "Faits mémorisés",
   "RulesMemoryPanel.memoryToggleLabel": "Autoriser l'agent à mémoriser des faits",
   "RulesMemoryPanel.memoryToggleDescription": "Si désactivé, l'agent ne peut pas enregistrer de nouveaux faits avec l'outil remember. Les faits existants restent appliqués — ce n'est pas de l'amnésie.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Ouvrez un dossier de projet pour voir ses faits mémorisés.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Ouvrez un dossier de projet pour ajouter ou effacer des faits spécifiques au projet.",
   "RulesMemoryPanel.memoryEmpty": "Aucun fait mémorisé pour l'instant.",
   "RulesMemoryPanel.memorySourceAgent": "agent",
   "RulesMemoryPanel.memorySourceUser": "utilisateur",
