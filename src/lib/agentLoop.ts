@@ -1139,7 +1139,16 @@ export async function runAgentTurn(
   sessionId: string,
   userText: string,
   attachments: AttachmentRef[] = [],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // Caller-supplied turn id, in place of the `crypto.randomUUID()` this
+  // function generates internally by default. The one real consumer is
+  // `recipeRunner.ts`: it needs the id *before* the turn starts so it can
+  // call `permissions.rs`'s `set_permission_mode_for_turn` ahead of time
+  // (and `clear_permission_mode_for_turn` once `done` settles) instead of
+  // flipping the app's single global mode for the run's duration — see
+  // `RecipeRunHandle`'s doc comment. Every other caller omits this and gets
+  // an internally-generated id, unchanged from before.
+  turnIdOverride?: string
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1157,7 +1166,7 @@ export async function runAgentTurn(
   useSessionStore.getState().markTurnRunning(sessionId, true);
   const startedAt = Date.now();
   try {
-    await runTurnGuarded(sessionId, userText, attachments, controller.signal);
+    await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnIdOverride);
   } finally {
     turnControllers.delete(sessionId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
@@ -1205,7 +1214,8 @@ async function runTurnGuarded(
   sessionId: string,
   userText: string,
   attachments: AttachmentRef[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  turnIdOverride?: string
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -1236,7 +1246,7 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell
   // cancellation and permission prompts to this turn on the Rust side.
-  const turnId = crypto.randomUUID();
+  const turnId = turnIdOverride ?? crypto.randomUUID();
   try {
     await runAgentTurnBody(sessionId, userText, attachments, checkpointId, turnId, signal);
     maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
