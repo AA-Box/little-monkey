@@ -615,8 +615,11 @@ pub async fn tool_run_shell(
 /// acceptEdits/auto, blocked in plan mode — see `permissions::mode_short_circuit`).
 /// Takes no path — it only ever writes app-data, never a workspace file — so
 /// unlike the other mutating tools it skips `workspace::resolve_path_and_root`
-/// sandboxing entirely; it still requires a workspace to be open, since a
-/// fact has to be keyed by some project's canonical root.
+/// sandboxing entirely. When no workspace is open, the fact is keyed under
+/// `memory::GLOBAL_SCOPE_KEY` instead of a project root — otherwise a plain
+/// chat with no folder open (e.g. "remember my name") silently had nowhere
+/// to save to and the tool call failed outright, even though the model had
+/// already told the user it remembered.
 ///
 /// `checkpoint_id` is deliberately NOT accepted here (unlike write/edit/
 /// run_shell): a remembered fact isn't a workspace file, so there is nothing
@@ -638,7 +641,9 @@ pub async fn tool_remember(
     permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref(), None, None)
         .await?;
 
-    let root = workspace::primary_root_canon(state.inner())?;
+    let root = workspace::primary_root_canon(state.inner())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| memory::GLOBAL_SCOPE_KEY.to_string());
     let path = memory::memories_file_path(&app)?;
 
     // Serialized against concurrent split-pane `tool_remember` calls (and
@@ -647,7 +652,7 @@ pub async fn tool_remember(
     // unsynchronized concurrent writers could otherwise silently drop one
     // fact's write.
     let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root.to_string_lossy(), &text, "agent")
+    memory::add_fact_impl(&path, &root, &text, "agent")
 }
 
 /// Cancel in-flight tool invocations: kills running `tool_run_shell` child

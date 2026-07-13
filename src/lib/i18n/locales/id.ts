@@ -415,7 +415,7 @@ export const id: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "Fakta yang diingat",
   "RulesMemoryPanel.memoryToggleLabel": "Izinkan agen mengingat fakta",
   "RulesMemoryPanel.memoryToggleDescription": "Jika dinonaktifkan, agen tidak dapat menyimpan fakta baru dengan alat remember. Fakta yang sudah ada tetap berlaku — ini bukan amnesia.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Buka folder proyek untuk melihat fakta yang diingat.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Buka folder proyek untuk menambah atau menghapus fakta khusus proyek.",
   "RulesMemoryPanel.memoryEmpty": "Belum ada fakta yang diingat.",
   "RulesMemoryPanel.memorySourceAgent": "agen",
   "RulesMemoryPanel.memorySourceUser": "pengguna",

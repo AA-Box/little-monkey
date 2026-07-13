@@ -415,7 +415,7 @@ export const ko: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "기억된 사실",
   "RulesMemoryPanel.memoryToggleLabel": "에이전트가 사실을 기억하도록 허용",
   "RulesMemoryPanel.memoryToggleDescription": "끄면 에이전트가 remember 도구로 새 사실을 저장할 수 없습니다. 기존 사실은 계속 적용됩니다 — 기억 상실이 아닙니다.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "기억된 사실을 보려면 프로젝트 폴더를 여세요.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "프로젝트별 사실을 추가하거나 삭제하려면 프로젝트 폴더를 여세요.",
   "RulesMemoryPanel.memoryEmpty": "아직 기억된 사실이 없습니다.",
   "RulesMemoryPanel.memorySourceAgent": "에이전트",
   "RulesMemoryPanel.memorySourceUser": "사용자",

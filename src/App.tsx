@@ -22,9 +22,9 @@ import { hydrateAutomations } from "./store/automationsStore";
 import { startScheduler } from "./lib/scheduler";
 import { useT } from "./lib/i18n";
 import {
+  detectShortcutPlatform,
   shortcutIdForEvent,
   shouldHandleGlobalShortcut,
-  usesMacShortcuts,
   type ShortcutIdForScope,
 } from "./lib/shortcuts";
 
@@ -97,7 +97,7 @@ function App() {
 
   // App-wide accelerators. The same definitions are rendered by the
   // Keyboard Shortcuts Settings panel, so a displayed binding always has a
-  // live handler behind it on both macOS (Command) and Windows/Linux (Ctrl).
+  // live handler behind it with native modifiers on macOS, Windows, and Linux.
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       // Read at event time rather than closing over a render-time snapshot:
@@ -106,7 +106,7 @@ function App() {
       // recorder's target-level key handler can cancel an existing shortcut.
       const { overrides, recordingId } = useShortcutStore.getState();
       if (!shouldHandleGlobalShortcut(event, permissionPending, recordingId !== null)) return;
-      const shortcut = shortcutIdForEvent(event, "global", usesMacShortcuts(), overrides);
+      const shortcut = shortcutIdForEvent(event, "global", detectShortcutPlatform(), overrides);
       if (!shortcut) return;
 
       // Session-scoped commands (pin/rename/fork/archive/open-in-X) act on

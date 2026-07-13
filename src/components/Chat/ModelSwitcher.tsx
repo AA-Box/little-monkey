@@ -77,15 +77,15 @@ export function ModelSwitcher() {
   }
 
   return (
-    <div ref={containerRef} className="relative inline-block">
+    <div ref={containerRef} className="relative inline-block min-w-0 max-w-[10rem]">
       <button
         type="button"
         onClick={() => setOpen((prev) => !prev)}
         aria-haspopup="true"
         aria-expanded={open}
-        className="flex cursor-pointer items-center gap-1 text-xs font-mono text-muted hover:text-foreground"
+        className="flex w-full cursor-pointer items-center gap-1 text-xs font-mono text-muted hover:text-foreground"
       >
-        {label ? label : <span className="text-faint">{t("ModelSwitcher.noModel")}</span>}
+        {label ? <span className="truncate">{label}</span> : <span className="truncate text-faint">{t("ModelSwitcher.noModel")}</span>}
         <ChevronDown size={12} className="shrink-0" />
       </button>
 
