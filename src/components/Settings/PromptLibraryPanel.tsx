@@ -55,10 +55,10 @@ const EMPTY_DRAFT: DraftState = {
  * Settings "Prompts" tab: the saved persona/snippet list (kind badge, name,
  * `/command`, first-line preview, edit/delete) plus an inline create/edit
  * form — modeled on `McpPanel.tsx`/`AddMcpServerForm.tsx`'s shape. Personas
- * aren't applied to the conversation yet (that lands with the agent-loop
- * wiring in a later slice); this tab only manages the library and the kind
- * radio, and snippets are immediately usable via the "/"-command popup in
- * the chat input (see `SlashCommandAutocomplete.tsx`).
+ * selected via `PersonaSelector` flow into the system prompt per-turn (see
+ * `agentLoop.ts`); this tab manages the library and the kind radio, and
+ * snippets are immediately usable via the "/"-command popup in the chat
+ * input (see `SlashCommandAutocomplete.tsx`).
  */
 export function PromptLibraryPanel() {
   const { t } = useT();
