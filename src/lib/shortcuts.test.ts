@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  defaultShortcutBindings,
+  detectShortcutPlatform,
   effectiveShortcutBindings,
   findShortcutConflict,
   formatShortcutBinding,
@@ -8,6 +10,7 @@ import {
   matchesShortcut,
   sanitizeShortcutBinding,
   shortcutBindingFromEvent,
+  shortcutBindingSeparator,
   shortcutBindingsConflict,
   shortcutById,
   shortcutDisplayLabel,
@@ -58,13 +61,13 @@ describe("shortcut registry", () => {
     }
   });
 
-  it("has no duplicate chord within a scope on either platform", () => {
-    for (const isMac of [true, false]) {
+  it("has no duplicate chord within a scope on any platform", () => {
+    for (const platform of ["macos", "windows", "linux"] as const) {
       for (const group of SHORTCUT_GROUPS) {
         const seen = new Set<string>();
         for (const shortcut of SHORTCUTS.filter((entry) => entry.scope === group.id)) {
-          for (const binding of shortcut.bindings) {
-            const chord = formatShortcutBinding(binding, isMac).join("+");
+          for (const binding of defaultShortcutBindings(shortcut, platform)) {
+            const chord = formatShortcutBinding(binding, platform).join("+");
             expect(seen.has(chord), `${group.id} contains duplicate ${chord}`).toBe(false);
             seen.add(chord);
           }
@@ -116,6 +119,25 @@ describe("shortcut matching", () => {
         true,
       ),
     ).toBe("openShortcuts");
+  });
+
+  it("uses the slash default on Windows and Linux", () => {
+    for (const platform of ["windows", "linux"] as const) {
+      expect(
+        shortcutIdForEvent(
+          keyboardEvent({ key: "/", code: "Slash", ctrlKey: true }),
+          "global",
+          platform,
+        ),
+      ).toBe("openShortcuts");
+      expect(
+        shortcutIdForEvent(
+          keyboardEvent({ key: "?", code: "Slash", ctrlKey: true, shiftKey: true }),
+          "global",
+          platform,
+        ),
+      ).toBeNull();
+    }
   });
 
   it("matches the displayed logical key instead of a QWERTY physical position", () => {
@@ -276,6 +298,8 @@ describe("shortcut recording and validation", () => {
     expect(validateShortcutBinding("newSession", { key: "z", primary: true, shift: true }, true)).toBe("reserved");
     expect(validateShortcutBinding("newSession", { key: "F4", alt: true }, false)).toBe("reserved");
     expect(validateShortcutBinding("newSession", { key: "F4", alt: true, shift: true }, false)).toBe("reserved");
+    expect(validateShortcutBinding("newSession", { key: "k", meta: true }, "windows")).toBe("reserved");
+    expect(validateShortcutBinding("newSession", { key: "k", meta: true }, "linux")).toBeNull();
   });
 
   it("detects same-scope/global conflicts but permits contextual scope reuse", () => {
@@ -291,24 +315,49 @@ describe("shortcut recording and validation", () => {
     expect(findShortcutConflict("sessionCloseMenu", { key: "Escape" }, overrides)).toBeNull();
   });
 
-  it("detects primary aliases on both platform families", () => {
-    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", meta: true })).toBe(true);
-    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", control: true })).toBe(true);
-    expect(shortcutBindingsConflict({ key: "k", primary: true, shift: true }, { key: "k", control: true })).toBe(false);
+  it("detects primary aliases on the active platform only", () => {
+    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", meta: true }, "macos")).toBe(true);
+    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", meta: true }, "windows")).toBe(false);
+    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", meta: true }, "linux")).toBe(false);
+    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", control: true }, "macos")).toBe(false);
+    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", control: true }, "windows")).toBe(true);
+    expect(shortcutBindingsConflict({ key: "k", primary: true }, { key: "k", control: true }, "linux")).toBe(true);
+    expect(
+      shortcutBindingsConflict(
+        { key: "k", primary: true, shift: true },
+        { key: "k", control: true },
+        "windows",
+      ),
+    ).toBe(false);
   });
 });
 
 describe("shortcut display and search", () => {
   it("formats platform-native modifier labels", () => {
-    const openShortcuts = shortcutById("openShortcuts").bindings[0];
-    expect(formatShortcutBinding(openShortcuts, true)).toEqual(["⌘", "?"]);
-    expect(formatShortcutBinding(openShortcuts, false)).toEqual(["Ctrl", "?"]);
+    const shortcut = shortcutById("openShortcuts");
+    const macOpenShortcuts = defaultShortcutBindings(shortcut, "macos")[0];
+    const windowsOpenShortcuts = defaultShortcutBindings(shortcut, "windows")[0];
+    expect(formatShortcutBinding(macOpenShortcuts, "macos")).toEqual(["⌘", "?"]);
+    expect(formatShortcutBinding(windowsOpenShortcuts, "windows")).toEqual(["Ctrl", "/"]);
     expect(formatShortcutBinding(shortcutById("nextSuggestion").bindings[0], true)).toEqual(["↓"]);
-    expect(formatShortcutAriaLabel(openShortcuts, true)).toBe("Command plus Question mark");
+    expect(formatShortcutAriaLabel(macOpenShortcuts, "macos")).toBe("Command plus Question mark");
     expect(formatShortcutAriaLabel(shortcutById("insertLineBreak").bindings[0], false)).toBe("Shift plus Enter");
+    expect(formatShortcutBinding({ key: "k", meta: true }, "windows")).toEqual(["Win", "K"]);
+    expect(formatShortcutBinding({ key: "k", meta: true }, "linux")).toEqual(["Super", "K"]);
+    expect(formatShortcutAriaLabel({ key: "k", meta: true }, "windows")).toBe("Windows plus K");
+    expect(formatShortcutAriaLabel({ key: "k", meta: true }, "linux")).toBe("Super plus K");
+    expect(shortcutBindingSeparator("macos")).toBe("");
+    expect(shortcutBindingSeparator("windows")).toBe("+");
+    expect(shortcutBindingSeparator("linux")).toBe("+");
   });
 
-  it("detects Apple platforms", () => {
+  it("detects macOS, Windows, and Linux explicitly", () => {
+    expect(detectShortcutPlatform("MacIntel")).toBe("macos");
+    expect(detectShortcutPlatform("iPhone")).toBe("macos");
+    expect(detectShortcutPlatform("Win32")).toBe("windows");
+    expect(detectShortcutPlatform("Windows NT 10.0")).toBe("windows");
+    expect(detectShortcutPlatform("Linux x86_64")).toBe("linux");
+    expect(detectShortcutPlatform("X11")).toBe("linux");
     expect(usesMacShortcuts("MacIntel")).toBe(true);
     expect(usesMacShortcuts("iPhone")).toBe(true);
     expect(usesMacShortcuts("Win32")).toBe(false);
@@ -328,6 +377,7 @@ describe("shortcut display and search", () => {
     const macShortcut = shortcutById("openShortcuts");
     expect(shortcutMatchesQuery(macShortcut, "command", translate, true)).toBe(true);
     expect(shortcutMatchesQuery(macShortcut, "slash", translate, true)).toBe(true);
+    expect(shortcutMatchesQuery(macShortcut, "slash", translate, "windows")).toBe(true);
   });
 
   it("renders and searches effective user bindings", () => {

@@ -1,4 +1,7 @@
 export type ShortcutScope = "global" | "composer" | "suggestions" | "sessionMenu";
+export type ShortcutPlatform = "macos" | "windows" | "linux";
+/** Boolean support keeps older callers compatible while runtime code uses an explicit OS. */
+export type ShortcutPlatformInput = ShortcutPlatform | boolean;
 
 export interface ShortcutBinding {
   key: string;
@@ -18,6 +21,8 @@ export interface ShortcutDefinition {
   labelKey: string;
   descriptionKey: string;
   bindings: readonly ShortcutBinding[];
+  /** Optional OS-specific defaults. User overrides remain portable across platforms. */
+  platformBindings?: Partial<Record<ShortcutPlatform, readonly ShortcutBinding[]>>;
 }
 
 export interface ShortcutGroup {
@@ -52,7 +57,10 @@ export const SHORTCUTS = [
     scope: "global",
     labelKey: "SettingsModal.tabKeyboardShortcuts",
     descriptionKey: "KeyboardShortcutsPanel.openShortcutsDescription",
-    bindings: [{ key: "?", code: "Slash", primary: true }],
+    bindings: [{ key: "/", code: "Slash", primary: true }],
+    platformBindings: {
+      macos: [{ key: "?", code: "Slash", primary: true }],
+    },
   },
   {
     id: "toggleWorkspacePanel",
@@ -211,10 +219,30 @@ export type ShortcutEvent = Pick<
 type GlobalShortcutEvent = ShortcutEvent &
   Pick<KeyboardEvent, "defaultPrevented" | "repeat" | "isComposing">;
 
-export function usesMacShortcuts(platform?: string): boolean {
+export function detectShortcutPlatform(platform?: string): ShortcutPlatform {
   const currentPlatform =
-    platform ?? (typeof navigator === "undefined" ? "" : navigator.platform);
-  return /Mac|iPhone|iPad|iPod/i.test(currentPlatform);
+    platform ??
+    (typeof navigator === "undefined"
+      ? ""
+      : navigator.platform || navigator.userAgent);
+  if (/Mac|iPhone|iPad|iPod/i.test(currentPlatform)) return "macos";
+  if (/Win/i.test(currentPlatform)) return "windows";
+  return "linux";
+}
+
+export function resolveShortcutPlatform(
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
+): ShortcutPlatform {
+  if (typeof platform === "boolean") return platform ? "macos" : "windows";
+  return platform;
+}
+
+export function usesMacShortcuts(platform?: string): boolean {
+  return detectShortcutPlatform(platform) === "macos";
+}
+
+export function shortcutBindingSeparator(platform: ShortcutPlatformInput): "" | "+" {
+  return resolveShortcutPlatform(platform) === "macos" ? "" : "+";
 }
 
 export function shouldHandleGlobalShortcut(
@@ -228,12 +256,23 @@ export function shouldHandleGlobalShortcut(
 export function effectiveShortcutBindings(
   shortcut: ShortcutDefinition,
   overrides: ShortcutOverrides = {},
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): readonly ShortcutBinding[] {
   const override = overrides[shortcut.id as ShortcutId];
   // A shortcut must always remain usable. Treat an empty/corrupt override as
   // absent here as a final line of defence; the store also refuses to persist
   // empty binding arrays.
-  return Array.isArray(override) && override.length > 0 ? override : shortcut.bindings;
+  return Array.isArray(override) && override.length > 0
+    ? override
+    : defaultShortcutBindings(shortcut, platform);
+}
+
+export function defaultShortcutBindings(
+  shortcut: ShortcutDefinition,
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
+): readonly ShortcutBinding[] {
+  const currentPlatform = resolveShortcutPlatform(platform);
+  return shortcut.platformBindings?.[currentPlatform] ?? shortcut.bindings;
 }
 
 function keyMatches(event: ShortcutEvent, binding: ShortcutBinding): boolean {
@@ -249,8 +288,9 @@ function keyMatches(event: ShortcutEvent, binding: ShortcutBinding): boolean {
 export function matchesShortcut(
   event: ShortcutEvent,
   binding: ShortcutBinding,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): boolean {
+  const isMac = resolveShortcutPlatform(platform) === "macos";
   // On many Windows/Linux layouts AltGr reports as Control+Alt. It produces
   // text and must never be mistaken for a command chord.
   if (event.getModifierState?.("AltGraph")) return false;
@@ -279,18 +319,19 @@ export function matchesShortcut(
 export function shortcutIdForEvent<Scope extends ShortcutScope>(
   event: ShortcutEvent,
   scope: Scope,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
   overrides: ShortcutOverrides = {},
 ): ShortcutIdForScope<Scope> | null {
   const shortcut = SHORTCUTS.find(
     (candidate) =>
       candidate.scope === scope &&
-      effectiveShortcutBindings(candidate, overrides).some((binding) => matchesShortcut(event, binding, isMac)),
+      effectiveShortcutBindings(candidate, overrides, platform).some((binding) =>
+        matchesShortcut(event, binding, platform)),
   );
   return (shortcut?.id ?? null) as ShortcutIdForScope<Scope> | null;
 }
 
-export function shortcutById(id: ShortcutId): (typeof SHORTCUTS)[number] {
+export function shortcutById(id: ShortcutId): ShortcutDefinition {
   const shortcut = SHORTCUTS.find((candidate) => candidate.id === id);
   if (!shortcut) throw new Error(`Unknown shortcut: ${id}`);
   return shortcut;
@@ -313,14 +354,22 @@ const ACCESSIBLE_KEY_LABELS: Readonly<Record<string, string>> = {
   Tab: "Tab",
   " ": "Space",
   "?": "Question mark",
+  "/": "Slash",
   ",": "Comma",
 };
 
-export function formatShortcutBinding(binding: ShortcutBinding, isMac: boolean): string[] {
+export function formatShortcutBinding(
+  binding: ShortcutBinding,
+  platform: ShortcutPlatformInput,
+): string[] {
+  const currentPlatform = resolveShortcutPlatform(platform);
+  const isMac = currentPlatform === "macos";
   const parts: string[] = [];
   if (binding.primary) parts.push(isMac ? "⌘" : "Ctrl");
   if (binding.control && !(binding.primary && !isMac)) parts.push(isMac ? "⌃" : "Ctrl");
-  if (binding.meta && !(binding.primary && isMac)) parts.push(isMac ? "⌘" : "Meta");
+  if (binding.meta && !(binding.primary && isMac)) {
+    parts.push(isMac ? "⌘" : currentPlatform === "windows" ? "Win" : "Super");
+  }
   if (binding.alt) parts.push(isMac ? "⌥" : "Alt");
   // A question mark already communicates the Shift+/ keystroke and matches
   // how native application menus render this conventional shortcut.
@@ -334,18 +383,27 @@ export function formatShortcutBinding(binding: ShortcutBinding, isMac: boolean):
 
 export function shortcutDisplayLabel(
   id: ShortcutId,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
   overrides: ShortcutOverrides = {},
 ): string {
-  const [binding] = effectiveShortcutBindings(shortcutById(id), overrides);
-  return binding ? formatShortcutBinding(binding, isMac).join(isMac ? "" : "+") : "";
+  const [binding] = effectiveShortcutBindings(shortcutById(id), overrides, platform);
+  return binding
+    ? formatShortcutBinding(binding, platform).join(shortcutBindingSeparator(platform))
+    : "";
 }
 
-export function formatShortcutAriaLabel(binding: ShortcutBinding, isMac: boolean): string {
+export function formatShortcutAriaLabel(
+  binding: ShortcutBinding,
+  platform: ShortcutPlatformInput,
+): string {
+  const currentPlatform = resolveShortcutPlatform(platform);
+  const isMac = currentPlatform === "macos";
   const parts: string[] = [];
   if (binding.primary) parts.push(isMac ? "Command" : "Control");
   if (binding.control && !(binding.primary && !isMac)) parts.push("Control");
-  if (binding.meta && !(binding.primary && isMac)) parts.push(isMac ? "Command" : "Meta");
+  if (binding.meta && !(binding.primary && isMac)) {
+    parts.push(isMac ? "Command" : currentPlatform === "windows" ? "Windows" : "Super");
+  }
   if (binding.alt) parts.push(isMac ? "Option" : "Alt");
   if (binding.shift) parts.push("Shift");
   parts.push(
@@ -359,22 +417,30 @@ export function shortcutMatchesQuery(
   shortcut: ShortcutDefinition,
   query: string,
   translate: (key: string) => string,
-  isMac: boolean,
+  platform: ShortcutPlatformInput,
   overrides: ShortcutOverrides = {},
 ): boolean {
+  const currentPlatform = resolveShortcutPlatform(platform);
+  const isMac = currentPlatform === "macos";
   const normalizedQuery = query.trim().toLocaleLowerCase();
   if (!normalizedQuery) return true;
 
-  const bindingText = effectiveShortcutBindings(shortcut, overrides)
+  const bindingText = effectiveShortcutBindings(shortcut, overrides, platform)
     .flatMap((binding) => [
-      ...formatShortcutBinding(binding, isMac),
+      ...formatShortcutBinding(binding, platform),
       binding.primary ? (isMac ? "command cmd" : "control ctrl") : "",
       binding.control ? "control ctrl" : "",
-      binding.meta ? "meta super command" : "",
+      binding.meta
+        ? currentPlatform === "macos"
+          ? "meta command cmd"
+          : currentPlatform === "windows"
+            ? "meta windows win"
+            : "meta super"
+        : "",
       binding.alt ? (isMac ? "option alt" : "alt") : "",
       binding.shift ? "shift" : "",
       binding.key === "Escape" ? "escape" : "",
-      binding.key === "?" ? "question mark slash" : "",
+      binding.key === "?" ? "question mark slash" : binding.key === "/" ? "slash" : "",
     ])
     .join(" ");
   return [translate(shortcut.labelKey), translate(shortcut.descriptionKey), bindingText]
@@ -421,8 +487,9 @@ function isLetterKey(key: string): boolean {
 /** Converts a real keydown into a layout-aware, platform-portable binding. */
 export function shortcutBindingFromEvent(
   event: ShortcutEvent,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): ShortcutBinding | null {
+  const isMac = resolveShortcutPlatform(platform) === "macos";
   if (event.getModifierState?.("AltGraph")) return null;
   const key = normalizeShortcutKey(event.key);
   if (!key || key === "Dead" || key === "Process" || key === "Unidentified" || MODIFIER_KEYS.has(key)) {
@@ -481,8 +548,10 @@ export function sanitizeShortcutBinding(raw: unknown): ShortcutBinding | null {
 export function validateShortcutBinding(
   id: ShortcutId,
   binding: ShortcutBinding,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): ShortcutValidationError | null {
+  const currentPlatform = resolveShortcutPlatform(platform);
+  const isMac = currentPlatform === "macos";
   const shortcut = shortcutById(id);
   if (!binding.key || MODIFIER_KEYS.has(binding.key)) return "invalidKey";
   const hasCommandModifier =
@@ -510,7 +579,7 @@ export function validateShortcutBinding(
   const effectiveControl = binding.primary || binding.control;
   const reservedNonMac =
     !isMac &&
-    (binding.meta === true ||
+    ((currentPlatform === "windows" && binding.meta === true) ||
       (binding.alt === true && !binding.primary && !binding.control && key === "tab") ||
       (binding.alt === true && !binding.primary && !binding.control && key === "f4") ||
       (binding.alt === true && effectiveControl && key === "delete"));
@@ -529,7 +598,11 @@ export function shortcutBindingIdentity(binding: ShortcutBinding): string {
   ].join("|");
 }
 
-function platformShortcutBindingIdentity(binding: ShortcutBinding, isMac: boolean): string {
+function platformShortcutBindingIdentity(
+  binding: ShortcutBinding,
+  platform: ShortcutPlatformInput,
+): string {
+  const isMac = resolveShortcutPlatform(platform) === "macos";
   const meta = (binding.primary === true && isMac) || binding.meta === true;
   const control = (binding.primary === true && !isMac) || binding.control === true;
   return [
@@ -541,15 +614,14 @@ function platformShortcutBindingIdentity(binding: ShortcutBinding, isMac: boolea
   ].join("|");
 }
 
-/** True when two portable bindings collide on macOS or Windows/Linux. */
+/** True when two bindings resolve to the same chord on the active platform. */
 export function shortcutBindingsConflict(
   left: ShortcutBinding,
   right: ShortcutBinding,
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): boolean {
-  return (
-    platformShortcutBindingIdentity(left, true) === platformShortcutBindingIdentity(right, true) ||
-    platformShortcutBindingIdentity(left, false) === platformShortcutBindingIdentity(right, false)
-  );
+  return platformShortcutBindingIdentity(left, platform) ===
+    platformShortcutBindingIdentity(right, platform);
 }
 
 export function shortcutBindingsEqual(
@@ -573,14 +645,15 @@ export function findShortcutConflict(
   id: ShortcutId,
   binding: ShortcutBinding,
   overrides: ShortcutOverrides = {},
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): ShortcutId | null {
   const target = shortcutById(id);
   const conflict = SHORTCUTS.find(
     (candidate) =>
       candidate.id !== id &&
       scopesCanConflict(target.scope, candidate.scope) &&
-      effectiveShortcutBindings(candidate, overrides).some(
-        (otherBinding) => shortcutBindingsConflict(otherBinding, binding),
+      effectiveShortcutBindings(candidate, overrides, platform).some(
+        (otherBinding) => shortcutBindingsConflict(otherBinding, binding, platform),
       ),
   );
   return (conflict?.id ?? null) as ShortcutId | null;

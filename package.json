@@ -9,8 +9,10 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts"
+    "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
+    "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
+    "stage:cli": "node scripts/stage-cli-sidecar.mjs",
+    "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

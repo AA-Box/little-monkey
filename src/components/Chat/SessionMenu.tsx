@@ -24,9 +24,9 @@ import { useShortcutStore } from "../../store/shortcutStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { useT } from "../../lib/i18n";
 import {
+  detectShortcutPlatform,
   shortcutDisplayLabel,
   shortcutIdForEvent,
-  usesMacShortcuts,
   type ShortcutId,
   type ShortcutIdForScope,
 } from "../../lib/shortcuts";
@@ -80,8 +80,8 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
   const unarchiveSession = useSessionStore((s) => s.unarchiveSession);
   const deleteSession = useSessionStore((s) => s.deleteSession);
   const shortcutOverrides = useShortcutStore((s) => s.overrides);
-  const isMac = usesMacShortcuts();
-  const shortcutLabel = (id: ShortcutId) => shortcutDisplayLabel(id, isMac, shortcutOverrides);
+  const platform = detectShortcutPlatform();
+  const shortcutLabel = (id: ShortcutId) => shortcutDisplayLabel(id, platform, shortcutOverrides);
 
   const [newGroupOpen, setNewGroupOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
@@ -150,13 +150,13 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
       // App-wide commands are handled at window-capture level. Close this
       // contextual menu as they pass through so it cannot remain active and
       // steal the next Escape behind a newly opened Settings modal.
-      const eventIsMac = usesMacShortcuts();
-      if (shortcutIdForEvent(event, "global", eventIsMac, overrides)) {
+      const eventPlatform = detectShortcutPlatform();
+      if (shortcutIdForEvent(event, "global", eventPlatform, overrides)) {
         onClose();
         return;
       }
       if (newGroupOpen || event.defaultPrevented) return;
-      const shortcut = shortcutIdForEvent(event, "sessionMenu", eventIsMac, overrides);
+      const shortcut = shortcutIdForEvent(event, "sessionMenu", eventPlatform, overrides);
       if (!shortcut) return;
 
       const runAndClose = (action: () => void) => () => {

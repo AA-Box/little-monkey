@@ -415,7 +415,7 @@ export const es419: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "Datos recordados",
   "RulesMemoryPanel.memoryToggleLabel": "Permitir que el agente recuerde datos",
   "RulesMemoryPanel.memoryToggleDescription": "Si está desactivado, el agente no puede guardar datos nuevos con la herramienta remember. Los datos existentes se siguen aplicando; esto no es amnesia.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Abre una carpeta de proyecto para ver sus datos recordados.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Abre una carpeta de proyecto para agregar o borrar datos específicos del proyecto.",
   "RulesMemoryPanel.memoryEmpty": "Aún no se ha recordado ningún dato.",
   "RulesMemoryPanel.memorySourceAgent": "agente",
   "RulesMemoryPanel.memorySourceUser": "usuario",

@@ -119,6 +119,32 @@ describe("shortcutStore persistence and mutations", () => {
     expect(persisted().overrides).toEqual({});
   });
 
+  it("compares edits and resets against the current platform default", () => {
+    expect(
+      useShortcutStore.getState().replaceBinding(
+        "openShortcuts",
+        0,
+        { key: "/", code: "Slash", primary: true },
+        "windows",
+      ),
+    ).toEqual({ ok: true });
+    expect(useShortcutStore.getState().overrides.openShortcuts).toBeUndefined();
+
+    expect(
+      useShortcutStore.getState().replaceBinding(
+        "openShortcuts",
+        0,
+        { key: "/", code: "Slash", primary: true },
+        "macos",
+      ),
+    ).toEqual({ ok: true });
+    expect(useShortcutStore.getState().overrides.openShortcuts).toEqual([
+      { key: "/", code: "Slash", primary: true },
+    ]);
+    expect(useShortcutStore.getState().resetShortcut("openShortcuts", "macos")).toEqual({ ok: true });
+    expect(useShortcutStore.getState().overrides.openShortcuts).toBeUndefined();
+  });
+
   it("returns actionable conflict and validation failures without mutating state", () => {
     expect(
       useShortcutStore.getState().replaceBinding(
@@ -147,13 +173,21 @@ describe("shortcutStore persistence and mutations", () => {
     expect(useShortcutStore.getState().overrides).toEqual({});
   });
 
-  it("detects primary aliases when reporting conflicts on either platform", () => {
+  it("detects the active platform's primary-modifier aliases", () => {
+    expect(
+      useShortcutStore.getState().replaceBinding(
+        "openSettings",
+        0,
+        { key: "n", code: "KeyN", meta: true },
+        "macos",
+      ),
+    ).toEqual({ ok: false, reason: "conflict", conflictId: "newSession" });
     expect(
       useShortcutStore.getState().replaceBinding(
         "openSettings",
         0,
         { key: "n", code: "KeyN", control: true },
-        true,
+        "windows",
       ),
     ).toEqual({ ok: false, reason: "conflict", conflictId: "newSession" });
   });
@@ -273,6 +307,21 @@ describe("shortcutStore hydration", () => {
     });
 
     expect(hydrateShortcutOverrides(raw, true)).toEqual({});
+  });
+
+  it("sanitizes sparse overrides against the platform-specific defaults", () => {
+    const raw = JSON.stringify({
+      version: SHORTCUT_STORAGE_VERSION,
+      overrides: {
+        openShortcuts: [{ key: "/", code: "Slash", primary: true }],
+      },
+    });
+
+    expect(hydrateShortcutOverrides(raw, "windows")).toEqual({});
+    expect(hydrateShortcutOverrides(raw, "linux")).toEqual({});
+    expect(hydrateShortcutOverrides(raw, "macos")).toEqual({
+      openShortcuts: [{ key: "/", code: "Slash", primary: true }],
+    });
   });
 
   it("preserves a valid full-map swap instead of comparing against stale defaults", () => {
