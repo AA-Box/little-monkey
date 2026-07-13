@@ -83,6 +83,15 @@ export function isSwitchNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SWITCH_NOTE_PREFIX);
 }
 
+/** Matches the OpenRouter (and OpenAI-compat-alike) 404 body some free/small
+ * models return when tools are merely *offered* in the request, even for a
+ * turn the model never intended to call one — every turn offers the full
+ * tool list (see `toolsForTurn` below), so without this the model is
+ * unusable for plain chat too. Caught in `runAgentTurn` to retry the same
+ * target once with an empty tool list rather than surfacing a raw error or
+ * failing the target over. */
+const TOOL_UNSUPPORTED_ERROR_PATTERN = /support(?:s|ing)? tool use/i;
+
 /** Prefix identifying a synthetic notice listing "@"-mentions that failed to
  * resolve this turn (typo'd path, unreadable file — see `resolveReferences`)
  * — same pattern as `SWITCH_NOTE_PREFIX`, so the user learns why the model
@@ -940,6 +949,48 @@ function applyTargetSwitch(target: ResolvedTarget): void {
   // 'local' is never produced as a switch target — see buildFailoverChain/findVisionCandidate.
 }
 
+/** Whether `target` (an already-*resolved* target, unlike `activeTargetSatisfiesVision`
+ * below which reads live store state) can see images — used to decide whether
+ * older image-bearing turns still in `history` need stripping before this
+ * particular target sees them. See `stripImagesForTextOnlyTarget`. */
+function resolvedTargetSupportsVision(target: ResolvedTarget): boolean {
+  if (target.kind === 'provider') return isVisionCapableProviderModel(target.providerId, target.model);
+  if (target.kind === 'ollama') {
+    const model = useModelStore.getState().ollamaModels.find((m) => m.name === target.model);
+    return model ? isVisionCapableOllamaModel(model) : false;
+  }
+  return false;
+}
+
+/**
+ * A conversation can carry an image from an earlier turn (sent to a
+ * vision-capable model) into a later turn where the user has since switched
+ * to a text-only model — `requireVision` below only accounts for THIS turn's
+ * *new* attachments, not images already baked into stored history, so
+ * without this the text-only model's provider rejects the whole request over
+ * a `ChatContentPart[]` it can't parse (image content from turns ago). Called
+ * per-target (not just once) since a mid-turn failover can move between
+ * vision and non-vision targets. A no-op (returns `messages` unchanged) for
+ * a target that does support vision. The image bytes themselves are never
+ * recoverable here — a text-only model genuinely cannot see them regardless
+ * — but a bare `textContent()` call would also erase every *trace* that an
+ * image was ever attached, leaving the model to silently misread "what's in
+ * that image?" a few turns later as referring to nothing. A short marker is
+ * appended per stripped message instead, so the model at least knows why it
+ * can't answer.
+ */
+function stripImagesForTextOnlyTarget(messages: ChatMessage[], target: ResolvedTarget): ChatMessage[] {
+  if (resolvedTargetSupportsVision(target)) return messages;
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    const imageCount = message.content.filter((part) => part.type === 'image_url').length;
+    const text = textContent(message.content);
+    if (imageCount === 0) return { ...message, content: text };
+    const marker = `[${imageCount} image${imageCount > 1 ? 's' : ''} attached here — not visible to the current model]`;
+    return { ...message, content: text.length > 0 ? `${text}\n\n${marker}` : marker };
+  });
+}
+
 /** Whether the currently active target satisfies `requireVision` (always `true` when vision isn't required). Local llama.cpp models are never vision-capable — see `visionModels.ts`. */
 function activeTargetSatisfiesVision(requireVision: boolean): boolean {
   if (!requireVision) return true;
@@ -1355,6 +1406,23 @@ async function runAgentTurnBody(
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
   const primaryTarget = await resolveTarget();
+
+  // Distinct from the block above: that one is about a NEW image attached
+  // THIS turn; this one is an OLDER image already sitting in history from a
+  // previous turn, now that the resolved target can't see it (e.g. the user
+  // switched to a text-only model since). Deliberately not auto-switched —
+  // unlike the new-attachment case, silently jumping back to a vision model
+  // on every later turn would undo the user's own model choice — so this
+  // just surfaces a notice and leaves the decision to them.
+  // `stripImagesForTextOnlyTarget` (used below, per-target) does the actual
+  // stripping so the request itself doesn't fail either way.
+  if (!requireVision && !resolvedTargetSupportsVision(primaryTarget) && storedMessages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'))) {
+    addMessage({
+      role: 'system',
+      content: `${SWITCH_NOTE_PREFIX} This conversation has an earlier image that ${targetLabel(primaryTarget)} can't see — this reply won't see it either. Switch to a vision-capable model if you need it referenced.`,
+    });
+  }
+
   const sequence: ResolvedTarget[] =
     settings.autoFailoverEnabled && primaryTarget.kind === 'provider'
       ? [primaryTarget, ...buildFailoverChain(requireVision).filter((c) => !(c.kind === 'provider' && c.providerId === primaryTarget.providerId && c.model === primaryTarget.model))]
@@ -1549,17 +1617,38 @@ async function runAgentTurnBody(
     // itself (and what's stored/rendered) is left untouched. No substitution
     // is needed when there were no text references (`wireContent === null`):
     // `storedUserMessage` already carries any images directly.
-    const wireHistory: ChatMessage[] = [
+    const fullWireHistory: ChatMessage[] = [
       systemMessage,
       ...(wireContent !== null
         ? history.map((message) => (message === storedUserMessage ? { ...message, content: wireContent } : message))
         : history),
     ];
+    // Strips any image content left over from earlier turns when `target`
+    // can't see images — see `stripImagesForTextOnlyTarget`'s doc comment.
+    const wireHistoryFor = (t: ResolvedTarget): ChatMessage[] => stripImagesForTextOnlyTarget(fullWireHistory, t);
 
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
-    let attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+    let attempt = await attemptStream(target, wireHistoryFor(target), toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+
+    // Some cloud routes (notably free-tier OpenRouter models) reject a
+    // request outright just because tools were offered, even when the model
+    // never intended to call one this turn. Retry the SAME target once with
+    // no tools instead of treating it as a dead target — switching providers
+    // or surfacing a raw error would be wrong when the model is otherwise
+    // fine for a plain-text reply. Only tool_calls can be lost this way
+    // (`toolsForTurn` empty on retry means the model literally cannot emit
+    // one), so the outer round-trip loop just sees a normal plain answer.
+    if (attempt.streamError !== null && !attempt.contentStarted && toolsForTurn.length > 0 && TOOL_UNSUPPORTED_ERROR_PATTERN.test(attempt.streamError)) {
+      removeLastMessage();
+      addMessage({
+        role: 'system',
+        content: `${SWITCH_NOTE_PREFIX} ${targetLabel(target)} doesn't support tool calling — retrying this turn without tools.`,
+      });
+      addMessage({ role: 'assistant', content: '' });
+      attempt = await attemptStream(target, wireHistoryFor(target), [], signal, effort, sessionId, (content) => updateLastMessage({ content }));
+    }
 
     // Failover: only ever retry a *different* target when nothing streamed
     // back yet for this attempt — once tokens have started arriving, a
@@ -1578,7 +1667,7 @@ async function runAgentTurnBody(
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(target, wireHistoryFor(target), toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
     }
 
     const { content, toolCalls, streamError } = attempt;

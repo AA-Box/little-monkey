@@ -331,44 +331,42 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
         label={t("RulesMemoryPanel.memoryToggleLabel")}
         description={t("RulesMemoryPanel.memoryToggleDescription")}
       />
-      {!hasWorkspace ? (
-        <p className="text-xs text-faint">{t("RulesMemoryPanel.memoryNoWorkspaceOpen")}</p>
-      ) : (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-col gap-2">
-            {facts.length === 0 ? (
-              <p className="text-xs text-faint">{t("RulesMemoryPanel.memoryEmpty")}</p>
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2">
+          {facts.length === 0 ? (
+            <p className="text-xs text-faint">{t("RulesMemoryPanel.memoryEmpty")}</p>
+          ) : (
+            facts.map((fact) => <FactRow key={fact.id} fact={fact} onChanged={refresh} />)
+          )}
+        </div>
+
+        {facts.length > 0 && hasWorkspace && (
+          <div className="flex items-center justify-between gap-2 border-t border-border pt-2">
+            {confirmingClear ? (
+              <div className="flex flex-1 items-center justify-between gap-2">
+                <span className="text-xs text-warning">
+                  {t("RulesMemoryPanel.memoryClearConfirmPrompt", { count: facts.length })}
+                </span>
+                <div className="flex shrink-0 gap-1.5">
+                  <Button size="sm" variant="ghost" onClick={() => setConfirmingClear(false)} disabled={clearing}>
+                    {t("RulesMemoryPanel.memoryClearCancelButton")}
+                  </Button>
+                  <Button size="sm" variant="danger" onClick={() => void handleClearAll()} disabled={clearing}>
+                    {clearing ? t("RulesMemoryPanel.memoryClearingButton") : t("RulesMemoryPanel.memoryClearConfirmButton")}
+                  </Button>
+                </div>
+              </div>
             ) : (
-              facts.map((fact) => <FactRow key={fact.id} fact={fact} onChanged={refresh} />)
+              <Button size="sm" variant="ghost" onClick={() => setConfirmingClear(true)}>
+                <Trash2 size={12} />
+                {t("RulesMemoryPanel.memoryClearAllButton")}
+              </Button>
             )}
           </div>
+        )}
+        {clearError && <p className="text-xs text-danger">{t("RulesMemoryPanel.memoryErrorPrefix", { error: clearError })}</p>}
 
-          {facts.length > 0 && (
-            <div className="flex items-center justify-between gap-2 border-t border-border pt-2">
-              {confirmingClear ? (
-                <div className="flex flex-1 items-center justify-between gap-2">
-                  <span className="text-xs text-warning">
-                    {t("RulesMemoryPanel.memoryClearConfirmPrompt", { count: facts.length })}
-                  </span>
-                  <div className="flex shrink-0 gap-1.5">
-                    <Button size="sm" variant="ghost" onClick={() => setConfirmingClear(false)} disabled={clearing}>
-                      {t("RulesMemoryPanel.memoryClearCancelButton")}
-                    </Button>
-                    <Button size="sm" variant="danger" onClick={() => void handleClearAll()} disabled={clearing}>
-                      {clearing ? t("RulesMemoryPanel.memoryClearingButton") : t("RulesMemoryPanel.memoryClearConfirmButton")}
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <Button size="sm" variant="ghost" onClick={() => setConfirmingClear(true)}>
-                  <Trash2 size={12} />
-                  {t("RulesMemoryPanel.memoryClearAllButton")}
-                </Button>
-              )}
-            </div>
-          )}
-          {clearError && <p className="text-xs text-danger">{t("RulesMemoryPanel.memoryErrorPrefix", { error: clearError })}</p>}
-
+        {hasWorkspace ? (
           <div className="flex flex-col gap-1.5 rounded-lg border border-dashed border-border p-2.5">
             <textarea
               value={newFactText}
@@ -394,8 +392,10 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
             </div>
             {addError && <p className="text-xs text-danger">{t("RulesMemoryPanel.memoryErrorPrefix", { error: addError })}</p>}
           </div>
-        </div>
-      )}
+        ) : (
+          <p className="text-xs text-faint">{t("RulesMemoryPanel.memoryNoWorkspaceOpen")}</p>
+        )}
+      </div>
     </section>
   );
 }

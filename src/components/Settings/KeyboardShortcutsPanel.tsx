@@ -1,35 +1,38 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Pencil, Plus, RotateCcw, Search, Trash2 } from "lucide-react";
+import { Monitor, Pencil, Plus, RotateCcw, Search, Trash2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
 import { usePermissionStore } from "../../store/permissionStore";
 import {
+  defaultShortcutBindings,
+  detectShortcutPlatform,
   effectiveShortcutBindings,
   findShortcutConflict,
   formatShortcutAriaLabel,
   formatShortcutBinding,
   shortcutBindingFromEvent,
+  shortcutBindingSeparator,
   shortcutBindingsConflict,
   shortcutById,
   shortcutMatchesQuery,
   SHORTCUT_GROUPS,
   SHORTCUTS,
-  usesMacShortcuts,
   validateShortcutBinding,
   type ShortcutBinding,
   type ShortcutId,
+  type ShortcutPlatform,
   type ShortcutValidationError,
 } from "../../lib/shortcuts";
 import { MAX_SHORTCUT_BINDINGS, useShortcutStore } from "../../store/shortcutStore";
 import { Button } from "../ui";
 
-function ShortcutKeys({ binding, isMac }: { binding: ShortcutBinding; isMac: boolean }) {
-  const parts = formatShortcutBinding(binding, isMac);
+function ShortcutKeys({ binding, platform }: { binding: ShortcutBinding; platform: ShortcutPlatform }) {
+  const parts = formatShortcutBinding(binding, platform);
   return (
     <span
       className="inline-flex items-center gap-1"
       role="img"
-      aria-label={formatShortcutAriaLabel(binding, isMac)}
+      aria-label={formatShortcutAriaLabel(binding, platform)}
     >
       {parts.map((part, index) => (
         <kbd
@@ -67,7 +70,15 @@ export function KeyboardShortcutsPanel() {
   const recorderRef = useRef<HTMLButtonElement>(null);
   const reviewRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-  const isMac = useMemo(() => usesMacShortcuts(), []);
+  const platform = useMemo(() => detectShortcutPlatform(), []);
+  const separator = shortcutBindingSeparator(platform);
+  const platformName = t(
+    platform === "macos"
+      ? "KeyboardShortcutsPanel.platformMacos"
+      : platform === "windows"
+        ? "KeyboardShortcutsPanel.platformWindows"
+        : "KeyboardShortcutsPanel.platformLinux",
+  );
   const permissionPending = usePermissionStore((state) => state.pending !== null);
 
   const overrides = useShortcutStore((state) => state.overrides);
@@ -84,32 +95,33 @@ export function KeyboardShortcutsPanel() {
     () =>
       SHORTCUT_GROUPS.map((group) => {
         const shortcuts = SHORTCUTS.filter((shortcut) => shortcut.scope === group.id).filter(
-          (shortcut) => shortcutMatchesQuery(shortcut, query, t, isMac, overrides),
+          (shortcut) => shortcutMatchesQuery(shortcut, query, t, platform, overrides),
         );
         return { ...group, shortcuts };
       }).filter((group) => group.shortcuts.length > 0),
-    [isMac, overrides, query, t],
+    [overrides, platform, query, t],
   );
   const resultCount = groups.reduce((count, group) => count + group.shortcuts.length, 0);
   const hasCustomizations = Object.keys(overrides).length > 0;
 
   const currentEditorBindings = editor
-    ? effectiveShortcutBindings(shortcutById(editor.id), overrides)
+    ? effectiveShortcutBindings(shortcutById(editor.id), overrides, platform)
     : [];
   const draftValidation: ShortcutValidationError | null =
-    editor && draft ? validateShortcutBinding(editor.id, draft, isMac) : null;
+    editor && draft ? validateShortcutBinding(editor.id, draft, platform) : null;
   const draftDuplicate = Boolean(
     editor &&
       draft &&
       currentEditorBindings.some(
-        (binding, index) => index !== editor.index && shortcutBindingsConflict(binding, draft),
+        (binding, index) =>
+          index !== editor.index && shortcutBindingsConflict(binding, draft, platform),
       ),
   );
   const draftConflictId =
     editor && draft && !draftValidation && !draftDuplicate
-      ? findShortcutConflict(editor.id, draft, overrides)
+      ? findShortcutConflict(editor.id, draft, overrides, platform)
       : null;
-  const draftLabel = draft ? formatShortcutBinding(draft, isMac).join(isMac ? "" : "+") : "";
+  const draftLabel = draft ? formatShortcutBinding(draft, platform).join(separator) : "";
 
   const restoreFocus = (elementId: string) => {
     requestAnimationFrame(() => {
@@ -154,7 +166,7 @@ export function KeyboardShortcutsPanel() {
       event.stopImmediatePropagation();
       if (event.repeat || event.isComposing) return;
 
-      const binding = shortcutBindingFromEvent(event, isMac);
+      const binding = shortcutBindingFromEvent(event, platform);
       if (!binding) {
         setEditorError(
           event.key === "Dead" || event.key === "Process" || event.key === "Unidentified"
@@ -186,7 +198,7 @@ export function KeyboardShortcutsPanel() {
       window.removeEventListener("keydown", handleRecordedKey, true);
       window.removeEventListener("keyup", handleRecordedKeyUp, true);
     };
-  }, [editor, isMac, recordingId, stopRecording, t]);
+  }, [editor, platform, recordingId, stopRecording, t]);
 
   useEffect(() => {
     if (editor && recordingId === editor.id) recorderRef.current?.focus();
@@ -236,8 +248,8 @@ export function KeyboardShortcutsPanel() {
   const saveDraft = () => {
     if (!editor || !draft || validationError) return;
     const result = editor.index < currentEditorBindings.length
-      ? replaceBinding(editor.id, editor.index, draft, isMac)
-      : addBinding(editor.id, draft, isMac);
+      ? replaceBinding(editor.id, editor.index, draft, platform)
+      : addBinding(editor.id, draft, platform);
     if (!result.ok) {
       if (result.reason === "conflict" && result.conflictId) {
         setEditorError(
@@ -272,13 +284,13 @@ export function KeyboardShortcutsPanel() {
 
   const handleRemove = (id: ShortcutId, index: number) => {
     const shortcut = shortcutById(id);
-    const bindings = effectiveShortcutBindings(shortcut, overrides);
+    const bindings = effectiveShortcutBindings(shortcut, overrides, platform);
     const binding = bindings[index];
     if (!binding) {
       setStatus(t("KeyboardShortcutsPanel.lastBindingError"));
       return;
     }
-    const result = removeBinding(id, index);
+    const result = removeBinding(id, index, platform);
     if (!result.ok) {
       setStatus(t("KeyboardShortcutsPanel.lastBindingError"));
       return;
@@ -286,7 +298,7 @@ export function KeyboardShortcutsPanel() {
     if (editor?.id === id) closeEditor(false);
     setStatus(
       t("KeyboardShortcutsPanel.removedStatus", {
-        shortcut: formatShortcutBinding(binding, isMac).join(isMac ? "" : "+"),
+        shortcut: formatShortcutBinding(binding, platform).join(separator),
         action: t(shortcut.labelKey),
       }),
     );
@@ -295,15 +307,17 @@ export function KeyboardShortcutsPanel() {
 
   const handleResetShortcut = (id: ShortcutId) => {
     const action = t(shortcutById(id).labelKey);
-    const result = resetShortcut(id);
+    const result = resetShortcut(id, platform);
     if (!result.ok) {
       if (result.reason === "conflict" && result.conflictId) {
         const resetPreview = { ...overrides };
         delete resetPreview[id];
-        const defaultBinding = shortcutById(id).bindings.find(
-          (binding) => findShortcutConflict(id, binding, resetPreview) === result.conflictId,
-        ) ?? shortcutById(id).bindings[0];
-        const defaultLabel = formatShortcutBinding(defaultBinding, isMac).join(isMac ? "" : "+");
+        const defaultBindings = defaultShortcutBindings(shortcutById(id), platform);
+        const defaultBinding = defaultBindings.find(
+          (binding) =>
+            findShortcutConflict(id, binding, resetPreview, platform) === result.conflictId,
+        ) ?? defaultBindings[0];
+        const defaultLabel = formatShortcutBinding(defaultBinding, platform).join(separator);
         setStatus(
           t("KeyboardShortcutsPanel.conflictError", {
             shortcut: defaultLabel,
@@ -339,9 +353,15 @@ export function KeyboardShortcutsPanel() {
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <p className="max-w-2xl text-sm leading-6 text-muted">
-          {t("KeyboardShortcutsPanel.description")}
-        </p>
+        <div className="flex max-w-2xl flex-col items-start gap-2">
+          <p className="text-sm leading-6 text-muted">
+            {t("KeyboardShortcutsPanel.description")}
+          </p>
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface-2 px-2.5 py-1 text-xs font-medium text-foreground">
+            <Monitor size={13} aria-hidden="true" />
+            {t("KeyboardShortcutsPanel.platformContext", { platform: platformName })}
+          </span>
+        </div>
         {hasCustomizations && !confirmResetAll && (
           <Button
             id="keyboard-shortcuts-reset-all"
@@ -421,7 +441,7 @@ export function KeyboardShortcutsPanel() {
             </h3>
             <div className="overflow-hidden rounded-xl border border-border bg-surface">
               {group.shortcuts.map((shortcut, shortcutIndex) => {
-                const bindings = effectiveShortcutBindings(shortcut, overrides);
+                const bindings = effectiveShortcutBindings(shortcut, overrides, platform);
                 const customized = hasOwnShortcut(overrides, shortcut.id);
                 const editing = editor?.id === shortcut.id;
                 return (
@@ -445,7 +465,7 @@ export function KeyboardShortcutsPanel() {
 
                     <div className="flex max-w-full flex-wrap items-center gap-2 lg:justify-end">
                       {bindings.map((binding, bindingIndex) => {
-                        const bindingLabel = formatShortcutBinding(binding, isMac).join(isMac ? "" : "+");
+                        const bindingLabel = formatShortcutBinding(binding, platform).join(separator);
                         const bindingId = `shortcut-${shortcut.id}-binding-${bindingIndex}`;
                         return (
                           <div key={`${shortcut.id}-${bindingIndex}`} className="flex items-center gap-1">
@@ -464,7 +484,7 @@ export function KeyboardShortcutsPanel() {
                               })}
                               className="flex min-h-11 items-center gap-2 rounded-lg border border-transparent px-1.5 transition-colors hover:border-border-strong hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                             >
-                              <ShortcutKeys binding={binding} isMac={isMac} />
+                              <ShortcutKeys binding={binding} platform={platform} />
                               <Pencil size={13} className="text-faint" aria-hidden="true" />
                             </button>
                             {bindings.length > 1 && (
@@ -555,7 +575,7 @@ export function KeyboardShortcutsPanel() {
                             <span className="text-xs font-medium text-muted">
                               {t("KeyboardShortcutsPanel.draftLabel")}
                             </span>
-                            <ShortcutKeys binding={draft} isMac={isMac} />
+                            <ShortcutKeys binding={draft} platform={platform} />
                             <button
                               type="button"
                               onClick={saveDraft}

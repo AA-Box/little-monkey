@@ -2,6 +2,8 @@ import { create } from "zustand";
 
 import {
   SHORTCUTS,
+  defaultShortcutBindings,
+  detectShortcutPlatform,
   effectiveShortcutBindings,
   findShortcutConflict,
   sanitizeShortcutBinding,
@@ -9,10 +11,10 @@ import {
   shortcutBindingsEqual,
   shortcutById,
   validateShortcutBinding,
-  usesMacShortcuts,
   type ShortcutBinding,
   type ShortcutId,
   type ShortcutOverrides,
+  type ShortcutPlatformInput,
   type ShortcutValidationError,
 } from "../lib/shortcuts";
 
@@ -48,15 +50,19 @@ export interface ShortcutState {
     id: ShortcutId,
     index: number,
     binding: ShortcutBinding,
-    isMac?: boolean,
+    platform?: ShortcutPlatformInput,
   ) => ShortcutMutationResult;
   addBinding: (
     id: ShortcutId,
     binding: ShortcutBinding,
-    isMac?: boolean,
+    platform?: ShortcutPlatformInput,
   ) => ShortcutMutationResult;
-  removeBinding: (id: ShortcutId, index: number) => ShortcutMutationResult;
-  resetShortcut: (id: ShortcutId) => ShortcutMutationResult;
+  removeBinding: (
+    id: ShortcutId,
+    index: number,
+    platform?: ShortcutPlatformInput,
+  ) => ShortcutMutationResult;
+  resetShortcut: (id: ShortcutId, platform?: ShortcutPlatformInput) => ShortcutMutationResult;
   resetAll: () => void;
 }
 
@@ -66,8 +72,12 @@ function own<T extends object>(value: T, key: PropertyKey): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function mutableBindings(id: ShortcutId, overrides: ShortcutOverrides): ShortcutBinding[] {
-  return effectiveShortcutBindings(shortcutById(id), overrides).map((binding) => ({ ...binding }));
+function mutableBindings(
+  id: ShortcutId,
+  overrides: ShortcutOverrides,
+  platform: ShortcutPlatformInput,
+): ShortcutBinding[] {
+  return effectiveShortcutBindings(shortcutById(id), overrides, platform).map((binding) => ({ ...binding }));
 }
 
 function sanitizedBinding(raw: unknown): ShortcutBinding | null {
@@ -80,9 +90,10 @@ function sparseOverride(
   overrides: ShortcutOverrides,
   id: ShortcutId,
   bindings: readonly ShortcutBinding[],
+  platform: ShortcutPlatformInput,
 ): ShortcutOverrides {
   const next: ShortcutOverrides = { ...overrides };
-  const defaults = shortcutById(id).bindings;
+  const defaults = defaultShortcutBindings(shortcutById(id), platform);
   if (shortcutBindingsEqual(bindings, defaults)) {
     delete next[id];
   } else {
@@ -97,20 +108,21 @@ function validationResult(
   currentBindings: readonly ShortcutBinding[],
   ignoredIndex: number | null,
   overrides: ShortcutOverrides,
-  isMac: boolean,
+  platform: ShortcutPlatformInput,
 ): ShortcutMutationResult {
   const sanitized = sanitizedBinding(binding);
   if (!sanitized) return { ok: false, reason: "invalidKey" };
 
-  const validationError = validateShortcutBinding(id, sanitized, isMac);
+  const validationError = validateShortcutBinding(id, sanitized, platform);
   if (validationError) return { ok: false, reason: validationError };
 
   const duplicate = currentBindings.some(
-    (candidate, index) => index !== ignoredIndex && shortcutBindingsConflict(candidate, sanitized),
+    (candidate, index) =>
+      index !== ignoredIndex && shortcutBindingsConflict(candidate, sanitized, platform),
   );
   if (duplicate) return { ok: false, reason: "conflict", conflictId: id };
 
-  const conflictId = findShortcutConflict(id, sanitized, overrides);
+  const conflictId = findShortcutConflict(id, sanitized, overrides, platform);
   if (conflictId) return { ok: false, reason: "conflict", conflictId };
   return { ok: true };
 }
@@ -122,7 +134,7 @@ function validationResult(
  */
 export function sanitizeShortcutOverrides(
   raw: unknown,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): ShortcutOverrides {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const source = raw as Record<string, unknown>;
@@ -140,15 +152,15 @@ export function sanitizeShortcutOverrides(
     const bindings: ShortcutBinding[] = [];
     for (const rawBinding of rawBindings.slice(0, MAX_SHORTCUT_BINDINGS)) {
       const binding = sanitizedBinding(rawBinding);
-      if (!binding || validateShortcutBinding(shortcut.id, binding, isMac)) continue;
-      if (bindings.some((candidate) => shortcutBindingsConflict(candidate, binding))) continue;
+      if (!binding || validateShortcutBinding(shortcut.id, binding, platform)) continue;
+      if (bindings.some((candidate) => shortcutBindingsConflict(candidate, binding, platform))) continue;
       bindings.push(binding);
     }
 
     // An override may never disable a command. If every stored binding was
     // rejected, leave the id absent so the registry default remains active.
     if (bindings.length === 0) continue;
-    candidates = sparseOverride(candidates, shortcut.id, bindings);
+    candidates = sparseOverride(candidates, shortcut.id, bindings, platform);
   }
 
   // Hand-edited data can still contain cross-action collisions. Drop a
@@ -160,8 +172,8 @@ export function sanitizeShortcutOverrides(
     changed = false;
     for (const shortcut of SHORTCUTS) {
       if (!own(candidates, shortcut.id)) continue;
-      const bindings = effectiveShortcutBindings(shortcut, candidates);
-      if (bindings.some((binding) => findShortcutConflict(shortcut.id, binding, candidates))) {
+      const bindings = effectiveShortcutBindings(shortcut, candidates, platform);
+      if (bindings.some((binding) => findShortcutConflict(shortcut.id, binding, candidates, platform))) {
         const next: ShortcutOverrides = { ...candidates };
         delete next[shortcut.id];
         candidates = next;
@@ -175,13 +187,13 @@ export function sanitizeShortcutOverrides(
 /** Parses the versioned storage envelope and returns safe sparse overrides. */
 export function hydrateShortcutOverrides(
   raw: string | null,
-  isMac = usesMacShortcuts(),
+  platform: ShortcutPlatformInput = detectShortcutPlatform(),
 ): ShortcutOverrides {
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw) as { version?: unknown; overrides?: unknown } | null;
     if (!parsed || parsed.version !== SHORTCUT_STORAGE_VERSION) return {};
-    return sanitizeShortcutOverrides(parsed.overrides, isMac);
+    return sanitizeShortcutOverrides(parsed.overrides, platform);
   } catch {
     return {};
   }
@@ -217,60 +229,60 @@ export const useShortcutStore = create<ShortcutState>((set, get) => ({
   startRecording: (id) => set({ recordingId: id }),
   stopRecording: () => set({ recordingId: null }),
 
-  replaceBinding: (id, index, rawBinding, isMac = usesMacShortcuts()) => {
+  replaceBinding: (id, index, rawBinding, platform = detectShortcutPlatform()) => {
     const state = get();
-    const bindings = mutableBindings(id, state.overrides);
+    const bindings = mutableBindings(id, state.overrides, platform);
     if (!Number.isInteger(index) || index < 0 || index >= bindings.length) {
       return { ok: false, reason: "invalidIndex" };
     }
 
     const binding = sanitizedBinding(rawBinding);
     if (!binding) return { ok: false, reason: "invalidKey" };
-    const result = validationResult(id, binding, bindings, index, state.overrides, isMac);
+    const result = validationResult(id, binding, bindings, index, state.overrides, platform);
     if (!result.ok) return result;
 
     bindings[index] = binding;
-    const overrides = sparseOverride(state.overrides, id, bindings);
+    const overrides = sparseOverride(state.overrides, id, bindings, platform);
     set({ overrides });
     persist(overrides);
     return { ok: true };
   },
 
-  addBinding: (id, rawBinding, isMac = usesMacShortcuts()) => {
+  addBinding: (id, rawBinding, platform = detectShortcutPlatform()) => {
     const state = get();
-    const bindings = mutableBindings(id, state.overrides);
+    const bindings = mutableBindings(id, state.overrides, platform);
     if (bindings.length >= MAX_SHORTCUT_BINDINGS) {
       return { ok: false, reason: "maxBindings" };
     }
 
     const binding = sanitizedBinding(rawBinding);
     if (!binding) return { ok: false, reason: "invalidKey" };
-    const result = validationResult(id, binding, bindings, null, state.overrides, isMac);
+    const result = validationResult(id, binding, bindings, null, state.overrides, platform);
     if (!result.ok) return result;
 
     bindings.push(binding);
-    const overrides = sparseOverride(state.overrides, id, bindings);
+    const overrides = sparseOverride(state.overrides, id, bindings, platform);
     set({ overrides });
     persist(overrides);
     return { ok: true };
   },
 
-  removeBinding: (id, index) => {
+  removeBinding: (id, index, platform = detectShortcutPlatform()) => {
     const state = get();
-    const bindings = mutableBindings(id, state.overrides);
+    const bindings = mutableBindings(id, state.overrides, platform);
     if (!Number.isInteger(index) || index < 0 || index >= bindings.length) {
       return { ok: false, reason: "invalidIndex" };
     }
     if (bindings.length === 1) return { ok: false, reason: "lastBinding" };
 
     bindings.splice(index, 1);
-    const overrides = sparseOverride(state.overrides, id, bindings);
+    const overrides = sparseOverride(state.overrides, id, bindings, platform);
     set({ overrides });
     persist(overrides);
     return { ok: true };
   },
 
-  resetShortcut: (id) => {
+  resetShortcut: (id, platform = detectShortcutPlatform()) => {
     const state = get();
     if (!own(state.overrides, id)) return { ok: true };
     const overrides: ShortcutOverrides = { ...state.overrides };
@@ -279,8 +291,8 @@ export const useShortcutStore = create<ShortcutState>((set, get) => ({
     // A different command may have claimed this command's now-free default
     // chord. Refuse the reset instead of silently creating two live actions
     // for the same event; the user can move the conflicting command first.
-    for (const binding of shortcutById(id).bindings) {
-      const conflictId = findShortcutConflict(id, binding, overrides);
+    for (const binding of defaultShortcutBindings(shortcutById(id), platform)) {
+      const conflictId = findShortcutConflict(id, binding, overrides, platform);
       if (conflictId) return { ok: false, reason: "conflict", conflictId };
     }
 

@@ -415,7 +415,7 @@ export const it: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "Fatti memorizzati",
   "RulesMemoryPanel.memoryToggleLabel": "Consenti all'agente di memorizzare fatti",
   "RulesMemoryPanel.memoryToggleDescription": "Se disattivato, l'agente non può salvare nuovi fatti con lo strumento remember. I fatti esistenti restano comunque applicati — non è amnesia.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Apri una cartella di progetto per vedere i suoi fatti memorizzati.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Apri una cartella di progetto per aggiungere o cancellare fatti specifici del progetto.",
   "RulesMemoryPanel.memoryEmpty": "Nessun fatto memorizzato ancora.",
   "RulesMemoryPanel.memorySourceAgent": "agente",
   "RulesMemoryPanel.memorySourceUser": "utente",

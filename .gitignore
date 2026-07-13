@@ -28,6 +28,9 @@ target
 src-tauri/target
 src-tauri/gen/schemas
 
+# CLI sidecar staged by scripts/stage-cli-sidecar.mjs before tauri dev/build
+src-tauri/binaries/
+
 # Downloaded GGUF model weights
 /models/
 *.gguf

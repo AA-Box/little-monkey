@@ -415,7 +415,7 @@ export const de: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "Gemerkte Fakten",
   "RulesMemoryPanel.memoryToggleLabel": "Agent darf sich Fakten merken",
   "RulesMemoryPanel.memoryToggleDescription": "Wenn deaktiviert, kann der Agent mit dem Remember-Tool keine neuen Fakten speichern. Vorhandene Fakten gelten weiterhin — das ist kein Gedächtnisverlust.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Öffne einen Projektordner, um seine gemerkten Fakten anzuzeigen.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Öffne einen Projektordner, um projektspezifische Fakten hinzuzufügen oder zu löschen.",
   "RulesMemoryPanel.memoryEmpty": "Noch keine Fakten gemerkt.",
   "RulesMemoryPanel.memorySourceAgent": "Agent",
   "RulesMemoryPanel.memorySourceUser": "Benutzer",

@@ -10,6 +10,11 @@ pub mod app_paths;
 // module-private when every sibling with reusable core logic already isn't.
 pub mod artifacts;
 pub mod checkpoints;
+// `pub` only for the doc-comment convention every sibling module below
+// follows (a future `monkey-cli` command could call `install_if_needed`
+// directly, though none exists yet — the CLI installing itself onto its own
+// `PATH` isn't a meaningful operation).
+pub mod cli_install;
 mod git;
 // `pub` so `monkey-cli`'s `embed_cli` module (RAG design doc slice 4 CLI parity)
 // can reuse `find_llama_server_binary`/`embed_server_args`/`EMBED_PORT`/
@@ -260,6 +265,17 @@ pub fn run() {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
         .setup(|app| {
+            // Best-effort, silent `monkey` PATH shim install — see
+            // `cli_install.rs`'s module doc. Spawned on a blocking thread
+            // (it does filesystem/registry I/O, no `.await` points) so
+            // `setup` still returns promptly; failures are swallowed here on
+            // purpose, matching every other autostart-style setup step in
+            // this function — a missing/failed CLI shim is never worth
+            // interrupting the GUI launching.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ = cli_install::install_if_needed();
+            });
+
             // Autostart the local API server if `api_server.json` says to —
             // the only reader of that file at launch time, since every
             // other consumer (the Settings panel) fetches it on demand via
@@ -279,6 +295,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            cli_install::cli_install_status,
+            cli_install::cli_install_set_enabled,
             llama::llama_start,
             llama::llama_stop,
             llama::llama_status,

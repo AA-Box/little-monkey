@@ -29,6 +29,15 @@ use crate::{workspace, AppState};
 
 const MEMORIES_FILE: &str = "memories.json";
 
+/// Reserved `projects` key for facts remembered while no workspace folder is
+/// open (`tool_remember` used to hard-fail in that case — see
+/// ROADMAP/session notes on the "remember with no workspace" bug). Never
+/// collides with a real project root: canonicalized workspace roots are
+/// always absolute filesystem paths, which this string is not. Global facts
+/// are included in every `memory_list` call regardless of which (if any)
+/// project is open, in addition to that project's own facts.
+pub(crate) const GLOBAL_SCOPE_KEY: &str = "__global__";
+
 /// Current (and, so far, only) on-disk schema version.
 const SCHEMA_VERSION: u8 = 1;
 
@@ -258,21 +267,53 @@ pub fn delete_fact_impl(path: &Path, root: &str, id: &str) -> Result<(), String>
     Ok(())
 }
 
-/// Facts remembered for the current primary workspace root. Never fails just
-/// because no workspace is open yet (mirrors `rules_read`'s "no workspace =
-/// no project-scope entries" tolerance) — this is called once per turn via
+/// Facts remembered for the current primary workspace root, plus any
+/// [`GLOBAL_SCOPE_KEY`] facts saved while no workspace was open — those are
+/// always visible so a fact like "the user's name is Ahmad" recalls
+/// regardless of which (if any) project is open. Never fails just because no
+/// workspace is open yet (mirrors `rules_read`'s "no workspace = no
+/// project-scope entries" tolerance) — this is called once per turn via
 /// `rulesStore.refresh()`, and a missing workspace must not block a turn.
 #[tauri::command]
 pub fn memory_list(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<Fact>, String> {
-    let Some(root) = workspace::primary_root_canon(state.inner()).ok() else {
-        return Ok(Vec::new());
-    };
     let memories = load_impl(&memories_file_path(&app)?)?;
-    Ok(memories
+    let mut facts = memories
         .projects
-        .get(&root.to_string_lossy().to_string())
+        .get(GLOBAL_SCOPE_KEY)
         .map(|p| p.facts.clone())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if let Ok(root) = workspace::primary_root_canon(state.inner()) {
+        if let Some(project) = memories.projects.get(&root.to_string_lossy().to_string()) {
+            facts.extend(project.facts.clone());
+        }
+    }
+    Ok(facts)
+}
+
+/// The candidate scope keys a fact reachable from the current app state could
+/// live under: [`GLOBAL_SCOPE_KEY`] always, plus the primary workspace root
+/// when one is open. Used by [`memory_delete`]/[`memory_update`] to find
+/// which bucket actually holds a given fact id, since `memory_list` merges
+/// both scopes but a mutation has to target the right one underneath.
+fn candidate_scopes(state: &AppState) -> Vec<String> {
+    let mut scopes = vec![GLOBAL_SCOPE_KEY.to_string()];
+    if let Ok(root) = workspace::primary_root_canon(state) {
+        scopes.push(root.to_string_lossy().to_string());
+    }
+    scopes
+}
+
+/// Which of `scopes` currently holds a fact with `id`, if any.
+fn owning_scope(memories: &MemoriesFile, scopes: &[String], id: &str) -> Option<String> {
+    scopes
+        .iter()
+        .find(|scope| {
+            memories
+                .projects
+                .get(*scope)
+                .is_some_and(|p| p.facts.iter().any(|f| f.id == id))
+        })
+        .cloned()
 }
 
 /// Manually add a fact for the current primary root — the Settings "Add
@@ -287,26 +328,41 @@ pub fn memory_add(app: tauri::AppHandle, state: tauri::State<'_, AppState>, text
     add_fact_impl(&memories_file_path(&app)?, &root.to_string_lossy(), &text, "user")
 }
 
-/// Delete a fact by id for the current primary root — used by the
-/// transcript's "Forget" button (see `MessageList.tsx`'s `MemoryRow`) and, in
-/// slice 4, the Settings fact list. A direct, human-initiated UI action —
-/// like `rules_write`/`checkpoint_revert`, intentionally NOT routed through
+/// Delete a fact by id — used by the transcript's "Forget" button (see
+/// `MessageList.tsx`'s `MemoryRow`) and, in slice 4, the Settings fact list.
+/// Searches [`GLOBAL_SCOPE_KEY`] and the current primary root (whichever
+/// actually holds `id` — `memory_list` merges both scopes, so a fact shown to
+/// the user may live in either) rather than assuming the project root, since
+/// a global fact must still be forgettable while a project happens to be
+/// open. A direct, human-initiated UI action — like
+/// `rules_write`/`checkpoint_revert`, intentionally NOT routed through
 /// `permissions::request_permission`.
 #[tauri::command]
 pub fn memory_delete(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    let root = workspace::primary_root_canon(state.inner())?;
+    let path = memories_file_path(&app)?;
     let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
-    delete_fact_impl(&memories_file_path(&app)?, &root.to_string_lossy(), &id)
+    let memories = load_impl(&path)?;
+    let scopes = candidate_scopes(state.inner());
+    match owning_scope(&memories, &scopes, &id) {
+        Some(scope) => delete_fact_impl(&path, &scope, &id),
+        None => Ok(()), // already gone from every reachable scope — no-op success, same as delete_fact_impl
+    }
 }
 
-/// Edit a fact's text in place for the current primary root — the Settings
-/// fact list's inline edit (slice 4). Preserves the fact's `id`, `source`,
-/// and `created_at`; only `text` changes.
+/// Edit a fact's text in place — the Settings fact list's inline edit (slice
+/// 4). Preserves the fact's `id`, `source`, and `created_at`; only `text`
+/// changes. Searches [`GLOBAL_SCOPE_KEY`] and the current primary root the
+/// same way [`memory_delete`] does, so editing a global fact works
+/// regardless of which project (if any) is open.
 #[tauri::command]
 pub fn memory_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, text: String) -> Result<Fact, String> {
-    let root = workspace::primary_root_canon(state.inner())?;
+    let path = memories_file_path(&app)?;
     let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
-    update_fact_impl(&memories_file_path(&app)?, &root.to_string_lossy(), &id, &text)
+    let memories = load_impl(&path)?;
+    let scopes = candidate_scopes(state.inner());
+    let scope = owning_scope(&memories, &scopes, &id)
+        .ok_or_else(|| "Fact not found — it may have already been forgotten.".to_string())?;
+    update_fact_impl(&path, &scope, &id, &text)
 }
 
 /// Delete every remembered fact for the current primary root — the Settings
@@ -526,6 +582,44 @@ mod tests {
         let memories = load_impl(&path).unwrap();
         assert!(!memories.projects.contains_key("/ws/a") || memories.projects["/ws/a"].facts.is_empty());
         assert_eq!(memories.projects["/ws/b"].facts.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_with_no_workspace_saves_under_the_global_scope() {
+        let path = temp_path();
+        let fact = add_fact_impl(&path, GLOBAL_SCOPE_KEY, "User's name is Ahmad.", "agent").unwrap();
+
+        let reloaded = load_impl(&path).unwrap();
+        let facts = &reloaded.projects[GLOBAL_SCOPE_KEY].facts;
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].id, fact.id);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owning_scope_finds_a_fact_in_the_global_bucket_even_with_a_project_open() {
+        let path = temp_path();
+        let global_fact = add_fact_impl(&path, GLOBAL_SCOPE_KEY, "global fact", "agent").unwrap();
+        add_fact_impl(&path, "/ws/project", "project fact", "agent").unwrap();
+
+        let memories = load_impl(&path).unwrap();
+        let scopes = vec![GLOBAL_SCOPE_KEY.to_string(), "/ws/project".to_string()];
+        assert_eq!(owning_scope(&memories, &scopes, &global_fact.id), Some(GLOBAL_SCOPE_KEY.to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owning_scope_is_none_when_the_id_is_in_neither_candidate_scope() {
+        let path = temp_path();
+        add_fact_impl(&path, "/ws/other-project", "unrelated fact", "agent").unwrap();
+
+        let memories = load_impl(&path).unwrap();
+        let scopes = vec![GLOBAL_SCOPE_KEY.to_string(), "/ws/project".to_string()];
+        assert_eq!(owning_scope(&memories, &scopes, "not-a-real-id"), None);
 
         let _ = std::fs::remove_file(&path);
     }

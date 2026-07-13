@@ -28,7 +28,7 @@ import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
 import { WorkspaceBar } from "../Workspace";
 import { useT } from "../../lib/i18n";
-import { shortcutIdForEvent, usesMacShortcuts } from "../../lib/shortcuts";
+import { detectShortcutPlatform, shortcutIdForEvent } from "../../lib/shortcuts";
 
 const MAX_TEXTAREA_HEIGHT_PX = 192;
 
@@ -508,8 +508,8 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
     // Resolve from the store on every event so an edit in Settings is live
     // without remounting the composer (including in a secondary window).
     const { overrides } = useShortcutStore.getState();
-    const isMac = usesMacShortcuts();
-    const suggestionShortcut = shortcutIdForEvent(event, "suggestions", isMac, overrides);
+    const platform = detectShortcutPlatform();
+    const suggestionShortcut = shortcutIdForEvent(event, "suggestions", platform, overrides);
     if (mentionQuery !== null) {
       if (suggestionShortcut === "nextSuggestion") {
         event.preventDefault();
@@ -568,7 +568,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
       }
     }
 
-    const composerShortcut = shortcutIdForEvent(event, "composer", isMac, overrides);
+    const composerShortcut = shortcutIdForEvent(event, "composer", platform, overrides);
     if (composerShortcut === "sendMessage") {
       event.preventDefault();
       handleSend();

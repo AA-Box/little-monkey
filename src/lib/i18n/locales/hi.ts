@@ -415,7 +415,7 @@ export const hi: Record<string, string> = {
   "RulesMemoryPanel.memoryHeading": "याद रखे गए तथ्य",
   "RulesMemoryPanel.memoryToggleLabel": "एजेंट को तथ्य याद रखने दें",
   "RulesMemoryPanel.memoryToggleDescription": "बंद होने पर, एजेंट remember टूल से नए तथ्य सहेज नहीं सकता। मौजूदा तथ्य फिर भी लागू होते हैं — यह भूलने जैसा नहीं है।",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen": "इसके याद रखे गए तथ्य देखने के लिए एक प्रोजेक्ट फ़ोल्डर खोलें।",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "प्रोजेक्ट-विशिष्ट तथ्य जोड़ने या हटाने के लिए एक प्रोजेक्ट फ़ोल्डर खोलें।",
   "RulesMemoryPanel.memoryEmpty": "अभी तक कोई तथ्य याद नहीं रखा गया।",
   "RulesMemoryPanel.memorySourceAgent": "एजेंट",
   "RulesMemoryPanel.memorySourceUser": "उपयोगकर्ता",
