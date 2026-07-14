@@ -344,7 +344,7 @@ impl RemoteApi {
         scopes: &RemoteScopes,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
         let ledger = self.run_ledger()?;
-        let runs = ledger.list_runs(1_000, false).map_err(internal)?;
+        let runs = ledger.list_runs(1_000).map_err(internal)?;
         let shared = SharedLedger::open(&self.paths.ledger_db).map_err(internal)?;
         let summaries = runs
             .iter()
