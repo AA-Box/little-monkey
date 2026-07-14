@@ -1,0 +1,1999 @@
+mod engine;
+mod ledger;
+mod remote;
+mod service;
+mod store;
+mod trigger;
+mod webhook;
+mod workflow_trigger;
+mod worktree;
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::{Args, Subcommand, ValueEnum};
+use little_monkey_lib::recipes::{self, Recipe};
+use little_monkey_lib::run_protocol::{
+    ClientIdentity, ClientKind, PermissionDecision, RunEvent, RunStatus,
+};
+use little_monkey_lib::workflow_core::WorkflowTrigger;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
+
+use self::engine::{DaemonEngine, OsNotificationAdapter, RealProcessAdapter, SystemClock};
+use self::ledger::SharedLedger;
+use self::service::{DaemonLock, ServiceManager};
+use self::store::{
+    DaemonConfig, DaemonPaths, DaemonStore, JobState, NewDaemonJob, PendingDelivery,
+};
+use self::trigger::{
+    ingest_signed_delivery, poll_persistent_triggers, IngestOutcome, KeyringSecretStore,
+    SecretStore, SignedDelivery, TriggerConfig, TriggerTarget, WorkflowTriggerBinding,
+    DEFAULT_SIGNATURE_SKEW_MS,
+};
+use self::workflow_trigger::WorkflowBatchSynchronizer;
+use self::worktree::{OwnedWorktree, WorktreeRequest};
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCmd {
+    /// Explicitly install and start the current-user OS service.
+    Install(DaemonInstallArgs),
+    /// Start the previously installed user service.
+    Start,
+    /// Show service, heartbeat, kill-switch, queue, and active-run state.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Gracefully cancel active work and stop the user service.
+    Stop,
+    /// Remove the user service. Durable run history is retained by default.
+    Uninstall {
+        /// Also delete daemon queue/config/log/snapshot state. Shared run
+        /// history is never deleted. Refused while jobs or owned worktrees remain.
+        #[arg(long)]
+        purge_state: bool,
+    },
+    /// Queue an immutable recipe snapshot for resident execution.
+    Run(DaemonRunArgs),
+    /// Print durable events for a run; optionally follow until terminal.
+    Attach {
+        run_id: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a queued or active run. Active task process groups are suspended.
+    Pause { run_id: String },
+    /// Resume a paused queued or active run.
+    Resume { run_id: String },
+    /// Cancel a queued or active run and its supervised process group.
+    Cancel {
+        run_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Submit a new run from a terminal prior snapshot; never replays in place.
+    Retry {
+        run_id: String,
+        /// Required when the prior run reached reconciliation or confirmed an
+        /// external mutation. This remains an explicit operator action.
+        #[arg(long)]
+        acknowledge_side_effects: bool,
+    },
+    /// Decide a daemon-hosted approval request bound to its operation digest.
+    Approve {
+        run_id: String,
+        request_id: String,
+        decision: ApprovalChoice,
+    },
+    /// Engage, release, or inspect the durable global kill switch.
+    #[command(subcommand)]
+    KillSwitch(KillSwitchCmd),
+    /// Configure or deliver persistent cron/filesystem/signed/GitHub triggers.
+    #[command(subcommand)]
+    Trigger(TriggerCmd),
+    /// Pair and control a user-owned remote runner over pinned TLS. Provider
+    /// keys, inference, tools, and workspace access stay on the runner.
+    #[command(subcommand)]
+    Remote(remote::RemoteCmd),
+    /// Resident service entrypoint used only by the installed OS manifest.
+    #[command(hide = true)]
+    Serve,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonInstallArgs {
+    #[arg(long, default_value_t = store::DEFAULT_CONCURRENCY)]
+    concurrency: u32,
+    #[arg(long, default_value_t = store::DEFAULT_MAX_QUEUE)]
+    max_queue: u32,
+    #[arg(long, default_value_t = store::DEFAULT_RETENTION_DAYS)]
+    retention_days: u32,
+    /// Optional localhost-only HTTP port for signed webhook delivery.
+    #[arg(long)]
+    webhook_port: Option<u16>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    notifications: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DaemonRunArgs {
+    pub name_or_path: String,
+    #[arg(long = "param", value_name = "KEY=VALUE")]
+    pub param: Vec<String>,
+    /// Caller-owned key. Only its digest affects the durable job id; the raw
+    /// value is not persisted.
+    #[arg(long)]
+    pub run_key: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    pub priority: i32,
+    #[arg(long, default_value_t = 1)]
+    pub max_attempts: u32,
+    #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
+    pub max_runtime_seconds: u64,
+    #[arg(long)]
+    pub max_memory_mb: Option<u64>,
+    /// Create and require an app-owned isolated git worktree.
+    #[arg(long)]
+    pub owned_worktree: bool,
+    /// Repository used for --owned-worktree; defaults to the recipe workspace.
+    #[arg(long)]
+    pub repository: Option<PathBuf>,
+    #[arg(long, default_value = "codex/")]
+    pub branch_prefix: String,
+    #[arg(long = "remote", default_value = "origin")]
+    pub allowed_remotes: Vec<String>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub allow_commit: bool,
+    #[arg(long)]
+    pub allow_push: bool,
+    #[arg(long)]
+    pub allow_create_pull_request: bool,
+    #[arg(long)]
+    pub allow_review_comment: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KillSwitchCmd {
+    Engage,
+    Release,
+    Status,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum ApprovalChoice {
+    AllowOnce,
+    AllowForRun,
+    Deny,
+}
+
+impl From<ApprovalChoice> for PermissionDecision {
+    fn from(value: ApprovalChoice) -> Self {
+        match value {
+            ApprovalChoice::AllowOnce => Self::AllowOnce,
+            ApprovalChoice::AllowForRun => Self::AllowForRun,
+            ApprovalChoice::Deny => Self::Deny,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TriggerCmd {
+    AddCron {
+        id: String,
+        #[command(flatten)]
+        target: TriggerTargetArgs,
+        #[arg(long)]
+        cron: String,
+        #[arg(long = "param")]
+        param: Vec<String>,
+        #[arg(long)]
+        payload_param: Option<String>,
+    },
+    AddFilesystem {
+        id: String,
+        #[command(flatten)]
+        target: TriggerTargetArgs,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long = "param")]
+        param: Vec<String>,
+        #[arg(long)]
+        payload_param: Option<String>,
+    },
+    AddWebhook {
+        id: String,
+        #[command(flatten)]
+        target: TriggerTargetArgs,
+        /// Name of an environment variable containing the HMAC secret.
+        #[arg(long)]
+        secret_env: String,
+        #[arg(long = "param")]
+        param: Vec<String>,
+        #[arg(long)]
+        payload_param: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_SIGNATURE_SKEW_MS)]
+        max_skew_ms: u64,
+    },
+    AddGithub {
+        id: String,
+        #[command(flatten)]
+        target: TriggerTargetArgs,
+        #[arg(long)]
+        secret_env: String,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        local_repository: PathBuf,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long = "branch-prefix", required = true)]
+        branch_prefixes: Vec<String>,
+        #[arg(long = "event", required = true)]
+        events: Vec<String>,
+        #[arg(long)]
+        allow_push: bool,
+        #[arg(long)]
+        allow_create_pull_request: bool,
+        #[arg(long)]
+        allow_review_comment: bool,
+        #[arg(long = "param")]
+        param: Vec<String>,
+        #[arg(long)]
+        payload_param: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_SIGNATURE_SKEW_MS)]
+        max_skew_ms: u64,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Remove {
+        id: String,
+    },
+    /// Store a workflow webhook HMAC secret under an opaque OS-keychain
+    /// reference. The secret value is read from the named environment variable
+    /// and never written to daemon JSON/SQLite state.
+    SecretSet {
+        reference: String,
+        #[arg(long)]
+        secret_env: String,
+    },
+    /// Remove an opaque workflow webhook HMAC secret from the OS keychain.
+    SecretRemove {
+        reference: String,
+    },
+    /// Offline/forwarder-friendly signed ingestion path. The resident HTTP
+    /// endpoint uses the exact same verifier and dedupe transaction.
+    Deliver {
+        id: String,
+        #[arg(long)]
+        delivery_id: String,
+        #[arg(long)]
+        timestamp_ms: u64,
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        signature: String,
+        #[arg(long)]
+        payload: PathBuf,
+        #[arg(long)]
+        event: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct TriggerTargetArgs {
+    /// Existing recipe name/path. Omit when selecting an M4 workflow target.
+    #[arg(value_name = "RECIPE")]
+    recipe: Option<String>,
+    /// Exact M4 workflow identifier (mutually exclusive with RECIPE).
+    #[arg(long)]
+    workflow_id: Option<String>,
+    /// SHA-256 of the immutable M4 workflow definition.
+    #[arg(long)]
+    definition_sha256: Option<String>,
+    /// Positive M4 workflow definition version.
+    #[arg(long)]
+    workflow_version: Option<u32>,
+    /// Exact serialized WorkflowTrigger declaration. Required for a workflow
+    /// target and checked against the daemon trigger kind/configuration.
+    #[arg(long)]
+    workflow_trigger_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueuedRun {
+    pub(crate) job_id: String,
+    pub(crate) run_id: String,
+    pub(crate) state: JobState,
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonStatus {
+    installed: bool,
+    service_running: bool,
+    heartbeat_fresh: bool,
+    pid: Option<u32>,
+    kill_switch: bool,
+    queued: u32,
+    active: u32,
+    waiting_approval: u32,
+    paused: u32,
+    managed_run_ids: Vec<String>,
+    platform: service::ServicePlatform,
+}
+
+pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
+    match action {
+        DaemonCmd::Install(args) => install(args),
+        DaemonCmd::Start => {
+            ServiceManager::<service::RealCommandRunner>::real()?.start(&DaemonPaths::resolve()?)
+        }
+        DaemonCmd::Status { json } => status(*json),
+        DaemonCmd::Stop => stop().await,
+        DaemonCmd::Uninstall { purge_state } => uninstall(*purge_state),
+        DaemonCmd::Run(args) => queue_command(cli, args),
+        DaemonCmd::Attach {
+            run_id,
+            follow,
+            json,
+        } => attach(run_id, *follow, *json).await,
+        DaemonCmd::Pause { run_id } => pause(run_id),
+        DaemonCmd::Resume { run_id } => resume(run_id),
+        DaemonCmd::Cancel { run_id, reason } => cancel(run_id, reason.as_deref()),
+        DaemonCmd::Retry {
+            run_id,
+            acknowledge_side_effects,
+        } => retry(cli, run_id, *acknowledge_side_effects),
+        DaemonCmd::Approve {
+            run_id,
+            request_id,
+            decision,
+        } => approve(run_id, request_id, (*decision).into()),
+        DaemonCmd::KillSwitch(action) => kill_switch(action),
+        DaemonCmd::Trigger(action) => trigger_command(action),
+        DaemonCmd::Remote(action) => remote::run(action).await,
+        DaemonCmd::Serve => serve(cli).await,
+    }
+}
+
+fn install(args: &DaemonInstallArgs) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig {
+        concurrency: args.concurrency,
+        max_queue: args.max_queue,
+        retention_days: args.retention_days,
+        webhook_port: args.webhook_port,
+        notifications: args.notifications,
+        ..DaemonConfig::default()
+    };
+    let mut store = DaemonStore::open(&paths)?;
+    store.set_meta("stop_requested", "0")?;
+    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
+    let manifest = manager.install(&paths, &config)?;
+    println!(
+        "Installed {} user service at {}",
+        format!("{:?}", manager.platform()).to_lowercase(),
+        manifest.display()
+    );
+    Ok(())
+}
+
+fn status(json: bool) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
+    let installed = paths.config.is_file() && manager.manifest_path(&paths).is_file();
+    let mut queued = 0;
+    let mut active = 0;
+    let mut waiting_approval = 0;
+    let mut paused = 0;
+    let mut kill_switch = false;
+    let mut heartbeat = None;
+    let mut pid = None;
+    let mut managed_run_ids = Vec::new();
+    if paths.state_db.is_file() {
+        let store = DaemonStore::open(&paths)?;
+        kill_switch = store.kill_switch()?;
+        heartbeat = store
+            .get_meta("heartbeat_ms")?
+            .and_then(|value| value.parse::<u64>().ok());
+        pid = store
+            .get_meta("pid")?
+            .and_then(|value| value.parse::<u32>().ok());
+        managed_run_ids = store.managed_run_ids(512)?;
+        for job in store.nonterminal_jobs()? {
+            match job.state {
+                JobState::Preparing | JobState::Queued => queued += 1,
+                JobState::WaitingApproval => waiting_approval += 1,
+                JobState::Paused => paused += 1,
+                JobState::Running | JobState::Cancelling => active += 1,
+                _ => {}
+            }
+        }
+    }
+    let now = now_ms()?;
+    let service_running = manager.status(&paths).unwrap_or(false);
+    let result = DaemonStatus {
+        installed,
+        service_running,
+        heartbeat_fresh: heartbeat.is_some_and(|value| now.saturating_sub(value) < 5_000),
+        pid,
+        kill_switch,
+        queued,
+        active,
+        waiting_approval,
+        paused,
+        managed_run_ids,
+        platform: manager.platform(),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "installed={} service={} heartbeat={} pid={} kill_switch={} queued={} active={} waiting_approval={} paused={}",
+            result.installed,
+            result.service_running,
+            result.heartbeat_fresh,
+            result.pid.map(|value| value.to_string()).unwrap_or_else(|| "-".into()),
+            result.kill_switch,
+            result.queued,
+            result.active,
+            result.waiting_approval,
+            result.paused,
+        );
+    }
+    Ok(())
+}
+
+async fn stop() -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    if paths.state_db.is_file() {
+        let mut store = DaemonStore::open(&paths)?;
+        store.set_meta("stop_requested", "1")?;
+        store.request_cancel_all(now_ms()?)?;
+        for _ in 0..20 {
+            if store.active_jobs()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
+    if manager.manifest_path(&paths).is_file() {
+        manager.stop(&paths)?;
+    }
+    println!("Daemon stopped.");
+    Ok(())
+}
+
+fn uninstall(purge_state: bool) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
+    manager.uninstall(&paths)?;
+    if purge_state && paths.root.exists() {
+        let store = DaemonStore::open(&paths)?;
+        if store.nonterminal_count()? != 0 || !store.terminal_worktree_jobs(now_ms()?)?.is_empty() {
+            return Err(
+                "Refusing --purge-state while jobs or owned worktrees remain; retain state and inspect them"
+                    .to_string(),
+            );
+        }
+        std::fs::remove_dir_all(&paths.root)
+            .map_err(|error| format!("Failed to purge daemon state: {error}"))?;
+    } else {
+        let _ = std::fs::remove_file(&paths.config);
+    }
+    println!("Daemon service uninstalled; shared durable run history was retained.");
+    Ok(())
+}
+
+fn queue_command(cli: &crate::Cli, args: &DaemonRunArgs) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths)?;
+    let mut store = DaemonStore::open(&paths)?;
+    if store.kill_switch()? {
+        return Err("Global kill switch is engaged; release it before queueing work".to_string());
+    }
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let options = QueueOptions::from_run_args(args);
+    let queued = enqueue(cli, &paths, &config, &mut store, &mut shared, options)?;
+    if args.json {
+        println!("{}", serde_json::to_string(&queued).unwrap_or_default());
+    } else {
+        println!("Queued {} as durable run {}", queued.job_id, queued.run_id);
+    }
+    Ok(())
+}
+
+/// Queue an immutable recipe on behalf of a protocol client without writing
+/// human-oriented text to stdout. ACP uses this bridge so the resident daemon
+/// remains the execution authority while the stdio connection only relays the
+/// shared run protocol.
+pub(crate) fn queue_client_recipe(
+    cli: &crate::Cli,
+    recipe_path: &Path,
+    client_key: &str,
+) -> Result<QueuedRun, String> {
+    if client_key.is_empty() || client_key.len() > 4_096 || client_key.contains('\0') {
+        return Err("Protocol client run key is invalid".to_string());
+    }
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths).map_err(|error| {
+        format!(
+            "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
+        )
+    })?;
+    let mut store = DaemonStore::open(&paths)?;
+    if store.kill_switch()? {
+        return Err("Global kill switch is engaged; protocol runs cannot be queued".to_string());
+    }
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let options = QueueOptions {
+        recipe: recipe_path.to_string_lossy().into_owned(),
+        params: Vec::new(),
+        deterministic_job_id: Some(format!(
+            "job-{}",
+            &sha256_hex(format!("protocol-client:{client_key}").as_bytes())[..32]
+        )),
+        priority: 0,
+        max_attempts: 1,
+        max_runtime_ms: 24 * 60 * 60 * 1_000,
+        max_memory_bytes: None,
+        owned_worktree: false,
+        repository: None,
+        branch_prefix: "codex/".to_string(),
+        allowed_remotes: vec!["origin".to_string()],
+        allow_commit: false,
+        allow_push: false,
+        allow_create_pull_request: false,
+        allow_review_comment: false,
+        parent_run_id: None,
+        snapshot_is_frozen: false,
+    };
+    enqueue(cli, &paths, &config, &mut store, &mut shared, options)
+}
+
+pub(crate) fn cancel_client_run(run_id: &str, reason: &str) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    let job = store.request_cancel(run_id, now_ms()?)?;
+    if let Some(run_id) = job.run_id.as_deref() {
+        append_cancellation(&paths, run_id, reason)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct QueueOptions {
+    recipe: String,
+    params: Vec<String>,
+    deterministic_job_id: Option<String>,
+    priority: i32,
+    max_attempts: u32,
+    max_runtime_ms: u64,
+    max_memory_bytes: Option<u64>,
+    owned_worktree: bool,
+    repository: Option<PathBuf>,
+    branch_prefix: String,
+    allowed_remotes: Vec<String>,
+    allow_commit: bool,
+    allow_push: bool,
+    allow_create_pull_request: bool,
+    allow_review_comment: bool,
+    parent_run_id: Option<String>,
+    /// The source recipe is already an immutable, fully rendered snapshot.
+    /// In particular, do not merge current rules into its captured system
+    /// prompt again when an operator explicitly retries it.
+    snapshot_is_frozen: bool,
+}
+
+impl QueueOptions {
+    fn from_run_args(args: &DaemonRunArgs) -> Self {
+        let deterministic_job_id = args.run_key.as_ref().map(|key| {
+            format!(
+                "job-{}",
+                &sha256_hex(format!("daemon-user:{key}").as_bytes())[..32]
+            )
+        });
+        Self {
+            recipe: args.name_or_path.clone(),
+            params: args.param.clone(),
+            deterministic_job_id,
+            priority: args.priority,
+            max_attempts: args.max_attempts,
+            max_runtime_ms: args.max_runtime_seconds.saturating_mul(1000),
+            max_memory_bytes: args
+                .max_memory_mb
+                .and_then(|value| value.checked_mul(1024 * 1024)),
+            owned_worktree: args.owned_worktree,
+            repository: args.repository.clone(),
+            branch_prefix: args.branch_prefix.clone(),
+            allowed_remotes: args.allowed_remotes.clone(),
+            allow_commit: args.allow_commit,
+            allow_push: args.allow_push,
+            allow_create_pull_request: args.allow_create_pull_request,
+            allow_review_comment: args.allow_review_comment,
+            parent_run_id: None,
+            snapshot_is_frozen: false,
+        }
+    }
+}
+
+fn enqueue(
+    cli: &crate::Cli,
+    paths: &DaemonPaths,
+    config: &DaemonConfig,
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+    options: QueueOptions,
+) -> Result<QueuedRun, String> {
+    if options.max_attempts == 0 || options.max_attempts > 100 {
+        return Err("daemon max_attempts must be between 1 and 100".to_string());
+    }
+    if options.max_runtime_ms == 0 || options.max_runtime_ms > 7 * 24 * 60 * 60 * 1_000 {
+        return Err("daemon max runtime must be between 1 second and 7 days".to_string());
+    }
+    let job_id = options
+        .deterministic_job_id
+        .clone()
+        .unwrap_or_else(|| format!("job-{}", uuid::Uuid::new_v4()));
+    if let Some(existing) = store.get_job(&job_id)? {
+        let run_id = existing
+            .run_id
+            .ok_or_else(|| format!("Existing job '{job_id}' is still preparing"))?;
+        return Ok(QueuedRun {
+            job_id,
+            run_id,
+            state: existing.state,
+        });
+    }
+    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
+    let workspace_root = std::env::current_dir().ok();
+    let (recipe, recipe_path) =
+        recipes::resolve_recipe_with_path(&options.recipe, workspace_root.as_deref(), &app_data)?;
+    let overrides = parse_params(&options.params)?;
+    let rendered = recipes::render_recipe(&recipe, &overrides)?;
+    let original_workspace = resolve_recipe_workspace(&recipe, &recipe_path)?;
+    // M6A desktop submissions already contain the exact rules/persona/system
+    // snapshot observed by the sending WebView. Re-merging whatever rules
+    // happen to exist when the resident service dequeues it would violate
+    // immutability just as surely as doing so during an explicit retry.
+    let snapshot_is_frozen = options.snapshot_is_frozen || recipe.desktop_turn.is_some();
+    let effective_system = if snapshot_is_frozen {
+        rendered.system.clone()
+    } else {
+        let state = crate::build_state(&Some(original_workspace.clone()))?;
+        crate::effective_system(cli, &state, rendered.system.as_deref())
+    };
+
+    let mut worktree = None;
+    let mut repository_policy = None;
+    let workspace = if options.owned_worktree {
+        let request = WorktreeRequest {
+            repository: options
+                .repository
+                .clone()
+                .unwrap_or_else(|| original_workspace.clone()),
+            branch_prefix: options.branch_prefix.clone(),
+            allowed_remote_names: options.allowed_remotes.clone(),
+            allow_commit: options.allow_commit,
+            allow_push: options.allow_push,
+            allow_create_pull_request: options.allow_create_pull_request,
+            allow_review_comment: options.allow_review_comment,
+        };
+        let owned = OwnedWorktree::create(paths, &job_id, &request)?;
+        let policy = owned.repository_policy(&request);
+        policy.validate().map_err(|error| error.to_string())?;
+        let path = PathBuf::from(&owned.canonical_path);
+        repository_policy = Some(policy);
+        worktree = Some(owned);
+        path
+    } else {
+        if options.allow_push || options.allow_create_pull_request || options.allow_review_comment {
+            return Err(
+                "Remote Git mutations require --owned-worktree and an explicit repository policy"
+                    .to_string(),
+            );
+        }
+        original_workspace
+    };
+
+    let mut snapshot = recipe;
+    snapshot.prompt = rendered.prompt;
+    snapshot.system = effective_system;
+    snapshot.params.clear();
+    snapshot.workspace = Some(
+        workspace
+            .canonicalize()
+            .map_err(|error| format!("Cannot canonicalize daemon workspace: {error}"))?
+            .to_string_lossy()
+            .to_string(),
+    );
+    snapshot.output.json = true;
+    let snapshot_path = paths.snapshots.join(format!("{job_id}.json"));
+    write_snapshot(&snapshot_path, &snapshot)?;
+    let created_at_ms = now_ms()?;
+    let repository_policy_json = repository_policy
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let worktree_json = worktree
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    store.insert_preparing(
+        &NewDaemonJob {
+            job_id: job_id.clone(),
+            recipe_snapshot: snapshot_path.clone(),
+            priority: options.priority,
+            max_attempts: options.max_attempts,
+            created_at_ms,
+            max_runtime_ms: options.max_runtime_ms,
+            max_memory_bytes: options.max_memory_bytes,
+            max_log_bytes: config.max_log_bytes,
+            repository_policy_json: repository_policy_json.clone(),
+            worktree_json: worktree_json.clone(),
+            parent_run_id: options.parent_run_id,
+        },
+        config.max_queue,
+    )?;
+    let run_id =
+        match submit_queued_snapshot(&snapshot_path, &job_id, repository_policy_json.as_deref()) {
+            Ok(run_id) => run_id,
+            Err(error) => {
+                store.transition(&job_id, JobState::Failed, now_ms()?, None, Some(&error))?;
+                return Err(error);
+            }
+        };
+    store.mark_queued(&job_id, &run_id, now_ms()?)?;
+    if let Some(owned) = &worktree {
+        shared.record_worktree_lease(
+            &owned.lease_id,
+            &run_id,
+            &owned.repository_id,
+            &owned.common_git_dir,
+            &owned.canonical_path,
+            &owned.branch,
+            &owned.base_oid,
+            Some(&owned.expected_head),
+            "active",
+            now_ms()?,
+        )?;
+    }
+    Ok(QueuedRun {
+        job_id,
+        run_id,
+        state: JobState::Queued,
+    })
+}
+
+fn submit_queued_snapshot(
+    snapshot: &Path,
+    job_id: &str,
+    repository_policy_json: Option<&str>,
+) -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve monkey executable: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--no-rules")
+        .arg("task")
+        .arg("run")
+        .arg(snapshot)
+        .arg("--run-key")
+        .arg(format!("daemon:{job_id}"))
+        .arg("--json")
+        .env("LITTLE_MONKEY_TASK_QUEUE_ONLY", "1")
+        .env("LITTLE_MONKEY_DAEMON_APPROVAL_WAIT", "1")
+        .stdin(Stdio::null());
+    if let Some(policy) = repository_policy_json {
+        command.env("LITTLE_MONKEY_DAEMON_REPOSITORY_POLICY_JSON", policy);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("Failed to submit queued durable run: {error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "Queue submission did not return JSON ({error}): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    })?;
+    if !output.status.success()
+        || value.get("status").and_then(|value| value.as_str()) != Some("queued")
+    {
+        return Err(value
+            .get("final_message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("durable queue submission failed")
+            .to_string());
+    }
+    value
+        .get("run_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "Queue submission omitted run_id".to_string())
+}
+
+fn write_snapshot(path: &Path, recipe: &Recipe) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(recipe).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("Failed to write immutable recipe snapshot: {error}"))?;
+    store::restrict_file(&tmp)?;
+    std::fs::rename(&tmp, path)
+        .map_err(|error| format!("Failed to publish immutable recipe snapshot: {error}"))?;
+    store::restrict_file(path)
+}
+
+fn resolve_recipe_workspace(recipe: &Recipe, recipe_path: &Path) -> Result<PathBuf, String> {
+    let value = match &recipe.workspace {
+        Some(value) => recipe_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(value),
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    value.canonicalize().map_err(|error| {
+        format!(
+            "Cannot resolve recipe workspace '{}': {error}",
+            value.display()
+        )
+    })
+}
+
+fn parse_params(values: &[String]) -> Result<HashMap<String, String>, String> {
+    let mut out = HashMap::new();
+    for value in values {
+        let (key, item) = value
+            .split_once('=')
+            .ok_or_else(|| format!("--param '{value}' must be key=value"))?;
+        if key.is_empty() {
+            return Err(format!("--param '{value}' has an empty key"));
+        }
+        out.insert(key.to_string(), item.to_string());
+    }
+    Ok(out)
+}
+
+async fn attach(run_id: &str, follow: bool, json: bool) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let shared = SharedLedger::open(&paths.ledger_db)?;
+    let mut sequence = 0;
+    loop {
+        let events = shared.events(run_id, sequence, 1000)?;
+        for event in events {
+            sequence = event.sequence;
+            if json {
+                println!("{}", serde_json::to_string(&event).unwrap_or_default());
+            } else {
+                println!("{:>6}  {}", event.sequence, event_type(&event.event));
+            }
+        }
+        let run = shared
+            .load_run(run_id)?
+            .ok_or_else(|| format!("Unknown run '{run_id}'"))?;
+        if !follow || run.status.is_terminal() {
+            if !json {
+                println!("status={:?}", run.status);
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn event_type(event: &RunEvent) -> &'static str {
+    match event {
+        RunEvent::Queued { .. } => "queued",
+        RunEvent::Started { .. } => "started",
+        RunEvent::ModelDelta { .. } => "model_delta",
+        RunEvent::ToolProposed { .. } => "tool_proposed",
+        RunEvent::PermissionRequested { .. } => "permission_requested",
+        RunEvent::PermissionDecided { .. } => "permission_decided",
+        RunEvent::ToolStarted { .. } => "tool_started",
+        RunEvent::ToolFinished { .. } => "tool_finished",
+        RunEvent::ArtifactAdded { .. } => "artifact_added",
+        RunEvent::CheckpointLinked { .. } => "checkpoint_linked",
+        RunEvent::VerificationFinished { .. } => "verification_finished",
+        RunEvent::UsageRecorded { .. } => "usage_recorded",
+        RunEvent::CancellationRequested { .. } => "cancellation_requested",
+        RunEvent::ExternalMutationPrepared { .. } => "external_mutation_prepared",
+        RunEvent::ExternalMutationConfirmed { .. } => "external_mutation_confirmed",
+        RunEvent::AwaitingApproval { .. } => "awaiting_approval",
+        RunEvent::Paused { .. } => "paused",
+        RunEvent::Cancelling { .. } => "cancelling",
+        RunEvent::Completed { .. } => "completed",
+        RunEvent::Failed { .. } => "failed",
+        RunEvent::Cancelled { .. } => "cancelled",
+        RunEvent::NeedsReconciliation { .. } => "needs_reconciliation",
+    }
+}
+
+fn pause(run_id: &str) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    let job = store.request_pause(run_id, true, now_ms()?)?;
+    println!("Pause requested for {}", job.run_id.unwrap_or(job.job_id));
+    Ok(())
+}
+
+fn resume(run_id: &str) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    let job = store.request_pause(run_id, false, now_ms()?)?;
+    println!("Resume requested for {}", job.run_id.unwrap_or(job.job_id));
+    Ok(())
+}
+
+fn cancel(run_id: &str, reason: Option<&str>) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    let job = store.request_cancel(run_id, now_ms()?)?;
+    if let Some(run_id) = job.run_id.as_deref() {
+        append_cancellation(&paths, run_id, reason.unwrap_or("Cancelled by daemon user"))?;
+    }
+    println!("Cancellation requested for {run_id}");
+    Ok(())
+}
+
+fn append_cancellation(paths: &DaemonPaths, run_id: &str, reason: &str) -> Result<(), String> {
+    let shared = SharedLedger::open(&paths.ledger_db)?;
+    let run = shared
+        .load_run(run_id)?
+        .ok_or_else(|| format!("Unknown run '{run_id}'"))?;
+    if run.status.is_terminal() || run.status == RunStatus::Cancelling {
+        return Ok(());
+    }
+    let recorder = control_recorder(&shared, run_id)?;
+    recorder.emit(RunEvent::CancellationRequested {
+        requested_by: recorder.client_identity(),
+        reason: Some(bounded_text(reason, 60 * 1024)),
+    })?;
+    recorder.emit(RunEvent::Cancelling {
+        reason: Some(bounded_text(reason, 60 * 1024)),
+    })
+}
+
+fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths)?;
+    let mut store = DaemonStore::open(&paths)?;
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let prior = store
+        .get_job(run_id)?
+        .ok_or_else(|| format!("Unknown daemon run '{run_id}'"))?;
+    if !prior.state.is_terminal() {
+        return Err("Only terminal daemon runs can be retried".to_string());
+    }
+    let prior_run = prior.run_id.as_deref().unwrap_or(run_id);
+    let mutations = shared.mutations(prior_run)?;
+    if (!mutations.is_empty() || prior.state == JobState::NeedsReconciliation) && !acknowledge {
+        return Err(
+            "Retry requires --acknowledge-side-effects because the prior run reached an external-mutation boundary"
+                .to_string(),
+        );
+    }
+    let recipe: Recipe = serde_json::from_slice(
+        &std::fs::read(&prior.recipe_snapshot)
+            .map_err(|error| format!("Cannot read prior immutable snapshot: {error}"))?,
+    )
+    .map_err(|error| format!("Prior immutable snapshot is invalid: {error}"))?;
+    let retry_source = paths
+        .snapshots
+        .join(format!("retry-source-{}.json", uuid::Uuid::new_v4()));
+    write_snapshot(&retry_source, &recipe)?;
+    let options = QueueOptions {
+        recipe: retry_source.to_string_lossy().to_string(),
+        params: vec![],
+        deterministic_job_id: None,
+        priority: prior.priority,
+        max_attempts: prior.max_attempts,
+        max_runtime_ms: prior.max_runtime_ms,
+        max_memory_bytes: prior.max_memory_bytes,
+        owned_worktree: false,
+        repository: None,
+        branch_prefix: "codex/".into(),
+        allowed_remotes: vec!["origin".into()],
+        allow_commit: true,
+        allow_push: false,
+        allow_create_pull_request: false,
+        allow_review_comment: false,
+        parent_run_id: prior.run_id,
+        snapshot_is_frozen: true,
+    };
+    let queued = enqueue(cli, &paths, &config, &mut store, &mut shared, options)?;
+    let _ = std::fs::remove_file(retry_source);
+    println!("Queued retry {} as {}", queued.job_id, queued.run_id);
+    Ok(())
+}
+
+fn approve(run_id: &str, request_id: &str, decision: PermissionDecision) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths)?;
+    let store = DaemonStore::open(&paths)?;
+    let shared = SharedLedger::open(&paths.ledger_db)?;
+    let engine = DaemonEngine::new(
+        store,
+        shared,
+        paths,
+        config,
+        RealProcessAdapter::current()?,
+        OsNotificationAdapter,
+        SystemClock,
+        format!("daemon-control-{}", std::process::id()),
+    );
+    engine.decide_approval(run_id, request_id, decision)?;
+    println!("Approval {request_id} recorded for {run_id}");
+    Ok(())
+}
+
+fn kill_switch(action: &KillSwitchCmd) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    match action {
+        KillSwitchCmd::Engage => {
+            store.set_kill_switch(true)?;
+            let count = store.request_cancel_all(now_ms()?)?;
+            println!("Kill switch engaged; cancellation requested for {count} run(s).");
+        }
+        KillSwitchCmd::Release => {
+            store.set_kill_switch(false)?;
+            println!("Kill switch released. New work may start.");
+        }
+        KillSwitchCmd::Status => println!(
+            "{}",
+            if store.kill_switch()? {
+                "engaged"
+            } else {
+                "released"
+            }
+        ),
+    }
+    Ok(())
+}
+
+fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    DaemonConfig::load(&paths)?;
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let mut state = DaemonStore::open(&paths)?;
+    let secrets = KeyringSecretStore;
+    match action {
+        TriggerCmd::AddCron {
+            id,
+            target,
+            cron,
+            param,
+            payload_param,
+        } => {
+            let (target, workflow) = build_trigger_target(target, param, payload_param)?;
+            let config = TriggerConfig::Cron {
+                target,
+                workflow,
+                schedule: cron.clone(),
+            };
+            add_trigger(&mut shared, id, config, None)?;
+        }
+        TriggerCmd::AddFilesystem {
+            id,
+            target,
+            path,
+            recursive,
+            param,
+            payload_param,
+        } => {
+            let (target, workflow) = build_trigger_target(target, param, payload_param)?;
+            let pattern = workflow
+                .as_ref()
+                .and_then(|binding| match &binding.trigger {
+                    WorkflowTrigger::Filesystem { pattern, .. } => Some(pattern.clone()),
+                    _ => None,
+                });
+            let config = TriggerConfig::Filesystem {
+                target,
+                workflow,
+                path: trigger::canonicalize_trigger_path(path.clone())?,
+                recursive: *recursive,
+                pattern,
+                last_fingerprint: None,
+            };
+            add_trigger(&mut shared, id, config, None)?;
+        }
+        TriggerCmd::AddWebhook {
+            id,
+            target,
+            secret_env,
+            param,
+            payload_param,
+            max_skew_ms,
+        } => {
+            let secret = std::env::var(secret_env)
+                .map_err(|_| format!("Environment variable '{secret_env}' is not set"))?;
+            let (target, workflow) = build_trigger_target(target, param, payload_param)?;
+            let secret_reference = workflow
+                .as_ref()
+                .and_then(|binding| match &binding.trigger {
+                    WorkflowTrigger::SignedWebhook {
+                        secret_reference, ..
+                    } => Some(secret_reference.clone()),
+                    _ => None,
+                });
+            let config = TriggerConfig::SignedWebhook {
+                target,
+                workflow,
+                secret_reference,
+                max_skew_ms: *max_skew_ms,
+            };
+            let secret_slot = config.secret_reference(id).to_string();
+            add_trigger(
+                &mut shared,
+                id,
+                config,
+                Some((&secrets, &secret_slot, &secret)),
+            )?;
+        }
+        TriggerCmd::AddGithub {
+            id,
+            target,
+            secret_env,
+            repository,
+            local_repository,
+            remote,
+            branch_prefixes,
+            events,
+            allow_push,
+            allow_create_pull_request,
+            allow_review_comment,
+            param,
+            payload_param,
+            max_skew_ms,
+        } => {
+            let secret = std::env::var(secret_env)
+                .map_err(|_| format!("Environment variable '{secret_env}' is not set"))?;
+            let (target, workflow) = build_trigger_target(target, param, payload_param)?;
+            let local_repository = local_repository
+                .canonicalize()
+                .map_err(|error| format!("Cannot canonicalize local repository: {error}"))?;
+            let config = TriggerConfig::Github {
+                target,
+                workflow,
+                repository: repository.clone(),
+                local_repository: local_repository.to_string_lossy().to_string(),
+                remote_name: remote.clone(),
+                branch_prefixes: branch_prefixes.clone(),
+                events: events.clone(),
+                allow_push: *allow_push,
+                allow_create_pull_request: *allow_create_pull_request,
+                allow_review_comment: *allow_review_comment,
+                max_skew_ms: *max_skew_ms,
+            };
+            add_trigger(&mut shared, id, config, Some((&secrets, id, &secret)))?;
+        }
+        TriggerCmd::List { json } => {
+            let triggers = shared.list_triggers()?;
+            if *json {
+                let values = triggers
+                    .iter()
+                    .map(|trigger| {
+                        serde_json::json!({
+                            "id": trigger.trigger_id,
+                            "kind": trigger.kind,
+                            "enabled": trigger.enabled,
+                            "next_fire_at_ms": trigger.next_fire_at_ms,
+                            "last_delivery_at_ms": trigger.last_delivery_at_ms,
+                            "config": serde_json::from_slice::<serde_json::Value>(&trigger.config_json)
+                                .unwrap_or(serde_json::Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&values).unwrap_or_default()
+                );
+            } else {
+                for trigger in triggers {
+                    println!(
+                        "{}\t{}\t{}",
+                        trigger.trigger_id, trigger.kind, trigger.enabled
+                    );
+                }
+            }
+        }
+        TriggerCmd::Remove { id } => {
+            let stored = shared
+                .trigger(id)?
+                .ok_or_else(|| format!("Unknown trigger '{id}'"))?;
+            let config: TriggerConfig = serde_json::from_slice(&stored.config_json)
+                .map_err(|error| format!("Invalid trigger '{id}': {error}"))?;
+            if config
+                .workflow_binding()
+                .is_some_and(|binding| binding.managed_by_batch)
+            {
+                return Err(
+                    "M4-managed trigger must be removed by unregistering its workflow batch"
+                        .to_string(),
+                );
+            }
+            if !shared.disable_trigger(id, now_ms()?)? {
+                return Err(format!("Unknown trigger '{id}'"));
+            }
+            secrets.delete(config.secret_reference(id))?;
+            println!("Trigger '{id}' disabled and its signing secret removed.");
+        }
+        TriggerCmd::SecretSet {
+            reference,
+            secret_env,
+        } => {
+            trigger::validate_secret_reference(reference)?;
+            let secret = std::env::var(secret_env)
+                .map_err(|_| format!("Environment variable '{secret_env}' is not set"))?;
+            secrets.put(reference, &secret)?;
+            println!("Webhook secret reference '{reference}' stored in the OS keychain.");
+        }
+        TriggerCmd::SecretRemove { reference } => {
+            trigger::validate_secret_reference(reference)?;
+            secrets.delete(reference)?;
+            println!("Webhook secret reference '{reference}' removed from the OS keychain.");
+        }
+        TriggerCmd::Deliver {
+            id,
+            delivery_id,
+            timestamp_ms,
+            nonce,
+            signature,
+            payload,
+            event,
+        } => {
+            let bytes = read_payload(payload)?;
+            let outcome = ingest_signed_delivery(
+                &mut shared,
+                &mut state,
+                &secrets,
+                &SignedDelivery {
+                    trigger_id: id,
+                    delivery_id,
+                    timestamp_ms: *timestamp_ms,
+                    nonce,
+                    signature,
+                    event_name: event.as_deref(),
+                    payload: &bytes,
+                },
+                now_ms()?,
+            )?;
+            println!("{}", serde_json::to_string(&outcome).unwrap_or_default());
+            if outcome == IngestOutcome::Rejected {
+                return Err("Signed delivery was rejected".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_trigger(
+    shared: &mut SharedLedger,
+    id: &str,
+    config: TriggerConfig,
+    secret: Option<(&dyn SecretStore, &str, &str)>,
+) -> Result<(), String> {
+    validate_trigger_id(id)?;
+    config.validate()?;
+    validate_trigger_recipe(&config)?;
+    if let Some((store, slot, secret)) = secret {
+        store.put(slot, secret)?;
+    }
+    let next = match &config {
+        TriggerConfig::Cron { schedule, .. } => Some(trigger::next_cron_ms(schedule, now_ms()?)?),
+        _ => None,
+    };
+    shared.upsert_trigger(
+        id,
+        config.kind_token(),
+        &serde_json::to_vec(&config).map_err(|error| error.to_string())?,
+        now_ms()?,
+        next,
+    )?;
+    println!("Trigger '{id}' installed ({})", config.kind_token());
+    Ok(())
+}
+
+fn validate_trigger_recipe(config: &TriggerConfig) -> Result<(), String> {
+    let Some((recipe_name, params, payload_param)) = config.recipe_target() else {
+        return Ok(());
+    };
+    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
+    let cwd = std::env::current_dir().ok();
+    let recipe = recipes::resolve_recipe(recipe_name, cwd.as_deref(), &app_data)?;
+    for key in params.keys() {
+        if !recipe.params.contains_key(key) {
+            return Err(format!(
+                "Trigger parameter '{key}' is not declared by the recipe"
+            ));
+        }
+    }
+    if let Some(key) = payload_param {
+        if !recipe.params.contains_key(key) {
+            return Err(format!(
+                "Payload parameter '{key}' is not declared by the recipe"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_trigger_target(
+    args: &TriggerTargetArgs,
+    params: &[String],
+    payload_param: &Option<String>,
+) -> Result<(TriggerTarget, Option<WorkflowTriggerBinding>), String> {
+    let workflow_fields_present = args.workflow_id.is_some()
+        || args.definition_sha256.is_some()
+        || args.workflow_version.is_some()
+        || args.workflow_trigger_json.is_some();
+    if let Some(recipe) = &args.recipe {
+        if workflow_fields_present {
+            return Err("RECIPE and workflow target flags are mutually exclusive".to_string());
+        }
+        return Ok((
+            TriggerTarget::Recipe {
+                recipe: recipe.clone(),
+                params: parse_btree_params(params)?,
+                payload_param: payload_param.clone(),
+            },
+            None,
+        ));
+    }
+    if !params.is_empty() || payload_param.is_some() {
+        return Err("--param/--payload-param are supported only for recipe targets".to_string());
+    }
+    let workflow_id = args
+        .workflow_id
+        .clone()
+        .ok_or_else(|| "Provide either a RECIPE or all M4 workflow target flags".to_string())?;
+    let definition_sha256 = args
+        .definition_sha256
+        .clone()
+        .ok_or_else(|| "Workflow target requires --definition-sha256".to_string())?;
+    let workflow_version = args
+        .workflow_version
+        .ok_or_else(|| "Workflow target requires --workflow-version".to_string())?;
+    let trigger_json = args
+        .workflow_trigger_json
+        .as_deref()
+        .ok_or_else(|| "Workflow target requires --workflow-trigger-json".to_string())?;
+    let declared_trigger: WorkflowTrigger = serde_json::from_str(trigger_json)
+        .map_err(|error| format!("Invalid --workflow-trigger-json: {error}"))?;
+    Ok((
+        TriggerTarget::Workflow {
+            workflow_id,
+            definition_sha256,
+        },
+        Some(WorkflowTriggerBinding {
+            workflow_version,
+            managed_by_batch: false,
+            trigger: declared_trigger,
+        }),
+    ))
+}
+
+fn validate_trigger_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        Err("Trigger id must contain only letters, digits, '-' or '_'".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_btree_params(values: &[String]) -> Result<BTreeMap<String, String>, String> {
+    Ok(parse_params(values)?.into_iter().collect())
+}
+
+fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    if path == Path::new("-") {
+        std::io::stdin()
+            .take((trigger::MAX_WEBHOOK_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("Failed to read webhook payload: {error}"))?;
+    } else {
+        bytes = std::fs::read(path)
+            .map_err(|error| format!("Failed to read webhook payload: {error}"))?;
+    }
+    if bytes.len() > trigger::MAX_WEBHOOK_BYTES {
+        return Err("Webhook payload exceeds 1 MiB".to_string());
+    }
+    Ok(bytes)
+}
+
+async fn serve(cli: &crate::Cli) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths)?;
+    paths.ensure()?;
+    let _lock = DaemonLock::acquire(&paths.lock)?;
+    let mut store = DaemonStore::open(&paths)?;
+    store.set_meta("stop_requested", "0")?;
+    recover_preparing(&paths, &mut store)?;
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    reconcile_reserved_deliveries(&mut store, &mut shared)?;
+    let owner_id = format!("daemon-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    let mut engine = DaemonEngine::new(
+        store,
+        shared,
+        paths.clone(),
+        config.clone(),
+        RealProcessAdapter::current()?,
+        OsNotificationAdapter,
+        SystemClock,
+        owner_id,
+    );
+    engine.recover()?;
+    remote::spawn_if_configured(paths.clone()).await?;
+    spawn_knowledge_refresh_scheduler()?;
+    spawn_webdav_backup_scheduler()?;
+    if let Some(port) = config.webhook_port {
+        webhook::spawn_local_listener(paths.clone(), port).await?;
+    }
+    let mut workflow_trigger_sync = WorkflowBatchSynchronizer::default();
+    loop {
+        let now = now_ms()?;
+        if let Err(error) =
+            workflow_trigger_sync.sync_if_changed(&paths.root, &mut engine.shared, now)
+        {
+            // A malformed or rolled-back batch must leave the prior atomic
+            // registration active, but it must not take the resident service
+            // (and unrelated queued work) offline.
+            eprintln!("Rejected M4 workflow trigger batch: {error}");
+        }
+        poll_persistent_triggers(&mut engine.shared, &mut engine.store, now)?;
+        if let Err(error) =
+            process_pending_deliveries(cli, &paths, &config, &mut engine.store, &mut engine.shared)
+        {
+            eprintln!("Persistent trigger delivery paused: {error}");
+        }
+        engine.tick()?;
+        if engine.store.get_meta("stop_requested")?.as_deref() == Some("1") {
+            engine.store.request_cancel_all(now)?;
+            engine.tick()?;
+            if engine.active_count() == 0 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+    }
+    engine.store.set_meta("pid", "")?;
+    engine.store.set_meta("heartbeat_ms", "0")?;
+    Ok(())
+}
+
+fn spawn_knowledge_refresh_scheduler() -> Result<(), String> {
+    let app_data = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve app data for Knowledge background refresh".to_string())?;
+    tokio::spawn(async move {
+        loop {
+            let now = now_ms().unwrap_or_default();
+            match little_monkey_lib::knowledge_service::run_due_background_refresh(&app_data, now)
+                .await
+            {
+                Ok(outcome) if !outcome.failures.is_empty() => {
+                    eprintln!(
+                        "Knowledge background refresh completed with errors: {}",
+                        outcome.failures.join("; ")
+                    );
+                }
+                Err(error) => eprintln!("Knowledge background refresh check failed: {error}"),
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+    Ok(())
+}
+
+fn spawn_webdav_backup_scheduler() -> Result<(), String> {
+    let app_data = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve app data for WebDAV background backup".to_string())?;
+    let owner = format!(
+        "daemon-webdav-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    tokio::spawn(async move {
+        loop {
+            let now = now_ms().unwrap_or_default();
+            if let Err(error) = little_monkey_lib::portability_commands::run_due_webdav_backup(
+                &app_data, &owner, now, false,
+            )
+            .await
+            {
+                eprintln!("WebDAV background backup check failed: {error}");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+    Ok(())
+}
+
+fn recover_preparing(paths: &DaemonPaths, store: &mut DaemonStore) -> Result<(), String> {
+    for job in store.stale_preparing(now_ms()?)? {
+        match submit_queued_snapshot(
+            &job.recipe_snapshot,
+            &job.job_id,
+            job.repository_policy_json.as_deref(),
+        ) {
+            Ok(run_id) => store.mark_queued(&job.job_id, &run_id, now_ms()?)?,
+            Err(error) => {
+                store.transition(&job.job_id, JobState::Failed, now_ms()?, None, Some(&error))?
+            }
+        }
+    }
+    let _ = paths;
+    Ok(())
+}
+
+/// Completes the cross-database hand-off for signed deliveries that were
+/// durably reserved in daemon state before a crash. The shared ledger remains
+/// authoritative for replay/conflict decisions; an already-submitted delivery
+/// is safe to reactivate because its downstream job id is deterministic.
+fn reconcile_reserved_deliveries(
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+) -> Result<(), String> {
+    for pending in store.reserved_delivery_payloads(256)? {
+        let payload_sha256 = sha256_hex(pending.payload_json.as_bytes());
+        let disposition = match shared.delivery(&pending.trigger_id, &pending.delivery_id)? {
+            None => shared.accept_delivery(
+                &pending.trigger_id,
+                &pending.delivery_id,
+                &payload_sha256,
+                pending.received_at_ms,
+            )?,
+            Some((status, stored_sha256, _)) if stored_sha256 == payload_sha256 => {
+                if status == "accepted" || status == "submitted" {
+                    ledger::DeliveryDisposition::Duplicate
+                } else {
+                    ledger::DeliveryDisposition::ConflictingDuplicate
+                }
+            }
+            Some(_) => ledger::DeliveryDisposition::ConflictingDuplicate,
+        };
+        match disposition {
+            ledger::DeliveryDisposition::Accepted | ledger::DeliveryDisposition::Duplicate => {
+                store.activate_delivery_payload(&pending.trigger_id, &pending.delivery_id)?;
+            }
+            ledger::DeliveryDisposition::ConflictingDuplicate => {
+                store.discard_delivery_payload(&pending.trigger_id, &pending.delivery_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn process_pending_deliveries(
+    cli: &crate::Cli,
+    paths: &DaemonPaths,
+    config: &DaemonConfig,
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+) -> Result<(), String> {
+    for pending in store.pending_delivery_payloads(64)? {
+        if let Err(error) =
+            process_one_pending_delivery(cli, paths, config, store, shared, &pending)
+        {
+            eprintln!(
+                "Persistent trigger delivery '{}/{}' paused: {error}",
+                pending.trigger_id, pending.delivery_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn process_one_pending_delivery(
+    cli: &crate::Cli,
+    paths: &DaemonPaths,
+    config: &DaemonConfig,
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+    pending: &PendingDelivery,
+) -> Result<(), String> {
+    let Some(stored_trigger) = shared.trigger(&pending.trigger_id)? else {
+        return Ok(());
+    };
+    let trigger: TriggerConfig =
+        serde_json::from_slice(&stored_trigger.config_json).map_err(|error| error.to_string())?;
+    trigger.validate()?;
+    if let Some((workflow_id, definition_sha256, binding)) = trigger.workflow_target() {
+        return dispatch_workflow_delivery(
+            paths,
+            store,
+            shared,
+            pending,
+            workflow_id,
+            definition_sha256,
+            &binding.trigger,
+        );
+    }
+    let (recipe_name, recipe_params, payload_param) = trigger
+        .recipe_target()
+        .ok_or_else(|| "Trigger target is neither a recipe nor a workflow".to_string())?;
+    let mut params = recipe_params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    if let Some(key) = payload_param {
+        params.push(format!("{key}={}", pending.payload_json));
+    }
+    let deterministic_job_id = format!(
+        "trigger-{}",
+        &sha256_hex(format!("{}:{}", pending.trigger_id, pending.delivery_id).as_bytes())[..32]
+    );
+    let mut options = QueueOptions {
+        recipe: recipe_name.to_string(),
+        params,
+        deterministic_job_id: Some(deterministic_job_id),
+        priority: 0,
+        max_attempts: 1,
+        max_runtime_ms: 7 * 24 * 60 * 60 * 1_000,
+        max_memory_bytes: None,
+        owned_worktree: false,
+        repository: None,
+        branch_prefix: "codex/".into(),
+        allowed_remotes: vec!["origin".into()],
+        allow_commit: true,
+        allow_push: false,
+        allow_create_pull_request: false,
+        allow_review_comment: false,
+        parent_run_id: None,
+        snapshot_is_frozen: false,
+    };
+    if let TriggerConfig::Github {
+        local_repository,
+        remote_name,
+        branch_prefixes,
+        allow_push,
+        allow_create_pull_request,
+        allow_review_comment,
+        ..
+    } = &trigger
+    {
+        options.owned_worktree = true;
+        options.repository = Some(PathBuf::from(local_repository));
+        options.allowed_remotes = vec![remote_name.clone()];
+        options.branch_prefix = branch_prefixes
+            .first()
+            .cloned()
+            .ok_or_else(|| "GitHub trigger has no branch policy".to_string())?;
+        options.allow_push = *allow_push;
+        options.allow_create_pull_request = *allow_create_pull_request;
+        options.allow_review_comment = *allow_review_comment;
+    }
+    let queued = enqueue(cli, paths, config, store, shared, options)?;
+    shared.mark_delivery_submitted(
+        &pending.trigger_id,
+        &pending.delivery_id,
+        &queued.run_id,
+        now_ms()?,
+    )?;
+    store.mark_delivery_submitted(&pending.trigger_id, &pending.delivery_id, &queued.job_id)
+}
+
+fn dispatch_workflow_delivery(
+    paths: &DaemonPaths,
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+    pending: &PendingDelivery,
+    workflow_id: &str,
+    definition_sha256: &str,
+    declared_trigger: &WorkflowTrigger,
+) -> Result<(), String> {
+    let deterministic_run_id = format!(
+        "m4-trigger-{}",
+        &sha256_hex(format!("{}:{}", pending.trigger_id, pending.delivery_id).as_bytes())[..32]
+    );
+    match shared.delivery(&pending.trigger_id, &pending.delivery_id)? {
+        Some((status, _, None)) if status == "submitted" => {
+            // Crash window: M4 history and the shared submission marker were
+            // committed, but daemon-local payload bookkeeping was not.
+            store.mark_delivery_submitted_external(&pending.trigger_id, &pending.delivery_id)?;
+            return Ok(());
+        }
+        Some((status, _, None)) if status == "accepted" => {}
+        Some((status, _, run_id)) => {
+            return Err(format!(
+                "Workflow delivery has incompatible shared state status={status} run_id={run_id:?}"
+            ));
+        }
+        None => {
+            return Err("Workflow delivery is missing from the shared replay ledger".to_string())
+        }
+    }
+
+    let payload_json: serde_json::Value = serde_json::from_str(&pending.payload_json)
+        .map_err(|error| format!("Stored trigger payload is invalid JSON: {error}"))?;
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let history = little_monkey_lib::m4_runtime::run_daemon_workflow_delivery(
+        app_data,
+        workflow_id,
+        definition_sha256,
+        &deterministic_run_id,
+        declared_trigger.clone(),
+        payload_json,
+    )?;
+    if history.run_id != deterministic_run_id
+        || history.workflow_id != workflow_id
+        || history.definition_sha256 != definition_sha256
+        || &history.trigger != declared_trigger
+    {
+        return Err("M4 workflow delivery returned mismatched durable history".to_string());
+    }
+    // The M4 append-only history commits first. A crash before either marker
+    // below safely re-enters with the same run id and receives that history.
+    shared.mark_delivery_submitted_external(
+        &pending.trigger_id,
+        &pending.delivery_id,
+        now_ms()?,
+    )?;
+    store.mark_delivery_submitted_external(&pending.trigger_id, &pending.delivery_id)
+}
+
+fn control_recorder(
+    shared: &SharedLedger,
+    run_id: &str,
+) -> Result<Arc<DurableRunRecorder>, String> {
+    DurableRunRecorder::attach(
+        shared.run_ledger()?,
+        run_id,
+        "daemon-controller".into(),
+        ClientIdentity {
+            client_id: "monkey-daemon".into(),
+            instance_id: format!("daemon-control-{}", std::process::id()),
+            kind: ClientKind::Daemon,
+            version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )
+}
+
+fn now_ms() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())
+        .and_then(|duration| {
+            u64::try_from(duration.as_millis()).map_err(|_| "timestamp overflow".to_string())
+        })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
+
+    #[test]
+    fn user_run_key_is_hashed_into_job_id() {
+        let args = DaemonRunArgs {
+            name_or_path: "x".into(),
+            param: vec![],
+            run_key: Some("raw-secret-key".into()),
+            priority: 0,
+            max_attempts: 1,
+            max_runtime_seconds: 60,
+            max_memory_mb: None,
+            owned_worktree: false,
+            repository: None,
+            branch_prefix: "codex/".into(),
+            allowed_remotes: vec!["origin".into()],
+            allow_commit: true,
+            allow_push: false,
+            allow_create_pull_request: false,
+            allow_review_comment: false,
+            json: false,
+        };
+        let options = QueueOptions::from_run_args(&args);
+        let id = options.deterministic_job_id.unwrap();
+        assert!(!id.contains("raw-secret-key"));
+        assert_eq!(id.len(), 36);
+    }
+
+    #[test]
+    fn remote_mutations_are_never_implicit_without_owned_worktree() {
+        let mut args = DaemonRunArgs {
+            name_or_path: "x".into(),
+            param: vec![],
+            run_key: None,
+            priority: 0,
+            max_attempts: 1,
+            max_runtime_seconds: 60,
+            max_memory_mb: None,
+            owned_worktree: false,
+            repository: None,
+            branch_prefix: "codex/".into(),
+            allowed_remotes: vec!["origin".into()],
+            allow_commit: true,
+            allow_push: true,
+            allow_create_pull_request: false,
+            allow_review_comment: false,
+            json: false,
+        };
+        let options = QueueOptions::from_run_args(&args);
+        assert!(!options.owned_worktree && options.allow_push);
+        args.owned_worktree = true;
+        assert!(QueueOptions::from_run_args(&args).owned_worktree);
+    }
+
+    #[test]
+    fn trigger_target_args_keep_recipe_and_workflow_namespaces_distinct() {
+        let recipe_args = TriggerTargetArgs {
+            recipe: Some("fixture".into()),
+            workflow_id: None,
+            definition_sha256: None,
+            workflow_version: None,
+            workflow_trigger_json: None,
+        };
+        let (target, binding) = build_trigger_target(
+            &recipe_args,
+            &["topic=value".into()],
+            &Some("payload".into()),
+        )
+        .unwrap();
+        assert!(matches!(target, TriggerTarget::Recipe { .. }));
+        assert!(binding.is_none());
+
+        let workflow_args = TriggerTargetArgs {
+            recipe: None,
+            workflow_id: Some("workflow.one".into()),
+            definition_sha256: Some("a".repeat(64)),
+            workflow_version: Some(3),
+            workflow_trigger_json: Some(
+                serde_json::json!({
+                    "kind": "event_ingestion",
+                    "topic": "github.events",
+                    "consumer_id": "consumer.one"
+                })
+                .to_string(),
+            ),
+        };
+        let (target, binding) = build_trigger_target(&workflow_args, &[], &None).unwrap();
+        assert!(matches!(target, TriggerTarget::Workflow { .. }));
+        assert!(matches!(
+            binding.unwrap().trigger,
+            WorkflowTrigger::EventIngestion { .. }
+        ));
+    }
+
+    #[test]
+    fn trigger_target_args_reject_ambiguous_or_payload_expanding_workflows() {
+        let ambiguous = TriggerTargetArgs {
+            recipe: Some("fixture".into()),
+            workflow_id: Some("workflow.one".into()),
+            definition_sha256: Some("a".repeat(64)),
+            workflow_version: Some(1),
+            workflow_trigger_json: Some(r#"{"kind":"manual"}"#.into()),
+        };
+        assert!(build_trigger_target(&ambiguous, &[], &None).is_err());
+
+        let workflow = TriggerTargetArgs {
+            recipe: None,
+            workflow_id: Some("workflow.one".into()),
+            definition_sha256: Some("a".repeat(64)),
+            workflow_version: Some(1),
+            workflow_trigger_json: Some(r#"{"kind":"manual"}"#.into()),
+        };
+        assert!(build_trigger_target(&workflow, &["x=y".into()], &None).is_err());
+    }
+
+    #[test]
+    fn workflow_delivery_commits_m4_history_then_cross_ledger_markers() {
+        let app_data = std::env::temp_dir().join(format!(
+            "little-monkey-m4-daemon-delivery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&app_data).unwrap();
+        let services = little_monkey_lib::m4_runtime::production_m4_services(&app_data).unwrap();
+        let mut definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        let declared_trigger = WorkflowTrigger::PersistentCron {
+            expression: "*/5 * * * *".into(),
+        };
+        definition.triggers = vec![declared_trigger.clone()];
+        let ir = services.workflows.create(definition.clone()).unwrap();
+
+        let paths = DaemonPaths::under(&app_data);
+        paths.ensure().unwrap();
+        let mut store = DaemonStore::open(&paths).unwrap();
+        let mut shared = SharedLedger::open(&paths.ledger_db).unwrap();
+        let trigger_id = "workflow-cron";
+        let config = TriggerConfig::Cron {
+            target: TriggerTarget::Workflow {
+                workflow_id: definition.workflow_id.clone(),
+                definition_sha256: ir.definition_sha256.clone(),
+            },
+            workflow: Some(WorkflowTriggerBinding {
+                workflow_version: definition.workflow_version,
+                managed_by_batch: true,
+                trigger: declared_trigger.clone(),
+            }),
+            schedule: "*/5 * * * *".into(),
+        };
+        shared
+            .upsert_trigger(
+                trigger_id,
+                config.kind_token(),
+                &serde_json::to_vec(&config).unwrap(),
+                10,
+                None,
+            )
+            .unwrap();
+        let payload = serde_json::json!({"kind":"cron","scheduled_at_ms":11}).to_string();
+        store
+            .reserve_delivery_payload(trigger_id, "delivery-one", None, &payload, 11)
+            .unwrap();
+        store
+            .activate_delivery_payload(trigger_id, "delivery-one")
+            .unwrap();
+        shared
+            .accept_delivery(
+                trigger_id,
+                "delivery-one",
+                &sha256_hex(payload.as_bytes()),
+                11,
+            )
+            .unwrap();
+        let pending = store.pending_delivery_payloads(1).unwrap().remove(0);
+        dispatch_workflow_delivery(
+            &paths,
+            &mut store,
+            &mut shared,
+            &pending,
+            &definition.workflow_id,
+            &ir.definition_sha256,
+            &declared_trigger,
+        )
+        .unwrap();
+
+        let run_id = format!(
+            "m4-trigger-{}",
+            &sha256_hex(format!("{trigger_id}:delivery-one").as_bytes())[..32]
+        );
+        let history = services.workflows.history(&run_id).unwrap();
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
+        assert!(matches!(
+            shared.delivery(trigger_id, "delivery-one").unwrap(),
+            Some((ref status, _, None)) if status == "submitted"
+        ));
+        assert!(store.pending_delivery_payloads(1).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(app_data);
+    }
+}

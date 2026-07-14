@@ -307,6 +307,8 @@ function makeStoreTestSession(id: string): ChatSession {
     unread: false,
     archived: false,
     groupId: null,
+    modelTarget: null,
+    comparisonBranch: null,
     workspacePath: null,
     personaId: null,
     attachedStackIds: [],

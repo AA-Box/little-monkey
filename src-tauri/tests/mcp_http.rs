@@ -36,7 +36,9 @@ use rmcp::model::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use little_monkey_lib::mcp::{call_tool_impl, connect_impl, disconnect_impl, McpServerEntry, McpTransport};
+use little_monkey_lib::mcp::{
+    call_tool_impl, connect_impl, disconnect_impl, McpServerEntry, McpTransport,
+};
 use little_monkey_lib::AppState;
 
 const TEST_INSTRUCTIONS: &str = "Test HTTP MCP server instructions.";
@@ -65,7 +67,10 @@ async fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
     let mut chunk = [0u8; 4096];
 
     let header_end = loop {
-        let n = stream.read(&mut chunk).await.expect("read failed while waiting for headers");
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .expect("read failed while waiting for headers");
         assert!(n > 0, "connection closed before headers completed");
         buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
@@ -78,18 +83,26 @@ async fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
         .lines()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
         })
         .unwrap_or(0);
 
     let body_start = header_end + 4;
     while buf.len() < body_start + content_length {
-        let n = stream.read(&mut chunk).await.expect("read failed while waiting for body");
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .expect("read failed while waiting for body");
         assert!(n > 0, "connection closed before body completed");
         buf.extend_from_slice(&chunk[..n]);
     }
 
-    (header_text, buf[body_start..body_start + content_length].to_vec())
+    (
+        header_text,
+        buf[body_start..body_start + content_length].to_vec(),
+    )
 }
 
 async fn write_json_response(stream: &mut TcpStream, body: &[u8]) {
@@ -97,23 +110,36 @@ async fn write_json_response(stream: &mut TcpStream, body: &[u8]) {
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).await.expect("write headers failed");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write headers failed");
     stream.write_all(body).await.expect("write body failed");
     stream.flush().await.expect("flush failed");
 }
 
 async fn write_accepted_response(stream: &mut TcpStream) {
     let head = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    stream.write_all(head.as_bytes()).await.expect("write headers failed");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write headers failed");
     stream.flush().await.expect("flush failed");
 }
 
 /// Handles exactly one JSON-RPC message over one accepted TCP connection,
 /// responding using `rmcp`'s own model types so the reply is byte-for-byte
 /// what a real server would send.
-async fn handle_one_request(mut stream: TcpStream, tools: Vec<Tool>, saw_auth_header: Arc<AtomicBool>) {
+async fn handle_one_request(
+    mut stream: TcpStream,
+    tools: Vec<Tool>,
+    saw_auth_header: Arc<AtomicBool>,
+) {
     let (headers, body) = read_request(&mut stream).await;
-    if headers.lines().any(|line| line.to_ascii_lowercase().starts_with("authorization:")) {
+    if headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+    {
         saw_auth_header.store(true, Ordering::SeqCst);
     }
 
@@ -155,7 +181,10 @@ async fn handle_one_request(mut stream: TcpStream, tools: Vec<Tool>, saw_auth_he
             // e.g. `notifications/initialized` — no response body expected.
             write_accepted_response(&mut stream).await;
         }
-        other => panic!("unexpected client message: {other:?} (raw body: {:?})", String::from_utf8_lossy(&body)),
+        other => panic!(
+            "unexpected client message: {other:?} (raw body: {:?})",
+            String::from_utf8_lossy(&body)
+        ),
     }
 }
 
@@ -173,7 +202,9 @@ async fn spawn_fake_http_mcp_server(
 
     let handle = tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { break };
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
             let tools = tools.clone();
             let saw_auth_header = saw_auth_header_for_server.clone();
             tokio::spawn(handle_one_request(stream, tools, saw_auth_header));
@@ -212,8 +243,22 @@ async fn connect_lists_tools_and_instructions_from_a_real_http_server() {
 #[tokio::test]
 async fn call_tool_round_trips_arguments_through_a_real_http_server() {
     let tools = vec![
-        Tool::new("echo_http", "Echo", serde_json::json!({"type": "object"}).as_object().unwrap().clone()),
-        Tool::new("boom_http", "Always fails", serde_json::json!({"type": "object"}).as_object().unwrap().clone()),
+        Tool::new(
+            "echo_http",
+            "Echo",
+            serde_json::json!({"type": "object"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+        Tool::new(
+            "boom_http",
+            "Always fails",
+            serde_json::json!({"type": "object"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
     ];
     let (url, server, _saw_auth_header) = spawn_fake_http_mcp_server(tools).await;
     let state = AppState::default();
@@ -221,13 +266,26 @@ async fn call_tool_round_trips_arguments_through_a_real_http_server() {
 
     connect_impl(&state, &entry).await.unwrap();
 
-    let ok = call_tool_impl(&state, &entry, "echo_http", serde_json::json!({ "text": "hello over http" }))
-        .await
-        .unwrap();
-    assert_eq!(ok.content.first().and_then(|c| c.as_text()).map(|t| t.text.as_str()), Some("hello over http"));
+    let ok = call_tool_impl(
+        &state,
+        &entry,
+        "echo_http",
+        serde_json::json!({ "text": "hello over http" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ok.content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str()),
+        Some("hello over http")
+    );
     assert_ne!(ok.is_error, Some(true));
 
-    let err = call_tool_impl(&state, &entry, "boom_http", serde_json::json!({})).await.unwrap();
+    let err = call_tool_impl(&state, &entry, "boom_http", serde_json::json!({}))
+        .await
+        .unwrap();
     assert_eq!(err.is_error, Some(true));
 
     disconnect_impl(&state, &entry.id).await;

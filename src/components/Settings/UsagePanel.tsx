@@ -227,7 +227,7 @@ export function UsagePanel() {
   ];
 
   return (
-    <div className="flex flex-col gap-6 p-2">
+    <div className="flex flex-col gap-6 py-2">
       <p className="text-xs text-muted">{t("UsagePanel.description")}</p>
 
       <div className="flex divide-x divide-border rounded-xl border border-border">

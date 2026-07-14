@@ -198,7 +198,7 @@ export function ApiServerPanel() {
   }
 
   return (
-    <div className="flex flex-col gap-4 p-2">
+    <div className="flex flex-col gap-4 py-2">
       <p className="text-xs text-muted">{t("ApiServerPanel.description")}</p>
 
       <div className="rounded-lg border border-border bg-background px-3">

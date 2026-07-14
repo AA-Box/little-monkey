@@ -60,7 +60,7 @@ export function OllamaPanel() {
   }, [signinOllama]);
 
   return (
-    <div className="flex flex-col gap-2 p-2">
+    <div className="flex flex-col gap-2 py-2">
       <div className="flex flex-wrap items-center gap-2 px-1">
         <StatusPill tone={ollamaReachable ? "success" : "neutral"}>
           {ollamaReachable ? t("OllamaPanel.statusConnected") : t("OllamaPanel.statusNotRunning")}

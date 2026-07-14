@@ -125,10 +125,13 @@ pub fn primary_root_canon(state: &AppState) -> Result<PathBuf, String> {
     let primary = roots
         .first()
         .ok_or_else(|| "No workspace folder is open. Open a folder first.".to_string())?;
-    primary
-        .path
-        .canonicalize()
-        .map_err(|e| format!("Workspace root '{}' is no longer valid: {}", primary.path.display(), e))
+    primary.path.canonicalize().map_err(|e| {
+        format!(
+            "Workspace root '{}' is no longer valid: {}",
+            primary.path.display(),
+            e
+        )
+    })
 }
 
 /// Every attached root as `(canonical_path, label, is_primary)`, primary
@@ -142,10 +145,13 @@ pub fn all_roots(state: &AppState) -> Result<Vec<(PathBuf, String, bool)>, Strin
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let canon = r
-                .path
-                .canonicalize()
-                .map_err(|e| format!("Workspace root '{}' is no longer valid: {}", r.path.display(), e))?;
+            let canon = r.path.canonicalize().map_err(|e| {
+                format!(
+                    "Workspace root '{}' is no longer valid: {}",
+                    r.path.display(),
+                    e
+                )
+            })?;
             Ok((canon, r.label.clone(), i == 0))
         })
         .collect()
@@ -159,7 +165,11 @@ pub fn secondary_label_for(state: &AppState, root_canon: &Path) -> Result<Option
     for (i, root) in roots.iter().enumerate() {
         if let Ok(canon) = root.path.canonicalize() {
             if canon == root_canon {
-                return Ok(if i == 0 { None } else { Some(root.label.clone()) });
+                return Ok(if i == 0 {
+                    None
+                } else {
+                    Some(root.label.clone())
+                });
             }
         }
     }
@@ -226,7 +236,10 @@ fn resolve_against_root(root_canon: &Path, raw: &str) -> Result<PathBuf, String>
     }
 
     if !resolved.starts_with(root_canon) {
-        return Err(format!("Path '{}' escapes the workspace root and is not allowed", raw));
+        return Err(format!(
+            "Path '{}' escapes the workspace root and is not allowed",
+            raw
+        ));
     }
 
     Ok(resolved)
@@ -247,34 +260,46 @@ pub fn resolve_path_and_root(state: &AppState, path: &str) -> Result<(PathBuf, P
 
     if Path::new(path).is_absolute() {
         for root in roots.iter() {
-            let root_canon = root
-                .path
-                .canonicalize()
-                .map_err(|e| format!("Workspace root '{}' is no longer valid: {}", root.path.display(), e))?;
+            let root_canon = root.path.canonicalize().map_err(|e| {
+                format!(
+                    "Workspace root '{}' is no longer valid: {}",
+                    root.path.display(),
+                    e
+                )
+            })?;
             if let Ok(resolved) = resolve_against_root(&root_canon, path) {
                 return Ok((resolved, root_canon));
             }
         }
-        return Err(format!("Path '{}' escapes the workspace root and is not allowed", path));
+        return Err(format!(
+            "Path '{}' escapes the workspace root and is not allowed",
+            path
+        ));
     }
 
     for root in roots.iter().skip(1) {
         let prefix = format!("{}/", root.label);
         if let Some(rest) = path.strip_prefix(&prefix) {
-            let root_canon = root
-                .path
-                .canonicalize()
-                .map_err(|e| format!("Workspace root '{}' is no longer valid: {}", root.path.display(), e))?;
+            let root_canon = root.path.canonicalize().map_err(|e| {
+                format!(
+                    "Workspace root '{}' is no longer valid: {}",
+                    root.path.display(),
+                    e
+                )
+            })?;
             let resolved = resolve_against_root(&root_canon, rest)?;
             return Ok((resolved, root_canon));
         }
     }
 
     let primary = &roots[0];
-    let root_canon = primary
-        .path
-        .canonicalize()
-        .map_err(|e| format!("Workspace root '{}' is no longer valid: {}", primary.path.display(), e))?;
+    let root_canon = primary.path.canonicalize().map_err(|e| {
+        format!(
+            "Workspace root '{}' is no longer valid: {}",
+            primary.path.display(),
+            e
+        )
+    })?;
     let resolved = resolve_against_root(&root_canon, path)?;
     Ok((resolved, root_canon))
 }
@@ -284,7 +309,10 @@ pub fn resolve_path_and_root(state: &AppState, path: &str) -> Result<(PathBuf, P
 /// primary actually changed (callers use this to decide whether to reset
 /// permission grants / record a recent-workspace entry) plus the resulting
 /// info.
-fn set_primary_workspace_root_impl(state: &AppState, path: String) -> Result<(bool, WorkspaceRootInfo), String> {
+fn set_primary_workspace_root_impl(
+    state: &AppState,
+    path: String,
+) -> Result<(bool, WorkspaceRootInfo), String> {
     let canonical = canonical_dir(&path)?;
     let label = label_for(&canonical);
     let id = canonical.to_string_lossy().to_string();
@@ -292,7 +320,11 @@ fn set_primary_workspace_root_impl(state: &AppState, path: String) -> Result<(bo
     let (changed, info) = {
         let mut roots = roots_lock(state)?;
         let changed = roots.first().map(|r| r.path != canonical).unwrap_or(true);
-        let root = WorkspaceRoot { id, path: canonical, label };
+        let root = WorkspaceRoot {
+            id,
+            path: canonical,
+            label,
+        };
         let info = root.to_info(true);
         if changed {
             *roots = vec![root];
@@ -324,7 +356,10 @@ pub fn set_primary_workspace_root(
     Ok(info)
 }
 
-fn add_secondary_workspace_root_impl(state: &AppState, path: String) -> Result<WorkspaceRootInfo, String> {
+fn add_secondary_workspace_root_impl(
+    state: &AppState,
+    path: String,
+) -> Result<WorkspaceRootInfo, String> {
     let canonical = canonical_dir(&path)?;
     let id = canonical.to_string_lossy().to_string();
 
@@ -337,7 +372,11 @@ fn add_secondary_workspace_root_impl(state: &AppState, path: String) -> Result<W
     }
 
     let label = unique_label(&canonical, &roots);
-    let root = WorkspaceRoot { id, path: canonical, label };
+    let root = WorkspaceRoot {
+        id,
+        path: canonical,
+        label,
+    };
     let info = root.to_info(false);
     roots.push(root);
     Ok(info)
@@ -350,7 +389,10 @@ fn add_secondary_workspace_root_impl(state: &AppState, path: String) -> Result<W
 /// touches permission grants — the sandbox boundary is still enforced per
 /// path, and attaching a folder is itself an explicit, visible user action.
 #[tauri::command]
-pub fn add_secondary_workspace_root(state: tauri::State<'_, AppState>, path: String) -> Result<WorkspaceRootInfo, String> {
+pub fn add_secondary_workspace_root(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<WorkspaceRootInfo, String> {
     add_secondary_workspace_root_impl(state.inner(), path)
 }
 
@@ -370,15 +412,24 @@ fn remove_secondary_workspace_root_impl(state: &AppState, id: String) -> Result<
 /// Detach a secondary folder. Errors if `id` refers to the primary root —
 /// use [`set_primary_workspace_root`] to change that instead.
 #[tauri::command]
-pub fn remove_secondary_workspace_root(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn remove_secondary_workspace_root(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     remove_secondary_workspace_root_impl(state.inner(), id)
 }
 
 /// Every currently attached folder, primary first.
 #[tauri::command]
-pub fn get_workspace_roots(state: tauri::State<'_, AppState>) -> Result<Vec<WorkspaceRootInfo>, String> {
+pub fn get_workspace_roots(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<WorkspaceRootInfo>, String> {
     let roots = roots_lock(state.inner())?;
-    Ok(roots.iter().enumerate().map(|(i, r)| r.to_info(i == 0)).collect())
+    Ok(roots
+        .iter()
+        .enumerate()
+        .map(|(i, r)| r.to_info(i == 0))
+        .collect())
 }
 
 fn recent_workspaces_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -478,7 +529,8 @@ mod tests {
 
     fn state_with_primary(root: &Path) -> AppState {
         let state = AppState::default();
-        let (_, _) = set_primary_workspace_root_impl(&state, root.to_string_lossy().to_string()).unwrap();
+        let (_, _) =
+            set_primary_workspace_root_impl(&state, root.to_string_lossy().to_string()).unwrap();
         state
     }
 
@@ -500,7 +552,12 @@ mod tests {
         let (resolved, _) = resolve_path_and_root(&state, "new/deep/file.txt").unwrap();
         assert_eq!(
             resolved,
-            ws.path.canonicalize().unwrap().join("new").join("deep").join("file.txt")
+            ws.path
+                .canonicalize()
+                .unwrap()
+                .join("new")
+                .join("deep")
+                .join("file.txt")
         );
     }
 
@@ -620,11 +677,17 @@ mod tests {
         std::fs::write(secondary.path.join("notes.txt"), "hi").unwrap();
         let state = state_with_primary(&primary.path);
 
-        let info = add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string()).unwrap();
+        let info =
+            add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string())
+                .unwrap();
         assert!(!info.is_primary);
 
-        let (resolved, root_canon) = resolve_path_and_root(&state, &format!("{}/notes.txt", info.label)).unwrap();
-        assert_eq!(resolved, secondary.path.canonicalize().unwrap().join("notes.txt"));
+        let (resolved, root_canon) =
+            resolve_path_and_root(&state, &format!("{}/notes.txt", info.label)).unwrap();
+        assert_eq!(
+            resolved,
+            secondary.path.canonicalize().unwrap().join("notes.txt")
+        );
         assert_eq!(root_canon, secondary.path.canonicalize().unwrap());
     }
 
@@ -634,10 +697,14 @@ mod tests {
         let secondary = TempWorkspace::new();
         std::fs::write(primary.path.join("file.txt"), "hi").unwrap();
         let state = state_with_primary(&primary.path);
-        add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string()).unwrap();
+        add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string())
+            .unwrap();
 
         let (resolved, root_canon) = resolve_path_and_root(&state, "file.txt").unwrap();
-        assert_eq!(resolved, primary.path.canonicalize().unwrap().join("file.txt"));
+        assert_eq!(
+            resolved,
+            primary.path.canonicalize().unwrap().join("file.txt")
+        );
         assert_eq!(root_canon, primary.path.canonicalize().unwrap());
     }
 
@@ -647,11 +714,19 @@ mod tests {
         let secondary = TempWorkspace::new();
         let state = state_with_primary(&primary.path);
 
-        let first = add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string()).unwrap();
-        let second = add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string()).unwrap();
+        let first =
+            add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string())
+                .unwrap();
+        let second =
+            add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string())
+                .unwrap();
 
         assert_eq!(first.id, second.id);
-        assert_eq!(roots_lock(&state).unwrap().len(), 2, "must not attach the same folder twice");
+        assert_eq!(
+            roots_lock(&state).unwrap().len(),
+            2,
+            "must not attach the same folder twice"
+        );
     }
 
     #[test]
@@ -665,11 +740,16 @@ mod tests {
         std::fs::create_dir_all(&dup_b).unwrap();
         let state = state_with_primary(&primary.path);
 
-        let first = add_secondary_workspace_root_impl(&state, dup_a.to_string_lossy().to_string()).unwrap();
-        let second = add_secondary_workspace_root_impl(&state, dup_b.to_string_lossy().to_string()).unwrap();
+        let first =
+            add_secondary_workspace_root_impl(&state, dup_a.to_string_lossy().to_string()).unwrap();
+        let second =
+            add_secondary_workspace_root_impl(&state, dup_b.to_string_lossy().to_string()).unwrap();
 
         assert_eq!(first.label, "app");
-        assert_ne!(second.label, "app", "colliding basenames must be disambiguated");
+        assert_ne!(
+            second.label, "app",
+            "colliding basenames must be disambiguated"
+        );
         assert!(second.label.ends_with("/app"));
     }
 
@@ -680,7 +760,10 @@ mod tests {
         let primary_id = get_workspace_roots_for_test(&state)[0].id.clone();
 
         let err = remove_secondary_workspace_root_impl(&state, primary_id).unwrap_err();
-        assert!(err.contains("Cannot remove the primary"), "unexpected error: {err}");
+        assert!(
+            err.contains("Cannot remove the primary"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -688,7 +771,9 @@ mod tests {
         let primary = TempWorkspace::new();
         let secondary = TempWorkspace::new();
         let state = state_with_primary(&primary.path);
-        let info = add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string()).unwrap();
+        let info =
+            add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string())
+                .unwrap();
 
         remove_secondary_workspace_root_impl(&state, info.id).unwrap();
 
@@ -707,15 +792,31 @@ mod tests {
             .unwrap()
             .insert("write_file".to_string());
 
-        let info = add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string()).unwrap();
-        assert!(state.permissions.session_allow.lock().unwrap().contains("write_file"));
+        let info =
+            add_secondary_workspace_root_impl(&state, secondary.path.to_string_lossy().to_string())
+                .unwrap();
+        assert!(state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains("write_file"));
 
         remove_secondary_workspace_root_impl(&state, info.id).unwrap();
-        assert!(state.permissions.session_allow.lock().unwrap().contains("write_file"));
+        assert!(state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains("write_file"));
     }
 
     fn get_workspace_roots_for_test(state: &AppState) -> Vec<WorkspaceRootInfo> {
         let roots = roots_lock(state).unwrap();
-        roots.iter().enumerate().map(|(i, r)| r.to_info(i == 0)).collect()
+        roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r.to_info(i == 0))
+            .collect()
     }
 }

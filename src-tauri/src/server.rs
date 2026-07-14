@@ -425,8 +425,12 @@ pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join(CONFIG_FILE))
 }
@@ -446,8 +450,8 @@ pub fn load_config_impl(path: &Path) -> Result<ApiServerConfig, String> {
 /// Core save logic: atomic sibling temp file + rename, same idiom as
 /// `sessions.rs`'s `save_to` / `web.rs`'s `save_settings_impl`.
 pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), String> {
-    let payload =
-        serde_json::to_string_pretty(config).map_err(|e| format!("Failed to serialize api_server.json: {e}"))?;
+    let payload = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize api_server.json: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write api_server.json: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize api_server.json: {e}"))?;
@@ -466,7 +470,10 @@ pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), Str
 pub enum ModelRoute {
     Llama,
     Ollama,
-    Providers { provider_id: String, model_id: String },
+    Providers {
+        provider_id: String,
+        model_id: String,
+    },
     Unknown,
 }
 
@@ -610,7 +617,9 @@ pub struct ServerRequest {
 fn full_body(bytes: impl Into<Bytes>) -> ResponseBody {
     // `Full<Bytes>`'s `Error` is `Infallible` — map it into `BoxError` so
     // every response path shares one concrete body type.
-    Full::new(bytes.into()).map_err(|never: Infallible| match never {}).boxed()
+    Full::new(bytes.into())
+        .map_err(|never: Infallible| match never {})
+        .boxed()
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<ResponseBody> {
@@ -655,9 +664,18 @@ fn not_found_response() -> Response<ResponseBody> {
 fn cors_preflight_response() -> Response<ResponseBody> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"))
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Authorization"))
+        .header(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        )
+        .header(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, OPTIONS"),
+        )
+        .header(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type, Authorization"),
+        )
         .body(full_body(Bytes::new()))
         .expect("building a fixed-shape preflight response never fails")
 }
@@ -670,8 +688,10 @@ fn cors_preflight_response() -> Response<ResponseBody> {
 /// token for any request carrying an `Origin` header, even when
 /// `require_token` is off — see its doc comment.
 fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
-    resp.headers_mut()
-        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
     resp
 }
 
@@ -682,7 +702,10 @@ fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
 /// means the request is authenticated as that specific token, and route
 /// handlers must still check `auth.scopes`/`auth.backends`. `Err(response)`
 /// is the exact response to return immediately.
-fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
+fn authenticate(
+    deps: &ServerDeps,
+    headers: &HeaderMap,
+) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
     // `require_token: false` is documented (module doc comment) as an escape
     // hatch for tools that literally can't set a custom header — it was
     // never meant to also hand out unauthenticated access to whatever
@@ -819,8 +842,12 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     // security-review finding this gate closes).
     if deps.expose_providers && backend_visible(authed, Backend::Providers) {
         for provider in &deps.providers {
-            let Ok(api_key) = providers::read_key(&provider.id) else { continue };
-            if let Ok(models) = providers::fetch_models(&provider.base_url, &provider.id, &api_key).await {
+            let Ok(api_key) = providers::read_key(&provider.id) else {
+                continue;
+            };
+            if let Ok(models) =
+                providers::fetch_models(&provider.base_url, &provider.id, &api_key).await
+            {
                 for model in models {
                     data.push(json!({
                         "id": format!("{}/{}", provider.id, model.id),
@@ -835,7 +862,11 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
 }
 
-async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, body: Bytes) -> Response<ResponseBody> {
+async fn handle_chat_completions(
+    deps: &ServerDeps,
+    authed: Option<&TokenAuth>,
+    body: Bytes,
+) -> Response<ResponseBody> {
     if let Some(auth) = authed {
         if !auth.scopes.contains(&Scope::Chat) {
             return forbidden_response("This token isn't scoped for `chat`.");
@@ -844,17 +875,39 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
 
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body", "invalid_request_error"),
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON body",
+                "invalid_request_error",
+            )
+        }
     };
 
-    let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let stream = parsed.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stream = parsed
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref(), &deps.providers);
+    let route = route_model(
+        &model,
+        deps.llama_ready,
+        deps.llama_model_stem.as_deref(),
+        &deps.providers,
+    );
 
     if route == ModelRoute::Unknown {
         // Mirrors OpenAI's own wording for a request with no `model`.
-        return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "you must provide a model parameter",
+            "model_not_found",
+        );
     }
 
     // Same "only advertise/serve what's actually exposed" stance as
@@ -866,7 +919,11 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
         ModelRoute::Llama | ModelRoute::Unknown => false,
     };
     if backend_disabled {
-        return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Unknown model '{model}'"),
+            "model_not_found",
+        );
     }
 
     if let Some(auth) = authed {
@@ -883,7 +940,10 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
     let request_builder = match &route {
         ModelRoute::Llama => deps
             .client
-            .post(format!("http://127.0.0.1:{}/v1/chat/completions", deps.llama_port))
+            .post(format!(
+                "http://127.0.0.1:{}/v1/chat/completions",
+                deps.llama_port
+            ))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
         ModelRoute::Ollama => deps
@@ -891,17 +951,31 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
             .post(format!("{}/v1/chat/completions", deps.ollama_base_url))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
-        ModelRoute::Providers { provider_id, model_id } => {
+        ModelRoute::Providers {
+            provider_id,
+            model_id,
+        } => {
             // `provider_id` is guaranteed to match an entry in
             // `deps.providers` — `route_model` only ever produces this
             // variant for a known provider id — but a defensive `NOT_FOUND`
             // beats an `unwrap` panic if that invariant is ever broken.
-            let Some(base_url) = deps.providers.iter().find(|p| &p.id == provider_id).map(|p| p.base_url.clone()) else {
-                return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+            let Some(base_url) = deps
+                .providers
+                .iter()
+                .find(|p| &p.id == provider_id)
+                .map(|p| p.base_url.clone())
+            else {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Unknown model '{model}'"),
+                    "model_not_found",
+                );
             };
             let api_key = match providers::read_key(provider_id) {
                 Ok(key) => key,
-                Err(e) => return error_response(StatusCode::BAD_GATEWAY, &e, "provider_not_configured"),
+                Err(e) => {
+                    return error_response(StatusCode::BAD_GATEWAY, &e, "provider_not_configured")
+                }
             };
             // Forward the caller's own OpenAI-shaped body verbatim (their
             // `stream`/`temperature`/etc. survive untouched) — only the
@@ -920,7 +994,11 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
             // reused verbatim, unmodified.
             let mut outgoing = parsed.clone();
             outgoing["model"] = json!(model_id);
-            let request = deps.client.post(format!("{base_url}/chat/completions")).bearer_auth(&api_key).json(&outgoing);
+            let request = deps
+                .client
+                .post(format!("{base_url}/chat/completions"))
+                .bearer_auth(&api_key)
+                .json(&outgoing);
             providers::add_anthropic_headers(request, provider_id, &api_key)
         }
         ModelRoute::Unknown => unreachable!("handled above"),
@@ -937,12 +1015,17 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or(if stream { "text/event-stream" } else { "application/json" })
+        .unwrap_or(if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        })
         .to_string();
 
     if stream {
@@ -955,7 +1038,9 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
             .body(BodyExt::boxed(StreamBody::new(byte_stream)))
-            .expect("building a streaming response from an upstream status + content-type never fails")
+            .expect(
+                "building a streaming response from an upstream status + content-type never fails",
+            )
     } else {
         match upstream.bytes().await {
             Ok(bytes) => Response::builder()
@@ -985,7 +1070,11 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
 /// supported yet" apart from "unknown model". Not streamed — embeddings
 /// responses are always a single buffered JSON payload, unlike chat
 /// completions.
-async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: Bytes) -> Response<ResponseBody> {
+async fn handle_embeddings(
+    deps: &ServerDeps,
+    authed: Option<&TokenAuth>,
+    body: Bytes,
+) -> Response<ResponseBody> {
     if let Some(auth) = authed {
         if !auth.scopes.contains(&Scope::Embeddings) {
             return forbidden_response("This token isn't scoped for `embeddings`.");
@@ -994,14 +1083,33 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
 
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body", "invalid_request_error"),
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON body",
+                "invalid_request_error",
+            )
+        }
     };
-    let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref(), &deps.providers);
+    let route = route_model(
+        &model,
+        deps.llama_ready,
+        deps.llama_model_stem.as_deref(),
+        &deps.providers,
+    );
 
     if route == ModelRoute::Unknown {
-        return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "you must provide a model parameter",
+            "model_not_found",
+        );
     }
 
     if let ModelRoute::Providers { .. } = &route {
@@ -1013,7 +1121,11 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
     }
 
     if route == ModelRoute::Ollama && !deps.expose_ollama {
-        return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Unknown model '{model}'"),
+            "model_not_found",
+        );
     }
 
     if route == ModelRoute::Llama && !deps.llama_embeddings_enabled {
@@ -1059,7 +1171,8 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     match upstream.bytes().await {
         Ok(bytes) => Response::builder()
             .status(status)
@@ -1081,8 +1194,16 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
 /// its scope/backend checks), that token's id — [`serve_one_request`]'s
 /// caller uses this to bump `last_used_at` without `handle_request` itself
 /// needing any I/O or `AppHandle`.
-pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> (Response<ResponseBody>, Option<String>) {
-    let ServerRequest { method, path, headers, body } = req;
+pub async fn handle_request(
+    deps: &ServerDeps,
+    req: ServerRequest,
+) -> (Response<ResponseBody>, Option<String>) {
+    let ServerRequest {
+        method,
+        path,
+        headers,
+        body,
+    } = req;
 
     // `/health` is the one unauthenticated route (a liveness probe has to
     // work before a caller has a token to hand it).
@@ -1104,7 +1225,9 @@ pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> (Response<
 
     let response = match (method, path.as_str()) {
         (Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
-        (Method::POST, "/v1/chat/completions") => handle_chat_completions(deps, authed.as_ref(), body).await,
+        (Method::POST, "/v1/chat/completions") => {
+            handle_chat_completions(deps, authed.as_ref(), body).await
+        }
         (Method::POST, "/v1/embeddings") => handle_embeddings(deps, authed.as_ref(), body).await,
         _ => not_found_response(),
     };
@@ -1138,9 +1261,15 @@ struct ServerRuntime {
 fn provider_catalog_from(custom: Vec<providers::CustomProviderEntry>) -> Vec<ProviderSummary> {
     let mut out: Vec<ProviderSummary> = providers::providers_list_presets()
         .into_iter()
-        .map(|p| ProviderSummary { id: p.id, base_url: p.base_url })
+        .map(|p| ProviderSummary {
+            id: p.id,
+            base_url: p.base_url,
+        })
         .collect();
-    out.extend(custom.into_iter().map(|c| ProviderSummary { id: c.id, base_url: c.base_url }));
+    out.extend(custom.into_iter().map(|c| ProviderSummary {
+        id: c.id,
+        base_url: c.base_url,
+    }));
     out
 }
 
@@ -1246,8 +1375,17 @@ async fn probe_llama_server(client: &reqwest::Client, port: u16) -> (bool, Optio
         None => None,
     };
     let model_id = model_id
-        .and_then(|v| v.get("data").and_then(|d| d.as_array()).and_then(|arr| arr.first().cloned()))
-        .and_then(|entry| entry.get("id").and_then(|id| id.as_str()).map(str::to_string));
+        .and_then(|v| {
+            v.get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|arr| arr.first().cloned())
+        })
+        .and_then(|entry| {
+            entry
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        });
 
     (true, model_id)
 }
@@ -1275,7 +1413,9 @@ where
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                let Some(data) = frame.data_ref() else { continue };
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
                 if collected.len() + data.len() > limit {
                     return Err(with_cors(error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -1301,7 +1441,10 @@ where
 /// Adapts a real hyper request into the `AppHandle`-free [`handle_request`]
 /// core: reads the body (capped — see [`read_capped_body`]) and hands
 /// everything off unchanged.
-async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
+async fn serve_one_request(
+    deps: ServerDeps,
+    req: Request<Incoming>,
+) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
@@ -1310,13 +1453,24 @@ async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<(
         Err(response) => return Ok((response, None)),
     };
 
-    Ok(handle_request(&deps, ServerRequest { method, path, headers, body }).await)
+    Ok(handle_request(
+        &deps,
+        ServerRequest {
+            method,
+            path,
+            headers,
+            body,
+        },
+    )
+    .await)
 }
 
 fn bump_request_count(app: &AppHandle) {
     let state = app.state::<AppState>();
     let payload = {
-        let Ok(mut s) = state.api_server.lock() else { return };
+        let Ok(mut s) = state.api_server.lock() else {
+            return;
+        };
         s.request_count += 1;
         s.last_request_at = Some(now_ms());
         status_payload(&s)
@@ -1332,8 +1486,12 @@ fn bump_request_count(app: &AppHandle) {
 /// with no `AppHandle` — same `*_with_state_impl` shape as
 /// `mcp.rs::add_server_with_state_impl`.
 fn record_token_used_with_state(state: &AppState, path: &Path, token_id: &str) {
-    let Ok(_guard) = state.api_server_config_lock.lock() else { return };
-    let Ok(mut config) = load_config_impl(path) else { return };
+    let Ok(_guard) = state.api_server_config_lock.lock() else {
+        return;
+    };
+    let Ok(mut config) = load_config_impl(path) else {
+        return;
+    };
     if let Some(entry) = config.tokens.iter_mut().find(|t| t.id == token_id) {
         entry.last_used_at = Some(now_ms());
         let _ = save_config_impl(path, &config);
@@ -1343,7 +1501,9 @@ fn record_token_used_with_state(state: &AppState, path: &Path, token_id: &str) {
 /// Best-effort: a failure to record "last used" (corrupt file, race with a
 /// concurrent revoke) never fails the request that's already been served.
 fn record_token_used(app: &AppHandle, token_id: &str) {
-    let Ok(path) = config_file_path(app) else { return };
+    let Ok(path) = config_file_path(app) else {
+        return;
+    };
     record_token_used_with_state(&app.state::<AppState>(), &path, token_id);
 }
 
@@ -1356,7 +1516,12 @@ fn record_token_used(app: &AppHandle, token_id: &str) {
 /// `ApiServerState` before notifying this loop, and doing it here too would
 /// race that same-port-restart concern right back in (see the review finding
 /// `ApiServerState::accept_task`'s doc comment addresses).
-async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<Notify>, runtime: Arc<ServerRuntime>) {
+async fn run_accept_loop(
+    app: AppHandle,
+    listener: TcpListener,
+    shutdown: Arc<Notify>,
+    runtime: Arc<ServerRuntime>,
+) {
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -1477,7 +1642,8 @@ pub async fn run_cli_server(
                 let cli_state = cli_state.clone();
                 async move {
                     let config = load_config_impl(&config_path).unwrap_or_default();
-                    let (llama_ready, llama_model_stem) = probe_llama_server(&client, llama_port).await;
+                    let (llama_ready, llama_model_stem) =
+                        probe_llama_server(&client, llama_port).await;
                     let deps = ServerDeps {
                         llama_port,
                         llama_ready,
@@ -1503,7 +1669,11 @@ pub async fn run_cli_server(
                     if let Some(token_id) = &matched_token_id {
                         record_token_used_with_state(&cli_state, &config_path, token_id);
                     }
-                    eprintln!("[api-serve] request #{n} {} -> {}", req_log_hint(matched_token_id.as_deref()), resp.status());
+                    eprintln!(
+                        "[api-serve] request #{n} {} -> {}",
+                        req_log_hint(matched_token_id.as_deref()),
+                        resp.status()
+                    );
                     Ok::<_, Infallible>(resp)
                 }
             });
@@ -1703,7 +1873,8 @@ pub async fn api_server_set_config(
     state: State<'_, AppState>,
     config: ApiServerConfigView,
 ) -> Result<ApiServerConfigView, String> {
-    let (updated, needs_restart) = set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
+    let (updated, needs_restart) =
+        set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
     if needs_restart {
         stop_server_core(&app).await?;
         start_server_core(&app).await?;
@@ -1716,7 +1887,11 @@ pub async fn api_server_set_config(
 /// [`create_token_with_state_impl`] so the "plaintext never ends up in the
 /// persisted entry" property is testable with no file/lock/`AppState` at all
 /// — see `tests::creating_a_token_never_persists_its_plaintext`.
-fn mint_token(label: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> Result<(String, TokenEntry), String> {
+fn mint_token(
+    label: &str,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+) -> Result<(String, TokenEntry), String> {
     let label = label.trim().to_string();
     if label.is_empty() {
         return Err("Label is required".to_string());
@@ -1790,12 +1965,25 @@ pub fn api_server_create_token(
     scopes: Vec<Scope>,
     backends: Vec<Backend>,
 ) -> Result<CreateTokenResult, String> {
-    let (token, entry) = create_token_with_state_impl(state.inner(), &config_file_path(&app)?, &label, scopes, backends)?;
-    Ok(CreateTokenResult { token, entry: TokenEntryView::from(&entry) })
+    let (token, entry) = create_token_with_state_impl(
+        state.inner(),
+        &config_file_path(&app)?,
+        &label,
+        scopes,
+        backends,
+    )?;
+    Ok(CreateTokenResult {
+        token,
+        entry: TokenEntryView::from(&entry),
+    })
 }
 
 #[tauri::command]
-pub fn api_server_revoke_token(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn api_server_revoke_token(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     revoke_token_with_state_impl(state.inner(), &config_file_path(&app)?, &id)
 }
 
@@ -1812,7 +2000,10 @@ mod tests {
     use std::io::{Read, Write};
 
     fn test_provider(id: &str, base_url: &str) -> ProviderSummary {
-        ProviderSummary { id: id.to_string(), base_url: base_url.to_string() }
+        ProviderSummary {
+            id: id.to_string(),
+            base_url: base_url.to_string(),
+        }
     }
 
     fn test_deps(ollama_base_url: String) -> ServerDeps {
@@ -1825,14 +2016,27 @@ mod tests {
             require_token: false,
             expose_ollama: true,
             expose_providers: false,
-            providers: vec![test_provider("openai", "https://api.openai.com/v1"), test_provider("anthropic", "https://api.anthropic.com/v1")],
+            providers: vec![
+                test_provider("openai", "https://api.openai.com/v1"),
+                test_provider("anthropic", "https://api.anthropic.com/v1"),
+            ],
             tokens: Vec::new(),
             client: reqwest::Client::new(),
         }
     }
 
-    fn stored_token(id: &str, plaintext: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> StoredToken {
-        StoredToken { id: id.to_string(), sha256: sha256_hex(plaintext), scopes, backends }
+    fn stored_token(
+        id: &str,
+        plaintext: &str,
+        scopes: Vec<Scope>,
+        backends: Vec<Backend>,
+    ) -> StoredToken {
+        StoredToken {
+            id: id.to_string(),
+            sha256: sha256_hex(plaintext),
+            scopes,
+            backends,
+        }
     }
 
     fn get_request(path: &str) -> ServerRequest {
@@ -1854,7 +2058,10 @@ mod tests {
     }
 
     fn with_bearer(mut req: ServerRequest, token: &str) -> ServerRequest {
-        req.headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        req.headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
         req
     }
 
@@ -1868,8 +2075,16 @@ mod tests {
         // `prompts.rs::tests::temp_file`).
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("little_monkey_api_server_test_{}_{}_{}.json", std::process::id(), n, nanos))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_api_server_test_{}_{}_{}.json",
+            std::process::id(),
+            n,
+            nanos
+        ))
     }
 
     fn no_providers() -> Vec<ProviderSummary> {
@@ -1877,41 +2092,85 @@ mod tests {
     }
 
     fn two_providers() -> Vec<ProviderSummary> {
-        vec![test_provider("openai", "https://api.openai.com/v1"), test_provider("anthropic", "https://api.anthropic.com/v1")]
+        vec![
+            test_provider("openai", "https://api.openai.com/v1"),
+            test_provider("anthropic", "https://api.anthropic.com/v1"),
+        ]
     }
 
     #[test]
     fn route_model_matches_llama_exactly() {
         assert_eq!(
-            route_model("qwen2.5-7b-instruct", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            route_model(
+                "qwen2.5-7b-instruct",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &no_providers()
+            ),
             ModelRoute::Llama
         );
     }
 
     #[test]
     fn route_model_falls_back_to_ollama_for_any_other_nonempty_id() {
-        assert_eq!(route_model("llama3.1:8b", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Ollama);
+        assert_eq!(
+            route_model(
+                "llama3.1:8b",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &no_providers()
+            ),
+            ModelRoute::Ollama
+        );
         // Even when llama isn't ready, a non-empty id is assumed to be an
         // Ollama tag — Ollama is the source of truth for whether it exists.
-        assert_eq!(route_model("qwen2.5-7b-instruct", false, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Ollama);
-        assert_eq!(route_model("anything", true, None, &no_providers()), ModelRoute::Ollama);
+        assert_eq!(
+            route_model(
+                "qwen2.5-7b-instruct",
+                false,
+                Some("qwen2.5-7b-instruct"),
+                &no_providers()
+            ),
+            ModelRoute::Ollama
+        );
+        assert_eq!(
+            route_model("anything", true, None, &no_providers()),
+            ModelRoute::Ollama
+        );
     }
 
     #[test]
     fn route_model_is_unknown_only_when_blank() {
-        assert_eq!(route_model("", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Unknown);
-        assert_eq!(route_model("   ", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Unknown);
+        assert_eq!(
+            route_model("", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            ModelRoute::Unknown
+        );
+        assert_eq!(
+            route_model("   ", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            ModelRoute::Unknown
+        );
     }
 
     #[test]
     fn route_model_routes_a_known_provider_prefixed_id_to_providers() {
         assert_eq!(
-            route_model("openai/gpt-4o", true, Some("qwen2.5-7b-instruct"), &two_providers()),
-            ModelRoute::Providers { provider_id: "openai".to_string(), model_id: "gpt-4o".to_string() }
+            route_model(
+                "openai/gpt-4o",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &two_providers()
+            ),
+            ModelRoute::Providers {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-4o".to_string()
+            }
         );
         assert_eq!(
             route_model("anthropic/claude-opus-4-8", false, None, &two_providers()),
-            ModelRoute::Providers { provider_id: "anthropic".to_string(), model_id: "claude-opus-4-8".to_string() }
+            ModelRoute::Providers {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-8".to_string()
+            }
         );
     }
 
@@ -1921,7 +2180,15 @@ mod tests {
         // as an Ollama tag (Ollama namespaced tags can themselves contain a
         // slash) — exactly the design doc's "otherwise treat as Ollama tag"
         // fallback.
-        assert_eq!(route_model("library/llama3", true, Some("qwen2.5-7b-instruct"), &two_providers()), ModelRoute::Ollama);
+        assert_eq!(
+            route_model(
+                "library/llama3",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &two_providers()
+            ),
+            ModelRoute::Ollama
+        );
     }
 
     #[test]
@@ -1929,7 +2196,10 @@ mod tests {
         assert_eq!(route_backend(&ModelRoute::Llama), Some(Backend::Local));
         assert_eq!(route_backend(&ModelRoute::Ollama), Some(Backend::Ollama));
         assert_eq!(
-            route_backend(&ModelRoute::Providers { provider_id: "openai".to_string(), model_id: "gpt-4o".to_string() }),
+            route_backend(&ModelRoute::Providers {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-4o".to_string()
+            }),
             Some(Backend::Providers)
         );
         assert_eq!(route_backend(&ModelRoute::Unknown), None);
@@ -1941,7 +2211,10 @@ mod tests {
         let b = generate_token();
         assert!(a.starts_with(TOKEN_PREFIX));
         assert_eq!(a.len(), TOKEN_PREFIX.len() + 32);
-        assert!(a.chars().skip(TOKEN_PREFIX.len()).all(|c| c.is_ascii_hexdigit()));
+        assert!(a
+            .chars()
+            .skip(TOKEN_PREFIX.len())
+            .all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two generated tokens collided — RNG is broken");
     }
 
@@ -1968,7 +2241,14 @@ mod tests {
         first_byte_flipped.replace_range(0..1, if &base[0..1] == "0" { "1" } else { "0" });
         let mut last_byte_flipped = base.clone();
         let last = base.len() - 1;
-        last_byte_flipped.replace_range(last..last + 1, if &base[last..last + 1] == "0" { "1" } else { "0" });
+        last_byte_flipped.replace_range(
+            last..last + 1,
+            if &base[last..last + 1] == "0" {
+                "1"
+            } else {
+                "0"
+            },
+        );
 
         assert!(!constant_time_eq(&base, &first_byte_flipped));
         assert!(!constant_time_eq(&base, &last_byte_flipped));
@@ -1979,7 +2259,12 @@ mod tests {
     async fn health_requires_no_token_even_when_auth_is_on() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "t1",
+            "lmk-real-token",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
 
         let (resp, matched) = handle_request(&deps, get_request("/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1993,7 +2278,12 @@ mod tests {
     async fn missing_or_wrong_bearer_token_is_rejected_on_protected_routes() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "t1",
+            "lmk-real-token",
+            vec![Scope::Models],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
         let (resp, matched) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2020,7 +2310,12 @@ mod tests {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
         deps.llama_ready = false;
-        deps.tokens = vec![stored_token("tok-1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-1",
+            "lmk-real-token",
+            vec![Scope::Models],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
         let req = with_bearer(get_request("/v1/models"), "lmk-real-token");
         let (resp, matched) = handle_request(&deps, req).await;
@@ -2052,9 +2347,17 @@ mod tests {
     async fn token_missing_the_required_scope_is_rejected_with_403() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-models-only", "lmk-models-only", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-models-only",
+            "lmk-models-only",
+            vec![Scope::Models],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"qwen2.5-7b-instruct"}"#), "lmk-models-only");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"qwen2.5-7b-instruct"}"#),
+            "lmk-models-only",
+        );
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         // Still authenticated as a real token, even though this particular
@@ -2066,11 +2369,19 @@ mod tests {
     async fn token_scoped_to_local_backend_is_rejected_when_the_request_routes_to_ollama() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-local-only", "lmk-local-only", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-local-only",
+            "lmk-local-only",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
 
         // "llama3.1:8b" isn't the ready llama stem, so `route_model` sends
         // it to Ollama — a token scoped to `local` only must be rejected.
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#), "lmk-local-only");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+            "lmk-local-only",
+        );
         let (resp, _) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
@@ -2079,9 +2390,17 @@ mod tests {
     async fn token_scoped_to_the_matching_backend_is_accepted() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-ollama", "lmk-ollama-scoped", vec![Scope::Chat], vec![Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-ollama",
+            "lmk-ollama-scoped",
+            vec![Scope::Chat],
+            vec![Backend::Ollama],
+        )];
 
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#), "lmk-ollama-scoped");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+            "lmk-ollama-scoped",
+        );
         let (resp, matched) = handle_request(&deps, req).await;
         // 502, not 403: the scope/backend check passed, and it proceeded to
         // (unsuccessfully) proxy to the dummy unreachable address.
@@ -2102,14 +2421,19 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_with_blank_model_returns_404() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"messages":[]}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"messages":[]}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn chat_completions_with_invalid_json_returns_400() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", "not json")).await;
+        let (resp, _) =
+            handle_request(&deps, post_request("/v1/chat/completions", "not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2124,7 +2448,9 @@ mod tests {
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
-        assert!(data.iter().any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
+        assert!(data
+            .iter()
+            .any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
     }
 
     #[tokio::test]
@@ -2142,7 +2468,11 @@ mod tests {
     async fn chat_completions_404s_for_an_ollama_routed_model_when_expose_ollama_is_off() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_ollama = false;
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2152,7 +2482,11 @@ mod tests {
         // provider-prefixed id must 404 exactly like an unexposed Ollama tag,
         // never silently proxy anyway.
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2164,7 +2498,8 @@ mod tests {
     /// depend on whether a real key happens to be configured for "openai" on
     /// the machine running this test.
     #[tokio::test]
-    async fn token_without_providers_backend_is_rejected_even_when_expose_providers_is_globally_on() {
+    async fn token_without_providers_backend_is_rejected_even_when_expose_providers_is_globally_on()
+    {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
         deps.require_token = true;
@@ -2175,7 +2510,10 @@ mod tests {
             vec![Backend::Local, Backend::Ollama],
         )];
 
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#), "lmk-no-providers");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#),
+            "lmk-no-providers",
+        );
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(matched.as_deref(), Some("tok-no-providers"));
@@ -2195,7 +2533,10 @@ mod tests {
         // A provider id that should never realistically have a real
         // keychain entry on the machine running this test, so the outcome
         // here is deterministic regardless of what's actually configured.
-        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.providers = vec![test_provider(
+            "zzz-test-provider-no-key",
+            "https://example.invalid/v1",
+        )];
         deps.tokens = vec![stored_token(
             "tok-with-providers",
             "lmk-with-providers",
@@ -2204,7 +2545,10 @@ mod tests {
         )];
 
         let req = with_bearer(
-            post_request("/v1/chat/completions", r#"{"model":"zzz-test-provider-no-key/some-model"}"#),
+            post_request(
+                "/v1/chat/completions",
+                r#"{"model":"zzz-test-provider-no-key/some-model"}"#,
+            ),
             "lmk-with-providers",
         );
         let (resp, matched) = handle_request(&deps, req).await;
@@ -2214,7 +2558,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_provider_route_reports_provider_not_configured_with_no_token_required() {
+    async fn chat_completions_provider_route_reports_provider_not_configured_with_no_token_required(
+    ) {
         // A provider id with no saved key deterministically 502s before ever
         // sending a request — this only exercises the routing decision (and
         // that it's reachable with `require_token: false`, unlike the
@@ -2222,11 +2567,17 @@ mod tests {
         // a real network call to a mock upstream to exercise.
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
-        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.providers = vec![test_provider(
+            "zzz-test-provider-no-key",
+            "https://example.invalid/v1",
+        )];
 
         let (resp, _) = handle_request(
             &deps,
-            post_request("/v1/chat/completions", r#"{"model":"zzz-test-provider-no-key/some-model"}"#),
+            post_request(
+                "/v1/chat/completions",
+                r#"{"model":"zzz-test-provider-no-key/some-model"}"#,
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -2239,22 +2590,30 @@ mod tests {
     async fn models_endpoint_omits_provider_models_when_no_key_is_configured() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
-        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.providers = vec![test_provider(
+            "zzz-test-provider-no-key",
+            "https://example.invalid/v1",
+        )];
 
         let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
-        assert!(data.iter().all(|m| m["owned_by"] != "zzz-test-provider-no-key"));
+        assert!(data
+            .iter()
+            .all(|m| m["owned_by"] != "zzz-test-provider-no-key"));
     }
 
     #[tokio::test]
     async fn embeddings_501s_when_llama_wasnt_started_with_embeddings() {
         // `test_deps` defaults `llama_embeddings_enabled` to `false`.
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) =
-            handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2279,8 +2638,11 @@ mod tests {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.llama_port = addr.port();
         deps.llama_embeddings_enabled = true;
-        let (resp, _) =
-            handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         handle.join().unwrap();
@@ -2290,7 +2652,14 @@ mod tests {
     async fn embeddings_501s_for_a_provider_routed_model() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
-        let (resp, _) = handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"openai/text-embedding-3-small"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request(
+                "/v1/embeddings",
+                r#"{"model":"openai/text-embedding-3-small"}"#,
+            ),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2301,9 +2670,17 @@ mod tests {
     async fn embeddings_requires_the_embeddings_scope() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-chat-only", "lmk-chat-only", vec![Scope::Chat], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-chat-only",
+            "lmk-chat-only",
+            vec![Scope::Chat],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
-        let req = with_bearer(post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#), "lmk-chat-only");
+        let req = with_bearer(
+            post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#),
+            "lmk-chat-only",
+        );
         let (resp, _) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
@@ -2319,7 +2696,12 @@ mod tests {
     async fn options_preflight_on_v1_routes_returns_cors_headers_and_needs_no_token() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "t1",
+            "lmk-real-token",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
 
         let req = ServerRequest {
             method: Method::OPTIONS,
@@ -2329,7 +2711,10 @@ mod tests {
         };
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
         assert!(resp.headers().get("access-control-allow-methods").is_some());
         assert!(matched.is_none());
     }
@@ -2338,13 +2723,22 @@ mod tests {
     async fn every_response_carries_the_cors_allow_origin_header() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
         let (resp, _) = handle_request(&deps, get_request("/health")).await;
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
 
         let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
 
         let (resp, _) = handle_request(&deps, get_request("/v1/nope")).await;
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
     }
 
     /// Spins up a bare-bones raw-TCP "upstream" that writes back a fixed
@@ -2356,7 +2750,8 @@ mod tests {
     async fn sse_streaming_passthrough_preserves_upstream_bytes_exactly() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let canned: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let canned: &[u8] =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
 
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
@@ -2372,7 +2767,14 @@ mod tests {
         });
 
         let deps = test_deps(format!("http://{addr}"));
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b","stream":true}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request(
+                "/v1/chat/completions",
+                r#"{"model":"llama3.1:8b","stream":true}"#,
+            ),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body_bytes(resp).await;
         assert_eq!(&bytes[..], canned);
@@ -2385,7 +2787,11 @@ mod tests {
         // Port 1 on loopback: nothing listens there, so the connection is
         // refused immediately — a deterministic "unreachable upstream".
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -2407,18 +2813,26 @@ mod tests {
 
     #[tokio::test]
     async fn bind_listener_succeeds_on_an_available_port() {
-        let listener = bind_listener(0).await.expect("binding port 0 (OS-assigned) should always succeed");
+        let listener = bind_listener(0)
+            .await
+            .expect("binding port 0 (OS-assigned) should always succeed");
         assert!(listener.local_addr().unwrap().port() > 0);
     }
 
     #[test]
     fn creating_a_token_never_persists_its_plaintext() {
         let (token, entry) = mint_token("CI", vec![Scope::Chat], vec![Backend::Local]).unwrap();
-        assert_ne!(entry.sha256, token, "the persisted entry must never contain the plaintext token");
+        assert_ne!(
+            entry.sha256, token,
+            "the persisted entry must never contain the plaintext token"
+        );
         assert_eq!(entry.sha256, sha256_hex(&token));
 
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(!json.contains(&token), "serialized TokenEntry must never contain the plaintext token");
+        assert!(
+            !json.contains(&token),
+            "serialized TokenEntry must never contain the plaintext token"
+        );
     }
 
     #[test]
@@ -2492,7 +2906,13 @@ mod tests {
         let path = temp_config_path();
         let state = AppState::default();
 
-        let view = ApiServerConfigView { port: 1234, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let view = ApiServerConfigView {
+            port: 1234,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+        };
         let (_, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
         assert!(!needs_restart, "server is stopped — no restart needed");
 
@@ -2500,9 +2920,18 @@ mod tests {
             let mut s = state.api_server.lock().unwrap();
             s.status = "running".to_string();
         }
-        let view = ApiServerConfigView { port: 5555, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let view = ApiServerConfigView {
+            port: 5555,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+        };
         let (updated, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
-        assert!(needs_restart, "server is running — a config change must trigger a restart");
+        assert!(
+            needs_restart,
+            "server is running — a config change must trigger a restart"
+        );
         assert_eq!(updated.port, 5555);
 
         let _ = std::fs::remove_file(&path);
@@ -2512,7 +2941,13 @@ mod tests {
     fn set_config_rejects_a_zero_port() {
         let path = temp_config_path();
         let state = AppState::default();
-        let view = ApiServerConfigView { port: 0, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let view = ApiServerConfigView {
+            port: 0,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+        };
         assert!(set_config_with_state_impl(&state, &path, view).is_err());
     }
 
@@ -2521,8 +2956,14 @@ mod tests {
         let path = temp_config_path();
         let state = AppState::default();
 
-        let (token, entry) =
-            create_token_with_state_impl(&state, &path, "My IDE", vec![Scope::Chat, Scope::Models], vec![Backend::Local]).unwrap();
+        let (token, entry) = create_token_with_state_impl(
+            &state,
+            &path,
+            "My IDE",
+            vec![Scope::Chat, Scope::Models],
+            vec![Backend::Local],
+        )
+        .unwrap();
         assert!(token.starts_with(TOKEN_PREFIX));
 
         let loaded = load_config_impl(&path).unwrap();
@@ -2534,7 +2975,10 @@ mod tests {
         let loaded = load_config_impl(&path).unwrap();
         assert!(loaded.tokens.is_empty());
 
-        assert!(revoke_token_with_state_impl(&state, &path, &entry.id).is_err(), "revoking an already-gone id must error, not silently succeed");
+        assert!(
+            revoke_token_with_state_impl(&state, &path, &entry.id).is_err(),
+            "revoking an already-gone id must error, not silently succeed"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2567,8 +3011,20 @@ mod tests {
         record_token_used_with_state(&state, &path, "b");
 
         let reloaded = load_config_impl(&path).unwrap();
-        assert!(reloaded.tokens.iter().find(|t| t.id == "a").unwrap().last_used_at.is_none());
-        assert!(reloaded.tokens.iter().find(|t| t.id == "b").unwrap().last_used_at.is_some());
+        assert!(reloaded
+            .tokens
+            .iter()
+            .find(|t| t.id == "a")
+            .unwrap()
+            .last_used_at
+            .is_none());
+        assert!(reloaded
+            .tokens
+            .iter()
+            .find(|t| t.id == "b")
+            .unwrap()
+            .last_used_at
+            .is_some());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2586,7 +3042,8 @@ mod tests {
     /// here is tested through a `*_with_state_impl`/`*_impl` taking an
     /// explicit `&Path` instead) — `tokio::time::timeout` is the hang guard.
     #[tokio::test]
-    async fn config_triggered_restart_onto_an_already_taken_port_surfaces_status_error_without_hanging() {
+    async fn config_triggered_restart_onto_an_already_taken_port_surfaces_status_error_without_hanging(
+    ) {
         let mut state = ApiServerState::default();
 
         // Simulates a healthy running server on an OS-assigned port, exactly
@@ -2611,9 +3068,12 @@ mod tests {
         }
         state.status = "stopped".to_string();
 
-        let bind_result = tokio::time::timeout(std::time::Duration::from_secs(2), bind_listener(conflicting_port))
-            .await
-            .expect("bind_listener must not hang when the target port is already taken");
+        let bind_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bind_listener(conflicting_port),
+        )
+        .await
+        .expect("bind_listener must not hang when the target port is already taken");
 
         match bind_result {
             Ok(_) => panic!("expected a bind conflict against an already-bound port"),
@@ -2646,7 +3106,9 @@ mod tests {
         assert!(catalog.iter().any(|p| p.id == "openai"));
         assert!(catalog.iter().any(|p| p.id == "anthropic"));
         // ...alongside the custom entry.
-        assert!(catalog.iter().any(|p| p.id == "my-local-router" && p.base_url == "http://127.0.0.1:9999/v1"));
+        assert!(catalog
+            .iter()
+            .any(|p| p.id == "my-local-router" && p.base_url == "http://127.0.0.1:9999/v1"));
     }
 
     #[test]
@@ -2707,7 +3169,8 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
-                let body = r#"{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}"#;
+                let body =
+                    r#"{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -2761,7 +3224,11 @@ mod tests {
 
     #[test]
     fn backend_visible_respects_a_matched_tokens_backend_list() {
-        let auth = TokenAuth { id: "t".to_string(), scopes: vec![Scope::Models], backends: vec![Backend::Local] };
+        let auth = TokenAuth {
+            id: "t".to_string(),
+            scopes: vec![Scope::Models],
+            backends: vec![Backend::Local],
+        };
         assert!(backend_visible(Some(&auth), Backend::Local));
         assert!(!backend_visible(Some(&auth), Backend::Ollama));
         assert!(!backend_visible(Some(&auth), Backend::Providers));
@@ -2801,14 +3268,21 @@ mod tests {
     async fn models_endpoint_includes_the_local_model_for_a_token_scoped_for_the_local_backend() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-local", "lmk-local", vec![Scope::Models], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-local",
+            "lmk-local",
+            vec![Scope::Models],
+            vec![Backend::Local],
+        )];
 
         let req = with_bearer(get_request("/v1/models"), "lmk-local");
         let (resp, _) = handle_request(&deps, req).await;
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
-        assert!(data.iter().any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
+        assert!(data
+            .iter()
+            .any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
     }
 
     /// The core regression for the CORS/`require_token: false` finding: a
@@ -2820,13 +3294,20 @@ mod tests {
     /// open drive `/v1/chat/completions` (including a real, credential-
     /// spending provider call) with zero authentication.
     #[tokio::test]
-    async fn a_request_carrying_an_origin_header_is_never_exempt_from_auth_even_when_require_token_is_off() {
+    async fn a_request_carrying_an_origin_header_is_never_exempt_from_auth_even_when_require_token_is_off(
+    ) {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = false;
-        deps.tokens = vec![stored_token("tok-1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-1",
+            "lmk-real-token",
+            vec![Scope::Models],
+            vec![Backend::Local],
+        )];
 
         let mut req = get_request("/v1/models");
-        req.headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        req.headers
+            .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(matched.is_none());
@@ -2835,7 +3316,9 @@ mod tests {
         // this isn't a blanket ban on `Origin`, just a requirement that a
         // real token accompany it.
         let mut authed_req = get_request("/v1/models");
-        authed_req.headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        authed_req
+            .headers
+            .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         let authed_req = with_bearer(authed_req, "lmk-real-token");
         let (resp, matched) = handle_request(&deps, authed_req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2859,15 +3342,23 @@ mod tests {
 
     #[tokio::test]
     async fn read_capped_body_returns_the_bytes_when_well_within_the_limit() {
-        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"hello world")))]);
-        let bytes = read_capped_body(StreamBody::new(stream), 1024).await.unwrap();
+        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(
+            Bytes::from_static(b"hello world"),
+        ))]);
+        let bytes = read_capped_body(StreamBody::new(stream), 1024)
+            .await
+            .unwrap();
         assert_eq!(&bytes[..], b"hello world");
     }
 
     #[tokio::test]
     async fn read_capped_body_rejects_a_single_oversized_frame_with_413() {
-        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"0123456789")))]);
-        let response = read_capped_body(StreamBody::new(stream), 4).await.unwrap_err();
+        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(
+            Bytes::from_static(b"0123456789"),
+        ))]);
+        let response = read_capped_body(StreamBody::new(stream), 4)
+            .await
+            .unwrap_err();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let bytes = body_bytes(response).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2885,7 +3376,9 @@ mod tests {
             Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"12345"))),
             Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"67890"))),
         ]);
-        let response = read_capped_body(StreamBody::new(stream), 6).await.unwrap_err();
+        let response = read_capped_body(StreamBody::new(stream), 6)
+            .await
+            .unwrap_err();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -2893,9 +3386,14 @@ mod tests {
     /// body" finding: a failed frame read must surface as its own distinct
     /// `400 body_read_error`, never as `Ok(Bytes::new())`.
     #[tokio::test]
-    async fn read_capped_body_reports_a_distinct_error_instead_of_silently_substituting_an_empty_body() {
-        let stream = futures_util::stream::iter(vec![Err::<Frame<Bytes>, BoxError>("simulated connection drop".into())]);
-        let response = read_capped_body(StreamBody::new(stream), 1024).await.unwrap_err();
+    async fn read_capped_body_reports_a_distinct_error_instead_of_silently_substituting_an_empty_body(
+    ) {
+        let stream = futures_util::stream::iter(vec![Err::<Frame<Bytes>, BoxError>(
+            "simulated connection drop".into(),
+        )]);
+        let response = read_capped_body(StreamBody::new(stream), 1024)
+            .await
+            .unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = body_bytes(response).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

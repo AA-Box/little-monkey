@@ -1,134 +1,208 @@
 # <img width="50" height="51" alt="LM-logo" src="https://github.com/user-attachments/assets/84651d01-f18b-4c49-b203-8d1b7e8f16b6" /> Little Monkey
 
-Little Monkey is a Tauri desktop app for running an agentic AI coding chat against local models, Ollama models, or OpenAI-compatible cloud providers. It combines a React chat UI with a Rust backend that manages model processes, workspace access, permissions, sessions, tool execution, and a growing set of agentic-coding staples (checkpoints, MCP, RAG, subagents, automations).
+Little Monkey is a local-first Tauri desktop workspace for agentic AI. It can run against managed `llama.cpp`, Ollama, MLX on supported Apple Silicon, or OpenAI-compatible providers that you configure. The React UI and Rust backend share workspace, permission, run, model, package, browser, Git, and background-service contracts instead of treating each surface as a separate product.
+
+The current working tree includes functional M1–M7 implementations. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations) and tracked precisely in [ROADMAP.md](ROADMAP.md).
 
 ## Features
 
-**Core chat and models**
-- Chat with a local `llama.cpp` `llama-server`, Ollama, or cloud providers, with provider failover, vision-aware model switching, context compaction, and rate-limit warnings.
-- Manage curated GGUF models, external `.gguf` files, Ollama tags, and custom OpenAI-compatible providers.
-- Attach files, folders, and images to prompts; reference workspace paths with `@` mentions; insert saved prompts with `/` slash commands.
-- Browse the active workspace, preview files, refresh diffs, inspect git status, and commit from the workspace bar.
-- Store cloud API keys and MCP/search bearer tokens in the OS keychain through the Rust backend.
-- Switch between light/dark themes and localized UI copy (11 locales).
+### Chat, models, and collaboration
 
-**Agent tools and safety**
-- Run tool-calling agent turns over an attached workspace: read files, list directories, glob, grep, edit/write files, and run shell commands.
-- Gate mutating tools with permission modes (`manual`, `acceptEdits`, `smart`, `plan`, `auto`, `bypass`) and per-action prompts. Smart mode auto-approves low-risk writes using an LLM risk judge backed by a deterministic Rust path floor (dotfiles, lockfiles, CI config, etc. always fall through to a real prompt, regardless of the model's own risk assessment) — `run_shell` is never auto-approved outside `bypass`.
-- **Checkpoints & rollback**: every mutating turn is checkpointed; revert or re-apply file changes, rewind the conversation, or both, from the in-chat timeline. Manifest format is versioned with fallback deserialization for older checkpoints.
-- **Plan/Act workflow**: in `plan` mode the agent proposes a plan via a `present_plan` tool card you approve before it can act — approval flips the session into `acceptEdits`/your prior act mode.
-- **Post-edit verification**: configure verify commands (lint/build/test) that auto-run after edits; failures feed back to the model for a bounded number of fix rounds, reported inline as `[Verify]` notices.
+- Chat with managed `llama.cpp`, Ollama, MLX, or configured cloud/BYOK providers, with capability-aware routing, provider failover, context compaction, usage accounting, and rate-limit warnings.
+- Compare one frozen prompt across two-to-four explicit local, Ollama, or provider targets with independent streaming, stop, retry, timing, usage, persistence, and response promotion. Compare runs default to no tools and keep their target snapshots even if global model settings change.
+- Run saved Crew chats with a coordinator and bounded parallel persona members. Member transcripts remain isolated, coordinator synthesis is explicit, actor usage is attributed, and cancel-all reaches outstanding members.
+- Keep multiple sessions, forks, groups, and a two-pane split view with independent streams.
+- Attach files, folders, and images; reference workspace paths with `@`; select personas and knowledge stacks; and invoke skills with `/`.
+- Search active and archived chats, messages, tool output, artifacts, and durable runs with date, model, persona, and workspace filters.
+- Export a session as Markdown, JSON, or Word (`.docx`), translate individual messages or a whole thread while retaining the original, and create versioned portable backups.
+- Create encrypted local snapshots with retention, preflight imports before changing live state, and use encrypted WebDAV backup with conflict copies and launch-time catch-up. Reliable unattended backup moves through the installed daemon.
 
-**Knowledge and memory**
-- **Project rules & memory**: drop a `MONKEY.md` file in your repo (global or per-workspace) for persistent instructions, plus a `remember` tool the agent can use to save facts across sessions — both editable from Settings.
-- **Knowledge Stacks (RAG)**: index local documents/PDFs (brute-force embedding search, no vector DB dependency) into named stacks; attach a stack to a chat to give the agent a `search_docs` tool with citation chips, or use doc-chat mode for automatic retrieval.
-- **Prompt & persona library**: save reusable prompt snippets and personas (with Cherry Studio import/export compatibility), insert via slash commands or attach a persona to a session.
+### Agent tools and safety
 
-**Extensibility**
-- **MCP client**: connect stdio or streamable-HTTP MCP servers with per-server tool allowlists; tools are namespaced `mcp__<server>__<tool>` and every call still goes through Little Monkey's own permission prompts (server-asserted `readOnlyHint` is never trusted).
-- **Local OpenAI-compatible API server**: expose `llama-server`/Ollama (and, opt-in, your configured cloud providers) on `127.0.0.1:1234` with scoped, hash-stored auth tokens — a drop-in target for other tools, loopback-only by design.
-- **Web fetch & search**: an SSRF-guarded `web_fetch` tool (blocks loopback/private/link-local ranges and re-validates redirects) plus `web_search` over DuckDuckGo, Brave, or SearXNG — both permission-gated, never silently injected into context.
-- **Subagents**: delegate scoped subtasks to a bounded pool of parallel subagents (explore-only or code profiles) via a `task` tool, with live per-subagent progress rows in chat.
-- **Artifacts**: render HTML/SVG/Mermaid previews inline from fenced code blocks, sandboxed via `srcdoc` or an opaque-origin `artifact://` protocol for interactive content.
-- **Scheduled automations**: save recipes (YAML/JSON) with a mandatory explicit `permission_mode` and run them from the GUI, on an in-app scheduler, or headlessly via the CLI with JSON output and CI-friendly exit codes; export a launchd plist or crontab line instead of the app self-daemonizing.
+- Use workspace-scoped file read/list, glob, grep, edit/write, shell, memory, web fetch/search, knowledge search, MCP, subagent, plan, and verification tools.
+- Choose `manual`, `plan`, `acceptEdits`, `smart`, `auto`, or `bypass` permission modes. Sensitive paths have a deterministic risk floor, shell execution is kept behind the stronger policy, and unattended recipes cannot use `bypass`.
+- Checkpoint every mutating turn, then revert or re-apply file changes, rewind the conversation, or do both from the timeline.
+- Configure post-edit lint/build/test commands. Failures can return to the model for a bounded repair loop and are recorded as verification events.
+- Treat retrieved pages, RAG chunks, MCP results, subprocess output, GitHub content, browser evidence, subagent reports, and other model output as untrusted data before it re-enters a model prompt.
+- Inspect local posture in **Settings → Security Doctor**, or run `monkey security audit`. It checks app-data permissions, API/webhook listeners, remote TLS posture, MCP origins, installed skill integrity, and active browser/companion grants without contacting a model. `--fix` is limited to private app-owned modes and disabling clearly unsafe listeners; it does not delete user data or rotate credentials.
+
+### Knowledge Stacks 2.0
+
+- Ingest local files/folders, projects, URLs, sitemaps, selected chats, and manually configured WebDAV sources.
+- Extract text and source locations from text/code, HTML, PDF, DOCX headings/tables, XLSX sheets/cell ranges, and PPTX slides/notes. Macros, formulas, embedded scripts, and automatic external-link execution are not enabled.
+- Refresh incrementally with content hashes, connector cursors, deletion propagation, progress, cancellation, retry state, and optional daemon scheduling.
+- Add optional local OCR through a verified or explicitly selected worker, with language, provenance, size, digest, license, progress, and cancellation controls.
+- Fuse BM25/FTS-style lexical retrieval with vector similarity and optional reranking, while retaining the existing local vector path.
+- Use the retrieval inspector to see the normalized query, filters, candidates, lexical/vector scores, fused rank, reranker score, exclusions, token budget, and final context; copy a reproducible diagnostic bundle or preview local PII/secret redaction.
+
+### Runtime and API Hub
+
+- Inspect CPU/memory and runtime inventory, estimate model fit, search configured catalogs, resume verified downloads, activate/roll back model versions, prune old versions, clean owned orphan data, and load/unload supported runtimes.
+- Manage Ollama, `llama.cpp`, and MLX through one runtime contract with capability preflight, owned-process shutdown, logs, metrics, cancellation, and resource-aware scheduling.
+- Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
+- Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
+- Store private keys and provider credentials in the OS keychain; persisted configuration contains references rather than plaintext key material.
+
+### Skills, plugins, MCP Apps, and workflows
+
+- Install data-only `SKILL.md` skills globally or per workspace from a reviewed local folder or an immutable 40-character Git commit. Preview returns the exact SHA-256 approval digest; symlinks, special files, mutable Git refs, command collisions, oversized trees, and unmet OS/binary/environment requirements fail closed.
+- Invoke up to five installed skills at the beginning of a chat turn, for example `/review /testing check this patch`. The selected instructions, version, source, and digest are frozen into that turn and never expand tool permissions.
+- Use `/learn command | instructions` to create a quarantined local skill proposal. It becomes active only after reviewing risk flags and approving the exact digest, and it can be rejected or rolled back.
+- Manage signed declarative packages in **Settings → Ecosystem** with install/update permission previews, pins, enable/disable, rollback, revocation state, uninstall, offline cache, and portable export/import. Local unsigned development packages remain data-only and require an explicit warning/approval; unsigned Git packages and executable payloads are rejected.
+- Seed a signed first-party catalog containing six skills (review, testing, documentation, browser QA, release preparation, and knowledge workflows) plus declarative GitHub, GitLab, WebDAV, and REST/webhook connector packages.
+- Inspect plugin health and component setup, use explicit package assistants, activate package workflow templates, and apply verified package rules to normal, Compare, and Crew turns with provenance.
+- Configure remote MCP OAuth metadata/tokens, preserve structured MCP content, route relevant tools without bypassing allowlists, and host interactive MCP Apps in an opaque-origin window with a narrow declared bridge and text fallback.
+- Build typed workflow DAGs visually with model, agent/subagent, tool, MCP, browser, Git/PR, shell, verify, transform, condition, bounded-loop, human-approval, artifact, and output nodes. Validate before saving, run from UI or CLI, inspect node history, cancel, replay from safe boundaries, and reconcile ambiguous external effects.
+- Attach manual, in-app cron, persistent cron, filesystem, signed-webhook, and event-ingestion triggers. Persistent triggers are hosted by the explicitly installed daemon.
+
+A minimal native skill looks like this:
+
+```markdown
+---
+name: Project Review
+description: Review this project for correctness and risk
+command: project-review
+version: 1.0.0
+requires:
+  bins: [git]
+  env: []
+---
+Review the requested scope. Report evidence, severity, and a concrete fix.
+```
+
+### Developer integrations
+
+- Run `monkey acp` as an ACP v1 stdio server. Little Monkey remains the approval authority and carries streaming, tool status, cancellation, diagnostics, artifacts, checkpoints, and diffs through the durable run protocol.
+- Use the thin VS Code extension in `extensions/little-monkey-vscode` for active-file/selection/Problems context, native diff review, explicit selection edits, and optional local Ollama FIM completion. Completion is off by default, requires an explicitly allowed model whose live metadata advertises `insert`, cancels stale document versions, and never falls back to cloud.
+- Use the JetBrains plugin in `extensions/little-monkey-jetbrains` for IntelliJ IDEA, Android Studio, and compatible IDEs. It captures exact editor context and diagnostics, opens read-only diff previews, and cannot silently approve or apply mutations.
+- Start an owned disposable Chromium session from **Settings → Browser Verification**. Navigate, inspect DOM/accessibility state, click, type, scroll, capture screenshots, and retain console/network evidence as durable artifacts. Exact-origin grants, DNS rechecks, quotas, cancellation, and explicit loopback approval are enforced; file URLs, uploads/downloads, clipboard, extensions, persistent profiles, and general desktop control are unavailable.
+- Create and recover Little Monkey-owned Git worktrees, inspect HEAD/staged/unstaged diffs, stage selected paths, commit, push only declared owned branches, and safely archive/clean owned worktrees.
+- Read GitHub issues, PRs, unresolved review threads, and checks through existing `gh` authentication; create/update owned draft PRs, run a local Ollama PR reviewer, publish one deduplicated review report, and queue an explicitly selected review comment as an isolated daemon patch task. Merge, force-push, branch deletion, and automatic thread resolution are not exposed.
+
+### Background agents and user-owned handoff
+
+- Explicitly install a current-user `monkey daemon` service with bounded concurrency, queue size, retention, notifications, and an optional loopback webhook listener.
+- Queue immutable recipe/workflow runs with idempotency keys, budgets, approval waits, pause/resume, attach/detach, cancellation, retry, crash recovery, orphan detection, owned worktrees, and a durable global kill switch.
+- Configure persistent cron, filesystem, signed webhook, and GitHub triggers with replay protection and deduplication.
+- Pair a user-owned remote runner over direct/Tailscale/SSH-forwarded HTTPS with pinned TLS, mutually scoped credentials, rotation/revocation, replay protection, and audit history. A responsive controller can view events, inspect bounded artifacts, approve digest-bound requests, cancel runs, or engage the kill switch only when its invitation grants that exact action. Inference, tools, workspaces, and provider keys remain on the runner; Little Monkey operates no relay.
+
+### Multimodal desktop companion
+
+- Open a restricted always-on-top companion overlay with a configurable global shortcut. Context capture is explicit and visibly granted; supported inputs include pasted text, an approved file, and a selected screen area. Emergency stop revokes active capture and cancels owned media jobs.
+- Transcribe audio files, push-to-talk clips, or meeting recordings through a configured local `whisper.cpp`-style worker or an explicit provider. Timed speaker segments are retained when the backend supplies diarization, and meeting text is prepared for user-reviewed notes, decisions, questions, and action items. Raw audio is retained only when explicitly requested.
+- Read text aloud with system TTS and stop playback through the same cancellation path.
+- Configure user-owned ComfyUI or OpenAI-compatible image endpoints, then generate or edit when the endpoint advertises editing. Jobs retain prompt, negative prompt, model, seed, dimensions, steps, CFG, source/output hashes, progress, cancellation, metadata, and a gallery action that inserts an owned artifact into chat through the normal review path.
+
+## Desktop slash commands
+
+The chat composer autocompletes built-ins, saved prompt/persona commands, native skills, and installed package skills.
+
+| Command | Action |
+| --- | --- |
+| `/status` | Show the active runtime, workspace, and connections. |
+| `/tools` | List tools available to the next model turn. |
+| `/skills` | List enabled skills and invocation names. |
+| `/plugins` | List installed declarative plugins and health. |
+| `/model [provider:model-or-name]` | Show or switch the active model. |
+| `/new` | Start a new chat without contacting a model. |
+| `/compact` | Compact older completed turns. |
+| `/stop` | Cancel the active turn. |
+| `/usage` | Show reported token usage for the chat. |
+| `/learn command \| instructions` | Create a quarantined skill proposal for review. |
+| `/<installed-skill> [request]` | Freeze and apply an installed skill to this turn. Up to five may be stacked. |
+
+Built-ins run locally and deterministically. Unknown leading `/text` remains ordinary input, so paths are not silently consumed as commands.
 
 ## Prerequisites
 
-- Node.js and `pnpm`
-- Rust and Cargo
-- Tauri 2 system prerequisites for your OS
-- Optional for local GGUF models: `llama-server` from `llama.cpp`
-- Optional for Ollama models: Ollama installed and reachable at `http://127.0.0.1:11434`
+- Node.js, `pnpm`, Rust, Cargo, and the Tauri 2 prerequisites for your operating system.
+- Optional managed GGUF runtime: `llama-server` from `llama.cpp` on `PATH` or in a supported Homebrew location.
+- Optional Ollama runtime: Ollama reachable at `http://127.0.0.1:11434`.
+- Optional MLX runtime: supported Apple Silicon plus the configured MLX Python environment.
+- Optional browser verification: a supported Chromium/Chrome binary.
+- Optional GitHub delivery: Git and an authenticated GitHub CLI (`gh`).
+- Optional local OCR, transcription, image generation, IDE extensions, and remote handoff: their explicitly configured worker/model, endpoint, SDK, or TLS identity.
 
-On macOS, the local GGUF path expects `llama-server` on `PATH` or in a common Homebrew location:
+On macOS, the existing unmanaged GGUF setup can use:
 
 ```sh
 brew install llama.cpp
 ```
 
-## Development
+The Runtime Hub can also install checksum-pinned artifacts from a configured catalog. This repository does not claim a complete publisher-operated artifact feed for every platform/runtime.
 
-Install dependencies:
+## Development
 
 ```sh
 pnpm install
-```
-
-Run the desktop app in development:
-
-```sh
-pnpm tauri dev
-```
-
-Run only the Vite frontend:
-
-```sh
-pnpm dev
-```
-
-Build the frontend:
-
-```sh
-pnpm build
-```
-
-Build a Tauri bundle:
-
-```sh
-pnpm tauri build
+pnpm tauri dev       # build/stage the CLI sidecar and run the desktop app
+pnpm dev             # Vite frontend only
+pnpm build           # TypeScript check and frontend production build
+pnpm tauri build     # desktop bundles for the current platform
 ```
 
 ## Testing
 
 ```sh
 pnpm test
+pnpm i18n:lint
 pnpm test:rust
+pnpm test:git-delivery-action
+```
+
+Extension checks:
+
+```sh
+cd extensions/little-monkey-vscode && npm test
+cd ../little-monkey-jetbrains && gradle test --no-daemon
+```
+
+The live Compare smoke is opt-in because it uses installed Ollama models:
+
+```sh
+pnpm test:compare:live
+```
+
+The VS Code completion hardware gate is also opt-in and requires an explicitly selected local FIM model:
+
+```sh
+cd extensions/little-monkey-vscode
+LITTLE_MONKEY_COMPLETION_MODEL='your-exact-fim-tag' npm run benchmark:completions
 ```
 
 ## CLI
 
-Little Monkey has a terminal agent. The intended installed command is `monkey`:
+The installed command is `monkey`. The preferred chat form is model first:
 
 ```sh
-monkey --help
+# Local-first automatic resolution; an installed Ollama tag wins.
+monkey llama3.2 "Summarize this project"
+
+# Omit the prompt for the interactive REPL.
+monkey llama3.2
+
+# Select a provider only when you want to override/disambiguate resolution.
+monkey --provider openai gpt-4.1-mini "Review this codebase"
+monkey --provider ollama llama3.2 "Explain the failing test"
+
+# Explicit OpenAI-compatible local endpoint.
+monkey --local-url http://127.0.0.1:8090 local-model "Inspect the workspace"
 ```
 
-One-shot chat examples:
+If a non-local model is exposed by more than one configured provider, `monkey` asks for `--provider <id>` instead of guessing. The legacy `--ollama`, `--model`, and `monkey run` forms remain compatibility aliases, but new scripts should use `monkey [--provider ID] MODEL [PROMPT]`.
 
-```sh
-# Chat with an Ollama model
-monkey --ollama llama3.2 "Summarize this project"
+Useful chat flags:
 
-# Chat with a local OpenAI-compatible server such as llama-server
-monkey --local-url http://127.0.0.1:8090 "Inspect the workspace"
+- `--workspace <path>` — sandbox tool access to a workspace; defaults to the current directory.
+- `--permission-mode manual|acceptEdits|smart|plan|auto|bypass` — terminal permission policy.
+- `--provider <id>` — override or disambiguate `ollama`, managed `llama.cpp`, OpenAI, Anthropic, Gemini, OpenRouter, or a custom provider.
+- `--local-url <url>` — explicit local OpenAI-compatible endpoint.
+- `--persona <slash-command>` and repeatable `--stack <name>` — attach saved context.
+- `--verify` / `--no-verify`, `--subagents`, `--no-rules`, and `--no-mcp` — opt into verification/subagents or suppress configured context.
+- `--temperature`, `--top-p`, `--seed`, `--stop`, `--num-predict`, `--system`, `--format`, `--verbose`, and `--attach-images` — generation controls.
+- `--num-ctx`, `--keepalive`, `--think`, and `--hidethinking` — Ollama-native controls.
 
-# Chat with a configured cloud provider key from the desktop app
-monkey --provider openai --model <model-id> "Review this codebase"
-```
-
-Omit the prompt to start the interactive REPL:
-
-```sh
-monkey --ollama llama3.2
-```
-
-Useful global chat flags:
-
-- `--workspace <path>` - sandbox tool access to a workspace; defaults to the current directory.
-- `--permission-mode manual|acceptEdits|smart|plan|auto|bypass` - controls terminal prompts for mutating tools; matches the desktop app's modes.
-- `--provider <id> --model <model-id>` - use OpenAI, Anthropic, Gemini, OpenRouter, or a custom provider configured by the app.
-- `--ollama <tag>` - use the local Ollama daemon.
-- `--local-url <url>` - use a local OpenAI-compatible endpoint.
-- `--persona <slash-command>` - append a saved persona (Settings > Prompts) to the system prompt.
-- `--stack <name>` - attach a knowledge stack (repeatable), offering the agent `search_docs`.
-- `--verify` / `--no-verify` - auto-run configured verification commands after edits, feeding failures back for a bounded number of fix rounds. Off by default.
-- `--subagents` - offer the `task` tool for delegating explore-only subtasks. Off by default.
-- `--no-rules` - skip auto-loading `MONKEY.md` rules and remembered facts into the system prompt.
-- `--no-mcp` - skip loading MCP servers configured in Settings > MCP for this invocation.
-- `--temperature`, `--top-p`, `--seed`, `--stop`, `--num-predict`, `--system`, `--format`, `--verbose`, `--attach-images` - generation controls.
-- `--num-ctx`, `--keepalive`, `--think`, `--hidethinking` - Ollama-native options.
-
-Ollama-compatible model commands:
+Ollama-compatible model management remains available:
 
 ```sh
 monkey list
@@ -146,107 +220,97 @@ monkey signout
 monkey serve
 ```
 
-Other commands, sharing config and state with the desktop app:
+Shared desktop/headless commands:
 
 ```sh
-# Revert a checkpoint's file changes (defaults to the most recent one from this CLI)
+monkey acp
 monkey revert [checkpoint-id]
-
-# Run the local OpenAI-compatible API server headlessly on 127.0.0.1
 monkey api-serve [--port <port>]
 
-# Knowledge Stacks: list/reindex stacks created in Settings > Knowledge
 monkey stacks list
 monkey stacks reindex <name>
-monkey stacks embed-server start|stop ...
+monkey stacks embed-server start --model-path <embedding.gguf>
+monkey stacks embed-server status
+monkey stacks embed-server stop
 
-# Saved recipes: headless runner with JSON output and CI exit codes
-monkey task run <name-or-path> [--param key=value ...] [--json]
-monkey task validate <path>
 monkey task list
-monkey task schedule <name-or-path> --cron "<expr>"   # prints a launchd plist / crontab line, installs nothing
+monkey task validate <recipe-file>
+monkey task run <name-or-path> [--param key=value ...] [--json]
+monkey task schedule <name-or-path> --cron "<expr>"
+
+monkey workflow list
+monkey workflow validate <definition.json>
+monkey workflow run <workflow-id> [--inputs '{}'] [--secrets '{}']
+monkey workflow history [run-id]
+monkey workflow replay <workflow-id> <source-run-id> <boundary-node-id> --approval
+
+monkey skills list [--json]
+monkey skills preview-local <folder> [--scope global|workspace]
+monkey skills install-local <folder> --approval-digest <sha256> --yes
+monkey skills preview-git <repository-url> <40-char-commit> [--subdirectory <path>]
+monkey skills install-git <repository-url> <40-char-commit> --approval-digest <sha256> --yes
+monkey skills enable|disable|rollback|uninstall <command>
+
+monkey plugins list [--json]
+monkey plugins health [--json]
+monkey security audit [--deep] [--fix] [--json]
+
+monkey daemon install
+monkey daemon status [--json]
+monkey daemon run <recipe> [--owned-worktree] [--json]
+monkey daemon attach <run-id> [--follow] [--json]
+monkey daemon pause|resume|cancel <run-id>
+monkey daemon retry <run-id> [--acknowledge-side-effects]
+monkey daemon kill-switch engage|release|status
+monkey daemon trigger --help
+monkey daemon remote --help
 ```
 
-Inside the REPL, use `/help` to list slash commands. Supported commands include `/set`, `/show`, `/save <model>`, `/load <model>`, `/revert [checkpoint-id]`, `/persona <slash-command>`, `/prompts`, `/verify`, `/clear`, and `/bye`.
+Inside the REPL, `/help` lists terminal-only controls such as `/set`, `/show`, `/save`, `/load`, `/revert`, `/persona`, `/prompts`, `/verify`, `/clear`, and `/bye`. Installed skill invocations use the same frozen turn-scoped prompt composition as desktop chat.
 
-The desktop app installs `monkey` onto your `PATH` automatically the first time it launches — no separate installer step or opt-in checkbox. It's bundled as a Tauri `externalBin` sidecar (built and staged by `pnpm stage:cli` before every `tauri dev`/`tauri build`, per `src-tauri/tauri.conf.json`) and linked/copied onto `PATH` on startup by `src-tauri/src/cli_install.rs`:
+The desktop bundle stages `monkey-cli` as a Tauri sidecar and performs a best-effort, non-elevated installation of the `monkey` command on first launch:
 
-- **macOS/Linux**: symlinked as `monkey` into `/usr/local/bin` if already writable (macOS, no prompt), else `~/.local/bin` (created if missing).
-- **Windows**: copied to `%LOCALAPPDATA%\Programs\monkey-cli\monkey.exe`, with that folder added to your user `PATH` (`HKCU\Environment`, no admin).
+- **macOS/Linux:** `/usr/local/bin/monkey` when writable, otherwise `~/.local/bin/monkey`.
+- **Windows:** `%LOCALAPPDATA%\Programs\monkey-cli\monkey.exe`, with that directory added to the user `PATH`.
 
-It never asks for elevated permissions and never edits your shell rc files — if the chosen directory isn't already on your `PATH` (e.g. a stock macOS shell without `~/.local/bin` added), add it yourself once. This install step is best-effort and silent: a failure never blocks the app from starting.
+It does not edit shell startup files. If the selected directory is not already on `PATH`, add it once yourself. A development launch stages the sidecar automatically; once staged or installed, use the same `monkey` commands shown above. The Rust target remains named `monkey-cli` internally.
 
-Developer note: the source tree builds the CLI from `src-tauri/src/bin/monkey-cli/`. Running from a checkout before the app has installed the shim, use the same arguments after Cargo's `--` separator:
+## Model setup
 
-```sh
-cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- --help
-cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- --ollama llama3.2 "Summarize this project"
-```
+1. For managed GGUF, install `llama-server` or configure a verified Runtime Hub catalog, then use **Settings → Local Models** or **Runtime Hub**.
+2. For Ollama, open **Settings → Ollama**, confirm the daemon is reachable, pull/import a model, and select it.
+3. For cloud/BYOK, open **Settings → AI Providers**, store the key, refresh the provider model list, and select a model.
+4. For MLX, configure the supported Apple Silicon MLX runtime in **Settings → Runtime Hub → Runtimes**.
 
-## Model Setup
+Other important Settings surfaces include **Security Doctor**, **Companion**, **Portability**, **Knowledge**, **Ecosystem**, **Browser Verification**, **Git Delivery**, **Background Agents**, **MCP**, **Prompts/Skills**, **API Server**, **Tasks**, **Rules**, **Automation**, **Usage**, and **Keyboard Shortcuts**.
 
-Local GGUF models:
+## Workspace and trust boundaries
 
-1. Install `llama.cpp` so `llama-server` is available.
-2. Open Settings -> Local Models.
-3. Download one of the curated models or add an existing `.gguf` file.
-4. Start the model. Little Monkey launches `llama-server` with OpenAI-compatible tool calling enabled.
+Little Monkey canonicalizes workspace paths and rejects traversal and symlink escapes. Read-only workspace operations do not mutate files; mutating file, shell, memory, MCP, browser, Git/GitHub, workflow, background, capture, and remote actions use their applicable permission/grant boundary. A remote server's `readOnlyHint`, model output, webpage text, package instructions, or imported archive can never approve its own operation.
 
-Ollama:
+Shell commands run inside the workspace with bounded time and cancellation. Scheduled/headless recipes require an explicit permission mode and cannot use unattended `bypass`. External mutations are recorded as pending/confirmed or `needs_reconciliation`; ambiguous effects are not retried as if they were known safe. API keys, OAuth tokens, bearer secrets, remote device keys, and TLS private keys use the OS keychain where the feature supports credentials.
 
-1. Install Ollama.
-2. Open Settings -> Ollama.
-3. Start Ollama if it is not already running.
-4. Pull or import a model, then select it for chat.
+Security Doctor is a posture aid, not a replacement for operating-system updates, endpoint security, or a release penetration test.
 
-Cloud providers:
+## Current limitations
 
-1. Open Settings -> AI Providers.
-2. Add an API key for OpenAI, Anthropic, Google Gemini, OpenRouter, or a custom OpenAI-compatible endpoint.
-3. Refresh models and select the provider model to use.
+- The Runtime Hub supports checksum/provenance validation and configured catalogs, but this repository does not include a publisher-operated, platform-complete signed `llama.cpp`/MLX artifact feed. ROCm, Vulkan, and DirectML are not advertised as maintained managed runtimes.
+- Hardware-fit estimates and runtime controls are implemented, but the roadmap's plus-or-minus-15% memory matrix, clean-machine lifecycle checks, and MLX release gate still need maintained physical reference hardware.
+- VS Code completion requires a real installed Ollama model that advertises `insert`; the latency/compile gate cannot be claimed on a machine without one.
+- Browser verification uses disposable profiles. Persistent authenticated profiles, file transfer, clipboard, browser extensions, and general host-computer control remain intentionally out of scope.
+- GitHub delivery needs local `git` plus authenticated `gh`; hosted Actions need user-supplied provider credentials, while Ollama review needs a user-owned self-hosted runner.
+- The local OCR, speech, meeting, and image paths require configured binaries/models/endpoints. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
+- Remote handoff requires a user-owned reachable network and valid TLS identity. There is no Little Monkey relay, account service, RBAC/SSO plane, or hosted GPU.
+- M8 release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim.
 
-Other Settings tabs:
+## Project layout
 
-- **Rules** - view/edit `MONKEY.md` project instructions and remembered facts.
-- **MCP** - add stdio or streamable-HTTP MCP servers, set per-server tool allowlists, store bearer tokens in the keychain.
-- **Prompts** - manage prompt snippets and personas, import/export (including a Cherry Studio adapter).
-- **Knowledge** - create and reindex Knowledge Stacks for RAG.
-- **API Server** - toggle the local OpenAI-compatible proxy, mint/revoke scoped tokens, opt into cloud-provider proxying.
-- **Automation** - provider failover, context compaction, artifacts, checkpoint retention, and web fetch/search settings.
-- **Tasks** - manage and schedule saved recipes.
-- **Usage** - token/cost activity.
-
-## Workspace And Safety
-
-Little Monkey only lets agent tools operate inside attached workspace folders. Path resolution canonicalizes requests and rejects traversal outside the workspace, including symlink escapes.
-
-Read-only tools (`read_file`, `list_dir`, `glob`, `grep`, `search_docs`, `web_fetch`, `web_search`, MCP tools marked read-only by their own server) are still routed through the active permission mode. Mutating tools are always permission-gated by default:
-
-- `write_file`
-- `edit_file`
-- `run_shell`
-- `remember`
-- MCP tool calls
-
-Permission modes, from most to least restrictive: `manual` (prompt every mutation), `plan` (read-only, propose a plan and get approval before acting), `acceptEdits` (auto-approve file writes, still prompt for shell), `smart` (auto-approve low-risk file writes per an LLM risk judge with a deterministic Rust path floor that can't be overridden), `auto` (auto-approve everything except shell), `bypass` (auto-approve everything, including shell — never used for unattended recipes, see below).
-
-Shell commands run inside the workspace, have a 120 second timeout, and can be cancelled from the chat turn. Every mutating turn is checkpointed so file changes (and optionally the conversation) can be reverted or re-applied later. Scheduled/headless recipes require an explicit `permission_mode` in their YAML and can never set it to `bypass`. API keys and bearer tokens are stored in the OS keychain and are never persisted in plaintext config files.
-
-## Project Layout
-
-- `src/` - React frontend, Zustand stores (`src/store/`), the agent turn loop and shared turn engine (`src/lib/agentLoop.ts`, `src/lib/turnEngine.ts`), model/provider clients, and UI components (chat, settings panels, workspace bar).
-- `src-tauri/` - Tauri 2 Rust backend. Notable modules beyond model/provider/workspace/permission/session/git basics: `checkpoints.rs` (rollback), `rules.rs`/`memory.rs` (MONKEY.md + remember), `mcp.rs` (MCP client), `server.rs` (local OpenAI-compatible API server), `web.rs` (SSRF-guarded fetch/search), `prompts.rs` (prompt/persona library), `verify.rs` (post-edit verification), `artifacts.rs` (sandboxed HTML/SVG previews), `stacks.rs` (Knowledge Stacks/RAG), `recipes.rs`/`automations.rs` (scheduled recipes).
-- `src-tauri/src/bin/monkey-cli/` - the `monkey`/`monkey-cli` terminal agent: chat/REPL, model management, and CLI parity commands (`checkpoints_cli.rs`, `mcp_cli.rs`, `web_cli.rs`, `verify_cli.rs`, `stacks_cli.rs`, `task.rs`) that reuse the same `little_monkey_lib` code the desktop app calls.
-- `docs/roadmap/` - per-feature design docs; [ROADMAP.md](ROADMAP.md) is the milestone-level plan and status.
-- `public/` and `src/assets/` - static frontend assets.
-
-## Useful Commands
-
-```sh
-pnpm tauri dev       # run the desktop app
-pnpm dev             # run Vite only
-pnpm build           # typecheck and build frontend
-pnpm tauri build     # create app bundle
-pnpm test            # run frontend tests
-pnpm test:rust       # run Rust tests
-```
+- `src/` — React UI, Zustand stores, chat/Compare/Crew flows, portability/search, durable run clients, skills/slash commands, and Settings panels.
+- `src-tauri/src/` — Rust model/runtime, permission, workspace, run ledger, assets, Knowledge 2.0, packages/workflows, browser, Git delivery, daemon bridge, companion, and Security Doctor services exposed through Tauri commands.
+- `src-tauri/src/bin/monkey-cli/` — terminal chat/REPL, ACP, model management, workflows, skills/plugins/security, daemon, remote-controller, stacks, tasks, and shared headless tooling.
+- `extensions/little-monkey-vscode/` and `extensions/little-monkey-jetbrains/` — thin IDE clients.
+- `.github/actions/little-monkey-review/` — reusable PR-review action implementation and contract test.
+- `src-tauri/fixtures/` — deterministic browser and knowledge acceptance fixtures.
+- `graphify-out/` — generated architecture graph and wiki; run `graphify update .` after code changes.
+- [ROADMAP.md](ROADMAP.md) — milestone design, dependency order, implementation status, acceptance gates, and remaining external evidence.
+- [roadmap_audit_report.md](roadmap_audit_report.md) — preserved historical audit followed by a current working-tree closeout.

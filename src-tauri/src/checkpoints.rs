@@ -202,7 +202,8 @@ fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?
         .join("checkpoints");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create checkpoints dir: {}", e))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create checkpoints dir: {}", e))?;
     Ok(dir)
 }
 
@@ -389,14 +390,22 @@ pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> R
 
     let backup = if resolved.is_file() {
         let backup_name = format!("{}.bak", active.entries.len());
-        std::fs::copy(resolved, active.dir.join(&backup_name))
-            .map_err(|e| format!("Failed to back up '{}' before modifying it: {}", path_str, e))?;
+        std::fs::copy(resolved, active.dir.join(&backup_name)).map_err(|e| {
+            format!(
+                "Failed to back up '{}' before modifying it: {}",
+                path_str, e
+            )
+        })?;
         Some(backup_name)
     } else {
         None
     };
 
-    active.entries.push(CheckpointEntry { path: path_str, backup, redo: None });
+    active.entries.push(CheckpointEntry {
+        path: path_str,
+        backup,
+        redo: None,
+    });
     Ok(())
 }
 
@@ -469,8 +478,10 @@ fn write_manifest(dir: &Path, manifest: &CheckpointManifest) -> Result<(), Strin
         .map_err(|e| format!("Failed to serialize checkpoint manifest: {}", e))?;
     let path = dir.join(MANIFEST_FILE);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, payload).map_err(|e| format!("Failed to write checkpoint manifest: {}", e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize checkpoint manifest: {}", e))?;
+    std::fs::write(&tmp, payload)
+        .map_err(|e| format!("Failed to write checkpoint manifest: {}", e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to finalize checkpoint manifest: {}", e))?;
     Ok(())
 }
 
@@ -682,7 +693,8 @@ pub fn reapply_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
 /// (used by the timeline's "Restore to here" chain, which is only
 /// well-defined within a single session).
 pub fn list_impl(base_dir: &Path, session_id: Option<&str>) -> Result<Vec<CheckpointInfo>, String> {
-    let read_dir = std::fs::read_dir(base_dir).map_err(|e| format!("Failed to read checkpoints dir: {}", e))?;
+    let read_dir = std::fs::read_dir(base_dir)
+        .map_err(|e| format!("Failed to read checkpoints dir: {}", e))?;
 
     let mut infos: Vec<CheckpointInfo> = Vec::new();
     for entry in read_dir.flatten() {
@@ -709,7 +721,10 @@ pub fn list_impl(base_dir: &Path, session_id: Option<&str>) -> Result<Vec<Checkp
 /// one session. Read-only UI plumbing — like `checkpoint_revert`,
 /// intentionally NOT routed through the permission system.
 #[tauri::command]
-pub fn checkpoint_list(app: tauri::AppHandle, session_id: Option<String>) -> Result<Vec<CheckpointInfo>, String> {
+pub fn checkpoint_list(
+    app: tauri::AppHandle,
+    session_id: Option<String>,
+) -> Result<Vec<CheckpointInfo>, String> {
     list_impl(&checkpoints_base_dir(&app)?, session_id.as_deref())
 }
 
@@ -726,13 +741,23 @@ pub fn checkpoint_begin(
     label: String,
     max_keep: Option<usize>,
 ) -> Result<String, String> {
-    begin_impl(state.inner(), &checkpoints_base_dir(&app)?, session_id, anchor_index, label, max_keep)
+    begin_impl(
+        state.inner(),
+        &checkpoints_base_dir(&app)?,
+        session_id,
+        anchor_index,
+        label,
+        max_keep,
+    )
 }
 
 /// Close checkpoint `id`; returns the touched files (empty = nothing was
 /// mutated this turn and the checkpoint was discarded).
 #[tauri::command]
-pub fn checkpoint_end(state: tauri::State<'_, AppState>, id: String) -> Result<CheckpointSummary, String> {
+pub fn checkpoint_end(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<CheckpointSummary, String> {
     end_impl(state.inner(), &id)
 }
 
@@ -763,14 +788,21 @@ fn acquire_revert_lock<'a>(state: &'a AppState, id: &str) -> Result<RevertLockGu
     if !locks.insert(id.to_string()) {
         return Err(format!("Checkpoint '{}' is already being restored", id));
     }
-    Ok(RevertLockGuard { state, id: id.to_string() })
+    Ok(RevertLockGuard {
+        state,
+        id: id.to_string(),
+    })
 }
 
 /// Restore every file recorded in checkpoint `id` to its pre-turn state.
 /// A direct, human-initiated UI action (the transcript's "Revert" button) —
 /// like `git_commit`, intentionally NOT routed through the permission system.
 #[tauri::command]
-pub fn checkpoint_revert(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<u32, String> {
+pub fn checkpoint_revert(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<u32, String> {
     let _lock = acquire_revert_lock(state.inner(), &id)?;
     revert_impl(&checkpoints_base_dir(&app)?, &id)
 }
@@ -779,7 +811,11 @@ pub fn checkpoint_revert(app: tauri::AppHandle, state: tauri::State<'_, AppState
 /// over the files revert touched, restoring the turn's own changes. Like
 /// `checkpoint_revert`, a direct human-initiated UI action, not permission-gated.
 #[tauri::command]
-pub fn checkpoint_reapply(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<u32, String> {
+pub fn checkpoint_reapply(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<u32, String> {
     let _lock = acquire_revert_lock(state.inner(), &id)?;
     reapply_impl(&checkpoints_base_dir(&app)?, &id)
 }
@@ -822,7 +858,15 @@ mod tests {
 
     /// `begin_impl` with default metadata, for tests that don't care about it.
     fn begin(state: &AppState, base_dir: &Path) -> String {
-        begin_impl(state, base_dir, "test-session".to_string(), 0, "test prompt".to_string(), None).unwrap()
+        begin_impl(
+            state,
+            base_dir,
+            "test-session".to_string(),
+            0,
+            "test prompt".to_string(),
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -851,7 +895,10 @@ mod tests {
         assert!(!state.checkpoints.lock().unwrap()[&id].shell_ran);
 
         record_shell(&state, Some(&id)).unwrap();
-        assert!(state.checkpoints.lock().unwrap()[&id].shell_ran, "shell_ran must flip to true");
+        assert!(
+            state.checkpoints.lock().unwrap()[&id].shell_ran,
+            "shell_ran must flip to true"
+        );
 
         // The flag must survive into the persisted manifest via checkpoint_end.
         let ws = TempDir::new("ws");
@@ -873,7 +920,10 @@ mod tests {
 
         assert_eq!(summary.id, id);
         assert!(summary.files.is_empty());
-        assert!(!base.path.join(&id).exists(), "empty checkpoint dir must be removed");
+        assert!(
+            !base.path.join(&id).exists(),
+            "empty checkpoint dir must be removed"
+        );
     }
 
     #[test]
@@ -898,7 +948,10 @@ mod tests {
         let reverted = revert_impl(&base.path, &id).unwrap();
         assert_eq!(reverted, 2);
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), "original");
-        assert!(!created.exists(), "file created during the turn must be deleted on revert");
+        assert!(
+            !created.exists(),
+            "file created during the turn must be deleted on revert"
+        );
     }
 
     #[test]
@@ -966,7 +1019,10 @@ mod tests {
     fn revert_rejects_traversal_ids() {
         let base = TempDir::new("base");
         let err = revert_impl(&base.path, "../outside").unwrap_err();
-        assert!(err.contains("Invalid checkpoint id"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid checkpoint id"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1011,7 +1067,10 @@ mod tests {
         assert_eq!(manifest.label, "fix the login bug");
         assert!(!manifest.shell_ran);
         assert!(!manifest.reverted);
-        assert!(manifest.created_at_ms >= before_ms, "created_at_ms must be set at begin time");
+        assert!(
+            manifest.created_at_ms >= before_ms,
+            "created_at_ms must be set at begin time"
+        );
         assert_eq!(manifest.entries.len(), 1);
     }
 
@@ -1044,7 +1103,10 @@ mod tests {
         let reverted = revert_impl(&base.path, id).unwrap();
         assert_eq!(reverted, 2);
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), "original");
-        assert!(!created.exists(), "file created during the v1 turn must be deleted on revert");
+        assert!(
+            !created.exists(),
+            "file created during the v1 turn must be deleted on revert"
+        );
     }
 
     #[test]
@@ -1064,7 +1126,10 @@ mod tests {
         assert!(manifest.label.is_empty());
         assert!(!manifest.shell_ran);
         assert!(!manifest.reverted);
-        assert!(manifest.created_at_ms > 0, "created_at_ms must be synthesized from the dir mtime");
+        assert!(
+            manifest.created_at_ms > 0,
+            "created_at_ms must be synthesized from the dir mtime"
+        );
         assert_eq!(manifest.entries.len(), 1);
     }
 
@@ -1080,7 +1145,15 @@ mod tests {
         for n in 0..4 {
             let file = ws.path.join(format!("f{n}.txt"));
             std::fs::write(&file, "x").unwrap();
-            let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), None).unwrap();
+            let id = begin_impl(
+                &state,
+                &base.path,
+                "s".to_string(),
+                0,
+                "p".to_string(),
+                None,
+            )
+            .unwrap();
             record_original(&state, Some(&id), &file).unwrap();
             std::fs::write(&file, "y").unwrap();
             end_impl(&state, &id).unwrap();
@@ -1088,7 +1161,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
 
-        let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), Some(2)).unwrap();
+        let id = begin_impl(
+            &state,
+            &base.path,
+            "s".to_string(),
+            0,
+            "p".to_string(),
+            Some(2),
+        )
+        .unwrap();
 
         let remaining: Vec<String> = std::fs::read_dir(&base.path)
             .unwrap()
@@ -1099,8 +1180,14 @@ mod tests {
         // The two oldest were pruned; the two newest plus the just-opened
         // checkpoint remain.
         assert_eq!(remaining.len(), 3, "remaining: {remaining:?}");
-        assert!(!remaining.contains(&ids[0]), "oldest checkpoint must be pruned");
-        assert!(!remaining.contains(&ids[1]), "second-oldest checkpoint must be pruned");
+        assert!(
+            !remaining.contains(&ids[0]),
+            "oldest checkpoint must be pruned"
+        );
+        assert!(
+            !remaining.contains(&ids[1]),
+            "second-oldest checkpoint must be pruned"
+        );
         assert!(remaining.contains(&ids[2]));
         assert!(remaining.contains(&ids[3]));
         assert!(remaining.contains(&id));
@@ -1114,7 +1201,15 @@ mod tests {
 
         // Turn A begins and stays open (no checkpoint_end) — its directory
         // has no manifest.json yet.
-        let id_a = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), None).unwrap();
+        let id_a = begin_impl(
+            &state,
+            &base.path,
+            "s".to_string(),
+            0,
+            "p".to_string(),
+            None,
+        )
+        .unwrap();
         assert!(base.path.join(&id_a).is_dir());
 
         // Several other turns finish afterwards, each bumping the total
@@ -1122,14 +1217,25 @@ mod tests {
         for n in 0..5 {
             let file = ws.path.join(format!("f{n}.txt"));
             std::fs::write(&file, "x").unwrap();
-            let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), Some(1)).unwrap();
+            let id = begin_impl(
+                &state,
+                &base.path,
+                "s".to_string(),
+                0,
+                "p".to_string(),
+                Some(1),
+            )
+            .unwrap();
             record_original(&state, Some(&id), &file).unwrap();
             end_impl(&state, &id).unwrap();
         }
 
         // Turn A's directory must have survived every intervening prune_old
         // call, since it never got a manifest and is still open.
-        assert!(base.path.join(&id_a).is_dir(), "in-flight checkpoint dir must never be pruned");
+        assert!(
+            base.path.join(&id_a).is_dir(),
+            "in-flight checkpoint dir must never be pruned"
+        );
         assert!(state.checkpoints.lock().unwrap().contains_key(&id_a));
 
         // And a mutation recorded against it afterwards must still succeed.
@@ -1148,12 +1254,16 @@ mod tests {
         let stale_id = "00000000-0000-4000-8000-0000000stale1";
         let stale_dir = base.path.join(stale_id);
         std::fs::create_dir_all(&stale_dir).unwrap();
-        let ancient = std::time::SystemTime::now() - std::time::Duration::from_millis(ABANDONED_IN_FLIGHT_MAX_AGE_MS + 60_000);
+        let ancient = std::time::SystemTime::now()
+            - std::time::Duration::from_millis(ABANDONED_IN_FLIGHT_MAX_AGE_MS + 60_000);
         set_dir_mtime(&stale_dir, ancient);
 
         prune_old(&base.path, 20);
 
-        assert!(!stale_dir.exists(), "an old-enough manifest-less directory must be swept as abandoned");
+        assert!(
+            !stale_dir.exists(),
+            "an old-enough manifest-less directory must be swept as abandoned"
+        );
     }
 
     /// Backdates `dir`'s mtime for the abandoned-in-flight sweep test above.
@@ -1173,7 +1283,15 @@ mod tests {
         let make = |n: u64| {
             let file = ws.path.join(format!("f{n}.txt"));
             std::fs::write(&file, "x").unwrap();
-            let id = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), None).unwrap();
+            let id = begin_impl(
+                &state,
+                &base.path,
+                "s".to_string(),
+                0,
+                "p".to_string(),
+                None,
+            )
+            .unwrap();
             record_original(&state, Some(&id), &file).unwrap();
             end_impl(&state, &id).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(15));
@@ -1190,10 +1308,24 @@ mod tests {
         // With max_keep=2, the correct "keep newest 2 by created_at_ms" is
         // {B, C}; a mtime-based ranking would instead keep {A, C} since A
         // was just touched by revert.
-        let _ = begin_impl(&state, &base.path, "s".to_string(), 0, "p".to_string(), Some(2)).unwrap();
+        let _ = begin_impl(
+            &state,
+            &base.path,
+            "s".to_string(),
+            0,
+            "p".to_string(),
+            Some(2),
+        )
+        .unwrap();
 
-        assert!(!base.path.join(&id_a).exists(), "reverted-but-genuinely-oldest checkpoint must still be pruned");
-        assert!(base.path.join(&id_b).exists(), "genuinely newer checkpoint must survive pruning");
+        assert!(
+            !base.path.join(&id_a).exists(),
+            "reverted-but-genuinely-oldest checkpoint must still be pruned"
+        );
+        assert!(
+            base.path.join(&id_b).exists(),
+            "genuinely newer checkpoint must survive pruning"
+        );
         assert!(base.path.join(&id_c).exists());
     }
 
@@ -1211,8 +1343,14 @@ mod tests {
         end_impl(&state, &id).unwrap();
 
         revert_impl(&base.path, &id).unwrap();
-        assert!(!created.exists(), "revert must delete the turn-created file");
-        assert!(read_manifest(&base.path, &id).unwrap().reverted, "revert must persist reverted: true");
+        assert!(
+            !created.exists(),
+            "revert must delete the turn-created file"
+        );
+        assert!(
+            read_manifest(&base.path, &id).unwrap().reverted,
+            "revert must persist reverted: true"
+        );
 
         let reapplied = reapply_impl(&base.path, &id).unwrap();
         assert_eq!(reapplied, 1);
@@ -1221,7 +1359,10 @@ mod tests {
             "brand new",
             "reapply must recreate the turn-created file with its post-turn content"
         );
-        assert!(!read_manifest(&base.path, &id).unwrap().reverted, "reapply must persist reverted: false");
+        assert!(
+            !read_manifest(&base.path, &id).unwrap().reverted,
+            "reapply must persist reverted: false"
+        );
     }
 
     #[test]
@@ -1275,8 +1416,15 @@ mod tests {
         // must be a no-op, not re-snapshot the current ("v1") content over
         // the true post-turn ("v2") redo backup.
         let second = revert_impl(&base.path, &id).unwrap();
-        assert_eq!(second, 0, "a repeat revert of an already-reverted checkpoint must be a no-op");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1", "the file itself must be unaffected");
+        assert_eq!(
+            second, 0,
+            "a repeat revert of an already-reverted checkpoint must be a no-op"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v1",
+            "the file itself must be unaffected"
+        );
 
         let reapplied = reapply_impl(&base.path, &id).unwrap();
         assert_eq!(reapplied, 1);
@@ -1303,8 +1451,15 @@ mod tests {
 
         // Reapply before any revert has ever happened: nothing to redo yet.
         let noop = reapply_impl(&base.path, &id).unwrap();
-        assert_eq!(noop, 0, "reapply on a never-reverted checkpoint must be a no-op");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2", "must not touch the file");
+        assert_eq!(
+            noop, 0,
+            "reapply on a never-reverted checkpoint must be a no-op"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v2",
+            "must not touch the file"
+        );
 
         revert_impl(&base.path, &id).unwrap();
         reapply_impl(&base.path, &id).unwrap();
@@ -1326,7 +1481,15 @@ mod tests {
         let make = |n: u64| {
             let file = ws.path.join(format!("f{n}.txt"));
             std::fs::write(&file, "x").unwrap();
-            let id = begin_impl(&state, &base.path, "s1".to_string(), 0, "p".to_string(), None).unwrap();
+            let id = begin_impl(
+                &state,
+                &base.path,
+                "s1".to_string(),
+                0,
+                "p".to_string(),
+                None,
+            )
+            .unwrap();
             record_original(&state, Some(&id), &file).unwrap();
             end_impl(&state, &id).unwrap();
             id
@@ -1335,19 +1498,39 @@ mod tests {
         let id_b = make(1);
 
         let manifest_a = read_manifest(&base.path, &id_a).unwrap();
-        assert_eq!(manifest_a.prev_id, None, "the session's first checkpoint has no predecessor");
+        assert_eq!(
+            manifest_a.prev_id, None,
+            "the session's first checkpoint has no predecessor"
+        );
 
         let manifest_b = read_manifest(&base.path, &id_b).unwrap();
-        assert_eq!(manifest_b.prev_id, Some(id_a.clone()), "must link to the session's previous checkpoint");
+        assert_eq!(
+            manifest_b.prev_id,
+            Some(id_a.clone()),
+            "must link to the session's previous checkpoint"
+        );
 
         // A checkpoint in a different session must not be treated as a
         // predecessor.
         let file_c = ws.path.join("c.txt");
         std::fs::write(&file_c, "x").unwrap();
-        let id_other_session = begin_impl(&state, &base.path, "s2".to_string(), 0, "p".to_string(), None).unwrap();
+        let id_other_session = begin_impl(
+            &state,
+            &base.path,
+            "s2".to_string(),
+            0,
+            "p".to_string(),
+            None,
+        )
+        .unwrap();
         record_original(&state, Some(&id_other_session), &file_c).unwrap();
         end_impl(&state, &id_other_session).unwrap();
-        assert_eq!(read_manifest(&base.path, &id_other_session).unwrap().prev_id, None);
+        assert_eq!(
+            read_manifest(&base.path, &id_other_session)
+                .unwrap()
+                .prev_id,
+            None
+        );
     }
 
     #[test]
@@ -1359,7 +1542,15 @@ mod tests {
         let make = |n: u64| {
             let file = ws.path.join(format!("f{n}.txt"));
             std::fs::write(&file, "x").unwrap();
-            let id = begin_impl(&state, &base.path, "s1".to_string(), 0, "p".to_string(), None).unwrap();
+            let id = begin_impl(
+                &state,
+                &base.path,
+                "s1".to_string(),
+                0,
+                "p".to_string(),
+                None,
+            )
+            .unwrap();
             record_original(&state, Some(&id), &file).unwrap();
             end_impl(&state, &id).unwrap();
             id
@@ -1379,8 +1570,16 @@ mod tests {
         // C's recorded predecessor (B) doesn't match the next surviving
         // entry (A) — that mismatch is exactly the pruned-gap signal the
         // timeline's "Restore to here" must key off of.
-        assert_eq!(infos[0].prev_id, Some(id_b), "C's prev_id still points at the pruned B");
-        assert_ne!(infos[0].prev_id, Some(infos[1].id.clone()), "mismatch signals a gap");
+        assert_eq!(
+            infos[0].prev_id,
+            Some(id_b),
+            "C's prev_id still points at the pruned B"
+        );
+        assert_ne!(
+            infos[0].prev_id,
+            Some(infos[1].id.clone()),
+            "mismatch signals a gap"
+        );
     }
 
     #[test]
@@ -1393,7 +1592,10 @@ mod tests {
             Ok(_) => panic!("a second concurrent claim on the same id must be rejected"),
             Err(e) => e,
         };
-        assert!(err.contains("already being restored"), "unexpected error: {err}");
+        assert!(
+            err.contains("already being restored"),
+            "unexpected error: {err}"
+        );
 
         drop(guard);
         // Once released, a new claim must succeed.
@@ -1404,7 +1606,10 @@ mod tests {
     fn reapply_rejects_traversal_ids() {
         let base = TempDir::new("base");
         let err = reapply_impl(&base.path, "../outside").unwrap_err();
-        assert!(err.contains("Invalid checkpoint id"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid checkpoint id"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1422,7 +1627,15 @@ mod tests {
 
         let file_a = ws.path.join("a.txt");
         std::fs::write(&file_a, "a").unwrap();
-        let id_older = begin_impl(&state, &base.path, "s1".to_string(), 0, "older turn".to_string(), None).unwrap();
+        let id_older = begin_impl(
+            &state,
+            &base.path,
+            "s1".to_string(),
+            0,
+            "older turn".to_string(),
+            None,
+        )
+        .unwrap();
         record_original(&state, Some(&id_older), &file_a).unwrap();
         end_impl(&state, &id_older).unwrap();
 
@@ -1430,16 +1643,37 @@ mod tests {
 
         let file_b = ws.path.join("b.txt");
         std::fs::write(&file_b, "b").unwrap();
-        let id_newer = begin_impl(&state, &base.path, "s1".to_string(), 1, "newer turn".to_string(), None).unwrap();
+        let id_newer = begin_impl(
+            &state,
+            &base.path,
+            "s1".to_string(),
+            1,
+            "newer turn".to_string(),
+            None,
+        )
+        .unwrap();
         record_original(&state, Some(&id_newer), &file_b).unwrap();
         end_impl(&state, &id_newer).unwrap();
 
         // A checkpoint whose turn is still running (no `checkpoint_end` yet,
         // so no manifest.json on disk) must not appear in the list.
-        let _in_flight = begin_impl(&state, &base.path, "s1".to_string(), 2, "still running".to_string(), None).unwrap();
+        let _in_flight = begin_impl(
+            &state,
+            &base.path,
+            "s1".to_string(),
+            2,
+            "still running".to_string(),
+            None,
+        )
+        .unwrap();
 
         let infos = list_impl(&base.path, None).unwrap();
-        assert_eq!(infos.len(), 2, "in-flight checkpoint must be skipped: {:?}", infos.iter().map(|i| &i.id).collect::<Vec<_>>());
+        assert_eq!(
+            infos.len(),
+            2,
+            "in-flight checkpoint must be skipped: {:?}",
+            infos.iter().map(|i| &i.id).collect::<Vec<_>>()
+        );
         assert_eq!(infos[0].id, id_newer, "newest checkpoint must sort first");
         assert_eq!(infos[1].id, id_older);
         assert_eq!(infos[0].files, 1);
@@ -1456,13 +1690,29 @@ mod tests {
 
         let file_a = ws.path.join("a.txt");
         std::fs::write(&file_a, "a").unwrap();
-        let id_s1 = begin_impl(&state, &base.path, "session-1".to_string(), 0, "s1 turn".to_string(), None).unwrap();
+        let id_s1 = begin_impl(
+            &state,
+            &base.path,
+            "session-1".to_string(),
+            0,
+            "s1 turn".to_string(),
+            None,
+        )
+        .unwrap();
         record_original(&state, Some(&id_s1), &file_a).unwrap();
         end_impl(&state, &id_s1).unwrap();
 
         let file_b = ws.path.join("b.txt");
         std::fs::write(&file_b, "b").unwrap();
-        let id_s2 = begin_impl(&state, &base.path, "session-2".to_string(), 0, "s2 turn".to_string(), None).unwrap();
+        let id_s2 = begin_impl(
+            &state,
+            &base.path,
+            "session-2".to_string(),
+            0,
+            "s2 turn".to_string(),
+            None,
+        )
+        .unwrap();
         record_original(&state, Some(&id_s2), &file_b).unwrap();
         end_impl(&state, &id_s2).unwrap();
 
@@ -1488,21 +1738,33 @@ mod tests {
         let v1_dir = base.path.join(v1_id);
         std::fs::create_dir_all(&v1_dir).unwrap();
         std::fs::write(v1_dir.join("0.bak"), "original").unwrap();
-        let raw = format!(r#"[{{"path":{:?},"backup":"0.bak"}}]"#, existing.to_string_lossy());
+        let raw = format!(
+            r#"[{{"path":{:?},"backup":"0.bak"}}]"#,
+            existing.to_string_lossy()
+        );
         std::fs::write(v1_dir.join(MANIFEST_FILE), raw).unwrap();
 
         let before_revert = list_impl(&base.path, None).unwrap();
         assert_eq!(before_revert.len(), 1);
-        assert_eq!(before_revert[0].session_id, "", "v1 manifests synthesize an empty session id");
+        assert_eq!(
+            before_revert[0].session_id, "",
+            "v1 manifests synthesize an empty session id"
+        );
         assert!(!before_revert[0].reverted);
-        assert!(!before_revert[0].reapplyable, "not reverted yet, so nothing to re-apply");
+        assert!(
+            !before_revert[0].reapplyable,
+            "not reverted yet, so nothing to re-apply"
+        );
 
         revert_impl(&base.path, v1_id).unwrap();
 
         let after_revert = list_impl(&base.path, None).unwrap();
         assert_eq!(after_revert.len(), 1);
         assert!(after_revert[0].reverted);
-        assert!(after_revert[0].reapplyable, "revert_impl recorded a redo backup, so re-apply is now meaningful");
+        assert!(
+            after_revert[0].reapplyable,
+            "revert_impl recorded a redo backup, so re-apply is now meaningful"
+        );
     }
 
     /// Reproduces (and pins the fix for) the concurrent-write race a code
@@ -1533,7 +1795,10 @@ mod tests {
             let state = Arc::new(AppState::default());
             let checkpoint_id = begin(&state, &base.path);
 
-            let run = |state: Arc<AppState>, checkpoint_id: String, file: PathBuf, content: &'static str| {
+            let run = |state: Arc<AppState>,
+                       checkpoint_id: String,
+                       file: PathBuf,
+                       content: &'static str| {
                 tokio::spawn(async move {
                     // Force genuine interleaving opportunity across the two
                     // tasks before either takes the lock — standing in for
@@ -1547,8 +1812,18 @@ mod tests {
                 })
             };
 
-            let a = run(state.clone(), checkpoint_id.clone(), file.clone(), "from writer A");
-            let b = run(state.clone(), checkpoint_id.clone(), file.clone(), "from writer B");
+            let a = run(
+                state.clone(),
+                checkpoint_id.clone(),
+                file.clone(),
+                "from writer A",
+            );
+            let b = run(
+                state.clone(),
+                checkpoint_id.clone(),
+                file.clone(),
+                "from writer B",
+            );
             a.await.unwrap();
             b.await.unwrap();
 
@@ -1564,7 +1839,9 @@ mod tests {
             // and skips (this dedup was always mutex-protected; the fix is
             // that the two writers' backup+write pairs can no longer
             // interleave with each other).
-            let entries = state.checkpoints.lock().unwrap()[&checkpoint_id].entries.clone();
+            let entries = state.checkpoints.lock().unwrap()[&checkpoint_id]
+                .entries
+                .clone();
             let file_str = file.to_string_lossy().to_string();
             assert_eq!(entries.iter().filter(|e| e.path == file_str).count(), 1);
         }

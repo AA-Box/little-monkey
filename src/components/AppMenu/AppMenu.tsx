@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  Activity,
   Check,
   ChevronRight,
   ChevronsUpDown,
   Globe,
   HelpCircle,
   Moon,
+  Search,
   Settings as SettingsIcon,
   Sun,
 } from "lucide-react";
@@ -18,6 +20,8 @@ const APP_VERSION = "0.1.0";
 
 interface AppMenuProps {
   onOpenSettings: () => void;
+  onOpenRunCenter: () => void;
+  onOpenGlobalSearch: () => void;
 }
 
 interface MenuRowProps {
@@ -45,7 +49,7 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings, theme, and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings }: AppMenuProps) {
+export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -97,6 +101,22 @@ export function AppMenu({ onOpenSettings }: AppMenuProps) {
 
       {open && (
         <div className="absolute bottom-full left-2 mb-1 min-w-[220px] whitespace-nowrap rounded-lg border border-border bg-background py-1 shadow-lg z-30">
+          <MenuRow
+            icon={<Search size={14} className="text-faint" />}
+            label={t("AppMenu.globalSearch")}
+            onClick={() => {
+              closeAll();
+              onOpenGlobalSearch();
+            }}
+          />
+          <MenuRow
+            icon={<Activity size={14} className="text-faint" />}
+            label={t("AppMenu.runCenter")}
+            onClick={() => {
+              closeAll();
+              onOpenRunCenter();
+            }}
+          />
           <MenuRow
             icon={<SettingsIcon size={14} className="text-faint" />}
             label={t("AppMenu.settings")}

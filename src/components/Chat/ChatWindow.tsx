@@ -1,27 +1,32 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CornerDownLeft, Square } from "lucide-react";
 
-import { runAgentTurn, stopTurn } from "../../lib/agentLoop";
+import { compactSessionNow, runAgentTurn, stopTurn } from "../../lib/agentLoop";
 import type { AttachmentRef } from "../../lib/agentLoop";
+import { startComparison } from "../../lib/compareRunner";
+import { startCrew } from "../../lib/crewRunner";
+import type { ModelTargetSnapshot } from "../../lib/modelTargets";
 import { isImagePath, readImageAsDataUrl } from "../../lib/imageAttachment";
 import { textContent } from "../../lib/llamaClient";
 import { selectSessionMessages, selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
 import { usePromptStore } from "../../store/promptStore";
 import { useShortcutStore } from "../../store/shortcutStore";
-import type { PromptEntry } from "../../store/promptStore";
 import MessageList from "./MessageList";
 import { MentionAutocomplete } from "./MentionAutocomplete";
 import type { MentionEntry } from "./MentionAutocomplete";
 import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
+import type { SlashCatalogEntry } from "./SlashCommandAutocomplete";
 import { ModeSelector } from "./ModeSelector";
 import { EffortSelector } from "./EffortSelector";
 import { PersonaSelector } from "./PersonaSelector";
 import { StackPicker } from "./StackPicker";
 import { ModelSwitcher } from "./ModelSwitcher";
+import { CompareTargetPicker } from "./CompareTargetPicker";
+import { CrewPicker } from "./CrewPicker";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
@@ -29,6 +34,41 @@ import { AttachmentChip } from "./AttachmentChip";
 import { WorkspaceBar } from "../Workspace";
 import { useT } from "../../lib/i18n";
 import { detectShortcutPlatform, shortcutIdForEvent } from "../../lib/shortcuts";
+import {
+  ecosystemClient,
+  type ActivePluginRuntimeSnapshot,
+  type ActiveSkillDescriptor,
+  type PluginRuntimeDescriptor,
+} from "../../lib/ecosystemClient";
+import {
+  localPromptSkills,
+  nativeSkills,
+  packageAssistantSkills,
+  packageRuleInvocations,
+  packageSkills,
+  parseSkillTurn,
+  type SkillInvocationSnapshot,
+} from "../../lib/skills";
+import { useEcosystemStore } from "../../store/ecosystemStore";
+import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
+import { companionClient } from "../../lib/companionClient";
+import {
+  BUILT_IN_SLASH_COMMANDS,
+  formatCommandNotice,
+  parseBuiltInSlashCommand,
+  type BuiltInSlashCommandName,
+} from "../../lib/slashCommands";
+import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
+import { mcpToolDefs } from "../../lib/mcpTools";
+import { useSettingsStore } from "../../store/settingsStore";
+import { usePermissionStore } from "../../store/permissionStore";
+import { useModelStore } from "../../store/modelStore";
+import { useUsageStore } from "../../store/usageStore";
+import { useStackStore } from "../../store/stackStore";
+import { useSkillProposalStore } from "../../store/skillProposalStore";
+import { useMcpStore } from "../../store/mcpStore";
+import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
+import type { SettingsTab } from "../Settings";
 
 const MAX_TEXTAREA_HEIGHT_PX = 192;
 
@@ -119,10 +159,10 @@ function findSlashRange(text: string, cursor: number): { start: number; query: s
  * fully client-side against `promptStore` entries, unlike mentions there's
  * no Rust round trip since the whole library is already in memory.
  */
-function filterSlashEntries(all: PromptEntry[], query: string): PromptEntry[] {
+function filterSlashEntries(all: SlashCatalogEntry[], query: string): SlashCatalogEntry[] {
   const needle = query.toLowerCase();
 
-  const ranked: { entry: PromptEntry; rank: number }[] = [];
+  const ranked: { entry: SlashCatalogEntry; rank: number }[] = [];
   for (const entry of all) {
     const command = entry.command.toLowerCase();
     const name = entry.name.toLowerCase();
@@ -144,6 +184,61 @@ function filterSlashEntries(all: PromptEntry[], query: string): PromptEntry[] {
   return ranked.map((r) => r.entry);
 }
 
+function activeModelDescription(): string {
+  const state = useModelStore.getState();
+  if (state.activeProvider === "provider") {
+    return state.activeProviderId && state.activeProviderModel
+      ? `${state.activeProviderId}:${state.activeProviderModel}`
+      : "cloud provider (no model selected)";
+  }
+  if (state.activeProvider === "ollama") {
+    return state.activeOllamaModel ? `ollama:${state.activeOllamaModel}` : "Ollama (no model selected)";
+  }
+  return state.active ? `local:${state.active.name} (${state.llamaStatus})` : `local runtime (${state.llamaStatus}; no model selected)`;
+}
+
+async function switchModelFromSlash(selector: string): Promise<string> {
+  const state = useModelStore.getState();
+  const requested = selector.trim().toLowerCase();
+  if (!requested) return activeModelDescription();
+  const candidates: Array<{ canonical: string; aliases: string[]; activate: () => Promise<void> }> = [];
+  for (const model of state.installed.filter((entry) => entry.kind === "chat")) {
+    candidates.push({
+      canonical: `local:${model.id}`,
+      aliases: [model.id, model.name].map((value) => value.toLowerCase()),
+      activate: async () => state.start(model),
+    });
+  }
+  for (const model of state.ollamaModels) {
+    candidates.push({
+      canonical: `ollama:${model.name}`,
+      aliases: [model.name.toLowerCase()],
+      activate: async () => useModelStore.getState().useOllamaModel(model.name),
+    });
+  }
+  for (const provider of state.providers) {
+    for (const model of state.providerModels[provider.id] ?? []) {
+      candidates.push({
+        canonical: `${provider.id}:${model.id}`,
+        aliases: [model.id.toLowerCase()],
+        activate: async () => useModelStore.getState().useProviderModel(provider.id, model.id),
+      });
+    }
+  }
+  const matches = candidates.filter((candidate) =>
+    candidate.canonical.toLowerCase() === requested || candidate.aliases.includes(requested),
+  );
+  if (matches.length === 0) {
+    const available = candidates.slice(0, 30).map((candidate) => candidate.canonical).join("\n");
+    throw new Error(`No configured model matches “${selector}”.${available ? `\n\nAvailable:\n${available}` : ""}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`“${selector}” is available from more than one runtime/provider. Choose one explicitly:\n${matches.map((entry) => entry.canonical).join("\n")}`);
+  }
+  await matches[0].activate();
+  return matches[0].canonical;
+}
+
 interface ChatWindowProps {
   /** The session this pane renders and sends turns into. Each pane (primary
    * and split — see App.tsx) owns one; they operate independently. */
@@ -151,9 +246,10 @@ interface ChatWindowProps {
   /** Opens Settings on the Prompts tab — passed down to `PersonaSelector`'s
    * "Manage prompts…" row (see App.tsx's deep-link hook). */
   onManagePrompts: () => void;
+  onOpenSettingsTab: (tab: SettingsTab) => void;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -165,6 +261,12 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
   // its Stop affordance wherever its session is shown), and a session
   // already running a turn stays locked in whichever pane displays it.
   const sending = useSessionStore(selectTurnRunning(sessionId));
+  const [preparingTurn, setPreparingTurn] = useState(false);
+  const preparingTurnRef = useRef(false);
+  const [startingComparison, setStartingComparison] = useState(false);
+  const [compareTargets, setCompareTargets] = useState<ModelTargetSnapshot[]>([]);
+  const [startingCrew, setStartingCrew] = useState(false);
+  const [crewId, setCrewId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -199,12 +301,150 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
   // "/"-command autocomplete state — mirrors the "@"-mention state above.
   // `slashQuery` being non-null is what controls whether the popup renders.
   const promptEntries = usePromptStore((state) => state.entries);
+  const installedPackageKey = useEcosystemStore((state) =>
+    state.installed
+      .map((entry) => `${entry.package_id}:${entry.sequence}:${entry.enabled}:${entry.revoked}:${entry.tombstoned}`)
+      .join("|"),
+  );
+  const [activePackageSkills, setActivePackageSkills] = useState<ActiveSkillDescriptor[]>([]);
+  const [activePluginSnapshots, setActivePluginSnapshots] = useState<ActivePluginRuntimeSnapshot[]>([]);
+  const [pluginRuntimes, setPluginRuntimes] = useState<PluginRuntimeDescriptor[]>([]);
+  const [activeNativeSkills, setActiveNativeSkills] = useState<NativeSkillDescriptor[]>([]);
+  const nativeSkillsRevision = useNativeSkillsStore((state) => state.revision);
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([
+      ecosystemClient.activeSkills().catch(() => [] as ActiveSkillDescriptor[]),
+      ecosystemClient.activePluginSnapshots().catch(() => [] as ActivePluginRuntimeSnapshot[]),
+      ecosystemClient.pluginRuntime().catch(() => [] as PluginRuntimeDescriptor[]),
+      nativeSkillsClient.discover().catch(() => [] as NativeSkillDescriptor[]),
+    ])
+      .then(([packageEntries, pluginSnapshots, runtimes, nativeEntries]) => {
+        if (!cancelled) {
+          setActivePackageSkills(packageEntries);
+          setActivePluginSnapshots(pluginSnapshots);
+          setPluginRuntimes(runtimes);
+          setActiveNativeSkills(nativeEntries);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setActivePackageSkills([]);
+          setActivePluginSnapshots([]);
+          setPluginRuntimes([]);
+          setActiveNativeSkills([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [installedPackageKey, rootsKey, nativeSkillsRevision]);
+  const baseAvailableSkills = useMemo(
+    () => [...localPromptSkills(promptEntries), ...nativeSkills(activeNativeSkills), ...packageSkills(activePackageSkills)],
+    [promptEntries, activeNativeSkills, activePackageSkills],
+  );
+  const activePackageAssistants = useMemo(
+    () => packageAssistantSkills(
+      activePluginSnapshots,
+      new Set(pluginRuntimes.filter((runtime) => runtime.health === "healthy").map((runtime) => runtime.package_id)),
+    ),
+    [activePluginSnapshots, pluginRuntimes],
+  );
+  const availableSkills = useMemo(
+    () => [...baseAvailableSkills, ...activePackageAssistants],
+    [baseAvailableSkills, activePackageAssistants],
+  );
+  const slashCatalog = useMemo<SlashCatalogEntry[]>(
+    () => [
+      ...BUILT_IN_SLASH_COMMANDS.map((command) => ({
+        id: `builtin:${command.command}`,
+        kind: "snippet" as const,
+        name: command.name,
+        command: command.command,
+        content: command.usage,
+        description: command.description,
+        createdAt: 0,
+        updatedAt: 0,
+        builtin: true,
+      })),
+      ...promptEntries,
+      ...activeNativeSkills
+        .filter((skill) => skill.source.kind !== "signed_package" && skill.enabled && skill.eligibility.eligible)
+        .map((skill) => ({
+          id: `native:${skill.source.kind}:${skill.command}:${skill.sha256}`,
+          kind: "skill" as const,
+          name: skill.name,
+          command: skill.command,
+          content: skill.instructions,
+          description: skill.description,
+          createdAt: 0,
+          updatedAt: 0,
+        })),
+      ...activePackageSkills.map((skill) => ({
+        id: `package:${skill.package_id}`,
+        kind: "skill" as const,
+        name: skill.name,
+        command: skill.command,
+        content: skill.instructions,
+        description: skill.description,
+        createdAt: 0,
+        updatedAt: 0,
+      })),
+      ...activePackageAssistants.map((assistant) => ({
+        id: assistant.id,
+        kind: "skill" as const,
+        name: assistant.name,
+        command: assistant.command,
+        content: assistant.instructions,
+        description: assistant.description,
+        createdAt: 0,
+        updatedAt: 0,
+      })),
+    ],
+    [promptEntries, activeNativeSkills, activePackageSkills, activePackageAssistants],
+  );
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
-  const [slashEntries, setSlashEntries] = useState<PromptEntry[]>([]);
+  const [slashEntries, setSlashEntries] = useState<SlashCatalogEntry[]>([]);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
   // Index of the "/" that opened the current slash trigger, so selection
   // knows exactly what span of the textarea to replace.
   const slashStartRef = useRef<number | null>(null);
+  const invokedSkillPreview = useMemo(() => {
+    try {
+      return parseSkillTurn(input, availableSkills)?.invocations ?? [];
+    } catch {
+      return [];
+    }
+  }, [input, availableSkills]);
+  const activePackageRuleCount = useMemo(
+    () => activePluginSnapshots.reduce(
+      (total, snapshot) => total + (snapshot.manifest.kind === "assistant"
+        ? 0
+        : snapshot.manifest.content.filter((reference) => reference.kind === "rule").length),
+      0,
+    ),
+    [activePluginSnapshots],
+  );
+
+  const prepareTurnInstructions = useCallback(async (text: string): Promise<SkillInvocationSnapshot[]> => {
+    const pluginSnapshots = await ecosystemClient.activePluginSnapshots();
+    const runtimes = pluginSnapshots.some((snapshot) => snapshot.manifest.kind === "assistant")
+      ? await ecosystemClient.pluginRuntime()
+      : [];
+    const readyAssistantIds = new Set(
+      runtimes.filter((runtime) => runtime.health === "healthy").map((runtime) => runtime.package_id),
+    );
+    const parsed = parseSkillTurn(text, [
+      ...baseAvailableSkills,
+      ...packageAssistantSkills(pluginSnapshots, readyAssistantIds),
+    ]);
+    setActivePluginSnapshots(pluginSnapshots);
+    setPluginRuntimes(runtimes);
+    return [
+      ...packageRuleInvocations(pluginSnapshots, parsed?.request ?? text.trim()),
+      ...(parsed?.invocations ?? []),
+    ];
+  }, [baseAvailableSkills]);
 
   const resizeTextarea = useCallback(() => {
     const el = textareaRef.current;
@@ -221,12 +461,51 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
     setInput("");
     setError(null);
     setAttachments([]);
+    setCompareTargets([]);
+    setStartingComparison(false);
+    setCrewId(null);
+    setStartingCrew(false);
     setMentionQuery(null);
     mentionStartRef.current = null;
     setSlashQuery(null);
     slashStartRef.current = null;
     requestAnimationFrame(resizeTextarea);
   }, [sessionId, resizeTextarea]);
+
+  // The separately-capability-scoped companion overlay never writes session
+  // state directly. Rust emits its explicit context only to the main window;
+  // the currently active primary composer accepts it here for user review
+  // before Send. Screen context stays an in-memory vision attachment.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void companionClient.onCompose((payload) => {
+      if (useSessionStore.getState().activeSessionId !== sessionId) return;
+      setInput(payload.text);
+      if (payload.imageDataUrl) {
+        setAttachments((current) => [
+          ...current.filter((attachment) => !attachment.path.startsWith("companion://")),
+          {
+            path: `companion://${payload.source}/${Date.now()}.png`,
+            isDir: false,
+            kind: "image",
+            dataUrl: payload.imageDataUrl ?? undefined,
+          },
+        ]);
+      }
+      requestAnimationFrame(() => {
+        resizeTextarea();
+        textareaRef.current?.focus();
+      });
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [resizeTextarea, sessionId]);
 
   const loadWorkspacePaths = useCallback((): Promise<MentionEntry[]> => {
     if (workspacePathsRef.current) return Promise.resolve(workspacePathsRef.current);
@@ -299,13 +578,17 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
     setAttachments((prev) => prev.filter((a) => a.path !== path));
   }, []);
 
-  const sendTurn = useCallback((text: string, pendingAttachments: AttachmentRef[]) => {
+  const sendTurn = useCallback((
+    text: string,
+    pendingAttachments: AttachmentRef[],
+    skillInvocations: SkillInvocationSnapshot[] = [],
+  ) => {
     setError(null);
 
     // The agent loop owns the turn's abort handle (keyed by session — see
     // stopTurn) and flips the per-session running flag `sending` above
     // subscribes to, so nothing pane-local tracks the turn.
-    void runAgentTurn(sessionId, text, pendingAttachments)
+    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations)
       .catch((err: unknown) => {
         setError(err instanceof Error ? err.message : String(err));
       })
@@ -314,16 +597,221 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
       });
   }, [sessionId]);
 
-  const handleSend = useCallback(() => {
+  const appendCommandNotice = useCallback((command: BuiltInSlashCommandName, text: string, ok = true, targetSessionId = sessionId) => {
+    useSessionStore.getState().addMessage(targetSessionId, {
+      role: "system",
+      content: formatCommandNotice({ command, text, ok }),
+    });
+  }, [sessionId]);
+
+  const executeBuiltIn = useCallback(async (
+    command: BuiltInSlashCommandName,
+    commandArguments: string,
+  ): Promise<void> => {
+    const requireNoArguments = () => {
+      if (commandArguments) throw new Error(`/${command} does not accept arguments.`);
+    };
+    if (command === "stop") {
+      requireNoArguments();
+      if (!useSessionStore.getState().runningTurns[sessionId]) {
+        appendCommandNotice(command, "No model turn is currently running.");
+        return;
+      }
+      stopTurn(sessionId);
+      appendCommandNotice(command, "Cancellation requested. The run will finish only after the active model/tool acknowledges cancellation.");
+      return;
+    }
+    if (command === "new") {
+      requireNoArguments();
+      useSessionStore.getState().newSession();
+      const newSessionId = useSessionStore.getState().activeSessionId;
+      appendCommandNotice(command, "Started a fresh local chat. No model request was made.", true, newSessionId);
+      return;
+    }
+    if (command === "compact") {
+      requireNoArguments();
+      const result = await compactSessionNow(sessionId);
+      appendCommandNotice(
+        command,
+        result.changed
+          ? `Compacted ${result.removedMessages} older message${result.removedMessages === 1 ? "" : "s"}.`
+          : "Nothing was compacted. Keep at least two complete user turns before using /compact.",
+      );
+      return;
+    }
+    if (command === "model") {
+      const selected = await switchModelFromSlash(commandArguments);
+      appendCommandNotice(command, commandArguments ? `Active model switched to ${selected}.` : `Active model: ${selected}`);
+      return;
+    }
+    if (command === "usage") {
+      requireNoArguments();
+      const usageState = useUsageStore.getState();
+      const usage = usageState.usageBySession[sessionId];
+      appendCommandNotice(
+        command,
+        usage
+          ? [
+              `Last completed turn: ${usage.promptTokens.toLocaleString()} prompt + ${usage.completionTokens.toLocaleString()} completion = ${usage.totalTokens.toLocaleString()} tokens`,
+              `Context limit: ${usageState.contextLimit?.toLocaleString() ?? "not reported by the active runtime"}`,
+            ].join("\n")
+          : "The active runtime has not reported token usage for a completed turn in this chat yet.",
+      );
+      return;
+    }
+    if (command === "skills") {
+      requireNoArguments();
+      const lines = availableSkills
+        .slice()
+        .sort((left, right) => left.command.localeCompare(right.command))
+        .map((skill) => `/${skill.command} — ${skill.name} [${skill.source} ${skill.version}]`);
+      appendCommandNotice(command, lines.length > 0 ? lines.join("\n") : "No enabled skills are currently available.");
+      return;
+    }
+    if (command === "plugins") {
+      requireNoArguments();
+      const ecosystem = useEcosystemStore.getState();
+      const catalogById = new Map(ecosystem.catalog.map((entry) => [entry.manifest.package_id, entry.manifest.display_name]));
+      const lines = ecosystem.installed.map((plugin) => {
+        const health = plugin.revoked
+          ? "revoked"
+          : plugin.tombstoned
+            ? "uninstalled"
+            : plugin.enabled
+              ? "enabled"
+              : "disabled";
+        return `${catalogById.get(plugin.package_id) ?? plugin.package_id} ${plugin.active_version ?? ""} — ${health}`.trim();
+      });
+      appendCommandNotice(command, lines.length > 0 ? lines.join("\n") : "No declarative plugins are installed. Open Settings → Ecosystem to review signed packages.");
+      return;
+    }
+    if (command === "tools") {
+      requireNoArguments();
+      const settings = useSettingsStore.getState();
+      const permissionMode = usePermissionStore.getState().mode;
+      const attachedIds = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.attachedStackIds ?? [];
+      const stackNames = useStackStore.getState().stacks.filter((stack) => attachedIds.includes(stack.id)).map((stack) => stack.name);
+      const builtIns = buildTools(stackNames).filter((tool) => {
+        const name = tool.function.name;
+        if (!settings.memoryEnabled && name === "remember") return false;
+        if (!settings.webToolsEnabled && (name === "web_fetch" || name === "web_search")) return false;
+        return true;
+      });
+      if (settings.subagentsEnabled) builtIns.push(TASK_TOOL);
+      if (permissionMode === "plan") builtIns.push(PRESENT_PLAN_TOOL);
+      const mcp = mcpToolDefs().defs;
+      const lines = [...builtIns, ...mcp]
+        .map((tool) => tool.function.name)
+        .sort()
+        .map((name) => `${name.startsWith("mcp__") ? "MCP" : "host"} · ${name}`);
+      appendCommandNotice(command, `${lines.join("\n")}\n\nPermission mode: ${permissionMode}. Tool permissions remain authoritative.`);
+      return;
+    }
+    if (command === "status") {
+      requireNoArguments();
+      const roots = useWorkspaceStore.getState().roots;
+      const mcp = useMcpStore.getState().servers;
+      const pluginCount = useEcosystemStore.getState().installed.filter((entry) => entry.enabled && !entry.revoked && !entry.tombstoned).length;
+      appendCommandNotice(command, [
+        `Model: ${activeModelDescription()}`,
+        `Turn: ${useSessionStore.getState().runningTurns[sessionId] ? "running" : "idle"}`,
+        `Permission mode: ${usePermissionStore.getState().mode}`,
+        `Workspace: ${roots.length > 0 ? roots.map((root) => root.path).join(", ") : "none attached"}`,
+        `MCP: ${mcp.filter((entry) => entry.status === "connected").length}/${mcp.length} connected`,
+        `Skills: ${availableSkills.length} enabled`,
+        `Plugins: ${pluginCount} enabled`,
+      ].join("\n"));
+      return;
+    }
+    if (command === "learn") {
+      const separator = commandArguments.indexOf("|");
+      if (separator < 1) throw new Error("Use /learn command | instructions. The proposal will remain quarantined until you review its digest.");
+      const proposedCommand = commandArguments.slice(0, separator).trim();
+      const instructions = commandArguments.slice(separator + 1).trim();
+      if (availableSkills.some((skill) => skill.command.toLowerCase() === proposedCommand.toLowerCase())) {
+        throw new Error(`/${proposedCommand} already exists as an enabled skill.`);
+      }
+      const proposal = await useSkillProposalStore.getState().createProposal(proposedCommand, instructions);
+      appendCommandNotice(
+        command,
+        `Created quarantined /${proposal.command} proposal. Review the full instructions, warnings, and sha256:${proposal.contentSha256} in Settings → Prompts before approval.`,
+      );
+      onOpenSettingsTab("prompts");
+    }
+  }, [appendCommandNotice, availableSkills, onOpenSettingsTab, sessionId]);
+
+  const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text) return;
+    const builtIn = parseBuiltInSlashCommand(text);
+    if (builtIn) {
+      setInput("");
+      setAttachments([]);
+      requestAnimationFrame(resizeTextarea);
+      void executeBuiltIn(builtIn.definition.command, builtIn.arguments).catch((commandError: unknown) => {
+        appendCommandNotice(
+          builtIn.definition.command,
+          commandError instanceof Error ? commandError.message : String(commandError),
+          false,
+        );
+      });
+      return;
+    }
+    if (sending || startingComparison || startingCrew || preparingTurnRef.current) return;
+
+    preparingTurnRef.current = true;
+    setPreparingTurn(true);
+    let skillInvocations: SkillInvocationSnapshot[];
+    try {
+      skillInvocations = await prepareTurnInstructions(text);
+    } catch (skillError) {
+      setError(`No turn was sent because enabled plugin instructions could not be verified: ${skillError instanceof Error ? skillError.message : String(skillError)}`);
+      preparingTurnRef.current = false;
+      setPreparingTurn(false);
+      return;
+    }
+    preparingTurnRef.current = false;
+    setPreparingTurn(false);
 
     const pendingAttachments = attachments;
+    if (crewId) {
+      setError(null);
+      setStartingCrew(true);
+      try {
+        await startCrew(sessionId, text, pendingAttachments, crewId, skillInvocations);
+        setInput("");
+        setAttachments([]);
+        requestAnimationFrame(resizeTextarea);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setStartingCrew(false);
+        textareaRef.current?.focus();
+      }
+      return;
+    }
+    if (compareTargets.length >= 2) {
+      setError(null);
+      setStartingComparison(true);
+      try {
+        await startComparison(sessionId, text, pendingAttachments, compareTargets, skillInvocations);
+        setInput("");
+        setAttachments([]);
+        requestAnimationFrame(resizeTextarea);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setStartingComparison(false);
+        textareaRef.current?.focus();
+      }
+      return;
+    }
+
     setInput("");
     setAttachments([]);
     requestAnimationFrame(resizeTextarea);
-    sendTurn(text, pendingAttachments);
-  }, [input, sending, attachments, resizeTextarea, sendTurn]);
+    sendTurn(text, pendingAttachments, skillInvocations);
+  }, [input, sending, startingComparison, startingCrew, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice]);
 
   const handleStop = useCallback(() => {
     stopTurn(sessionId);
@@ -331,11 +819,26 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
 
   const handleEditMessage = useCallback(
     (index: number, newText: string) => {
-      if (sending) return;
-      useSessionStore.getState().truncateFromIndex(sessionId, index);
-      sendTurn(newText, []);
+      if (sending || preparingTurnRef.current) return;
+      preparingTurnRef.current = true;
+      setPreparingTurn(true);
+      void prepareTurnInstructions(newText)
+        .then((skillInvocations) => {
+          if (useSessionStore.getState().runningTurns[sessionId]) {
+            throw new Error("This chat started another turn while plugin instructions were being verified.");
+          }
+          useSessionStore.getState().truncateFromIndex(sessionId, index);
+          sendTurn(newText, [], skillInvocations);
+        })
+        .catch((turnError: unknown) => {
+          setError(turnError instanceof Error ? turnError.message : String(turnError));
+        })
+        .finally(() => {
+          preparingTurnRef.current = false;
+          setPreparingTurn(false);
+        });
     },
-    [sending, sendTurn, sessionId]
+    [sending, prepareTurnInstructions, sendTurn, sessionId]
   );
 
   // Regenerate the last turn: drop everything from the last user message
@@ -345,7 +848,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
   // parts (they carry the already-encoded data URL), so a retried turn keeps
   // its images.
   const handleRetry = useCallback(() => {
-    if (sending) return;
+    if (sending || preparingTurnRef.current) return;
     const currentMessages = sessionMessages(sessionId);
     let lastUserIndex = -1;
     for (let i = currentMessages.length - 1; i >= 0; i--) {
@@ -366,9 +869,24 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
             .map((part, i) => ({ path: `retried-image-${i}`, isDir: false, kind: "image" as const, dataUrl: part.image_url.url }));
     if (!text.trim() && imageAttachments.length === 0) return;
 
-    useSessionStore.getState().truncateFromIndex(sessionId, lastUserIndex);
-    sendTurn(text, imageAttachments);
-  }, [sending, sendTurn, sessionId]);
+    preparingTurnRef.current = true;
+    setPreparingTurn(true);
+    void prepareTurnInstructions(text)
+      .then((skillInvocations) => {
+        if (useSessionStore.getState().runningTurns[sessionId]) {
+          throw new Error("This chat started another turn while plugin instructions were being verified.");
+        }
+        useSessionStore.getState().truncateFromIndex(sessionId, lastUserIndex);
+        sendTurn(text, imageAttachments, skillInvocations);
+      })
+      .catch((turnError: unknown) => {
+        setError(turnError instanceof Error ? turnError.message : String(turnError));
+      })
+      .finally(() => {
+        preparingTurnRef.current = false;
+        setPreparingTurn(false);
+      });
+  }, [sending, prepareTurnInstructions, sendTurn, sessionId]);
 
   const closeMentionPopup = useCallback(() => {
     setMentionQuery(null);
@@ -411,7 +929,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
   }, []);
 
   const selectSlashEntry = useCallback(
-    (entry: PromptEntry) => {
+    (entry: SlashCatalogEntry) => {
       const start = slashStartRef.current;
       const el = textareaRef.current;
       if (start === null) {
@@ -444,7 +962,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
         return;
       }
 
-      const insertion = entry.content;
+      const insertion = entry.builtin || entry.kind === "skill" ? `/${entry.command} ` : entry.content;
       const nextValue = currentValue.slice(0, start) + insertion + currentValue.slice(end);
       const cursorPos = start + insertion.length;
 
@@ -495,7 +1013,7 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
       slashStartRef.current = slashRange.start;
       setSlashQuery(slashRange.query);
       setSlashActiveIndex(0);
-      setSlashEntries(filterSlashEntries(promptEntries, slashRange.query));
+      setSlashEntries(filterSlashEntries(slashCatalog, slashRange.query));
       return;
     }
     if (slashQuery !== null) closeSlashPopup();
@@ -620,8 +1138,8 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
             <span className="min-w-0 break-words">{error}</span>
             <button
               type="button"
-              onClick={handleRetry}
-              disabled={sending}
+              onClick={compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
+              disabled={sending || preparingTurn || startingComparison || startingCrew}
               className="shrink-0 cursor-pointer rounded-md border border-danger px-2 py-0.5 text-xs transition-colors hover:bg-danger hover:text-danger-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               {t("ChatWindow.retryButton")}
@@ -660,6 +1178,27 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
             />
           )}
           <div className="flex flex-col rounded-3xl border border-border bg-surface px-4 py-2.5 transition-colors focus-within:border-accent focus-within:ring-1 focus-within:ring-accent">
+            {(activePackageRuleCount > 0 || invokedSkillPreview.length > 0) && (
+              <div className="mb-1.5 flex flex-wrap gap-1.5" aria-label={t("ChatWindow.activeTurnInstructionsLabel")}>
+                {activePackageRuleCount > 0 && (
+                  <span
+                    title={t("ChatWindow.activePackageRulesTitle", { count: activePackageRuleCount })}
+                    className="rounded-full border border-accent/30 bg-accent-soft px-2 py-0.5 text-[11px] text-accent"
+                  >
+                    {t("ChatWindow.activePackageRules", { count: activePackageRuleCount })}
+                  </span>
+                )}
+                {invokedSkillPreview.map(({ skill }) => (
+                  <span
+                    key={skill.id}
+                    title={`${skill.source} · ${skill.version}`}
+                    className="rounded-full border border-success/30 bg-success-soft px-2 py-0.5 text-[11px] text-success"
+                  >
+                    /{skill.command} · {skill.name}
+                  </span>
+                ))}
+              </div>
+            )}
             {attachments.length > 0 && (
               <div className="mb-1.5 flex flex-wrap gap-1.5">
                 {attachments.map((attachment) => {
@@ -685,12 +1224,13 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
                 onKeyDown={handleKeyDown}
                 placeholder={t("ChatWindow.inputPlaceholder")}
                 rows={1}
+                disabled={preparingTurn || startingComparison || startingCrew}
                 className="max-h-48 min-h-[2.25rem] flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-relaxed text-foreground outline-none placeholder:text-faint"
               />
               <button
                 type="button"
                 onClick={sending ? handleStop : handleSend}
-                disabled={!sending && !input.trim()}
+                disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
                 aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
                 className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
@@ -699,13 +1239,29 @@ export default function ChatWindow({ sessionId, onManagePrompts }: ChatWindowPro
             </div>
           </div>
         </div>
-        <div className="mx-auto mt-1.5 flex max-w-3xl items-center justify-between">
-          <div className="flex items-center gap-1.5">
+        <div className="mx-auto mt-1.5 flex max-w-3xl flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             <ModeSelector />
             <PersonaSelector sessionId={sessionId} onManagePrompts={onManagePrompts} />
             <AttachMenu onAddFiles={() => void handleAddFiles()} onAddFolder={() => void handleAddFolder()} />
+            <CompareTargetPicker
+              value={compareTargets}
+              onChange={(targets) => {
+                setCompareTargets(targets);
+                if (targets.length > 0) setCrewId(null);
+              }}
+              disabled={sending || preparingTurn || startingComparison || startingCrew}
+            />
+            <CrewPicker
+              value={crewId}
+              onChange={(nextCrewId) => {
+                setCrewId(nextCrewId);
+                if (nextCrewId) setCompareTargets([]);
+              }}
+              disabled={sending || preparingTurn || startingComparison || startingCrew}
+            />
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <ModelSwitcher />
             <StackPicker sessionId={sessionId} />
             <EffortSelector />

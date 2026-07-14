@@ -20,11 +20,17 @@
 //! Cline's headless mode (see the design doc's "Competitor reference"):
 //! nothing should run unattended without an explicit policy choice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
+
+use crate::run_protocol::{
+    ModelTargetSnapshot, PermissionMode as RunPermissionMode, PermissionPolicySnapshot,
+    WorkspaceContext,
+};
 
 /// Current (and, so far, only) recipe schema version.
 pub const RECIPE_SCHEMA_VERSION: u32 = 1;
@@ -52,18 +58,522 @@ impl RecipeTarget {
     /// Enforces the design doc's XOR constraint: `provider: openrouter #
     /// XOR ollama: "qwen2.5:14b" XOR local_url: "http://127.0.0.1:8090"`.
     pub fn validate(&self) -> Result<(), String> {
-        let set_count = [self.provider.is_some(), self.ollama.is_some(), self.local_url.is_some()]
-            .iter()
-            .filter(|set| **set)
-            .count();
+        let set_count = [
+            self.provider.is_some(),
+            self.ollama.is_some(),
+            self.local_url.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count();
         if set_count == 0 {
-            return Err("recipe target must set exactly one of provider, ollama, or local_url".to_string());
+            return Err(
+                "recipe target must set exactly one of provider, ollama, or local_url".to_string(),
+            );
         }
         if set_count > 1 {
             return Err("recipe target must set exactly one of provider, ollama, or local_url — not more than one".to_string());
         }
         if self.provider.is_some() && self.model.is_none() {
             return Err("recipe target with 'provider' must also set 'model'".to_string());
+        }
+        Ok(())
+    }
+}
+
+pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 2;
+const MAX_DESKTOP_HISTORY_MESSAGES: usize = 2_000;
+const MAX_DESKTOP_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DESKTOP_MCP_SERVERS: usize = 64;
+const MAX_DESKTOP_STACKS: usize = 128;
+
+/// One exact workspace root used to reconstruct the desktop's multi-root
+/// sandbox inside the daemon-owned CLI task process. `WorkspaceContext`
+/// intentionally stores grants rather than display labels, so this small
+/// execution-only companion retains the label required by path routing.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopWorkspaceRootSnapshot {
+    pub root_id: String,
+    pub canonical_path: String,
+    pub label: String,
+    pub is_primary: bool,
+}
+
+/// Attachment bytes/text are embedded in the immutable queue snapshot. The
+/// daemon never re-reads the original picker path after submission, so an
+/// edited or removed source file cannot change the model input later.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopAttachmentSnapshot {
+    pub path: String,
+    pub kind: String,
+    pub media_type: String,
+    pub content: String,
+    pub content_sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Secret-free selection of one MCP server that was connected and offered to
+/// the desktop model at submission time. The digest covers the normalized
+/// local config entry (including stdio environment values) without copying
+/// those values into the daemon ledger. HTTP bearer tokens remain exclusively
+/// in the OS keychain and are resolved only after the digest check succeeds.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopMcpServerSnapshot {
+    pub id: String,
+    pub config_sha256: String,
+    pub tool_allowlist: Option<Vec<String>>,
+}
+
+/// Generation controls frozen with an interactive desktop turn. Most desktop
+/// transports currently leave the native Ollama/OpenAI knobs unset, but
+/// carrying the complete CLI-supported shape prevents a queued request from
+/// inheriting later CLI defaults and preserves Anthropic effort exactly.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopGenerationSettingsSnapshot {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub seed: Option<i64>,
+    pub stop: Vec<String>,
+    pub num_ctx: Option<i64>,
+    pub num_predict: Option<i64>,
+    pub format: Option<serde_json::Value>,
+    pub think: Option<serde_json::Value>,
+    pub hide_thinking: bool,
+    pub keep_alive: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Desktop tool-availability settings that change authorization or whether a
+/// model can initiate more work. These are read once when the turn is queued,
+/// then drive the daemon CLI loop without consulting mutable UI settings.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopToolProfileSnapshot {
+    pub memory_enabled: bool,
+    pub web_tools_enabled: bool,
+    pub verify_enabled: bool,
+    pub verify_max_rounds: u32,
+    pub subagents_enabled: bool,
+}
+
+/// Frozen M6A desktop request carried inside the ordinary daemon recipe
+/// snapshot. This is audit/input data only; execution still goes through the
+/// daemon's one queue and `monkey-cli task run` agent loop.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopTurnSnapshot {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub turn_id: String,
+    pub submitted_at_ms: u64,
+    /// Exact transport origin for managed-llama and Ollama execution. A
+    /// provider target is resolved by its credential-bound provider id and
+    /// must leave this unset.
+    pub execution_base_url: Option<String>,
+    pub history: Vec<serde_json::Value>,
+    pub target: ModelTargetSnapshot,
+    pub workspace: WorkspaceContext,
+    pub execution_roots: Vec<DesktopWorkspaceRootSnapshot>,
+    pub permission_policy: PermissionPolicySnapshot,
+    pub generation: DesktopGenerationSettingsSnapshot,
+    pub tool_profile: DesktopToolProfileSnapshot,
+    pub mcp_servers: Vec<DesktopMcpServerSnapshot>,
+    pub attached_stack_ids: Vec<String>,
+    pub attached_stack_names: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<DesktopAttachmentSnapshot>,
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
+}
+
+/// MCP tool allowlists are semantic sets. Sorting and de-duplicating before
+/// hashing means harmless hand-edited ordering does not look like config
+/// drift, while any actual selection change still does.
+pub fn normalized_mcp_tool_allowlist(value: Option<&[String]>) -> Option<Vec<String>> {
+    value.map(|items| {
+        let mut normalized = items.to_vec();
+        normalized.sort();
+        normalized.dedup();
+        normalized
+    })
+}
+
+fn canonical_json(value: &serde_json::Value, output: &mut String) {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).expect("JSON strings are serializable"));
+        }
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                canonical_json(value, output);
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut keys: Vec<&String> = values.keys().collect();
+            keys.sort();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(
+                    &serde_json::to_string(key).expect("JSON object keys are serializable"),
+                );
+                output.push(':');
+                canonical_json(&values[key], output);
+            }
+            output.push('}');
+        }
+    }
+}
+
+/// Cross-language digest for one normalized `mcp_servers.json` entry. The
+/// TypeScript bridge uses the same recursively key-sorted JSON algorithm.
+pub fn mcp_server_config_digest(entry: &crate::mcp::McpServerEntry) -> Result<String, String> {
+    let mut normalized = entry.clone();
+    normalized.tool_allowlist = normalized_mcp_tool_allowlist(entry.tool_allowlist.as_deref());
+    let value = serde_json::to_value(normalized)
+        .map_err(|error| format!("Failed to normalize MCP server '{}': {error}", entry.id))?;
+    let mut canonical = String::new();
+    canonical_json(&value, &mut canonical);
+    Ok(sha256_hex(canonical.as_bytes()))
+}
+
+fn valid_snapshot_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+impl DesktopGenerationSettingsSnapshot {
+    fn validate(&self) -> Result<(), String> {
+        if self.temperature.is_some_and(|value| !value.is_finite())
+            || self.top_p.is_some_and(|value| !value.is_finite())
+        {
+            return Err("desktop generation floats must be finite".to_string());
+        }
+        if self.stop.len() > 64
+            || self
+                .stop
+                .iter()
+                .any(|value| value.is_empty() || value.len() > 4_096)
+        {
+            return Err("desktop stop sequences are invalid".to_string());
+        }
+        if self.num_ctx.is_some_and(|value| value <= 0)
+            || self.num_predict.is_some_and(|value| value <= 0)
+        {
+            return Err("desktop token limits must be positive".to_string());
+        }
+        if self
+            .keep_alive
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
+            return Err("desktop keep_alive is invalid".to_string());
+        }
+        if self
+            .effort
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "low" | "medium" | "high" | "xhigh" | "max"))
+        {
+            return Err("desktop effort is invalid".to_string());
+        }
+        if self.think.as_ref().is_some_and(|value| {
+            !matches!(value, serde_json::Value::Bool(_))
+                && !matches!(value.as_str(), Some("low" | "medium" | "high"))
+        }) {
+            return Err("desktop think setting is invalid".to_string());
+        }
+        if self.format.as_ref().is_some_and(|value| {
+            !matches!(value, serde_json::Value::Object(_)) && value.as_str() != Some("json")
+        }) {
+            return Err("desktop response format is invalid".to_string());
+        }
+        let structured_bytes =
+            serde_json::to_vec(&(&self.format, &self.think)).map_err(|error| error.to_string())?;
+        if structured_bytes.len() > 64 * 1024 {
+            return Err("desktop generation schema exceeds 64 KiB".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn permission_mode_token(mode: &RunPermissionMode) -> &'static str {
+    match mode {
+        RunPermissionMode::Manual => "manual",
+        RunPermissionMode::AcceptEdits => "acceptEdits",
+        RunPermissionMode::Smart => "smart",
+        RunPermissionMode::Plan => "plan",
+        RunPermissionMode::Auto => "auto",
+        RunPermissionMode::Bypass => "bypass",
+    }
+}
+
+impl DesktopTurnSnapshot {
+    pub fn validate_for_recipe(&self, recipe: &Recipe) -> Result<(), String> {
+        if self.schema_version != DESKTOP_TURN_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported desktop turn version {} (expected {})",
+                self.schema_version, DESKTOP_TURN_SCHEMA_VERSION
+            ));
+        }
+        if self.session_id.trim().is_empty()
+            || self.session_id.len() > 256
+            || self.turn_id.trim().is_empty()
+            || self.turn_id.len() > 256
+            || self.submitted_at_ms == 0
+        {
+            return Err("desktop turn identity/timestamp is invalid".to_string());
+        }
+        self.target.validate().map_err(|error| error.to_string())?;
+        match (&self.target, &self.execution_base_url) {
+            (ModelTargetSnapshot::Ollama { base_url, .. }, Some(execution))
+                if base_url == execution => {}
+            (ModelTargetSnapshot::ManagedLlama { .. }, Some(execution)) => {
+                let parsed = url::Url::parse(execution)
+                    .map_err(|error| format!("desktop managed runtime URL is invalid: {error}"))?;
+                if parsed.scheme() != "http"
+                    || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(
+                        "desktop managed runtime must use a credential-free loopback HTTP origin"
+                            .to_string(),
+                    );
+                }
+            }
+            (ModelTargetSnapshot::Provider { .. }, None) => {}
+            _ => {
+                return Err("desktop execution origin does not match the frozen target".to_string())
+            }
+        }
+        match &self.target {
+            ModelTargetSnapshot::Provider {
+                provider_id, model, ..
+            } if recipe.target.provider.as_deref() == Some(provider_id.as_str())
+                && recipe.target.model.as_deref() == Some(model.as_str()) => {}
+            ModelTargetSnapshot::Ollama { model, .. }
+                if recipe.target.ollama.as_deref() == Some(model.as_str()) => {}
+            ModelTargetSnapshot::ManagedLlama { model_id, .. }
+                if recipe.target.local_url.as_deref() == self.execution_base_url.as_deref()
+                    && recipe.target.model.as_deref() == Some(model_id.as_str()) => {}
+            _ => {
+                return Err(
+                    "desktop recipe target fields differ from the frozen model target".to_string(),
+                )
+            }
+        }
+        self.workspace
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.permission_policy
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if !self.permission_policy.unattended {
+            return Err("daemon-backed desktop turns must snapshot unattended=true".to_string());
+        }
+        if permission_mode_token(&self.permission_policy.mode) != recipe.permission_mode {
+            return Err(
+                "desktop permission snapshot does not match recipe permission_mode".to_string(),
+            );
+        }
+        if self.permission_policy.allow_network != self.tool_profile.web_tools_enabled {
+            return Err(
+                "desktop web-tool profile differs from the frozen network permission".to_string(),
+            );
+        }
+        self.generation.validate()?;
+        if self.tool_profile.verify_max_rounds > 3 {
+            return Err("desktop verify_max_rounds must be between 0 and 3".to_string());
+        }
+        let system = recipe
+            .system
+            .as_deref()
+            .ok_or_else(|| "desktop turns require a frozen system prompt".to_string())?;
+        if system.len() > 1024 * 1024 {
+            return Err("desktop system prompt exceeds 1 MiB".to_string());
+        }
+
+        if self.mcp_servers.len() > MAX_DESKTOP_MCP_SERVERS {
+            return Err(format!(
+                "desktop MCP selection exceeds {MAX_DESKTOP_MCP_SERVERS} servers"
+            ));
+        }
+        let mut mcp_ids = HashSet::new();
+        for server in &self.mcp_servers {
+            if !valid_snapshot_id(&server.id)
+                || !valid_digest(&server.config_sha256)
+                || !mcp_ids.insert(server.id.as_str())
+            {
+                return Err("desktop MCP selection metadata is invalid".to_string());
+            }
+            if let Some(allowlist) = &server.tool_allowlist {
+                if allowlist.len() > 1_000
+                    || allowlist
+                        .iter()
+                        .any(|name| name.is_empty() || name.len() > 512)
+                    || normalized_mcp_tool_allowlist(Some(allowlist)) != Some(allowlist.clone())
+                {
+                    return Err(format!(
+                        "desktop MCP tool allowlist for '{}' is not normalized",
+                        server.id
+                    ));
+                }
+            }
+        }
+
+        if self.attached_stack_ids.len() > MAX_DESKTOP_STACKS {
+            return Err(format!(
+                "desktop stack selection exceeds {MAX_DESKTOP_STACKS} stacks"
+            ));
+        }
+        let mut stack_ids = HashSet::new();
+        if self
+            .attached_stack_ids
+            .iter()
+            .any(|id| !valid_snapshot_id(id) || !stack_ids.insert(id.as_str()))
+        {
+            return Err("desktop attached stack ids are invalid or duplicated".to_string());
+        }
+        let mut stack_names = HashSet::new();
+        if self.attached_stack_names.len() != self.attached_stack_ids.len()
+            || self.attached_stack_names.iter().any(|name| {
+                let normalized = name.trim().to_ascii_lowercase();
+                normalized.is_empty() || name.len() > 512 || !stack_names.insert(normalized)
+            })
+        {
+            return Err(
+                "desktop attached stack names must uniquely match the frozen ids".to_string(),
+            );
+        }
+        if self.history.is_empty() || self.history.len() > MAX_DESKTOP_HISTORY_MESSAGES {
+            return Err(format!(
+                "desktop history must contain 1..={MAX_DESKTOP_HISTORY_MESSAGES} messages"
+            ));
+        }
+        for (index, message) in self.history.iter().enumerate() {
+            let role = message.get("role").and_then(serde_json::Value::as_str);
+            if !matches!(role, Some("system" | "user" | "assistant" | "tool")) {
+                return Err(format!(
+                    "desktop history message {index} has an invalid role"
+                ));
+            }
+            if message.get("content").is_none() {
+                return Err(format!("desktop history message {index} omits content"));
+            }
+        }
+        if self
+            .history
+            .last()
+            .and_then(|message| message.get("role"))
+            .and_then(serde_json::Value::as_str)
+            != Some("user")
+        {
+            return Err("desktop history must end with the submitted user message".to_string());
+        }
+        let history_bytes = serde_json::to_vec(&self.history).map_err(|error| error.to_string())?;
+        if history_bytes.len() > MAX_DESKTOP_SNAPSHOT_BYTES {
+            return Err("desktop history exceeds the 32 MiB snapshot limit".to_string());
+        }
+
+        if self.execution_roots.is_empty()
+            || self.execution_roots.len() != self.workspace.roots.len()
+            || self
+                .execution_roots
+                .iter()
+                .filter(|root| root.is_primary)
+                .count()
+                != 1
+        {
+            return Err(
+                "desktop execution roots must exactly cover the workspace grants".to_string(),
+            );
+        }
+        for root in &self.execution_roots {
+            if root.label.trim().is_empty() || root.label.len() > 512 {
+                return Err("desktop workspace root label is invalid".to_string());
+            }
+            let grant = self
+                .workspace
+                .roots
+                .iter()
+                .find(|grant| grant.root_id == root.root_id)
+                .ok_or_else(|| {
+                    "desktop execution root is absent from workspace grants".to_string()
+                })?;
+            if grant.canonical_path != root.canonical_path {
+                return Err(
+                    "desktop execution root path differs from its workspace grant".to_string(),
+                );
+            }
+            if root.is_primary != (root.root_id == self.workspace.primary_root_id) {
+                return Err("desktop execution root primary marker is inconsistent".to_string());
+            }
+        }
+        let primary = self
+            .execution_roots
+            .iter()
+            .find(|root| root.is_primary)
+            .ok_or_else(|| "desktop primary execution root is missing".to_string())?;
+        if recipe.workspace.as_deref() != Some(primary.canonical_path.as_str()) {
+            return Err("desktop primary workspace does not match recipe workspace".to_string());
+        }
+
+        let mut attachment_bytes = 0usize;
+        for attachment in &self.attachments {
+            if attachment.path.trim().is_empty()
+                || attachment.kind.trim().is_empty()
+                || attachment.media_type.trim().is_empty()
+                || attachment.content_sha256.len() != 64
+                || !attachment
+                    .content_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("desktop attachment metadata is invalid".to_string());
+            }
+            let bytes = attachment.content.as_bytes();
+            if attachment.size_bytes != bytes.len() as u64
+                || sha256_hex(bytes) != attachment.content_sha256.to_ascii_lowercase()
+            {
+                return Err(format!(
+                    "desktop attachment '{}' failed its content digest",
+                    attachment.path
+                ));
+            }
+            attachment_bytes = attachment_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| "desktop attachment size overflow".to_string())?;
+        }
+        if attachment_bytes > MAX_DESKTOP_SNAPSHOT_BYTES {
+            return Err("desktop attachments exceed the 32 MiB snapshot limit".to_string());
         }
         Ok(())
     }
@@ -106,10 +616,17 @@ pub struct Recipe {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub output: RecipeOutput,
+    /// Present only for immutable desktop turns submitted to the resident
+    /// daemon. Hand-authored/scheduled recipes remain unchanged.
+    #[serde(default)]
+    pub desktop_turn: Option<DesktopTurnSnapshot>,
 }
 
 fn is_valid_recipe_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Full validation beyond what `serde` already enforces (required fields
@@ -134,7 +651,10 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
         ));
     }
     if !is_valid_recipe_name(&recipe.name) {
-        return Err(format!("recipe name '{}' must match [a-z0-9-]+", recipe.name));
+        return Err(format!(
+            "recipe name '{}' must match [a-z0-9-]+",
+            recipe.name
+        ));
     }
     recipe.target.validate()?;
     if recipe.permission_mode == "bypass" {
@@ -154,6 +674,9 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
     }
     if recipe.prompt.trim().is_empty() {
         return Err("recipe prompt must not be empty".to_string());
+    }
+    if let Some(snapshot) = &recipe.desktop_turn {
+        snapshot.validate_for_recipe(recipe)?;
     }
     Ok(())
 }
@@ -179,7 +702,10 @@ fn placeholder_regex() -> Regex {
 /// Every placeholder must resolve — an unsubstituted `{{name}}` left in the
 /// output (no matching key in `values`) is a hard error, never sent to the
 /// model as literal `{{...}}` text.
-pub fn substitute_params(template: &str, values: &HashMap<String, String>) -> Result<String, String> {
+pub fn substitute_params(
+    template: &str,
+    values: &HashMap<String, String>,
+) -> Result<String, String> {
     let re = placeholder_regex();
     let mut missing: Vec<String> = Vec::new();
     let substituted = re.replace_all(template, |caps: &regex::Captures| {
@@ -195,7 +721,10 @@ pub fn substitute_params(template: &str, values: &HashMap<String, String>) -> Re
     if !missing.is_empty() {
         missing.sort();
         missing.dedup();
-        return Err(format!("unsubstituted parameter placeholder(s): {}", missing.join(", ")));
+        return Err(format!(
+            "unsubstituted parameter placeholder(s): {}",
+            missing.join(", ")
+        ));
     }
     Ok(substituted.into_owned())
 }
@@ -206,7 +735,10 @@ pub fn substitute_params(template: &str, values: &HashMap<String, String>) -> Re
 /// silent no-op) — and every declared param either has an override, has its
 /// own default, or is reported as missing (also a hard error, since a param
 /// with no default and no override can't be substituted).
-pub fn resolve_param_values(recipe: &Recipe, overrides: &HashMap<String, String>) -> Result<HashMap<String, String>, String> {
+pub fn resolve_param_values(
+    recipe: &Recipe,
+    overrides: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
     let mut unknown: Vec<&str> = overrides
         .keys()
         .filter(|k| !recipe.params.contains_key(k.as_str()))
@@ -214,7 +746,10 @@ pub fn resolve_param_values(recipe: &Recipe, overrides: &HashMap<String, String>
         .collect();
     if !unknown.is_empty() {
         unknown.sort();
-        return Err(format!("unknown --param key(s) not declared in this recipe: {}", unknown.join(", ")));
+        return Err(format!(
+            "unknown --param key(s) not declared in this recipe: {}",
+            unknown.join(", ")
+        ));
     }
 
     let mut values = HashMap::new();
@@ -230,7 +765,10 @@ pub fn resolve_param_values(recipe: &Recipe, overrides: &HashMap<String, String>
     }
     if !missing.is_empty() {
         missing.sort();
-        return Err(format!("missing required --param value(s) (no default): {}", missing.join(", ")));
+        return Err(format!(
+            "missing required --param value(s) (no default): {}",
+            missing.join(", ")
+        ));
     }
     Ok(values)
 }
@@ -246,10 +784,17 @@ pub struct RenderedRecipe {
 
 /// Resolves param values then substitutes them into `prompt`/`system` — the
 /// one function both `task run` and the GUI's "Run now" call.
-pub fn render_recipe(recipe: &Recipe, overrides: &HashMap<String, String>) -> Result<RenderedRecipe, String> {
+pub fn render_recipe(
+    recipe: &Recipe,
+    overrides: &HashMap<String, String>,
+) -> Result<RenderedRecipe, String> {
     let values = resolve_param_values(recipe, overrides)?;
     let prompt = substitute_params(&recipe.prompt, &values)?;
-    let system = recipe.system.as_deref().map(|s| substitute_params(s, &values)).transpose()?;
+    let system = recipe
+        .system
+        .as_deref()
+        .map(|s| substitute_params(s, &values))
+        .transpose()?;
     Ok(RenderedRecipe { prompt, system })
 }
 
@@ -286,15 +831,28 @@ fn scan_recipe_dir(dir: &Path, source: RecipeSource) -> Vec<DiscoveredRecipe> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        if !RECIPE_EXTENSIONS.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)) {
+        if !RECIPE_EXTENSIONS
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+        {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
         match parse_recipe(&content, ext) {
-            Ok(recipe) => out.push(DiscoveredRecipe { path, source: source.clone(), recipe: Some(recipe), error: None }),
-            Err(e) => out.push(DiscoveredRecipe { path, source: source.clone(), recipe: None, error: Some(e) }),
+            Ok(recipe) => out.push(DiscoveredRecipe {
+                path,
+                source: source.clone(),
+                recipe: Some(recipe),
+                error: None,
+            }),
+            Err(e) => out.push(DiscoveredRecipe {
+                path,
+                source: source.clone(),
+                recipe: None,
+                error: Some(e),
+            }),
         }
     }
     out
@@ -306,20 +864,31 @@ fn scan_recipe_dir(dir: &Path, source: RecipeSource) -> Vec<DiscoveredRecipe> {
 /// directory, with a workspace recipe shadowing a global one of the same
 /// `name` (never both — the workspace copy wins, matching "local shadows
 /// global" from the design doc).
-pub fn discover_recipes(workspace_root: Option<&Path>, app_data_dir: &Path) -> Vec<DiscoveredRecipe> {
+pub fn discover_recipes(
+    workspace_root: Option<&Path>,
+    app_data_dir: &Path,
+) -> Vec<DiscoveredRecipe> {
     let mut local = workspace_root
-        .map(|root| scan_recipe_dir(&root.join(".littlemonkey").join("recipes"), RecipeSource::Workspace))
+        .map(|root| {
+            scan_recipe_dir(
+                &root.join(".littlemonkey").join("recipes"),
+                RecipeSource::Workspace,
+            )
+        })
         .unwrap_or_default();
     let global = scan_recipe_dir(&app_data_dir.join("recipes"), RecipeSource::Global);
 
-    let local_names: std::collections::HashSet<String> =
-        local.iter().filter_map(|d| d.recipe.as_ref().map(|r| r.name.clone())).collect();
+    let local_names: std::collections::HashSet<String> = local
+        .iter()
+        .filter_map(|d| d.recipe.as_ref().map(|r| r.name.clone()))
+        .collect();
 
-    local.extend(
-        global
-            .into_iter()
-            .filter(|d| d.recipe.as_ref().map(|r| !local_names.contains(&r.name)).unwrap_or(true)),
-    );
+    local.extend(global.into_iter().filter(|d| {
+        d.recipe
+            .as_ref()
+            .map(|r| !local_names.contains(&r.name))
+            .unwrap_or(true)
+    }));
     local
 }
 
@@ -328,8 +897,13 @@ pub fn discover_recipes(workspace_root: Option<&Path>, app_data_dir: &Path) -> V
 /// [`discover_recipes`]. Used by `recipes_read`; see [`resolve_recipe_with_path`]
 /// for the variant `monkey-cli task run` needs (which also needs the file's
 /// own directory, to resolve a recipe's `workspace: .` field against it).
-pub fn resolve_recipe(name_or_path: &str, workspace_root: Option<&Path>, app_data_dir: &Path) -> Result<Recipe, String> {
-    resolve_recipe_with_path(name_or_path, workspace_root, app_data_dir).map(|(recipe, _path)| recipe)
+pub fn resolve_recipe(
+    name_or_path: &str,
+    workspace_root: Option<&Path>,
+    app_data_dir: &Path,
+) -> Result<Recipe, String> {
+    resolve_recipe_with_path(name_or_path, workspace_root, app_data_dir)
+        .map(|(recipe, _path)| recipe)
 }
 
 /// Same resolution as [`resolve_recipe`], but also returns the file path the
@@ -341,8 +915,12 @@ pub fn resolve_recipe_with_path(
 ) -> Result<(Recipe, PathBuf), String> {
     let direct_path = Path::new(name_or_path);
     if direct_path.is_file() {
-        let ext = direct_path.extension().and_then(|e| e.to_str()).unwrap_or("yml");
-        let content = std::fs::read_to_string(direct_path).map_err(|e| format!("Failed to read '{name_or_path}': {e}"))?;
+        let ext = direct_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("yml");
+        let content = std::fs::read_to_string(direct_path)
+            .map_err(|e| format!("Failed to read '{name_or_path}': {e}"))?;
         return Ok((parse_recipe(&content, ext)?, direct_path.to_path_buf()));
     }
     discover_recipes(workspace_root, app_data_dir)
@@ -368,14 +946,22 @@ fn validate_recipe_id(name: &str) -> Result<(), String> {
 /// into the GLOBAL directory: the desktop app's recipe library (design doc
 /// slice 2) has no concept of "which workspace" a saved recipe belongs to,
 /// unlike a hand-authored `.littlemonkey/recipes/` file committed to a repo.
-pub fn save_recipe_impl(app_data_dir: &Path, name: &str, yaml_content: &str) -> Result<Recipe, String> {
+pub fn save_recipe_impl(
+    app_data_dir: &Path,
+    name: &str,
+    yaml_content: &str,
+) -> Result<Recipe, String> {
     validate_recipe_id(name)?;
     let recipe = parse_recipe(yaml_content, "yml")?;
     if recipe.name != name {
-        return Err(format!("recipe content's name '{}' does not match the target '{name}'", recipe.name));
+        return Err(format!(
+            "recipe content's name '{}' does not match the target '{name}'",
+            recipe.name
+        ));
     }
     let dir = app_data_dir.join("recipes");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create recipes directory: {e}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create recipes directory: {e}"))?;
     let path = dir.join(format!("{name}.yml"));
     let tmp = path.with_extension("yml.tmp");
     std::fs::write(&tmp, yaml_content).map_err(|e| format!("Failed to write recipe: {e}"))?;
@@ -402,7 +988,9 @@ pub fn delete_recipe_impl(app_data_dir: &Path, name: &str) -> Result<(), String>
 // ---------------------------------------------------------------------------
 
 fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|e| format!("Failed to resolve app data dir: {e}"))
+    app.path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))
 }
 
 #[tauri::command]
@@ -411,7 +999,10 @@ pub fn recipes_list(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<DiscoveredRecipe>, String> {
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
-    Ok(discover_recipes(workspace_root.as_deref(), &app_data_dir(&app)?))
+    Ok(discover_recipes(
+        workspace_root.as_deref(),
+        &app_data_dir(&app)?,
+    ))
 }
 
 #[tauri::command]
@@ -421,7 +1012,11 @@ pub fn recipes_read(
     name_or_path: String,
 ) -> Result<Recipe, String> {
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
-    resolve_recipe(&name_or_path, workspace_root.as_deref(), &app_data_dir(&app)?)
+    resolve_recipe(
+        &name_or_path,
+        workspace_root.as_deref(),
+        &app_data_dir(&app)?,
+    )
 }
 
 /// Reads a recipe's raw (unparsed) file content — the Settings > Tasks
@@ -437,7 +1032,11 @@ pub fn recipes_read_raw(
     name_or_path: String,
 ) -> Result<String, String> {
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
-    let (_recipe, path) = resolve_recipe_with_path(&name_or_path, workspace_root.as_deref(), &app_data_dir(&app)?)?;
+    let (_recipe, path) = resolve_recipe_with_path(
+        &name_or_path,
+        workspace_root.as_deref(),
+        &app_data_dir(&app)?,
+    )?;
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read '{}': {e}", path.display()))
 }
 
@@ -453,7 +1052,11 @@ pub fn recipes_render(
     overrides: HashMap<String, String>,
 ) -> Result<RenderedRecipe, String> {
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
-    let recipe = resolve_recipe(&name_or_path, workspace_root.as_deref(), &app_data_dir(&app)?)?;
+    let recipe = resolve_recipe(
+        &name_or_path,
+        workspace_root.as_deref(),
+        &app_data_dir(&app)?,
+    )?;
     render_recipe(&recipe, &overrides)
 }
 
@@ -465,14 +1068,23 @@ pub fn recipes_render(
 pub const RECIPES_CHANGED_EVENT: &str = "recipes://changed";
 
 #[tauri::command]
-pub fn recipes_save(app: tauri::AppHandle, window: tauri::Window, name: String, content: String) -> Result<Recipe, String> {
+pub fn recipes_save(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    name: String,
+    content: String,
+) -> Result<Recipe, String> {
     let recipe = save_recipe_impl(&app_data_dir(&app)?, &name, &content)?;
     let _ = app.emit(RECIPES_CHANGED_EVENT, window.label());
     Ok(recipe)
 }
 
 #[tauri::command]
-pub fn recipes_delete(app: tauri::AppHandle, window: tauri::Window, name: String) -> Result<(), String> {
+pub fn recipes_delete(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    name: String,
+) -> Result<(), String> {
     delete_recipe_impl(&app_data_dir(&app)?, &name)?;
     let _ = app.emit(RECIPES_CHANGED_EVENT, window.label());
     Ok(())
@@ -492,7 +1104,12 @@ mod tests {
     use super::*;
 
     fn valid_target() -> RecipeTarget {
-        RecipeTarget { provider: Some("openrouter".to_string()), model: Some("anthropic/claude-sonnet".to_string()), ollama: None, local_url: None }
+        RecipeTarget {
+            provider: Some("openrouter".to_string()),
+            model: Some("anthropic/claude-sonnet".to_string()),
+            ollama: None,
+            local_url: None,
+        }
     }
 
     fn valid_recipe() -> Recipe {
@@ -509,7 +1126,220 @@ mod tests {
             max_iterations: None,
             timeout_seconds: None,
             output: RecipeOutput::default(),
+            desktop_turn: None,
         }
+    }
+
+    fn unknown_capability() -> crate::run_protocol::CapabilityAssessment {
+        crate::run_protocol::CapabilityAssessment {
+            state: crate::run_protocol::CapabilityState::Unknown,
+            evidence: "test snapshot".to_string(),
+        }
+    }
+
+    fn test_capabilities() -> crate::run_protocol::ModelCapabilitiesSnapshot {
+        crate::run_protocol::ModelCapabilitiesSnapshot {
+            tool_calling: unknown_capability(),
+            vision: unknown_capability(),
+            embeddings: unknown_capability(),
+            structured_output: unknown_capability(),
+            image_generation: unknown_capability(),
+            audio: unknown_capability(),
+            runtime_lifecycle: unknown_capability(),
+            fim: unknown_capability(),
+            code_completion: unknown_capability(),
+            inline_edit: unknown_capability(),
+            fim_metadata: None,
+        }
+    }
+
+    fn desktop_recipe() -> Recipe {
+        let mut recipe = valid_recipe();
+        recipe.workspace = Some("/workspace/project".to_string());
+        recipe.system = Some("frozen desktop system".to_string());
+        let content = "exact attachment bytes".to_string();
+        recipe.desktop_turn = Some(DesktopTurnSnapshot {
+            schema_version: DESKTOP_TURN_SCHEMA_VERSION,
+            session_id: "session-one".to_string(),
+            turn_id: "turn-one".to_string(),
+            submitted_at_ms: 1,
+            execution_base_url: None,
+            history: vec![serde_json::json!({"role":"user","content":"inspect"})],
+            target: crate::run_protocol::ModelTargetSnapshot::Provider {
+                target_id: "target-openrouter".to_string(),
+                label: "OpenRouter test".to_string(),
+                provider_id: "openrouter".to_string(),
+                endpoint: "https://openrouter.ai/api/v1".to_string(),
+                model: "anthropic/claude-sonnet".to_string(),
+                credential_ref_id: "credential-openrouter".to_string(),
+                capabilities: test_capabilities(),
+            },
+            workspace: crate::run_protocol::WorkspaceContext {
+                workspace_id: "workspace-test".to_string(),
+                primary_root_id: "root-primary".to_string(),
+                roots: vec![crate::run_protocol::RootGrant {
+                    root_id: "root-primary".to_string(),
+                    canonical_path: "/workspace/project".to_string(),
+                    access: crate::run_protocol::RootAccess::ReadWrite,
+                    allow_symlinks_within_root: false,
+                }],
+                repository_policy: None,
+            },
+            execution_roots: vec![DesktopWorkspaceRootSnapshot {
+                root_id: "root-primary".to_string(),
+                canonical_path: "/workspace/project".to_string(),
+                label: "project".to_string(),
+                is_primary: true,
+            }],
+            permission_policy: crate::run_protocol::PermissionPolicySnapshot {
+                mode: crate::run_protocol::PermissionMode::AcceptEdits,
+                unattended: true,
+                approval_timeout_ms: 60_000,
+                default_tool_decision: crate::run_protocol::ToolPolicyDecision::Prompt,
+                tool_rules: Vec::new(),
+                allow_network: false,
+                allow_external_mutations: false,
+            },
+            generation: DesktopGenerationSettingsSnapshot {
+                temperature: None,
+                top_p: None,
+                seed: None,
+                stop: Vec::new(),
+                num_ctx: None,
+                num_predict: None,
+                format: None,
+                think: None,
+                hide_thinking: false,
+                keep_alive: None,
+                effort: Some("high".to_string()),
+            },
+            tool_profile: DesktopToolProfileSnapshot {
+                memory_enabled: true,
+                web_tools_enabled: false,
+                verify_enabled: true,
+                verify_max_rounds: 2,
+                subagents_enabled: false,
+            },
+            mcp_servers: Vec::new(),
+            attached_stack_ids: vec!["stack-one".to_string()],
+            attached_stack_names: vec!["Docs".to_string()],
+            attachments: vec![DesktopAttachmentSnapshot {
+                path: "/workspace/project/input.txt".to_string(),
+                kind: "file".to_string(),
+                media_type: "text/plain".to_string(),
+                content_sha256: sha256_hex(content.as_bytes()),
+                size_bytes: content.len() as u64,
+                content,
+            }],
+        });
+        recipe
+    }
+
+    #[test]
+    fn desktop_snapshot_rejects_attachment_tampering_and_scope_drift() {
+        let recipe = desktop_recipe();
+        validate_recipe(&recipe).unwrap();
+
+        let mut tampered = recipe.clone();
+        tampered.desktop_turn.as_mut().unwrap().attachments[0]
+            .content
+            .push_str(" changed");
+        assert!(validate_recipe(&tampered)
+            .unwrap_err()
+            .contains("content digest"));
+
+        let mut mismatched_root = recipe.clone();
+        mismatched_root
+            .desktop_turn
+            .as_mut()
+            .unwrap()
+            .execution_roots[0]
+            .canonical_path = "/workspace/other".to_string();
+        assert!(validate_recipe(&mismatched_root)
+            .unwrap_err()
+            .contains("differs from its workspace grant"));
+
+        let mut hostile_origin = recipe;
+        hostile_origin
+            .desktop_turn
+            .as_mut()
+            .unwrap()
+            .execution_base_url = Some("https://attacker.invalid".to_string());
+        assert!(validate_recipe(&hostile_origin)
+            .unwrap_err()
+            .contains("execution origin"));
+    }
+
+    #[test]
+    fn desktop_snapshot_rejects_tool_profile_and_selection_tampering() {
+        let mut recipe = desktop_recipe();
+        recipe
+            .desktop_turn
+            .as_mut()
+            .unwrap()
+            .tool_profile
+            .web_tools_enabled = true;
+        assert!(validate_recipe(&recipe)
+            .unwrap_err()
+            .contains("network permission"));
+
+        let mut duplicate_stack = desktop_recipe();
+        duplicate_stack
+            .desktop_turn
+            .as_mut()
+            .unwrap()
+            .attached_stack_ids
+            .push("stack-one".to_string());
+        assert!(validate_recipe(&duplicate_stack)
+            .unwrap_err()
+            .contains("duplicated"));
+
+        let mut bad_rounds = desktop_recipe();
+        bad_rounds
+            .desktop_turn
+            .as_mut()
+            .unwrap()
+            .tool_profile
+            .verify_max_rounds = 4;
+        assert!(validate_recipe(&bad_rounds)
+            .unwrap_err()
+            .contains("verify_max_rounds"));
+
+        let mut changed_model = desktop_recipe();
+        changed_model.target.model = Some("different-model".to_string());
+        assert!(validate_recipe(&changed_model)
+            .unwrap_err()
+            .contains("frozen model target"));
+    }
+
+    #[test]
+    fn normalized_mcp_digest_is_order_stable_and_secret_free() {
+        use crate::mcp::{McpServerEntry, McpTransport};
+        let mut entry = McpServerEntry {
+            id: "docs".to_string(),
+            label: "Docs".to_string(),
+            transport: McpTransport::Stdio {
+                command: "docs-server".to_string(),
+                args: vec!["--safe".to_string()],
+                env: std::collections::BTreeMap::from([(
+                    "TOKEN".to_string(),
+                    "keychain-local".to_string(),
+                )]),
+            },
+            enabled: true,
+            tool_allowlist: Some(vec!["search".to_string(), "read".to_string()]),
+            timeout_secs: Some(30),
+        };
+        let first = mcp_server_config_digest(&entry).unwrap();
+        assert_eq!(
+            first,
+            "df5d5a0b8e06cffe7f147abe9e439633fb80c71bd4a831386fd6406dc1b2bf20"
+        );
+        entry.tool_allowlist = Some(vec!["read".to_string(), "search".to_string()]);
+        assert_eq!(mcp_server_config_digest(&entry).unwrap(), first);
+        assert!(!first.contains("keychain-local"));
+        entry.timeout_secs = Some(31);
+        assert_ne!(mcp_server_config_digest(&entry).unwrap(), first);
     }
 
     // --- RecipeTarget::validate ---
@@ -522,26 +1352,46 @@ mod tests {
 
     #[test]
     fn target_rejects_more_than_one_set() {
-        let t = RecipeTarget { provider: Some("openrouter".to_string()), model: Some("x".to_string()), ollama: Some("qwen2.5:14b".to_string()), local_url: None };
+        let t = RecipeTarget {
+            provider: Some("openrouter".to_string()),
+            model: Some("x".to_string()),
+            ollama: Some("qwen2.5:14b".to_string()),
+            local_url: None,
+        };
         assert!(t.validate().is_err());
     }
 
     #[test]
     fn target_rejects_provider_without_model() {
-        let t = RecipeTarget { provider: Some("openrouter".to_string()), model: None, ollama: None, local_url: None };
+        let t = RecipeTarget {
+            provider: Some("openrouter".to_string()),
+            model: None,
+            ollama: None,
+            local_url: None,
+        };
         let err = t.validate().unwrap_err();
         assert!(err.contains("model"));
     }
 
     #[test]
     fn target_accepts_ollama_alone() {
-        let t = RecipeTarget { provider: None, model: None, ollama: Some("qwen2.5:14b".to_string()), local_url: None };
+        let t = RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: Some("qwen2.5:14b".to_string()),
+            local_url: None,
+        };
         assert!(t.validate().is_ok());
     }
 
     #[test]
     fn target_accepts_local_url_alone() {
-        let t = RecipeTarget { provider: None, model: None, ollama: None, local_url: Some("http://127.0.0.1:8090".to_string()) };
+        let t = RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: None,
+            local_url: Some("http://127.0.0.1:8090".to_string()),
+        };
         assert!(t.validate().is_ok());
     }
 
@@ -561,16 +1411,28 @@ mod tests {
         let recipe: Recipe = serde_json::from_str(CANONICAL_RECIPE_JSON).unwrap();
         assert_eq!(recipe.version, 1);
         assert_eq!(recipe.name, "nightly-deps-audit");
-        assert_eq!(recipe.description.as_deref(), Some("Audit dependencies for known vulnerabilities and file a report"));
+        assert_eq!(
+            recipe.description.as_deref(),
+            Some("Audit dependencies for known vulnerabilities and file a report")
+        );
         assert_eq!(recipe.target.provider.as_deref(), Some("openrouter"));
-        assert_eq!(recipe.target.model.as_deref(), Some("anthropic/claude-sonnet"));
+        assert_eq!(
+            recipe.target.model.as_deref(),
+            Some("anthropic/claude-sonnet")
+        );
         assert_eq!(recipe.target.ollama, None);
         assert_eq!(recipe.target.local_url, None);
         assert_eq!(recipe.workspace, None);
         assert_eq!(recipe.permission_mode, "acceptEdits");
         assert_eq!(recipe.system, None);
-        assert_eq!(recipe.prompt, "Check {{manifest}} for outdated or vulnerable dependencies and summarize findings.");
-        assert_eq!(recipe.params.get("manifest"), Some(&Some("package.json".to_string())));
+        assert_eq!(
+            recipe.prompt,
+            "Check {{manifest}} for outdated or vulnerable dependencies and summarize findings."
+        );
+        assert_eq!(
+            recipe.params.get("manifest"),
+            Some(&Some("package.json".to_string()))
+        );
         assert_eq!(recipe.max_iterations, None);
         assert_eq!(recipe.timeout_seconds, Some(900));
         assert!(!recipe.output.json);
@@ -597,7 +1459,10 @@ mod tests {
         for bad in ["Has Spaces", "UPPER", "trailing_underscore_", "has/slash"] {
             let mut r = valid_recipe();
             r.name = bad.to_string();
-            assert!(validate_recipe(&r).is_err(), "expected '{bad}' to be rejected");
+            assert!(
+                validate_recipe(&r).is_err(),
+                "expected '{bad}' to be rejected"
+            );
         }
     }
 
@@ -614,9 +1479,15 @@ mod tests {
             let mut r = valid_recipe();
             r.permission_mode = mode.to_string();
             if *mode == "bypass" {
-                assert!(validate_recipe(&r).is_err(), "expected 'bypass' to be rejected");
+                assert!(
+                    validate_recipe(&r).is_err(),
+                    "expected 'bypass' to be rejected"
+                );
             } else {
-                assert!(validate_recipe(&r).is_ok(), "expected '{mode}' to be accepted");
+                assert!(
+                    validate_recipe(&r).is_ok(),
+                    "expected '{mode}' to be accepted"
+                );
             }
         }
     }
@@ -627,7 +1498,10 @@ mod tests {
         r.permission_mode = "bypass".to_string();
         let err = validate_recipe(&r).unwrap_err();
         assert!(err.contains("bypass"), "error should mention bypass: {err}");
-        assert!(err.contains("unattended"), "error should explain why: {err}");
+        assert!(
+            err.contains("unattended"),
+            "error should explain why: {err}"
+        );
     }
 
     #[test]
@@ -665,10 +1539,16 @@ params:
         let recipe = parse_recipe(YAML_RECIPE, "yml").expect("should parse");
         assert_eq!(recipe.name, "nightly-deps-audit");
         assert_eq!(recipe.target.provider.as_deref(), Some("openrouter"));
-        assert_eq!(recipe.target.model.as_deref(), Some("anthropic/claude-sonnet"));
+        assert_eq!(
+            recipe.target.model.as_deref(),
+            Some("anthropic/claude-sonnet")
+        );
         assert_eq!(recipe.permission_mode, "acceptEdits");
         assert!(recipe.prompt.contains("{{manifest}}"));
-        assert_eq!(recipe.params.get("manifest"), Some(&Some("package.json".to_string())));
+        assert_eq!(
+            recipe.params.get("manifest"),
+            Some(&Some("package.json".to_string()))
+        );
     }
 
     #[test]
@@ -682,7 +1562,10 @@ params:
         let err = parse_recipe(&no_mode, "yml").unwrap_err();
         // serde's own "missing field" error — the whole point of NOT giving
         // `permission_mode` a `#[serde(default)]`.
-        assert!(err.to_lowercase().contains("permission_mode") || err.to_lowercase().contains("missing"));
+        assert!(
+            err.to_lowercase().contains("permission_mode")
+                || err.to_lowercase().contains("missing")
+        );
     }
 
     #[test]
@@ -704,7 +1587,10 @@ params:
     #[test]
     fn substitute_params_replaces_every_placeholder() {
         let values = HashMap::from([("name".to_string(), "world".to_string())]);
-        assert_eq!(substitute_params("Hello {{name}}!", &values).unwrap(), "Hello world!");
+        assert_eq!(
+            substitute_params("Hello {{name}}!", &values).unwrap(),
+            "Hello world!"
+        );
     }
 
     #[test]
@@ -751,7 +1637,10 @@ params:
         recipe.system = Some("You are auditing {{manifest}}.".to_string());
         let rendered = render_recipe(&recipe, &HashMap::new()).unwrap();
         assert!(rendered.prompt.contains("package.json"));
-        assert_eq!(rendered.system.as_deref(), Some("You are auditing package.json."));
+        assert_eq!(
+            rendered.system.as_deref(),
+            Some("You are auditing package.json.")
+        );
     }
 
     // --- discovery / resolution / save / delete ---
@@ -759,8 +1648,14 @@ params:
     fn temp_dir(label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("little_monkey_recipes_test_{label}_{}_{n}_{nanos}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "little_monkey_recipes_test_{label}_{}_{n}_{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -777,11 +1672,18 @@ params:
     fn discover_recipes_finds_both_workspace_and_global_recipes() {
         let workspace = temp_dir("ws");
         let app_data = temp_dir("app");
-        write_recipe_file(&workspace.join(".littlemonkey").join("recipes"), "local.yml", "local-recipe");
+        write_recipe_file(
+            &workspace.join(".littlemonkey").join("recipes"),
+            "local.yml",
+            "local-recipe",
+        );
         write_recipe_file(&app_data.join("recipes"), "global.yml", "global-recipe");
 
         let found = discover_recipes(Some(&workspace), &app_data);
-        let names: Vec<&str> = found.iter().filter_map(|d| d.recipe.as_ref().map(|r| r.name.as_str())).collect();
+        let names: Vec<&str> = found
+            .iter()
+            .filter_map(|d| d.recipe.as_ref().map(|r| r.name.as_str()))
+            .collect();
         assert!(names.contains(&"local-recipe"));
         assert!(names.contains(&"global-recipe"));
     }
@@ -790,12 +1692,28 @@ params:
     fn discover_recipes_lets_a_workspace_recipe_shadow_a_global_one_with_the_same_name() {
         let workspace = temp_dir("ws-shadow");
         let app_data = temp_dir("app-shadow");
-        write_recipe_file(&workspace.join(".littlemonkey").join("recipes"), "r.yml", "shared-name");
+        write_recipe_file(
+            &workspace.join(".littlemonkey").join("recipes"),
+            "r.yml",
+            "shared-name",
+        );
         write_recipe_file(&app_data.join("recipes"), "r.yml", "shared-name");
 
         let found = discover_recipes(Some(&workspace), &app_data);
-        let matches: Vec<&DiscoveredRecipe> = found.iter().filter(|d| d.recipe.as_ref().map(|r| r.name == "shared-name").unwrap_or(false)).collect();
-        assert_eq!(matches.len(), 1, "the global copy must be shadowed, not listed twice");
+        let matches: Vec<&DiscoveredRecipe> = found
+            .iter()
+            .filter(|d| {
+                d.recipe
+                    .as_ref()
+                    .map(|r| r.name == "shared-name")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the global copy must be shadowed, not listed twice"
+        );
         assert_eq!(matches[0].source, RecipeSource::Workspace);
     }
 
@@ -833,7 +1751,8 @@ params:
         let app_data = temp_dir("app-resolve-path");
         let dir = app_data.join("somewhere-else");
         write_recipe_file(&dir, "custom.yml", "path-recipe");
-        let recipe = resolve_recipe(dir.join("custom.yml").to_str().unwrap(), None, &app_data).unwrap();
+        let recipe =
+            resolve_recipe(dir.join("custom.yml").to_str().unwrap(), None, &app_data).unwrap();
         assert_eq!(recipe.name, "path-recipe");
     }
 
@@ -850,7 +1769,10 @@ params:
         let yaml = "version: 1\nname: saved-recipe\ntarget:\n  ollama: qwen2.5:14b\npermission_mode: manual\nprompt: do it\n";
         let saved = save_recipe_impl(&app_data, "saved-recipe", yaml).unwrap();
         assert_eq!(saved.name, "saved-recipe");
-        assert!(!app_data.join("recipes").join("saved-recipe.yml.tmp").exists());
+        assert!(!app_data
+            .join("recipes")
+            .join("saved-recipe.yml.tmp")
+            .exists());
 
         let reread = resolve_recipe("saved-recipe", None, &app_data).unwrap();
         assert_eq!(reread.name, "saved-recipe");
@@ -881,7 +1803,12 @@ params:
     #[test]
     fn recipe_id_validation_rejects_path_traversal_style_names() {
         let app_data = temp_dir("app-traversal");
-        assert!(save_recipe_impl(&app_data, "../evil", "version: 1\nname: x\ntarget:\n  ollama: q\npermission_mode: manual\nprompt: x\n").is_err());
+        assert!(save_recipe_impl(
+            &app_data,
+            "../evil",
+            "version: 1\nname: x\ntarget:\n  ollama: q\npermission_mode: manual\nprompt: x\n"
+        )
+        .is_err());
         assert!(delete_recipe_impl(&app_data, "../evil").is_err());
     }
 }

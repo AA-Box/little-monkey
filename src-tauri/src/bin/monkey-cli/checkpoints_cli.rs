@@ -45,7 +45,9 @@ pub fn revert(id: Option<&str>) -> Result<u32, String> {
 /// The newest `"cli"`-tagged checkpoint on disk, if any.
 fn most_recent(base: &std::path::Path) -> Result<Option<checkpoints::CheckpointInfo>, String> {
     // `list_impl` already sorts newest-first.
-    Ok(checkpoints::list_impl(base, Some(CLI_SESSION_ID))?.into_iter().next())
+    Ok(checkpoints::list_impl(base, Some(CLI_SESSION_ID))?
+        .into_iter()
+        .next())
 }
 
 #[cfg(test)]
@@ -67,7 +69,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
 
         let result = most_recent(&base).unwrap();
-        assert!(result.is_none(), "empty checkpoints dir must have no most-recent checkpoint");
+        assert!(
+            result.is_none(),
+            "empty checkpoints dir must have no most-recent checkpoint"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

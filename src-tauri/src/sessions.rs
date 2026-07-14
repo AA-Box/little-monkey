@@ -27,7 +27,7 @@ const SESSIONS_FILE: &str = "chat_sessions.json";
 /// other on their next save.
 pub const SESSIONS_CHANGED_EVENT: &str = "sessions://changed";
 
-fn sessions_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn sessions_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -68,9 +68,13 @@ pub fn sessions_load(app: tauri::AppHandle) -> Result<Option<String>, String> {
 pub fn sessions_save(
     app: tauri::AppHandle,
     window: tauri::Window,
+    state: tauri::State<'_, crate::AppState>,
     payload: String,
 ) -> Result<(), String> {
     save_to(&sessions_file_path(&app)?, &payload)?;
+    // Keep the validated transactional profile/index current on every
+    // successful legacy snapshot. The JSON file remains a recovery copy.
+    crate::profile_commands::sync_profile_payload(&app, state.inner(), &payload)?;
     // Best-effort fan-out to the other windows; the save itself succeeded.
     let _ = app.emit(SESSIONS_CHANGED_EVENT, window.label());
     Ok(())

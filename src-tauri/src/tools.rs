@@ -64,7 +64,10 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read a UTF-8 text file from the workspace.
 #[tauri::command]
-pub async fn tool_read_file(state: tauri::State<'_, AppState>, path: String) -> Result<String, String> {
+pub async fn tool_read_file(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
     let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
 
     if !resolved.is_file() {
@@ -86,7 +89,8 @@ pub async fn tool_list_dir(
         return Err(format!("'{}' is not a directory", path));
     }
 
-    let read_dir = std::fs::read_dir(&resolved).map_err(|e| format!("Failed to list '{}': {}", path, e))?;
+    let read_dir =
+        std::fs::read_dir(&resolved).map_err(|e| format!("Failed to list '{}': {}", path, e))?;
 
     let mut entries = Vec::new();
     for entry in read_dir {
@@ -240,7 +244,10 @@ fn glob_impl(
             continue;
         }
 
-        let relative = entry.path().strip_prefix(search_root).unwrap_or_else(|_| entry.path());
+        let relative = entry
+            .path()
+            .strip_prefix(search_root)
+            .unwrap_or_else(|_| entry.path());
         if !matcher.is_match(relative) {
             continue;
         }
@@ -312,6 +319,7 @@ pub async fn tool_write_file(
     content: String,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
@@ -324,8 +332,17 @@ pub async fn tool_write_file(
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
     let detail = format!("Write {} bytes to {}", content.len(), path);
-    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref(), risk, agent_label.as_deref())
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "write_file",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        risk,
+        agent_label.as_deref(),
+    )
+    .await?;
 
     // Serializes the backup+write critical section against any other
     // concurrent write_file/edit_file targeting the same path — see this
@@ -344,7 +361,8 @@ pub async fn tool_write_file(
             .map_err(|e| format!("Failed to create parent directories for '{}': {}", path, e))?;
     }
 
-    std::fs::write(&resolved, &content).map_err(|e| format!("Failed to write '{}': {}", path, e))?;
+    std::fs::write(&resolved, &content)
+        .map_err(|e| format!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Wrote {} bytes to {}", content.len(), path))
 }
@@ -372,7 +390,10 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
         preview.push(format!("- {}", truncate(line)));
     }
     if old_lines.len() > MAX_PREVIEW_LINES {
-        preview.push(format!("  … ({} more removed lines)", old_lines.len() - MAX_PREVIEW_LINES));
+        preview.push(format!(
+            "  … ({} more removed lines)",
+            old_lines.len() - MAX_PREVIEW_LINES
+        ));
     }
 
     let new_lines: Vec<&str> = new_string.lines().collect();
@@ -380,7 +401,10 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
         preview.push(format!("+ {}", truncate(line)));
     }
     if new_lines.len() > MAX_PREVIEW_LINES {
-        preview.push(format!("  … ({} more added lines)", new_lines.len() - MAX_PREVIEW_LINES));
+        preview.push(format!(
+            "  … ({} more added lines)",
+            new_lines.len() - MAX_PREVIEW_LINES
+        ));
     }
 
     preview.join("\n")
@@ -419,6 +443,7 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     new_string: String,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
@@ -433,8 +458,8 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
         return Err(format!("'{}' is not a file", path));
     }
 
-    let current =
-        std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let current = std::fs::read_to_string(&resolved)
+        .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
 
     let occurrences = current.matches(old_string.as_str()).count();
     if occurrences == 0 {
@@ -451,8 +476,17 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     let preview = build_diff_preview(&old_string, &new_string);
     let detail = format!("Edit {}\n{}", path, preview);
 
-    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref(), risk, agent_label.as_deref())
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "edit_file",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        risk,
+        agent_label.as_deref(),
+    )
+    .await?;
 
     // Serializes the re-read+backup+write critical section against any
     // other concurrent write_file/edit_file targeting the same path — see
@@ -466,7 +500,8 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     // Re-read fresh, now that we hold the lock: `current` above may already
     // be stale if another call mutated this same path while this call's own
     // permission prompt was pending.
-    let fresh = std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let fresh = std::fs::read_to_string(&resolved)
+        .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
     let fresh_occurrences = fresh.matches(old_string.as_str()).count();
     if fresh_occurrences == 0 {
         return Err(format!(
@@ -484,7 +519,8 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
     let updated = fresh.replacen(old_string.as_str(), new_string.as_str(), 1);
-    std::fs::write(&resolved, &updated).map_err(|e| format!("Failed to write '{}': {}", path, e))?;
+    std::fs::write(&resolved, &updated)
+        .map_err(|e| format!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Edited {}", path))
 }
@@ -520,13 +556,23 @@ pub async fn tool_run_shell(
     cwd: Option<String>,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
-    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref(), risk, agent_label.as_deref())
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "run_shell",
+        command.clone(),
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        risk,
+        agent_label.as_deref(),
+    )
+    .await?;
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
 
@@ -596,7 +642,10 @@ pub async fn tool_run_shell(
             .tool_cancel
             .lock()
             .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -637,9 +686,19 @@ pub async fn tool_remember(
     state: tauri::State<'_, AppState>,
     text: String,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<memory::Fact, String> {
-    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref(), None, None)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "remember",
+        text.clone(),
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
 
     let root = workspace::primary_root_canon(state.inner())
         .map(|p| p.to_string_lossy().to_string())
@@ -651,7 +710,10 @@ pub async fn tool_remember(
     // whole `memories.json` file is rewritten on every add, so two
     // unsynchronized concurrent writers could otherwise silently drop one
     // fact's write.
-    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
     memory::add_fact_impl(&path, &root, &text, "agent")
 }
 
@@ -706,7 +768,9 @@ pub struct WorkspacePathsResult {
 /// [`tool_list_dir`] and [`tool_grep`], it is intentionally NOT
 /// permission-gated.
 #[tauri::command]
-pub fn list_workspace_paths(state: tauri::State<'_, AppState>) -> Result<WorkspacePathsResult, String> {
+pub fn list_workspace_paths(
+    state: tauri::State<'_, AppState>,
+) -> Result<WorkspacePathsResult, String> {
     let roots = workspace::all_roots(state.inner())?;
 
     let mut entries = Vec::new();
@@ -849,7 +913,10 @@ mod tests {
     fn glob_rejects_invalid_pattern() {
         let tree = TempTree::new();
         let err = glob_impl("a{b", &tree.path, &tree.path, "").unwrap_err();
-        assert!(err.contains("Invalid glob pattern"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid glob pattern"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -872,11 +939,15 @@ mod tests {
 
         let state = crate::AppState::default();
         *state.permissions.mode.lock().unwrap() = "acceptEdits".to_string();
-        state.workspace_roots.lock().unwrap().push(workspace::WorkspaceRoot {
-            id: canonical.to_string_lossy().to_string(),
-            label: "test".to_string(),
-            path: canonical,
-        });
+        state
+            .workspace_roots
+            .lock()
+            .unwrap()
+            .push(workspace::WorkspaceRoot {
+                id: canonical.to_string_lossy().to_string(),
+                label: "test".to_string(),
+                path: canonical,
+            });
         state.checkpoints.lock().unwrap().insert(
             "test-checkpoint".to_string(),
             checkpoints::ActiveCheckpoint {
@@ -1013,7 +1084,8 @@ mod tests {
             let app = mock_app_with_workspace(&tree.path);
             let handle = app.handle().clone();
 
-            let run = |handle: tauri::AppHandle<tauri::test::MockRuntime>, new_value: &'static str| {
+            let run = |handle: tauri::AppHandle<tauri::test::MockRuntime>,
+                       new_value: &'static str| {
                 tokio::spawn(async move {
                     // Widen the window for the two calls to genuinely
                     // overlap before either takes the file-write lock.
@@ -1030,6 +1102,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                 })
@@ -1042,7 +1115,10 @@ mod tests {
             let result_b = result_b.unwrap();
 
             let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
-            assert_eq!(successes, 1, "expected exactly one edit to win, got: {result_a:?} / {result_b:?}");
+            assert_eq!(
+                successes, 1,
+                "expected exactly one edit to win, got: {result_a:?} / {result_b:?}"
+            );
 
             let final_content = std::fs::read_to_string(tree.path.join("shared.txt")).unwrap();
             assert!(

@@ -125,8 +125,12 @@ fn providers_file_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join("providers.json"))
 }
@@ -143,8 +147,8 @@ pub fn read_custom_providers(app: &AppHandle) -> Result<Vec<CustomProviderEntry>
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let parsed: ProvidersFile =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    let parsed: ProvidersFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
     Ok(parsed.custom)
 }
 
@@ -153,9 +157,10 @@ fn write_custom_providers(app: &AppHandle, entries: &[CustomProviderEntry]) -> R
     let file = ProvidersFile {
         custom: entries.to_vec(),
     };
-    let serialized =
-        serde_json::to_string_pretty(&file).map_err(|e| format!("Failed to serialize provider config: {e}"))?;
-    std::fs::write(&path, serialized).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    let serialized = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("Failed to serialize provider config: {e}"))?;
+    std::fs::write(&path, serialized)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 /// Pure preset-then-custom lookup, parameterized by an already-loaded
@@ -177,6 +182,17 @@ pub fn resolve_base_url(id: &str, custom: &[CustomProviderEntry]) -> Result<Stri
 fn find_base_url(app: &AppHandle, id: &str) -> Result<String, String> {
     let custom = read_custom_providers(app)?;
     resolve_base_url(id, &custom)
+}
+
+/// Secret-free stable reference written into durable run snapshots. The
+/// actual credential remains in the OS keychain and is still loaded only for
+/// the lifetime of one request.
+pub fn credential_ref_id(id: &str) -> String {
+    format!("keychain:{KEYCHAIN_SERVICE}:{id}")
+}
+
+pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> {
+    find_base_url(app, id).map(|value| value.trim_end_matches('/').to_string())
 }
 
 pub fn has_key(id: &str) -> bool {
@@ -203,7 +219,13 @@ pub fn read_key(provider_id: &str) -> Result<String, String> {
 fn provider_env_var_name(provider_id: &str) -> String {
     let upper: String = provider_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("LITTLE_MONKEY_API_KEY_{upper}")
 }
@@ -304,7 +326,11 @@ fn unique_slug(label: &str, existing: &HashSet<String>) -> String {
 /// already-OpenAI-shaped body it forwards verbatim, without duplicating the
 /// header names/version string in a third place. `pub` for that reuse; no
 /// behavior change to either existing call site.
-pub fn add_anthropic_headers(request: reqwest::RequestBuilder, provider_id: &str, api_key: &str) -> reqwest::RequestBuilder {
+pub fn add_anthropic_headers(
+    request: reqwest::RequestBuilder,
+    provider_id: &str,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
     if provider_id == "anthropic" {
         request
             .header("x-api-key", api_key)
@@ -324,7 +350,13 @@ pub async fn fetch_models(
     api_key: &str,
 ) -> Result<Vec<ProviderModelInfo>, String> {
     let client = reqwest::Client::new();
-    let request = add_anthropic_headers(client.get(format!("{base_url}/models")).bearer_auth(api_key), provider_id, api_key);
+    let request = add_anthropic_headers(
+        client
+            .get(format!("{base_url}/models"))
+            .bearer_auth(api_key),
+        provider_id,
+        api_key,
+    );
 
     let response = request
         .send()
@@ -405,7 +437,11 @@ pub fn providers_list_configured(app: AppHandle) -> Result<Vec<ProviderConfig>, 
 /// Registers a new custom OpenAI-compatible provider (Groq, Mistral,
 /// self-hosted, etc.) with no key yet — call `providers_set_key` next.
 #[tauri::command]
-pub fn providers_add_custom(app: AppHandle, label: String, base_url: String) -> Result<ProviderConfig, String> {
+pub fn providers_add_custom(
+    app: AppHandle,
+    label: String,
+    base_url: String,
+) -> Result<ProviderConfig, String> {
     let label = label.trim().to_string();
     if label.is_empty() {
         return Err("Label is required".to_string());
@@ -455,7 +491,11 @@ pub fn providers_remove_custom(app: AppHandle, id: String) -> Result<(), String>
 /// returns the model list immediately so the caller doesn't need a second
 /// round trip.
 #[tauri::command]
-pub async fn providers_set_key(app: AppHandle, id: String, api_key: String) -> Result<Vec<ProviderModelInfo>, String> {
+pub async fn providers_set_key(
+    app: AppHandle,
+    id: String,
+    api_key: String,
+) -> Result<Vec<ProviderModelInfo>, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
         return Err("API key is required".to_string());
@@ -464,7 +504,8 @@ pub async fn providers_set_key(app: AppHandle, id: String, api_key: String) -> R
     let base_url = find_base_url(&app, &id)?;
     let models = fetch_models(&base_url, &id, &api_key).await?;
 
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id).map_err(|e| format!("Failed to access keychain: {e}"))?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id)
+        .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry
         .set_password(&api_key)
         .map_err(|e| format!("Failed to save key to keychain: {e}"))?;
@@ -480,7 +521,10 @@ pub fn providers_remove_key(id: String) -> Result<(), String> {
 
 /// Manual "refresh models" — re-fetches using the already-saved key.
 #[tauri::command]
-pub async fn providers_list_models(app: AppHandle, id: String) -> Result<Vec<ProviderModelInfo>, String> {
+pub async fn providers_list_models(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<ProviderModelInfo>, String> {
     let base_url = find_base_url(&app, &id)?;
     let api_key = read_key(&id)?;
     fetch_models(&base_url, &id, &api_key).await
@@ -497,7 +541,9 @@ pub struct Utf8ChunkAccumulator {
 
 impl Utf8ChunkAccumulator {
     pub fn new() -> Self {
-        Self { leftover: Vec::new() }
+        Self {
+            leftover: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> String {
@@ -547,6 +593,7 @@ pub async fn providers_stream_chat(
     messages: Vec<serde_json::Value>,
     tools: Vec<serde_json::Value>,
     effort: Option<String>,
+    run_id: Option<String>,
 ) -> Result<(), String> {
     if let Some(ref e) = effort {
         if !VALID_EFFORT_LEVELS.contains(&e.as_str()) {
@@ -554,14 +601,34 @@ pub async fn providers_stream_chat(
         }
     }
 
+    let frozen_endpoint = match run_id.as_deref() {
+        Some(run_id) => Some(crate::run_commands::provider_endpoint_for_run(
+            &app,
+            state.inner(),
+            run_id,
+            &provider_id,
+            &model,
+        )?),
+        None => None,
+    };
     let cancel = Arc::new(Notify::new());
     state
         .stream_cancels
         .lock()
         .unwrap()
         .insert(request_id.clone(), cancel.clone());
-
-    let result = run_stream_chat(&app, &request_id, &provider_id, &model, messages, tools, effort, cancel).await;
+    let result = run_stream_chat(
+        &app,
+        &request_id,
+        &provider_id,
+        &model,
+        messages,
+        tools,
+        effort,
+        cancel,
+        frozen_endpoint,
+    )
+    .await;
 
     state.stream_cancels.lock().unwrap().remove(&request_id);
 
@@ -613,11 +680,25 @@ pub fn build_chat_request(
 ) -> reqwest::RequestBuilder {
     let mut body = json!({
         "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
         "stream": true,
         "model": model,
     });
+
+    // `tool_choice` without at least one tool is rejected by a number of
+    // OpenAI-compatible/custom endpoints. No-tools runs (notably Compare)
+    // omit both fields rather than sending an empty catalog plus "auto".
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
+
+    // OpenAI-compatible streaming APIs only include the terminal usage
+    // chunk when explicitly requested. Anthropic/Gemini compatibility
+    // endpoints reject or ignore this OpenAI-only extension, matching the
+    // CLI's request-shaping rule.
+    if provider_id != "anthropic" && provider_id != "gemini" {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
 
     if provider_id == "anthropic" {
         if let Some(effort) = effort {
@@ -625,7 +706,10 @@ pub fn build_chat_request(
         }
     }
 
-    let request = client.post(format!("{base_url}/chat/completions")).bearer_auth(api_key).json(&body);
+    let request = client
+        .post(format!("{base_url}/chat/completions"))
+        .bearer_auth(api_key)
+        .json(&body);
     add_anthropic_headers(request, provider_id, api_key)
 }
 
@@ -638,13 +722,25 @@ async fn run_stream_chat(
     tools: Vec<serde_json::Value>,
     effort: Option<String>,
     cancel: Arc<Notify>,
+    frozen_endpoint: Option<String>,
 ) -> Result<(), String> {
-    let base_url = find_base_url(app, provider_id)?;
+    let base_url = match frozen_endpoint {
+        Some(endpoint) => endpoint,
+        None => configured_endpoint(app, provider_id)?,
+    };
     let api_key = read_key(provider_id)?;
 
     let client = reqwest::Client::new();
-    let request =
-        build_chat_request(&client, &base_url, provider_id, &api_key, model, &messages, &tools, effort.as_deref());
+    let request = build_chat_request(
+        &client,
+        &base_url,
+        provider_id,
+        &api_key,
+        model,
+        &messages,
+        &tools,
+        effort.as_deref(),
+    );
 
     let response = request
         .send()
@@ -724,8 +820,14 @@ mod tests {
 
     #[test]
     fn validate_base_url_accepts_http_and_https() {
-        assert_eq!(validate_base_url("https://api.openai.com/v1").unwrap(), "https://api.openai.com/v1");
-        assert_eq!(validate_base_url("http://localhost:8080/v1/").unwrap(), "http://localhost:8080/v1");
+        assert_eq!(
+            validate_base_url("https://api.openai.com/v1").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            validate_base_url("http://localhost:8080/v1/").unwrap(),
+            "http://localhost:8080/v1"
+        );
     }
 
     #[test]
@@ -739,8 +841,14 @@ mod tests {
 
     #[test]
     fn provider_env_var_name_upcases_and_prefixes() {
-        assert_eq!(provider_env_var_name("openrouter"), "LITTLE_MONKEY_API_KEY_OPENROUTER");
-        assert_eq!(provider_env_var_name("anthropic"), "LITTLE_MONKEY_API_KEY_ANTHROPIC");
+        assert_eq!(
+            provider_env_var_name("openrouter"),
+            "LITTLE_MONKEY_API_KEY_OPENROUTER"
+        );
+        assert_eq!(
+            provider_env_var_name("anthropic"),
+            "LITTLE_MONKEY_API_KEY_ANTHROPIC"
+        );
     }
 
     #[test]
@@ -748,7 +856,10 @@ mod tests {
         // A custom provider id could contain a hyphen — standard env-var
         // naming replaces it with an underscore rather than dropping it
         // (dropping could collide two distinct provider ids onto one var).
-        assert_eq!(provider_env_var_name("my-custom-provider"), "LITTLE_MONKEY_API_KEY_MY_CUSTOM_PROVIDER");
+        assert_eq!(
+            provider_env_var_name("my-custom-provider"),
+            "LITTLE_MONKEY_API_KEY_MY_CUSTOM_PROVIDER"
+        );
     }
 
     #[test]
@@ -783,8 +894,12 @@ mod tests {
         )
         .build()
         .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(anthropic_req.body().unwrap().as_bytes().unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(anthropic_req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("stream_options").is_none());
 
         let openai_req = build_chat_request(
             &client,
@@ -798,8 +913,27 @@ mod tests {
         )
         .build()
         .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(openai_req.body().unwrap().as_bytes().unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(openai_req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert!(body.get("output_config").is_none());
+        assert_eq!(body["stream_options"]["include_usage"], true);
+
+        let tool_req = build_chat_request(
+            &client,
+            "https://api.openai.com/v1",
+            "openai",
+            "key",
+            "gpt-4o",
+            &[],
+            &[json!({"type": "function", "function": {"name": "read_file"}})],
+            None,
+        )
+        .build()
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(tool_req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

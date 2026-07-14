@@ -26,7 +26,10 @@ pub fn base_dir() -> Option<PathBuf> {
 
 fn find_by_name(registry: &[KnowledgeStack], name: &str) -> Option<KnowledgeStack> {
     let trimmed = name.trim();
-    registry.iter().find(|s| s.name.eq_ignore_ascii_case(trimmed)).cloned()
+    registry
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(trimmed))
+        .cloned()
 }
 
 /// `monkey-cli stacks list` — one line per stack: name, source count, chunk
@@ -35,7 +38,9 @@ pub fn list() -> Result<(), String> {
     let base = base_dir().ok_or("Could not resolve the app data directory")?;
     let registry = stacks::list_impl(&base)?;
     if registry.is_empty() {
-        println!("No knowledge stacks yet — create one in the desktop app's Settings > Knowledge tab.");
+        println!(
+            "No knowledge stacks yet — create one in the desktop app's Settings > Knowledge tab."
+        );
         return Ok(());
     }
     for stack in &registry {
@@ -65,12 +70,18 @@ pub fn list() -> Result<(), String> {
 pub async fn reindex(name: &str) -> Result<(), String> {
     let base = base_dir().ok_or("Could not resolve the app data directory")?;
     let registry = stacks::list_impl(&base)?;
-    let stack = find_by_name(&registry, name).ok_or_else(|| format!("No knowledge stack named '{}'", name.trim()))?;
+    let stack = find_by_name(&registry, name)
+        .ok_or_else(|| format!("No knowledge stack named '{}'", name.trim()))?;
     let state = AppState::default();
 
-    let updated = stacks::reindex_impl(&base, &state, &stack.id, |files_done, files_total, chunks, phase| {
-        render_progress(files_done, files_total, chunks, phase);
-    })
+    let updated = stacks::reindex_impl(
+        &base,
+        &state,
+        &stack.id,
+        |files_done, files_total, chunks, phase| {
+            render_progress(files_done, files_total, chunks, phase);
+        },
+    )
     .await?;
 
     println!();
@@ -89,7 +100,9 @@ pub async fn reindex(name: &str) -> Result<(), String> {
 fn render_progress(files_done: usize, files_total: usize, chunks: usize, phase: &str) {
     let line = match phase {
         "walking" => "Scanning files…".to_string(),
-        "chunking" => format!("Hashing/chunking {files_done}/{files_total} files ({chunks} chunks so far)…"),
+        "chunking" => {
+            format!("Hashing/chunking {files_done}/{files_total} files ({chunks} chunks so far)…")
+        }
         "embedding" => format!("Embedding… {chunks} chunks ready"),
         "done" => format!("Done — {chunks} chunks."),
         other => other.to_string(),
@@ -122,7 +135,11 @@ pub async fn search_docs(
 ) -> Result<Vec<StackQueryResult>, String> {
     let base = base_dir().ok_or("Could not resolve the app data directory")?;
     let registry = stacks::list_impl(&base)?;
-    let allowed = if attached_stacks.is_empty() { None } else { Some(attached_stacks) };
+    let allowed = if attached_stacks.is_empty() {
+        None
+    } else {
+        Some(attached_stacks)
+    };
     let stack_ids = stacks::resolve_search_stack_ids(&registry, allowed, stack.as_deref())?;
     let k = max_results.unwrap_or(6) as usize;
     stacks::query_impl(&base, state, &stack_ids, &query, k).await

@@ -433,7 +433,7 @@ export function RulesMemoryPanel() {
   }
 
   return (
-    <div className="flex flex-col gap-4 p-2">
+    <div className="flex flex-col gap-4 py-2">
       <section>
         <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-faint">
           {t("RulesMemoryPanel.globalHeading")}

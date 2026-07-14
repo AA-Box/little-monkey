@@ -87,11 +87,11 @@ describe("runRecipeNow", () => {
     expect(runAgentTurnMock).toHaveBeenCalledWith(sessionId, "You are auditing package.json.\n\nDo the thing.", [], undefined, turnId);
   });
 
-  it("rejects a local_url target with a message pointing at monkey-cli task run, without touching the model store or starting a turn", async () => {
+  it("rejects a local_url target with a message pointing at monkey task run, without touching the model store or starting a turn", async () => {
     invokeMock.mockResolvedValueOnce({ prompt: "Do the thing.", system: null });
     const recipe = makeRecipe({ target: { local_url: "http://127.0.0.1:8090" } });
 
-    await expect(runRecipeNow(recipe)).rejects.toThrow("monkey-cli task run");
+    await expect(runRecipeNow(recipe)).rejects.toThrow("monkey task run");
     expect(runAgentTurnMock).not.toHaveBeenCalled();
   });
 

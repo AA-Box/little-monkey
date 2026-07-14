@@ -22,6 +22,7 @@ import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useModelStore } from '../store/modelStore';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
 import { runSubagentTask } from './subagent';
+import { protocolToolCallId } from './durableRun';
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -29,7 +30,7 @@ import { runSubagentTask } from './subagent';
  * (`useOllamaModel` vs `useProviderModel`) to call when it picks a
  * different target — both still stream via the same `streamChat` transport. */
 export type ResolvedTarget =
-  | { kind: 'local'; baseUrl: string }
+  | { kind: 'local'; baseUrl: string; modelLabel?: string }
   | { kind: 'ollama'; baseUrl: string; model: string }
   | { kind: 'provider'; providerId: string; model: string };
 
@@ -39,7 +40,7 @@ export type ResolvedTarget =
  * active model's display name is read from `modelStore` at the moment usage
  * arrives; Ollama/provider targets already carry a model id. */
 export function describeUsageTarget(target: ResolvedTarget): string {
-  if (target.kind === 'local') return useModelStore.getState().active?.name ?? 'Local model';
+  if (target.kind === 'local') return target.modelLabel ?? useModelStore.getState().active?.name ?? 'Local model';
   if (target.kind === 'ollama') return `Ollama · ${target.model}`;
   return `${target.providerId} · ${target.model}`;
 }
@@ -121,17 +122,20 @@ function invokeMcpTool(
   name: string,
   args: Record<string, unknown>,
   turnId: string,
+  toolCallId: string,
   mcpRegistry: McpToolRegistry
 ): Promise<string> {
   const resolved = resolveMcpToolName(mcpRegistry, name);
   if (!resolved) {
     return Promise.resolve(stringifyToolError(new Error(`MCP tool "${name}" was not offered this turn.`)));
   }
+  const { turn_id: _turnId, tool_call_id: _toolCallId, ...argumentsForServer } = args;
   return invoke<McpCallToolResult>('mcp_call_tool', {
     server_id: resolved.serverId,
     tool_name: resolved.toolName,
-    arguments: args,
+    arguments: argumentsForServer,
     turn_id: turnId,
+    tool_call_id: toolCallId,
   }).then(formatMcpCallToolResult, stringifyToolError);
 }
 
@@ -171,6 +175,10 @@ const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
  * cancellation) to the right in-flight turn. */
 const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
 
+function isPermissionGatedTool(name: string): boolean {
+  return PERMISSION_GATED_TOOLS.has(name) || name.startsWith('mcp__');
+}
+
 /** Per-call context `RESERVED_ARGS`' `resolve` functions read from — one
  * object built fresh by `executeToolCall` for each tool call, after risk
  * classification has run (so `riskClassification` reflects this call). */
@@ -178,6 +186,7 @@ interface ReservedArgContext {
   name: string;
   checkpointId: string | null;
   turnId: string;
+  toolCallId: string;
   agentLabel?: string;
   attachedStackNames?: string[];
   riskClassification: RiskClassification | null;
@@ -218,7 +227,10 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   },
   // Scopes permission prompts and shell/fetch cancellation to THIS turn —
   // Stop in one pane must never touch the other pane's command or prompt.
-  { key: 'turn_id', resolve: (ctx) => (PERMISSION_GATED_TOOLS.has(ctx.name) ? ctx.turnId : undefined) },
+  { key: 'turn_id', resolve: (ctx) => (isPermissionGatedTool(ctx.name) ? ctx.turnId : undefined) },
+  // Links Rust-hosted permission decisions to the exact redacted durable
+  // ToolProposed event. Provider-supplied ids are normalized before IPC.
+  { key: 'tool_call_id', resolve: (ctx) => (isPermissionGatedTool(ctx.name) ? ctx.toolCallId : undefined) },
   // `search_docs` is scoped to THIS session's attached knowledge stacks
   // server-side, never left to the model to declare — always overwritten
   // (even with an empty array), never left merely scrubbed, so a compliant
@@ -282,6 +294,8 @@ export interface SubagentContext {
    * that function's own doc comment for why child usage is never actually
    * recorded under it (the whole point of `recordUsage: false`). */
   sessionId: string;
+  /** Immutable durable parent run id used for permission/cancellation audit. */
+  runId?: string;
   /** THIS turn's already-resolved active target (see `ResolvedTarget`) —
    * passed down rather than re-resolved, so a mid-turn manual model switch
    * can never split the parent and child across different targets. */
@@ -380,7 +394,15 @@ export async function executeToolCall(
 
   // Sets back in only the keys that apply to this tool call, from the
   // frontend's own sources of truth — see `RESERVED_ARGS`.
-  injectReservedArgs(args, { name, checkpointId, turnId, agentLabel, attachedStackNames, riskClassification });
+  injectReservedArgs(args, {
+    name,
+    checkpointId,
+    turnId,
+    toolCallId: protocolToolCallId(toolCall.id),
+    agentLabel,
+    attachedStackNames,
+    riskClassification,
+  });
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
   // doc comment): it never reaches Rust at all, checked BEFORE the
@@ -433,6 +455,7 @@ export async function executeToolCall(
       const childTurnId = crypto.randomUUID();
       return await runSubagentTask({
         sessionId: subagent.sessionId,
+        runId: subagent.runId,
         parentCheckpointId: checkpointId,
         parentSignal: signal,
         taskId: childTurnId,
@@ -456,7 +479,7 @@ export async function executeToolCall(
   }
 
   const invocation = name.startsWith('mcp__')
-    ? invokeMcpTool(name, args, turnId, mcpRegistry)
+    ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
     : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
   if (!signal) return invocation;
 
@@ -471,7 +494,7 @@ export async function executeToolCall(
 }
 
 /** Result of a single streaming attempt against one target. */
-interface AttemptResult {
+export interface AttemptResult {
   content: string;
   toolCalls: ToolCall[];
   streamError: string | null;
@@ -519,7 +542,15 @@ export async function attemptStream(
   // request) but must never clobber the PARENT session's own context-usage
   // ring — see the design doc's "usage clobbering" risk and
   // `subagent.test.ts` for the test pinning this.
-  recordUsage: boolean = true
+  recordUsage: boolean = true,
+  /** Optional hard completion ceiling for compatible local/Ollama routes.
+   * Provider calls are still bounded by the caller's AbortController and
+   * aggregate ledger because their Rust proxy contract does not yet expose
+   * this optional field. */
+  maxTokens?: number,
+  /** Durable run whose host-canonicalized provider endpoint/model must match
+   * this request. Ignored by unauthenticated local runtimes. */
+  runId?: string,
 ): Promise<AttemptResult> {
   if (target.kind === 'provider') recordRequest(target.providerId);
 
@@ -531,8 +562,23 @@ export async function attemptStream(
 
   const events: AsyncGenerator<StreamEvent> =
     target.kind === 'provider'
-      ? streamProviderChat(target.providerId, target.model, wireHistory, tools, signal, target.providerId === 'anthropic' ? effort : undefined)
-      : streamChat(target.baseUrl, wireHistory, tools, target.kind === 'ollama' ? target.model : undefined, signal);
+      ? streamProviderChat(
+          target.providerId,
+          target.model,
+          wireHistory,
+          tools,
+          signal,
+          target.providerId === 'anthropic' ? effort : undefined,
+          runId,
+        )
+      : streamChat(
+          target.baseUrl,
+          wireHistory,
+          tools,
+          target.kind === 'ollama' ? target.model : undefined,
+          signal,
+          maxTokens,
+        );
 
   try {
     for await (const event of events) {

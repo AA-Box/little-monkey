@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use little_monkey_lib::mcp::{
-    call_tool_impl, call_tool_with_cancel_impl, connect_impl, disconnect_all, disconnect_impl, McpServerEntry,
-    McpTransport,
+    call_tool_impl, call_tool_with_cancel_impl, connect_impl, disconnect_all, disconnect_impl,
+    McpServerEntry, McpTransport,
 };
 use little_monkey_lib::AppState;
 
@@ -118,7 +118,10 @@ async fn call_tool_enforces_the_allowlist() {
     let err = call_tool_impl(&state, &entry, "echo", serde_json::json!({"text": "x"}))
         .await
         .unwrap_err();
-    assert!(err.contains("not in the allowlist"), "unexpected error: {err}");
+    assert!(
+        err.contains("not in the allowlist"),
+        "unexpected error: {err}"
+    );
 
     disconnect_impl(&state, &entry.id).await;
 }
@@ -144,8 +147,12 @@ async fn reconnect_replaces_the_previous_connection() {
 #[tokio::test]
 async fn disconnect_all_clears_every_connected_server() {
     let state = AppState::default();
-    connect_impl(&state, &stdio_entry("d1", test_server_binary(), &[])).await.unwrap();
-    connect_impl(&state, &stdio_entry("d2", test_server_binary(), &[])).await.unwrap();
+    connect_impl(&state, &stdio_entry("d1", test_server_binary(), &[]))
+        .await
+        .unwrap();
+    connect_impl(&state, &stdio_entry("d2", test_server_binary(), &[]))
+        .await
+        .unwrap();
     assert_eq!(state.mcp.lock().await.len(), 2);
 
     disconnect_all(&state).await;
@@ -165,7 +172,11 @@ async fn connect_impl_can_be_bounded_by_an_external_timeout_against_a_hung_serve
     let state = AppState::default();
     let entry = stdio_entry("hangs-forever", "sleep", &["30"]);
 
-    let result = tokio::time::timeout(std::time::Duration::from_millis(500), connect_impl(&state, &entry)).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        connect_impl(&state, &entry),
+    )
+    .await;
     assert!(
         result.is_err(),
         "connect_impl unexpectedly completed against a server that never speaks MCP"
@@ -185,7 +196,10 @@ async fn call_tool_cancellation_sends_a_real_cancelled_notification_to_the_serve
     let marker = std::env::temp_dir().join(format!(
         "lm_mcp_cancel_marker_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let _ = std::fs::remove_file(&marker);
 
@@ -215,9 +229,15 @@ async fn call_tool_cancellation_sends_a_real_cancelled_notification_to_the_serve
         "test cancel".to_string()
     };
 
-    let err = call_tool_with_cancel_impl(&state, &entry, "wait_for_cancel", serde_json::json!({}), cancel)
-        .await
-        .unwrap_err();
+    let err = call_tool_with_cancel_impl(
+        &state,
+        &entry,
+        "wait_for_cancel",
+        serde_json::json!({}),
+        cancel,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err, "test cancel");
 
     // Give the (separate) server process a moment to receive the
@@ -250,9 +270,14 @@ async fn call_tool_impl_still_works_with_no_cancellation_wired_up() {
     let entry = stdio_entry("plain-call", test_server_binary(), &[]);
     connect_impl(&state, &entry).await.unwrap();
 
-    let result = call_tool_impl(&state, &entry, "echo", serde_json::json!({"text": "still works"}))
-        .await
-        .unwrap();
+    let result = call_tool_impl(
+        &state,
+        &entry,
+        "echo",
+        serde_json::json!({"text": "still works"}),
+    )
+    .await
+    .unwrap();
     let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
         panic!("expected a text content block, got {:?}", result.content[0]);
     };

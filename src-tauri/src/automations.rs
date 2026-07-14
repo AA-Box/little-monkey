@@ -26,7 +26,10 @@ const AUTOMATIONS_FILE: &str = "automations.json";
 pub const AUTOMATIONS_CHANGED_EVENT: &str = "automations://changed";
 
 fn automations_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
     Ok(dir.join(AUTOMATIONS_FILE))
 }
@@ -60,7 +63,11 @@ pub fn automations_load(app: tauri::AppHandle) -> Result<Option<String>, String>
 /// Persists the automations blob (opaque JSON string owned by the frontend's
 /// `automationsStore.ts`).
 #[tauri::command]
-pub fn automations_save(app: tauri::AppHandle, window: tauri::Window, payload: String) -> Result<(), String> {
+pub fn automations_save(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    payload: String,
+) -> Result<(), String> {
     save_to(&automations_file_path(&app)?, &payload)?;
     let _ = app.emit(AUTOMATIONS_CHANGED_EVENT, window.label());
     Ok(())
@@ -73,7 +80,9 @@ pub fn automations_save(app: tauri::AppHandle, window: tauri::Window, payload: S
 /// silently mean a different day than a user expects coming from Quartz-style
 /// cron).
 pub fn validate_cron_impl(expr: &str) -> Result<String, String> {
-    Cron::from_str(expr).map(|cron| cron.describe()).map_err(|e| format!("Invalid cron expression: {e}"))
+    Cron::from_str(expr)
+        .map(|cron| cron.describe())
+        .map_err(|e| format!("Invalid cron expression: {e}"))
 }
 
 #[tauri::command]
@@ -154,10 +163,23 @@ fn simple_calendar_fields(expr: &str) -> Option<Vec<(&'static str, u32)>> {
 /// Formats a ready-to-install launchd plist for `expr`, or `None` when
 /// `expr` uses cron syntax launchd can't express directly (see
 /// [`simple_calendar_fields`]).
-pub fn format_launchd_plist(label: &str, program: &str, args: &[String], expr: &str) -> Option<String> {
+pub fn format_launchd_plist(
+    label: &str,
+    program: &str,
+    args: &[String],
+    expr: &str,
+) -> Option<String> {
     let fields = simple_calendar_fields(expr)?;
-    let calendar_entries: String = fields.iter().map(|(key, value)| format!("        <key>{key}</key>\n        <integer>{value}</integer>\n")).collect();
-    let arg_entries: String = args.iter().map(|a| format!("        <string>{a}</string>\n")).collect();
+    let calendar_entries: String = fields
+        .iter()
+        .map(|(key, value)| {
+            format!("        <key>{key}</key>\n        <integer>{value}</integer>\n")
+        })
+        .collect();
+    let arg_entries: String = args
+        .iter()
+        .map(|a| format!("        <string>{a}</string>\n"))
+        .collect();
     Some(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -197,8 +219,14 @@ mod tests {
     fn temp_file() -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("little_monkey_automations_test_{}_{n}_{nanos}", std::process::id()))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_automations_test_{}_{n}_{nanos}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -264,7 +292,10 @@ mod tests {
 
     #[test]
     fn next_occurrences_impl_with_zero_count_returns_an_empty_vec() {
-        assert_eq!(next_occurrences_impl("0 3 * * *", 0).unwrap(), Vec::<i64>::new());
+        assert_eq!(
+            next_occurrences_impl("0 3 * * *", 0).unwrap(),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]
@@ -289,7 +320,11 @@ mod tests {
         let plist = format_launchd_plist(
             "com.littlemonkey.task.nightly-audit",
             "/usr/local/bin/monkey-cli",
-            &["task".to_string(), "run".to_string(), "/ws/recipe.yml".to_string()],
+            &[
+                "task".to_string(),
+                "run".to_string(),
+                "/ws/recipe.yml".to_string(),
+            ],
             "0 3 * * *",
         )
         .expect("a fixed-value daily schedule must convert");
@@ -308,7 +343,9 @@ mod tests {
 
     #[test]
     fn format_launchd_plist_converts_a_weekly_schedule() {
-        let plist = format_launchd_plist("label", "monkey-cli", &["task".to_string()], "30 9 * * 1").unwrap();
+        let plist =
+            format_launchd_plist("label", "monkey-cli", &["task".to_string()], "30 9 * * 1")
+                .unwrap();
         assert!(plist.contains("<key>Weekday</key>\n        <integer>1</integer>"));
         assert!(!plist.contains("<key>Day</key>"));
     }
@@ -322,8 +359,19 @@ mod tests {
 
     #[test]
     fn format_crontab_line_includes_the_expression_and_quoted_args() {
-        let line = format_crontab_line("0 3 * * *", "/usr/local/bin/monkey-cli", &["task".to_string(), "run".to_string(), "/ws/r.yml".to_string()]);
-        assert_eq!(line, "0 3 * * * '/usr/local/bin/monkey-cli' 'task' 'run' '/ws/r.yml'");
+        let line = format_crontab_line(
+            "0 3 * * *",
+            "/usr/local/bin/monkey-cli",
+            &[
+                "task".to_string(),
+                "run".to_string(),
+                "/ws/r.yml".to_string(),
+            ],
+        );
+        assert_eq!(
+            line,
+            "0 3 * * * '/usr/local/bin/monkey-cli' 'task' 'run' '/ws/r.yml'"
+        );
     }
 
     #[test]

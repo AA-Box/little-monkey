@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { MoreVertical, Plus } from "lucide-react";
 
-import { type ChatSession, useSessionStore } from "../../store/sessionStore";
+import { sessionDisplayTitle, type ChatSession, useSessionStore } from "../../store/sessionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 import { SessionMenu } from "./SessionMenu";
@@ -115,7 +115,7 @@ export default function ChatSessionList() {
             {session.unread && (
               <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-accent align-middle" />
             )}
-            {session.title}
+            {sessionDisplayTitle(session)}
           </span>
         )}
 

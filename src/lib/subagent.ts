@@ -32,6 +32,7 @@ import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
+import { protectToolResult } from './untrustedContent';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -153,6 +154,8 @@ export interface RunSubagentTaskParams {
    * plumbing; passed with `recordUsage: false` below, so it is never
    * actually written anywhere (see that param's own doc comment). */
   sessionId: string;
+  /** Durable parent run used for permission and cancellation audit. */
+  runId?: string;
   /** The PARENT turn's checkpoint id (or `null` if the parent turn has none
    * — e.g. bypass mode with nothing mutating yet). Passed straight through
    * to every child tool call unchanged, so any file a `code`-profile child
@@ -238,7 +241,7 @@ export interface RunSubagentTaskParams {
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
   useUsageHistoryStore.getState().recordSubagentTaskStarted();
-  const { sessionId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort, risk, onMutatedPath } =
+  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort, risk, onMutatedPath } =
     params;
 
   // The key `subagentStore`/`ChatSession.subagentRuns` are updated under —
@@ -361,8 +364,24 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
               // agent_label`) — harmless for `explore` children too, since
               // none of their tools are permission-gated mutations that
               // read it.
-              await executeToolCall(toolCall, parentCheckpointId, taskId, mcpRegistry, parentSignal, risk, undefined, undefined, description);
-        const toolMessage: ChatMessage = { role: 'tool', tool_call_id: toolCall.id, content: resultContent };
+              await executeToolCall(
+                toolCall,
+                parentCheckpointId,
+                runId ?? taskId,
+                mcpRegistry,
+                parentSignal,
+                risk,
+                undefined,
+                undefined,
+                description,
+              );
+        const toolMessage: ChatMessage = {
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: allowed
+            ? protectToolResult(toolCall.function.name, resultContent, mcpRegistry.has(toolCall.function.name))
+            : resultContent,
+        };
         messages = [...messages, toolMessage];
         useSubagentStore.getState().appendMessage(storeKey, toolMessage);
 

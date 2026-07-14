@@ -314,7 +314,7 @@ export function McpPanel() {
     .reduce((sum, s) => sum + s.tools.length, 0);
 
   return (
-    <div className="flex flex-col gap-3 p-2">
+    <div className="flex flex-col gap-3 py-2">
       <p className="text-xs text-muted">{t("McpPanel.description")}</p>
       <p className="rounded-md bg-warning-soft px-2 py-1.5 text-xs text-warning">{t("McpPanel.sideEffectsNotice")}</p>
 
