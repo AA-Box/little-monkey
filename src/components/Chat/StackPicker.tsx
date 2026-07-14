@@ -12,6 +12,8 @@ interface StackPickerProps {
   sessionId: string;
 }
 
+const EMPTY_STACK_IDS: string[] = [];
+
 /**
  * Pill button + checklist for attaching knowledge stacks (see
  * `stacks.rs`/`stackStore.ts`) to this session — mirrors `PersonaSelector`'s
@@ -27,7 +29,7 @@ export function StackPicker({ sessionId }: StackPickerProps) {
   const stacks = useStackStore(useShallow((state) => state.stacks));
   const refresh = useStackStore((state) => state.refresh);
   const attachedStackIds = useSessionStore(
-    (state) => state.sessions.find((s) => s.id === sessionId)?.attachedStackIds ?? []
+    (state) => state.sessions.find((s) => s.id === sessionId)?.attachedStackIds ?? EMPTY_STACK_IDS
   );
   const toggleAttachedStack = useSessionStore((state) => state.toggleAttachedStack);
   const docChatMode = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.docChatMode ?? false);

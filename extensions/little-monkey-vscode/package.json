@@ -1,0 +1,90 @@
+{
+  "name": "little-monkey",
+  "displayName": "Little Monkey",
+  "description": "ACP coding agent and explicit local FIM completions for Little Monkey.",
+  "version": "0.1.0",
+  "publisher": "little-monkey",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": ["Machine Learning", "Programming Languages", "Other"],
+  "activationEvents": [
+    "onCommand:littleMonkey.ask",
+    "onCommand:littleMonkey.cancel",
+    "onCommand:littleMonkey.inlineEdit",
+    "onCommand:littleMonkey.reviewProblems",
+    "onCommand:littleMonkey.openRun",
+    "onCommand:littleMonkey.showCompletionRoute",
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "benchmark:completions": "node scripts/benchmark-completions.js"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "littleMonkey.ask", "title": "Little Monkey: Ask About Active Editor" },
+      { "command": "littleMonkey.cancel", "title": "Little Monkey: Cancel Active Run" },
+      { "command": "littleMonkey.inlineEdit", "title": "Little Monkey: Edit Selection" },
+      { "command": "littleMonkey.reviewProblems", "title": "Little Monkey: Review Problems" },
+      { "command": "littleMonkey.openRun", "title": "Little Monkey: Open Current Run" },
+      { "command": "littleMonkey.showCompletionRoute", "title": "Little Monkey: Show Completion Route" }
+    ],
+    "configuration": {
+      "title": "Little Monkey",
+      "properties": {
+        "littleMonkey.cliPath": {
+          "type": "string",
+          "default": "monkey",
+          "description": "Path to the Little Monkey CLI sidecar."
+        },
+        "littleMonkey.agentModel": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit Ollama model used by ACP agent runs. No cloud fallback is performed."
+        },
+        "littleMonkey.permissionMode": {
+          "type": "string",
+          "enum": ["manual", "plan", "acceptEdits", "smart", "auto"],
+          "default": "manual",
+          "description": "Permission ceiling selected when the ACP process starts. Approvals remain in Little Monkey."
+        },
+        "littleMonkey.enableCompletions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable direct low-latency Ollama inline completions."
+        },
+        "littleMonkey.completionModel": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit local Ollama FIM/code-completion model."
+        },
+        "littleMonkey.fimCapableModels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Exact model tags the user has declared FIM-capable."
+        },
+        "littleMonkey.ollamaHost": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Loopback Ollama origin for completions. Non-loopback origins are rejected."
+        },
+        "littleMonkey.completionDebounceMs": {
+          "type": "number",
+          "minimum": 25,
+          "maximum": 2000,
+          "default": 140
+        },
+        "littleMonkey.completionMaxTokens": {
+          "type": "number",
+          "minimum": 8,
+          "maximum": 1024,
+          "default": 160
+        }
+      }
+    }
+  }
+}

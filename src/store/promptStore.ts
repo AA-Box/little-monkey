@@ -13,7 +13,7 @@ const PROMPTS_CHANGED_EVENT = "prompts://changed";
  * value/rationale as `sessionStore.ts`'s `PERSIST_DEBOUNCE_MS`. */
 const PERSIST_DEBOUNCE_MS = 400;
 
-export type PromptKind = "persona" | "snippet";
+export type PromptKind = "persona" | "snippet" | "skill";
 
 /**
  * A saved prompt-library entry: a persona (a system-prompt extension that
@@ -110,6 +110,14 @@ export interface PromptStore {
    * prompt. Every imported entry gets a fresh `id`/timestamps, ignoring
    * whatever the source file had. Returns the number of entries added. */
   importEntries: (incoming: PromptEntry[]) => number;
+  /** Portable profile import keeps stable ids/timestamps whenever possible;
+   * unlike the user-facing generic prompt import, it only runs after the
+   * Rust bundle preflight and can explicitly replace the restored library. */
+  importPortableEntries: (
+    incoming: PromptEntry[],
+    defaultPersonaId: string | null,
+    mode: "merge" | "replace",
+  ) => number;
   /** Serializes the current library to the portable JSON shape written by
    * `prompts_write_external` — the Settings "Prompts" tab's Export button.
    * Deliberately omits `defaultPersonaId`: it's a local preference, not
@@ -119,6 +127,13 @@ export interface PromptStore {
    * start on — see `sessionStore.ts`'s `createSession`. No-ops if `id`
    * doesn't name a persona entry. Passing `null` always clears it. */
   setDefaultPersona: (id: string | null) => void;
+}
+
+export interface PortablePromptImportPlan {
+  added: number;
+  entries: PromptEntry[];
+  defaultPersonaId: string | null;
+  hasSeededDefaults: true;
 }
 
 /** 2-3 small built-in personas seeded once, on the very first hydration ever
@@ -288,7 +303,7 @@ function normalizeEntry(raw: Partial<PromptEntry>): PromptEntry {
   const createdAt = typeof raw.createdAt === "number" ? raw.createdAt : now;
   return {
     id: typeof raw.id === "string" && raw.id.length > 0 ? raw.id : crypto.randomUUID(),
-    kind: raw.kind === "persona" ? "persona" : "snippet",
+    kind: raw.kind === "persona" || raw.kind === "skill" ? raw.kind : "snippet",
     name: typeof raw.name === "string" && raw.name.trim().length > 0 ? raw.name : "Untitled",
     command: typeof raw.command === "string" ? raw.command : "",
     content: typeof raw.content === "string" ? raw.content : "",
@@ -321,6 +336,69 @@ function parsePersisted(raw: string | null): PersistedShape | null {
   } catch {
     return null;
   }
+}
+
+/** Pure prompt-library counterpart to `planPortableSessionImport`. It
+ * resolves stable-id and command conflicts once, before Rust receives the
+ * complete multi-file restore write-set. */
+export function planPortablePromptImport(
+  state: Pick<PromptStore, "entries" | "defaultPersonaId">,
+  incoming: PromptEntry[],
+  requestedDefault: string | null,
+  mode: "merge" | "replace",
+): PortablePromptImportPlan {
+  const normalized = incoming.map((entry) => normalizeEntry(entry));
+  if (mode === "replace") {
+    const ids = new Set(normalized.map((entry) => entry.id));
+    return {
+      added: normalized.length,
+      entries: normalized,
+      defaultPersonaId: requestedDefault && ids.has(requestedDefault) ? requestedDefault : null,
+      hasSeededDefaults: true,
+    };
+  }
+  let added = 0;
+  const entries = [...state.entries];
+  const takenCommands = new Set(entries.map((entry) => entry.command));
+  for (const candidate of normalized) {
+    const sameId = entries.find((entry) => entry.id === candidate.id);
+    if (!sameId) {
+      const command = uniqueCommand(candidate.command, takenCommands);
+      takenCommands.add(command);
+      entries.push({ ...candidate, command });
+      added += 1;
+    } else if (JSON.stringify(sameId) !== JSON.stringify(candidate)) {
+      const command = uniqueCommand(candidate.command, takenCommands);
+      takenCommands.add(command);
+      entries.push({ ...candidate, id: crypto.randomUUID(), command });
+      added += 1;
+    }
+  }
+  const defaultPersonaId = state.defaultPersonaId ?? (
+    requestedDefault && entries.some((entry) => entry.id === requestedDefault && entry.kind === "persona")
+      ? requestedDefault
+      : null
+  );
+  return { added, entries, defaultPersonaId, hasSeededDefaults: true };
+}
+
+export function portablePromptPlanPayload(plan: PortablePromptImportPlan): string {
+  return JSON.stringify({
+    version: 1,
+    entries: plan.entries,
+    defaultPersonaId: plan.defaultPersonaId,
+    hasSeededDefaults: plan.hasSeededDefaults,
+  });
+}
+
+/** Applies a prompt plan whose byte-identical payload Rust already committed. */
+export function applyPortablePromptImportPlan(plan: PortablePromptImportPlan): void {
+  usePromptStore.setState({
+    entries: plan.entries,
+    defaultPersonaId: plan.defaultPersonaId,
+    hasSeededDefaults: true,
+    persistError: null,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +626,21 @@ export const usePromptStore = create<PromptStore>((set, get) => ({
     return added;
   },
 
+  importPortableEntries: (incoming, requestedDefault, mode) => {
+    let added = 0;
+    set((state) => {
+      const plan = planPortablePromptImport(state, incoming, requestedDefault, mode);
+      added = plan.added;
+      persist(plan.entries, plan.defaultPersonaId, true);
+      return {
+        entries: plan.entries,
+        defaultPersonaId: plan.defaultPersonaId,
+        hasSeededDefaults: true,
+      };
+    });
+    return added;
+  },
+
   exportPayload: () => JSON.stringify({ version: 1, entries: get().entries }, null, 2),
 
   setDefaultPersona: (id) => {
@@ -568,6 +661,12 @@ export function selectPersonas(state: PromptStore): PromptEntry[] {
 /** Zustand selector: every saved snippet, in library order. */
 export function selectSnippets(state: PromptStore): PromptEntry[] {
   return state.entries.filter((e) => e.kind === "snippet");
+}
+
+/** User-authored procedural skills. Marketplace skills remain in the signed
+ * M4 package registry and are merged only at discovery time. */
+export function selectSkills(state: PromptStore): PromptEntry[] {
+  return state.entries.filter((e) => e.kind === "skill");
 }
 
 /** Finds the entry (if any) whose `command` matches exactly — used for

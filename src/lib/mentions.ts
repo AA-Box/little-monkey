@@ -6,6 +6,8 @@
  * string/array work.
  */
 
+import { wrapUntrustedContent } from './untrustedContent';
+
 /** Matches "@"-mention tokens in raw user text, e.g. "@src/lib/tools.ts". */
 const MENTION_REGEX = /@([^\s]+)/g;
 
@@ -79,8 +81,10 @@ export function truncateMentionContent(content: string): string {
  */
 export function composeReferencedText(userText: string, textRefs: ResolvedTextReference[]): string {
   if (textRefs.length === 0) return userText;
-  const sections = textRefs.map(({ path, isDir, content }) =>
-    isDir ? `### ${path}\n${content}` : `### ${path}\n\`\`\`\n${truncateMentionContent(content)}\n\`\`\``
-  );
+  const sections = textRefs.map(({ path, isDir, content }) => {
+    const bounded = isDir ? content : truncateMentionContent(content);
+    const rendered = isDir ? bounded : `\`\`\`\n${bounded}\n\`\`\``;
+    return `### ${path}\n${wrapUntrustedContent(isDir ? `workspace directory ${path}` : `workspace file ${path}`, rendered)}`;
+  });
   return `Referenced files:\n\n${sections.join('\n\n')}\n\n---\n\n${userText}`;
 }

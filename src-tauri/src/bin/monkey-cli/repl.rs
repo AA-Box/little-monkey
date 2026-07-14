@@ -19,6 +19,7 @@ use crate::chat::{self, Target};
 use crate::cmds;
 use crate::ollama_api;
 use crate::permission::{PermissionMode, TerminalPermissions};
+use crate::skills_cli::{self, CliSkill};
 
 /// One read from the line source. `Interrupted` (Ctrl-C) only occurs on the
 /// rustyline path; the plain reader maps everything unusual to `Eof`.
@@ -44,7 +45,9 @@ impl Reader {
                 if let Some(path) = &path {
                     let _ = editor.load_history(path);
                 }
-                return Self { editor: Some((editor, path)) };
+                return Self {
+                    editor: Some((editor, path)),
+                };
             }
         }
         Self { editor: None }
@@ -101,6 +104,7 @@ pub async fn run(
     mode: PermissionMode,
     mut options: chat::ChatOptions,
     initial_persona: Option<PromptEntry>,
+    skills: Vec<CliSkill>,
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
 ) {
@@ -144,6 +148,44 @@ pub async fn run(
         }
 
         if trimmed.starts_with('/') {
+            let slash_command = trimmed
+                .strip_prefix('/')
+                .and_then(|value| value.split_whitespace().next())
+                .unwrap_or_default();
+            if skills.iter().any(|skill| skill.command == slash_command) {
+                if !keep_history {
+                    truncate_to_system(&mut history);
+                }
+                let mut skill_options = options.clone();
+                skill_options.system = match skills_cli::compose_for_prompt(
+                    options.system.as_deref(),
+                    trimmed,
+                    &skills,
+                ) {
+                    Ok(system) => system,
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        continue;
+                    }
+                };
+                if let Err(error) = agent::run_turn(
+                    client,
+                    &target,
+                    state,
+                    &mut perms,
+                    &mut history,
+                    &skill_options,
+                    trimmed,
+                    mcp_entries,
+                    attached_stacks,
+                )
+                .await
+                {
+                    eprintln!("\nError: {error}");
+                }
+                println!();
+                continue;
+            }
             let result = handle_command(
                 client,
                 state,
@@ -153,6 +195,7 @@ pub async fn run(
                 &mut keep_history,
                 &mut system_base,
                 &mut persona,
+                &skills,
                 trimmed,
             )
             .await;
@@ -221,7 +264,12 @@ fn read_prompt_text(first: &str, mut next_line: impl FnMut(&str) -> ReadOutcome)
 
 /// Drops everything from the conversation except a leading system message.
 fn truncate_to_system(history: &mut Vec<serde_json::Value>) {
-    let keep = usize::from(history.first().map(|m| m["role"] == "system").unwrap_or(false));
+    let keep = usize::from(
+        history
+            .first()
+            .map(|m| m["role"] == "system")
+            .unwrap_or(false),
+    );
     history.truncate(keep);
 }
 
@@ -236,6 +284,7 @@ async fn handle_command(
     keep_history: &mut bool,
     system_base: &mut Option<String>,
     persona: &mut Option<PromptEntry>,
+    skills: &[CliSkill],
     line: &str,
 ) -> Result<(), String> {
     let (cmd, rest) = split_first_word(line);
@@ -252,7 +301,14 @@ async fn handle_command(
             println!("Cleared session context");
             Ok(())
         }
-        "/set" => handle_set(options, keep_history, target.is_native(), system_base, persona, rest),
+        "/set" => handle_set(
+            options,
+            keep_history,
+            target.is_native(),
+            system_base,
+            persona,
+            rest,
+        ),
         "/show" => handle_show(client, target, options, rest).await,
         "/save" => handle_save(client, target, options, rest).await,
         "/load" => handle_load(client, target, rest).await,
@@ -260,6 +316,20 @@ async fn handle_command(
         "/persona" => handle_persona(options, system_base, persona, rest),
         "/prompts" => {
             print_prompts();
+            Ok(())
+        }
+        "/skills" => {
+            if skills.is_empty() {
+                println!("No eligible skills are enabled.");
+            } else {
+                println!("Enabled skills:");
+                for skill in skills {
+                    println!(
+                        "  /{:<24} {} [{} {}]",
+                        skill.command, skill.name, skill.source, skill.version
+                    );
+                }
+            }
             Ok(())
         }
         "/verify" => handle_verify(state, rest).await,
@@ -288,7 +358,12 @@ async fn handle_verify(state: &AppState, rest: &str) -> Result<(), String> {
             println!("Running \"{}\"...", cmd.label);
             let result = little_monkey_lib::verify::run_command_impl(state, &root, cmd, None).await;
             let ok = !result.timed_out && result.code == Some(0);
-            println!("{} — {} ({} ms)", result.label, if ok { "PASS" } else { "FAIL" }, result.duration_ms);
+            println!(
+                "{} — {} ({} ms)",
+                result.label,
+                if ok { "PASS" } else { "FAIL" },
+                result.duration_ms
+            );
             if !ok {
                 let stdout = result.stdout.trim();
                 let stderr = result.stderr.trim();
@@ -313,7 +388,10 @@ async fn handle_verify(state: &AppState, rest: &str) -> Result<(), String> {
     println!("Configured verification commands:");
     for cmd in &commands {
         let mark = if cmd.enabled { "x" } else { " " };
-        println!("  [{mark}] {:<8} {:<20} {}", cmd.kind, cmd.label, cmd.command);
+        println!(
+            "  [{mark}] {:<8} {:<20} {}",
+            cmd.kind, cmd.label, cmd.command
+        );
     }
     println!("\nUse /verify run to run the enabled commands now.");
     Ok(())
@@ -362,7 +440,10 @@ fn print_prompts() {
     }
     for entry in &entries {
         let desc = entry.description.as_deref().unwrap_or("");
-        println!("  {:<8} /{:<20} {}  {}", entry.kind, entry.command, entry.name, desc);
+        println!(
+            "  {:<8} /{:<20} {}  {}",
+            entry.kind, entry.command, entry.name, desc
+        );
     }
 }
 
@@ -418,7 +499,8 @@ fn handle_set(
                 return Err("Usage: /set system <message>".to_string());
             }
             *system_base = Some(strip_wrapping_quotes(rest).to_string());
-            options.system = crate::compose_persona_and_system(persona.as_ref(), system_base.as_deref());
+            options.system =
+                crate::compose_persona_and_system(persona.as_ref(), system_base.as_deref());
             println!("Set system message.");
             Ok(())
         }
@@ -478,7 +560,9 @@ fn handle_set(
             println!("Disabled history.");
             Ok(())
         }
-        other => Err(format!("Unknown /set option '{other}'. Type /set for options")),
+        other => Err(format!(
+            "Unknown /set option '{other}'. Type /set for options"
+        )),
     }
 }
 
@@ -494,7 +578,8 @@ fn set_parameter(
     }
     let first = values[0];
     let as_f64 = |v: &str| {
-        v.parse::<f64>().map_err(|_| format!("Invalid value '{v}' for '{name}' (expected a number)"))
+        v.parse::<f64>()
+            .map_err(|_| format!("Invalid value '{v}' for '{name}' (expected a number)"))
     };
     let as_i64 = |v: &str| {
         v.parse::<i64>()
@@ -512,7 +597,10 @@ fn set_parameter(
         }
         "num_predict" => options.num_predict = Some(as_i64(first)?),
         "stop" => {
-            options.stop = values.iter().map(|v| strip_wrapping_quotes(v).to_string()).collect()
+            options.stop = values
+                .iter()
+                .map(|v| strip_wrapping_quotes(v).to_string())
+                .collect()
         }
         other => {
             return Err(format!(
@@ -537,7 +625,11 @@ async fn handle_show(
         return Ok(());
     }
     let model = match target {
-        Target::Local { model, native_ollama: true, .. } => model.clone().unwrap_or_default(),
+        Target::Local {
+            model,
+            native_ollama: true,
+            ..
+        } => model.clone().unwrap_or_default(),
         Target::Provider { provider_id, model } => {
             if sub == "info" {
                 println!("  Target\n    provider    {provider_id}\n    model       {model}");
@@ -545,7 +637,9 @@ async fn handle_show(
             }
             return Err(format!("'/show {sub}' requires an Ollama target"));
         }
-        Target::Local { base_url, model, .. } => {
+        Target::Local {
+            base_url, model, ..
+        } => {
             if sub == "info" {
                 println!(
                     "  Target\n    endpoint    {base_url} (OpenAI-compatible)\n    model       {}",
@@ -571,7 +665,9 @@ async fn handle_show(
         },
         "license" => cmds::show(client, &model, false, false, false, false, true).await,
         "modelfile" => cmds::show(client, &model, true, false, false, false, false).await,
-        other => Err(format!("Unknown /show option '{other}'. Type /show for options")),
+        other => Err(format!(
+            "Unknown /show option '{other}'. Type /show for options"
+        )),
     }
 }
 
@@ -587,7 +683,12 @@ async fn handle_save(
     if name.is_empty() {
         return Err("Usage: /save <modelname>".to_string());
     }
-    let Target::Local { model, native_ollama: true, .. } = target else {
+    let Target::Local {
+        model,
+        native_ollama: true,
+        ..
+    } = target
+    else {
         return Err("/save requires an Ollama target".to_string());
     };
     let mut parameters = serde_json::Map::new();
@@ -613,7 +714,11 @@ async fn handle_save(
         model: name.to_string(),
         from: Some(model.clone().unwrap_or_default()),
         system: options.system.clone(),
-        parameters: if parameters.is_empty() { None } else { Some(parameters) },
+        parameters: if parameters.is_empty() {
+            None
+        } else {
+            Some(parameters)
+        },
         stream: true,
         ..Default::default()
     };
@@ -633,13 +738,24 @@ async fn handle_load(
     if name.is_empty() {
         return Err("Usage: /load <modelname>".to_string());
     }
-    let Target::Local { model, native_ollama: true, .. } = target else {
+    let Target::Local {
+        model,
+        native_ollama: true,
+        ..
+    } = target
+    else {
         return Err("/load requires an Ollama target".to_string());
     };
     let tags = ollama_api::tags(client).await?;
-    let want = if name.contains(':') { name.to_string() } else { format!("{name}:latest") };
+    let want = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("{name}:latest")
+    };
     if !tags.models.iter().any(|m| m.name == want) {
-        return Err(format!("model '{name}' not found — run: monkey-cli pull {name}"));
+        return Err(format!(
+            "model '{name}' not found — run: monkey pull {name}"
+        ));
     }
     *model = Some(want.clone());
     println!("Loading model '{want}'");
@@ -676,7 +792,9 @@ fn print_help() {
   /load <model>    Switch to a different local model (keeps the conversation)
   /revert [id]     Restore a checkpoint's files (defaults to the most recent)
   /persona <cmd>   Set the active persona (/persona clear to remove)
-  /prompts         List saved personas and snippets
+  /prompts         List saved personas, snippets, and local prompt skills
+  /skills          List eligible native, local, and signed-package skills
+  /<skill> [args]  Invoke an enabled skill for exactly one turn
   /verify          List this workspace's configured verification commands
   /verify run      Run the enabled verification commands now
   /clear           Clear session context
@@ -748,7 +866,10 @@ mod tests {
         assert_eq!(split_first_word(""), ("", ""));
         assert_eq!(split_first_word("  "), ("", ""));
         assert_eq!(split_first_word("word"), ("word", ""));
-        assert_eq!(split_first_word("set parameter temperature"), ("set", "parameter temperature"));
+        assert_eq!(
+            split_first_word("set parameter temperature"),
+            ("set", "parameter temperature")
+        );
         assert_eq!(split_first_word("  a   b c  "), ("a", "b c"));
     }
 
@@ -808,33 +929,129 @@ mod tests {
         let mut system_base: Option<String> = None;
         let persona: Option<PromptEntry> = None;
 
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "verbose").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "verbose",
+        )
+        .unwrap();
         assert!(options.verbose);
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "quiet").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "quiet",
+        )
+        .unwrap();
         assert!(!options.verbose);
 
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "nohistory").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "nohistory",
+        )
+        .unwrap();
         assert!(!keep_history);
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "history").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "history",
+        )
+        .unwrap();
         assert!(keep_history);
 
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "think low").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "think low",
+        )
+        .unwrap();
         assert_eq!(options.think, Some(serde_json::json!("low")));
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "think").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "think",
+        )
+        .unwrap();
         assert_eq!(options.think, Some(serde_json::json!(true)));
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "nothink").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "nothink",
+        )
+        .unwrap();
         assert_eq!(options.think, Some(serde_json::json!(false)));
 
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "format json").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "format json",
+        )
+        .unwrap();
         assert_eq!(options.format, Some(serde_json::json!("json")));
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "noformat").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "noformat",
+        )
+        .unwrap();
         assert_eq!(options.format, None);
 
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "system \"You are terse.\"").unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "system \"You are terse.\"",
+        )
+        .unwrap();
         assert_eq!(options.system.as_deref(), Some("You are terse."));
 
-        assert!(handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "bogus on").is_err());
-        assert!(handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "system").is_err());
+        assert!(handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "bogus on"
+        )
+        .is_err());
+        assert!(handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "system"
+        )
+        .is_err());
     }
 
     fn stub_persona(name: &str, content: &str) -> PromptEntry {
@@ -860,8 +1077,15 @@ mod tests {
         let mut system_base: Option<String> = None;
         let persona = Some(stub_persona("Terse", "Be brief."));
 
-        handle_set(&mut options, &mut keep_history, true, &mut system_base, &persona, "system \"Reply in French.\"")
-            .unwrap();
+        handle_set(
+            &mut options,
+            &mut keep_history,
+            true,
+            &mut system_base,
+            &persona,
+            "system \"Reply in French.\"",
+        )
+        .unwrap();
 
         assert_eq!(system_base.as_deref(), Some("Reply in French."));
         let system = options.system.as_deref().unwrap();
@@ -956,6 +1180,9 @@ mod tests {
         assert_eq!(read_prompt_text("\"\"\"", scripted(lines)), None);
 
         let lines = vec![ReadOutcome::Line("kept".to_string()), ReadOutcome::Eof];
-        assert_eq!(read_prompt_text("\"\"\"", scripted(lines)), Some("kept".to_string()));
+        assert_eq!(
+            read_prompt_text("\"\"\"", scripted(lines)),
+            Some("kept".to_string())
+        );
     }
 }

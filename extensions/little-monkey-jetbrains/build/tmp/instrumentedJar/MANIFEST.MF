@@ -1,0 +1,14 @@
+Manifest-Version: 1.0
+Created-By: Gradle 9.6.1
+Version: 0.1.0
+Build-JVM: 21.0.9 (JetBrains s.r.o. 21.0.9+10-b1038.75)
+Build-OS: Mac OS X 26.5.1 aarch64
+Build-Plugin: IntelliJ Platform Gradle Plugin
+Build-Plugin-Version: 2.18.1
+Platform-Type: IU
+Platform-Version: 2025.1.7
+Platform-Build: 251.29188.11
+Kotlin-Available: false
+Kotlin-Stdlib-Bundled: false
+Kotlin-Version: null
+

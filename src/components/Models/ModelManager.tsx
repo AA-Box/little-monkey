@@ -87,7 +87,7 @@ export function ModelManager() {
   );
 
   return (
-    <div className="flex flex-col gap-2 p-2">
+    <div className="flex flex-col gap-2 py-2">
       <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border bg-background px-3 py-2.5">
         <input
           type="checkbox"

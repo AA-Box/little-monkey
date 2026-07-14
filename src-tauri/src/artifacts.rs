@@ -127,13 +127,23 @@ pub fn publish_impl(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
-    artifacts.insert(id.clone(), PublishedArtifact { content, mime, seq: next_seq() });
+    artifacts.insert(
+        id.clone(),
+        PublishedArtifact {
+            content,
+            mime,
+            seq: next_seq(),
+        },
+    );
     Ok(id)
 }
 
 /// Removes the `n` oldest entries (by publish order) from `artifacts`.
 fn evict_oldest(artifacts: &mut HashMap<String, PublishedArtifact>, n: usize) {
-    let mut ids: Vec<(String, u64)> = artifacts.iter().map(|(id, a)| (id.clone(), a.seq)).collect();
+    let mut ids: Vec<(String, u64)> = artifacts
+        .iter()
+        .map(|(id, a)| (id.clone(), a.seq))
+        .collect();
     ids.sort_by_key(|(_, seq)| *seq);
     for (id, _) in ids.into_iter().take(n) {
         artifacts.remove(&id);
@@ -156,8 +166,15 @@ pub fn remove_impl(artifacts: &mut HashMap<String, PublishedArtifact>, id: &str)
 /// open/refresh (see the design doc's LIFECYCLE section) rather than
 /// updating an existing entry in place.
 #[tauri::command]
-pub fn artifact_publish(state: tauri::State<'_, AppState>, content: String, kind: String) -> Result<String, String> {
-    let mut artifacts = state.artifacts.lock().map_err(|_| "Artifact lock poisoned".to_string())?;
+pub fn artifact_publish(
+    state: tauri::State<'_, AppState>,
+    content: String,
+    kind: String,
+) -> Result<String, String> {
+    let mut artifacts = state
+        .artifacts
+        .lock()
+        .map_err(|_| "Artifact lock poisoned".to_string())?;
     publish_impl(&mut artifacts, content, &kind)
 }
 
@@ -167,7 +184,10 @@ pub fn artifact_publish(state: tauri::State<'_, AppState>, content: String, kind
 /// id — see [`remove_impl`]'s doc comment.
 #[tauri::command]
 pub fn artifact_remove(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut artifacts = state.artifacts.lock().map_err(|_| "Artifact lock poisoned".to_string())?;
+    let mut artifacts = state
+        .artifacts
+        .lock()
+        .map_err(|_| "Artifact lock poisoned".to_string())?;
     remove_impl(&mut artifacts, &id);
     Ok(())
 }
@@ -269,18 +289,35 @@ mod tests {
         let response = handle_request(&state, &request_for(&format!("/{}", id)));
         assert_eq!(response.status(), 200);
         assert_eq!(response.body(), &b"<h1>hi</h1>".to_vec());
-        assert_eq!(response.headers().get("Content-Type").unwrap(), "text/html; charset=utf-8");
-        assert_eq!(response.headers().get("X-Content-Type-Options").unwrap(), "nosniff");
-        let csp = response.headers().get("Content-Security-Policy").unwrap().to_str().unwrap();
+        assert_eq!(
+            response.headers().get("Content-Type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get("X-Content-Type-Options").unwrap(),
+            "nosniff"
+        );
+        let csp = response
+            .headers()
+            .get("Content-Security-Policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(csp.contains("default-src 'none'"));
-        assert!(csp.contains("connect-src 'none'"), "connect-src 'none' is what blocks network exfiltration");
+        assert!(
+            csp.contains("connect-src 'none'"),
+            "connect-src 'none' is what blocks network exfiltration"
+        );
         assert!(csp.contains("script-src 'unsafe-inline'"));
     }
 
     #[test]
     fn unknown_id_is_404() {
         let state = AppState::default();
-        let response = handle_request(&state, &request_for("/00000000-0000-4000-8000-000000000000"));
+        let response = handle_request(
+            &state,
+            &request_for("/00000000-0000-4000-8000-000000000000"),
+        );
         assert_eq!(response.status(), 404);
     }
 
@@ -322,9 +359,19 @@ mod tests {
 
         let newest = publish_impl(&mut artifacts, "one more".to_string(), "html").unwrap();
 
-        assert_eq!(artifacts.len(), MAX_ARTIFACTS, "total count must stay capped");
-        assert!(!artifacts.contains_key(&ids[0]), "the oldest entry must have been evicted");
-        assert!(artifacts.contains_key(&ids[MAX_ARTIFACTS - 1]), "the second-oldest entry must survive");
+        assert_eq!(
+            artifacts.len(),
+            MAX_ARTIFACTS,
+            "total count must stay capped"
+        );
+        assert!(
+            !artifacts.contains_key(&ids[0]),
+            "the oldest entry must have been evicted"
+        );
+        assert!(
+            artifacts.contains_key(&ids[MAX_ARTIFACTS - 1]),
+            "the second-oldest entry must survive"
+        );
         assert!(artifacts.contains_key(&newest));
     }
 
@@ -358,7 +405,8 @@ mod tests {
     #[test]
     fn capability_config_grants_no_scheme_access() {
         let raw = include_str!("../capabilities/default.json");
-        let parsed: serde_json::Value = serde_json::from_str(raw).expect("capabilities/default.json must be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("capabilities/default.json must be valid JSON");
 
         assert!(
             parsed.get("remote").is_none(),
@@ -366,7 +414,9 @@ mod tests {
              extend this capability's permissions (including IPC) to a non-app-origin frame like artifact://"
         );
 
-        let windows = parsed["windows"].as_array().expect("default.json must list \"windows\"");
+        let windows = parsed["windows"]
+            .as_array()
+            .expect("default.json must list \"windows\"");
         for w in windows {
             let label = w.as_str().unwrap_or("");
             assert!(

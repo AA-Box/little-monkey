@@ -3,6 +3,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
+import type { RecipeSchedulerAuthority } from "../lib/recipeScheduleClient";
+
 /** Emitted by the backend after a successful `automations_save` (see
  * src-tauri/src/automations.rs), with the saving window's label as payload —
  * same cross-window sync mechanism as `promptStore.ts`/`sessionStore.ts`. */
@@ -44,15 +46,34 @@ interface PersistedShape {
   entries: AutomationEntry[];
 }
 
+export interface SchedulerRuntimeState {
+  authority: RecipeSchedulerAuthority | "unknown";
+  daemonRunning: boolean;
+  synchronizedAtMs: number | null;
+  syncError: string | null;
+  issues: Record<string, string>;
+  lastDeliveryAtMs: Record<string, number>;
+}
+
 export interface AutomationsStore {
   entries: AutomationEntry[];
+  /** Last snapshot successfully loaded from or committed to Rust. Scheduler
+   * authority is reconciled from this durable set, never from optimistic UI
+   * edits that may still fail to save. */
+  persistedEntries: AutomationEntry[];
   persistError: string | null;
+  /** True only after the authoritative automations file was read
+   * successfully. The scheduler fails closed while this is false so a
+   * transient load error cannot erase daemon triggers. */
+  hydrated: boolean;
+  scheduler: SchedulerRuntimeState;
   addEntry: (input: Omit<AutomationEntry, "id">) => AutomationEntry;
   updateEntry: (id: string, patch: Partial<Omit<AutomationEntry, "id">>) => void;
   removeEntry: (id: string) => void;
   /** Records the outcome of a scheduler-driven run — called by
    * `scheduler.ts` after every attempt, success or failure. */
   recordRun: (id: string, status: AutomationRunStatus, sessionId?: string) => void;
+  setSchedulerRuntime: (runtime: SchedulerRuntimeState) => void;
 }
 
 function normalizeEntry(raw: Partial<AutomationEntry>): AutomationEntry | null {
@@ -90,6 +111,7 @@ function parsePersisted(raw: string | null): PersistedShape | null {
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingPayload: string | null = null;
+let persistQueue: Promise<void> = Promise.resolve();
 
 function flushPersist(): void {
   if (persistTimer !== null) {
@@ -100,15 +122,23 @@ function flushPersist(): void {
   pendingPayload = null;
   if (payload === null) return;
 
-  invoke("automations_save", { payload })
-    .then(() => {
-      if (useAutomationsStore.getState().persistError !== null) {
-        useAutomationsStore.setState({ persistError: null });
-      }
-    })
-    .catch((err: unknown) => {
+  const persisted = parsePersisted(payload)?.entries ?? [];
+  persistQueue = persistQueue.then(async () => {
+    try {
+      await invoke("automations_save", { payload });
+      useAutomationsStore.setState({ persistedEntries: persisted, persistError: null });
+    } catch (err) {
       useAutomationsStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
-    });
+    }
+  });
+}
+
+/** Flushes the latest optimistic snapshot through the Rust durability
+ * boundary and waits until its persisted mirror is settled. The scheduler
+ * observes that mirror, so failed writes can never leak into daemon state. */
+export async function flushAutomationsPersistence(): Promise<void> {
+  flushPersist();
+  await persistQueue;
 }
 
 function persist(entries: AutomationEntry[]): void {
@@ -133,11 +163,22 @@ async function rehydrateFromFile(): Promise<void> {
   try {
     const raw = await invoke<string | null>("automations_load");
     fromFile = parsePersisted(raw);
+    if (raw !== null && !fromFile) {
+      useAutomationsStore.setState({
+        hydrated: false,
+        persistError: "Saved automations are invalid; daemon schedules were left unchanged.",
+      });
+      return;
+    }
   } catch {
     return;
   }
-  if (!fromFile) return;
-  useAutomationsStore.setState({ entries: fromFile.entries });
+  useAutomationsStore.setState({
+    entries: fromFile?.entries ?? [],
+    persistedEntries: fromFile?.entries ?? [],
+    hydrated: true,
+    persistError: null,
+  });
 }
 
 let subscribed = false;
@@ -162,17 +203,40 @@ export async function hydrateAutomations(): Promise<void> {
   try {
     const raw = await invoke<string | null>("automations_load");
     const fromFile = parsePersisted(raw);
-    if (fromFile) {
-      useAutomationsStore.setState({ entries: fromFile.entries });
+    if (raw !== null && !fromFile) {
+      useAutomationsStore.setState({
+        hydrated: false,
+        persistError: "Saved automations are invalid; daemon schedules were left unchanged.",
+      });
+      return;
     }
+    useAutomationsStore.setState({
+      entries: fromFile?.entries ?? [],
+      persistedEntries: fromFile?.entries ?? [],
+      hydrated: true,
+      persistError: null,
+    });
   } catch (err) {
-    useAutomationsStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    useAutomationsStore.setState({
+      hydrated: false,
+      persistError: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
 export const useAutomationsStore = create<AutomationsStore>((set) => ({
   entries: [],
+  persistedEntries: [],
   persistError: null,
+  hydrated: false,
+  scheduler: {
+    authority: "unknown",
+    daemonRunning: false,
+    synchronizedAtMs: null,
+    syncError: null,
+    issues: {},
+    lastDeliveryAtMs: {},
+  },
 
   addEntry: (input) => {
     const entry: AutomationEntry = { id: crypto.randomUUID(), ...input };
@@ -212,4 +276,6 @@ export const useAutomationsStore = create<AutomationsStore>((set) => ({
       return { entries };
     });
   },
+
+  setSchedulerRuntime: (scheduler) => set({ scheduler }),
 }));

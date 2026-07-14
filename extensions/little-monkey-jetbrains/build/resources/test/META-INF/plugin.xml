@@ -1,0 +1,24 @@
+<idea-plugin>
+  <idea-version since-build="251" />
+  <version>0.1.0</version>
+  <id>app.littlemonkey.jetbrains</id>
+  <name>Little Monkey</name>
+  <vendor url="https://github.com/sarollahi">Little Monkey</vendor>
+  <description><![CDATA[Thin ACP v1 client for Little Monkey. Agent execution, permissions,
+      checkpoints, verification, and cancellation remain in Little Monkey.]]></description>
+  <depends>com.intellij.modules.platform</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <projectConfigurable id="app.littlemonkey.jetbrains.settings" parentId="tools" displayName="Little Monkey" instance="app.littlemonkey.jetbrains.LittleMonkeyConfigurable" />
+    <notificationGroup id="Little Monkey" displayType="BALLOON" isLogByDefault="true" />
+  </extensions>
+  <actions>
+    <group id="LittleMonkey.Actions" text="Little Monkey" popup="true">
+      <add-to-group group-id="EditorPopupMenu" anchor="last" />
+      <action id="LittleMonkey.Ask" class="app.littlemonkey.jetbrains.actions.AskAction" text="Ask About Active Editor" description="Send active file, selection, and diagnostics through ACP" />
+      <action id="LittleMonkey.ReviewProblems" class="app.littlemonkey.jetbrains.actions.ReviewProblemsAction" text="Review Problems" description="Review current editor diagnostics through ACP" />
+      <separator />
+      <action id="LittleMonkey.Cancel" class="app.littlemonkey.jetbrains.actions.CancelAction" text="Cancel Active Run" />
+      <action id="LittleMonkey.OpenRun" class="app.littlemonkey.jetbrains.actions.OpenRunAction" text="Show Attach Command" />
+    </group>
+  </actions>
+</idea-plugin>

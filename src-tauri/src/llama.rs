@@ -99,7 +99,10 @@ impl LlamaState {
     /// `pub` so `monkey-cli`'s `embed_cli` module can build its own throwaway
     /// `LlamaState` for the one-off spawn it performs per CLI invocation.
     pub fn for_embeddings() -> Self {
-        LlamaState { port: EMBED_PORT, ..Self::default() }
+        LlamaState {
+            port: EMBED_PORT,
+            ..Self::default()
+        }
     }
 }
 
@@ -117,7 +120,10 @@ pub fn find_llama_server_binary() -> Result<String, String> {
         }
     }
 
-    for candidate in ["/opt/homebrew/bin/llama-server", "/usr/local/bin/llama-server"] {
+    for candidate in [
+        "/opt/homebrew/bin/llama-server",
+        "/usr/local/bin/llama-server",
+    ] {
         if Path::new(candidate).exists() {
             return Ok(candidate.to_string());
         }
@@ -135,7 +141,13 @@ pub fn find_llama_server_binary() -> Result<String, String> {
 
 /// Emit a status event (`llama://status` or `embed://status`) to all windows
 /// with the current status snapshot.
-fn emit_status(app: &AppHandle, event_name: &str, status: &str, port: u16, model_path: &Option<String>) {
+fn emit_status(
+    app: &AppHandle,
+    event_name: &str,
+    status: &str,
+    port: u16,
+    model_path: &Option<String>,
+) {
     let _ = app.emit(
         event_name,
         json!({
@@ -176,7 +188,13 @@ async fn spawn_and_wait_healthy(
         guard.status = "starting".to_string();
         guard.model_path = Some(model_path.to_string());
     }
-    emit_status(app, event_name, "starting", port, &Some(model_path.to_string()));
+    emit_status(
+        app,
+        event_name,
+        "starting",
+        port,
+        &Some(model_path.to_string()),
+    );
 
     let mut command = Command::new(binary);
     command.args(args);
@@ -192,7 +210,13 @@ async fn spawn_and_wait_healthy(
             let mut guard = state.lock().map_err(|e| e.to_string())?;
             guard.status = "error".to_string();
             drop(guard);
-            emit_status(app, event_name, "error", port, &Some(model_path.to_string()));
+            emit_status(
+                app,
+                event_name,
+                "error",
+                port,
+                &Some(model_path.to_string()),
+            );
             return Err(format!("Failed to spawn llama-server: {e}"));
         }
     };
@@ -251,11 +275,18 @@ async fn spawn_and_wait_healthy(
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.status = "ready".to_string();
         drop(guard);
-        emit_status(app, event_name, "ready", port, &Some(model_path.to_string()));
+        emit_status(
+            app,
+            event_name,
+            "ready",
+            port,
+            &Some(model_path.to_string()),
+        );
         Ok(())
     } else {
-        let error_message =
-            failure.unwrap_or_else(|| "Timed out waiting for llama-server to become healthy after 60s".to_string());
+        let error_message = failure.unwrap_or_else(|| {
+            "Timed out waiting for llama-server to become healthy after 60s".to_string()
+        });
 
         {
             let mut guard = state.lock().map_err(|e| e.to_string())?;
@@ -266,7 +297,13 @@ async fn spawn_and_wait_healthy(
             guard.status = "error".to_string();
         }
 
-        emit_status(app, event_name, "error", port, &Some(model_path.to_string()));
+        emit_status(
+            app,
+            event_name,
+            "error",
+            port,
+            &Some(model_path.to_string()),
+        );
         Err(error_message)
     }
 }
@@ -307,7 +344,16 @@ pub async fn llama_start(
         args.push("--embeddings".into());
     }
 
-    spawn_and_wait_healthy(&app, &state.llama, "llama://status", &binary, &args, port, &model_path).await
+    spawn_and_wait_healthy(
+        &app,
+        &state.llama,
+        "llama://status",
+        &binary,
+        &args,
+        port,
+        &model_path,
+    )
+    .await
 }
 
 /// Kill the managed chat `llama-server` process, if any, and mark it stopped.
@@ -348,12 +394,24 @@ pub fn llama_status(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 /// ready — a `/health` 200 alone doesn't prove that (see
 /// `spawn_and_wait_healthy`'s doc comment).
 #[tauri::command]
-pub async fn embed_server_start(app: AppHandle, state: State<'_, AppState>, model_path: String) -> Result<(), String> {
+pub async fn embed_server_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model_path: String,
+) -> Result<(), String> {
     let binary = find_llama_server_binary()?;
     let args = embed_server_args(&model_path);
 
-    spawn_and_wait_healthy(&app, &state.embed_llama, "embed://status", &binary, &args, EMBED_PORT, &model_path)
-        .await?;
+    spawn_and_wait_healthy(
+        &app,
+        &state.embed_llama,
+        "embed://status",
+        &binary,
+        &args,
+        EMBED_PORT,
+        &model_path,
+    )
+    .await?;
 
     let client = reqwest::Client::new();
     let verify = client
@@ -372,7 +430,13 @@ pub async fn embed_server_start(app: AppHandle, state: State<'_, AppState>, mode
         }
         guard.status = "error".to_string();
         drop(guard);
-        emit_status(&app, "embed://status", "error", EMBED_PORT, &Some(model_path));
+        emit_status(
+            &app,
+            "embed://status",
+            "error",
+            EMBED_PORT,
+            &Some(model_path),
+        );
         return Err(
             "The embedding server process started but a test /v1/embeddings request failed — this build of \
              llama-server may not support --pooling mean, or may need a newer version."

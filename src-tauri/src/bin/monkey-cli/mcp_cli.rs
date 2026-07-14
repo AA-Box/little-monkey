@@ -51,6 +51,15 @@ pub fn load_enabled_servers() -> Vec<McpServerEntry> {
     }
 }
 
+/// Loads every configured entry with errors preserved. Immutable desktop
+/// turns use this stricter seam so a missing/corrupt config or a snapshotted
+/// server being removed becomes a visible run failure instead of silently
+/// shrinking the tool set.
+pub fn load_all_servers_strict() -> Result<Vec<McpServerEntry>, String> {
+    let path = config_path().ok_or("Could not resolve the MCP config path")?;
+    Ok(mcp::load_config_impl(&path)?.servers)
+}
+
 /// Connects every entry, one at a time. A server that fails to connect (or
 /// times out — see `mcp::CONNECT_TIMEOUT_SECS`; `connect_impl` itself has no
 /// internal timeout, so a hung handshake would otherwise stall the whole
@@ -69,7 +78,10 @@ pub async fn connect_all(state: &AppState, entries: &[McpServerEntry]) -> Vec<Mc
         .await;
         match outcome {
             Ok(Ok(_)) => connected.push(entry.clone()),
-            Ok(Err(e)) => eprintln!("Warning: MCP server '{}' failed to connect: {e}", entry.label),
+            Ok(Err(e)) => eprintln!(
+                "Warning: MCP server '{}' failed to connect: {e}",
+                entry.label
+            ),
             Err(_elapsed) => eprintln!(
                 "Warning: MCP server '{}' timed out while connecting (>{}s)",
                 entry.label,
@@ -78,6 +90,40 @@ pub async fn connect_all(state: &AppState, entries: &[McpServerEntry]) -> Vec<Mc
         }
     }
     connected
+}
+
+/// Connects an already validated immutable selection and fails the whole turn
+/// if any server cannot be restored. The ordinary CLI keeps its best-effort
+/// behavior above; only the desktop snapshot requires exact tool parity.
+pub async fn connect_all_strict(
+    state: &AppState,
+    entries: &[McpServerEntry],
+) -> Result<Vec<McpServerEntry>, String> {
+    let mut connected = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(mcp::CONNECT_TIMEOUT_SECS),
+            mcp::connect_impl(state, entry),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(_)) => connected.push(entry.clone()),
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "Snapshotted MCP server '{}' failed to connect: {error}",
+                    entry.id
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "Snapshotted MCP server '{}' timed out while connecting (>{}s)",
+                    entry.id,
+                    mcp::CONNECT_TIMEOUT_SECS
+                ));
+            }
+        }
+    }
+    Ok(connected)
 }
 
 /// Executes one `mcp__`-namespaced tool call end to end: permission-gates it
@@ -100,11 +146,15 @@ pub async fn call(
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<String, String> {
-    let pretty_args = serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| arguments.to_string());
+    let pretty_args =
+        serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| arguments.to_string());
     let detail = format!("{} → {}\n{}", entry.label, tool_name, pretty_args);
-    perms.request(&format!("mcp:{}:{}", entry.id, tool_name), &detail).await?;
+    perms
+        .request(&format!("mcp:{}:{}", entry.id, tool_name), &detail)
+        .await?;
 
-    let timeout = std::time::Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    let timeout =
+        std::time::Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
     let timeout_reason = async move {
         tokio::time::sleep(timeout).await;
         format!(
@@ -114,7 +164,8 @@ pub async fn call(
             timeout.as_secs()
         )
     };
-    let result = mcp::call_tool_with_cancel_impl(state, entry, tool_name, arguments, timeout_reason).await?;
+    let result =
+        mcp::call_tool_with_cancel_impl(state, entry, tool_name, arguments, timeout_reason).await?;
     Ok(format_call_tool_result(&result))
 }
 
@@ -162,7 +213,10 @@ mod tests {
 
     #[test]
     fn format_concatenates_text_blocks() {
-        let result = CallToolResult::success(vec![ContentBlock::text("hello"), ContentBlock::text("world")]);
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("hello"),
+            ContentBlock::text("world"),
+        ]);
         assert_eq!(format_call_tool_result(&result), "hello\nworld");
     }
 
@@ -185,7 +239,10 @@ mod tests {
     fn format_error_with_no_text_falls_back_to_generic_message() {
         let mut result = CallToolResult::error(vec![]);
         result.content = Vec::new();
-        assert_eq!(format_call_tool_result(&result), r#"{"error":"MCP tool call failed"}"#);
+        assert_eq!(
+            format_call_tool_result(&result),
+            r#"{"error":"MCP tool call failed"}"#
+        );
     }
 
     #[tokio::test]
@@ -205,7 +262,10 @@ mod tests {
         }];
 
         let connected = connect_all(&state, &entries).await;
-        assert!(connected.is_empty(), "a failed connection must not be returned as connected");
+        assert!(
+            connected.is_empty(),
+            "a failed connection must not be returned as connected"
+        );
     }
 
     #[test]
@@ -223,7 +283,10 @@ mod tests {
             "monkey_cli_mcp_cli_test_{}_{}_{}",
             std::process::id(),
             name,
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ))
     }
 

@@ -1,0 +1,1269 @@
+use little_monkey_lib::compatibility_hub::{
+    ApiBackend, ApiScope, CompatibilityProtocol, LanEntropySource, LanServerPolicy,
+    LanStateProtector, PairingRequest, RateLimitPolicy, SecurityAuditKind, TlsPolicy,
+};
+use little_monkey_lib::m3_runtime_hub::*;
+use little_monkey_lib::runtime_adapter::{
+    AdvancedSettingCapability, EndpointOrigin, EndpointPolicy, HardwareSnapshot, ModelCapabilities,
+    PlatformCapabilities, ResidencyOwnership, RunningModel, RuntimeDescriptor, RuntimeInventory,
+    RuntimeLifecycleState, RuntimeLogTail, RuntimeModel, RuntimeStatus, SettingValue,
+    SettingValueSchema, RUNTIME_ADAPTER_SCHEMA_VERSION,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "m3-hub-{label}-{}-{}",
+            std::process::id(),
+            next_test_id()
+        ));
+        fs::create_dir_all(&path).expect("create test directory");
+        Self(path)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn next_test_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+struct FixedClock(AtomicU64);
+
+impl FixedClock {
+    fn new(start: u64) -> Self {
+        Self(AtomicU64::new(start))
+    }
+}
+
+impl M3Clock for FixedClock {
+    fn now_ms(&self) -> M3HubResult<u64> {
+        Ok(self.0.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+struct FixedHardware(HardwareSnapshot);
+
+impl M3HardwareProbe for FixedHardware {
+    fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
+        Ok(self.0.clone())
+    }
+}
+
+fn hardware() -> HardwareSnapshot {
+    HardwareSnapshot {
+        captured_at_ms: 1_000,
+        total_ram_bytes: 16 * 1024 * 1024 * 1024,
+        available_ram_bytes: 12 * 1024 * 1024 * 1024,
+        logical_cpu_count: 8,
+        platform: PlatformCapabilities::from_host("linux", "x86_64", Vec::new()),
+    }
+}
+
+struct StaticCatalog {
+    source_id: String,
+    entries: Vec<M3CatalogModel>,
+}
+
+impl M3CatalogSource for StaticCatalog {
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, Vec<M3CatalogModel>> {
+        Box::pin(async move {
+            Ok(self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .display_name
+                        .to_ascii_lowercase()
+                        .contains(&query.to_ascii_lowercase())
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        })
+    }
+}
+
+struct DownloadState {
+    bytes: Vec<u8>,
+    etag: String,
+    fail_once_at: Option<u64>,
+    offsets: Vec<u64>,
+}
+
+struct MutableDownload {
+    state: Mutex<DownloadState>,
+}
+
+impl MutableDownload {
+    fn new(bytes: Vec<u8>, etag: &str) -> Self {
+        Self {
+            state: Mutex::new(DownloadState {
+                bytes,
+                etag: etag.to_string(),
+                fail_once_at: None,
+                offsets: Vec::new(),
+            }),
+        }
+    }
+
+    fn set_payload(&self, bytes: Vec<u8>, etag: &str) {
+        let mut state = self.state.lock().expect("download state");
+        state.bytes = bytes;
+        state.etag = etag.to_string();
+        state.fail_once_at = None;
+    }
+
+    fn fail_once_at(&self, offset: u64) {
+        self.state.lock().expect("download state").fail_once_at = Some(offset);
+    }
+
+    fn offsets(&self) -> Vec<u64> {
+        self.state.lock().expect("download state").offsets.clone()
+    }
+}
+
+impl M3DownloadTransport for MutableDownload {
+    fn probe<'a>(
+        &'a self,
+        _url: &'a str,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, M3DownloadProbe> {
+        Box::pin(async move {
+            let state = self.state.lock().map_err(|_| M3HubError::LockPoisoned)?;
+            Ok(M3DownloadProbe {
+                total_bytes: state.bytes.len() as u64,
+                etag: Some(state.etag.clone()),
+                accepts_ranges: true,
+            })
+        })
+    }
+
+    fn read_range<'a>(
+        &'a self,
+        _url: &'a str,
+        offset: u64,
+        max_bytes: usize,
+        _expected_etag: Option<&'a str>,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, M3DownloadChunk> {
+        Box::pin(async move {
+            let mut state = self.state.lock().map_err(|_| M3HubError::LockPoisoned)?;
+            state.offsets.push(offset);
+            if state.fail_once_at == Some(offset) {
+                state.fail_once_at = None;
+                return Err(M3HubError::Transport(
+                    "injected one-shot range failure".to_string(),
+                ));
+            }
+            let start = usize::try_from(offset)
+                .map_err(|_| M3HubError::Transport("offset overflow".to_string()))?;
+            if start >= state.bytes.len() {
+                return Err(M3HubError::Transport("range starts past EOF".to_string()));
+            }
+            let end = start.saturating_add(max_bytes).min(state.bytes.len());
+            Ok(M3DownloadChunk {
+                offset,
+                total_bytes: state.bytes.len() as u64,
+                etag: Some(state.etag.clone()),
+                bytes: state.bytes[start..end].to_vec(),
+            })
+        })
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn payload(size: usize, seed: u8) -> Vec<u8> {
+    (0..size)
+        .map(|index| seed.wrapping_add((index % 251) as u8))
+        .collect()
+}
+
+fn catalog_model(bytes: &[u8], revision: &str) -> M3CatalogModel {
+    M3CatalogModel {
+        schema_version: M3_CATALOG_SCHEMA_VERSION,
+        source_id: "test-catalog".to_string(),
+        model_id: "local-model".to_string(),
+        display_name: "Local Model".to_string(),
+        runtime: M3RuntimeKind::LlamaCpp,
+        variant_id: "q4_k_m".to_string(),
+        revision: revision.to_string(),
+        quantization: Some("Q4_K_M".to_string()),
+        download_url: "https://models.example.test/local-model.gguf".to_string(),
+        sha256: sha256(bytes),
+        size_bytes: bytes.len() as u64,
+        estimated_ram_bytes: 1024 * 1024 * 1024,
+        estimated_vram_bytes: 0,
+        supported_os: BTreeSet::from(["linux".to_string()]),
+        supported_arch: BTreeSet::from(["x86_64".to_string()]),
+        required_accelerator: Some("cpu".to_string()),
+        capabilities: M3ModelCapabilities {
+            chat: true,
+            embeddings: false,
+            tool_calling: true,
+            vision: false,
+            structured_output: true,
+        },
+        license: M3ModelLicense {
+            name: "Apache-2.0".to_string(),
+            spdx_id: Some("Apache-2.0".to_string()),
+            source_url: "https://models.example.test/LICENSE".to_string(),
+            revision: revision.to_string(),
+            retrieved_at_ms: 1_000,
+            raw_declaration: "Apache License 2.0 test declaration".to_string(),
+        },
+        metadata: BTreeMap::from([("publisher".to_string(), "test".to_string())]),
+    }
+}
+
+fn test_config() -> M3HubConfig {
+    M3HubConfig {
+        schema_version: M3_HUB_SCHEMA_VERSION,
+        storage_quota_bytes: 16 * 1024 * 1024,
+        storage_reserve_bytes: 1024 * 1024,
+        download_chunk_bytes: 64 * 1024,
+        operation_timeout_ms: 10_000,
+        max_catalog_results: 100,
+    }
+}
+
+fn make_hub(
+    root: &Path,
+    download: Arc<dyn M3DownloadTransport>,
+    catalogs: Vec<Arc<dyn M3CatalogSource>>,
+    runtimes: Vec<Arc<dyn M3RuntimeDriver>>,
+    runtime_reconciler: Option<Arc<dyn M3RuntimeReconciler>>,
+    lan_factory: Option<Arc<dyn M3LanAccessFactory>>,
+) -> M3RuntimeHub {
+    M3RuntimeHub::new(
+        root,
+        test_config(),
+        M3RuntimeHubDependencies {
+            clock: Arc::new(FixedClock::new(10_000)),
+            hardware: Arc::new(FixedHardware(hardware())),
+            download,
+            catalogs,
+            runtimes,
+            runtime_reconciler,
+            lan_factory,
+        },
+    )
+    .expect("M3 hub")
+}
+
+#[tokio::test]
+async fn download_resumes_verifies_license_checksum_updates_and_deletes_atomically() {
+    let directory = TestDirectory::new("download");
+    let first_bytes = payload(160_000, 7);
+    let download = Arc::new(MutableDownload::new(first_bytes.clone(), "etag-v1"));
+    download.fail_once_at(64 * 1024);
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let model = catalog_model(&first_bytes, "rev-1");
+    let context = M3OperationContext::new(10_000);
+
+    let wrong_license = M3DownloadRequest {
+        model: model.clone(),
+        accepted_license_sha256: "0".repeat(64),
+    };
+    assert!(matches!(
+        hub.download_model(&wrong_license, &context).await,
+        Err(M3HubError::Forbidden(_))
+    ));
+    assert!(download.offsets().is_empty());
+
+    let request = M3DownloadRequest {
+        accepted_license_sha256: model.license.declaration_sha256(),
+        model: model.clone(),
+    };
+    assert!(matches!(
+        hub.download_model(&request, &context).await,
+        Err(M3HubError::Transport(_))
+    ));
+    assert_eq!(download.offsets(), vec![0, 64 * 1024]);
+    let partial = fs::read_dir(directory.0.join("downloads"))
+        .expect("downloads")
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+        .expect("partial file");
+    assert_eq!(
+        partial.metadata().expect("partial metadata").len(),
+        64 * 1024
+    );
+
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("resume verified download");
+    assert_eq!(installed.versions.len(), 1);
+    assert_eq!(
+        fs::read(&installed.versions[0].artifact_path).unwrap(),
+        first_bytes
+    );
+    assert!(download.offsets()[2..].starts_with(&[64 * 1024]));
+    assert!(hub.storage_status().expect("storage").used_bytes > model.size_bytes);
+    let first_version_key = installed.active_version_key.clone();
+
+    let second_bytes = payload(175_000, 19);
+    download.set_payload(second_bytes.clone(), "etag-v2");
+    let updated_model = catalog_model(&second_bytes, "rev-2");
+    let updated = hub
+        .update_model(
+            &model.asset_id(),
+            &M3DownloadRequest {
+                accepted_license_sha256: updated_model.license.declaration_sha256(),
+                model: updated_model,
+            },
+            &context,
+        )
+        .await
+        .expect("verified update");
+    assert_eq!(updated.versions.len(), 2);
+    let second_artifact_path = updated
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active update")
+        .artifact_path
+        .clone();
+    assert_eq!(
+        fs::read(
+            &updated
+                .versions
+                .iter()
+                .find(|version| version.active)
+                .expect("active update")
+                .artifact_path
+        )
+        .unwrap(),
+        second_bytes
+    );
+
+    let rolled_back = hub
+        .activate_model_version(
+            &M3ActivateModelVersionRequest {
+                asset_id: model.asset_id(),
+                version_key: first_version_key.clone(),
+            },
+            &context,
+        )
+        .await
+        .expect("activate verified prior version");
+    assert_eq!(rolled_back.active_version_key, first_version_key);
+    assert_eq!(
+        rolled_back
+            .versions
+            .iter()
+            .find(|version| version.active)
+            .unwrap()
+            .revision,
+        "rev-1"
+    );
+    assert!(matches!(
+        hub.prune_model_versions(
+            &M3PruneModelVersionsRequest {
+                asset_id: model.asset_id(),
+                confirmation: "yes".to_string(),
+            },
+            &context,
+        )
+        .await,
+        Err(M3HubError::Forbidden(_))
+    ));
+    let pruned = hub
+        .prune_model_versions(
+            &M3PruneModelVersionsRequest {
+                asset_id: model.asset_id(),
+                confirmation: format!("PRUNE {}", model.asset_id()),
+            },
+            &context,
+        )
+        .await
+        .expect("prune inactive version");
+    assert_eq!(pruned.versions.len(), 1);
+    assert_eq!(pruned.active_version_key, first_version_key);
+    assert!(!second_artifact_path.exists());
+
+    let interrupted = directory.0.join("downloads").join("fixture.partial");
+    fs::write(&interrupted, b"partial").expect("interrupted download");
+    let trash = directory.0.join("models").join(".trash-fixture");
+    fs::create_dir(&trash).expect("trash directory");
+    fs::write(trash.join("owned"), b"trash").expect("trash payload");
+    let asset_root = pruned.versions[0]
+        .artifact_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("asset root");
+    let staging = asset_root.join(".staging-fixture");
+    fs::create_dir(&staging).expect("staging directory");
+    fs::write(staging.join("owned"), b"stage").expect("staging payload");
+    let cleanup = hub
+        .cleanup_orphans("CLEAN ORPHANS", &context)
+        .await
+        .expect("bounded orphan cleanup");
+    assert_eq!(cleanup.removed_paths, 3);
+    assert!(cleanup.reclaimed_bytes >= 17);
+    assert!(!interrupted.exists());
+    assert!(!trash.exists());
+    assert!(!staging.exists());
+
+    assert!(matches!(
+        hub.delete_model(
+            &M3DeleteModelRequest {
+                asset_id: model.asset_id(),
+                confirmation: "yes".to_string(),
+            },
+            &context
+        )
+        .await,
+        Err(M3HubError::Forbidden(_))
+    ));
+    assert!(hub
+        .delete_model(
+            &M3DeleteModelRequest {
+                asset_id: model.asset_id(),
+                confirmation: format!("DELETE {}", model.asset_id()),
+            },
+            &context,
+        )
+        .await
+        .expect("delete"));
+    assert!(hub.list_installed_models().unwrap().is_empty());
+
+    let corrupt_bytes = payload(96_000, 31);
+    download.set_payload(corrupt_bytes.clone(), "etag-corrupt");
+    let mut corrupt_model = catalog_model(&corrupt_bytes, "rev-corrupt");
+    corrupt_model.sha256 = "f".repeat(64);
+    assert!(matches!(
+        hub.download_model(
+            &M3DownloadRequest {
+                accepted_license_sha256: corrupt_model.license.declaration_sha256(),
+                model: corrupt_model,
+            },
+            &context,
+        )
+        .await,
+        Err(M3HubError::Integrity { .. })
+    ));
+    assert!(hub.list_installed_models().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn catalog_hardware_fit_is_bounded_deduplicated_and_explicit_about_mlx() {
+    let directory = TestDirectory::new("catalog");
+    let bytes = payload(80_000, 2);
+    let cpu = catalog_model(&bytes, "rev-cpu");
+    let mut mlx = cpu.clone();
+    mlx.runtime = M3RuntimeKind::Mlx;
+    mlx.variant_id = "mlx-4bit".to_string();
+    mlx.revision = "rev-mlx".to_string();
+    mlx.required_accelerator = Some("metal".to_string());
+    let download = Arc::new(MutableDownload::new(bytes, "etag"));
+    let hub = make_hub(
+        &directory.0,
+        download,
+        vec![Arc::new(StaticCatalog {
+            source_id: "test-catalog".to_string(),
+            entries: vec![cpu, mlx],
+        })],
+        Vec::new(),
+        None,
+        None,
+    );
+    let matches = hub
+        .search_catalog("local", 10, &M3OperationContext::default())
+        .await
+        .expect("catalog search");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].fit.rating, M3HardwareFitRating::Recommended);
+    assert_eq!(matches[1].fit.rating, M3HardwareFitRating::Incompatible);
+    assert!(matches[1]
+        .fit
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("Apple Silicon")));
+    assert!(hub
+        .search_catalog("", 10, &M3OperationContext::default())
+        .await
+        .is_err());
+    let manifest = hub.conformance_manifest();
+    assert!(!manifest.workspace_tool_routes_exposed);
+    assert_eq!(manifest.endpoints.len(), 3);
+}
+
+#[derive(Default)]
+struct MockRuntimeState {
+    models: Mutex<BTreeMap<String, (PathBuf, u64)>>,
+    loaded: Mutex<BTreeSet<String>>,
+    cancelled: Mutex<Vec<String>>,
+}
+
+struct MockRuntimeDriver {
+    state: Arc<MockRuntimeState>,
+}
+
+impl MockRuntimeDriver {
+    fn new(state: Arc<MockRuntimeState>) -> Self {
+        Self { state }
+    }
+
+    fn descriptor_value() -> M3RuntimeDescriptor {
+        M3RuntimeDescriptor {
+            runtime_id: "managed-llama".to_string(),
+            kind: M3RuntimeKind::LlamaCpp,
+            label: "Managed llama.cpp".to_string(),
+            managed: true,
+            api_backend: ApiBackend::ManagedLocal,
+        }
+    }
+
+    fn native_descriptor() -> RuntimeDescriptor {
+        RuntimeDescriptor {
+            schema_version: RUNTIME_ADAPTER_SCHEMA_VERSION,
+            runtime_id: "managed-llama".to_string(),
+            kind: little_monkey_lib::runtime_adapter::RuntimeKind::LlamaCpp,
+            label: "Managed llama.cpp".to_string(),
+            endpoint: EndpointOrigin::parse("http://127.0.0.1:8080", EndpointPolicy::LoopbackOnly)
+                .expect("endpoint"),
+            managed: true,
+        }
+    }
+
+    fn setting_capabilities() -> Vec<AdvancedSettingCapability> {
+        vec![AdvancedSettingCapability {
+            key: "threads".to_string(),
+            label: "Threads".to_string(),
+            description: "Worker thread count".to_string(),
+            schema: SettingValueSchema::Integer {
+                min: 1,
+                max: 64,
+                step: 1,
+            },
+            default_value: SettingValue::Integer { value: 4 },
+            restart_required: true,
+        }]
+    }
+
+    fn running_models(&self) -> M3HubResult<Vec<RunningModel>> {
+        let loaded = self
+            .state
+            .loaded
+            .lock()
+            .map_err(|_| M3HubError::LockPoisoned)?;
+        let models = self
+            .state
+            .models
+            .lock()
+            .map_err(|_| M3HubError::LockPoisoned)?;
+        Ok(loaded
+            .iter()
+            .map(|model_id| RunningModel {
+                runtime_id: "managed-llama".to_string(),
+                model_id: model_id.clone(),
+                size_bytes: models.get(model_id).map_or(1, |model| model.1),
+                memory_bytes: models.get(model_id).map_or(1, |model| model.1),
+                vram_bytes: 0,
+                digest: None,
+                expires_at: None,
+                ownership: ResidencyOwnership::AppManaged,
+            })
+            .collect())
+    }
+
+    fn status_value(&self) -> M3HubResult<M3RuntimeStatusView> {
+        let running_models = self.running_models()?;
+        Ok(M3RuntimeStatusView::Adapter {
+            status: RuntimeStatus {
+                runtime: Self::native_descriptor(),
+                state: RuntimeLifecycleState::Ready,
+                version: Some("test-1".to_string()),
+                process: None,
+                message: None,
+                checked_at_ms: 20_000,
+            },
+            running_models,
+        })
+    }
+}
+
+impl M3RuntimeDriver for MockRuntimeDriver {
+    fn descriptor(&self) -> M3RuntimeDescriptor {
+        Self::descriptor_value()
+    }
+
+    fn capabilities(&self) -> M3RuntimeCapabilityView {
+        M3RuntimeCapabilityView {
+            descriptor: self.descriptor(),
+            can_load: true,
+            can_unload: true,
+            can_logs: true,
+            can_metrics: true,
+            can_infer: true,
+            settings: Self::setting_capabilities(),
+        }
+    }
+
+    fn validate_config(&self, values: &BTreeMap<String, SettingValue>) -> M3HubResult<()> {
+        little_monkey_lib::runtime_adapter::validate_setting_values(
+            "managed-llama",
+            &Self::setting_capabilities(),
+            values,
+            128 * 1024,
+        )
+        .map_err(|error| M3HubError::Runtime(error.to_string()))
+    }
+
+    fn status<'a>(
+        &'a self,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, M3RuntimeStatusView> {
+        Box::pin(async move { self.status_value() })
+    }
+
+    fn inventory<'a>(
+        &'a self,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, RuntimeInventory> {
+        Box::pin(async move {
+            let models = self
+                .state
+                .models
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)?
+                .iter()
+                .map(|(model_id, (path, size))| RuntimeModel {
+                    model_id: model_id.clone(),
+                    display_name: model_id.clone(),
+                    size_bytes: *size,
+                    local_path: Some(path.clone()),
+                    digest: None,
+                    modified_at: None,
+                    capabilities: ModelCapabilities {
+                        chat: true,
+                        embeddings: false,
+                        tool_calling: true,
+                        vision: false,
+                    },
+                    metadata: BTreeMap::new(),
+                })
+                .collect();
+            Ok(RuntimeInventory {
+                schema_version: RUNTIME_ADAPTER_SCHEMA_VERSION,
+                runtime_id: "managed-llama".to_string(),
+                models,
+                captured_at_ms: 20_000,
+            })
+        })
+    }
+
+    fn load<'a>(
+        &'a self,
+        model: &'a M3ResolvedModel,
+        _settings: &'a BTreeMap<String, SettingValue>,
+        _keep_alive: Option<little_monkey_lib::runtime_adapter::KeepAlive>,
+        _replace_existing: bool,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, ()> {
+        Box::pin(async move {
+            let models = self
+                .state
+                .models
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)?;
+            let Some((path, _)) = models.get(&model.model_id) else {
+                return Err(M3HubError::Conflict(
+                    "runtime inventory was not reconciled".to_string(),
+                ));
+            };
+            if path != &model.artifact_path || !path.is_file() {
+                return Err(M3HubError::Conflict(
+                    "runtime model path differs from managed storage".to_string(),
+                ));
+            }
+            drop(models);
+            self.state
+                .loaded
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)?
+                .insert(model.model_id.clone());
+            Ok(())
+        })
+    }
+
+    fn unload<'a>(
+        &'a self,
+        model_id: &'a str,
+        _force_exact_owner: bool,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, ()> {
+        Box::pin(async move {
+            self.state
+                .loaded
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)?
+                .remove(model_id);
+            Ok(())
+        })
+    }
+
+    fn logs<'a>(
+        &'a self,
+        max_bytes: usize,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, RuntimeLogTail> {
+        Box::pin(async move {
+            let text = "ready\ngenerated\n";
+            Ok(RuntimeLogTail {
+                text: text[..text.len().min(max_bytes)].to_string(),
+                truncated: max_bytes < text.len(),
+            })
+        })
+    }
+
+    fn metrics<'a>(
+        &'a self,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, M3RuntimeMetricsView> {
+        Box::pin(async move {
+            match self.status_value()? {
+                M3RuntimeStatusView::Adapter {
+                    status,
+                    running_models,
+                } => Ok(M3RuntimeMetricsView::Adapter {
+                    status,
+                    running_models,
+                }),
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn complete<'a>(
+        &'a self,
+        request: &'a little_monkey_lib::compatibility_hub::CanonicalInferenceRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, little_monkey_lib::compatibility_hub::CanonicalInferenceResponse> {
+        Box::pin(async move {
+            Ok(
+                little_monkey_lib::compatibility_hub::CanonicalInferenceResponse {
+                    response_id: format!("response-{}", request.request_id),
+                    model: request.model.clone(),
+                    content: vec![
+                        little_monkey_lib::compatibility_hub::CanonicalContent::Text {
+                            text: "functional response".to_string(),
+                        },
+                    ],
+                    finish_reason: "stop".to_string(),
+                    usage: little_monkey_lib::compatibility_hub::CanonicalUsage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                    },
+                    created_at_seconds: 20,
+                },
+            )
+        })
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a little_monkey_lib::compatibility_hub::CanonicalInferenceRequest,
+        sink: &'a mut dyn M3CanonicalStreamSink,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, ()> {
+        Box::pin(async move {
+            use little_monkey_lib::compatibility_hub::{CanonicalStreamEvent, CanonicalUsage};
+            let response_id = format!("response-{}", request.request_id);
+            sink.emit(CanonicalStreamEvent::ResponseStart {
+                response_id: response_id.clone(),
+                model: request.model.clone(),
+                created_at_seconds: 20,
+            })
+            .map_err(M3HubError::Runtime)?;
+            sink.emit(CanonicalStreamEvent::TextStart { index: 0 })
+                .and_then(|_| {
+                    sink.emit(CanonicalStreamEvent::TextDelta {
+                        index: 0,
+                        text: "streamed".to_string(),
+                    })
+                })
+                .and_then(|_| sink.emit(CanonicalStreamEvent::TextEnd { index: 0 }))
+                .and_then(|_| {
+                    sink.emit(CanonicalStreamEvent::ResponseCompleted {
+                        response_id,
+                        finish_reason: "stop".to_string(),
+                        usage: CanonicalUsage {
+                            input_tokens: 4,
+                            output_tokens: 1,
+                        },
+                    })
+                })
+                .map_err(M3HubError::Runtime)
+        })
+    }
+
+    fn cancel<'a>(
+        &'a self,
+        request_id: &'a str,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, bool> {
+        Box::pin(async move {
+            self.state
+                .cancelled
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)?
+                .push(request_id.to_string());
+            Ok(true)
+        })
+    }
+}
+
+struct MockReconciler {
+    state: Arc<MockRuntimeState>,
+}
+
+impl M3RuntimeReconciler for MockReconciler {
+    fn reconcile<'a>(
+        &'a self,
+        installed: &'a [M3InstalledModelView],
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, Vec<Arc<dyn M3RuntimeDriver>>> {
+        Box::pin(async move {
+            let mut models = self
+                .state
+                .models
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)?;
+            models.clear();
+            for model in installed {
+                let active = model
+                    .versions
+                    .iter()
+                    .find(|version| version.active)
+                    .ok_or_else(|| M3HubError::State("missing active model".to_string()))?;
+                models.insert(
+                    model.model_id.clone(),
+                    (active.artifact_path.clone(), active.size_bytes),
+                );
+            }
+            drop(models);
+            Ok(vec![
+                Arc::new(MockRuntimeDriver::new(self.state.clone())) as Arc<dyn M3RuntimeDriver>
+            ])
+        })
+    }
+}
+
+#[tokio::test]
+async fn reconciled_runtime_load_config_metrics_logs_unload_and_safe_delete_are_wired() {
+    let directory = TestDirectory::new("runtime");
+    let bytes = payload(90_000, 3);
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-runtime"));
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    let hub = make_hub(
+        &directory.0,
+        download,
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        Some(Arc::new(MockReconciler {
+            state: runtime_state.clone(),
+        })),
+        None,
+    );
+    let model = catalog_model(&bytes, "rev-runtime");
+    let context = M3OperationContext::default();
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: model.license.declaration_sha256(),
+            model: model.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("download and reconcile");
+
+    hub.set_runtime_config(&M3SetRuntimeConfigRequest {
+        runtime_id: "managed-llama".to_string(),
+        values: BTreeMap::from([("threads".to_string(), SettingValue::Integer { value: 8 })]),
+    })
+    .expect("persist runtime config");
+    assert!(hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([("threads".to_string(), SettingValue::Integer { value: 100 })]),
+        })
+        .is_err());
+    hub.load_model(
+        &M3LoadModelRequest {
+            runtime_id: "managed-llama".to_string(),
+            asset_id: model.asset_id(),
+            keep_alive: None,
+            replace_existing: false,
+        },
+        &context,
+    )
+    .await
+    .expect("load managed model");
+    assert!(matches!(
+        hub.runtime_status("managed-llama", &context).await.unwrap(),
+        M3RuntimeStatusView::Adapter { running_models, .. } if running_models.len() == 1
+    ));
+    assert_eq!(
+        hub.runtime_logs("managed-llama", 1024, &context)
+            .await
+            .unwrap()
+            .text,
+        "ready\ngenerated\n"
+    );
+    assert!(matches!(
+        hub.runtime_metrics("managed-llama", &context)
+            .await
+            .unwrap(),
+        M3RuntimeMetricsView::Adapter { running_models, .. } if running_models.len() == 1
+    ));
+    assert!(matches!(
+        hub.delete_model(
+            &M3DeleteModelRequest {
+                asset_id: model.asset_id(),
+                confirmation: format!("DELETE {}", model.asset_id()),
+            },
+            &context,
+        )
+        .await,
+        Err(M3HubError::Conflict(_))
+    ));
+    hub.unload_model(
+        &M3UnloadModelRequest {
+            runtime_id: "managed-llama".to_string(),
+            model_id: model.model_id.clone(),
+            force_exact_owner: false,
+        },
+        &context,
+    )
+    .await
+    .expect("unload");
+    assert!(hub
+        .delete_model(
+            &M3DeleteModelRequest {
+                asset_id: model.asset_id(),
+                confirmation: format!("DELETE {}", model.asset_id()),
+            },
+            &context,
+        )
+        .await
+        .expect("delete after unload"));
+}
+
+struct DeterministicEntropy(Mutex<u8>);
+
+impl LanEntropySource for DeterministicEntropy {
+    fn fill(&self, output: &mut [u8]) -> Result<(), String> {
+        let mut seed = self.0.lock().map_err(|_| "entropy lock".to_string())?;
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        *seed = seed.wrapping_add(29);
+        Ok(())
+    }
+}
+
+struct TestProtector(Vec<u8>);
+
+impl TestProtector {
+    fn tag(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut hash = Sha256::new();
+        hash.update((self.0.len() as u64).to_le_bytes());
+        hash.update(&self.0);
+        hash.update(bytes);
+        hash.finalize().to_vec()
+    }
+}
+
+impl LanStateProtector for TestProtector {
+    fn protector_id(&self) -> &str {
+        "test-keychain-v1"
+    }
+
+    fn authenticate(&self, canonical_state: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(self.tag(canonical_state))
+    }
+
+    fn verify(&self, canonical_state: &[u8], tag: &[u8]) -> Result<(), String> {
+        if self.tag(canonical_state) == tag {
+            Ok(())
+        } else {
+            Err("tag mismatch".to_string())
+        }
+    }
+}
+
+struct VecFrameSink(Vec<little_monkey_lib::compatibility_hub::ProtocolStreamFrame>);
+
+impl M3ProtocolFrameSink for VecFrameSink {
+    fn emit(
+        &mut self,
+        frame: little_monkey_lib::compatibility_hub::ProtocolStreamFrame,
+    ) -> Result<(), String> {
+        self.0.push(frame);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_wired() {
+    let directory = TestDirectory::new("lan-api");
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    let lan_factory = Arc::new(DefaultM3LanAccessFactory::new(
+        Arc::new(DeterministicEntropy(Mutex::new(5))),
+        Arc::new(TestProtector(b"test-secret-key".to_vec())),
+    ));
+    let hub = make_hub(
+        &directory.0,
+        Arc::new(MutableDownload::new(payload(70_000, 1), "unused")),
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        None,
+        Some(lan_factory),
+    );
+    let mut policy = LanServerPolicy::default();
+    policy.rate_limit = RateLimitPolicy {
+        window_ms: 60_000,
+        max_requests: 2,
+        max_input_bytes: 1024 * 1024,
+    };
+    policy.tls = TlsPolicy::Disabled;
+    hub.configure_lan(policy.clone())
+        .expect("configure loopback LAN");
+    let challenge = hub
+        .begin_pairing(
+            PairingRequest {
+                client_label: "Test client".to_string(),
+                scopes: BTreeSet::from([ApiScope::ChatCompletions]),
+                backends: BTreeSet::from([ApiBackend::ManagedLocal]),
+                allowed_models: BTreeSet::from(["local-model".to_string()]),
+                token_expires_at_ms: Some(100_000),
+            },
+            20_000,
+            "127.0.0.1",
+        )
+        .expect("pairing challenge");
+    let paired = hub
+        .complete_pairing(
+            &challenge.challenge_id,
+            &challenge.pairing_code,
+            20_001,
+            "127.0.0.1",
+        )
+        .expect("paired token");
+    assert!(!serde_json::to_string(&hub.list_tokens().unwrap())
+        .unwrap()
+        .contains(&paired.token));
+
+    let body = serde_json::to_vec(&json!({
+        "model":"local-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_tokens":32
+    }))
+    .unwrap();
+    let caller = M3ApiCaller::External {
+        bearer_token: paired.token.clone(),
+        remote_address: "127.0.0.1".to_string(),
+    };
+    let context = M3OperationContext::default();
+    let response = hub
+        .dispatch_api(
+            &M3ApiDispatchRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "managed-llama".to_string(),
+                request_id: "request-1".to_string(),
+                body: body.clone(),
+                caller: caller.clone(),
+                now_ms: 20_002,
+            },
+            &context,
+        )
+        .await
+        .expect("authorized completion");
+    assert_eq!(response.body["object"], "chat.completion");
+
+    let stream_body = serde_json::to_vec(&json!({
+        "model":"local-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_tokens":32,
+        "stream":true
+    }))
+    .unwrap();
+    let mut frames = VecFrameSink(Vec::new());
+    hub.dispatch_api_stream(
+        &M3ApiDispatchRequest {
+            protocol: CompatibilityProtocol::OpenAiChatCompletions,
+            runtime_id: "managed-llama".to_string(),
+            request_id: "request-2".to_string(),
+            body: stream_body,
+            caller: caller.clone(),
+            now_ms: 20_003,
+        },
+        &mut frames,
+        &context,
+    )
+    .await
+    .expect("authorized stream");
+    assert_eq!(frames.0.last().expect("terminal frame").data, "[DONE]");
+
+    assert!(matches!(
+        hub.dispatch_api(
+            &M3ApiDispatchRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "managed-llama".to_string(),
+                request_id: "request-3".to_string(),
+                body,
+                caller: caller.clone(),
+                now_ms: 20_004,
+            },
+            &context,
+        )
+        .await,
+        Err(M3HubError::RateLimited { .. })
+    ));
+
+    assert!(hub
+        .cancel_inference(
+            &M3CancelInferenceRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "managed-llama".to_string(),
+                request_id: "request-internal-cancel".to_string(),
+                model_id: "local-model".to_string(),
+                caller: M3ApiCaller::Internal,
+                now_ms: 20_005,
+            },
+            &context,
+        )
+        .await
+        .expect("internal cancel"));
+    assert_eq!(
+        runtime_state.cancelled.lock().unwrap().as_slice(),
+        ["request-internal-cancel"]
+    );
+
+    hub.revoke_token(&paired.record.token_id, 20_006, "127.0.0.1")
+        .expect("revoke");
+    let revoked_body = serde_json::to_vec(&json!({
+        "model":"local-model",
+        "messages":[{"role":"user","content":"after revoke"}],
+        "max_tokens":8
+    }))
+    .unwrap();
+    assert!(matches!(
+        hub.dispatch_api(
+            &M3ApiDispatchRequest {
+                protocol: CompatibilityProtocol::OpenAiChatCompletions,
+                runtime_id: "managed-llama".to_string(),
+                request_id: "request-revoked".to_string(),
+                body: revoked_body,
+                caller,
+                now_ms: 20_007,
+            },
+            &context,
+        )
+        .await,
+        Err(M3HubError::Forbidden(_))
+    ));
+    let audit = hub.security_audit_events().expect("audit");
+    assert!(audit
+        .iter()
+        .any(|event| event.kind == SecurityAuditKind::TokenAuthorized));
+    assert!(audit
+        .iter()
+        .any(|event| event.kind == SecurityAuditKind::TokenRateLimited));
+    assert!(audit
+        .iter()
+        .any(|event| event.kind == SecurityAuditKind::TokenRevoked));
+    assert!(audit
+        .iter()
+        .all(|event| !event.detail.contains(&paired.token)));
+
+    let delete_challenge = hub
+        .begin_pairing(
+            PairingRequest {
+                client_label: "Lifecycle client".to_string(),
+                scopes: BTreeSet::from([ApiScope::ModelDelete]),
+                backends: BTreeSet::from([ApiBackend::ManagedLocal]),
+                allowed_models: BTreeSet::from(["local-model".to_string()]),
+                token_expires_at_ms: Some(100_000),
+            },
+            20_008,
+            "127.0.0.1",
+        )
+        .expect("lifecycle pairing challenge");
+    let delete_token = hub
+        .complete_pairing(
+            &delete_challenge.challenge_id,
+            &delete_challenge.pairing_code,
+            20_009,
+            "127.0.0.1",
+        )
+        .expect("lifecycle token");
+    let mut authorization = M3ExternalOperationAuthorization {
+        bearer_token: delete_token.token.clone(),
+        scope: ApiScope::ModelDelete,
+        backend: ApiBackend::ManagedLocal,
+        model_id: Some("local-model".to_string()),
+        input_bytes: 0,
+        remote_address: "127.0.0.1".to_string(),
+        destructive_confirmation: Some("DELETE wrong-model".to_string()),
+        now_ms: 20_010,
+    };
+    assert!(matches!(
+        hub.authorize_external_operation(&authorization),
+        Err(M3HubError::Forbidden(_))
+    ));
+    authorization.destructive_confirmation = Some("DELETE local-model".to_string());
+    authorization.now_ms = 20_011;
+    assert_eq!(
+        hub.authorize_external_operation(&authorization)
+            .expect("authorize exact destructive lifecycle request")
+            .scope,
+        ApiScope::ModelDelete
+    );
+
+    assert!(hub
+        .disable_lan("DISABLE LAN API")
+        .expect("disable LAN and revoke live tokens"));
+    hub.configure_lan(policy).expect("re-enable loopback LAN");
+    authorization.now_ms = 20_012;
+    assert!(matches!(
+        hub.authorize_external_operation(&authorization),
+        Err(M3HubError::Forbidden(_))
+    ));
+}

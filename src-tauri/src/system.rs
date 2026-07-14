@@ -8,6 +8,26 @@ use std::process::Command;
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemMemoryInfo {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Returns a point-in-time physical-memory snapshot for comparison launch
+/// planning. The third-party syscall wrapper documents that a platform call
+/// may panic; convert that into an ordinary IPC error so model selection can
+/// conservatively queue local branches instead of crashing the app.
+#[tauri::command]
+pub fn system_memory_info() -> Result<SystemMemoryInfo, String> {
+    std::panic::catch_unwind(|| SystemMemoryInfo {
+        total_bytes: system_memory::total(),
+        available_bytes: system_memory::available(),
+    })
+    .map_err(|_| "Failed to read system memory information".to_string())
+}
+
 /// Reveal `path` in the OS file manager (Finder on macOS, Explorer on
 /// Windows, the default file manager elsewhere on Unix).
 #[tauri::command]
@@ -89,7 +109,11 @@ pub fn open_in_editor(path: String, editor: String) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn open_in_editor_impl(path: &Path, editor: &str) -> Result<(), String> {
-    let app_name = if editor == "cursor" { "Cursor" } else { "Visual Studio Code" };
+    let app_name = if editor == "cursor" {
+        "Cursor"
+    } else {
+        "Visual Studio Code"
+    };
     Command::new("open")
         .arg("-a")
         .arg(app_name)
@@ -148,4 +172,16 @@ pub fn open_session_window(app: AppHandle, session_id: String) -> Result<(), Str
 
     builder.build().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_info_reports_sane_byte_counts_on_supported_desktop_targets() {
+        let info = system_memory_info().expect("system memory query");
+        assert!(info.total_bytes > 0);
+        assert!(info.available_bytes <= info.total_bytes);
+    }
 }

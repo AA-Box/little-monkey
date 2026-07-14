@@ -51,6 +51,8 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
+import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from './skills';
+import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
@@ -60,10 +62,29 @@ import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
+import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
+import {
+  buildModelTargetInventory,
+  type ModelTargetSnapshot,
+} from './modelTargets';
+import { beginDurableRun, type DurableRunRecorder } from './durableRun';
+import { requestRunCancellation } from './runProtocol';
+import { registerRunCancellation } from './runCancellationRegistry';
+import {
+  buildDaemonDesktopRecipe,
+  daemonDesktopRoute,
+  loadActiveDaemonTurns,
+  removeActiveDaemonTurn,
+  saveActiveDaemonTurn,
+  submitDaemonDesktopTurn,
+  watchDaemonDesktopTurn,
+  type ActiveDaemonDesktopTurn,
+  type FrozenAttachmentInput,
+} from './daemonDesktopTurn';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -550,6 +571,8 @@ export const parseSourcesNotice = sourcesNoticeCodec.parse;
 /** Serializes a sources notice back into message content. */
 export const formatSourcesNotice = sourcesNoticeCodec.format;
 
+export const hardenSourcesNoticeForModel = protectKnowledgeNoticeForModel;
+
 /** Prefix identifying a synthetic notice inserted at the start of a session
  * created by `recipeRunner.ts`'s "Run now" (design doc:
  * docs/roadmap/p3-scheduled-automation.md, slice 2) — the 6th notice type
@@ -929,7 +952,85 @@ async function resolveTarget(): Promise<ResolvedTarget> {
   }
 
   const baseUrl = await resolveBaseUrl();
-  return { kind: 'local', baseUrl };
+  return { kind: 'local', baseUrl, modelLabel: useModelStore.getState().active?.name ?? 'Local model' };
+}
+
+/** Deterministic `/compact` entry point. It reuses the same compaction and
+ * one-shot summary path as automatic context trimming, but never appends a
+ * user/model turn. The persisted transcript is replaced only after a full
+ * compacted result has been produced. */
+export async function compactSessionNow(sessionId: string): Promise<{ changed: boolean; removedMessages: number }> {
+  const sessionState = useSessionStore.getState();
+  if (sessionState.runningTurns[sessionId]) {
+    throw new Error("Stop the active turn before compacting this chat.");
+  }
+  const history = sessionMessages(sessionId);
+  if (history.length === 0) return { changed: false, removedMessages: 0 };
+
+  const settings = useSettingsStore.getState();
+  const target = await resolveTarget();
+  const result = await applyContextCompaction(history, {
+    strategy: settings.contextTrimStrategy,
+    contextLimit: useUsageStore.getState().contextLimit,
+    thresholdPercent: 100,
+    sendForSummary: async (dropped) => {
+      const summary = await attemptStream(
+        target,
+        [
+          {
+            role: 'system',
+            content:
+              'Summarize the following earlier conversation concisely for another AI assistant to continue from. Preserve key facts, decisions, file paths, and code context. Reply with only the summary text.',
+          },
+          { role: 'user', content: renderForSummary(dropped) },
+        ],
+        [],
+        undefined,
+        useModelStore.getState().effort,
+        sessionId,
+      );
+      if (summary.streamError) throw new Error(summary.streamError);
+      return summary.content.trim() || '(summary unavailable)';
+    },
+  });
+  if (!result.changed) return { changed: false, removedMessages: 0 };
+  useSessionStore.getState().replaceMessages(sessionId, result.messages);
+  return {
+    changed: true,
+    removedMessages: Math.max(0, history.length - result.messages.length + 1),
+  };
+}
+
+/** Resolves a streaming target back to the immutable inventory record that
+ * contains its endpoint/model/capability evidence. The inventory is built
+ * once at run start; later global model changes cannot rewrite the ledger
+ * snapshot. */
+function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+  const state = useModelStore.getState();
+  const inventory = buildModelTargetInventory({
+    installed: state.installed,
+    active: state.active,
+    llamaStatus: state.llamaStatus,
+    ollamaModels: state.ollamaModels,
+    ollamaReachable: state.ollamaReachable,
+    providers: state.providers,
+    providerModels: state.providerModels,
+    effort: state.effort,
+  });
+  if (target.kind === 'local') {
+    return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
+  }
+  if (target.kind === 'ollama') {
+    return inventory.targets.find(
+      (candidate) => candidate.kind === 'ollama' && candidate.model === target.model,
+    ) ?? null;
+  }
+  return inventory.targets.find(
+    (candidate) =>
+      candidate.kind === 'provider' &&
+      candidate.providerId === target.providerId &&
+      candidate.model === target.model,
+  ) ?? null;
 }
 
 /** Human-readable label for a switch notice. */
@@ -1073,7 +1174,7 @@ export interface AttachmentRef {
 }
 
 /** A single resolved image attachment, ready to become a `ChatContentPart`. */
-interface ResolvedImage {
+export interface ResolvedImage {
   path: string;
   dataUrl: string;
 }
@@ -1091,7 +1192,7 @@ interface ResolvedImage {
  * surface a notice instead of the failure staying invisible. Resolution
  * failure never fails the turn.
  */
-async function resolveReferences(
+export async function resolveReferences(
   text: string,
   attachments: AttachmentRef[]
 ): Promise<{ textRefs: ResolvedTextReference[]; images: ResolvedImage[]; unresolved: string[] }> {
@@ -1150,7 +1251,7 @@ async function resolveReferences(
  * references also need expanding, what gets substituted into the *wire*
  * payload — see `runAgentTurn`.
  */
-function toMessageContent(text: string, images: ResolvedImage[]): string | ChatContentPart[] {
+export function toMessageContent(text: string, images: ResolvedImage[]): string | ChatContentPart[] {
   if (images.length === 0) return text;
   const parts: ChatContentPart[] = [{ type: 'text', text }];
   for (const image of images) parts.push({ type: 'image_url', image_url: { url: image.dataUrl } });
@@ -1178,6 +1279,23 @@ function toMessageContent(text: string, images: ResolvedImage[]): string | ChatC
  * pane — owns its controller: a pane switch mid-turn must leave the turn
  * stoppable from whichever pane shows its session later. */
 const turnControllers = new Map<string, AbortController>();
+const externallyRequestedCancellations = new Set<string>();
+const cancellationDisposers = new Map<AbortController, Array<() => void>>();
+
+function registerDurableController(runId: string, controller: AbortController): void {
+  const dispose = registerRunCancellation(runId, () => {
+    externallyRequestedCancellations.add(runId);
+    controller.abort();
+  });
+  const existing = cancellationDisposers.get(controller) ?? [];
+  existing.push(dispose);
+  cancellationDisposers.set(controller, existing);
+}
+
+interface DurableTurnContext {
+  recorder: DurableRunRecorder | null;
+  failure: string | null;
+}
 
 /** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
  * buttons call this instead of holding their own AbortController — see
@@ -1199,7 +1317,8 @@ export async function runAgentTurn(
   // flipping the app's single global mode for the run's duration — see
   // `RecipeRunHandle`'s doc comment. Every other caller omits this and gets
   // an internally-generated id, unchanged from before.
-  turnIdOverride?: string
+  turnIdOverride?: string,
+  skillInvocations: SkillInvocationSnapshot[] = [],
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1209,19 +1328,249 @@ export async function runAgentTurn(
     throw new Error('A turn is already running in this session.');
   }
   const controller = new AbortController();
+  const turnId = turnIdOverride ?? crypto.randomUUID();
   if (signal) {
     if (signal.aborted) controller.abort();
     else signal.addEventListener('abort', () => controller.abort(), { once: true });
   }
   turnControllers.set(sessionId, controller);
+  registerDurableController(turnId, controller);
   useSessionStore.getState().markTurnRunning(sessionId, true);
   const startedAt = Date.now();
   try {
-    await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnIdOverride);
+    const route = await daemonDesktopRoute();
+    if (route === 'daemon') {
+      await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
+    } else {
+      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
+    }
   } finally {
     turnControllers.delete(sessionId);
+    cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
+    cancellationDisposers.delete(controller);
+    externallyRequestedCancellations.delete(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
+  }
+}
+
+function daemonProjectionContent(
+  projection: Awaited<ReturnType<typeof watchDaemonDesktopTurn>>,
+): string {
+  if (!projection.terminal) {
+    return projection.output || `⏳ ${projection.status}`;
+  }
+  if (projection.terminalStatus === 'succeeded') {
+    return projection.output || projection.summary || 'Background turn completed.';
+  }
+  if (projection.terminalStatus === 'cancelled') {
+    return projection.output || projection.status || 'Background turn stopped.';
+  }
+  const error = projection.error || projection.status || 'The resident agent did not complete the turn.';
+  return projection.output ? `${projection.output}\n\n[Background run error: ${error}]` : `[Background run error: ${error}]`;
+}
+
+async function attachDaemonTurnToChat(
+  link: ActiveDaemonDesktopTurn,
+  controller: AbortController,
+): Promise<void> {
+  let latestContent = link.output || '⏳ Reconnecting to the resident runner…';
+  let terminal = false;
+  try {
+    const projection = await watchDaemonDesktopTurn(link, controller.signal, {
+      onLinkChanged: saveActiveDaemonTurn,
+      onProjection: (next) => {
+        latestContent = daemonProjectionContent(next);
+        useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
+          content: latestContent,
+        });
+      },
+    });
+    terminal = projection.terminal;
+    latestContent = daemonProjectionContent(projection);
+    useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
+      content: latestContent,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
+      content: link.output
+        ? `${link.output}\n\n[Lost connection to resident run: ${message}]`
+        : `[Lost connection to resident run: ${message}]`,
+    });
+    // Keep the link: a later app start can replay all durable events after
+    // the last committed sequence instead of treating a transient IPC/SQLite
+    // failure as terminal.
+    throw error;
+  } finally {
+    // Only terminal runs are removed by the successful path. A stopped UI
+    // controller can return before the daemon commits Cancelled, so preserve
+    // its link for startup recovery in that case.
+    if (terminal) removeActiveDaemonTurn(link.runId);
+  }
+}
+
+async function runDaemonAgentTurn(
+  sessionId: string,
+  userText: string,
+  attachments: AttachmentRef[],
+  signal: AbortSignal,
+  turnId: string,
+  skillInvocations: SkillInvocationSnapshot[],
+): Promise<void> {
+  const store = useSessionStore.getState();
+  const priorMessages = sessionMessages(sessionId);
+  const anchorIndex = priorMessages.length;
+  store.addMessage(sessionId, { role: 'user', content: userText });
+
+  const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+  if (images.length > 0) {
+    store.updateMessageAt(sessionId, anchorIndex, { content: toMessageContent(userText, images) });
+  }
+  if (signal.aborted) throw new DOMException('Turn cancelled', 'AbortError');
+
+  const settings = useSettingsStore.getState();
+  if (!activeTargetSatisfiesVision(images.length > 0) && settings.autoVisionSwitchEnabled) {
+    const candidate = findVisionCandidate();
+    if (candidate) applyTargetSwitch(candidate);
+  }
+  const resolvedTarget = await resolveTarget();
+  const targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
+  if (!targetSnapshot) {
+    throw new Error('The selected model target could not be frozen for the resident runner.');
+  }
+
+  await useRulesStore.getState().refresh();
+  const session = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
+  const attachedStackIds = session?.attachedStackIds ?? [];
+  const attachedStacks = attachedStackIds.length > 0
+    ? useStackStore.getState().stacks.filter((stack) => attachedStackIds.includes(stack.id))
+    : [];
+  const attachedStacksForPrompt = attachedStackPromptInfo(attachedStacks);
+  const docChatMode = session?.docChatMode ?? false;
+  let sourcesNotice: string | null = null;
+  if (docChatMode && attachedStackIds.length > 0) {
+    try {
+      const hits = await invoke<StackQueryResult[]>('stacks_query', {
+        stackIds: attachedStackIds,
+        query: userText,
+      });
+      if (hits.length > 0) {
+        sourcesNotice = formatSourcesNotice({
+          results: hits.map((hit) => ({
+            path: hit.source_path,
+            stack: hit.stack_name,
+            score: hit.score,
+            snippet: hit.text,
+          })),
+        });
+      }
+    } catch {
+      // Same best-effort semantics as the local turn path.
+    }
+  }
+
+  const composedText = composeReferencedText(userText, textRefs);
+  const wireCurrent: ChatMessage = {
+    role: 'user',
+    content: toMessageContent(composedText, images),
+  };
+  const history: ChatMessage[] = [
+    ...priorMessages,
+    ...(sourcesNotice ? [{ role: 'system' as const, content: sourcesNotice }] : []),
+    wireCurrent,
+  ];
+  const targetHistory = stripImagesForTextOnlyTarget(history, resolvedTarget);
+  const frozenAttachments: FrozenAttachmentInput[] = [
+    ...textRefs.map((reference) => ({
+      path: reference.path,
+      kind: reference.isDir ? 'directory' as const : 'file' as const,
+      mediaType: 'text/plain; charset=utf-8',
+      content: reference.content,
+    })),
+    ...images.map((image) => ({
+      path: image.path,
+      kind: 'image' as const,
+      mediaType: image.dataUrl.slice(5, image.dataUrl.indexOf(';')) || 'application/octet-stream',
+      content: image.dataUrl,
+    })),
+  ];
+  const mode = usePermissionStore.getState().mode;
+  const recipe = await buildDaemonDesktopRecipe({
+    sessionId,
+    turnId,
+    userText,
+    systemPrompt: composeSkillSystemPrompt(
+      currentSystemPrompt(session?.personaId ?? null, attachedStacksForPrompt, docChatMode),
+      skillInvocations,
+    ),
+    history: targetHistory,
+    resolvedTarget,
+    targetSnapshot,
+    roots: useWorkspaceStore.getState().roots,
+    permissionMode: mode,
+    allowNetwork: settings.webToolsEnabled,
+    memoryEnabled: settings.memoryEnabled,
+    verifyEnabled: settings.verifyEnabled,
+    verifyMaxRounds: settings.verifyMaxRounds,
+    subagentsEnabled: settings.subagentsEnabled,
+    effort: useModelStore.getState().effort,
+    mcpServers: useMcpStore.getState().servers,
+    attachedStackIds,
+    attachedStackNames: attachedStacks.map((stack) => stack.name),
+    attachments: frozenAttachments,
+  });
+  const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  if (signal.aborted) {
+    await import('./daemonClient').then(({ daemonCancel }) => daemonCancel(queued.run_id, 'Stopped before attach'));
+  }
+
+  if (unresolved.length > 0) {
+    store.addMessage(sessionId, {
+      role: 'system',
+      content: `${MENTION_NOTE_PREFIX} Couldn't read ${unresolved.map((path) => `@${path}`).join(', ')} — the resident snapshot contains only successfully resolved attachments.`,
+    });
+  }
+  if (sourcesNotice) store.addMessage(sessionId, { role: 'system', content: sourcesNotice });
+  const assistantIndex = sessionMessages(sessionId).length;
+  store.addMessage(sessionId, { role: 'assistant', content: '⏳ Queued in the resident runner…' });
+  const link: ActiveDaemonDesktopTurn = {
+    sessionId,
+    turnId,
+    runId: queued.run_id,
+    assistantIndex,
+    lastSequence: 0,
+    output: '',
+  };
+  saveActiveDaemonTurn(link);
+  const controller = turnControllers.get(sessionId);
+  if (!controller) throw new Error('Desktop turn controller disappeared before daemon attach.');
+  registerDurableController(queued.run_id, controller);
+  await attachDaemonTurnToChat(link, controller);
+  maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
+}
+
+/** Reattaches chat placeholders to nonterminal daemon runs after an app or
+ * WebView restart. The durable event sequence is replayed from the exact
+ * last committed sequence stored with each link. */
+export function recoverDaemonDesktopTurns(): void {
+  for (const link of loadActiveDaemonTurns()) {
+    if (turnControllers.has(link.sessionId)) continue;
+    if (!useSessionStore.getState().sessions.some((session) => session.id === link.sessionId)) {
+      removeActiveDaemonTurn(link.runId);
+      continue;
+    }
+    const controller = new AbortController();
+    turnControllers.set(link.sessionId, controller);
+    useSessionStore.getState().markTurnRunning(link.sessionId, true);
+    registerDurableController(link.runId, controller);
+    void attachDaemonTurnToChat(link, controller).finally(() => {
+      turnControllers.delete(link.sessionId);
+      cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
+      cancellationDisposers.delete(controller);
+      externallyRequestedCancellations.delete(link.runId);
+      useSessionStore.getState().markTurnRunning(link.sessionId, false);
+    });
   }
 }
 
@@ -1266,7 +1615,8 @@ async function runTurnGuarded(
   userText: string,
   attachments: AttachmentRef[],
   signal: AbortSignal,
-  turnIdOverride?: string
+  turnId: string,
+  skillInvocations: SkillInvocationSnapshot[],
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -1295,15 +1645,34 @@ async function runTurnGuarded(
     label: userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS),
     maxKeep: useSettingsStore.getState().checkpointRetention,
   }).catch(() => null);
-  // Distinct from checkpointId (which can be null): scopes shell
-  // cancellation and permission prompts to this turn on the Rust side.
-  const turnId = turnIdOverride ?? crypto.randomUUID();
+  // Distinct from checkpointId (which can be null): scopes shell,
+  // cancellation, permission prompts, and durable run events to this turn.
+  const durable: DurableTurnContext = { recorder: null, failure: null };
+  let thrown: unknown = null;
   try {
-    await runAgentTurnBody(sessionId, userText, attachments, checkpointId, turnId, signal);
+    await runAgentTurnBody(
+      sessionId,
+      userText,
+      attachments,
+      checkpointId,
+      turnId,
+      durable,
+      signal,
+      skillInvocations,
+    );
     maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
+  } catch (error) {
+    thrown = error;
+    throw error;
   } finally {
     if (checkpointId !== null) {
       const summary = await invoke<CheckpointNotice>('checkpoint_end', { id: checkpointId }).catch(() => null);
+      if (summary) {
+        durable.recorder?.recordCheckpoint(
+          summary.id,
+          summary.label ?? (userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS) || 'Workspace checkpoint'),
+        );
+      }
       if (summary && summary.files.length > 0) {
         useSessionStore.getState().addMessage(sessionId, {
           role: 'system',
@@ -1322,6 +1691,21 @@ async function runTurnGuarded(
       // and forget: a panel that isn't open just gets a fresher cache.
       void useCheckpointStore.getState().refresh(sessionId);
     }
+    if (durable.recorder) {
+      if (signal.aborted && !externallyRequestedCancellations.delete(durable.recorder.runId)) {
+        await requestRunCancellation(durable.recorder.runId, 'Stopped from chat').catch((error) =>
+          console.error('Failed to record cancellation request', error),
+        );
+      }
+      const terminal = signal.aborted
+        ? durable.recorder.cancel('Stopped by the user')
+        : thrown !== null
+          ? durable.recorder.fail(thrown)
+          : durable.failure !== null
+            ? durable.recorder.fail(new Error(durable.failure), true)
+            : durable.recorder.complete('Desktop turn completed');
+      await terminal.catch((error) => console.error('Failed to finalize durable run', error));
+    }
   }
 }
 
@@ -1334,7 +1718,9 @@ async function runAgentTurnBody(
   attachments: AttachmentRef[],
   checkpointId: string | null,
   turnId: string,
-  signal?: AbortSignal
+  durable: DurableTurnContext,
+  signal?: AbortSignal,
+  skillInvocations: SkillInvocationSnapshot[] = [],
 ): Promise<void> {
   // Every transcript mutation this turn makes is pinned to the session the
   // turn was submitted from — the user may be running another turn in the
@@ -1440,6 +1826,32 @@ async function runAgentTurnBody(
   // `present_plan` is gated on this snapshot.
   const mode = usePermissionStore.getState().mode;
 
+  const startDurableRecorder = async (
+    resolvedTarget: ResolvedTarget,
+    runId: string,
+  ): Promise<DurableRunRecorder | null> => {
+    const targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
+    if (!targetSnapshot) return null;
+    return beginDurableRun({
+      runId,
+      kind: 'interactive',
+      task: userText,
+      instructions: `Session ${sessionId}`,
+      target: targetSnapshot,
+      roots: useWorkspaceStore.getState().roots,
+      permissionMode: mode,
+      allowNetwork: settings.webToolsEnabled,
+      allowExternalMutations: mode !== 'plan',
+    });
+  };
+  // Durable recording is additive during the engine migration. A profile
+  // opened by an older host still runs normally; the protocol-version probe
+  // inside `beginDurableRun` returns null in that case.
+  durable.recorder = await startDurableRecorder(primaryTarget, turnId).catch((error) => {
+    console.error('Failed to start durable run', error);
+    return null;
+  });
+
   // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
   // newly remembered facts) before building the system prompt below — two
   // local-file reads per turn is negligible and needs no file watcher.
@@ -1522,7 +1934,18 @@ async function runAgentTurnBody(
       },
       { role: 'user', content: renderForSummary(dropped) },
     ];
-    const result = await attemptStream(target, summaryMessages, [], signal, effort, sessionId);
+    const result = await attemptStream(
+      target,
+      summaryMessages,
+      [],
+      signal,
+      effort,
+      sessionId,
+      undefined,
+      true,
+      undefined,
+      durable.recorder?.runId,
+    );
     if (result.streamError) throw new Error(result.streamError);
     return result.content.trim() || '(summary unavailable)';
   };
@@ -1549,7 +1972,19 @@ async function runAgentTurnBody(
         toolName,
         toolArgs,
         workspaceRootPath,
-        (judgeMessages, judgeSignal) => attemptStream(target, judgeMessages, [], judgeSignal, effort, sessionId),
+        (judgeMessages, judgeSignal) =>
+          attemptStream(
+            target,
+            judgeMessages,
+            [],
+            judgeSignal,
+            effort,
+            sessionId,
+            undefined,
+            true,
+            undefined,
+            durable.recorder?.runId,
+          ),
         signal
       ),
   };
@@ -1607,7 +2042,10 @@ async function runAgentTurnBody(
     const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
     const systemMessage: ChatMessage = {
       role: 'system',
-      content: currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+      content: composeSkillSystemPrompt(
+        currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+        skillInvocations,
+      ),
     };
 
     // Build the wire payload for this request: the system prompt first, then
@@ -1622,7 +2060,7 @@ async function runAgentTurnBody(
       ...(wireContent !== null
         ? history.map((message) => (message === storedUserMessage ? { ...message, content: wireContent } : message))
         : history),
-    ];
+    ].map(hardenSourcesNoticeForModel);
     // Strips any image content left over from earlier turns when `target`
     // can't see images — see `stripImagesForTextOnlyTarget`'s doc comment.
     const wireHistoryFor = (t: ResolvedTarget): ChatMessage[] => stripImagesForTextOnlyTarget(fullWireHistory, t);
@@ -1630,7 +2068,18 @@ async function runAgentTurnBody(
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
-    let attempt = await attemptStream(target, wireHistoryFor(target), toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+    let attempt = await attemptStream(
+      target,
+      wireHistoryFor(target),
+      toolsForTurn,
+      signal,
+      effort,
+      sessionId,
+      (content) => updateLastMessage({ content }),
+      true,
+      undefined,
+      durable.recorder?.runId,
+    );
 
     // Some cloud routes (notably free-tier OpenRouter models) reject a
     // request outright just because tools were offered, even when the model
@@ -1641,13 +2090,31 @@ async function runAgentTurnBody(
     // (`toolsForTurn` empty on retry means the model literally cannot emit
     // one), so the outer round-trip loop just sees a normal plain answer.
     if (attempt.streamError !== null && !attempt.contentStarted && toolsForTurn.length > 0 && TOOL_UNSUPPORTED_ERROR_PATTERN.test(attempt.streamError)) {
+      durable.recorder?.recordStatus(
+        `status-${turnId}-${iteration}-tools`,
+        `Target rejected tool calling; retrying without tools: ${attempt.streamError}`,
+      );
+      if (attempt.usage) {
+        durable.recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+      }
       removeLastMessage();
       addMessage({
         role: 'system',
         content: `${SWITCH_NOTE_PREFIX} ${targetLabel(target)} doesn't support tool calling — retrying this turn without tools.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistoryFor(target), [], signal, effort, sessionId, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(
+        target,
+        wireHistoryFor(target),
+        [],
+        signal,
+        effort,
+        sessionId,
+        (content) => updateLastMessage({ content }),
+        true,
+        undefined,
+        durable.recorder?.runId,
+      );
     }
 
     // Failover: only ever retry a *different* target when nothing streamed
@@ -1658,8 +2125,25 @@ async function runAgentTurnBody(
     // `updateLastMessage` below keeps targeting the placeholder rather than
     // clobbering the notice that was just inserted after it.
     while (attempt.streamError !== null && !attempt.contentStarted && sequenceIndex + 1 < sequence.length) {
+      if (attempt.usage) {
+        durable.recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+      }
+      await durable.recorder
+        ?.fail(new Error(`Target failed before output: ${attempt.streamError}`), true)
+        .catch((error) => console.error('Failed to close failed-over durable run', error));
       sequenceIndex += 1;
       target = sequence[sequenceIndex];
+      durable.recorder = await startDurableRecorder(
+        target,
+        `${turnId}-failover-${sequenceIndex}`,
+      ).catch((error) => {
+        console.error('Failed to start failover durable run', error);
+        return null;
+      });
+      if (durable.recorder) {
+        const controller = turnControllers.get(sessionId);
+        if (controller) registerDurableController(durable.recorder.runId, controller);
+      }
       applyTargetSwitch(target);
       removeLastMessage();
       addMessage({
@@ -1667,12 +2151,29 @@ async function runAgentTurnBody(
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistoryFor(target), toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(
+        target,
+        wireHistoryFor(target),
+        toolsForTurn,
+        signal,
+        effort,
+        sessionId,
+        (content) => updateLastMessage({ content }),
+        true,
+        undefined,
+        durable.recorder?.runId,
+      );
     }
 
     const { content, toolCalls, streamError } = attempt;
+    const messageId = `message-${turnId}-${iteration}`;
+    durable.recorder?.recordModelOutput(messageId, content);
+    if (attempt.usage) {
+      durable.recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+    }
 
     if (streamError !== null) {
+      durable.failure = streamError;
       updateLastMessage({
         content: content.length > 0 ? `${content}\n\n[Error: ${streamError}]` : `[Error: ${streamError}]`,
       });
@@ -1692,7 +2193,18 @@ async function runAgentTurnBody(
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
       if (!signal?.aborted && mutatedFiles.size > 0) {
+        const verificationStartedAt = Date.now();
         const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
+        if (settings.verifyEnabled && !signal?.aborted) {
+          durable.recorder?.recordVerification(
+            failure?.label ?? 'Workspace verification',
+            failure === null,
+            failure === null
+              ? 'Configured verification completed without a reported failure.'
+              : `Exit ${failure.code ?? 'timeout'}: ${failure.output}`,
+            Date.now() - verificationStartedAt,
+          );
+        }
         // A command failed and there's a feed-back round left to spend —
         // append one fix instruction and send the loop around again instead
         // of returning. `mutatedFiles` is cleared so only edits made in
@@ -1722,6 +2234,23 @@ async function runAgentTurnBody(
     // sequential — see `runToolCallsForRound`'s own doc comment for why, and
     // for the order-preservation guarantee the rest of this loop depends on.
     const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
+      const toolStartedAt = Date.now();
+      const recorder = durable.recorder;
+      await recorder?.recordToolProposed(
+        toolCall.id,
+        toolCall.function.name,
+        toolCall.function.arguments ?? '{}',
+      );
+      recorder?.recordToolStarted(toolCall.id);
+      const finishObservedTool = async (result: string): Promise<string> => {
+        await recorder?.recordToolFinished(
+          toolCall.id,
+          result,
+          Date.now() - toolStartedAt,
+          result === CANCELLED_TOOL_RESULT || signal?.aborted === true,
+        );
+        return result;
+      };
       // Reject (without executing) any call whose name wasn't actually
       // offered to the model this turn — e.g. `remember` after
       // `memoryEnabled` was turned off, or any other tool a local/quantized
@@ -1731,7 +2260,9 @@ async function runAgentTurnBody(
       // polite suggestion the model can ignore. Still gets a result message,
       // same invariant as the cancelled-call path below.
       if (!isToolCallAllowed(toolCall, toolsForTurn)) {
-        return stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`));
+        return finishObservedTool(
+          stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
+        );
       }
 
       // Once the Stop button has fired, remaining calls are not executed —
@@ -1744,7 +2275,7 @@ async function runAgentTurnBody(
       // next one) must never leave a subagent resolving a target the parent
       // has since moved off of. See `SubagentContext`'s doc comment in
       // `turnEngine.ts`.
-      if (signal?.aborted) return CANCELLED_TOOL_RESULT;
+      if (signal?.aborted) return finishObservedTool(CANCELLED_TOOL_RESULT);
       // `risk`/`onMutatedPath` thread THIS turn's own risk-annotation context
       // and mutated-file tracking down into a `code`-profile child's own
       // write_file/edit_file/run_shell calls — without these, a subagent's
@@ -1755,21 +2286,37 @@ async function runAgentTurnBody(
       // just the single `task` entry, never the child's nested writes).
       const subagentContext: SubagentContext = {
         sessionId,
+        runId: durable.recorder?.runId,
         target,
         effort,
         risk: riskAnnotation,
         onMutatedPath: (path) => mutatedFiles.add(path),
       };
-      return executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation, attachedStackNames, subagentContext);
+      const result = await executeToolCall(
+        toolCall,
+        checkpointId,
+        durable.recorder?.runId ?? turnId,
+        mcpRegistry,
+        signal,
+        riskAnnotation,
+        attachedStackNames,
+        subagentContext,
+      );
+      return finishObservedTool(result);
     });
 
     for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex++) {
       const toolCall = toolCalls[toolCallIndex];
       const resultContent = results[toolCallIndex];
+      const modelResultContent = protectToolResult(
+        toolCall.function.name,
+        resultContent,
+        mcpRegistry.has(toolCall.function.name),
+      );
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
-        content: resultContent,
+        content: modelResultContent,
       };
       addMessage(toolMessage);
 
@@ -1833,6 +2380,7 @@ async function runAgentTurnBody(
   // Safety cap reached: the model kept requesting tools without ever
   // settling on a final answer. Surface this clearly instead of looping
   // forever or silently truncating.
+  durable.failure = `Reached the safety limit of ${MAX_ITERATIONS} tool-calling iterations.`;
   addMessage({
     role: 'assistant',
     content: `Stopped after reaching the safety limit of ${MAX_ITERATIONS} tool-calling iterations without a final answer.`,

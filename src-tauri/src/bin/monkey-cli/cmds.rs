@@ -94,7 +94,12 @@ pub async fn show(
     system: bool,
     license: bool,
 ) -> Result<(), String> {
-    if [modelfile, parameters, template, system, license].iter().filter(|f| **f).count() > 1 {
+    if [modelfile, parameters, template, system, license]
+        .iter()
+        .filter(|f| **f)
+        .count()
+        > 1
+    {
         return Err(
             "only one of --modelfile, --parameters, --template, --system, or --license can be specified"
                 .to_string(),
@@ -141,13 +146,18 @@ pub async fn create(
 /// commands (signin/signout/serve) that have no daemon HTTP equivalent. A
 /// non-zero child exit code becomes our own exit code.
 pub fn passthrough(subcommand: &str) -> Result<(), String> {
-    let status = std::process::Command::new("ollama").arg(subcommand).status().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("`monkey-cli {subcommand}` requires the ollama binary, which was not found on PATH")
-        } else {
-            format!("Failed to run `ollama {subcommand}`: {e}")
-        }
-    })?;
+    let status = std::process::Command::new("ollama")
+        .arg(subcommand)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "`monkey {subcommand}` requires the ollama binary, which was not found on PATH"
+                )
+            } else {
+                format!("Failed to run `ollama {subcommand}`: {e}")
+            }
+        })?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -159,7 +169,11 @@ pub fn passthrough(subcommand: &str) -> Result<(), String> {
 /// name matches its `:latest` tag, like Ollama.
 pub async fn ensure_model(client: &reqwest::Client, model: &str) -> Result<(), String> {
     let tags = ollama_api::tags(client).await?;
-    let want = if model.contains(':') { model.to_string() } else { format!("{model}:latest") };
+    let want = if model.contains(':') {
+        model.to_string()
+    } else {
+        format!("{model}:latest")
+    };
     if tags.models.iter().any(|m| m.name == want) {
         return Ok(());
     }
@@ -260,7 +274,12 @@ fn print_show_summary(resp: &ShowResp) {
     }
     if !resp.license.trim().is_empty() {
         println!("  License");
-        for line in resp.license.lines().filter(|l| !l.trim().is_empty()).take(2) {
+        for line in resp
+            .license
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(2)
+        {
             println!("    {}", line.trim());
         }
         println!();
@@ -304,8 +323,7 @@ fn short_digest(digest: &str) -> String {
 /// Decimal-unit byte humanization matching ollama's `format.HumanBytes`:
 /// one decimal place only below 10 of a unit and only when non-integral.
 fn human_bytes(bytes: u64) -> String {
-    const UNITS: [(f64, &str); 4] =
-        [(1e12, "TB"), (1e9, "GB"), (1e6, "MB"), (1e3, "KB")];
+    const UNITS: [(f64, &str); 4] = [(1e12, "TB"), (1e9, "GB"), (1e6, "MB"), (1e3, "KB")];
     let b = bytes as f64;
     for (scale, unit) in UNITS {
         if b >= scale {
@@ -334,7 +352,10 @@ fn processor(size: u64, size_vram: u64) -> String {
 }
 
 fn now_epoch() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// "3 weeks ago"-style humanization of an RFC3339 timestamp; falls back to
@@ -428,7 +449,12 @@ fn parse_rfc3339_epoch(text: &str) -> Option<i64> {
     let hour: i64 = text[11..13].parse().ok()?;
     let minute: i64 = text[14..16].parse().ok()?;
     let second: i64 = text[17..19].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
 
@@ -500,10 +526,22 @@ mod tests {
     #[test]
     fn rfc3339_parses_offsets_fractions_and_rejects_junk() {
         assert_eq!(parse_rfc3339_epoch("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339_epoch("2024-01-15T10:30:00Z"), Some(1705314600));
-        assert_eq!(parse_rfc3339_epoch("2024-01-15T10:30:00.123456789Z"), Some(1705314600));
-        assert_eq!(parse_rfc3339_epoch("2024-01-15T02:30:00-08:00"), Some(1705314600));
-        assert_eq!(parse_rfc3339_epoch("2024-01-15T18:30:00+08:00"), Some(1705314600));
+        assert_eq!(
+            parse_rfc3339_epoch("2024-01-15T10:30:00Z"),
+            Some(1705314600)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch("2024-01-15T10:30:00.123456789Z"),
+            Some(1705314600)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch("2024-01-15T02:30:00-08:00"),
+            Some(1705314600)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch("2024-01-15T18:30:00+08:00"),
+            Some(1705314600)
+        );
         assert_eq!(parse_rfc3339_epoch("not a date"), None);
         assert_eq!(parse_rfc3339_epoch("2024-13-01T00:00:00Z"), None);
     }
