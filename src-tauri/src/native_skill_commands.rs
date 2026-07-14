@@ -251,7 +251,11 @@ pub async fn native_skills_rollback_many(
     run_blocking(move || manager.rollback_many(scope, workspace.as_deref(), &commands)).await
 }
 
-fn optional_primary_workspace(state: &AppState) -> Result<Option<PathBuf>, String> {
+/// `pub(crate)` (unlike the other private helpers in this module) so
+/// `tools.rs`'s `tool_read_skill_resource` can resolve the same primary
+/// workspace path this module's own commands do, instead of duplicating
+/// the `AppState.workspace_roots` lock/canonicalize dance.
+pub(crate) fn optional_primary_workspace(state: &AppState) -> Result<Option<PathBuf>, String> {
     let roots = state
         .workspace_roots
         .lock()
@@ -285,7 +289,10 @@ fn workspace_for_scope(state: &AppState, scope: SkillScope) -> Result<Option<Pat
     }
 }
 
-async fn run_blocking<T, F>(operation: F) -> Result<T, String>
+/// `pub(crate)` for the same reason as `optional_primary_workspace` above —
+/// `tools.rs`'s `tool_read_skill_resource` reuses this rather than a second
+/// `spawn_blocking`/`SkillError`-to-`String` wrapper.
+pub(crate) async fn run_blocking<T, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, crate::native_skills::SkillError> + Send + 'static,

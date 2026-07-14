@@ -128,10 +128,13 @@ struct RawRequirements {
 /// Frontmatter schema. Unknown top-level keys are deliberately tolerated
 /// (no `deny_unknown_fields`): the ecosystem SKILL.md format used by Claude
 /// Code, ponytail, and similar skill repos carries extra keys such as
-/// `argument-hint`, `license`, `allowed-tools`, and `metadata` that this
-/// runtime has no use for but must not reject. `command` and `version` are
-/// optional for the same reason — ecosystem skills derive the slash command
-/// from `name` and often carry no version. Nested `requires` stays strict.
+/// `argument-hint`, `license`, and `metadata` that this runtime has no use
+/// for but must not reject. `command` and `version` are optional for the
+/// same reason — ecosystem skills derive the slash command from `name` and
+/// often carry no version. Nested `requires` stays strict. `allowed-tools` IS
+/// consumed (see `deserialize_allowed_tools`) — it restricts which tools stay
+/// offered to the model while this skill is active (see
+/// `SkillManifest::allowed_tools`'s doc comment).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RawSkillManifest {
     name: String,
@@ -144,6 +147,40 @@ struct RawSkillManifest {
     os: Vec<SupportedOs>,
     #[serde(default)]
     requires: RawRequirements,
+    /// Accepts either a YAML list (`["Read", "Grep"]`) or a single
+    /// comma-separated string (`"Read, Grep"`) — both forms appear in
+    /// real-world `SKILL.md` files. `None` (key absent) means unrestricted;
+    /// this is intentionally distinct from `Some(vec![])`, which a
+    /// pathological frontmatter could in principle produce from an
+    /// all-whitespace CSV — both are normalized to "unrestricted" by
+    /// `normalize_manifest` regardless, so the distinction never leaks past
+    /// that function.
+    #[serde(default, rename = "allowed-tools", deserialize_with = "deserialize_allowed_tools")]
+    allowed_tools: Option<Vec<String>>,
+}
+
+/// Backing type for `RawSkillManifest.allowed_tools`'s `deserialize_with` —
+/// accepts the two shapes real `SKILL.md` files use for `allowed-tools`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawAllowedTools {
+    List(Vec<String>),
+    Csv(String),
+}
+
+fn deserialize_allowed_tools<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = RawAllowedTools::deserialize(deserializer)?;
+    Ok(Some(match raw {
+        RawAllowedTools::List(values) => values,
+        RawAllowedTools::Csv(text) => text
+            .split(',')
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +199,12 @@ pub struct SkillManifest {
     /// Empty means all supported operating systems.
     pub os: BTreeSet<SupportedOs>,
     pub requires: SkillRequirements,
+    /// Tool names this skill restricts the model to while it is active.
+    /// Empty (the frontmatter had no `allowed-tools`, or it normalized to
+    /// nothing) means unrestricted — callers must treat empty as "no
+    /// restriction", never as "restrict to nothing". Sorted and deduplicated
+    /// by `normalize_manifest`.
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +247,16 @@ pub struct SkillDescriptor {
     /// with shared enable/disable/uninstall/rollback. `None` for local
     /// installs and signed packages.
     pub git_repository: Option<String>,
+    /// Mirrors `SkillManifest.allowed_tools` — empty means unrestricted.
+    /// Always empty for signed packages (they carry their own separate
+    /// `permissions` system instead — see that field's doc comment).
+    pub allowed_tools: Vec<String>,
+    /// Every scanned file's relative path except `SKILL.md` itself, so a
+    /// caller can list what's readable via `native_skills_read_resource`
+    /// without needing the bytes up front (progressive disclosure — see that
+    /// command's doc comment). Always empty for signed packages, which carry
+    /// no bundle beyond their inline `instructions`.
+    pub resource_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -521,6 +574,8 @@ impl NativeSkillManager {
                 },
                 permissions: package.permissions.clone(),
                 git_repository: None,
+                allowed_tools: Vec::new(),
+                resource_files: Vec::new(),
             });
         }
         skills.sort_by(|left, right| {
@@ -529,6 +584,68 @@ impl NativeSkillManager {
                 .then_with(|| source_label(&left.source).cmp(&source_label(&right.source)))
         });
         Ok(skills)
+    }
+
+    /// Reads one bundled file from an installed skill's folder by its
+    /// command name — the progressive-disclosure counterpart to `discover`'s
+    /// `resource_files` listing: a model that has already invoked `/command`
+    /// (or been auto-invoked into it) can read one specific bundled file on
+    /// demand instead of every bundle byte being loaded up front. Re-scans
+    /// the whole folder via `scan_skill_folder` (already bounded to 2MB/128
+    /// files) rather than reading the single file directly off disk, so this
+    /// gets the exact same symlink/escape/size checks for free instead of a
+    /// second hand-rolled copy of them.
+    ///
+    /// Deliberately takes no `scope` — `discover_root` already enforces that
+    /// a `command` can never be active in both the global and workspace root
+    /// at once (see its `active_commands` collision check), so trying global
+    /// first and falling back to workspace is unambiguous and lets a model
+    /// tool call stay a plain `{command, path}` pair instead of having to
+    /// (mis)report a scope it has no real way to know. Signed-package skills
+    /// have no on-disk folder at all — those never match either root, which
+    /// is correct: their `resource_files` is always empty (see
+    /// `SkillDescriptor.resource_files`'s doc comment), so nothing should
+    /// ever call this for one.
+    pub fn read_resource(
+        &self,
+        command: &str,
+        relative_path: &str,
+        primary_workspace: Option<&Path>,
+    ) -> Result<String, SkillError> {
+        let _guard = self.lock()?;
+        let command = validate_command(command)?;
+        let candidate_roots = [
+            Some(self.global_root.clone()),
+            primary_workspace.and_then(|workspace| {
+                workspace_skill_root(workspace, false).ok().flatten()
+            }),
+        ];
+        let skill_dir = candidate_roots
+            .into_iter()
+            .flatten()
+            .map(|root| root.join(&command))
+            .find(|candidate| {
+                fs::symlink_metadata(candidate)
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+            })
+            .ok_or_else(|| SkillError::NotFound(format!("no skill installed at /{command}")))?;
+        let relative = validate_relative_subdirectory(relative_path)?;
+        if relative == Path::new("SKILL.md") {
+            return Err(SkillError::Invalid(
+                "SKILL.md is already provided as the skill's instructions, not a resource file"
+                    .to_string(),
+            ));
+        }
+        let scanned = scan_skill_folder(&skill_dir)?;
+        let file = scanned
+            .files
+            .iter()
+            .find(|file| file.relative == relative)
+            .ok_or_else(|| {
+                SkillError::NotFound(format!("/{command} has no file at {relative_path}"))
+            })?;
+        String::from_utf8(file.bytes.clone())
+            .map_err(|_| SkillError::Invalid(format!("{relative_path} is not valid UTF-8 text")))
     }
 
     pub fn preview_local(
@@ -1119,6 +1236,12 @@ impl NativeSkillManager {
                 },
             };
             let eligibility = evaluate_requirements(&scanned.parsed.manifest);
+            let resource_files = scanned
+                .files
+                .iter()
+                .filter(|file| file.relative != Path::new("SKILL.md"))
+                .map(|file| file.relative.to_string_lossy().replace('\\', "/"))
+                .collect();
             let descriptor = SkillDescriptor {
                 name: scanned.parsed.manifest.name.clone(),
                 description: scanned.parsed.manifest.description.clone(),
@@ -1135,6 +1258,8 @@ impl NativeSkillManager {
                 source,
                 permissions: BTreeSet::new(),
                 git_repository: managed.and_then(|record| record.origin_repository.clone()),
+                allowed_tools: scanned.parsed.manifest.allowed_tools.clone(),
+                resource_files,
             };
             if descriptor.enabled {
                 let current_source = source_label(&descriptor.source);
@@ -1874,6 +1999,11 @@ fn normalize_manifest(raw: RawSkillManifest) -> Result<SkillManifest, SkillError
             "frontmatter requirement lists exceed their bounded sizes".to_string(),
         ));
     }
+    if raw.allowed_tools.as_ref().is_some_and(|values| values.len() > 64) {
+        return Err(SkillError::Invalid(
+            "allowed-tools exceeds 64 entries".to_string(),
+        ));
+    }
     let name = bounded_trimmed(&raw.name, "name", 1, 96)?;
     let description = bounded_trimmed(&raw.description, "description", 1, 1024)?;
     let command = match &raw.command {
@@ -1904,6 +2034,18 @@ fn normalize_manifest(raw: RawSkillManifest) -> Result<SkillManifest, SkillError
         .into_iter()
         .map(|value| validate_requirement_name(&value, "environment variable", false))
         .collect::<Result<Vec<_>, _>>()?;
+    let allowed_tools = match raw.allowed_tools {
+        Some(values) => {
+            let validated = values
+                .into_iter()
+                .map(|value| bounded_trimmed(&value, "allowed-tools entry", 1, 128))
+                .collect::<Result<Vec<_>, _>>()?;
+            unique_set(validated, "allowed-tools")?
+                .into_iter()
+                .collect()
+        }
+        None => Vec::new(),
+    };
     Ok(SkillManifest {
         name,
         description,
@@ -1914,6 +2056,7 @@ fn normalize_manifest(raw: RawSkillManifest) -> Result<SkillManifest, SkillError
             bins: unique_set(bins, "requires.bins")?,
             env: unique_set(env, "requires.env")?,
         },
+        allowed_tools,
     })
 }
 
@@ -2765,7 +2908,8 @@ mod tests {
         );
 
         // Unknown top-level keys are tolerated for ecosystem SKILL.md compat
-        // (argument-hint, license, allowed-tools, metadata, ...).
+        // (argument-hint, license, metadata, ...) — `allowed-tools` is its
+        // own known, consumed key now (see `allowed_tools_*` tests below).
         fs::write(
             skill.join("SKILL.md"),
             "---\nname: X\ndescription: X\ncommand: x\nversion: 1.0.0\nunknown: true\n---\nDo x.\n",
@@ -3510,5 +3654,163 @@ esac
         symlink(root.path(), manager.global_root().join(HISTORY_DIR)).unwrap();
         assert!(history_command_root(manager.global_root(), "review", true).is_err());
         fs::remove_file(manager.global_root().join(HISTORY_DIR)).unwrap();
+    }
+
+    #[test]
+    fn allowed_tools_accepts_list_form() {
+        let root = TestDirectory::new("allowed-tools-list");
+        let skill = write_skill(
+            root.path(),
+            "review",
+            "1.0.0",
+            "allowed-tools: [read_file, grep]\n",
+        );
+        let manifest = scan_skill_folder(&skill).unwrap().parsed.manifest;
+        assert_eq!(manifest.allowed_tools, vec!["grep".to_string(), "read_file".to_string()]);
+    }
+
+    #[test]
+    fn allowed_tools_accepts_csv_form() {
+        let root = TestDirectory::new("allowed-tools-csv");
+        let skill = write_skill(
+            root.path(),
+            "review",
+            "1.0.0",
+            "allowed-tools: \"read_file,  grep \"\n",
+        );
+        // CSV entries are trimmed and returned sorted, same as the list form.
+        let manifest = scan_skill_folder(&skill).unwrap().parsed.manifest;
+        assert_eq!(manifest.allowed_tools, vec!["grep".to_string(), "read_file".to_string()]);
+    }
+
+    #[test]
+    fn allowed_tools_rejects_duplicates() {
+        // Mirrors `os`/`requires.bins`/`requires.env`: a duplicate entry
+        // fails closed rather than being silently deduplicated.
+        let root = TestDirectory::new("allowed-tools-dupes");
+        let skill = write_skill(
+            root.path(),
+            "review",
+            "1.0.0",
+            "allowed-tools: [grep, grep]\n",
+        );
+        assert!(scan_skill_folder(&skill)
+            .unwrap_err()
+            .to_string()
+            .contains("allowed-tools contains duplicates"));
+    }
+
+    #[test]
+    fn allowed_tools_absent_means_unrestricted() {
+        let root = TestDirectory::new("allowed-tools-absent");
+        let skill = write_skill(root.path(), "review", "1.0.0", "");
+        let manifest = scan_skill_folder(&skill).unwrap().parsed.manifest;
+        assert!(manifest.allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn allowed_tools_rejects_too_many_entries() {
+        let root = TestDirectory::new("allowed-tools-overflow");
+        let entries = (0..65).map(|index| format!("tool_{index}")).collect::<Vec<_>>().join(", ");
+        let skill = write_skill(
+            root.path(),
+            "review",
+            "1.0.0",
+            &format!("allowed-tools: [{entries}]\n"),
+        );
+        assert!(scan_skill_folder(&skill)
+            .unwrap_err()
+            .to_string()
+            .contains("allowed-tools exceeds"));
+    }
+
+    #[test]
+    fn read_resource_returns_bundled_file_contents() {
+        let root = TestDirectory::new("read-resource-ok");
+        let app_data = root.path().join("app-data");
+        let source = write_skill(root.path(), "summarize", "1.0.0", "");
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+        let preview = manager.preview_local(&source, SkillScope::Global, None).unwrap();
+        manager
+            .install_local(&source, SkillScope::Global, None, &preview.approval_digest, true)
+            .unwrap();
+        let contents = manager
+            .read_resource("summarize", "references/info.md", None)
+            .unwrap();
+        assert_eq!(contents, "reference");
+    }
+
+    #[test]
+    fn read_resource_rejects_path_escape_and_absolute_paths() {
+        let root = TestDirectory::new("read-resource-escape");
+        let app_data = root.path().join("app-data");
+        let source = write_skill(root.path(), "summarize", "1.0.0", "");
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+        let preview = manager.preview_local(&source, SkillScope::Global, None).unwrap();
+        manager
+            .install_local(&source, SkillScope::Global, None, &preview.approval_digest, true)
+            .unwrap();
+        assert!(manager
+            .read_resource("summarize", "../outside.txt", None)
+            .is_err());
+        assert!(manager
+            .read_resource("summarize", "/etc/passwd", None)
+            .is_err());
+    }
+
+    #[test]
+    fn read_resource_rejects_non_utf8_files() {
+        let root = TestDirectory::new("read-resource-binary");
+        let app_data = root.path().join("app-data");
+        let source = write_skill(root.path(), "summarize", "1.0.0", "");
+        fs::write(source.join("references/binary.bin"), [0xFFu8, 0xFE, 0x00]).unwrap();
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+        let preview = manager.preview_local(&source, SkillScope::Global, None).unwrap();
+        manager
+            .install_local(&source, SkillScope::Global, None, &preview.approval_digest, true)
+            .unwrap();
+        assert!(matches!(
+            manager.read_resource("summarize", "references/binary.bin", None),
+            Err(SkillError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn read_resource_falls_back_to_workspace_scope() {
+        let root = TestDirectory::new("read-resource-workspace");
+        let app_data = root.path().join("app-data");
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let source = write_skill(root.path(), "summarize", "1.0.0", "");
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+        let preview = manager
+            .preview_local(&source, SkillScope::Workspace, Some(&workspace))
+            .unwrap();
+        manager
+            .install_local(
+                &source,
+                SkillScope::Workspace,
+                Some(&workspace),
+                &preview.approval_digest,
+                true,
+            )
+            .unwrap();
+        // No scope is passed in — `read_resource` finds it in the workspace
+        // root after the (non-existent, for this command) global root misses.
+        let contents = manager
+            .read_resource("summarize", "references/info.md", Some(&workspace))
+            .unwrap();
+        assert_eq!(contents, "reference");
+    }
+
+    #[test]
+    fn read_resource_rejects_unknown_command() {
+        let root = TestDirectory::new("read-resource-unknown");
+        let app_data = root.path().join("app-data");
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+        assert!(matches!(
+            manager.read_resource("does-not-exist", "references/info.md", None),
+            Err(SkillError::NotFound(_))
+        ));
     }
 }
