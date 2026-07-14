@@ -6,6 +6,8 @@ const mocks = vi.hoisted(() => ({
   loadRunEvents: vi.fn(),
   checkRunLedgerIntegrity: vi.fn(),
   onRunsChanged: vi.fn(),
+  archiveRun: vi.fn(),
+  unarchiveRun: vi.fn(),
 }));
 vi.mock("../lib/runProtocol", () => mocks);
 
@@ -19,7 +21,12 @@ function run(id: string, created: number): RunRecord {
     lastSequence: 0,
     terminalSequence: null,
     updatedAtMs: created,
+    archivedAtMs: null,
   };
+}
+
+function archivedRun(id: string, created: number, archivedAtMs: number): RunRecord {
+  return { ...run(id, created), status: "cancelled", archivedAtMs };
 }
 
 describe("runStore", () => {
@@ -27,7 +34,7 @@ describe("runStore", () => {
     disposeRunStoreSubscription();
     useRunStore.setState({
       runs: [], selectedRunId: null, eventsByRun: {}, loading: false,
-      detailLoading: false, error: null, integrity: null,
+      detailLoading: false, error: null, integrity: null, showArchived: false,
     });
     vi.clearAllMocks();
     mocks.onRunsChanged.mockResolvedValue(() => {});
@@ -64,5 +71,36 @@ describe("runStore", () => {
     mocks.checkRunLedgerIntegrity.mockResolvedValue({ ok: false, violations: ["sequence gap"] });
     await useRunStore.getState().checkIntegrity();
     expect(useRunStore.getState().integrity).toEqual({ ok: false, violations: ["sequence gap"] });
+  });
+
+  it("archiving a run drops it from the visible list once showArchived is off", async () => {
+    const visible = run("run-visible", 1);
+    const target = run("run-target", 2);
+    useRunStore.setState({ runs: [target, visible], showArchived: false });
+    mocks.archiveRun.mockResolvedValue(archivedRun("run-target", 2, 9_000));
+    mocks.getRun.mockResolvedValue(archivedRun("run-target", 2, 9_000));
+
+    await useRunStore.getState().archiveRun("run-target");
+
+    expect(mocks.archiveRun).toHaveBeenCalledWith("run-target");
+    const ids = useRunStore.getState().runs.map((entry) => entry.spec.run_id);
+    expect(ids).toEqual(["run-visible"]);
+  });
+
+  it("showing archived runs keeps an archived run's refresh visible", async () => {
+    useRunStore.setState({ runs: [], showArchived: true });
+    mocks.getRun.mockResolvedValue(archivedRun("run-target", 2, 9_000));
+
+    await useRunStore.getState().refreshRun("run-target");
+
+    const ids = useRunStore.getState().runs.map((entry) => entry.spec.run_id);
+    expect(ids).toEqual(["run-target"]);
+  });
+
+  it("setShowArchived toggles the flag and reloads with the archived filter", async () => {
+    mocks.listRuns.mockResolvedValue([]);
+    await useRunStore.getState().setShowArchived(true);
+    expect(useRunStore.getState().showArchived).toBe(true);
+    expect(mocks.listRuns).toHaveBeenCalledWith(200, true);
   });
 });

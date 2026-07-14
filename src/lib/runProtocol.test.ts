@@ -4,7 +4,7 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
-import { appendRunEvent, decideRunPermission, listRuns, requestRunCancellation } from "./runProtocol";
+import { appendRunEvent, archiveRun, decideRunPermission, listRuns, requestRunCancellation, unarchiveRun } from "./runProtocol";
 
 describe("run protocol client", () => {
   beforeEach(() => invoke.mockReset());
@@ -31,10 +31,28 @@ describe("run protocol client", () => {
     });
   });
 
-  it("uses a bounded run-history default", async () => {
+  it("uses a bounded run-history default that hides archived runs", async () => {
     invoke.mockResolvedValue([]);
     await listRuns();
-    expect(invoke).toHaveBeenCalledWith("run_list", { limit: 200 });
+    expect(invoke).toHaveBeenCalledWith("run_list", { limit: 200, includeArchived: false });
+  });
+
+  it("can include archived runs on request", async () => {
+    invoke.mockResolvedValue([]);
+    await listRuns(200, true);
+    expect(invoke).toHaveBeenCalledWith("run_list", { limit: 200, includeArchived: true });
+  });
+
+  it("archives a run through a dedicated command", async () => {
+    invoke.mockResolvedValue({});
+    await archiveRun("run-1");
+    expect(invoke).toHaveBeenCalledWith("run_archive", { runId: "run-1" });
+  });
+
+  it("unarchives a run through a dedicated command", async () => {
+    invoke.mockResolvedValue({});
+    await unarchiveRun("run-1");
+    expect(invoke).toHaveBeenCalledWith("run_unarchive", { runId: "run-1" });
   });
 
   it("requests cancellation through a host-attributed command", async () => {

@@ -273,6 +273,7 @@ export interface RunRecord {
   lastSequence: number;
   terminalSequence: number | null;
   updatedAtMs: number;
+  archivedAtMs: number | null;
 }
 export interface RunSubmitResponse { run: RunRecord; inserted: boolean }
 export interface RunAppendResponse { envelope: RunEventEnvelopeWire; status: RunStatus; terminal: boolean }
@@ -303,8 +304,14 @@ export function requestRunCancellation(runId: string, reason: string | null = nu
 export function getRun(runId: string): Promise<RunRecord | null> {
   return invoke<RunRecord | null>("run_get", { runId });
 }
-export function listRuns(limit = 200): Promise<RunRecord[]> {
-  return invoke<RunRecord[]>("run_list", { limit });
+export function listRuns(limit = 200, includeArchived = false): Promise<RunRecord[]> {
+  return invoke<RunRecord[]>("run_list", { limit, includeArchived });
+}
+export function archiveRun(runId: string): Promise<RunRecord> {
+  return invoke<RunRecord>("run_archive", { runId });
+}
+export function unarchiveRun(runId: string): Promise<RunRecord> {
+  return invoke<RunRecord>("run_unarchive", { runId });
 }
 export function loadRunEvents(runId: string, afterSequence = 0, limit = 1_000): Promise<RunEventEnvelopeWire[]> {
   return invoke<RunEventEnvelopeWire[]>("run_events", { runId, afterSequence, limit });
