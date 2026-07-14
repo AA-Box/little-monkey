@@ -742,10 +742,23 @@ async fn run_stream_chat(
         effort.as_deref(),
     );
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach {base_url}: {e}"))?;
+    // Stop button: race connection establishment itself, not just the body
+    // stream below. Without this, a slow/hung provider (a loaded free-tier
+    // model queuing before it sends headers) makes cancellation inert until
+    // `send()` resolves on its own — the run would sit in `cancelling`
+    // forever with no way to actually stop it.
+    let response = tokio::select! {
+        _ = cancel.notified() => {
+            let _ = app.emit(
+                "provider://chat-done",
+                json!({ "request_id": request_id, "cancelled": true }),
+            );
+            return Ok(());
+        }
+        result = request.send() => {
+            result.map_err(|e| format!("Failed to reach {base_url}: {e}"))?
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();

@@ -1,11 +1,13 @@
 import { create } from "zustand";
 
 import {
+  archiveRun as archiveRunRequest,
   checkRunLedgerIntegrity,
   getRun,
   listRuns,
   loadRunEvents,
   onRunsChanged,
+  unarchiveRun as unarchiveRunRequest,
   type RunEventEnvelopeWire,
   type RunLedgerIntegrity,
   type RunRecord,
@@ -19,11 +21,15 @@ interface RunStoreState {
   detailLoading: boolean;
   error: string | null;
   integrity: RunLedgerIntegrity | null;
+  showArchived: boolean;
   refresh: () => Promise<void>;
   selectRun: (runId: string | null) => Promise<void>;
   refreshRun: (runId: string) => Promise<void>;
   checkIntegrity: () => Promise<void>;
   clearError: () => void;
+  setShowArchived: (value: boolean) => Promise<void>;
+  archiveRun: (runId: string) => Promise<void>;
+  unarchiveRun: (runId: string) => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -47,12 +53,13 @@ export const useRunStore = create<RunStoreState>((set, get) => ({
   detailLoading: false,
   error: null,
   integrity: null,
+  showArchived: false,
 
   refresh: async () => {
     const generation = ++listGeneration;
     set({ loading: true, error: null });
     try {
-      const runs = await listRuns();
+      const runs = await listRuns(200, get().showArchived);
       if (generation !== listGeneration) return;
       const currentSelection = get().selectedRunId;
       const selectedRunId = currentSelection && runs.some((run) => run.spec.run_id === currentSelection)
@@ -77,15 +84,22 @@ export const useRunStore = create<RunStoreState>((set, get) => ({
     try {
       const [run, events] = await Promise.all([getRun(runId), loadRunEvents(runId)]);
       if (detailGenerations.get(runId) !== generation) return;
-      set((state) => ({
-        runs: run
-          ? [run, ...state.runs.filter((entry) => entry.spec.run_id !== runId)].sort(
-              (a, b) => b.spec.created_at_ms - a.spec.created_at_ms || b.spec.run_id.localeCompare(a.spec.run_id),
-            )
-          : state.runs.filter((entry) => entry.spec.run_id !== runId),
-        eventsByRun: { ...state.eventsByRun, [runId]: events },
-        detailLoading: false,
-      }));
+      set((state) => {
+        // An archived run that just got archived (or a still-archived one
+        // refreshed while "show archived" is off) has no place in the
+        // visible list — remove it instead of re-inserting it, the same way
+        // a run that's gone entirely is dropped below.
+        const visible = run && (state.showArchived || run.archivedAtMs == null);
+        return {
+          runs: visible
+            ? [run, ...state.runs.filter((entry) => entry.spec.run_id !== runId)].sort(
+                (a, b) => b.spec.created_at_ms - a.spec.created_at_ms || b.spec.run_id.localeCompare(a.spec.run_id),
+              )
+            : state.runs.filter((entry) => entry.spec.run_id !== runId),
+          eventsByRun: { ...state.eventsByRun, [runId]: events },
+          detailLoading: false,
+        };
+      });
     } catch (error) {
       if (detailGenerations.get(runId) === generation) {
         set({ detailLoading: false, error: errorMessage(error) });
@@ -103,6 +117,25 @@ export const useRunStore = create<RunStoreState>((set, get) => ({
   },
 
   clearError: () => set({ error: null }),
+
+  setShowArchived: async (value) => {
+    set({ showArchived: value });
+    await get().refresh();
+  },
+
+  // Unlike `refresh`/`checkIntegrity` (background loads that own their error
+  // display via the store's `error` field), archive/unarchive are one-off
+  // commands a caller triggers with its own busy/error UI — same shape as
+  // `cancelRun` in RunCenter.tsx. So these rethrow instead of swallowing.
+  archiveRun: async (runId) => {
+    await archiveRunRequest(runId);
+    await get().refreshRun(runId);
+  },
+
+  unarchiveRun: async (runId) => {
+    await unarchiveRunRequest(runId);
+    await get().refreshRun(runId);
+  },
 }));
 
 let unlisten: (() => void) | null = null;

@@ -668,6 +668,8 @@ pub fn run() {
             run_commands::run_request_cancellation,
             run_commands::run_get,
             run_commands::run_list,
+            run_commands::run_archive,
+            run_commands::run_unarchive,
             run_commands::run_events,
             run_commands::run_integrity_check,
             m3_commands::m3_hardware_snapshot,

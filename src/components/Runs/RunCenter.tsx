@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Archive,
+  ArchiveRestore,
   CheckCircle2,
   Clock3,
   Pause,
@@ -91,11 +93,14 @@ function RunListItem({ run, selected, onSelect }: { run: RunRecord; selected: bo
       aria-current={selected ? "true" : undefined}
       className={`w-full border-b border-border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent ${
         selected ? "bg-surface-2" : "hover:bg-surface-2/60"
-      }`}
+      } ${run.archivedAtMs ? "opacity-60" : ""}`}
     >
       <div className="flex items-start justify-between gap-2">
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{run.spec.task}</span>
-        <StatusPill tone={statusTone(run.status)}>{t(`RunCenter.status.${run.status}`)}</StatusPill>
+        <div className="flex shrink-0 items-center gap-1">
+          {run.archivedAtMs && <StatusPill tone="neutral">{t("RunCenter.archived")}</StatusPill>}
+          <StatusPill tone={statusTone(run.status)}>{t(`RunCenter.status.${run.status}`)}</StatusPill>
+        </div>
       </div>
       <div className="mt-2 flex items-center justify-between gap-2 text-xs text-faint">
         <span className="truncate">{run.spec.target.label}</span>
@@ -119,6 +124,10 @@ export function RunCenter({ onClose }: RunCenterProps) {
   const refreshRun = useRunStore((state) => state.refreshRun);
   const checkIntegrity = useRunStore((state) => state.checkIntegrity);
   const clearError = useRunStore((state) => state.clearError);
+  const showArchived = useRunStore((state) => state.showArchived);
+  const setShowArchived = useRunStore((state) => state.setShowArchived);
+  const archiveRunAction = useRunStore((state) => state.archiveRun);
+  const unarchiveRunAction = useRunStore((state) => state.unarchiveRun);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [managedRunIds, setManagedRunIds] = useState<string[]>([]);
@@ -163,6 +172,32 @@ export function RunCenter({ onClose }: RunCenterProps) {
         await requestRunCancellation(selectedRunId, t("RunCenter.cancelReason"));
       }
       await refreshRun(selectedRunId);
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function archiveSelectedRun() {
+    if (!selectedRunId) return;
+    setActionBusy("archive");
+    setActionError(null);
+    try {
+      await archiveRunAction(selectedRunId);
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function unarchiveSelectedRun() {
+    if (!selectedRunId) return;
+    setActionBusy("unarchive");
+    setActionError(null);
+    try {
+      await unarchiveRunAction(selectedRunId);
     } catch (caught) {
       setActionError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -240,7 +275,15 @@ export function RunCenter({ onClose }: RunCenterProps) {
       )}
 
       <div className="flex min-h-0 flex-1">
-        <nav className="w-72 shrink-0 overflow-y-auto border-r border-border bg-surface [overscroll-behavior:contain]" aria-label={t("RunCenter.runHistory")}>
+        <nav className="flex w-72 shrink-0 flex-col overflow-y-auto border-r border-border bg-surface [overscroll-behavior:contain]" aria-label={t("RunCenter.runHistory")}>
+          <label className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(event) => void setShowArchived(event.target.checked)}
+            />
+            {t("RunCenter.showArchived")}
+          </label>
           {loading && runs.length === 0 ? (
             <p className="p-4 text-sm text-faint">{t("RunCenter.loading")}</p>
           ) : runs.length === 0 ? (
@@ -289,6 +332,16 @@ export function RunCenter({ onClose }: RunCenterProps) {
                   {!TERMINAL.has(selectedRun.status) && selectedRun.status !== "cancelling" && (
                     <Button variant="danger" size="sm" disabled={actionBusy !== null} onClick={() => void cancelRun()}>
                       <Square size={12} /> {t("RunCenter.requestCancellation")}
+                    </Button>
+                  )}
+                  {TERMINAL.has(selectedRun.status) && !selectedRun.archivedAtMs && (
+                    <Button size="sm" disabled={actionBusy !== null} onClick={() => void archiveSelectedRun()}>
+                      <Archive size={12} /> {t("RunCenter.archive")}
+                    </Button>
+                  )}
+                  {selectedRun.archivedAtMs && (
+                    <Button size="sm" disabled={actionBusy !== null} onClick={() => void unarchiveSelectedRun()}>
+                      <ArchiveRestore size={12} /> {t("RunCenter.unarchive")}
                     </Button>
                   )}
                 </div>
