@@ -29,6 +29,7 @@ pub struct RunRecord {
     pub last_sequence: u64,
     pub terminal_sequence: Option<u64>,
     pub updated_at_ms: u64,
+    pub archived_at_ms: Option<u64>,
 }
 
 impl From<StoredRun> for RunRecord {
@@ -39,6 +40,7 @@ impl From<StoredRun> for RunRecord {
             last_sequence: run.last_sequence,
             terminal_sequence: run.terminal_sequence,
             updated_at_ms: run.updated_at_ms,
+            archived_at_ms: run.archived_at_ms,
         }
     }
 }
@@ -462,9 +464,51 @@ pub fn run_list(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     limit: usize,
+    include_archived: Option<bool>,
 ) -> Result<Vec<RunRecord>, String> {
-    with_ledger(&app, state.inner(), |ledger| ledger.list_runs(limit))
-        .map(|runs| runs.into_iter().map(Into::into).collect())
+    with_ledger(&app, state.inner(), |ledger| {
+        ledger.list_runs(limit, include_archived.unwrap_or(false))
+    })
+    .map(|runs| runs.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub fn run_archive(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<RunRecord, String> {
+    let archived_at_ms = unix_time_ms()?;
+    let run = with_ledger(&app, state.inner(), |ledger| {
+        ledger.archive_run(&run_id, archived_at_ms)
+    })?;
+    let _ = app.emit(
+        RUNS_CHANGED_EVENT,
+        RunChangedPayload {
+            run_id: run.spec.run_id.clone(),
+            status: run.status,
+            last_sequence: run.last_sequence,
+        },
+    );
+    Ok(run.into())
+}
+
+#[tauri::command]
+pub fn run_unarchive(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<RunRecord, String> {
+    let run = with_ledger(&app, state.inner(), |ledger| ledger.unarchive_run(&run_id))?;
+    let _ = app.emit(
+        RUNS_CHANGED_EVENT,
+        RunChangedPayload {
+            run_id: run.spec.run_id.clone(),
+            status: run.status,
+            last_sequence: run.last_sequence,
+        },
+    );
+    Ok(run.into())
 }
 
 #[tauri::command]
