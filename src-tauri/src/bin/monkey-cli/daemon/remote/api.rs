@@ -344,7 +344,7 @@ impl RemoteApi {
         scopes: &RemoteScopes,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
         let ledger = self.run_ledger()?;
-        let runs = ledger.list_runs(1_000).map_err(internal)?;
+        let runs = ledger.list_runs(1_000, false).map_err(internal)?;
         let shared = SharedLedger::open(&self.paths.ledger_db).map_err(internal)?;
         let summaries = runs
             .iter()
@@ -1130,7 +1130,7 @@ mod tests {
         );
         let first = api.handle(valid.clone(), 2_001);
         let replay = api.handle(valid, 2_002);
-        assert_eq!(first.status, 200);
+        assert_eq!(first.status, 200, "body: {:?}", first.body);
         assert_eq!(first, replay);
         let approval = RunLedger::open(&DaemonPaths::under(&root).ledger_db)
             .unwrap()

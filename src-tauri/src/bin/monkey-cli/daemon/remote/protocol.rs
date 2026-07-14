@@ -369,6 +369,32 @@ pub fn random_token(bytes: usize) -> Result<String, String> {
     Ok(URL_SAFE_NO_PAD.encode(value))
 }
 
+/// Same as `random_token`, except the result is guaranteed to start and end
+/// with an ASCII letter or digit — required for any token that gets promoted
+/// into an identifier later checked by `run_protocol::validate_protocol_id`
+/// (e.g. a `device_id` reused as `ClientIdentity.client_id`/`instance_id`).
+/// `random_token`'s URL-safe base64 alphabet includes `-`/`_`, so an ordinary
+/// call has roughly a 1-in-32 chance of landing one of those at either
+/// boundary; resampling the whole token is simpler and just as sound as
+/// trying to fix up only the offending byte, since every byte is uniformly
+/// random anyway. Bounded to 8 attempts purely so a truly broken RNG fails
+/// loudly instead of looping forever — a real `SystemRandom` failing this
+/// check 8 times in a row is not a real-world scenario.
+pub fn random_token_id(bytes: usize) -> Result<String, String> {
+    for _ in 0..8 {
+        let token = random_token(bytes)?;
+        let boundary_safe = token
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+            && token.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric);
+        if boundary_safe {
+            return Ok(token);
+        }
+    }
+    Err("Failed to generate a boundary-safe random token".to_string())
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -443,6 +469,33 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the real bug `random_token_id` fixes: a
+    /// `device_id` built as `format!("device-{}", random_token(18)?)` had
+    /// roughly a 1-in-32 chance of failing `run_protocol::validate_protocol_id`'s
+    /// "must start and end with an ASCII letter or digit" rule once reused
+    /// as `ClientIdentity.client_id`/`instance_id` (see `control_recorder`
+    /// in `daemon/remote/api.rs`) — a real, permanently unusable paired
+    /// device on a live pairing, not just test flakiness. 500 iterations
+    /// makes a reintroduced bug (~6% failure rate per id, two ids checked
+    /// per iteration) essentially certain to be caught.
+    #[test]
+    fn random_token_id_stays_boundary_safe_once_embedded_as_a_client_identity() {
+        for _ in 0..500 {
+            let device_id = format!("device-{}", random_token_id(18).unwrap());
+            assert!(little_monkey_lib::run_protocol::validate_protocol_id(
+                "client.client_id",
+                &device_id
+            )
+            .is_ok());
+            let instance_id = format!("remote-{device_id}");
+            assert!(little_monkey_lib::run_protocol::validate_protocol_id(
+                "client.instance_id",
+                &instance_id
+            )
+            .is_ok());
+        }
+    }
 
     #[test]
     fn signed_request_binds_method_path_sequence_nonce_and_body() {
