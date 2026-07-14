@@ -2,15 +2,22 @@ import { useEffect, useRef, useState } from "react";
 import {
   BarChart3,
   BookOpen,
+  Bot,
+  Boxes,
   Cloud,
   Cpu,
   Keyboard,
+  HardDrive,
+  Gauge,
+  GitPullRequest,
   ListChecks,
   MessageSquare,
+  MonitorCheck,
   Plug,
   ScrollText,
   Search,
   Server,
+  ShieldCheck,
   Sparkles,
   Terminal,
   X,
@@ -31,6 +38,14 @@ import { KnowledgePanel } from "./KnowledgePanel";
 import { KeyboardShortcutsPanel } from "./KeyboardShortcutsPanel";
 import { ScheduledTasksPanel } from "./ScheduledTasksPanel";
 import { UsagePanel } from "./UsagePanel";
+import { PortabilityPanel } from "./PortabilityPanel";
+import { EcosystemPanel } from "./EcosystemPanel";
+import { RuntimeHubPanel } from "./RuntimeHubPanel";
+import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
+import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
+import { GitDeliveryPanel } from "./GitDeliveryPanel";
+import { CompanionPanel } from "./CompanionPanel";
+import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -48,7 +63,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -63,13 +78,21 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   shortcuts: Keyboard,
   usage: BarChart3,
   tasks: ListChecks,
+  portability: HardDrive,
+  ecosystem: Boxes,
+  runtimehub: Gauge,
+  browser: MonitorCheck,
+  gitdelivery: GitPullRequest,
+  background: Bot,
+  companion: Sparkles,
+  security: ShieldCheck,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
-  { labelKey: "SettingsModal.groupApplication", ids: ["shortcuts", "usage"] },
-  { labelKey: "SettingsModal.groupModels", ids: ["local", "ollama", "providers"] },
+  { labelKey: "SettingsModal.groupApplication", ids: ["security", "companion", "shortcuts", "usage", "portability"] },
+  { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["mcp", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "background", "mcp", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
@@ -85,6 +108,14 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   shortcuts: "SettingsModal.tabKeyboardShortcuts",
   usage: "SettingsModal.tabUsage",
   tasks: "SettingsModal.tabTasks",
+  portability: "SettingsModal.tabPortability",
+  ecosystem: "SettingsModal.tabEcosystem",
+  runtimehub: "SettingsModal.tabRuntimeHub",
+  browser: "SettingsModal.tabBrowserVerification",
+  gitdelivery: "SettingsModal.tabGitDelivery",
+  background: "SettingsModal.tabBackgroundAgents",
+  companion: "SettingsModal.tabCompanion",
+  security: "SettingsModal.tabSecurityDoctor",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -230,7 +261,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
         aria-modal="true"
         aria-labelledby="settings-modal-title"
         tabIndex={-1}
-        className="flex h-[85vh] w-[90vw] max-w-5xl overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
+        className="flex h-[85vh] w-[90vw] overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex w-64 shrink-0 flex-col border-r border-border bg-surface">
@@ -287,7 +318,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
 
           <div className="relative min-h-0 flex-1">
             <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-4 bg-gradient-to-b from-background to-transparent" />
-            <div className="h-full overflow-y-auto px-6 pb-6 [overscroll-behavior:contain]">
+            <div className="h-full overflow-y-auto px-6 pb-6 pt-4 [overscroll-behavior:contain]">
               {tab === "local" && <ModelManager />}
               {tab === "ollama" && <OllamaPanel />}
               {tab === "openrouter" && <OpenRouterModelsPanel />}
@@ -308,6 +339,14 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "shortcuts" && <KeyboardShortcutsPanel />}
               {tab === "usage" && <UsagePanel />}
               {tab === "tasks" && <ScheduledTasksPanel />}
+              {tab === "portability" && <PortabilityPanel />}
+              {tab === "ecosystem" && <EcosystemPanel />}
+              {tab === "runtimehub" && <RuntimeHubPanel />}
+              {tab === "browser" && <BrowserVerificationPanel />}
+              {tab === "gitdelivery" && <GitDeliveryPanel />}
+              {tab === "background" && <BackgroundAgentsPanel />}
+              {tab === "companion" && <CompanionPanel />}
+              {tab === "security" && <SecurityDoctorPanel />}
             </div>
           </div>
         </div>

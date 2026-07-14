@@ -92,11 +92,11 @@ async fn check_reachable() -> (bool, Option<String>) {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let version = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            let version = resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                v.get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
             (true, version)
         }
         _ => (false, None),
@@ -210,6 +210,18 @@ pub struct OllamaModelInfo {
     pub modified_at: String,
 }
 
+/// One model currently resident in Ollama's memory, as reported by
+/// `GET /api/ps`. This is intentionally a snapshot rather than an assertion
+/// that the model will remain resident after the command returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OllamaRunningModelInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    pub size_vram_bytes: u64,
+    pub digest: String,
+    pub expires_at: String,
+}
+
 /// Minimal shape of a single entry in `GET /api/tags`'s `models` array.
 /// Ollama's field naming has varied across versions/endpoints (`name` vs
 /// `model`), so both are accepted defensively.
@@ -229,6 +241,31 @@ struct RawTagEntry {
 struct RawTagsResponse {
     #[serde(default)]
     models: Vec<RawTagEntry>,
+}
+
+/// Minimal shape of a single entry in `GET /api/ps`'s `models` array.
+/// Accept both `name` and `model`, matching the defensive parsing used for
+/// `/api/tags` above across Ollama versions.
+#[derive(Deserialize)]
+struct RawRunningModelEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    size_vram: u64,
+    #[serde(default)]
+    digest: String,
+    #[serde(default)]
+    expires_at: String,
+}
+
+#[derive(Deserialize)]
+struct RawRunningModelsResponse {
+    #[serde(default)]
+    models: Vec<RawRunningModelEntry>,
 }
 
 #[derive(Deserialize, Default)]
@@ -293,24 +330,144 @@ pub async fn ollama_list_models() -> Result<Vec<OllamaModelInfo>, String> {
         })
         .collect();
 
-    let capability_flags =
-        futures_util::future::join_all(names.iter().map(|(name, _, _)| check_capabilities(&client, name)))
-            .await;
+    let capability_flags = futures_util::future::join_all(
+        names
+            .iter()
+            .map(|(name, _, _)| check_capabilities(&client, name)),
+    )
+    .await;
 
     let models = names
         .into_iter()
         .zip(capability_flags)
-        .map(|((name, size, modified_at), (tool_calling, vision))| OllamaModelInfo {
-            is_cloud: name.to_lowercase().contains("cloud"),
-            name,
-            size_bytes: size,
-            tool_calling,
-            vision,
-            modified_at,
-        })
+        .map(
+            |((name, size, modified_at), (tool_calling, vision))| OllamaModelInfo {
+                is_cloud: name.to_lowercase().contains("cloud"),
+                name,
+                size_bytes: size,
+                tool_calling,
+                vision,
+                modified_at,
+            },
+        )
         .collect();
 
     Ok(models)
+}
+
+/// Convert Ollama's version-tolerant `/api/ps` response into the stable shape
+/// exposed to the frontend. Entries without either supported model-name field
+/// are ignored because they cannot be targeted safely for an exact unload.
+fn normalize_running_models(parsed: RawRunningModelsResponse) -> Vec<OllamaRunningModelInfo> {
+    parsed
+        .models
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.name.or(entry.model)?;
+            Some(OllamaRunningModelInfo {
+                name,
+                size_bytes: entry.size,
+                size_vram_bytes: entry.size_vram,
+                digest: entry.digest,
+                expires_at: entry.expires_at,
+            })
+        })
+        .collect()
+}
+
+/// Fetch the currently resident Ollama models using a caller-provided client.
+/// Keeping the HTTP operation here lets both residency commands use identical
+/// parsing and error semantics.
+async fn fetch_running_models(
+    client: &reqwest::Client,
+) -> Result<Vec<OllamaRunningModelInfo>, String> {
+    let resp = client
+        .get(format!("{OLLAMA_BASE_URL}/api/ps"))
+        .send()
+        .await
+        .map_err(|_| "Ollama isn't running — start it first".to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(if body.is_empty() {
+            format!("Failed to list Ollama's running models (HTTP {status})")
+        } else {
+            format!("Failed to list Ollama's running models (HTTP {status}): {body}")
+        });
+    }
+
+    let parsed: RawRunningModelsResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Ollama's running model list: {e}"))?;
+
+    Ok(normalize_running_models(parsed))
+}
+
+fn residency_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create Ollama residency client: {e}"))
+}
+
+/// List the models currently loaded in Ollama memory. Callers can snapshot
+/// this list before a comparison run and avoid unloading models that were
+/// already resident before Little Monkey started work.
+#[tauri::command]
+pub async fn ollama_list_running_models() -> Result<Vec<OllamaRunningModelInfo>, String> {
+    let client = residency_client()?;
+    fetch_running_models(&client).await
+}
+
+fn unload_request_body(model: &str) -> serde_json::Value {
+    json!({
+        "model": model,
+        "messages": [],
+        "keep_alive": 0,
+        "stream": false,
+    })
+}
+
+fn contains_exact_running_model(models: &[OllamaRunningModelInfo], model: &str) -> bool {
+    models.iter().any(|entry| entry.name == model)
+}
+
+/// Unload exactly one currently resident model without stopping the Ollama
+/// daemon. The `/api/ps` preflight is deliberately case-sensitive and does
+/// not resolve aliases: if that exact name is no longer resident, this is an
+/// idempotent no-op. That avoids asking Ollama to load an absent model merely
+/// to process a `keep_alive: 0` request.
+#[tauri::command]
+pub async fn ollama_unload_model(model: String) -> Result<(), String> {
+    validate_tag(&model)?;
+    let model = model.trim().to_string();
+    let client = residency_client()?;
+
+    let running = fetch_running_models(&client).await?;
+    if !contains_exact_running_model(&running, &model) {
+        return Ok(());
+    }
+
+    let resp = client
+        .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+        .json(&unload_request_body(&model))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Ollama while unloading '{model}': {e}"))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(if body.is_empty() {
+            format!("Failed to unload '{model}' (HTTP {status})")
+        } else {
+            format!("Failed to unload '{model}' (HTTP {status}): {body}")
+        })
+    }
 }
 
 /// Lightweight tag-name-only fetch for `server.rs`'s `GET /v1/models`
@@ -336,14 +493,21 @@ pub async fn list_tag_names(client: &reqwest::Client) -> Result<Vec<String>, Str
         .await
         .map_err(|e| format!("Failed to parse Ollama's model list: {e}"))?;
 
-    Ok(parsed.models.into_iter().filter_map(|entry| entry.name.or(entry.model)).collect())
+    Ok(parsed
+        .models
+        .into_iter()
+        .filter_map(|entry| entry.name.or(entry.model))
+        .collect())
 }
 
 /// Returns the built-in list of example cloud model tags, so the frontend
 /// carries zero hardcoded tag strings of its own.
 #[tauri::command]
 pub fn ollama_example_cloud_tags() -> Vec<String> {
-    OLLAMA_EXAMPLE_CLOUD_TAGS.iter().map(|s| s.to_string()).collect()
+    OLLAMA_EXAMPLE_CLOUD_TAGS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Shape of `POST /api/embed`'s response — a batch of embedding vectors, one
@@ -376,7 +540,9 @@ pub async fn embed(model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>, Stri
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Ollama embedding request failed (HTTP {status}): {body}"));
+        return Err(format!(
+            "Ollama embedding request failed (HTTP {status}): {body}"
+        ));
     }
 
     let parsed: RawEmbedResponse = resp
@@ -429,7 +595,9 @@ async fn stream_ollama_progress(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let last_lines = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::<String>::with_capacity(21)));
+    let last_lines = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::<
+        String,
+    >::with_capacity(21)));
 
     let mut tasks = Vec::new();
 
@@ -440,7 +608,10 @@ async fn stream_ollama_progress(
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit("ollama://pull-progress", json!({ "tag": tag, "line": line }));
+                let _ = app.emit(
+                    "ollama://pull-progress",
+                    json!({ "tag": tag, "line": line }),
+                );
                 let mut buf = last_lines.lock().await;
                 buf.push_back(line);
                 if buf.len() > 20 {
@@ -457,7 +628,10 @@ async fn stream_ollama_progress(
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit("ollama://pull-progress", json!({ "tag": tag, "line": line }));
+                let _ = app.emit(
+                    "ollama://pull-progress",
+                    json!({ "tag": tag, "line": line }),
+                );
                 let mut buf = last_lines.lock().await;
                 buf.push_back(line);
                 if buf.len() > 20 {
@@ -532,8 +706,12 @@ pub async fn ollama_import_model(app: AppHandle, name: String, path: String) -> 
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
-    std::fs::create_dir_all(&app_dir)
-        .map_err(|e| format!("Failed to create app data directory {}: {e}", app_dir.display()))?;
+    std::fs::create_dir_all(&app_dir).map_err(|e| {
+        format!(
+            "Failed to create app data directory {}: {e}",
+            app_dir.display()
+        )
+    })?;
     let modelfile_path = app_dir.join(format!("Modelfile.{}", uuid::Uuid::new_v4()));
     std::fs::write(&modelfile_path, format!("FROM {}\n", source.display()))
         .map_err(|e| format!("Failed to write Modelfile: {e}"))?;
@@ -625,8 +803,20 @@ pub async fn ollama_signin(_app: AppHandle) -> Result<String, String> {
 
     let combined = async move {
         let (out, err) = tokio::join!(
-            async { if let Some(o) = stdout { drain_to_string(o).await } else { String::new() } },
-            async { if let Some(e) = stderr { drain_to_string(e).await } else { String::new() } },
+            async {
+                if let Some(o) = stdout {
+                    drain_to_string(o).await
+                } else {
+                    String::new()
+                }
+            },
+            async {
+                if let Some(e) = stderr {
+                    drain_to_string(e).await
+                } else {
+                    String::new()
+                }
+            },
         );
         format!("{out}{err}")
     };
@@ -647,5 +837,95 @@ pub async fn ollama_signin(_app: AppHandle) -> Result<String, String> {
         Ok("Sign-in started — a browser window should open. Complete it there, then try pulling the model again.".to_string())
     } else {
         Ok(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    fn parse_running_models(json: &str) -> Vec<OllamaRunningModelInfo> {
+        let raw: RawRunningModelsResponse =
+            serde_json::from_str(json).expect("valid /api/ps fixture");
+        normalize_running_models(raw)
+    }
+
+    #[test]
+    fn parses_running_models_across_name_field_variants() {
+        let models = parse_running_models(
+            r#"{
+                "models": [
+                    {
+                        "name": "llama3.2:latest",
+                        "size": 2100000000,
+                        "size_vram": 1800000000,
+                        "digest": "sha256:first",
+                        "expires_at": "2026-07-13T12:00:00Z"
+                    },
+                    {
+                        "model": "qwen3:8b",
+                        "size": 5200000000,
+                        "size_vram": 0,
+                        "digest": "sha256:second"
+                    },
+                    {
+                        "size": 123
+                    }
+                ]
+            }"#,
+        );
+
+        assert_eq!(
+            models,
+            vec![
+                OllamaRunningModelInfo {
+                    name: "llama3.2:latest".to_string(),
+                    size_bytes: 2_100_000_000,
+                    size_vram_bytes: 1_800_000_000,
+                    digest: "sha256:first".to_string(),
+                    expires_at: "2026-07-13T12:00:00Z".to_string(),
+                },
+                OllamaRunningModelInfo {
+                    name: "qwen3:8b".to_string(),
+                    size_bytes: 5_200_000_000,
+                    size_vram_bytes: 0,
+                    digest: "sha256:second".to_string(),
+                    expires_at: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_models_array_is_an_empty_snapshot() {
+        assert!(parse_running_models("{}").is_empty());
+    }
+
+    #[test]
+    fn exact_residency_match_does_not_resolve_aliases_or_case() {
+        let models = vec![OllamaRunningModelInfo {
+            name: "llama3.2:latest".to_string(),
+            size_bytes: 1,
+            size_vram_bytes: 1,
+            digest: String::new(),
+            expires_at: String::new(),
+        }];
+
+        assert!(contains_exact_running_model(&models, "llama3.2:latest"));
+        assert!(!contains_exact_running_model(&models, "llama3.2"));
+        assert!(!contains_exact_running_model(&models, "LLAMA3.2:latest"));
+    }
+
+    #[test]
+    fn unload_request_uses_empty_chat_and_zero_keep_alive() {
+        assert_eq!(
+            unload_request_body("llama3.2:latest"),
+            json!({
+                "model": "llama3.2:latest",
+                "messages": [],
+                "keep_alive": 0,
+                "stream": false,
+            })
+        );
     }
 }

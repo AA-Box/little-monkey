@@ -38,7 +38,7 @@ function applyRecipeTarget(recipe: Recipe): void {
   }
   if (target.local_url) {
     throw new Error(
-      `Recipe '${recipe.name}' targets a custom local URL (${target.local_url}), which the desktop app has no equivalent for — run it with \`monkey-cli task run ${recipe.name}\` instead.`,
+      `Recipe '${recipe.name}' targets a custom local URL (${target.local_url}), which the desktop app has no equivalent for — run it with \`monkey task run ${recipe.name}\` instead.`,
     );
   }
   throw new Error(`Recipe '${recipe.name}' has no valid target.`);

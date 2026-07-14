@@ -912,6 +912,8 @@ describe("maybeAutoPreviewNewestArtifact", () => {
       unread: false,
       archived: false,
       groupId: null,
+      modelTarget: null,
+      comparisonBranch: null,
       workspacePath: null,
       personaId: null,
       attachedStackIds: [],

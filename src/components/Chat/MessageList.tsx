@@ -53,6 +53,7 @@ import {
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
+import { isCommandNotice, parseCommandNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
@@ -75,6 +76,10 @@ export interface MessageListProps {
   /** Called when the user asks to regenerate the last turn — omit to hide
    * the affordance. */
   onRetry?: () => void;
+  /** Real transcript index represented by `messages[0]`. Comparison cards
+   * render only their branch suffix, but artifact/checkpoint actions still
+   * need indices into the full persisted transcript. */
+  messageIndexOffset?: number;
 }
 
 type TimelineItem =
@@ -82,6 +87,7 @@ type TimelineItem =
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
+  | { kind: "command"; key: string; notice: CommandNotice }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
@@ -102,7 +108,7 @@ type TimelineItem =
  *   synthetic notices (compaction, model switch, per-turn checkpoint,
  *   remembered fact, presented plan, doc-chat sources).
  */
-function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
+function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
   for (const msg of messages) {
     if (msg.role === "tool" && msg.tool_call_id) {
@@ -114,8 +120,9 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const items: TimelineItem[] = [];
 
   messages.forEach((msg, index) => {
+    const messageIndex = index + messageIndexOffset;
     if (msg.role === "user") {
-      items.push({ kind: "bubble", key: `msg-${index}`, message: msg, index });
+      items.push({ kind: "bubble", key: `msg-${messageIndex}`, message: msg, index: messageIndex });
       return;
     }
 
@@ -124,7 +131,7 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
       const toolCalls = msg.tool_calls ?? [];
 
       if (hasContent) {
-        items.push({ kind: "bubble", key: `msg-${index}`, message: msg, index });
+        items.push({ kind: "bubble", key: `msg-${messageIndex}`, message: msg, index: messageIndex });
       } else if (toolCalls.length === 0 && index === messages.length - 1) {
         items.push({ kind: "typing", key: `typing-${index}` });
       }
@@ -179,21 +186,21 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
       if (isCheckpointNotice(msg)) {
         const notice = parseCheckpointNotice(msg);
         if (notice) {
-          items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex: index });
+          items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex });
         }
         return;
       }
       if (isMemoryNotice(msg)) {
         const notice = parseMemoryNotice(msg);
         if (notice) {
-          items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex: index });
+          items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex });
         }
         return;
       }
       if (isPlanNotice(msg)) {
         const notice = parsePlanNotice(msg);
         if (notice) {
-          items.push({ kind: "plan", key: `plan-${notice.id}`, notice, messageIndex: index });
+          items.push({ kind: "plan", key: `plan-${notice.id}`, notice, messageIndex });
         }
         return;
       }
@@ -216,6 +223,11 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         if (notice) {
           items.push({ kind: "recipe", key: `recipe-${index}`, notice });
         }
+        return;
+      }
+      if (isCommandNotice(msg)) {
+        const notice = parseCommandNotice(msg);
+        if (notice) items.push({ kind: "command", key: `command-${index}`, notice });
         return;
       }
       if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg) || isVerifyFixNotice(msg)) {
@@ -332,6 +344,19 @@ const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
   return (
     <div className="flex justify-center">
       <div className="max-w-[85%] rounded-md bg-surface-2 px-3 py-1 text-center text-xs text-faint">{text}</div>
+    </div>
+  );
+});
+
+const CommandRow = memo(function CommandRow({ notice }: { notice: CommandNotice }) {
+  return (
+    <div className="flex justify-start">
+      <div className={`max-w-[85%] overflow-hidden rounded-md border px-3 py-2 ${
+        notice.ok ? "border-border bg-surface-2" : "border-danger bg-danger-soft"
+      }`}>
+        <div className="mb-1 font-mono text-[11px] font-semibold text-faint">/{notice.command}</div>
+        <pre className="whitespace-pre-wrap break-words font-sans text-xs text-muted">{notice.text}</pre>
+      </div>
     </div>
   );
 });
@@ -775,7 +800,14 @@ function canRetry(messages: ChatMessage[]): boolean {
   return messages.some((m) => m.role === "user");
 }
 
-export default function MessageList({ sessionId, messages, onEditUserMessage, editingDisabled, onRetry }: MessageListProps) {
+export default function MessageList({
+  sessionId,
+  messages,
+  onEditUserMessage,
+  editingDisabled,
+  onRetry,
+  messageIndexOffset = 0,
+}: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -794,9 +826,12 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
     stickToBottomRef.current = distanceFromBottom < 96;
   };
 
-  const items = buildTimeline(messages);
+  const items = buildTimeline(messages, messageIndexOffset);
   const showRetry = Boolean(onRetry) && !editingDisabled && canRetry(messages);
   const runningVerifyLabel = useSessionStore(selectRunningVerifyLabel(sessionId));
+  const session = useSessionStore((state) => state.sessions.find((candidate) => candidate.id === sessionId));
+  const messageTranslations = session?.messageTranslations ?? [];
+  const preferredTranslationLocale = session?.displayTranslationLocale ?? null;
 
   return (
     <div
@@ -819,6 +854,8 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
                   sessionId={sessionId}
                   onEditMessage={editable ? onEditUserMessage : undefined}
                   editDisabled={editingDisabled}
+                  translations={messageTranslations}
+                  preferredTranslationLocale={preferredTranslationLocale}
                 />
               );
             }
@@ -832,6 +869,9 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;
+            }
+            if (item.kind === "command") {
+              return <CommandRow key={item.key} notice={item.notice} />;
             }
             if (item.kind === "checkpoint") {
               return (

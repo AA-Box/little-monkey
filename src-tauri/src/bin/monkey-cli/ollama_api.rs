@@ -245,7 +245,10 @@ pub enum ChatEvent {
 
 /// Maps a non-2xx response to an `Err`, surfacing the daemon's JSON
 /// `{"error": ...}` message verbatim when present.
-async fn check_status(response: reqwest::Response, what: &str) -> Result<reqwest::Response, String> {
+async fn check_status(
+    response: reqwest::Response,
+    what: &str,
+) -> Result<reqwest::Response, String> {
     if response.status().is_success() {
         return Ok(response);
     }
@@ -386,7 +389,7 @@ pub async fn create(
 pub async fn chat_stream(
     client: &reqwest::Client,
     req: &NativeChatReq,
-    mut on_event: impl FnMut(ChatEvent),
+    mut on_event: impl FnMut(ChatEvent) -> Result<(), String>,
 ) -> Result<(), String> {
     let response = client
         .post(api("/api/chat"))
@@ -395,7 +398,19 @@ pub async fn chat_stream(
         .await
         .map_err(|e| format!("Failed to reach Ollama: {e}"))?;
     let response = check_status(response, "chat").await?;
-    stream_ndjson(response, |line| parse_chat_line(line, &mut on_event)).await
+    stream_ndjson(response, |line| {
+        let mut callback_error = None;
+        parse_chat_line(line, &mut |event| {
+            if callback_error.is_none() {
+                callback_error = on_event(event).err();
+            }
+        })?;
+        match callback_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
+    .await
 }
 
 /// Shared NDJSON progress plumbing for pull/push/create: sends `request`,
@@ -492,7 +507,11 @@ fn parse_chat_line(line: &str, on_event: &mut impl FnMut(ChatEvent)) -> Result<(
         }
     }
 
-    if payload.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+    if payload
+        .get("done")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false)
+    {
         let metrics: ChatMetrics = serde_json::from_value(payload).unwrap_or_default();
         on_event(ChatEvent::Done(metrics));
     }
@@ -513,8 +532,14 @@ mod tests {
             ("0.0.0.0", "http://0.0.0.0:11434"),
             ("http://10.0.0.5", "http://10.0.0.5:11434"),
             ("http://10.0.0.5:9999", "http://10.0.0.5:9999"),
-            ("https://ollama.example.com", "https://ollama.example.com:11434"),
-            ("https://ollama.example.com:443", "https://ollama.example.com:443"),
+            (
+                "https://ollama.example.com",
+                "https://ollama.example.com:11434",
+            ),
+            (
+                "https://ollama.example.com:443",
+                "https://ollama.example.com:443",
+            ),
             ("http://localhost:11434/", "http://localhost:11434"),
             ("example.com:8080/", "http://example.com:8080"),
             ("http://", DEFAULT_HOST),
@@ -535,7 +560,8 @@ mod tests {
 
     #[test]
     fn progress_line_deserializes_ndjson_fixtures() {
-        let manifest: ProgressLine = serde_json::from_str(r#"{"status":"pulling manifest"}"#).unwrap();
+        let manifest: ProgressLine =
+            serde_json::from_str(r#"{"status":"pulling manifest"}"#).unwrap();
         assert_eq!(manifest.status.as_deref(), Some("pulling manifest"));
         assert!(manifest.digest.is_none() && manifest.error.is_none());
 
@@ -547,7 +573,8 @@ mod tests {
         assert_eq!(layer.total, Some(104857600));
         assert_eq!(layer.completed, Some(52428800));
 
-        let error: ProgressLine = serde_json::from_str(r#"{"error":"file does not exist"}"#).unwrap();
+        let error: ProgressLine =
+            serde_json::from_str(r#"{"error":"file does not exist"}"#).unwrap();
         assert_eq!(error.error.as_deref(), Some("file does not exist"));
     }
 

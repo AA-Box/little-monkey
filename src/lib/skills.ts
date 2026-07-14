@@ -1,0 +1,355 @@
+import type {
+  ActivePluginRuntimeSnapshot,
+  ActiveSkillDescriptor,
+  PackagePermission,
+} from "./ecosystemClient";
+import type { PromptEntry } from "../store/promptStore";
+
+export const MAX_SKILLS_PER_TURN = 5;
+export const MAX_PACKAGE_RULES_PER_TURN = 20;
+export const MAX_PACKAGE_RULE_BYTES_PER_TURN = 64 * 1024;
+export const MAX_PACKAGE_ASSISTANT_BYTES = 64 * 1024;
+
+export interface SlashSkill {
+  id: string;
+  source: "local" | "native" | "package";
+  command: string;
+  name: string;
+  description?: string;
+  instructions: string;
+  version: string;
+  contentSha256: string;
+  bundleSha256?: string;
+  permissions: PackagePermission[];
+}
+
+export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkillDescriptor[]): SlashSkill[] {
+  return entries
+    .filter((entry) => entry.source.kind !== "signed_package" && entry.enabled && entry.eligibility.eligible)
+    .map((entry) => ({
+      id: `native:${entry.source.kind}:${entry.command}:${entry.sha256}`,
+      source: "native" as const,
+      command: entry.command,
+      name: entry.name,
+      description: entry.description,
+      instructions: entry.instructions,
+      version: entry.version,
+      contentSha256: entry.sha256,
+      permissions: [],
+    }));
+}
+
+export interface SkillInvocationSnapshot {
+  skill: SlashSkill;
+  arguments: string;
+  activation: "explicit" | "enabled_package_rule";
+}
+
+export interface ParsedSkillTurn {
+  invocations: SkillInvocationSnapshot[];
+  request: string;
+}
+
+export function localPromptSkills(entries: PromptEntry[]): SlashSkill[] {
+  return entries
+    .filter((entry) => entry.kind === "skill")
+    .map((entry) => ({
+      id: entry.id,
+      source: "local" as const,
+      command: entry.command,
+      name: entry.name,
+      description: entry.description,
+      instructions: entry.content,
+      version: `local-${entry.updatedAt}`,
+      contentSha256: `local:${entry.id}:${entry.updatedAt}`,
+      permissions: [],
+    }));
+}
+
+export function packageSkills(entries: ActiveSkillDescriptor[]): SlashSkill[] {
+  return entries.map((entry) => ({
+    id: entry.package_id,
+    source: "package" as const,
+    command: entry.command,
+    name: entry.name,
+    description: entry.description,
+    instructions: entry.instructions,
+    version: entry.version,
+    contentSha256: entry.content_sha256,
+    permissions: entry.permissions,
+  }));
+}
+
+function assertSha256(value: string, label: string): string {
+  if (!/^[a-f0-9]{64}$/i.test(value)) {
+    throw new Error(`${label} does not contain a valid SHA-256 digest.`);
+  }
+  return value.toLowerCase();
+}
+
+function packageRuleCommand(packageId: string, path: string): string {
+  const slug = `${packageId}-${path}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24);
+  return `rule-${slug || "package"}`.slice(0, 32);
+}
+
+function stableCommandSuffix(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36).padStart(7, "0").slice(-7);
+}
+
+function packageAssistantCommand(packageId: string): string {
+  const slug = packageId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 13) || "package";
+  return `assistant-${slug}-${stableCommandSuffix(packageId)}`;
+}
+
+function validatedBundleSha256(snapshot: ActivePluginRuntimeSnapshot): string {
+  if (snapshot.manifest.package_id !== snapshot.package_id || snapshot.manifest.version !== snapshot.version) {
+    throw new Error(`Enabled plugin ${snapshot.package_id} returned inconsistent package provenance.`);
+  }
+  return assertSha256(snapshot.bundle_sha256, `Enabled plugin ${snapshot.package_id}`);
+}
+
+/**
+ * Builds explicit, turn-scoped assistant commands. Assistant packages never
+ * replace the session persona implicitly; selecting this command snapshots
+ * the package's persona/instruction/rule text into the ordinary skill prompt.
+ * Assistants with disabled declared skill packages stay unavailable until
+ * their dependencies are enabled (the Plugin runtime panel explains setup).
+ */
+export function packageAssistantSkills(
+  snapshots: readonly ActivePluginRuntimeSnapshot[],
+  readyPackageIds: ReadonlySet<string>,
+): SlashSkill[] {
+  const activePackageIds = new Set(snapshots.map((snapshot) => snapshot.package_id));
+  const assistants: SlashSkill[] = [];
+  for (const snapshot of [...snapshots].sort((left, right) => left.package_id.localeCompare(right.package_id))) {
+    if (snapshot.manifest.kind !== "assistant") continue;
+    if (!readyPackageIds.has(snapshot.package_id)) continue;
+    const assistant = snapshot.manifest.assistant;
+    if (!assistant) {
+      throw new Error(`Enabled assistant ${snapshot.package_id} has no assistant composition.`);
+    }
+    if (assistant.skill_package_ids.some((packageId) => !activePackageIds.has(packageId))) continue;
+    const bundleSha256 = validatedBundleSha256(snapshot);
+    const persona = snapshot.manifest.content.find(
+      (reference) => reference.kind === "persona" && reference.path === assistant.persona_content_path,
+    );
+    if (!persona) {
+      throw new Error(`Enabled assistant ${snapshot.package_id} is missing its declared persona reference.`);
+    }
+    const references = snapshot.manifest.content
+      .filter((reference) => (
+        reference.kind === "persona"
+          ? reference.path === assistant.persona_content_path
+          : ["instructions", "prompt", "rule"].includes(reference.kind)
+      ))
+      .slice()
+      .sort((left, right) => {
+        if (left.path === assistant.persona_content_path) return -1;
+        if (right.path === assistant.persona_content_path) return 1;
+        return left.path.localeCompare(right.path);
+      });
+    let totalBytes = 0;
+    const instructionBlocks = references.map((reference) => {
+      const content = snapshot.text_content[reference.path];
+      if (typeof content !== "string") {
+        throw new Error(`Enabled assistant ${snapshot.package_id} is missing verified content ${reference.path}.`);
+      }
+      totalBytes += new TextEncoder().encode(content).byteLength;
+      if (totalBytes > MAX_PACKAGE_ASSISTANT_BYTES) {
+        throw new Error(
+          `Enabled assistant ${snapshot.package_id} exceeds the ${MAX_PACKAGE_ASSISTANT_BYTES.toLocaleString()}-byte turn instruction limit.`,
+        );
+      }
+      const digest = assertSha256(reference.sha256, `Enabled assistant content ${snapshot.package_id}:${reference.path}`);
+      return `#### ${reference.kind} · ${reference.path} · sha256:${digest}\n${content}`;
+    });
+    assistants.push({
+      id: `package-assistant:${snapshot.package_id}`,
+      source: "package",
+      command: packageAssistantCommand(snapshot.package_id),
+      name: snapshot.manifest.display_name,
+      description: `${snapshot.manifest.description} Explicit for one turn; the saved chat persona is unchanged.`,
+      instructions: [
+        "Use this explicitly selected package assistant for the current turn only. Do not change the saved chat persona. Do not auto-run starter workflows.",
+        ...instructionBlocks,
+      ].join("\n\n"),
+      version: snapshot.version,
+      contentSha256: bundleSha256,
+      bundleSha256,
+      permissions: structuredClone(snapshot.manifest.permissions),
+    });
+  }
+  return assistants;
+}
+
+/**
+ * Converts verified, enabled package Rule content into a bounded immutable
+ * turn snapshot. The Rust command reconstructs every entry from its
+ * checksum-validated active bundle, while this boundary also rejects
+ * inconsistent provenance instead of silently dropping a package rule.
+ */
+export function packageRuleInvocations(
+  snapshots: readonly ActivePluginRuntimeSnapshot[],
+  request: string,
+): SkillInvocationSnapshot[] {
+  const invocations: SkillInvocationSnapshot[] = [];
+  let totalBytes = 0;
+  const orderedSnapshots = [...snapshots].sort((left, right) => left.package_id.localeCompare(right.package_id));
+
+  for (const snapshot of orderedSnapshots) {
+    // Assistant content is opt-in through /assistant-… and must never alter
+    // the current persona or its rules merely because a package is enabled.
+    if (snapshot.manifest.kind === "assistant") continue;
+    const bundleSha256 = validatedBundleSha256(snapshot);
+    const rules = snapshot.manifest.content
+      .filter((reference) => reference.kind === "rule")
+      .slice()
+      .sort((left, right) => left.path.localeCompare(right.path));
+
+    for (const reference of rules) {
+      if (invocations.length >= MAX_PACKAGE_RULES_PER_TURN) {
+        throw new Error(`Enabled plugins declare more than ${MAX_PACKAGE_RULES_PER_TURN} package rules for one turn.`);
+      }
+      const instructions = snapshot.text_content[reference.path];
+      if (typeof instructions !== "string") {
+        throw new Error(`Enabled plugin ${snapshot.package_id} is missing verified rule content ${reference.path}.`);
+      }
+      totalBytes += new TextEncoder().encode(instructions).byteLength;
+      if (totalBytes > MAX_PACKAGE_RULE_BYTES_PER_TURN) {
+        throw new Error(
+          `Enabled package rules exceed the ${MAX_PACKAGE_RULE_BYTES_PER_TURN.toLocaleString()}-byte turn limit. Disable or reduce a rule package before sending.`,
+        );
+      }
+      const contentSha256 = assertSha256(
+        reference.sha256,
+        `Enabled plugin rule ${snapshot.package_id}:${reference.path}`,
+      );
+      invocations.push({
+        activation: "enabled_package_rule",
+        arguments: request,
+        skill: {
+          id: `package-rule:${snapshot.package_id}:${reference.path}`,
+          source: "package",
+          command: packageRuleCommand(snapshot.package_id, reference.path),
+          name: `${snapshot.manifest.display_name} · ${reference.path}`,
+          description: `Enabled declarative rule from ${snapshot.package_id}`,
+          instructions,
+          version: snapshot.version,
+          contentSha256,
+          bundleSha256,
+          permissions: structuredClone(snapshot.manifest.permissions),
+        },
+      });
+    }
+  }
+
+  return invocations;
+}
+
+/** Builds a collision-free command registry. Ambiguity fails closed instead
+ * of silently choosing a local or marketplace skill with the same command. */
+export function skillCommandMap(skills: SlashSkill[]): Map<string, SlashSkill> {
+  const registry = new Map<string, SlashSkill>();
+  for (const skill of skills) {
+    const command = skill.command.toLowerCase();
+    const existing = registry.get(command);
+    if (existing && existing.id !== skill.id) {
+      throw new Error(`Skill command /${command} is ambiguous between ${existing.name} and ${skill.name}.`);
+    }
+    registry.set(command, skill);
+  }
+  return registry;
+}
+
+/** Parses only explicitly installed skills at the beginning of a message.
+ * Unknown leading `/text` remains ordinary chat text (important for paths),
+ * while several known commands may be stacked before one shared request. */
+export function parseSkillTurn(text: string, skills: SlashSkill[]): ParsedSkillTurn | null {
+  const registry = skillCommandMap(skills);
+  let cursor = text.search(/\S/);
+  if (cursor < 0 || text[cursor] !== "/") return null;
+
+  const selected: SlashSkill[] = [];
+  while (text[cursor] === "/") {
+    const tokenEndMatch = text.slice(cursor).search(/\s/);
+    const end = tokenEndMatch < 0 ? text.length : cursor + tokenEndMatch;
+    const command = text.slice(cursor + 1, end).toLowerCase();
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(command)) break;
+    const skill = registry.get(command);
+    if (!skill) break;
+    if (selected.some((entry) => entry.id === skill.id)) {
+      throw new Error(`Skill /${command} can only be invoked once per turn.`);
+    }
+    selected.push(skill);
+    if (selected.length > MAX_SKILLS_PER_TURN) {
+      throw new Error(`A turn can invoke at most ${MAX_SKILLS_PER_TURN} skills.`);
+    }
+    cursor = end;
+    while (cursor < text.length && /\s/.test(text[cursor])) cursor += 1;
+  }
+  if (selected.length === 0) return null;
+  const request = text.slice(cursor).trim();
+  return {
+    request,
+    invocations: selected.map((skill) => ({
+      activation: "explicit" as const,
+      skill: structuredClone(skill),
+      arguments: request,
+    })),
+  };
+}
+
+export function composeSkillSystemPrompt(
+  baseSystemPrompt: string,
+  invocations: SkillInvocationSnapshot[],
+): string {
+  if (invocations.length === 0) return baseSystemPrompt;
+  const block = ({ skill, arguments: args, activation }: SkillInvocationSnapshot) => {
+    const permissions = skill.permissions.length > 0
+      ? skill.permissions.map((permission) => `${permission.kind}:${permission.scope}`).join(", ")
+      : "none declared; normal run permissions still apply";
+    return [
+      activation === "enabled_package_rule"
+        ? `### ${skill.name} (enabled package rule)`
+        : `### ${skill.name} (/${skill.command})`,
+      `Frozen source: ${skill.source} ${skill.id} version ${skill.version} hash ${skill.contentSha256}`,
+      ...(skill.bundleSha256 ? [`Frozen package bundle hash: ${skill.bundleSha256}`] : []),
+      `Declared permissions: ${permissions}`,
+      "Instructions:",
+      skill.instructions,
+      "Arguments/request:",
+      args || "(none)",
+    ].join("\n");
+  };
+  const packageRules = invocations.filter((entry) => entry.activation === "enabled_package_rule");
+  const explicitSkills = invocations.filter((entry) => entry.activation !== "enabled_package_rule");
+  const sections = [baseSystemPrompt];
+  if (packageRules.length > 0) {
+    sections.push(
+      "## Enabled package rules",
+      "Apply these package-authored rules because their verified data-only packages are enabled. This exact content is frozen for the current turn. Rules never grant or expand permissions and never bypass tool, workspace, network, approval, or mutation controls.",
+      ...packageRules.map(block),
+    );
+  }
+  if (explicitSkills.length > 0) {
+    sections.push(
+      "## Explicitly invoked skills",
+      "Apply these task-scoped instructions for this turn only. They never bypass tool, workspace, network, approval, or mutation permissions.",
+      ...explicitSkills.map(block),
+    );
+  }
+  return sections.join("\n\n");
+}

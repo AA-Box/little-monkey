@@ -71,8 +71,9 @@ const MAX_FILE_BYTES: u64 = 5_000_000;
 /// Extension allowlist for indexable files — text formats plus common code
 /// files. Matched case-insensitively.
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "md", "markdown", "txt", "rst", "json", "yaml", "yml", "toml", "csv", "html", "htm", "rs", "ts", "tsx", "js",
-    "jsx", "py", "go", "java", "c", "cpp", "cc", "h", "hpp", "cs", "rb", "php", "swift", "kt", "sh", "sql",
+    "md", "markdown", "txt", "rst", "json", "yaml", "yml", "toml", "csv", "html", "htm", "rs",
+    "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "cc", "h", "hpp", "cs", "rb", "php",
+    "swift", "kt", "sh", "sql",
 ];
 
 /// How many texts are embedded per HTTP request, both at index time and
@@ -227,7 +228,8 @@ fn load_registry(base: &Path) -> Result<Vec<KnowledgeStack>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -238,11 +240,12 @@ fn load_registry(base: &Path) -> Result<Vec<KnowledgeStack>, String> {
 /// `checkpoints.rs`'s manifest writes / `sessions.rs`.
 fn save_registry(base: &Path, stacks: &[KnowledgeStack]) -> Result<(), String> {
     let path = registry_path(base);
-    let payload =
-        serde_json::to_string_pretty(stacks).map_err(|e| format!("Failed to serialize stacks registry: {e}"))?;
+    let payload = serde_json::to_string_pretty(stacks)
+        .map_err(|e| format!("Failed to serialize stacks registry: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, payload).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -261,7 +264,33 @@ pub fn list_impl(base: &Path) -> Result<Vec<KnowledgeStack>, String> {
     load_registry(base)
 }
 
-pub fn create_impl(base: &Path, name: String, embedding: EmbeddingSpec) -> Result<KnowledgeStack, String> {
+/// Records a successfully activated Knowledge 2.0 generation in the shared
+/// stack registry. This keeps attachment badges and doc-chat readiness in
+/// sync while the underlying v2 index remains independently immutable.
+pub fn mark_v2_indexed_impl(
+    base: &Path,
+    id: &str,
+    indexed_at: u64,
+    chunk_count: usize,
+) -> Result<KnowledgeStack, String> {
+    validate_id(id)?;
+    let mut stacks = load_registry(base)?;
+    let stack = stacks
+        .iter_mut()
+        .find(|stack| stack.id == id)
+        .ok_or_else(|| format!("Stack '{id}' not found"))?;
+    stack.indexed_at = Some(indexed_at);
+    stack.chunk_count = chunk_count;
+    let updated = stack.clone();
+    save_registry(base, &stacks)?;
+    Ok(updated)
+}
+
+pub fn create_impl(
+    base: &Path,
+    name: String,
+    embedding: EmbeddingSpec,
+) -> Result<KnowledgeStack, String> {
     let mut registry = load_registry(base)?;
     let stack = KnowledgeStack {
         id: uuid::Uuid::new_v4().to_string(),
@@ -276,6 +305,70 @@ pub fn create_impl(base: &Path, name: String, embedding: EmbeddingSpec) -> Resul
     registry.push(stack.clone());
     save_registry(base, &registry)?;
     Ok(stack)
+}
+
+/// Imports portable stack *definitions* after the outer bundle has passed
+/// hostile-archive preflight. Vector/chunk indexes are deliberately reset:
+/// they are rebuildable, machine-specific data and never travel in M1
+/// bundles. Merge preserves stable ids when free and leaves an existing
+/// conflicting definition untouched; replace is reserved for explicit
+/// snapshot restore.
+pub fn import_definitions_impl(
+    base: &Path,
+    incoming: Vec<KnowledgeStack>,
+    replace: bool,
+) -> Result<Vec<KnowledgeStack>, String> {
+    let mut normalized = Vec::with_capacity(incoming.len());
+    let mut ids = std::collections::HashSet::new();
+    for mut stack in incoming {
+        validate_id(&stack.id)?;
+        if !ids.insert(stack.id.clone()) {
+            return Err(format!("Portable stack id '{}' is duplicated", stack.id));
+        }
+        if stack.name.trim().is_empty() || stack.name.len() > 512 {
+            return Err("Portable stack name must be 1..=512 bytes".to_string());
+        }
+        if stack.embedding.model_id_or_tag.trim().is_empty()
+            || stack.embedding.model_id_or_tag.len() > 1_024
+            || stack.embedding.dim == 0
+            || stack.embedding.dim > 65_536
+            || stack.chunk_chars == 0
+            || stack.chunk_chars > 1_000_000
+            || stack.chunk_overlap >= stack.chunk_chars
+        {
+            return Err(format!(
+                "Portable stack '{}' has invalid embedding/chunk settings",
+                stack.id
+            ));
+        }
+        if stack.sources.len() > 100_000
+            || stack.sources.iter().any(|source| {
+                source.path.is_empty() || source.path.len() > 32_768 || source.path.contains('\0')
+            })
+        {
+            return Err(format!("Portable stack '{}' has invalid sources", stack.id));
+        }
+        stack.indexed_at = None;
+        stack.chunk_count = 0;
+        normalized.push(stack);
+    }
+    let registry = if replace {
+        normalized
+    } else {
+        let mut registry = load_registry(base)?;
+        let known = registry
+            .iter()
+            .map(|stack| stack.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        registry.extend(
+            normalized
+                .into_iter()
+                .filter(|stack| !known.contains(&stack.id)),
+        );
+        registry
+    };
+    save_registry(base, &registry)?;
+    Ok(registry)
 }
 
 pub fn delete_impl(base: &Path, id: &str) -> Result<(), String> {
@@ -306,7 +399,40 @@ pub fn rename_impl(base: &Path, id: &str, name: String) -> Result<KnowledgeStack
     Ok(updated)
 }
 
-pub fn add_source_impl(base: &Path, id: &str, path: String, kind: SourceKind) -> Result<KnowledgeStack, String> {
+/// Updates the chunking definition used by the immutable Knowledge 2.0 build
+/// pipeline. The active generation remains usable until the caller completes
+/// a successful refresh with the new fingerprint.
+pub fn update_chunking_impl(
+    base: &Path,
+    id: &str,
+    chunk_chars: usize,
+    chunk_overlap: usize,
+) -> Result<KnowledgeStack, String> {
+    validate_id(id)?;
+    if chunk_chars == 0 || chunk_chars > 1_000_000 || chunk_overlap >= chunk_chars {
+        return Err(
+            "Chunk size must be 1..=1000000 characters and overlap must be smaller than the chunk"
+                .to_string(),
+        );
+    }
+    let mut registry = load_registry(base)?;
+    let stack = registry
+        .iter_mut()
+        .find(|stack| stack.id == id)
+        .ok_or_else(|| format!("Stack '{id}' not found"))?;
+    stack.chunk_chars = chunk_chars;
+    stack.chunk_overlap = chunk_overlap;
+    let updated = stack.clone();
+    save_registry(base, &registry)?;
+    Ok(updated)
+}
+
+pub fn add_source_impl(
+    base: &Path,
+    id: &str,
+    path: String,
+    kind: SourceKind,
+) -> Result<KnowledgeStack, String> {
     validate_id(id)?;
     let canonical = PathBuf::from(&path)
         .canonicalize()
@@ -319,9 +445,15 @@ pub fn add_source_impl(base: &Path, id: &str, path: String, kind: SourceKind) ->
         .find(|s| s.id == id)
         .ok_or_else(|| format!("Stack '{}' not found", id))?;
     if stack.sources.iter().any(|s| s.path == canonical_str) {
-        return Err(format!("'{}' is already a source of this stack", canonical_str));
+        return Err(format!(
+            "'{}' is already a source of this stack",
+            canonical_str
+        ));
     }
-    stack.sources.push(StackSource { path: canonical_str, kind });
+    stack.sources.push(StackSource {
+        path: canonical_str,
+        kind,
+    });
     let updated = stack.clone();
     save_registry(base, &registry)?;
     Ok(updated)
@@ -369,7 +501,10 @@ fn tail_chars(s: &str, n: usize) -> String {
 fn push_chunk(chunks: &mut Vec<Chunk>, heading: Option<String>, text: String) {
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        chunks.push(Chunk { heading, text: trimmed.to_string() });
+        chunks.push(Chunk {
+            heading,
+            text: trimmed.to_string(),
+        });
     }
 }
 
@@ -397,7 +532,10 @@ pub fn chunk_text(text: &str, chunk_chars: usize, chunk_overlap: usize) -> Vec<C
         let trimmed = line.trim_start();
         let hash_prefix_len = trimmed.chars().take_while(|&c| c == '#').count();
         let is_heading = hash_prefix_len > 0
-            && trimmed[hash_prefix_len..].chars().next().is_none_or(|c| c == ' ');
+            && trimmed[hash_prefix_len..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == ' ');
         if is_heading {
             if !buf.trim().is_empty() {
                 paragraphs.push((current_heading.clone(), std::mem::take(&mut buf)));
@@ -433,7 +571,11 @@ pub fn chunk_text(text: &str, chunk_chars: usize, chunk_overlap: usize) -> Vec<C
         // is pending, then hard-split it independently.
         if para.chars().count() > chunk_chars {
             if !current.is_empty() {
-                push_chunk(&mut chunks, current_heading_for_chunk.clone(), std::mem::take(&mut current));
+                push_chunk(
+                    &mut chunks,
+                    current_heading_for_chunk.clone(),
+                    std::mem::take(&mut current),
+                );
             }
             let chars: Vec<char> = para.chars().collect();
             let mut start = 0usize;
@@ -461,7 +603,11 @@ pub fn chunk_text(text: &str, chunk_chars: usize, chunk_overlap: usize) -> Vec<C
         };
 
         if !current.is_empty() && would_be_len > chunk_chars {
-            push_chunk(&mut chunks, current_heading_for_chunk.clone(), current.clone());
+            push_chunk(
+                &mut chunks,
+                current_heading_for_chunk.clone(),
+                current.clone(),
+            );
             current = tail_chars(&current, chunk_overlap);
             current_heading_for_chunk = heading.clone();
         }
@@ -493,14 +639,19 @@ const VECTORS_HEADER_LEN: usize = 16;
 
 fn write_vectors_bin(path: &Path, dim: u32, vectors: &[Vec<f32>]) -> Result<(), String> {
     let count = vectors.len() as u32;
-    let mut buf: Vec<u8> = Vec::with_capacity(VECTORS_HEADER_LEN + vectors.len() * dim as usize * 4);
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(VECTORS_HEADER_LEN + vectors.len() * dim as usize * 4);
     buf.extend_from_slice(&VECTORS_MAGIC);
     buf.extend_from_slice(&VECTORS_VERSION.to_le_bytes());
     buf.extend_from_slice(&dim.to_le_bytes());
     buf.extend_from_slice(&count.to_le_bytes());
     for row in vectors {
         if row.len() != dim as usize {
-            return Err(format!("Vector row has {} dims, expected {}", row.len(), dim));
+            return Err(format!(
+                "Vector row has {} dims, expected {}",
+                row.len(),
+                dim
+            ));
         }
         for x in row {
             buf.extend_from_slice(&x.to_le_bytes());
@@ -509,13 +660,15 @@ fn write_vectors_bin(path: &Path, dim: u32, vectors: &[Vec<f32>]) -> Result<(), 
 
     let tmp = path.with_extension("bin.tmp");
     std::fs::write(&tmp, &buf).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
     Ok(())
 }
 
 /// Reads a `vectors.bin` back into `(dim, count, flat_rows)`.
 fn read_vectors_bin(path: &Path) -> Result<(u32, u32, Vec<f32>), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     if bytes.len() < VECTORS_HEADER_LEN {
         return Err("vectors.bin is truncated (missing header)".to_string());
     }
@@ -524,7 +677,9 @@ fn read_vectors_bin(path: &Path) -> Result<(u32, u32, Vec<f32>), String> {
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     if version != VECTORS_VERSION {
-        return Err(format!("vectors.bin has unsupported version {version} — reindex required"));
+        return Err(format!(
+            "vectors.bin has unsupported version {version} — reindex required"
+        ));
     }
     let dim = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
@@ -559,7 +714,13 @@ fn l2_normalize(v: &mut [f32]) {
 /// because every row (and the query) is L2-normalized before being stored/
 /// used. Returns the top `k` `(row_index, score)` pairs, highest score
 /// first.
-pub fn top_k_by_dot(query: &[f32], flat: &[f32], dim: usize, count: usize, k: usize) -> Vec<(usize, f32)> {
+pub fn top_k_by_dot(
+    query: &[f32],
+    flat: &[f32],
+    dim: usize,
+    count: usize,
+    k: usize,
+) -> Vec<(usize, f32)> {
     let mut scores: Vec<(usize, f32)> = Vec::with_capacity(count);
     for i in 0..count {
         let row = &flat[i * dim..(i + 1) * dim];
@@ -595,7 +756,7 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
         .map_err(|e| {
             format!(
                 "Failed to reach the embedding server: {e} — start it first from the desktop app's Settings > \
-                 Knowledge tab, or (from a terminal) `monkey-cli stacks embed-server start --model-path <path>`."
+                 Knowledge tab, or (from a terminal) `monkey stacks embed-server start --model-path <path>`."
             )
         })?;
 
@@ -614,8 +775,10 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
         data: Vec<EmbeddingDatum>,
     }
 
-    let parsed: EmbeddingResponse =
-        resp.json().await.map_err(|e| format!("Failed to parse embedding response: {e}"))?;
+    let parsed: EmbeddingResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse embedding response: {e}"))?;
 
     // Mirrors `ollama::embed`'s own count check: a backend that silently
     // returns fewer (or more) embeddings than texts requested must be a hard
@@ -639,11 +802,19 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
 /// every returned vector. Hard-fails (rather than silently proceeding) if
 /// the model's actual output dimensionality doesn't match `spec.dim` — see
 /// [`spec_matches`]'s doc comment for why that must never be papered over.
-pub async fn embed_batch(spec: &EmbeddingSpec, texts: &[String], is_query: bool) -> Result<Vec<Vec<f32>>, String> {
+pub async fn embed_batch(
+    spec: &EmbeddingSpec,
+    texts: &[String],
+    is_query: bool,
+) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
-    let prefix = if is_query { &spec.query_prefix } else { &spec.doc_prefix };
+    let prefix = if is_query {
+        &spec.query_prefix
+    } else {
+        &spec.doc_prefix
+    };
     let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
 
     let mut out: Vec<Vec<f32>> = Vec::with_capacity(prefixed.len());
@@ -733,6 +904,7 @@ fn is_indexable_extension(path: &Path) -> bool {
 /// only when the `pdf-extraction` feature is compiled in). Returns
 /// `(canonical path string, content)`.
 fn read_indexable_file(path: &Path) -> Option<(String, String)> {
+    #[cfg(feature = "pdf-extraction")]
     let ext = path.extension().and_then(|e| e.to_str())?.to_lowercase();
 
     #[cfg(feature = "pdf-extraction")]
@@ -770,7 +942,10 @@ fn read_indexable_file(path: &Path) -> Option<(String, String)> {
 /// observed — the caller checks `cancel.is_cancelled()` right after calling
 /// this and discards the (possibly partial) result either way, so an early
 /// return here is never mistaken for "the real, complete file list".
-fn collect_source_files(sources: &[StackSource], cancel: &CancellationToken) -> Vec<(String, String)> {
+fn collect_source_files(
+    sources: &[StackSource],
+    cancel: &CancellationToken,
+) -> Vec<(String, String)> {
     let mut files = Vec::new();
     'sources: for source in sources {
         if cancel.is_cancelled() {
@@ -784,14 +959,17 @@ fn collect_source_files(sources: &[StackSource], cancel: &CancellationToken) -> 
                 }
             }
             SourceKind::Folder => {
-                let walker = WalkDir::new(path).follow_links(false).into_iter().filter_entry(|entry| {
-                    if entry.depth() > 0 && entry.file_type().is_dir() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+                let walker = WalkDir::new(path)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        if entry.depth() > 0 && entry.file_type().is_dir() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+                            }
                         }
-                    }
-                    true
-                });
+                        true
+                    });
                 for entry in walker {
                     if cancel.is_cancelled() {
                         break 'sources;
@@ -821,26 +999,37 @@ fn sha256_hex(content: &str) -> String {
 fn write_chunks_jsonl(stack_dir: &Path, chunks: &[ChunkMeta]) -> Result<(), String> {
     let mut buf = String::new();
     for chunk in chunks {
-        buf.push_str(&serde_json::to_string(chunk).map_err(|e| format!("Failed to serialize chunk: {e}"))?);
+        buf.push_str(
+            &serde_json::to_string(chunk).map_err(|e| format!("Failed to serialize chunk: {e}"))?,
+        );
         buf.push('\n');
     }
     let path = stack_dir.join("chunks.jsonl");
     let tmp = path.with_extension("jsonl.tmp");
     std::fs::write(&tmp, buf).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
     Ok(())
 }
 
 fn read_chunks_jsonl(stack_dir: &Path) -> Result<Vec<ChunkMeta>, String> {
     let path = stack_dir.join("chunks.jsonl");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     raw.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).map_err(|e| format!("Corrupt chunk entry: {e}")))
         .collect()
 }
 
-fn emit_progress(app: &AppHandle, stack_id: &str, files_done: usize, files_total: usize, chunks: usize, phase: &str) {
+fn emit_progress(
+    app: &AppHandle,
+    stack_id: &str,
+    files_done: usize,
+    files_total: usize,
+    chunks: usize,
+    phase: &str,
+) {
     let _ = app.emit(
         "stacks://index-progress",
         serde_json::json!({
@@ -877,10 +1066,12 @@ fn read_file_index(stack_dir: &Path) -> HashMap<String, String> {
 /// `write_chunks_jsonl`.
 fn write_file_index(stack_dir: &Path, index: &HashMap<String, String>) -> Result<(), String> {
     let path = file_index_path(stack_dir);
-    let payload = serde_json::to_string_pretty(index).map_err(|e| format!("Failed to serialize file index: {e}"))?;
+    let payload = serde_json::to_string_pretty(index)
+        .map_err(|e| format!("Failed to serialize file index: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, payload).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to finalize {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -944,8 +1135,9 @@ fn swap_stack_dir(base: &Path, stack_id: &str, staging_dir: &Path) -> Result<(),
 
     let had_previous = stack_dir.exists();
     if had_previous {
-        std::fs::rename(&stack_dir, &backup_dir)
-            .map_err(|e| format!("Failed to stage previous stack directory for replacement: {e}"))?;
+        std::fs::rename(&stack_dir, &backup_dir).map_err(|e| {
+            format!("Failed to stage previous stack directory for replacement: {e}")
+        })?;
     }
     if let Err(e) = std::fs::rename(staging_dir, &stack_dir) {
         // Best-effort restore so a failure here doesn't leave the stack
@@ -1026,7 +1218,9 @@ fn plan_reindex(
 ) -> ReindexPlan {
     let dim = stack.embedding.dim as usize;
     let reuse_old = old_vectors
-        .map(|(old_dim, old_count, _)| old_dim == stack.embedding.dim && old_count as usize == old_chunks.len())
+        .map(|(old_dim, old_count, _)| {
+            old_dim == stack.embedding.dim && old_count as usize == old_chunks.len()
+        })
         .unwrap_or(false);
     let old_flat: &[f32] = old_vectors.map(|(_, _, flat)| flat).unwrap_or(&[]);
 
@@ -1036,7 +1230,10 @@ fn plan_reindex(
     let mut old_rows_by_path: HashMap<&str, VecDeque<usize>> = HashMap::new();
     if reuse_old {
         for (row, chunk) in old_chunks.iter().enumerate() {
-            old_rows_by_path.entry(chunk.source_path.as_str()).or_default().push_back(row);
+            old_rows_by_path
+                .entry(chunk.source_path.as_str())
+                .or_default()
+                .push_back(row);
         }
     }
 
@@ -1068,8 +1265,9 @@ fn plan_reindex(
                 }
             }
         } else {
-            for (ordinal, chunk) in
-                chunk_text(content, stack.chunk_chars, stack.chunk_overlap).into_iter().enumerate()
+            for (ordinal, chunk) in chunk_text(content, stack.chunk_chars, stack.chunk_overlap)
+                .into_iter()
+                .enumerate()
             {
                 all_chunks.push(ChunkMeta {
                     source_path: source_path.clone(),
@@ -1087,7 +1285,13 @@ fn plan_reindex(
         on_file_done(i + 1, files.len(), all_chunks.len());
     }
 
-    ReindexPlan { all_chunks, vector_slots, to_embed_indices, to_embed_texts, new_file_index }
+    ReindexPlan {
+        all_chunks,
+        vector_slots,
+        to_embed_indices,
+        to_embed_texts,
+        new_file_index,
+    }
 }
 
 /// Walks `stack`'s sources, incrementally re-chunks/re-embeds only the files
@@ -1130,11 +1334,17 @@ pub async fn reindex_impl(
             .index_cancels
             .lock()
             .map_err(|_| "Index-cancel lock poisoned".to_string())?;
-        cancels.entry(stack_id.to_string()).or_insert_with(|| Arc::new(CancellationToken::new())).clone()
+        cancels
+            .entry(stack_id.to_string())
+            .or_insert_with(|| Arc::new(CancellationToken::new()))
+            .clone()
     };
     // RAII-style cleanup so the cancel handle never lingers past this run,
     // whether it finishes normally, errors, or is cancelled.
-    let _cleanup = CancelCleanup { state, stack_id: stack_id.to_string() };
+    let _cleanup = CancelCleanup {
+        state,
+        stack_id: stack_id.to_string(),
+    };
 
     on_progress(0, 0, 0, "walking");
     let files = collect_source_files(&stack.sources, &cancel);
@@ -1150,7 +1360,9 @@ pub async fn reindex_impl(
     let old_file_index = read_file_index(&stack_dir);
     let old_chunks = read_chunks_jsonl(&stack_dir).unwrap_or_default();
     let old_vectors_owned = read_vectors_bin(&stack_dir.join("vectors.bin")).ok();
-    let old_vectors_ref = old_vectors_owned.as_ref().map(|(d, c, flat)| (*d, *c, flat.as_slice()));
+    let old_vectors_ref = old_vectors_owned
+        .as_ref()
+        .map(|(d, c, flat)| (*d, *c, flat.as_slice()));
 
     let plan = plan_reindex(
         &stack,
@@ -1194,7 +1406,12 @@ pub async fn reindex_impl(
             }
         }
         embedded_so_far += end - start;
-        on_progress(files_total, files_total, reused_count + embedded_so_far, "embedding");
+        on_progress(
+            files_total,
+            files_total,
+            reused_count + embedded_so_far,
+            "embedding",
+        );
     }
 
     let vectors: Vec<Vec<f32>> = vector_slots
@@ -1209,9 +1426,14 @@ pub async fn reindex_impl(
     // becoming visible to a concurrent/later load.
     let staging_dir = staging_dir_path(base, stack_id);
     let _ = std::fs::remove_dir_all(&staging_dir);
-    std::fs::create_dir_all(&staging_dir).map_err(|e| format!("Failed to create staging directory: {e}"))?;
+    std::fs::create_dir_all(&staging_dir)
+        .map_err(|e| format!("Failed to create staging directory: {e}"))?;
     write_chunks_jsonl(&staging_dir, &plan.all_chunks)?;
-    write_vectors_bin(&staging_dir.join("vectors.bin"), stack.embedding.dim, &vectors)?;
+    write_vectors_bin(
+        &staging_dir.join("vectors.bin"),
+        stack.embedding.dim,
+        &vectors,
+    )?;
     write_file_index(&staging_dir, &plan.new_file_index)?;
     swap_stack_dir(base, stack_id, &staging_dir)?;
 
@@ -1255,9 +1477,16 @@ impl Drop for CancelCleanup<'_> {
 /// when the cached copy's embedding spec still matches the registry's
 /// current one (see `spec_matches`) — a stack whose embedding model changed
 /// since it was cached is transparently reloaded rather than served stale.
-fn load_stack_cached(state: &AppState, base: &Path, stack: &KnowledgeStack) -> Result<Arc<LoadedStack>, String> {
+fn load_stack_cached(
+    state: &AppState,
+    base: &Path,
+    stack: &KnowledgeStack,
+) -> Result<Arc<LoadedStack>, String> {
     {
-        let cache = state.stack_cache.lock().map_err(|_| "Stack-cache lock poisoned".to_string())?;
+        let cache = state
+            .stack_cache
+            .lock()
+            .map_err(|_| "Stack-cache lock poisoned".to_string())?;
         if let Some(loaded) = cache.get(&stack.id) {
             if spec_matches(&loaded.embedding, &stack.embedding) {
                 return Ok(loaded.clone());
@@ -1273,10 +1502,18 @@ fn load_stack_cached(state: &AppState, base: &Path, stack: &KnowledgeStack) -> R
         return Err("chunks.jsonl and vectors.bin are out of sync — reindex required".to_string());
     }
     if dim != stack.embedding.dim {
-        return Err("Indexed vector dimension doesn't match this stack's embedding spec — reindex required".to_string());
+        return Err(
+            "Indexed vector dimension doesn't match this stack's embedding spec — reindex required"
+                .to_string(),
+        );
     }
 
-    let loaded = Arc::new(LoadedStack { embedding: stack.embedding.clone(), chunks, dim, vectors });
+    let loaded = Arc::new(LoadedStack {
+        embedding: stack.embedding.clone(),
+        chunks,
+        dim,
+        vectors,
+    });
     state
         .stack_cache
         .lock()
@@ -1351,9 +1588,18 @@ pub async fn query_impl(
         let loaded = load_stack_cached(state, base, stack)?;
 
         let query_vectors = embed_batch(&stack.embedding, &[query.to_string()], true).await?;
-        let query_vec = query_vectors.into_iter().next().ok_or_else(|| "Failed to embed query".to_string())?;
+        let query_vec = query_vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Failed to embed query".to_string())?;
 
-        let ranked = top_k_by_dot(&query_vec, &loaded.vectors, loaded.dim as usize, loaded.chunks.len(), k);
+        let ranked = top_k_by_dot(
+            &query_vec,
+            &loaded.vectors,
+            loaded.dim as usize,
+            loaded.chunks.len(),
+            k,
+        );
         for (row, score) in ranked {
             if let Some(chunk) = loaded.chunks.get(row) {
                 all_results.push(StackQueryResult {
@@ -1368,7 +1614,11 @@ pub async fn query_impl(
         }
     }
 
-    all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     all_results.truncate(k);
     Ok(all_results)
 }
@@ -1383,12 +1633,36 @@ pub fn stacks_list(app: AppHandle) -> Result<Vec<KnowledgeStack>, String> {
 }
 
 #[tauri::command]
-pub fn stacks_create(app: AppHandle, name: String, embedding: EmbeddingSpec) -> Result<KnowledgeStack, String> {
+pub fn stacks_create(
+    app: AppHandle,
+    name: String,
+    embedding: EmbeddingSpec,
+) -> Result<KnowledgeStack, String> {
     create_impl(&stacks_base_dir(&app)?, name, embedding)
 }
 
 #[tauri::command]
-pub fn stacks_delete(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn stacks_import_definitions(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    stacks: Vec<KnowledgeStack>,
+    replace: bool,
+) -> Result<Vec<KnowledgeStack>, String> {
+    let imported = import_definitions_impl(&stacks_base_dir(&app)?, stacks, replace)?;
+    state
+        .stack_cache
+        .lock()
+        .map_err(|_| "Stack-cache lock poisoned".to_string())?
+        .clear();
+    Ok(imported)
+}
+
+#[tauri::command]
+pub fn stacks_delete(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     delete_impl(&stacks_base_dir(&app)?, &id)?;
     state
         .stack_cache
@@ -1404,23 +1678,48 @@ pub fn stacks_rename(app: AppHandle, id: String, name: String) -> Result<Knowled
 }
 
 #[tauri::command]
-pub fn stacks_add_source(app: AppHandle, id: String, path: String, kind: SourceKind) -> Result<KnowledgeStack, String> {
+pub fn stacks_add_source(
+    app: AppHandle,
+    id: String,
+    path: String,
+    kind: SourceKind,
+) -> Result<KnowledgeStack, String> {
     add_source_impl(&stacks_base_dir(&app)?, &id, path, kind)
 }
 
 #[tauri::command]
-pub fn stacks_remove_source(app: AppHandle, id: String, path: String) -> Result<KnowledgeStack, String> {
+pub fn stacks_remove_source(
+    app: AppHandle,
+    id: String,
+    path: String,
+) -> Result<KnowledgeStack, String> {
     remove_source_impl(&stacks_base_dir(&app)?, &id, &path)
 }
 
 #[tauri::command]
-pub async fn stacks_reindex(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<KnowledgeStack, String> {
+pub async fn stacks_reindex(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<KnowledgeStack, String> {
     let base = stacks_base_dir(&app)?;
     let app_for_progress = app.clone();
     let progress_id = id.clone();
-    reindex_impl(&base, state.inner(), &id, move |files_done, files_total, chunks, phase| {
-        emit_progress(&app_for_progress, &progress_id, files_done, files_total, chunks, phase);
-    })
+    reindex_impl(
+        &base,
+        state.inner(),
+        &id,
+        move |files_done, files_total, chunks, phase| {
+            emit_progress(
+                &app_for_progress,
+                &progress_id,
+                files_done,
+                files_total,
+                chunks,
+                phase,
+            );
+        },
+    )
     .await
 }
 
@@ -1434,7 +1733,10 @@ pub async fn stacks_reindex(app: AppHandle, state: tauri::State<'_, AppState>, i
 pub fn stacks_is_stale(app: AppHandle, id: String) -> Result<bool, String> {
     let base = stacks_base_dir(&app)?;
     let registry = load_registry(&base)?;
-    let stack = registry.iter().find(|s| s.id == id).ok_or_else(|| format!("Stack '{}' not found", id))?;
+    let stack = registry
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("Stack '{}' not found", id))?;
     Ok(is_stale_impl(stack))
 }
 
@@ -1446,7 +1748,10 @@ pub fn stacks_is_stale(app: AppHandle, id: String) -> Result<bool, String> {
 /// — see `reindex_impl`'s doc comment for why that distinction matters.
 #[tauri::command]
 pub fn stacks_cancel_index(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    let cancels = state.index_cancels.lock().map_err(|_| "Index-cancel lock poisoned".to_string())?;
+    let cancels = state
+        .index_cancels
+        .lock()
+        .map_err(|_| "Index-cancel lock poisoned".to_string())?;
     if let Some(token) = cancels.get(&id) {
         token.cancel();
     }
@@ -1462,7 +1767,32 @@ pub async fn stacks_query(
     k: Option<u32>,
 ) -> Result<Vec<StackQueryResult>, String> {
     let base = stacks_base_dir(&app)?;
-    query_impl(&base, state.inner(), &stack_ids, &query, k.unwrap_or(DEFAULT_QUERY_K as u32) as usize).await
+    let registry = load_registry(&base)?;
+    let k = k.unwrap_or(DEFAULT_QUERY_K as u32) as usize;
+    let mut results = Vec::new();
+    let mut legacy_ids = Vec::new();
+    for id in &stack_ids {
+        let stack = registry
+            .iter()
+            .find(|stack| &stack.id == id)
+            .ok_or_else(|| format!("Stack '{id}' not found"))?;
+        match crate::knowledge_service::query_for_agent(&app, stack, &query, k).await? {
+            Some(mut hybrid) => results.append(&mut hybrid),
+            None => legacy_ids.push(id.clone()),
+        }
+    }
+    if !legacy_ids.is_empty() {
+        results.extend(query_impl(&base, state.inner(), &legacy_ids, &query, k).await?);
+    }
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+    results.truncate(k);
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------
@@ -1475,12 +1805,22 @@ pub async fn stacks_query(
 /// deleted since indexing) counts as stale too, so a broken source surfaces
 /// via the same badge instead of silently being skipped.
 fn is_stale_impl(stack: &KnowledgeStack) -> bool {
-    let Some(indexed_at) = stack.indexed_at else { return false };
-    stack.sources.iter().any(|source| source_has_newer_mtime(Path::new(&source.path), indexed_at))
+    let Some(indexed_at) = stack.indexed_at else {
+        return false;
+    };
+    stack
+        .sources
+        .iter()
+        .any(|source| source_has_newer_mtime(Path::new(&source.path), indexed_at))
 }
 
 fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
-    metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
 }
 
 /// True if `path` itself (a file source) or any file reachable under it (a
@@ -1493,17 +1833,22 @@ fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
     };
 
     if !metadata.is_dir() {
-        return mtime_ms(&metadata).map(|mtime| mtime > indexed_at_ms).unwrap_or(true);
+        return mtime_ms(&metadata)
+            .map(|mtime| mtime > indexed_at_ms)
+            .unwrap_or(true);
     }
 
-    let walker = WalkDir::new(path).follow_links(false).into_iter().filter_entry(|entry| {
-        if entry.depth() > 0 && entry.file_type().is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+    let walker = WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() > 0 && entry.file_type().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !crate::tools::MENTION_SKIP_DIRS.contains(&name);
+                }
             }
-        }
-        true
-    });
+            true
+        });
     for entry in walker {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {
@@ -1522,11 +1867,16 @@ fn source_has_newer_mtime(path: &Path, indexed_at_ms: u64) -> bool {
         if !is_indexable_extension(entry.path()) {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         if metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
             continue;
         }
-        if mtime_ms(&metadata).map(|mtime| mtime > indexed_at_ms).unwrap_or(true) {
+        if mtime_ms(&metadata)
+            .map(|mtime| mtime > indexed_at_ms)
+            .unwrap_or(true)
+        {
             return true;
         }
     }
@@ -1576,7 +1926,11 @@ pub fn resolve_search_stack_ids(
 ) -> Result<Vec<String>, String> {
     let in_scope = |s: &KnowledgeStack| {
         allowed_names
-            .map(|names| names.iter().any(|n| n.trim().eq_ignore_ascii_case(s.name.trim())))
+            .map(|names| {
+                names
+                    .iter()
+                    .any(|n| n.trim().eq_ignore_ascii_case(s.name.trim()))
+            })
             .unwrap_or(true)
     };
 
@@ -1592,13 +1946,20 @@ pub fn resolve_search_stack_ids(
                     format!(
                         "No knowledge stack named '{}'{}",
                         trimmed,
-                        if allowed_names.is_some() { " attached to this session" } else { "" }
+                        if allowed_names.is_some() {
+                            " attached to this session"
+                        } else {
+                            ""
+                        }
                     )
                 })
         }
         None => {
-            let ids: Vec<String> =
-                registry.iter().filter(|s| in_scope(s) && s.indexed_at.is_some()).map(|s| s.id.clone()).collect();
+            let ids: Vec<String> = registry
+                .iter()
+                .filter(|s| in_scope(s) && s.indexed_at.is_some())
+                .map(|s| s.id.clone())
+                .collect();
             if ids.is_empty() {
                 Err("No indexed knowledge stacks are available to search".to_string())
             } else {
@@ -1657,9 +2018,54 @@ pub async fn tool_search_docs(
     // rather than fail open (scope to everything) if this ever arrives
     // unset.
     let allowed = allowed_stack_names.unwrap_or_default();
-    let stack_ids = resolve_search_stack_ids(&registry, Some(&allowed), stack.as_deref())?;
     let k = max_results.unwrap_or(DEFAULT_QUERY_K as u32) as usize;
-    query_impl(&base, state.inner(), &stack_ids, &query, k).await
+    let stack_ids = if stack.is_some() {
+        // Named resolution intentionally accepts an unindexed legacy stack;
+        // it may already have a Knowledge 2.0 generation.
+        resolve_search_stack_ids(&registry, Some(&allowed), stack.as_deref())?
+    } else {
+        let mut ids = Vec::new();
+        for candidate in registry.iter().filter(|candidate| {
+            allowed
+                .iter()
+                .any(|name| name.trim().eq_ignore_ascii_case(candidate.name.trim()))
+        }) {
+            if candidate.indexed_at.is_some()
+                || crate::knowledge_service::has_active_generation(&app, &candidate.id)?
+            {
+                ids.push(candidate.id.clone());
+            }
+        }
+        if ids.is_empty() {
+            return Err("No indexed knowledge stacks are available to search".to_string());
+        }
+        ids
+    };
+
+    let mut results = Vec::new();
+    let mut legacy_ids = Vec::new();
+    for id in &stack_ids {
+        let candidate = registry
+            .iter()
+            .find(|candidate| &candidate.id == id)
+            .ok_or_else(|| format!("Stack '{id}' not found"))?;
+        match crate::knowledge_service::query_for_agent(&app, candidate, &query, k).await? {
+            Some(mut hybrid) => results.append(&mut hybrid),
+            None => legacy_ids.push(id.clone()),
+        }
+    }
+    if !legacy_ids.is_empty() {
+        results.extend(query_impl(&base, state.inner(), &legacy_ids, &query, k).await?);
+    }
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+    results.truncate(k);
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -1674,9 +2080,17 @@ mod tests {
         fn new(tag: &str) -> Self {
             static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("little_monkey_stacks_test_{}_{}_{}_{}", tag, std::process::id(), n, nanos));
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "little_monkey_stacks_test_{}_{}_{}_{}",
+                tag,
+                std::process::id(),
+                n,
+                nanos
+            ));
             std::fs::create_dir_all(&path).unwrap();
             TempDir { path }
         }
@@ -1715,7 +2129,11 @@ mod tests {
         let text = format!("{a}\n\n{b}\n\n{c}");
         // Target small enough that a+b fits but a+b+c doesn't.
         let chunks = chunk_text(&text, 130, 0);
-        assert!(chunks.len() >= 2, "expected at least 2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected at least 2 chunks, got {}",
+            chunks.len()
+        );
         // No chunk should contain a partial paragraph (each paragraph is
         // uniform repeated chars, so a "partial" would be a different
         // length than 60, 120, or 180).
@@ -1729,13 +2147,22 @@ mod tests {
     fn chunk_text_hard_splits_an_oversized_single_paragraph() {
         let text = "x".repeat(500);
         let chunks = chunk_text(&text, 100, 20);
-        assert!(chunks.len() > 1, "an oversized paragraph must be split into multiple chunks");
+        assert!(
+            chunks.len() > 1,
+            "an oversized paragraph must be split into multiple chunks"
+        );
         for chunk in &chunks {
-            assert!(chunk.text.chars().count() <= 100, "hard-split chunk exceeded chunk_chars");
+            assert!(
+                chunk.text.chars().count() <= 100,
+                "hard-split chunk exceeded chunk_chars"
+            );
         }
         // Every char of the original text must still appear (nothing lost).
         let total_unique_chars: usize = chunks.iter().map(|c| c.text.chars().count()).sum();
-        assert!(total_unique_chars >= 500, "hard split must not lose content");
+        assert!(
+            total_unique_chars >= 500,
+            "hard split must not lose content"
+        );
     }
 
     #[test]
@@ -1747,7 +2174,11 @@ mod tests {
         assert!(chunks.len() >= 2);
         // The second chunk should start with the tail of the first (the
         // overlap), followed by the second paragraph.
-        assert!(chunks[1].text.starts_with(&"a".repeat(30)), "second chunk missing carried-over overlap: {:?}", chunks[1].text);
+        assert!(
+            chunks[1].text.starts_with(&"a".repeat(30)),
+            "second chunk missing carried-over overlap: {:?}",
+            chunks[1].text
+        );
     }
 
     #[test]
@@ -1756,7 +2187,12 @@ mod tests {
         // Small enough that the two sections can't be packed into one
         // chunk, so each section's heading is exercised independently.
         let chunks = chunk_text(text, 20, 0);
-        assert_eq!(chunks.len(), 2, "unexpected chunks: {:?}", chunks.iter().map(|c| &c.text).collect::<Vec<_>>());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "unexpected chunks: {:?}",
+            chunks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
         assert_eq!(chunks[0].heading.as_deref(), Some("Section One"));
         assert_eq!(chunks[1].heading.as_deref(), Some("Section Two"));
     }
@@ -1773,7 +2209,11 @@ mod tests {
     fn vectors_bin_roundtrips_exact_values() {
         let dir = TempDir::new("vectors");
         let path = dir.path.join("vectors.bin");
-        let vectors = vec![vec![0.1_f32, 0.2, 0.3, 0.4], vec![-1.0, 0.5, 0.0, 2.5], vec![9.9, -9.9, 0.0, 1e-6]];
+        let vectors = vec![
+            vec![0.1_f32, 0.2, 0.3, 0.4],
+            vec![-1.0, 0.5, 0.0, 2.5],
+            vec![9.9, -9.9, 0.0, 1e-6],
+        ];
 
         write_vectors_bin(&path, 4, &vectors).unwrap();
         let (dim, count, flat) = read_vectors_bin(&path).unwrap();
@@ -1783,7 +2223,11 @@ mod tests {
         assert_eq!(flat.len(), 12);
         for (i, row) in vectors.iter().enumerate() {
             let read_row = &flat[i * 4..(i + 1) * 4];
-            assert_eq!(read_row, row.as_slice(), "row {i} did not roundtrip exactly");
+            assert_eq!(
+                read_row,
+                row.as_slice(),
+                "row {i} did not roundtrip exactly"
+            );
         }
     }
 
@@ -1815,7 +2259,10 @@ mod tests {
         let query = vec![0.0_f32, 1.0];
 
         let ranked = top_k_by_dot(&query, &flat, 2, 3, 3);
-        assert_eq!(ranked[0].0, 1, "expected row 1 (matches the query exactly) to rank first");
+        assert_eq!(
+            ranked[0].0, 1,
+            "expected row 1 (matches the query exactly) to rank first"
+        );
         assert!((ranked[0].1 - 1.0).abs() < 1e-6);
         assert_eq!(ranked[1].0, 0, "orthogonal row should rank second");
         // Row 2 is the exact opposite of the query — should rank last.
@@ -1918,7 +2365,10 @@ mod tests {
             _ = long_running => false,
         };
 
-        assert!(cancelled, "cancel() must short-circuit the pending select! before the long future completes");
+        assert!(
+            cancelled,
+            "cancel() must short-circuit the pending select! before the long future completes"
+        );
     }
 
     /// The actual bug `tokio::sync::Notify::notify_waiters()` had (see
@@ -1939,7 +2389,10 @@ mod tests {
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => false,
         };
 
-        assert!(cancelled, "a token cancelled before any waiter existed must still short-circuit a later select!");
+        assert!(
+            cancelled,
+            "a token cancelled before any waiter existed must still short-circuit a later select!"
+        );
     }
 
     // --- registry CRUD ---
@@ -1958,6 +2411,28 @@ mod tests {
     }
 
     #[test]
+    fn chunking_update_is_validated_and_persisted_without_destroying_active_metadata() {
+        let base = TempDir::new("registry_chunking");
+        let mut created = create_impl(&base.path, "Docs".to_string(), test_spec(768)).unwrap();
+        created.indexed_at = Some(42);
+        created.chunk_count = 7;
+        save_registry(&base.path, &[created.clone()]).unwrap();
+
+        let updated = update_chunking_impl(&base.path, &created.id, 900, 120).unwrap();
+        assert_eq!(updated.chunk_chars, 900);
+        assert_eq!(updated.chunk_overlap, 120);
+        assert_eq!(updated.indexed_at, Some(42));
+        assert_eq!(updated.chunk_count, 7);
+        let persisted = list_impl(&base.path).unwrap().remove(0);
+        assert_eq!(persisted.id, updated.id);
+        assert_eq!(persisted.chunk_chars, updated.chunk_chars);
+        assert_eq!(persisted.chunk_overlap, updated.chunk_overlap);
+        assert_eq!(persisted.indexed_at, updated.indexed_at);
+        assert_eq!(persisted.chunk_count, updated.chunk_count);
+        assert!(update_chunking_impl(&base.path, &created.id, 100, 100).is_err());
+    }
+
+    #[test]
     fn rename_and_delete_update_the_registry() {
         let base = TempDir::new("registry_rename_delete");
         let stack = create_impl(&base.path, "Old Name".to_string(), test_spec(768)).unwrap();
@@ -1968,7 +2443,10 @@ mod tests {
 
         delete_impl(&base.path, &stack.id).unwrap();
         assert!(list_impl(&base.path).unwrap().is_empty());
-        assert!(delete_impl(&base.path, &stack.id).is_err(), "deleting an already-deleted stack must error");
+        assert!(
+            delete_impl(&base.path, &stack.id).is_err(),
+            "deleting an already-deleted stack must error"
+        );
     }
 
     #[test]
@@ -1977,15 +2455,28 @@ mod tests {
         let source = TempDir::new("registry_add_source_target");
         let stack = create_impl(&base.path, "Stack".to_string(), test_spec(768)).unwrap();
 
-        let updated =
-            add_source_impl(&base.path, &stack.id, source.path.to_string_lossy().to_string(), SourceKind::Folder)
-                .unwrap();
+        let updated = add_source_impl(
+            &base.path,
+            &stack.id,
+            source.path.to_string_lossy().to_string(),
+            SourceKind::Folder,
+        )
+        .unwrap();
         assert_eq!(updated.sources.len(), 1);
 
-        let dup = add_source_impl(&base.path, &stack.id, source.path.to_string_lossy().to_string(), SourceKind::Folder);
-        assert!(dup.is_err(), "adding the same canonicalized path twice must error");
+        let dup = add_source_impl(
+            &base.path,
+            &stack.id,
+            source.path.to_string_lossy().to_string(),
+            SourceKind::Folder,
+        );
+        assert!(
+            dup.is_err(),
+            "adding the same canonicalized path twice must error"
+        );
 
-        let with_removed = remove_source_impl(&base.path, &stack.id, &updated.sources[0].path).unwrap();
+        let with_removed =
+            remove_source_impl(&base.path, &stack.id, &updated.sources[0].path).unwrap();
         assert!(with_removed.sources.is_empty());
     }
 
@@ -2029,7 +2520,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_search_stack_ids_matches_an_unindexed_named_stack_leaving_the_not_indexed_error_to_query_impl() {
+    fn resolve_search_stack_ids_matches_an_unindexed_named_stack_leaving_the_not_indexed_error_to_query_impl(
+    ) {
         // The name resolves fine even though it hasn't been indexed yet —
         // `query_impl` (not this function) is what surfaces "has not been
         // indexed yet", so that message stays in exactly one place.
@@ -2040,7 +2532,11 @@ mod tests {
 
     #[test]
     fn resolve_search_stack_ids_defaults_to_every_indexed_stack_when_no_name_given() {
-        let registry = vec![test_stack("Docs", true), test_stack("Notes", false), test_stack("Wiki", true)];
+        let registry = vec![
+            test_stack("Docs", true),
+            test_stack("Notes", false),
+            test_stack("Wiki", true),
+        ];
         let mut ids = resolve_search_stack_ids(&registry, None, None).unwrap();
         ids.sort();
         assert_eq!(ids, vec!["id-Docs".to_string(), "id-Wiki".to_string()]);
@@ -2063,7 +2559,11 @@ mod tests {
 
     #[test]
     fn resolve_search_stack_ids_default_sweep_is_scoped_to_the_allow_list_only() {
-        let registry = vec![test_stack("Work Docs", true), test_stack("Diary", true), test_stack("Wiki", true)];
+        let registry = vec![
+            test_stack("Work Docs", true),
+            test_stack("Diary", true),
+            test_stack("Wiki", true),
+        ];
         let allowed = vec!["Work Docs".to_string()];
         let ids = resolve_search_stack_ids(&registry, Some(&allowed), None).unwrap();
         // "Diary" and "Wiki" are indexed too, but NOT in the allow list — an
@@ -2115,7 +2615,10 @@ mod tests {
         let registry = vec![test_stack("Docs", false), test_stack("Notes", false)];
         let ids = vec!["id-Docs".to_string(), "id-Notes".to_string()];
         let err = partition_indexed_stacks(&registry, &ids).unwrap_err();
-        assert!(err.contains("Docs") && err.contains("Notes"), "unexpected error: {err}");
+        assert!(
+            err.contains("Docs") && err.contains("Notes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2124,8 +2627,16 @@ mod tests {
         // return just the indexed ones, not discard everything the moment it
         // hits one unindexed stack among several — see `query_impl`'s doc
         // comment.
-        let registry = vec![test_stack("Docs", true), test_stack("Notes", false), test_stack("Wiki", true)];
-        let ids = vec!["id-Docs".to_string(), "id-Notes".to_string(), "id-Wiki".to_string()];
+        let registry = vec![
+            test_stack("Docs", true),
+            test_stack("Notes", false),
+            test_stack("Wiki", true),
+        ];
+        let ids = vec![
+            "id-Docs".to_string(),
+            "id-Notes".to_string(),
+            "id-Wiki".to_string(),
+        ];
         let indexed = partition_indexed_stacks(&registry, &ids).unwrap();
         let mut names: Vec<&str> = indexed.iter().map(|s| s.name.as_str()).collect();
         names.sort();
@@ -2156,9 +2667,18 @@ mod tests {
 
         swap_stack_dir(&base.path, stack_id, &staging_dir).unwrap();
 
-        assert_eq!(std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(), "new");
-        assert!(!staging_dir.exists(), "the staging dir must be consumed by the swap");
-        assert!(!backup_dir_path(&base.path, stack_id).exists(), "the backup dir must be cleaned up on success");
+        assert_eq!(
+            std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(),
+            "new"
+        );
+        assert!(
+            !staging_dir.exists(),
+            "the staging dir must be consumed by the swap"
+        );
+        assert!(
+            !backup_dir_path(&base.path, stack_id).exists(),
+            "the backup dir must be cleaned up on success"
+        );
     }
 
     #[test]
@@ -2171,7 +2691,10 @@ mod tests {
 
         swap_stack_dir(&base.path, stack_id, &staging_dir).unwrap();
 
-        assert_eq!(std::fs::read_to_string(base.path.join(stack_id).join("chunks.jsonl")).unwrap(), "content");
+        assert_eq!(
+            std::fs::read_to_string(base.path.join(stack_id).join("chunks.jsonl")).unwrap(),
+            "content"
+        );
     }
 
     #[test]
@@ -2188,8 +2711,14 @@ mod tests {
         recover_stack_dir(&base.path, stack_id);
 
         let live_dir = base.path.join(stack_id);
-        assert_eq!(std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(), "last-good");
-        assert!(!backup_dir.exists(), "the backup must be consumed by the restore");
+        assert_eq!(
+            std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(),
+            "last-good"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "the backup must be consumed by the restore"
+        );
     }
 
     #[test]
@@ -2202,7 +2731,10 @@ mod tests {
 
         recover_stack_dir(&base.path, stack_id);
 
-        assert!(!staging_dir.exists(), "a leftover staging dir from an interrupted run must be cleared");
+        assert!(
+            !staging_dir.exists(),
+            "a leftover staging dir from an interrupted run must be cleared"
+        );
     }
 
     #[test]
@@ -2215,7 +2747,10 @@ mod tests {
 
         recover_stack_dir(&base.path, stack_id);
 
-        assert_eq!(std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(), "fine");
+        assert_eq!(
+            std::fs::read_to_string(live_dir.join("chunks.jsonl")).unwrap(),
+            "fine"
+        );
     }
 
     // --- stale-index false positives (extension/size gate) ---
@@ -2300,16 +2835,21 @@ mod tests {
             heading: None,
         }];
         let old_vectors_flat = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let old_file_index: HashMap<String, String> =
-            [("a.txt".to_string(), a_hash.clone()), ("b.txt".to_string(), "stale-hash".to_string())]
-                .into_iter()
-                .collect();
+        let old_file_index: HashMap<String, String> = [
+            ("a.txt".to_string(), a_hash.clone()),
+            ("b.txt".to_string(), "stale-hash".to_string()),
+        ]
+        .into_iter()
+        .collect();
 
         // Current files: a.txt unchanged, b.txt changed (hash mismatch),
         // c.txt brand new (not in old_file_index at all).
         let files = vec![
             ("a.txt".to_string(), a_content.to_string()),
-            ("b.txt".to_string(), "beta content, now different".to_string()),
+            (
+                "b.txt".to_string(),
+                "beta content, now different".to_string(),
+            ),
             ("c.txt".to_string(), "gamma content".to_string()),
         ];
 
@@ -2324,19 +2864,36 @@ mod tests {
             |_, _, _| progress_calls += 1,
         );
 
-        assert_eq!(progress_calls, 3, "on_file_done must be called once per file");
+        assert_eq!(
+            progress_calls, 3,
+            "on_file_done must be called once per file"
+        );
 
         // a.txt's row was carried over verbatim — not queued for embedding.
-        let a_idx = plan.all_chunks.iter().position(|c| c.source_path == "a.txt").expect("a.txt chunk present");
-        assert!(!plan.to_embed_indices.contains(&a_idx), "unchanged file must not be queued for re-embedding");
+        let a_idx = plan
+            .all_chunks
+            .iter()
+            .position(|c| c.source_path == "a.txt")
+            .expect("a.txt chunk present");
+        assert!(
+            !plan.to_embed_indices.contains(&a_idx),
+            "unchanged file must not be queued for re-embedding"
+        );
         assert_eq!(plan.vector_slots[a_idx], Some(vec![1.0, 0.0, 0.0, 0.0]));
 
         // b.txt (changed) and c.txt (new) must both be queued for embedding.
-        let embedded_paths: Vec<&str> =
-            plan.to_embed_indices.iter().map(|&i| plan.all_chunks[i].source_path.as_str()).collect();
+        let embedded_paths: Vec<&str> = plan
+            .to_embed_indices
+            .iter()
+            .map(|&i| plan.all_chunks[i].source_path.as_str())
+            .collect();
         assert!(embedded_paths.contains(&"b.txt"));
         assert!(embedded_paths.contains(&"c.txt"));
-        assert_eq!(plan.to_embed_texts.len(), embedded_paths.len(), "exactly one chunk per short changed/new file here");
+        assert_eq!(
+            plan.to_embed_texts.len(),
+            embedded_paths.len(),
+            "exactly one chunk per short changed/new file here"
+        );
 
         // The key assertion this test exists for: re-embedding work only
         // covers the changed/new files, not the whole stack — i.e. the
@@ -2366,7 +2923,9 @@ mod tests {
         }];
         let old_vectors_flat = vec![0.5_f32, 0.5, 0.5, 0.5];
         let old_file_index: HashMap<String, String> =
-            [("deleted.txt".to_string(), sha256_hex("gone"))].into_iter().collect();
+            [("deleted.txt".to_string(), sha256_hex("gone"))]
+                .into_iter()
+                .collect();
 
         // `deleted.txt` no longer appears in the current file list at all —
         // its source was removed, or the file itself was deleted.
@@ -2383,7 +2942,10 @@ mod tests {
         );
 
         assert!(
-            !plan.all_chunks.iter().any(|c| c.source_path == "deleted.txt"),
+            !plan
+                .all_chunks
+                .iter()
+                .any(|c| c.source_path == "deleted.txt"),
             "a no-longer-present source's rows must be dropped, not carried over"
         );
         assert!(plan.all_chunks.iter().any(|c| c.source_path == "kept.txt"));
@@ -2404,7 +2966,8 @@ mod tests {
         // …but the previous vectors.bin was written for an 8-dim model —
         // an embedding-spec change since the last index.
         let old_vectors_flat = vec![0.0_f32; 8];
-        let old_file_index: HashMap<String, String> = [("a.txt".to_string(), hash)].into_iter().collect();
+        let old_file_index: HashMap<String, String> =
+            [("a.txt".to_string(), hash)].into_iter().collect();
         let files = vec![("a.txt".to_string(), content.to_string())];
 
         let plan = plan_reindex(
@@ -2428,9 +2991,20 @@ mod tests {
     #[test]
     fn plan_reindex_with_no_previous_index_queues_every_file_for_embedding() {
         let stack = plan_test_stack(4);
-        let files = vec![("a.txt".to_string(), "alpha".to_string()), ("b.txt".to_string(), "beta".to_string())];
+        let files = vec![
+            ("a.txt".to_string(), "alpha".to_string()),
+            ("b.txt".to_string(), "beta".to_string()),
+        ];
 
-        let plan = plan_reindex(&stack, &files, &HashMap::new(), &[], None, &CancellationToken::new(), |_, _, _| {});
+        let plan = plan_reindex(
+            &stack,
+            &files,
+            &HashMap::new(),
+            &[],
+            None,
+            &CancellationToken::new(),
+            |_, _, _| {},
+        );
 
         assert_eq!(plan.to_embed_texts.len(), plan.all_chunks.len());
         assert!(plan.vector_slots.iter().all(|v| v.is_none()));
@@ -2448,9 +3022,20 @@ mod tests {
         cancel.cancel();
 
         let mut progress_calls = 0;
-        let plan = plan_reindex(&stack, &files, &HashMap::new(), &[], None, &cancel, |_, _, _| progress_calls += 1);
+        let plan = plan_reindex(
+            &stack,
+            &files,
+            &HashMap::new(),
+            &[],
+            None,
+            &cancel,
+            |_, _, _| progress_calls += 1,
+        );
 
-        assert_eq!(progress_calls, 0, "an already-cancelled token must stop before the first file is processed");
+        assert_eq!(
+            progress_calls, 0,
+            "an already-cancelled token must stop before the first file is processed"
+        );
         assert!(plan.all_chunks.is_empty());
     }
 
@@ -2459,7 +3044,10 @@ mod tests {
     #[test]
     fn file_index_roundtrips_and_defaults_to_empty_when_missing() {
         let dir = TempDir::new("file_index");
-        assert!(read_file_index(&dir.path).is_empty(), "missing file_index.json must default to empty, not error");
+        assert!(
+            read_file_index(&dir.path).is_empty(),
+            "missing file_index.json must default to empty, not error"
+        );
 
         let mut index = HashMap::new();
         index.insert("a.txt".to_string(), "hash-a".to_string());
@@ -2475,16 +3063,28 @@ mod tests {
     #[test]
     fn is_stale_impl_is_false_for_a_never_indexed_stack() {
         let mut stack = test_stack("Docs", false);
-        stack.sources = vec![StackSource { path: "/nonexistent/path/at/all".to_string(), kind: SourceKind::File }];
-        assert!(!is_stale_impl(&stack), "a stack with no indexed_at is never stale");
+        stack.sources = vec![StackSource {
+            path: "/nonexistent/path/at/all".to_string(),
+            kind: SourceKind::File,
+        }];
+        assert!(
+            !is_stale_impl(&stack),
+            "a stack with no indexed_at is never stale"
+        );
     }
 
     #[test]
     fn is_stale_impl_is_true_when_a_source_file_is_missing() {
         let mut stack = test_stack("Docs", true);
         stack.indexed_at = Some(now_ms());
-        stack.sources = vec![StackSource { path: "/definitely/does/not/exist.txt".to_string(), kind: SourceKind::File }];
-        assert!(is_stale_impl(&stack), "an unreadable source counts as stale");
+        stack.sources = vec![StackSource {
+            path: "/definitely/does/not/exist.txt".to_string(),
+            kind: SourceKind::File,
+        }];
+        assert!(
+            is_stale_impl(&stack),
+            "an unreadable source counts as stale"
+        );
     }
 
     #[test]
@@ -2496,7 +3096,10 @@ mod tests {
         let mut stack = test_stack("Docs", true);
         // Indexed "in the future" relative to the file we just wrote.
         stack.indexed_at = Some(now_ms() + 60_000);
-        stack.sources = vec![StackSource { path: file_path.to_string_lossy().to_string(), kind: SourceKind::File }];
+        stack.sources = vec![StackSource {
+            path: file_path.to_string_lossy().to_string(),
+            kind: SourceKind::File,
+        }];
 
         assert!(!is_stale_impl(&stack));
     }
@@ -2510,7 +3113,10 @@ mod tests {
         let mut stack = test_stack("Docs", true);
         // Indexed "in the past" relative to the file we just wrote.
         stack.indexed_at = Some(0);
-        stack.sources = vec![StackSource { path: file_path.to_string_lossy().to_string(), kind: SourceKind::File }];
+        stack.sources = vec![StackSource {
+            path: file_path.to_string_lossy().to_string(),
+            kind: SourceKind::File,
+        }];
 
         assert!(is_stale_impl(&stack));
     }
@@ -2541,11 +3147,15 @@ mod tests {
         );
 
         offsets[4] = buf.len();
-        buf.extend_from_slice(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+        buf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
 
         let stream_content = b"BT /F1 24 Tf 100 700 Td (Hello World) Tj ET";
         offsets[5] = buf.len();
-        buf.extend_from_slice(format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_content.len()).as_bytes());
+        buf.extend_from_slice(
+            format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_content.len()).as_bytes(),
+        );
         buf.extend_from_slice(stream_content);
         buf.extend_from_slice(b"\nendstream\nendobj\n");
 
@@ -2569,9 +3179,13 @@ mod tests {
         let pdf_path = dir.path.join("fixture.pdf");
         std::fs::write(&pdf_path, minimal_pdf_fixture_bytes()).unwrap();
 
-        let (path, text) = read_indexable_pdf(&pdf_path).expect("a well-formed minimal PDF must extract text");
+        let (path, text) =
+            read_indexable_pdf(&pdf_path).expect("a well-formed minimal PDF must extract text");
         assert!(path.ends_with("fixture.pdf"));
-        assert!(text.contains("Hello World"), "unexpected extracted text: {text:?}");
+        assert!(
+            text.contains("Hello World"),
+            "unexpected extracted text: {text:?}"
+        );
     }
 
     #[cfg(feature = "pdf-extraction")]
@@ -2581,7 +3195,8 @@ mod tests {
         let pdf_path = dir.path.join("doc.pdf");
         std::fs::write(&pdf_path, minimal_pdf_fixture_bytes()).unwrap();
 
-        let (_, text) = read_indexable_file(&pdf_path).expect("read_indexable_file must handle .pdf");
+        let (_, text) =
+            read_indexable_file(&pdf_path).expect("read_indexable_file must handle .pdf");
         assert!(text.contains("Hello World"));
     }
 }

@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { DEFAULT_LOCALE, LOCALES, type LocaleCode } from "../lib/i18n/locales";
 
-const STORAGE_KEY = "little-monkey-locale";
+export const LOCALE_STORAGE_KEY = "little-monkey-locale";
 
 function isLocaleCode(value: string): value is LocaleCode {
   return LOCALES.some((entry) => entry.code === value);
@@ -9,7 +9,7 @@ function isLocaleCode(value: string): value is LocaleCode {
 
 function hydrate(): LocaleCode {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(LOCALE_STORAGE_KEY);
     if (raw && isLocaleCode(raw)) return raw;
   } catch {
     // Ignore — fall back to default.
@@ -27,7 +27,7 @@ export const useLocaleStore = create<LocaleState>((set) => ({
   setLocale: (locale) => {
     set({ locale });
     try {
-      localStorage.setItem(STORAGE_KEY, locale);
+      localStorage.setItem(LOCALE_STORAGE_KEY, locale);
     } catch {
       // Best-effort persistence.
     }

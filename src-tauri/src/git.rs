@@ -151,11 +151,15 @@ pub fn git_status(state: tauri::State<'_, AppState>) -> Result<GitStatusPayload,
     }
 
     let branch_output = run_git(&root, &["branch", "--show-current"])?;
-    let branch_name = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+    let branch_name = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
     let branch = if branch_name.is_empty() {
         // Detached HEAD: `branch --show-current` prints nothing.
         let short_hash_output = run_git(&root, &["rev-parse", "--short", "HEAD"])?;
-        let short_hash = String::from_utf8_lossy(&short_hash_output.stdout).trim().to_string();
+        let short_hash = String::from_utf8_lossy(&short_hash_output.stdout)
+            .trim()
+            .to_string();
         Some(format!("detached@{}", short_hash))
     } else {
         Some(branch_name)
@@ -221,7 +225,9 @@ fn detect_worktree_name(git_dir: &str, common_dir: &str) -> Option<String> {
         return None;
     }
 
-    Path::new(git_dir).file_name().map(|n| n.to_string_lossy().to_string())
+    Path::new(git_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
 }
 
 /// Stage everything and commit with `message`. Mirrors the default behavior
@@ -237,7 +243,9 @@ pub fn git_commit(state: tauri::State<'_, AppState>, message: String) -> Result<
 
     let add_output = run_git(&root, &["add", "-A"])?;
     if !add_output.status.success() {
-        return Err(String::from_utf8_lossy(&add_output.stderr).trim().to_string());
+        return Err(String::from_utf8_lossy(&add_output.stderr)
+            .trim()
+            .to_string());
     }
 
     // The message is passed as a single `Command::arg`, never
@@ -253,7 +261,9 @@ pub fn git_commit(state: tauri::State<'_, AppState>, message: String) -> Result<
         .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if !commit_output.status.success() {
-        return Err(String::from_utf8_lossy(&commit_output.stderr).trim().to_string());
+        return Err(String::from_utf8_lossy(&commit_output.stderr)
+            .trim()
+            .to_string());
     }
 
     let stdout = String::from_utf8_lossy(&commit_output.stdout);

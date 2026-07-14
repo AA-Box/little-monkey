@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
   ArchiveRestore,
@@ -10,9 +11,12 @@ import {
   Columns2,
   FolderInput,
   FolderOpen,
+  FileDown,
   GitFork,
   Mail,
   MailOpen,
+  Languages,
+  LoaderCircle,
   Pencil,
   Pin,
   PinOff,
@@ -23,6 +27,14 @@ import { type ChatSession, useSessionStore } from "../../store/sessionStore";
 import { useShortcutStore } from "../../store/shortcutStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { useT } from "../../lib/i18n";
+import {
+  cancelTranslation,
+  defaultTranslationLocale,
+  threadTranslationKey,
+  TRANSLATION_LOCALES,
+  translateThread,
+} from "../../lib/translation";
+import { exportPortableSession } from "../../lib/portability";
 import {
   detectShortcutPlatform,
   shortcutDisplayLabel,
@@ -68,7 +80,13 @@ const submenuClass =
  */
 export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionMenuProps) {
   const { t } = useT();
-  const groups = useSessionStore((s) => s.groups);
+  // Comparison groups are execution/result containers, not folders a user
+  // can file unrelated sessions into.
+  const allGroups = useSessionStore((s) => s.groups);
+  const groups = useMemo(
+    () => allGroups.filter((group) => group.kind === "folder"),
+    [allGroups],
+  );
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const isActiveSession = session.id === activeSessionId;
   const togglePin = useSessionStore((s) => s.togglePin);
@@ -79,12 +97,20 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
   const archiveSession = useSessionStore((s) => s.archiveSession);
   const unarchiveSession = useSessionStore((s) => s.unarchiveSession);
   const deleteSession = useSessionStore((s) => s.deleteSession);
+  const setDisplayTranslationLocale = useSessionStore((s) => s.setDisplayTranslationLocale);
   const shortcutOverrides = useShortcutStore((s) => s.overrides);
   const platform = detectShortcutPlatform();
   const shortcutLabel = (id: ShortcutId) => shortcutDisplayLabel(id, platform, shortcutOverrides);
 
   const [newGroupOpen, setNewGroupOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
+  const [translationTarget, setTranslationTarget] = useState(
+    session.displayTranslationLocale ?? defaultTranslationLocale(),
+  );
+  const [translating, setTranslating] = useState(false);
+  const [translationError, setTranslationError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   // The trigger button lives in the sidebar; this menu is portaled to
@@ -135,6 +161,41 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
     setNewGroupName("");
     setNewGroupOpen(false);
     onClose();
+  };
+
+  const handleTranslateThread = async () => {
+    setTranslating(true);
+    setTranslationError(null);
+    try {
+      await translateThread(session.id, translationTarget);
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        setTranslationError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setTranslating(false);
+    }
+  };
+
+  const handleSessionExport = async (format: "markdown" | "json" | "docx") => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const extension = format === "markdown" ? "md" : format;
+      const safeTitle = session.title.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "conversation";
+      const path = await save({
+        defaultPath: `${safeTitle}.${extension}`,
+        filters: [{
+          name: format === "docx" ? "Word document" : format === "json" ? "JSON" : "Markdown",
+          extensions: [extension],
+        }],
+      });
+      if (path) await exportPortableSession(path, session, format);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExporting(false);
+    }
   };
 
   // Real keyboard shortcuts while the menu is open, matching the mnemonics
@@ -283,6 +344,83 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
         </span>
         {isActiveSession && <kbd className="text-xs text-faint">{shortcutLabel("sessionFork")}</kbd>}
       </button>
+
+      <div className="group/translate relative">
+        <button type="button" className={itemClass}>
+          <span className="flex items-center gap-2">
+            <Languages size={14} className="text-faint" />
+            {t("Translation.translateThread")}
+          </span>
+          <ChevronRight size={14} className="text-faint" />
+        </button>
+        <div className={`${submenuClass} group-hover/translate:visible group-hover/translate:opacity-100 focus-within:visible focus-within:opacity-100`}>
+          <div className="px-3 py-2">
+            <label className="mb-1 block text-[11px] font-medium text-faint" htmlFor={`translation-${session.id}`}>
+              {t("Translation.languageLabel")}
+            </label>
+            <select
+              id={`translation-${session.id}`}
+              value={translationTarget}
+              disabled={translating}
+              onChange={(event) => setTranslationTarget(event.target.value)}
+              className="w-full cursor-pointer rounded-md border border-border bg-surface-2 px-2 py-1 text-xs text-foreground outline-none focus-visible:border-accent"
+            >
+              {TRANSLATION_LOCALES.map(({ code, label }) => <option key={code} value={code}>{label}</option>)}
+            </select>
+          </div>
+          {translating ? (
+            <button
+              type="button"
+              onClick={() => cancelTranslation(threadTranslationKey(session.id))}
+              className={itemClass}
+            >
+              <span className="flex items-center gap-2">
+                <LoaderCircle size={14} className="animate-spin text-faint" />
+                {t("Translation.cancel")}
+              </span>
+            </button>
+          ) : (
+            <button type="button" onClick={() => void handleTranslateThread()} className={itemClass}>
+              <span className="flex items-center gap-2">
+                <Languages size={14} className="text-faint" />
+                {t("Translation.translateThread")}
+              </span>
+            </button>
+          )}
+          {session.displayTranslationLocale && (
+            <button
+              type="button"
+              onClick={() => setDisplayTranslationLocale(session.id, null)}
+              className={itemClass}
+            >
+              <span>{t("Translation.showOriginalThread")}</span>
+            </button>
+          )}
+          {translationError && <p className="px-3 py-1.5 text-xs text-danger" role="alert">{translationError}</p>}
+        </div>
+      </div>
+
+      <div className="group/export relative">
+        <button type="button" className={itemClass} disabled={exporting}>
+          <span className="flex items-center gap-2">
+            <FileDown size={14} className="text-faint" />
+            {exporting ? t("Portability.busy") : t("Portability.exportSession")}
+          </span>
+          <ChevronRight size={14} className="text-faint" />
+        </button>
+        <div className={`${submenuClass} group-hover/export:visible group-hover/export:opacity-100 focus-within:visible focus-within:opacity-100`}>
+          <button type="button" className={itemClass} onClick={() => void handleSessionExport("markdown")}>
+            <span>{t("Portability.sessionMarkdown")}</span>
+          </button>
+          <button type="button" className={itemClass} onClick={() => void handleSessionExport("json")}>
+            <span>{t("Portability.sessionJson")}</span>
+          </button>
+          <button type="button" className={itemClass} onClick={() => void handleSessionExport("docx")}>
+            <span>{t("Portability.sessionWord")}</span>
+          </button>
+          {exportError && <p className="px-3 py-1.5 text-xs text-danger" role="alert">{exportError}</p>}
+        </div>
+      </div>
 
       <div className="my-1 border-t border-border" />
 

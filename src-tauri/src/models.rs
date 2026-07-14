@@ -301,8 +301,12 @@ fn external_registry_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join("external_models.json"))
 }
@@ -428,8 +432,10 @@ fn is_safe_path_component(s: &str) -> bool {
 /// a malformed value could otherwise be used to smuggle extra path segments
 /// or unexpected characters into the request.
 fn validate_repo(repo: &str) -> Result<(), String> {
-    let valid_charset =
-        |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let valid_charset = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
 
     match repo.split('/').collect::<Vec<_>>().as_slice() {
         [org, name]
@@ -484,7 +490,8 @@ pub async fn models_download(app: AppHandle, repo: String, file: String) -> Resu
     // both target paths to land directly inside the canonicalized models
     // directory before anything is created — mirroring the containment
     // check tools.rs::resolve_in_workspace performs for workspace paths.
-    if dest_path.parent() != Some(dir_canon.as_path()) || tmp_path.parent() != Some(dir_canon.as_path())
+    if dest_path.parent() != Some(dir_canon.as_path())
+        || tmp_path.parent() != Some(dir_canon.as_path())
     {
         return Err(format!("Invalid file name '{file}'"));
     }
@@ -617,7 +624,17 @@ pub async fn models_delete(
     }
 
     let detail = format!("Delete downloaded model weights at {}", p.display());
-    permissions::request_permission(&app, state.inner(), "delete_model", detail, None, None, None).await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "delete_model",
+        detail,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
 
     std::fs::remove_file(&p).map_err(|e| format!("Failed to delete {path}: {e}"))
 }

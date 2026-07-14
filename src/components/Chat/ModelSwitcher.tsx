@@ -35,6 +35,9 @@ export function ModelSwitcher() {
   const { t } = useT();
 
   const connectedProviders = providers.filter((provider) => provider.has_key);
+  // Embedding-only GGUFs can be installed for Knowledge Stacks, but they
+  // cannot answer chat requests and must never appear as chat targets.
+  const installedChatModels = installed.filter((model) => model.kind === "chat");
 
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -92,10 +95,10 @@ export function ModelSwitcher() {
       {open && (
         <div className="absolute bottom-full right-0 z-20 mb-1 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg">
           <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.localSectionLabel")}</p>
-          {installed.length === 0 ? (
+          {installedChatModels.length === 0 ? (
             <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noLocalModelsInstalled")}</p>
           ) : (
-            installed.map((model) => {
+            installedChatModels.map((model) => {
               const isActive = activeProvider === "local" && active?.path === model.path;
               return (
                 <button

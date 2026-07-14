@@ -204,9 +204,10 @@ export class SseEventParser {
  * `streamProviderChat` instead — same `StreamEvent` shape, but proxied
  * through Rust so the API key never enters this WebView.
  *
- * POSTs to `${baseUrl}/v1/chat/completions` with `{ messages, tools,
- * tool_choice: 'auto', stream: true, stream_options: { include_usage: true },
- * model }` and parses the response with {@link SseEventParser}, yielding a
+ * POSTs to `${baseUrl}/v1/chat/completions` with `{ messages, stream: true,
+ * stream_options: { include_usage: true }, model }` (plus `tools` and
+ * `tool_choice: 'auto'` only when tools are actually offered) and parses the
+ * response with {@link SseEventParser}, yielding a
  * final `{ type: 'done' }` once the stream ends. `stream_options.include_usage`
  * is a standard OpenAI-compatible param supported by both llama-server and
  * Ollama; a server that doesn't recognize it simply ignores it.
@@ -221,23 +222,36 @@ export async function* streamChat(
   messages: ChatMessage[],
   tools: ToolDef[],
   model?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxTokens?: number,
 ): AsyncGenerator<StreamEvent> {
   const url = `${baseUrl.replace(/\/+$/, '')}/v1/chat/completions`;
 
   let response: Response;
   try {
+    const body: Record<string, unknown> = {
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+      model: model ?? 'local',
+    };
+    // Crew runs pass a code-enforced per-call ceiling. OpenAI-compatible
+    // llama.cpp/Ollama endpoints honor `max_tokens`; ordinary chat callers
+    // omit it and retain their existing behavior.
+    if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) {
+      body.max_tokens = Math.floor(maxTokens);
+    }
+    // Some OpenAI-compatible endpoints reject `tool_choice` when the tools
+    // array is empty. Compare deliberately has no tools, so omit both fields
+    // entirely instead of sending a contradictory "auto" choice.
+    if (tools.length > 0) {
+      body.tools = tools;
+      body.tool_choice = 'auto';
+    }
     response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages,
-        tools,
-        tool_choice: 'auto',
-        stream: true,
-        stream_options: { include_usage: true },
-        model: model ?? 'local',
-      }),
+      body: JSON.stringify(body),
       signal,
     });
   } catch (err) {

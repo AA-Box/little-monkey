@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    { "id": "connect-stable-v1", "case": "initialize", "input": { "protocolVersion": 1 }, "accepted": true },
+    { "id": "reject-future-version", "case": "initialize", "input": { "protocolVersion": 2 }, "accepted": false },
+    { "id": "negotiate-real-workspace", "case": "workspace", "accepted": true },
+    { "id": "reject-additional-root", "case": "additional_root", "accepted": false },
+    { "id": "reject-workspace-symlink", "case": "workspace_symlink", "accepted": false },
+    { "id": "active-file-embedded-context", "case": "embedded_context", "accepted": true },
+    { "id": "selected-code-text-context", "case": "text_prompt", "accepted": true },
+    { "id": "problems-exact-document-version", "case": "diagnostics_context", "accepted": true },
+    { "id": "reject-linked-file-escape", "case": "resource_escape", "accepted": false },
+    { "id": "stream-assistant-delta", "case": "event", "expectedUpdate": "agent_message_chunk", "event": { "type": "model_delta", "payload": { "message_id": "m1", "channel": "assistant", "text": "hello" } } },
+    { "id": "show-tool-proposal", "case": "event", "expectedUpdate": "tool_call", "event": { "type": "tool_proposed", "payload": { "tool_call_id": "t1", "tool_name": "read_file", "arguments": { "value": { "path": "src/lib.rs" }, "redaction": "not_needed" }, "arguments_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "mutation": false } } },
+    { "id": "show-tool-progress", "case": "event", "expectedUpdate": "tool_call_update", "event": { "type": "tool_started", "payload": { "tool_call_id": "t1" } } },
+    { "id": "show-tool-result", "case": "event", "expectedUpdate": "tool_call_update", "event": { "type": "tool_finished", "payload": { "tool_call_id": "t1", "outcome": "succeeded", "output_excerpt": "ok", "output_sha256": null, "duration_ms": 4 } } },
+    { "id": "permission-remains-local", "case": "event", "expectedUpdate": "tool_call_update", "event": { "type": "awaiting_approval", "payload": { "request_id": "approval-1", "operation_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "expires_at_ms": 9999999999999, "reason": "Approve in Little Monkey" } } },
+    { "id": "publish-artifact-link", "case": "event", "expectedUpdate": "tool_call", "event": { "type": "artifact_added", "payload": { "artifact_id": "artifact-1", "kind": "report", "name": "report.md", "media_type": "text/markdown", "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size_bytes": 42 } } },
+    { "id": "publish-checkpoint", "case": "event", "expectedUpdate": "tool_call", "event": { "type": "checkpoint_linked", "payload": { "checkpoint_id": "checkpoint-1", "kind": "workspace", "label": "Before edit", "content_sha256": null } } },
+    { "id": "publish-verification", "case": "event", "expectedUpdate": "tool_call", "event": { "type": "verification_finished", "payload": { "verification_id": "verify-1", "name": "tests", "passed": true, "summary": "12 passed", "artifact_ids": [], "duration_ms": 20 } } },
+    { "id": "cancel-round-trip", "case": "cancel", "accepted": true },
+    { "id": "reconnect-from-durable-history", "case": "resume", "accepted": true },
+    { "id": "native-diff-path-is-relative", "case": "safe_diff", "accepted": true }
+  ]
+}

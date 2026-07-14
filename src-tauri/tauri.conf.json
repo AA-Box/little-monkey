@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "Little Monkey",
-        "width": 1280,
+        "width": 1440,
         "height": 800,
-        "minWidth": 900,
+        "minWidth": 1400,
         "minHeight": 600,
         "center": true,
         "titleBarStyle": "Overlay",

@@ -26,6 +26,7 @@ serde_json = "1"
 tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
+tauri-plugin-global-shortcut = "2"
 tokio = { version = "1.52.3", features = ["full"] }
 # "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
 # `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
@@ -33,7 +34,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 # "query" added in phase 3 for the same reason: `RequestBuilder::query` (used
 # by the Brave/SearXNG branches to attach `?q=&count=`/`?q=&format=json`) is
 # also feature-gated in reqwest 0.13, separately from "form".
-reqwest = { version = "0.13.4", features = ["json", "stream", "form", "query"] }
+reqwest = { version = "0.13.4", features = ["json", "stream", "form", "query", "multipart"] }
 futures-util = "0.3.32"
 uuid = { version = "1.23.4", features = ["v4"] }
 regex = "1.12.4"
@@ -108,6 +109,23 @@ hyper-util = { version = "0.1.20", features = ["tokio"] }
 http-body-util = "0.1.3"
 sha2 = "0.10.9"
 rand = "0.10.2"
+# portability_commands.rs: AES-256-GCM authenticated snapshot encryption.
+# ring 0.17.14 is already in the locked/compiled dependency graph through
+# rustls; making it direct lets the backup layer use its audited AEAD API
+# without a second crypto implementation or another downloaded crate.
+ring = "0.17.14"
+# daemon/remote: the optional user-owned remote runner terminates TLS itself
+# when exposed directly. These exact versions are already present through
+# reqwest, so this only makes the server-side API available to the binary.
+tokio-rustls = "0.26.4"
+rustls = "0.23.41"
+# knowledge_adapters.rs: bounded, inert Office Open XML extraction. These are
+# already locked transitively in this workspace; making them direct lets the
+# app decode ZIP/Deflate containers and stream XML without executing macros,
+# formulas, scripts, or external relationships.
+flate2 = "1.1.9"
+quick-xml = "0.41.0"
+crc32fast = "1.5.0"
 # stacks.rs (RAG design doc, slice 4): pure-Rust PDF text extraction for
 # Knowledge Stacks sources. `optional = true` + the `pdf-extraction` feature
 # below (default-on) so PDF support is a build-time toggle, not a hard
@@ -135,6 +153,16 @@ serde-saphyr = "0.0.29"
 # are the only new date-parsing surface this feature adds.
 croner = "3.0.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+# system.rs: cross-platform physical-memory snapshot used only to decide
+# whether multiple local comparison branches should launch concurrently or
+# be queued. The crate exposes byte counts on macOS, Windows, and Linux.
+system-memory = "0.1.7"
+# run_ledger.rs / storage.rs: one bundled, cross-platform SQLite engine for
+# ordered run events, approvals, migrations, FTS5 history, and verified
+# backup/restore. Bundling avoids depending on whatever SQLite version happens
+# to be installed on a user's machine; backup/limits support bounded portable
+# snapshots and hostile-input guardrails.
+rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
 
 # cli_install.rs (Windows only — macOS/Linux use a plain symlink via
 # `std::os::unix::fs::symlink`, no extra dependency needed): adds the CLI
@@ -149,7 +177,7 @@ winreg = "0.56"
 # actually used (SendMessageTimeoutW plus the HWND/WPARAM/LPARAM/LRESULT
 # type aliases it needs) are enabled. 0.61 verified current on crates.io at
 # implementation time.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["pdf-extraction"]
@@ -159,4 +187,3 @@ pdf-extraction = ["dep:pdf-extract"]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
 # command-macro argument-key matching can be exercised in unit tests.
 tauri = { version = "2", features = ["test"] }
-

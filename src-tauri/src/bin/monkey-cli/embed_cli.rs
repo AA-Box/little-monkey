@@ -42,7 +42,8 @@ fn read_pid() -> Option<u32> {
 
 fn write_pid(pid: u32) -> Result<(), String> {
     let path = pid_file_path().ok_or("Could not resolve the app data directory")?;
-    std::fs::write(&path, pid.to_string()).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    std::fs::write(&path, pid.to_string())
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 fn clear_pid_file() {
@@ -73,7 +74,10 @@ fn process_is_alive(pid: u32) -> bool {
 pub async fn start(model_path: String) -> Result<(), String> {
     if let Some(pid) = read_pid() {
         if process_is_alive(pid) {
-            println!("Embedding server already running (pid {pid}, port {}).", llama::EMBED_PORT);
+            println!(
+                "Embedding server already running (pid {pid}, port {}).",
+                llama::EMBED_PORT
+            );
             return Ok(());
         }
         // Stale pid file (process died without `stop` being called) — clear
@@ -98,7 +102,12 @@ pub async fn start(model_path: String) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut ready = false;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&health_url).timeout(Duration::from_secs(2)).send().await {
+        if let Ok(resp) = client
+            .get(&health_url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
             if resp.status().is_success() {
                 ready = true;
                 break;
@@ -107,18 +116,27 @@ pub async fn start(model_path: String) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     if !ready {
-        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
-        return Err("Timed out waiting for the embedding server to become healthy after 60s".to_string());
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        return Err(
+            "Timed out waiting for the embedding server to become healthy after 60s".to_string(),
+        );
     }
 
     let verify = client
-        .post(format!("http://127.0.0.1:{}/v1/embeddings", llama::EMBED_PORT))
+        .post(format!(
+            "http://127.0.0.1:{}/v1/embeddings",
+            llama::EMBED_PORT
+        ))
         .json(&serde_json::json!({ "model": model_path, "input": ["ready check"] }))
         .timeout(Duration::from_secs(10))
         .send()
         .await;
     if !matches!(verify, Ok(resp) if resp.status().is_success()) {
-        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
         return Err(
             "The embedding server process started but a test /v1/embeddings request failed — this build of \
              llama-server may not support --pooling mean, or may need a newer version."
@@ -127,7 +145,10 @@ pub async fn start(model_path: String) -> Result<(), String> {
     }
 
     write_pid(pid)?;
-    println!("Embedding server ready on port {} (pid {pid}).", llama::EMBED_PORT);
+    println!(
+        "Embedding server ready on port {} (pid {pid}).",
+        llama::EMBED_PORT
+    );
     // `child` is dropped here without `.kill()`/`.wait()` — deliberately: a
     // `std::process::Child` is not killed on drop, so the process keeps
     // running in the background after this CLI invocation exits.
@@ -157,7 +178,9 @@ pub fn stop() -> Result<(), String> {
 /// process that died without `stop` being called reports "not running").
 pub fn status() -> Result<(), String> {
     match read_pid() {
-        Some(pid) if process_is_alive(pid) => println!("Running (pid {pid}, port {}).", llama::EMBED_PORT),
+        Some(pid) if process_is_alive(pid) => {
+            println!("Running (pid {pid}, port {}).", llama::EMBED_PORT)
+        }
         _ => println!("Not running."),
     }
     Ok(())

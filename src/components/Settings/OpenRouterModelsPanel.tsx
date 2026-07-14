@@ -44,7 +44,7 @@ export function OpenRouterModelsPanel() {
   }, [models, search]);
 
   return (
-    <div className="flex flex-col gap-3 p-2">
+    <div className="flex flex-col gap-3 py-2">
       <p className="text-xs text-muted">{t("OpenRouterModelsPanel.description")}</p>
 
       <label className="flex items-start gap-2 text-sm text-foreground">

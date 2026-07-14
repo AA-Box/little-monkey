@@ -1,15 +1,17 @@
 import { useT } from "../../lib/i18n";
 import type { PromptEntry } from "../../store/promptStore";
 
+export type SlashCatalogEntry = PromptEntry & { builtin?: boolean };
+
 export interface SlashCommandAutocompleteProps {
   /** The raw text typed after "/" — filtering/sorting is done by the caller. */
   query: string;
   /** Already filtered/sorted entries to render, in order. */
-  entries: PromptEntry[];
+  entries: SlashCatalogEntry[];
   /** Index into `entries` that is currently keyboard-highlighted. */
   activeIndex: number;
   /** Called when a row is chosen (click, or Enter/Tab in the caller). */
-  onSelect: (entry: PromptEntry) => void;
+  onSelect: (entry: SlashCatalogEntry) => void;
   /** Called when the pointer hovers a row, so the caller can sync `activeIndex`. */
   onHoverIndex: (index: number) => void;
 }
@@ -43,10 +45,22 @@ export function SlashCommandAutocomplete({ entries, activeIndex, onSelect, onHov
             >
               <span
                 className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-medium uppercase ${
-                  entry.kind === "persona" ? "bg-accent-soft text-accent" : "bg-surface-2 text-muted"
+                  entry.builtin
+                    ? "bg-accent-soft text-accent"
+                    : entry.kind === "persona"
+                    ? "bg-accent-soft text-accent"
+                    : entry.kind === "skill"
+                      ? "bg-success/10 text-success"
+                      : "bg-surface-2 text-muted"
                 }`}
               >
-                {entry.kind === "persona" ? t("SlashCommandAutocomplete.personaBadge") : t("SlashCommandAutocomplete.snippetBadge")}
+                {entry.builtin
+                  ? "command"
+                  : entry.kind === "persona"
+                  ? t("SlashCommandAutocomplete.personaBadge")
+                  : entry.kind === "skill"
+                    ? t("SlashCommandAutocomplete.skillBadge")
+                    : t("SlashCommandAutocomplete.snippetBadge")}
               </span>
               <span className="min-w-0 flex-1 truncate">
                 <span className="font-mono text-xs text-foreground">/{entry.command}</span>

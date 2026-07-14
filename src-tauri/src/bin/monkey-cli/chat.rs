@@ -16,15 +16,28 @@ use crate::ollama_api::{self, ChatEvent, ChatMetrics, NativeChatReq};
 use crate::sse::{SseParser, StreamEvent, ToolCallEvent};
 
 pub enum Target {
-    Local { base_url: String, model: Option<String>, native_ollama: bool },
-    Provider { provider_id: String, model: String },
+    Local {
+        base_url: String,
+        model: Option<String>,
+        native_ollama: bool,
+    },
+    Provider {
+        provider_id: String,
+        model: String,
+    },
 }
 
 impl Target {
     /// True when this target speaks the native Ollama `/api/chat` protocol
     /// (`--ollama` and `run`) rather than OpenAI chat-completions.
     pub fn is_native(&self) -> bool {
-        matches!(self, Target::Local { native_ollama: true, .. })
+        matches!(
+            self,
+            Target::Local {
+                native_ollama: true,
+                ..
+            }
+        )
     }
 }
 
@@ -45,6 +58,9 @@ pub struct ChatOptions {
     pub think: Option<serde_json::Value>,
     pub hide_thinking: bool,
     pub keep_alive: Option<String>,
+    /// Anthropic `output_config.effort`; desktop snapshots preserve the
+    /// currently selected UI effort without consulting mutable state later.
+    pub effort: Option<String>,
     pub verbose: bool,
     /// Opt-in for attaching prompt-referenced image files on OpenAI-compat
     /// targets (native Ollama targets auto-detect the model's vision
@@ -58,12 +74,21 @@ pub struct ChatOptions {
     /// collects, rather than threading a separate parameter through
     /// `chat_setup`/`chat_loop`/`repl::run`.
     pub verify: bool,
+    /// `None` keeps the CLI's historical one-round default. Desktop daemon
+    /// snapshots always set the exact 0..=3 UI value.
+    pub verify_max_rounds: Option<u32>,
     /// `--subagents` — offers the `task` tool this turn (explore-profile
     /// only; see `tools_def::task_tool_def`/`agent.rs`'s `"task"` arm).
     /// Mirrors the desktop app's `subagentsEnabled` setting: off by default,
     /// same "a weak local model should never even see the schema unless
     /// asked for" posture (docs/roadmap/p3-subagents.md).
     pub subagents: bool,
+    /// `None` keeps ordinary CLI behavior (remember offered). Desktop daemon
+    /// snapshots set the exact memoryEnabled toggle.
+    pub memory_enabled: Option<bool>,
+    /// Suppress assistant text on stdout. `task run --json` uses this so its
+    /// stdout is exactly one JSON document; agent status still goes to stderr.
+    pub quiet: bool,
 }
 
 /// Parses a `--format` value: `json`, an inline JSON schema, or `@path` to a
@@ -78,8 +103,9 @@ pub fn parse_format_flag(raw: &str) -> Result<serde_json::Value, String> {
     } else {
         raw.to_string()
     };
-    serde_json::from_str(&text)
-        .map_err(|e| format!("Invalid --format value (expected 'json', an inline JSON schema, or @file): {e}"))
+    serde_json::from_str(&text).map_err(|e| {
+        format!("Invalid --format value (expected 'json', an inline JSON schema, or @file): {e}")
+    })
 }
 
 /// Parses a `--think` value: the bare flag means `true`, otherwise an
@@ -132,7 +158,12 @@ fn is_image_path(candidate: &str) -> bool {
     let ext_matches = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp"))
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp"
+            )
+        })
         .unwrap_or(false);
     ext_matches && path.is_file()
 }
@@ -142,13 +173,20 @@ fn is_image_path(candidate: &str) -> bool {
 pub fn encode_image(path: &Path) -> Result<(String, &'static str), String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("Failed to read image '{}': {e}", path.display()))?;
-    let mime = match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref()
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
     {
         Some("png") => "image/png",
         Some("webp") => "image/webp",
         _ => "image/jpeg",
     };
-    Ok((base64::engine::general_purpose::STANDARD.encode(bytes), mime))
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        mime,
+    ))
 }
 
 pub struct TurnUsage {
@@ -168,6 +206,8 @@ pub struct TurnResult {
     pub elapsed_secs: f64,
 }
 
+type DeltaObserver<'a> = &'a mut dyn FnMut(&str) -> Result<(), String>;
+
 /// Streams one turn, printing assistant text to stdout as it arrives (so the
 /// CLI "feels" like it's typing, same as the GUI's streamed bubble) and
 /// collecting any requested tool calls to return once the stream ends.
@@ -178,14 +218,37 @@ pub async fn stream_turn(
     tools: &[serde_json::Value],
     options: &ChatOptions,
 ) -> Result<TurnResult, String> {
+    stream_turn_observed(client, target, messages, tools, options, None).await
+}
+
+/// Same transport as [`stream_turn`], with an optional synchronous observer
+/// invoked at every decoded assistant delta before more model bytes are
+/// consumed. The daemon task supplies a durable-ledger observer so chat UI
+/// streaming survives process/WebView restarts without scraping stdout.
+pub async fn stream_turn_observed(
+    client: &reqwest::Client,
+    target: &Target,
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    options: &ChatOptions,
+    mut observer: Option<DeltaObserver<'_>>,
+) -> Result<TurnResult, String> {
     let started = std::time::Instant::now();
-    if let Target::Local { model, native_ollama: true, .. } = target {
+    if let Target::Local {
+        model,
+        native_ollama: true,
+        ..
+    } = target
+    {
         let model = model.clone().unwrap_or_default();
-        return stream_turn_native(client, &model, messages, tools, options, started).await;
+        return stream_turn_native(client, &model, messages, tools, options, started, observer)
+            .await;
     }
 
     let request = match target {
-        Target::Local { base_url, model, .. } => {
+        Target::Local {
+            base_url, model, ..
+        } => {
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
             let mut body = serde_json::json!({
                 "messages": messages,
@@ -221,9 +284,11 @@ pub async fn stream_turn(
             if !matches!(provider_id.as_str(), "anthropic" | "gemini") {
                 body["stream_options"] = serde_json::json!({ "include_usage": true });
             }
-            apply_openai_options(&mut body, options);
-            let mut request =
-                client.post(format!("{base_url}/chat/completions")).bearer_auth(&api_key).json(&body);
+            apply_provider_options(&mut body, provider_id, options)?;
+            let mut request = client
+                .post(format!("{base_url}/chat/completions"))
+                .bearer_auth(&api_key)
+                .json(&body);
             if provider_id == "anthropic" {
                 request = request
                     .header("x-api-key", &api_key)
@@ -233,13 +298,20 @@ pub async fn stream_turn(
         }
     };
 
-    let response = request.send().await.map_err(|e| format!("Request failed: {e}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
         return Err(format!(
             "Request failed ({status}){}",
-            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
         ));
     }
 
@@ -255,20 +327,47 @@ pub async fn stream_turn(
         let text = acc.push(&chunk);
         if !text.is_empty() {
             for event in parser.feed(&text) {
-                apply_event(event, &mut content, &mut tool_calls, &mut usage);
+                apply_event(
+                    event,
+                    &mut content,
+                    &mut tool_calls,
+                    &mut usage,
+                    options.quiet,
+                    &mut observer,
+                )?;
             }
         }
     }
     if let Some(tail) = acc.finish() {
         for event in parser.feed(&tail) {
-            apply_event(event, &mut content, &mut tool_calls, &mut usage);
+            apply_event(
+                event,
+                &mut content,
+                &mut tool_calls,
+                &mut usage,
+                options.quiet,
+                &mut observer,
+            )?;
         }
     }
     for event in parser.flush() {
-        apply_event(event, &mut content, &mut tool_calls, &mut usage);
+        apply_event(
+            event,
+            &mut content,
+            &mut tool_calls,
+            &mut usage,
+            options.quiet,
+            &mut observer,
+        )?;
     }
 
-    Ok(TurnResult { content, tool_calls, usage, metrics: None, elapsed_secs: started.elapsed().as_secs_f64() })
+    Ok(TurnResult {
+        content,
+        tool_calls,
+        usage,
+        metrics: None,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+    })
 }
 
 /// The native `/api/chat` turn: an NDJSON stream with options/think/format/
@@ -283,6 +382,7 @@ async fn stream_turn_native(
     tools: &[serde_json::Value],
     options: &ChatOptions,
     started: std::time::Instant,
+    mut observer: Option<DeltaObserver<'_>>,
 ) -> Result<TurnResult, String> {
     let mut opts = serde_json::Map::new();
     if let Some(temperature) = options.temperature {
@@ -307,7 +407,11 @@ async fn stream_turn_native(
     let req = NativeChatReq {
         model: model.to_string(),
         messages: messages.to_vec(),
-        tools: if tools.is_empty() { None } else { Some(serde_json::Value::Array(tools.to_vec())) },
+        tools: if tools.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Array(tools.to_vec()))
+        },
         stream: true,
         options: if opts.is_empty() { None } else { Some(opts) },
         keep_alive: options.keep_alive.as_deref().map(keep_alive_value),
@@ -328,52 +432,69 @@ async fn stream_turn_native(
     let mut suppress: Option<bool> = None;
     let mut pending = String::new();
 
-    ollama_api::chat_stream(client, &req, |event| match event {
-        ChatEvent::Thinking(text) => {
-            if !options.hide_thinking {
-                if !thinking_open {
-                    println!("Thinking...");
-                    thinking_open = true;
-                }
-                print!("{text}");
-                std::io::stdout().flush().ok();
-            }
-        }
-        ChatEvent::Content(text) => {
-            if thinking_open {
-                print!("\n...done thinking.\n\n");
-                thinking_open = false;
-            }
-            content.push_str(&text);
-            match suppress {
-                Some(false) => {
+    ollama_api::chat_stream(client, &req, |event| {
+        match event {
+            ChatEvent::Thinking(text) => {
+                if !options.hide_thinking && !options.quiet {
+                    if !thinking_open {
+                        println!("Thinking...");
+                        thinking_open = true;
+                    }
                     print!("{text}");
                     std::io::stdout().flush().ok();
                 }
-                Some(true) => {}
-                None => {
-                    pending.push_str(&text);
-                    let seen = pending.trim_start();
-                    let candidate = ["<tool_call>", "<function="]
-                        .iter()
-                        .any(|p| p.starts_with(seen) || seen.starts_with(p));
-                    if !candidate {
-                        suppress = Some(false);
-                        print!("{pending}");
-                        std::io::stdout().flush().ok();
-                        pending.clear();
-                    } else if ["<tool_call>", "<function="].iter().any(|p| seen.starts_with(p)) {
-                        suppress = Some(true);
-                        pending.clear();
+            }
+            ChatEvent::Content(text) => {
+                if let Some(callback) = observer.as_deref_mut() {
+                    callback(&text)?;
+                }
+                if thinking_open {
+                    print!("\n...done thinking.\n\n");
+                    thinking_open = false;
+                }
+                content.push_str(&text);
+                match suppress {
+                    Some(false) => {
+                        if !options.quiet {
+                            print!("{text}");
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    Some(true) => {}
+                    None => {
+                        pending.push_str(&text);
+                        let seen = pending.trim_start();
+                        let candidate = ["<tool_call>", "<function="]
+                            .iter()
+                            .any(|p| p.starts_with(seen) || seen.starts_with(p));
+                        if !candidate {
+                            suppress = Some(false);
+                            if !options.quiet {
+                                print!("{pending}");
+                                std::io::stdout().flush().ok();
+                            }
+                            pending.clear();
+                        } else if ["<tool_call>", "<function="]
+                            .iter()
+                            .any(|p| seen.starts_with(p))
+                        {
+                            suppress = Some(true);
+                            pending.clear();
+                        }
                     }
                 }
             }
+            ChatEvent::ToolCall(call) => {
+                let id = format!("call_{}", tool_calls.len() + 1);
+                tool_calls.push(ToolCallEvent {
+                    id,
+                    name: call.name,
+                    arguments: call.arguments.to_string(),
+                });
+            }
+            ChatEvent::Done(m) => metrics = Some(m),
         }
-        ChatEvent::ToolCall(call) => {
-            let id = format!("call_{}", tool_calls.len() + 1);
-            tool_calls.push(ToolCallEvent { id, name: call.name, arguments: call.arguments.to_string() });
-        }
-        ChatEvent::Done(m) => metrics = Some(m),
+        Ok(())
     })
     .await?;
     if thinking_open {
@@ -390,7 +511,11 @@ async fn stream_turn_native(
         return Err(format!(
             "chat stream for '{model}' ended without completing{} — the model runner likely \
              failed mid-turn (check the Ollama server log, e.g. out of memory)",
-            if content.is_empty() { " (no output)" } else { "" }
+            if content.is_empty() {
+                " (no output)"
+            } else {
+                ""
+            }
         ));
     }
 
@@ -405,12 +530,16 @@ async fn stream_turn_native(
         if let Some(leaked) = parse_leaked_tool_calls(&content) {
             for call in leaked {
                 let id = format!("call_{}", tool_calls.len() + 1);
-                tool_calls.push(ToolCallEvent { id, name: call.name, arguments: call.arguments.to_string() });
+                tool_calls.push(ToolCallEvent {
+                    id,
+                    name: call.name,
+                    arguments: call.arguments.to_string(),
+                });
             }
             content.clear();
         }
     }
-    if !content.is_empty() && suppress != Some(false) {
+    if !options.quiet && !content.is_empty() && suppress != Some(false) {
         // Undecided (reply shorter than the marker) or suppressed-but-not-
         // parseable: print what was withheld.
         print!("{content}");
@@ -420,9 +549,19 @@ async fn stream_turn_native(
     let usage = metrics.as_ref().map(|m| {
         let prompt_tokens = m.prompt_eval_count.unwrap_or(0);
         let completion_tokens = m.eval_count.unwrap_or(0);
-        TurnUsage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens }
+        TurnUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }
     });
-    Ok(TurnResult { content, tool_calls, usage, metrics, elapsed_secs: started.elapsed().as_secs_f64() })
+    Ok(TurnResult {
+        content,
+        tool_calls,
+        usage,
+        metrics,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+    })
 }
 
 /// Parses a reply that is exactly a raw qwen3-coder-style tool-call block —
@@ -475,7 +614,10 @@ fn parse_leaked_tool_calls(content: &str) -> Option<Vec<ollama_api::NativeToolCa
             // that framing, preserving interior/intentional whitespace.
             value = value.strip_prefix('\n').unwrap_or(value);
             value = value.strip_suffix('\n').unwrap_or(value);
-            arguments.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+            arguments.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
             body = &value_and_rest[value_end + "</parameter>".len()..];
         }
         if name.is_empty() {
@@ -526,6 +668,23 @@ fn apply_openai_options(body: &mut serde_json::Value, options: &ChatOptions) {
     }
 }
 
+fn apply_provider_options(
+    body: &mut serde_json::Value,
+    provider_id: &str,
+    options: &ChatOptions,
+) -> Result<(), String> {
+    apply_openai_options(body, options);
+    if provider_id == "anthropic" {
+        if let Some(effort) = options.effort.as_deref() {
+            if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+                return Err(format!("Unknown Anthropic effort level '{effort}'"));
+            }
+            body["output_config"] = serde_json::json!({ "effort": effort });
+        }
+    }
+    Ok(())
+}
+
 /// Prints `ollama run --verbose`'s post-response metrics block to stderr.
 pub fn print_verbose_metrics(metrics: &ChatMetrics) {
     let rate = |count: Option<u64>, ns: Option<u64>| {
@@ -537,14 +696,38 @@ pub fn print_verbose_metrics(metrics: &ChatMetrics) {
         }
     };
     eprintln!();
-    eprintln!("total duration:       {}", fmt_duration_ns(metrics.total_duration.unwrap_or(0)));
-    eprintln!("load duration:        {}", fmt_duration_ns(metrics.load_duration.unwrap_or(0)));
-    eprintln!("prompt eval count:    {} token(s)", metrics.prompt_eval_count.unwrap_or(0));
-    eprintln!("prompt eval duration: {}", fmt_duration_ns(metrics.prompt_eval_duration.unwrap_or(0)));
-    eprintln!("prompt eval rate:     {}", rate(metrics.prompt_eval_count, metrics.prompt_eval_duration));
-    eprintln!("eval count:           {} token(s)", metrics.eval_count.unwrap_or(0));
-    eprintln!("eval duration:        {}", fmt_duration_ns(metrics.eval_duration.unwrap_or(0)));
-    eprintln!("eval rate:            {}", rate(metrics.eval_count, metrics.eval_duration));
+    eprintln!(
+        "total duration:       {}",
+        fmt_duration_ns(metrics.total_duration.unwrap_or(0))
+    );
+    eprintln!(
+        "load duration:        {}",
+        fmt_duration_ns(metrics.load_duration.unwrap_or(0))
+    );
+    eprintln!(
+        "prompt eval count:    {} token(s)",
+        metrics.prompt_eval_count.unwrap_or(0)
+    );
+    eprintln!(
+        "prompt eval duration: {}",
+        fmt_duration_ns(metrics.prompt_eval_duration.unwrap_or(0))
+    );
+    eprintln!(
+        "prompt eval rate:     {}",
+        rate(metrics.prompt_eval_count, metrics.prompt_eval_duration)
+    );
+    eprintln!(
+        "eval count:           {} token(s)",
+        metrics.eval_count.unwrap_or(0)
+    );
+    eprintln!(
+        "eval duration:        {}",
+        fmt_duration_ns(metrics.eval_duration.unwrap_or(0))
+    );
+    eprintln!(
+        "eval rate:            {}",
+        rate(metrics.eval_count, metrics.eval_duration)
+    );
 }
 
 /// Humanizes a nanosecond duration, roughly like Go's `Duration.String()`.
@@ -568,18 +751,34 @@ fn apply_event(
     content: &mut String,
     tool_calls: &mut Vec<ToolCallEvent>,
     usage: &mut Option<TurnUsage>,
-) {
+    quiet: bool,
+    observer: &mut Option<DeltaObserver<'_>>,
+) -> Result<(), String> {
     match event {
         StreamEvent::Delta(text) => {
-            print!("{text}");
-            std::io::stdout().flush().ok();
+            if let Some(callback) = observer.as_deref_mut() {
+                callback(&text)?;
+            }
+            if !quiet {
+                print!("{text}");
+                std::io::stdout().flush().ok();
+            }
             content.push_str(&text);
         }
         StreamEvent::ToolCall(call) => tool_calls.push(call),
-        StreamEvent::Usage { prompt_tokens, completion_tokens, total_tokens } => {
-            *usage = Some(TurnUsage { prompt_tokens, completion_tokens, total_tokens });
+        StreamEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => {
+            *usage = Some(TurnUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            });
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -587,10 +786,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_format_flag_forms() {
-        assert_eq!(parse_format_flag("json").unwrap(), serde_json::json!("json"));
+    fn delta_observer_receives_decoded_text_before_accumulation() {
+        let mut observed = String::new();
+        let mut observer = |text: &str| -> Result<(), String> {
+            observed.push_str(text);
+            Ok(())
+        };
+        let mut observer: Option<DeltaObserver<'_>> = Some(&mut observer);
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        apply_event(
+            StreamEvent::Delta("live".to_string()),
+            &mut content,
+            &mut calls,
+            &mut usage,
+            true,
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(observed, "live");
+        assert_eq!(content, "live");
+    }
 
-        let schema = parse_format_flag(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#).unwrap();
+    #[test]
+    fn parse_format_flag_forms() {
+        assert_eq!(
+            parse_format_flag("json").unwrap(),
+            serde_json::json!("json")
+        );
+
+        let schema =
+            parse_format_flag(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#).unwrap();
         assert_eq!(schema["type"], "object");
 
         let dir = std::env::temp_dir().join("monkey_cli_chat_test_format");
@@ -660,7 +887,10 @@ mod tests {
         assert_eq!(body["seed"], 7);
         assert_eq!(body["stop"], serde_json::json!(["END"]));
         assert_eq!(body["max_tokens"], 128);
-        assert_eq!(body["response_format"], serde_json::json!({ "type": "json_object" }));
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({ "type": "json_object" })
+        );
 
         // A schema becomes response_format json_schema; nothing set adds nothing.
         let schema_options = ChatOptions {
@@ -670,11 +900,59 @@ mod tests {
         let mut body = serde_json::json!({ "stream": true });
         apply_openai_options(&mut body, &schema_options);
         assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["schema"]["type"], "object");
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
 
         let mut body = serde_json::json!({ "stream": true });
         apply_openai_options(&mut body, &ChatOptions::default());
         assert_eq!(body, serde_json::json!({ "stream": true }));
+    }
+
+    #[test]
+    fn provider_options_preserve_frozen_anthropic_effort_only_for_anthropic() {
+        let options = ChatOptions {
+            effort: Some("xhigh".to_string()),
+            ..Default::default()
+        };
+        let mut anthropic = serde_json::json!({});
+        apply_provider_options(&mut anthropic, "anthropic", &options).unwrap();
+        assert_eq!(anthropic["output_config"]["effort"], "xhigh");
+
+        let mut openai = serde_json::json!({});
+        apply_provider_options(&mut openai, "openai", &options).unwrap();
+        assert!(openai.get("output_config").is_none());
+
+        let invalid = ChatOptions {
+            effort: Some("impossible".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            apply_provider_options(&mut serde_json::json!({}), "anthropic", &invalid)
+                .unwrap_err()
+                .contains("Unknown Anthropic effort")
+        );
+    }
+
+    #[test]
+    fn quiet_stream_events_still_accumulate_model_content() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = None;
+        let mut observer = None;
+        apply_event(
+            StreamEvent::Delta("hello".to_string()),
+            &mut content,
+            &mut tool_calls,
+            &mut usage,
+            true,
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(content, "hello");
+        assert!(tool_calls.is_empty());
+        assert!(usage.is_none());
     }
 
     #[test]

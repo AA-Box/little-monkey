@@ -19,3 +19,6 @@ export type { AttachMenuProps } from "./AttachMenu";
 export { default as AttachmentChip } from "./AttachmentChip";
 export type { AttachmentChipProps } from "./AttachmentChip";
 export { default as ChatSessionList } from "./ChatSessionList";
+export { default as CompareView } from "./CompareView";
+export { default as CrewView } from "./CrewView";
+export { default as CrewPicker } from "./CrewPicker";

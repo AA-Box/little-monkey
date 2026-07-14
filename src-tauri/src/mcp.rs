@@ -38,7 +38,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientRequest, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+    ClientRequest, ServerResult,
 };
 use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::RoleClient;
@@ -155,7 +156,11 @@ pub struct McpConfigFile {
 /// ever sees its own generated UUIDs) since server ids are user-chosen
 /// slugs, e.g. "my_server".
 fn validate_id(id: &str) -> Result<(), String> {
-    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         Ok(())
     } else {
         Err(format!(
@@ -180,7 +185,9 @@ fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// never an error.
 pub fn load_config_impl(path: &Path) -> Result<McpConfigFile, String> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt mcp_servers.json: {}", e)),
+        Ok(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("Corrupt mcp_servers.json: {}", e))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(McpConfigFile::default()),
         Err(e) => Err(format!("Failed to read mcp_servers.json: {}", e)),
     }
@@ -193,8 +200,10 @@ pub fn save_config_impl(path: &Path, config: &McpConfigFile) -> Result<(), Strin
     let payload = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize mcp_servers.json: {}", e))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize mcp_servers.json: {}", e))?;
+    std::fs::write(&tmp, &payload)
+        .map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("Failed to finalize mcp_servers.json: {}", e))?;
     Ok(())
 }
 
@@ -224,7 +233,10 @@ pub fn add_server_impl(path: &Path, entry: McpServerEntry) -> Result<McpServerEn
 
     let mut config = load_config_impl(path)?;
     if config.servers.iter().any(|s| s.id == entry.id) {
-        return Err(format!("An MCP server with id '{}' already exists", entry.id));
+        return Err(format!(
+            "An MCP server with id '{}' already exists",
+            entry.id
+        ));
     }
 
     config.version = SCHEMA_VERSION;
@@ -338,7 +350,10 @@ pub async fn connect_impl(
     let service = match &entry.transport {
         McpTransport::Stdio { command, args, env } => {
             if command.trim().is_empty() {
-                return Err(format!("MCP server '{}' has no command configured", entry.id));
+                return Err(format!(
+                    "MCP server '{}' has no command configured",
+                    entry.id
+                ));
             }
 
             let mut command_builder = tokio::process::Command::new(command);
@@ -384,7 +399,9 @@ pub async fn connect_impl(
         .map(cache_tool)
         .collect();
 
-    let instructions = service.peer_info().and_then(|info| info.instructions.clone());
+    let instructions = service
+        .peer_info()
+        .and_then(|info| info.instructions.clone());
 
     let connection = McpConnection {
         service,
@@ -495,7 +512,12 @@ async fn resolve_call_tool(
     let arguments_obj = match arguments {
         serde_json::Value::Object(map) => Some(map),
         serde_json::Value::Null => None,
-        other => return Err(format!("MCP tool arguments must be a JSON object, got: {}", other)),
+        other => {
+            return Err(format!(
+                "MCP tool arguments must be a JSON object, got: {}",
+                other
+            ))
+        }
     };
 
     let mut params = CallToolRequestParams::new(tool_name.to_string());
@@ -545,7 +567,12 @@ pub async fn call_tool_with_cancel_impl(
             PeerRequestOptions::no_options(),
         )
         .await
-        .map_err(|e| format!("MCP tool call to '{}' on '{}' failed: {}", tool_name, entry.id, e))?;
+        .map_err(|e| {
+            format!(
+                "MCP tool call to '{}' on '{}' failed: {}",
+                tool_name, entry.id, e
+            )
+        })?;
 
     // Captured before `handle` is moved into `handle.await_response()` below
     // — everything `notify_cancelled` needs to tell the server to stop this
@@ -762,7 +789,11 @@ pub fn mcp_update_server(
 /// Deliberately doesn't disconnect the live connection or clear the keychain
 /// token itself — those need an `AppState`/`await` and an `AppHandle`
 /// respectively, so stay in the `#[tauri::command]` wrapper.
-fn remove_server_with_state_impl(state: &AppState, path: &Path, server_id: &str) -> Result<(), String> {
+fn remove_server_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    server_id: &str,
+) -> Result<(), String> {
     let _guard = state
         .mcp_config_lock
         .lock()
@@ -956,7 +987,10 @@ pub async fn mcp_list_tools(
                 .collect(),
             None => connection.tools.clone(),
         };
-        out.push(McpServerTools { server_id: entry.id.clone(), tools });
+        out.push(McpServerTools {
+            server_id: entry.id.clone(),
+            tools,
+        });
     }
     Ok(out)
 }
@@ -979,6 +1013,7 @@ pub async fn mcp_call_tool(
     tool_name: String,
     arguments: serde_json::Value,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<CallToolResult, String> {
     validate_id(&server_id)?;
 
@@ -1004,6 +1039,7 @@ pub async fn mcp_call_tool(
         &format!("mcp:{}:{}", server_id, tool_name),
         detail,
         turn_id.as_deref(),
+        tool_call_id.as_deref(),
         None,
         None,
     )
@@ -1037,7 +1073,9 @@ pub async fn mcp_call_tool(
         }
     };
 
-    let outcome = call_tool_with_cancel_impl(state.inner(), &entry, &tool_name, arguments, cancel_reason).await;
+    let outcome =
+        call_tool_with_cancel_impl(state.inner(), &entry, &tool_name, arguments, cancel_reason)
+            .await;
 
     // Drop this turn's cancel channel once no other MCP/shell call for the
     // same turn still holds it — same bookkeeping as `tool_run_shell`.
@@ -1046,7 +1084,10 @@ pub async fn mcp_call_tool(
             .tool_cancel
             .lock()
             .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -1106,7 +1147,10 @@ mod tests {
 
         add_server_impl(&path, entry.clone()).unwrap();
 
-        assert!(!path.with_extension("json.tmp").exists(), "temp file must not linger");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must not linger"
+        );
         let reloaded = load_config_impl(&path).unwrap();
         assert_eq!(reloaded.servers.len(), 1);
         assert_eq!(reloaded.servers[0], entry);
@@ -1125,7 +1169,10 @@ mod tests {
     fn add_rejects_invalid_id() {
         let path = temp_path("badid.json");
         let err = add_server_impl(&path, stdio_entry("bad id!", "echo", &[])).unwrap_err();
-        assert!(err.contains("Invalid MCP server id"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid MCP server id"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1158,7 +1205,10 @@ mod tests {
     fn update_errors_for_unknown_id() {
         let path = temp_path("update_missing.json");
         let err = update_server_impl(&path, stdio_entry("ghost", "echo", &[])).unwrap_err();
-        assert!(err.contains("Unknown MCP server"), "unexpected error: {err}");
+        assert!(
+            err.contains("Unknown MCP server"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1198,7 +1248,10 @@ mod tests {
     fn set_enabled_errors_for_unknown_id() {
         let path = temp_path("enable_missing.json");
         let err = set_enabled_impl(&path, "ghost", true).unwrap_err();
-        assert!(err.contains("Unknown MCP server"), "unexpected error: {err}");
+        assert!(
+            err.contains("Unknown MCP server"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1224,7 +1277,9 @@ mod tests {
         let entry = McpServerEntry {
             id: "http-srv".to_string(),
             label: "HTTP server".to_string(),
-            transport: McpTransport::Http { url: "   ".to_string() },
+            transport: McpTransport::Http {
+                url: "   ".to_string(),
+            },
             enabled: true,
             tool_allowlist: None,
             timeout_secs: None,
@@ -1291,14 +1346,22 @@ mod tests {
                 let path = &path;
                 let state = &state;
                 scope.spawn(move || {
-                    add_server_with_state_impl(state, path, stdio_entry(&format!("concurrent-{i}"), "echo", &[]))
-                        .unwrap();
+                    add_server_with_state_impl(
+                        state,
+                        path,
+                        stdio_entry(&format!("concurrent-{i}"), "echo", &[]),
+                    )
+                    .unwrap();
                 });
             }
         });
 
         let config = load_config_impl(&path).unwrap();
-        assert_eq!(config.servers.len(), 8, "a concurrent mcp_add_server call's entry was lost");
+        assert_eq!(
+            config.servers.len(),
+            8,
+            "a concurrent mcp_add_server call's entry was lost"
+        );
     }
 
     #[test]
@@ -1307,12 +1370,22 @@ mod tests {
         let state = AppState::default();
 
         add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v1"])).unwrap();
-        state.permissions.session_allow.lock().unwrap().insert("mcp:docs:search".to_string());
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("mcp:docs:search".to_string());
 
         update_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v2"])).unwrap();
 
         assert!(
-            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            !state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("mcp:docs:search"),
             "a grant approved against the old transport must not survive an update"
         );
     }
@@ -1323,19 +1396,39 @@ mod tests {
         let state = AppState::default();
 
         add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &[])).unwrap();
-        state.permissions.session_allow.lock().unwrap().insert("mcp:docs:search".to_string());
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("mcp:docs:search".to_string());
 
         remove_server_with_state_impl(&state, &path, "docs").unwrap();
         assert!(
-            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            !state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("mcp:docs:search"),
             "removing a server must revoke its grants"
         );
 
         // Reuse the id for a genuinely different server — a leftover grant
         // must never silently apply to it.
-        add_server_with_state_impl(&state, &path, stdio_entry("docs", "curl", &["https://evil.example"])).unwrap();
+        add_server_with_state_impl(
+            &state,
+            &path,
+            stdio_entry("docs", "curl", &["https://evil.example"]),
+        )
+        .unwrap();
         assert!(
-            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            !state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("mcp:docs:search"),
             "an id reused by a different server must not inherit the old server's grants"
         );
     }

@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { SseEventParser, textContent, type StreamEvent } from './llamaClient';
+import { SseEventParser, streamChat, textContent, type StreamEvent } from './llamaClient';
 
 function collect(parser: SseEventParser, chunks: string[]): StreamEvent[] {
   const events: StreamEvent[] = [];
@@ -88,5 +88,55 @@ describe('SseEventParser', () => {
   it('skips malformed payloads without crashing', () => {
     const events = collect(new SseEventParser(), ['data: {not json}\n', dataLine({ choices: [{ delta: { content: 'ok' } }] })]);
     expect(events).toEqual([{ type: 'delta', content: 'ok' }]);
+  });
+});
+
+describe('streamChat request shape', () => {
+  it('omits tools and tool_choice entirely for a no-tools request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('data: [DONE]\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    );
+
+    for await (const _event of streamChat('http://127.0.0.1:11434', [], [], 'model')) {
+      // Drain the stream.
+    }
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('tools');
+    expect(body).not.toHaveProperty('tool_choice');
+    fetchMock.mockRestore();
+  });
+
+  it('includes auto tool choice when at least one tool is offered', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('data: [DONE]\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    );
+    const tools = [{ type: 'function' as const, function: { name: 'read_file', description: 'Read', parameters: {} } }];
+
+    for await (const _event of streamChat('http://127.0.0.1:11434', [], tools, 'model')) {
+      // Drain the stream.
+    }
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.tools).toEqual(tools);
+    expect(body.tool_choice).toBe('auto');
+    fetchMock.mockRestore();
+  });
+
+  it('sends an explicit max_tokens ceiling when a bounded caller supplies one', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('data: [DONE]\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    );
+
+    for await (const _event of streamChat('http://127.0.0.1:11434', [], [], 'model', undefined, 2048)) {
+      // Drain the stream.
+    }
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.max_tokens).toBe(2048);
+    fetchMock.mockRestore();
   });
 });
