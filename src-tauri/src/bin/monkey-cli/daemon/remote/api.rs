@@ -1130,7 +1130,7 @@ mod tests {
         );
         let first = api.handle(valid.clone(), 2_001);
         let replay = api.handle(valid, 2_002);
-        assert_eq!(first.status, 200);
+        assert_eq!(first.status, 200, "body: {:?}", first.body);
         assert_eq!(first, replay);
         let approval = RunLedger::open(&DaemonPaths::under(&root).ledger_db)
             .unwrap()
