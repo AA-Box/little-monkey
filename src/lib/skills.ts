@@ -21,6 +21,16 @@ export interface SlashSkill {
   contentSha256: string;
   bundleSha256?: string;
   permissions: PackagePermission[];
+  /** Tool names this skill restricts the model to while active — only ever
+   * populated for `source: "native"` (ecosystem `SKILL.md`) skills, which
+   * are the only ones with an `allowed-tools` frontmatter concept. Empty or
+   * absent means unrestricted. */
+  allowedTools?: string[];
+  /** Bundled file paths (relative to the skill folder, excluding `SKILL.md`)
+   * readable on demand via the `read_skill_resource` tool — progressive
+   * disclosure, so their contents are never loaded until asked for. Only
+   * ever populated for `source: "native"` skills. */
+  resourceFiles?: string[];
 }
 
 export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkillDescriptor[]): SlashSkill[] {
@@ -36,6 +46,8 @@ export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkill
       version: entry.version,
       contentSha256: entry.sha256,
       permissions: [],
+      allowedTools: entry.allowed_tools,
+      resourceFiles: entry.resource_files,
     }));
 }
 
@@ -328,8 +340,14 @@ export function composeSkillSystemPrompt(
       `Frozen source: ${skill.source} ${skill.id} version ${skill.version} hash ${skill.contentSha256}`,
       ...(skill.bundleSha256 ? [`Frozen package bundle hash: ${skill.bundleSha256}`] : []),
       `Declared permissions: ${permissions}`,
+      ...(skill.allowedTools && skill.allowedTools.length > 0
+        ? [`Allowed tools while active: ${skill.allowedTools.join(", ")}`]
+        : []),
       "Instructions:",
       skill.instructions,
+      ...(skill.resourceFiles && skill.resourceFiles.length > 0
+        ? [`Bundled files (read via read_skill_resource): ${skill.resourceFiles.join(", ")}`]
+        : []),
       "Arguments/request:",
       args || "(none)",
     ].join("\n");
@@ -352,4 +370,57 @@ export function composeSkillSystemPrompt(
     );
   }
   return sections.join("\n\n");
+}
+
+/**
+ * Compact `name`+`description` catalog of every available skill NOT already
+ * invoked this turn — the auto-invocation counterpart to
+ * `composeSkillSystemPrompt` above: that function injects the FULL
+ * instructions for skills already invoked (explicitly, or via an
+ * always-on package rule); this one lists the rest by name only, so the
+ * model can choose to invoke one itself (via the `skill` tool — see
+ * `tools.ts`'s `SKILL_INVOKE_TOOL`) without every uninvoked skill's full
+ * instructions being loaded into every turn's context up front. Returns
+ * `""` when there's nothing left to list, so callers can `filter(Boolean)`
+ * it straight into a section list without a separate emptiness check.
+ */
+export function composeSkillCatalog(
+  availableSkills: SlashSkill[],
+  alreadyInvokedCommands: ReadonlySet<string>,
+): string {
+  const remaining = availableSkills.filter((skill) => !alreadyInvokedCommands.has(skill.command));
+  if (remaining.length === 0) return "";
+  return [
+    "## Available skills",
+    "Call the `skill` tool with one of these commands to invoke it when it matches the user's request — its full instructions are then returned as the tool result. Do not invoke a skill the request doesn't actually need.",
+    ...remaining.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name}`),
+  ].join("\n");
+}
+
+/**
+ * Formats a model-invoked (`skill` tool call) skill's instructions as the
+ * tool RESULT content — the auto-invocation counterpart to
+ * `composeSkillSystemPrompt`'s per-skill `block()` (see `turnEngine.ts`'s
+ * `executeToolCall`, the `name === 'skill'` branch that calls this). Kept as
+ * its own small function rather than sharing `block()` directly: that
+ * closure is local to `composeSkillSystemPrompt` and formats a whole
+ * system-prompt SECTION (with a `###` header and "never bypass..." framing
+ * appropriate to a few-times-per-turn injected block), whereas this formats
+ * a single tool result the model reads once, right after asking for it — the
+ * shape is similar by design (same instructions/allowed-tools/resource-files
+ * fields) but the two are edited independently on purpose.
+ */
+export function formatSkillToolResult(skill: SlashSkill, argumentsText: string): string {
+  return [
+    `Skill: ${skill.name} (/${skill.command})`,
+    ...(skill.allowedTools && skill.allowedTools.length > 0
+      ? [`Allowed tools while active: ${skill.allowedTools.join(", ")}`]
+      : []),
+    "Instructions:",
+    skill.instructions,
+    ...(skill.resourceFiles && skill.resourceFiles.length > 0
+      ? [`Bundled files (read via read_skill_resource): ${skill.resourceFiles.join(", ")}`]
+      : []),
+    ...(argumentsText ? ["Arguments/request:", argumentsText] : []),
+  ].join("\n");
 }

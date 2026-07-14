@@ -541,6 +541,7 @@ pub fn run() {
             tools::tools_cancel_running,
             tools::list_workspace_paths,
             tools::tool_remember,
+            tools::tool_read_skill_resource,
             web::tool_web_fetch,
             web::tool_web_search,
             web::web_get_settings,

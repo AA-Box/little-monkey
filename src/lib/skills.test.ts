@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { ActivePluginRuntimeSnapshot } from "./ecosystemClient";
+import type { NativeSkillDescriptor } from "./nativeSkillsClient";
 import {
   MAX_PACKAGE_RULES_PER_TURN,
+  composeSkillCatalog,
   composeSkillSystemPrompt,
+  nativeSkills,
   packageAssistantSkills,
   packageRuleInvocations,
   parseSkillTurn,
@@ -190,5 +193,75 @@ describe("skill slash invocation", () => {
     expect(prompt).toContain("## Explicitly invoked skills");
     expect(prompt).not.toContain("## Enabled package rules");
     expect(prompt).toContain("Do not change the saved chat persona");
+  });
+});
+
+function nativeDescriptor(overrides: Partial<NativeSkillDescriptor> = {}): NativeSkillDescriptor {
+  return {
+    name: "Review",
+    description: "Reviews a diff",
+    command: "review",
+    version: "1.0.0",
+    instructions: "Do review",
+    sha256: "a".repeat(64),
+    file_count: 1,
+    total_bytes: 10,
+    enabled: true,
+    eligibility: { eligible: true, current_os: "test", unsupported_os: false, missing_bins: [], missing_env: [] },
+    supported_os: [],
+    requirements: { bins: [], env: [] },
+    source: { kind: "global", path: "/skills/review" },
+    permissions: [],
+    git_repository: null,
+    allowed_tools: [],
+    resource_files: [],
+    ...overrides,
+  };
+}
+
+describe("allowed-tools and bundled resources", () => {
+  it("propagates allowed_tools and resource_files from the native descriptor", () => {
+    const [mapped] = nativeSkills([
+      nativeDescriptor({ allowed_tools: ["read_file", "grep"], resource_files: ["references/info.md"] }),
+    ]);
+    expect(mapped.allowedTools).toEqual(["read_file", "grep"]);
+    expect(mapped.resourceFiles).toEqual(["references/info.md"]);
+  });
+
+  it("lists allowed tools and bundled files in the composed system prompt", () => {
+    const restricted: SlashSkill = {
+      ...skill("review"),
+      allowedTools: ["read_file", "grep"],
+      resourceFiles: ["references/info.md"],
+    };
+    const parsed = parseSkillTurn("/review file.ts", [restricted])!;
+    const prompt = composeSkillSystemPrompt("BASE", parsed.invocations);
+    expect(prompt).toContain("Allowed tools while active: read_file, grep");
+    expect(prompt).toContain("Bundled files (read via read_skill_resource): references/info.md");
+  });
+});
+
+describe("composeSkillCatalog", () => {
+  it("lists every skill not already invoked this turn", () => {
+    const catalog = composeSkillCatalog([skill("review"), skill("verify")], new Set());
+    expect(catalog).toContain("## Available skills");
+    expect(catalog).toContain("- /review — review");
+    expect(catalog).toContain("- /verify — verify");
+  });
+
+  it("excludes skills already invoked this turn", () => {
+    const catalog = composeSkillCatalog([skill("review"), skill("verify")], new Set(["review"]));
+    expect(catalog).not.toContain("/review");
+    expect(catalog).toContain("/verify");
+  });
+
+  it("returns an empty string when nothing is left to list", () => {
+    expect(composeSkillCatalog([skill("review")], new Set(["review"]))).toBe("");
+    expect(composeSkillCatalog([], new Set())).toBe("");
+  });
+
+  it("prefers the skill's description, falling back to its name", () => {
+    const named: SlashSkill = { ...skill("review"), description: undefined, name: "Reviewer" };
+    expect(composeSkillCatalog([named], new Set())).toContain("- /review — Reviewer");
   });
 });

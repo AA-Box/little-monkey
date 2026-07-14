@@ -25,11 +25,13 @@ import {
   stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
+  type SkillToolContext,
   type SubagentContext,
 } from "./turnEngine";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
 import type { StreamEvent, ToolCall, ToolDef } from "./llamaClient";
+import type { SlashSkill } from "./skills";
 import { useUsageStore } from "../store/usageStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
@@ -413,6 +415,171 @@ describe("executeToolCall / task delegation", () => {
     const params = runSubagentTaskMock.mock.calls[0][0];
     expect(params.risk).toBeUndefined();
     expect(params.onMutatedPath).toBeUndefined();
+  });
+});
+
+// `skill` is a third frontend-only tool (see `tools.ts`'s `SKILL_INVOKE_TOOL`
+// doc comment) — same "invoke must never be called" invariant as
+// `present_plan`/`task` above, plus the auto-invocation-specific contract:
+// unknown/duplicate/over-cap commands are rejected with a tool error rather
+// than throwing, and a successful call both returns the skill's instructions
+// AND records the command in `invokedCommands` so a later call in the same
+// turn sees it as already-invoked.
+describe("executeToolCall / skill invocation", () => {
+  function fakeSkill(command: string, overrides: Partial<SlashSkill> = {}): SlashSkill {
+    return {
+      id: command,
+      source: "native",
+      command,
+      name: command,
+      description: `Handles ${command}`,
+      instructions: `Do ${command} carefully.`,
+      version: "1.0.0",
+      contentSha256: "a".repeat(64),
+      permissions: [],
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("never reaches invoke for a skill tool call", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review")],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(
+      call("skill", { command: "review" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(result).toContain("Do review carefully.");
+    expect(context.invokedCommands.has("review")).toBe(true);
+  });
+
+  it("includes allowed-tools and bundled-file listings in the result", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review", { allowedTools: ["read_file", "grep"], resourceFiles: ["references/info.md"] })],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(call("skill", { command: "review" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+
+    expect(result).toContain("Allowed tools while active: read_file, grep");
+    expect(result).toContain("Bundled files (read via read_skill_resource): references/info.md");
+  });
+
+  it("accepts a leading slash in the command argument", async () => {
+    const context: SkillToolContext = { availableSkills: [fakeSkill("review")], invokedCommands: new Set(), maxSkillsPerTurn: 5 };
+    const result = await executeToolCall(call("skill", { command: "/review" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(result).toContain("Do review carefully.");
+  });
+
+  it("returns a tool error without calling invoke when no skill context is configured", async () => {
+    const result = await executeToolCall(call("skill", { command: "review" }), null, "turn-1", emptyMcpRegistry);
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toHaveProperty("error");
+  });
+
+  it("rejects an unknown command", async () => {
+    const context: SkillToolContext = { availableSkills: [fakeSkill("review")], invokedCommands: new Set(), maxSkillsPerTurn: 5 };
+    const result = await executeToolCall(call("skill", { command: "does-not-exist" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(result).error).toMatch(/No enabled skill/);
+    expect(context.invokedCommands.size).toBe(0);
+  });
+
+  it("rejects a command already invoked this turn (explicit or previously model-invoked)", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review")],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(call("skill", { command: "review" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(result).error).toMatch(/already invoked/);
+  });
+
+  it("rejects once the per-turn skill cap is reached", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review"), fakeSkill("verify")],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 1,
+    };
+    const result = await executeToolCall(call("skill", { command: "verify" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(result).error).toMatch(/at most 1 skill/);
+  });
+});
+
+// `read_skill_resource` has a real `tool_read_skill_resource` Rust command
+// (unlike `skill` above), but its own tool description promises it "only
+// works for a skill that has already been invoked this turn" — these tests
+// pin that this is actually enforced here, before the generic `invoke`
+// dispatch, rather than just asserted in prose the model might not honor.
+describe("executeToolCall / read_skill_resource invocation gate", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("resource contents");
+  });
+
+  it("rejects when the named skill has not been invoked this turn", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [{ id: "review", source: "native", command: "review", name: "review", description: "d", instructions: "i", version: "1.0.0", contentSha256: "a".repeat(64), permissions: [] }],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(
+      call("read_skill_resource", { command: "review", path: "references/info.md" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result).error).toMatch(/has not been invoked this turn/);
+  });
+
+  it("allows the call once the skill was invoked (explicitly or via the skill tool) this turn", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [{ id: "review", source: "native", command: "review", name: "review", description: "d", instructions: "i", version: "1.0.0", contentSha256: "a".repeat(64), permissions: [] }],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(
+      call("read_skill_resource", { command: "review", path: "references/info.md" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context
+    );
+    expect(invokeMock).toHaveBeenCalledWith("tool_read_skill_resource", { command: "review", path: "references/info.md" });
+    expect(result).toBe("resource contents");
+  });
+
+  it("returns a tool error without calling invoke when no skill context is configured", async () => {
+    const result = await executeToolCall(call("read_skill_resource", { command: "review", path: "references/info.md" }), null, "turn-1", emptyMcpRegistry);
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toHaveProperty("error");
   });
 });
 

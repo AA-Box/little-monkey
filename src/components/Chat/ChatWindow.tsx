@@ -588,14 +588,18 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // The agent loop owns the turn's abort handle (keyed by session — see
     // stopTurn) and flips the per-session running flag `sending` above
     // subscribes to, so nothing pane-local tracks the turn.
-    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations)
+    // `availableSkills` (the same full list `prepareTurnInstructions` already
+    // draws `skillInvocations` from) lets the turn's `skill` tool auto-invoke
+    // any skill not already explicitly invoked above — see
+    // `settingsStore.skillAutoInvokeEnabled`.
+    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills)
       .catch((err: unknown) => {
         setError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
         textareaRef.current?.focus();
       });
-  }, [sessionId]);
+  }, [sessionId, availableSkills]);
 
   const appendCommandNotice = useCallback((command: BuiltInSlashCommandName, text: string, ok = true, targetSessionId = sessionId) => {
     useSessionStore.getState().addMessage(targetSessionId, {
