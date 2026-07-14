@@ -46,3 +46,8 @@ src-tauri/binaries/
 *.njsproj
 *.sln
 *.sw?
+
+# JetBrains extension build output
+extensions/little-monkey-jetbrains/.gradle
+extensions/little-monkey-jetbrains/.intellijPlatform
+extensions/little-monkey-jetbrains/build
