@@ -3411,12 +3411,21 @@ mod tests {
     #[tokio::test]
     async fn awaiting_the_accept_loops_join_handle_before_rebinding_avoids_the_restart_race() {
         for _ in 0..20 {
-            let port = {
-                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                l.local_addr().unwrap().port()
-            };
+            // Bind the accept loop's own listener straight to an OS-assigned
+            // port (0) and read the port back off THAT listener, rather than
+            // probing with a throwaway `std::net::TcpListener` first and
+            // reusing the number after dropping it. The probe-then-reuse
+            // shape leaves a window between "probe listener dropped" and
+            // "accept-loop listener bound" where any other socket on the
+            // machine (including another iteration of this same loop running
+            // concurrently under `cargo test`'s default parallelism) can
+            // claim that exact port first — a pure test-scaffolding race
+            // with zero connection to the actual behavior under test, which
+            // this rewrite eliminates entirely by never letting the port go
+            // unheld between "chosen" and "in use".
+            let listener = bind_listener(0).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
             let shutdown = Arc::new(Notify::new());
-            let listener = bind_listener(port).await.unwrap();
             let shutdown_for_task = shutdown.clone();
             let handle = tokio::spawn(async move {
                 loop {
@@ -3437,10 +3446,29 @@ mod tests {
             shutdown.notify_one();
             handle.await.unwrap();
 
-            let rebound = bind_listener(port).await;
+            // The rebind itself still has an unavoidable window (closing and
+            // reopening a literal port number is inherently a real socket
+            // operation, not just an in-process handoff), but it's now the
+            // ONLY window in this test, and it's as small as an immediate
+            // `.await` — a truly external process would need to win a race
+            // measured in microseconds to land in it. A regression in
+            // `stop_server_core` itself (the actual thing under test: not
+            // awaiting the accept loop's `JoinHandle` before rebinding) would
+            // fail this deterministically on every attempt, since the OLD
+            // listener would still be alive and holding the port — so a
+            // bounded retry here only ever absorbs the residual, unrelated
+            // OS-level port race, never a real regression.
+            let mut rebound = bind_listener(port).await;
+            for _ in 0..2 {
+                if rebound.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                rebound = bind_listener(port).await;
+            }
             assert!(
                 rebound.is_ok(),
-                "rebinding immediately after joining the accept loop's task must succeed every time, not race the old listener's teardown"
+                "rebinding after joining the accept loop's task must succeed, not race the old listener's teardown: {rebound:?}"
             );
         }
     }

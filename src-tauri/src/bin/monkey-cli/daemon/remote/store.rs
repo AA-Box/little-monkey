@@ -4,8 +4,8 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::protocol::{
-    random_token, sha256_hex, AuditEntry, ControllerProfile, PairAcceptResponse, RemoteScopes,
-    RotationBundle, REMOTE_PROTOCOL_VERSION,
+    random_token, random_token_id, sha256_hex, AuditEntry, ControllerProfile, PairAcceptResponse,
+    RemoteScopes, RotationBundle, REMOTE_PROTOCOL_VERSION,
 };
 
 const REMOTE_SCHEMA: &str = r#"
@@ -212,7 +212,12 @@ impl RemoteStore {
         secrets: &dyn RemoteSecretStore,
     ) -> Result<PairAcceptResponse, String> {
         validate_device_name(device_name)?;
-        let device_id = format!("device-{}", random_token(18)?);
+        // `random_token_id`, not `random_token`: this id is later reused as
+        // `ClientIdentity.client_id`/`instance_id` (see `control_recorder` in
+        // `daemon/remote/api.rs`), which `validate_protocol_id` requires to
+        // start and end with an ASCII letter or digit — a plain
+        // `random_token` can land `-`/`_` at either boundary.
+        let device_id = format!("device-{}", random_token_id(18)?);
         let secret = random_token(32)?;
         let secret_generation = 1u64;
         let slot = runner_secret_slot(&device_id, secret_generation);
