@@ -23,6 +23,7 @@ import { useModelStore } from '../store/modelStore';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
 import { runSubagentTask } from './subagent';
 import { protocolToolCallId } from './durableRun';
+import { formatSkillToolResult, type SlashSkill } from './skills';
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -323,6 +324,33 @@ export interface SubagentContext {
 }
 
 /**
+ * Everything `executeToolCall` needs to resolve a model-requested `skill`
+ * tool call (see `tools.ts`'s `SKILL_INVOKE_TOOL`) against the turn's own
+ * available skills — built once per turn by `agentLoop.ts`'s
+ * `runAgentTurnBody`, same "built once, passed down unchanged" shape as
+ * `RiskAnnotationContext`/`SubagentContext`, and passed through every
+ * `executeToolCall` call this turn.
+ */
+export interface SkillToolContext {
+  /** Every skill installed/enabled this turn — the same list
+   * `composeSkillCatalog` draws its "## Available skills" listing from. */
+  availableSkills: SlashSkill[];
+  /** Commands already invoked this turn — explicit `/command` invocations
+   * (present before the loop even starts) plus every command a previous
+   * `skill` tool call in THIS turn already resolved. Mutated in place (not
+   * replaced) so later iterations of the same turn see earlier model-invoked
+   * skills too, exactly like `mutatedFiles`/`onMutatedPath` in
+   * `agentLoop.ts`. A duplicate invocation of an already-present command is
+   * rejected with a tool error rather than silently re-returning the same
+   * instructions again. */
+  invokedCommands: Set<string>;
+  /** Hard cap on total skills (explicit + model-invoked) per turn — mirrors
+   * `skills.ts`'s `MAX_SKILLS_PER_TURN`, the same bound `parseSkillTurn`
+   * already enforces for stacked explicit invocations. */
+  maxSkillsPerTurn: number;
+}
+
+/**
  * Executes a single model-requested tool call via the corresponding
  * `tool_<name>` Tauri command (or, for an `mcp__`-namespaced name, via
  * `invokeMcpTool` above) and returns the string to use as the content of the
@@ -354,7 +382,16 @@ export async function executeToolCall(
   // parent-turn call (`agentLoop.ts` never passes it); `subagent.ts`'s
   // `runSubagentTask` passes its own `description` here for each of ITS
   // child's tool calls.
-  agentLabel?: string
+  agentLabel?: string,
+  // Context for resolving a model-requested `skill` tool call — see
+  // `SkillToolContext`'s doc comment. `undefined` for any caller that never
+  // offers the `skill` tool (e.g. `crewRunner.ts`/`subagent.ts`, which don't
+  // thread skill auto-invocation through at all — see agentLoop.ts's plan
+  // doc for why that's out of scope for now); a `skill` call reaching
+  // `executeToolCall` with no context configured is defensively reported as
+  // a tool error rather than throwing, same posture as an unconfigured
+  // `subagent` reaching the `task` branch below.
+  skill?: SkillToolContext
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
@@ -475,6 +512,65 @@ export async function executeToolCall(
       });
     } catch (err) {
       return stringifyToolError(err);
+    }
+  }
+
+  // `skill` is a third frontend-only tool, same treatment as `present_plan`/
+  // `task` above: no `tool_skill` Rust command exists, so it's intercepted
+  // here rather than falling through to the `invoke`/`mcp__` dispatch below.
+  // Wrapped in try/catch for the same reason as the `task` branch — any
+  // exception here must still produce a matching `tool` result rather than
+  // leaving this call's `tool_calls` entry without one.
+  if (name === 'skill') {
+    try {
+      if (!skill) {
+        return stringifyToolError(new Error('The skill tool has no context configured for this turn.'));
+      }
+      const command = typeof args.command === 'string' ? args.command.trim().replace(/^\//, '').toLowerCase() : '';
+      if (!command) {
+        return stringifyToolError(new Error('The skill tool requires a "command" argument.'));
+      }
+      if (skill.invokedCommands.has(command)) {
+        return stringifyToolError(new Error(`/${command} was already invoked this turn.`));
+      }
+      if (skill.invokedCommands.size >= skill.maxSkillsPerTurn) {
+        return stringifyToolError(new Error(`A turn can invoke at most ${skill.maxSkillsPerTurn} skills.`));
+      }
+      const matched = skill.availableSkills.find((candidate) => candidate.command.toLowerCase() === command);
+      if (!matched) {
+        return stringifyToolError(new Error(`No enabled skill named "/${command}".`));
+      }
+      // Recorded BEFORE returning the result (not after) so a second call
+      // for the same command later in this same batch of parallel tool
+      // calls is still caught by the duplicate check above — `Promise.all`
+      // in `agentLoop.ts` runs these concurrently, but each `skill` branch
+      // still executes its own body serially with respect to this
+      // synchronous bookkeeping (no `await` happens between the checks above
+      // and this line).
+      skill.invokedCommands.add(command);
+      const argumentsText = typeof args.arguments === 'string' ? args.arguments : '';
+      return formatSkillToolResult(matched, argumentsText);
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+  }
+
+  // `read_skill_resource` has a real `tool_read_skill_resource` Rust command
+  // (see `tools.ts`'s `READ_SKILL_RESOURCE_TOOL` doc comment), so unlike
+  // `skill` above it isn't intercepted — but its own schema promises it
+  // "only works for a skill that has already been invoked this turn", so
+  // that must be checked here before falling through to the generic
+  // `invoke` dispatch below, rather than trusting the model to only ever
+  // call it post-invocation.
+  if (name === 'read_skill_resource') {
+    if (!skill) {
+      return stringifyToolError(new Error('The read_skill_resource tool has no context configured for this turn.'));
+    }
+    const command = typeof args.command === 'string' ? args.command.trim().replace(/^\//, '').toLowerCase() : '';
+    if (!command || !skill.invokedCommands.has(command)) {
+      return stringifyToolError(
+        new Error(`/${command || '(missing)'} has not been invoked this turn — invoke it via the skill tool or /command first.`)
+      );
     }
   }
 

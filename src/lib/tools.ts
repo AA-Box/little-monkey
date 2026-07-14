@@ -396,6 +396,86 @@ export const TASK_TOOL: ToolDef = {
   },
 };
 
+/**
+ * The `skill` tool: lets the model invoke one of the skills listed in the
+ * turn's "## Available skills" catalog (see `skills.ts`'s
+ * `composeSkillCatalog`) on its own initiative, instead of only ever loading
+ * a skill the user explicitly typed `/command` for. Deliberately kept OUT of
+ * the `TOOLS` array above (only appended to the per-turn tool list by
+ * `agentLoop.ts`'s `toolsForSettings` when `settingsStore.skillAutoInvokeEnabled`
+ * is on AND at least one skill remains uninvoked this turn — a user who
+ * hasn't opted in should never even see the schema, same posture as
+ * `TASK_TOOL`'s `subagentsEnabled` gate). Frontend-only, same as `TASK_TOOL`/
+ * `PRESENT_PLAN_TOOL`: it has no `tool_skill` Rust command — `turnEngine.ts`'s
+ * `executeToolCall` intercepts this name before the `invoke` dispatch and
+ * resolves it against the turn's own `SkillToolContext.availableSkills`
+ * instead, returning the matched skill's instructions (and any bundled
+ * `resource_files` listing) as the tool result.
+ */
+export const SKILL_INVOKE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'skill',
+    description:
+      "Invoke one of the skills listed in the \"## Available skills\" section of the system prompt by its command name, when it matches what the user is asking for. The skill's full instructions are returned as this call's result — apply them for the rest of this turn. Do not invoke a skill the request doesn't actually need, and never invoke the same skill twice in one turn.",
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The skill\'s command name, without the leading slash, exactly as listed in the catalog (e.g. "review", not "/review").',
+        },
+        arguments: {
+          type: 'string',
+          description: 'Optional free-text arguments/context to pass to the skill — usually the relevant part of the user\'s request.',
+        },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * The `read_skill_resource` tool: reads one bundled file (other than
+ * `SKILL.md` itself) from a native skill's folder — the progressive-
+ * disclosure counterpart to a skill's `resource_files` listing (see
+ * `skills.ts`'s `SlashSkill.resourceFiles` and the instructions block
+ * `composeSkillSystemPrompt`/the `skill` tool's result both append it to).
+ * Unlike `SKILL_INVOKE_TOOL`, this DOES have a real Rust command
+ * (`tool_read_skill_resource` in `src-tauri/src/tools.rs`, delegating to
+ * `NativeSkillManager::read_resource`), so it flows through the ordinary
+ * `invoke('tool_' + name, args)` dispatch in `turnEngine.ts` — no special
+ * interception needed. Appended to the per-turn tool list by
+ * `agentLoop.ts`'s `toolsForSettings` whenever any currently available skill
+ * has at least one bundled resource file, independent of
+ * `skillAutoInvokeEnabled` — explicit `/command` invocation should be able to
+ * read bundled files too, not just an auto-invoked skill.
+ */
+export const READ_SKILL_RESOURCE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'read_skill_resource',
+    description:
+      "Read one bundled file from a skill's folder, by the skill's command name and the file's path as listed in its \"Bundled files\" line. Only works for a skill that has already been invoked (explicitly or via the skill tool) this turn.",
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The skill\'s command name, without the leading slash.',
+        },
+        path: {
+          type: 'string',
+          description: 'The bundled file\'s path, exactly as listed in the skill\'s "Bundled files" line (e.g. "references/info.md").',
+        },
+      },
+      required: ['command', 'path'],
+      additionalProperties: false,
+    },
+  },
+};
+
 export const PRESENT_PLAN_TOOL: ToolDef = {
   type: 'function',
   function: {

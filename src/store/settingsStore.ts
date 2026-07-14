@@ -61,6 +61,16 @@ export interface SettingsState {
    * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
    * not offered" treatment of `remember`. */
   subagentsEnabled: boolean;
+  /** Whether the model can invoke an installed skill on its own initiative
+   * (see `tools.ts`'s `SKILL_INVOKE_TOOL` and `agentLoop.ts`'s
+   * `toolsForSettings` filter), in addition to a user explicitly typing
+   * `/command`. Default false, same posture as `subagentsEnabled` —
+   * "automatically doing something on the model's own initiative should be
+   * opt-in". Turning it off makes both the `skill` tool AND the "## Available
+   * skills" catalog invisible to the model (not merely denied), mirroring
+   * `memoryEnabled`'s "disabled = not offered" treatment of `remember`;
+   * explicit `/command` invocation is unaffected either way. */
+  skillAutoInvokeEnabled: boolean;
   /** How many `task` tool calls in the same round trip `runToolCallsForRound`
    * (see `agentLoop.ts`) will run concurrently via its bounded promise pool —
    * every other tool call in the round stays sequential regardless of this
@@ -108,6 +118,7 @@ export interface SettingsState {
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
   setSubagentsEnabled: (value: boolean) => void;
+  setSkillAutoInvokeEnabled: (value: boolean) => void;
   setMaxConcurrentSubagents: (value: number) => void;
   setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
   clearSubagentProfileModel: (profile: 'explore' | 'code') => void;
@@ -171,6 +182,7 @@ interface PersistedShape {
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
   subagentsEnabled: boolean;
+  skillAutoInvokeEnabled: boolean;
   maxConcurrentSubagents: number;
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
 }
@@ -195,6 +207,7 @@ function defaults(): PersistedShape {
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
     subagentsEnabled: false,
+    skillAutoInvokeEnabled: false,
     maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     subagentProfileModels: {},
   };
@@ -280,6 +293,8 @@ function hydrate(): PersistedShape {
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
       subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      skillAutoInvokeEnabled:
+        typeof parsed.skillAutoInvokeEnabled === "boolean" ? parsed.skillAutoInvokeEnabled : fallback.skillAutoInvokeEnabled,
       maxConcurrentSubagents:
         typeof parsed.maxConcurrentSubagents === "number" &&
         parsed.maxConcurrentSubagents >= MIN_MAX_CONCURRENT_SUBAGENTS &&
@@ -435,6 +450,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setSubagentsEnabled: (value) => {
     set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setSkillAutoInvokeEnabled: (value) => {
+    set({ skillAutoInvokeEnabled: value });
     persist({ ...get() });
   },
 

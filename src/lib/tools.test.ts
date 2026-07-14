@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTools, TASK_TOOL, toolsForProfile, TOOLS } from "./tools";
+import { buildTools, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, toolsForProfile, TOOLS } from "./tools";
 
 describe("buildTools", () => {
   it("returns the base TOOLS list unchanged when no stacks are attached", () => {
@@ -81,5 +81,27 @@ describe("TASK_TOOL", () => {
   it("allows both the explore and code profiles as of slice 3", () => {
     const profileParam = (TASK_TOOL.function.parameters as { properties: { profile: { enum: string[] } } }).properties.profile;
     expect(profileParam.enum).toEqual(["explore", "code"]);
+  });
+});
+
+describe("SKILL_INVOKE_TOOL", () => {
+  it("is kept out of the base TOOLS array (only offered when skillAutoInvokeEnabled, via agentLoop.ts's toolsForSettings)", () => {
+    expect(TOOLS).not.toContain(SKILL_INVOKE_TOOL);
+  });
+
+  it("requires only command, leaving arguments optional", () => {
+    const params = SKILL_INVOKE_TOOL.function.parameters as { required: string[] };
+    expect(params.required).toEqual(["command"]);
+  });
+});
+
+describe("READ_SKILL_RESOURCE_TOOL", () => {
+  it("is kept out of the base TOOLS array (appended by agentLoop.ts's toolsForSettings only when a resource file is available)", () => {
+    expect(TOOLS).not.toContain(READ_SKILL_RESOURCE_TOOL);
+  });
+
+  it("requires both command and path", () => {
+    const params = READ_SKILL_RESOURCE_TOOL.function.parameters as { required: string[] };
+    expect(params.required).toEqual(["command", "path"]);
   });
 });

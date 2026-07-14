@@ -370,6 +370,49 @@ describe("settingsStore.subagentsEnabled", () => {
   });
 });
 
+describe("settingsStore.skillAutoInvokeEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ skillAutoInvokeEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same posture as `subagentsEnabled`: the model acting on its own
+    // initiative (here, invoking a skill without an explicit `/command`)
+    // should be opt-in, not default-on.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().skillAutoInvokeEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setSkillAutoInvokeEnabled(true);
+    expect(useSettingsStore.getState().skillAutoInvokeEnabled).toBe(true);
+    useSettingsStore.getState().setSkillAutoInvokeEnabled(false);
+    expect(useSettingsStore.getState().skillAutoInvokeEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSkillAutoInvokeEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().skillAutoInvokeEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ skillAutoInvokeEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().skillAutoInvokeEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
 describe("settingsStore.maxConcurrentSubagents", () => {
   beforeEach(() => {
     useSettingsStore.setState({ maxConcurrentSubagents: 2 });
