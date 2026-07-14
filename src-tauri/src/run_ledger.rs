@@ -29,6 +29,8 @@ const MIGRATION_V1: i64 = 1;
 const MIGRATION_V1_CHECKSUM: &str = "run-ledger-v1-2026-07-13";
 const MIGRATION_V2: i64 = 2;
 const MIGRATION_V2_CHECKSUM: &str = "profile-store-v2-2026-07-13";
+const MIGRATION_V3: i64 = 3;
+const MIGRATION_V3_CHECKSUM: &str = "run-archive-v3-2026-07-14";
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -175,6 +177,7 @@ pub struct StoredRun {
     pub last_sequence: u64,
     pub terminal_sequence: Option<u64>,
     pub updated_at_ms: u64,
+    pub archived_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,11 +466,15 @@ impl RunLedger {
             .map(Option::flatten)
     }
 
-    pub fn list_runs(&self, limit: usize) -> LedgerResult<Vec<StoredRun>> {
+    pub fn list_runs(&self, limit: usize, include_archived: bool) -> LedgerResult<Vec<StoredRun>> {
         let limit = bounded_limit(limit)?;
-        let mut statement = self
-            .connection
-            .prepare("SELECT run_id FROM runs ORDER BY created_at_ms DESC, run_id DESC LIMIT ?1")?;
+        let sql = if include_archived {
+            "SELECT run_id FROM runs ORDER BY created_at_ms DESC, run_id DESC LIMIT ?1"
+        } else {
+            "SELECT run_id FROM runs WHERE archived_at_ms IS NULL
+             ORDER BY created_at_ms DESC, run_id DESC LIMIT ?1"
+        };
+        let mut statement = self.connection.prepare(sql)?;
         let ids = statement
             .query_map([limit], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -478,6 +485,60 @@ impl RunLedger {
                 })
             })
             .collect()
+    }
+
+    /// Hides a terminal run from the default `list_runs` result without
+    /// touching its event history — the ledger's append-only guarantee stays
+    /// intact (see `MIGRATION_V3_SQL`'s doc comment for why hard-delete isn't
+    /// an option). Archiving an active run makes no sense (there'd be
+    /// nothing stopping it from producing more events while hidden), so it's
+    /// rejected the same way other illegal state transitions are.
+    pub fn archive_run(&mut self, run_id: &str, archived_at_ms: u64) -> LedgerResult<StoredRun> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_run_from(&transaction, run_id)?.ok_or_else(|| LedgerError::NotFound {
+            entity: "run",
+            id: run_id.to_string(),
+        })?;
+        if !run.status.is_terminal() {
+            return Err(LedgerError::InvalidTransition(format!(
+                "run '{run_id}' cannot be archived while status is '{}'",
+                run_status_token(run.status)
+            )));
+        }
+        transaction.execute(
+            "UPDATE runs SET archived_at_ms = ?2 WHERE run_id = ?1",
+            params![run_id, to_sql_i64(archived_at_ms, "archived_at_ms")?],
+        )?;
+        let archived = load_run_from(&transaction, run_id)?.ok_or_else(|| {
+            LedgerError::Corrupt(format!("archived run '{run_id}' disappeared"))
+        })?;
+        transaction.commit()?;
+        Ok(archived)
+    }
+
+    /// Reverses `archive_run`. Always legal — an archived run's status never
+    /// changes, so there's no transition to validate.
+    pub fn unarchive_run(&mut self, run_id: &str) -> LedgerResult<StoredRun> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if load_run_from(&transaction, run_id)?.is_none() {
+            return Err(LedgerError::NotFound {
+                entity: "run",
+                id: run_id.to_string(),
+            });
+        }
+        transaction.execute(
+            "UPDATE runs SET archived_at_ms = NULL WHERE run_id = ?1",
+            [run_id],
+        )?;
+        let run = load_run_from(&transaction, run_id)?.ok_or_else(|| {
+            LedgerError::Corrupt(format!("unarchived run '{run_id}' disappeared"))
+        })?;
+        transaction.commit()?;
+        Ok(run)
     }
 
     pub fn load_events(
@@ -704,7 +765,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V2 {
+        if version > MIGRATION_V3 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -712,6 +773,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
     for (version, expected) in [
         (MIGRATION_V1, MIGRATION_V1_CHECKSUM),
         (MIGRATION_V2, MIGRATION_V2_CHECKSUM),
+        (MIGRATION_V3, MIGRATION_V3_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -746,6 +808,19 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
     if has_v2_before && !has_v1_before {
         return Err(LedgerError::MigrationConflict {
             version: MIGRATION_V2,
+        });
+    }
+    let has_v3_before = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V3],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if has_v3_before && !has_v2_before {
+        return Err(LedgerError::MigrationConflict {
+            version: MIGRATION_V3,
         });
     }
 
@@ -800,7 +875,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 2;")?;
+    let has_v3 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V3],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v3 {
+        transaction.execute_batch(MIGRATION_V3_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V3, MIGRATION_V3_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 3;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1316,6 +1408,21 @@ AFTER UPDATE ON profile_search_documents BEGIN
 END;
 "#;
 
+// Run Center has no way to remove a run from view: `run_events` is
+// deliberately append-only (see `run_events_forbid_delete` below) so the
+// ledger stays a tamper-evident audit trail, and every child table's FK is
+// `ON DELETE RESTRICT` for the same reason. Hard-deleting a run would fight
+// that invariant. Archiving just hides it from the default `list_runs`
+// result — the row and its full event history are untouched, so
+// `integrity_check` and the audit trail stay exactly as trustworthy as
+// before. Reversible via `unarchive_run`.
+const MIGRATION_V3_SQL: &str = r#"
+ALTER TABLE runs ADD COLUMN archived_at_ms INTEGER
+    CHECK (archived_at_ms IS NULL OR archived_at_ms > 0);
+
+CREATE INDEX runs_archived_idx ON runs(archived_at_ms) WHERE archived_at_ms IS NOT NULL;
+"#;
+
 struct EventEffects<'a> {
     event_type: &'static str,
     status: Option<RunStatus>,
@@ -1808,7 +1915,8 @@ fn apply_projection(
 fn load_run_from(connection: &Connection, run_id: &str) -> LedgerResult<Option<StoredRun>> {
     connection
         .query_row(
-            "SELECT spec_json, status, last_sequence, terminal_sequence, updated_at_ms
+            "SELECT spec_json, status, last_sequence, terminal_sequence, updated_at_ms,
+                    archived_at_ms
              FROM runs WHERE run_id = ?1",
             [run_id],
             |row| {
@@ -1818,6 +1926,7 @@ fn load_run_from(connection: &Connection, run_id: &str) -> LedgerResult<Option<S
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             },
         )
@@ -1832,6 +1941,10 @@ fn load_run_from(connection: &Connection, run_id: &str) -> LedgerResult<Option<S
                     .map(|value| from_sql_u64(value, "terminal_sequence"))
                     .transpose()?,
                 updated_at_ms: from_sql_u64(row.4, "updated_at_ms")?,
+                archived_at_ms: row
+                    .5
+                    .map(|value| from_sql_u64(value, "archived_at_ms"))
+                    .transpose()?,
             })
         })
         .transpose()
@@ -2685,10 +2798,10 @@ mod tests {
         let database = TempDb::new("migration");
         {
             let ledger = RunLedger::open(&database.path).unwrap();
-            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2]);
+            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3]);
         }
         let ledger = RunLedger::open(&database.path).unwrap();
-        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2]);
+        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3]);
 
         let journal_mode = ledger
             .connection
@@ -2809,5 +2922,64 @@ mod tests {
             assert_eq!(matches, 1);
         }
         assert!(ledger.integrity_check().unwrap().is_ok());
+    }
+
+    #[test]
+    fn archive_run_hides_it_from_the_default_list_but_keeps_its_events() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-archive", "submit/archive"))
+            .unwrap();
+        ledger.append_event(&queued("run-archive", 1)).unwrap();
+        ledger
+            .append_event(&completed("run-archive", 2, "completed"))
+            .unwrap();
+
+        let archived = ledger.archive_run("run-archive", 5_000).unwrap();
+        assert_eq!(archived.archived_at_ms, Some(5_000));
+        // Archiving is a view concern only — the event history is untouched.
+        assert_eq!(
+            ledger.load_events("run-archive", 0, 10).unwrap().len(),
+            2
+        );
+        assert!(ledger.integrity_check().unwrap().is_ok());
+
+        assert!(ledger
+            .list_runs(100, false)
+            .unwrap()
+            .iter()
+            .all(|run| run.spec.run_id != "run-archive"));
+        assert!(ledger
+            .list_runs(100, true)
+            .unwrap()
+            .iter()
+            .any(|run| run.spec.run_id == "run-archive"));
+
+        let unarchived = ledger.unarchive_run("run-archive").unwrap();
+        assert_eq!(unarchived.archived_at_ms, None);
+        assert!(ledger
+            .list_runs(100, false)
+            .unwrap()
+            .iter()
+            .any(|run| run.spec.run_id == "run-archive"));
+    }
+
+    #[test]
+    fn archive_run_rejects_a_run_that_is_still_active() {
+        let mut ledger = RunLedger::open_in_memory().unwrap();
+        ledger
+            .submit_run(&spec("run-active", "submit/active"))
+            .unwrap();
+        ledger.append_event(&queued("run-active", 1)).unwrap();
+
+        assert!(matches!(
+            ledger.archive_run("run-active", 5_000),
+            Err(LedgerError::InvalidTransition(_))
+        ));
+        assert!(ledger
+            .list_runs(100, false)
+            .unwrap()
+            .iter()
+            .any(|run| run.spec.run_id == "run-active"));
     }
 }
