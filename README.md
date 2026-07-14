@@ -1,4 +1,4 @@
-# Little Monkey
+# <img width="50" height="51" alt="LM-logo" src="https://github.com/user-attachments/assets/84651d01-f18b-4c49-b203-8d1b7e8f16b6" /> Little Monkey
 
 Little Monkey is a local-first Tauri desktop workspace for agentic AI. It can run against managed `llama.cpp`, Ollama, MLX on supported Apple Silicon, or OpenAI-compatible providers that you configure. The React UI and Rust backend share workspace, permission, run, model, package, browser, Git, and background-service contracts instead of treating each surface as a separate product.
 
