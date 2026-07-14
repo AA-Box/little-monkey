@@ -3,11 +3,14 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PanelRight, PanelRightClose, X } from "lucide-react";
 
-import { ChatSessionList, ChatWindow } from "./components/Chat";
+import { ChatSessionList, ChatWindow, CompareView, CrewView } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { RunCenter } from "./components/Runs";
+import { GlobalSearch } from "./components/Search";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
+import { useRunStore } from "./store/runStore";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
@@ -20,6 +23,7 @@ import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
 import { hydrateAutomations } from "./store/automationsStore";
 import { startScheduler } from "./lib/scheduler";
+import { startBackupScheduler } from "./lib/backupScheduler";
 import { useT } from "./lib/i18n";
 import {
   detectShortcutPlatform,
@@ -27,6 +31,9 @@ import {
   shouldHandleGlobalShortcut,
   type ShortcutIdForScope,
 } from "./lib/shortcuts";
+import { onRunCancellationRequested } from "./lib/runProtocol";
+import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
+import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
  * (captured the moment it was opened) so edits made by the agent afterwards
@@ -50,10 +57,21 @@ function formatError(err: unknown): string {
 function App() {
   const { t } = useT();
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const activeComparisonId = useSessionStore((s) =>
+    s.sessions.find((session) => session.id === s.activeSessionId)?.comparisonBranch?.comparisonId ?? null
+  );
+  const activeCrewSessionId = useSessionStore((s) =>
+    s.sessions.find((session) => session.id === s.activeSessionId)?.crewRun ? s.activeSessionId : null
+  );
   const newSession = useSessionStore((s) => s.newSession);
   const splitSessionId = useSessionStore((s) => s.splitSessionId);
   const splitTitle = useSessionStore((s) =>
     s.splitSessionId === null ? null : s.sessions.find((x) => x.id === s.splitSessionId)?.title ?? null
+  );
+  const splitCrewSessionId = useSessionStore((s) =>
+    s.splitSessionId !== null && s.sessions.find((session) => session.id === s.splitSessionId)?.crewRun
+      ? s.splitSessionId
+      : null
   );
   const closeSplit = useSessionStore((s) => s.closeSplit);
   const rootsVersion = useWorkspaceStore((s) => s.rootsVersion);
@@ -73,6 +91,8 @@ function App() {
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [runCenterOpen, setRunCenterOpen] = useState(false);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -86,6 +106,8 @@ function App() {
   const [settingsTabRequest, setSettingsTabRequest] = useState(0);
 
   const openSettingsTab = useCallback((tab: SettingsTab) => {
+    setRunCenterOpen(false);
+    setGlobalSearchOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -125,11 +147,15 @@ function App() {
 
       const actions: Record<ShortcutIdForScope<"global">, () => void> = {
         newSession: () => {
+          setRunCenterOpen(false);
+          setGlobalSearchOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
         },
         openSettings: () => {
+          setRunCenterOpen(false);
+          setGlobalSearchOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -191,6 +217,34 @@ function App() {
     void hydrateAutomations();
     if (isTauri() && getCurrentWindow().label === "main") {
       startScheduler();
+      return startBackupScheduler();
+    }
+    return undefined;
+  }, []);
+
+  // A stop requested from Run Center (including another app window) is
+  // recorded by Rust first, then bridged back to the exact active desktop
+  // AbortController. The turn finalizer records Cancelling/Cancelled only
+  // after the model/tool cancellation path has actually been triggered.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void onRunCancellationRequested(({ runId }) => cancelRegisteredRun(runId)).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Rebind persisted chat placeholders to the daemon's shared run ledger
+  // after a WebView/app restart. Only the main window owns recovery so two
+  // session windows never race to render the same durable event stream.
+  useEffect(() => {
+    if (isTauri() && getCurrentWindow().label === "main") {
+      recoverDaemonDesktopTurns();
     }
   }, []);
 
@@ -251,7 +305,25 @@ function App() {
         <div className="min-h-0 flex-1 overflow-y-auto [overscroll-behavior:contain]">
           <ChatSessionList />
         </div>
-        <AppMenu onOpenSettings={() => setSettingsOpen(true)} />
+        <AppMenu
+          onOpenSettings={() => {
+            setRunCenterOpen(false);
+            setGlobalSearchOpen(false);
+            setSettingsOpen(true);
+          }}
+          onOpenRunCenter={() => {
+            setSettingsOpen(false);
+            setGlobalSearchOpen(false);
+            setSettingsInitialTab(undefined);
+            setRunCenterOpen(true);
+          }}
+          onOpenGlobalSearch={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setSettingsInitialTab(undefined);
+            setGlobalSearchOpen(true);
+          }}
+        />
       </aside>
 
       {/* Center: chat, with a drag-region strip standing in for the title bar */}
@@ -261,8 +333,29 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={activeSessionId}>
-          <ChatWindow sessionId={activeSessionId} onManagePrompts={handleManagePrompts} />
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : runCenterOpen ? "run-center" : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+          {globalSearchOpen ? (
+            <GlobalSearch
+              onClose={() => setGlobalSearchOpen(false)}
+              onOpenRun={(runId) => {
+                setGlobalSearchOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
+          ) : runCenterOpen ? (
+            <RunCenter onClose={() => setRunCenterOpen(false)} />
+          ) : activeComparisonId ? (
+            <CompareView groupId={activeComparisonId} />
+          ) : activeCrewSessionId ? (
+            <CrewView sessionId={activeCrewSessionId} />
+          ) : (
+            <ChatWindow
+              sessionId={activeSessionId}
+              onManagePrompts={handleManagePrompts}
+              onOpenSettingsTab={openSettingsTab}
+            />
+          )}
         </ErrorBoundary>
       </div>
 
@@ -270,7 +363,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {splitSessionId !== null && (
+      {!globalSearchOpen && !runCenterOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
@@ -281,7 +374,15 @@ function App() {
             </IconButton>
           </div>
           <ErrorBoundary resetKey={splitSessionId}>
-            <ChatWindow sessionId={splitSessionId} onManagePrompts={handleManagePrompts} />
+            {splitCrewSessionId ? (
+              <CrewView sessionId={splitCrewSessionId} />
+            ) : (
+              <ChatWindow
+                sessionId={splitSessionId}
+                onManagePrompts={handleManagePrompts}
+                onOpenSettingsTab={openSettingsTab}
+              />
+            )}
           </ErrorBoundary>
         </div>
       )}

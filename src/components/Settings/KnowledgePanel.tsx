@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronRight, Download, FileText, FolderOpen, Play, Plus, Search, Square, Trash2, X } from "lucide-react";
 import { Button, IconButton, StatusPill } from "../ui";
 import type { PillTone } from "../ui";
+import { KnowledgeV2Panel } from "./KnowledgeV2Panel";
 import { useT } from "../../lib/i18n";
 import { useModelStore } from "../../store/modelStore";
 import {
@@ -167,7 +168,7 @@ export function KnowledgePanel() {
   );
 
   return (
-    <div className="flex flex-col gap-3 p-2">
+    <div className="flex flex-col gap-3 py-2">
       <section className="rounded-lg border border-border bg-background p-3">
         <div className="flex items-center justify-between gap-2">
           <div>
@@ -348,6 +349,7 @@ export function KnowledgePanel() {
           ))
         )}
       </section>
+      <KnowledgeV2Panel stacks={stacks} />
     </div>
   );
 }

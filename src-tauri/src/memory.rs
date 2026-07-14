@@ -75,7 +75,10 @@ pub struct MemoriesFile {
 
 impl Default for MemoriesFile {
     fn default() -> Self {
-        MemoriesFile { version: SCHEMA_VERSION, projects: HashMap::new() }
+        MemoriesFile {
+            version: SCHEMA_VERSION,
+            projects: HashMap::new(),
+        }
     }
 }
 
@@ -275,7 +278,10 @@ pub fn delete_fact_impl(path: &Path, root: &str, id: &str) -> Result<(), String>
 /// project-scope entries" tolerance) — this is called once per turn via
 /// `rulesStore.refresh()`, and a missing workspace must not block a turn.
 #[tauri::command]
-pub fn memory_list(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<Fact>, String> {
+pub fn memory_list(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Fact>, String> {
     let memories = load_impl(&memories_file_path(&app)?)?;
     let mut facts = memories
         .projects
@@ -322,10 +328,22 @@ fn owning_scope(memories: &MemoriesFile, scopes: &[String], id: &str) -> Option<
 /// `source: "agent"` instead of going through this command. Serialized
 /// against concurrent `tool_remember` calls via `AppState::memory_lock`.
 #[tauri::command]
-pub fn memory_add(app: tauri::AppHandle, state: tauri::State<'_, AppState>, text: String) -> Result<Fact, String> {
+pub fn memory_add(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    text: String,
+) -> Result<Fact, String> {
     let root = workspace::primary_root_canon(state.inner())?;
-    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
-    add_fact_impl(&memories_file_path(&app)?, &root.to_string_lossy(), &text, "user")
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
+    add_fact_impl(
+        &memories_file_path(&app)?,
+        &root.to_string_lossy(),
+        &text,
+        "user",
+    )
 }
 
 /// Delete a fact by id — used by the transcript's "Forget" button (see
@@ -338,9 +356,16 @@ pub fn memory_add(app: tauri::AppHandle, state: tauri::State<'_, AppState>, text
 /// `rules_write`/`checkpoint_revert`, intentionally NOT routed through
 /// `permissions::request_permission`.
 #[tauri::command]
-pub fn memory_delete(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn memory_delete(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let path = memories_file_path(&app)?;
-    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
     let memories = load_impl(&path)?;
     let scopes = candidate_scopes(state.inner());
     match owning_scope(&memories, &scopes, &id) {
@@ -355,9 +380,17 @@ pub fn memory_delete(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
 /// same way [`memory_delete`] does, so editing a global fact works
 /// regardless of which project (if any) is open.
 #[tauri::command]
-pub fn memory_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, text: String) -> Result<Fact, String> {
+pub fn memory_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    text: String,
+) -> Result<Fact, String> {
     let path = memories_file_path(&app)?;
-    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
     let memories = load_impl(&path)?;
     let scopes = candidate_scopes(state.inner());
     let scope = owning_scope(&memories, &scopes, &id)
@@ -370,9 +403,15 @@ pub fn memory_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
 /// it's destructive (though app-local and non-catastrophic: nothing else
 /// depends on facts persisting, and re-remembering is one tool call away).
 #[tauri::command]
-pub fn memory_clear(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub fn memory_clear(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let root = workspace::primary_root_canon(state.inner())?;
-    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
     clear_impl(&memories_file_path(&app)?, &root.to_string_lossy())
 }
 
@@ -406,7 +445,10 @@ mod tests {
     fn fact_deserializes_canonical_fixture() {
         let fact: Fact = serde_json::from_str(CANONICAL_FACT_JSON).unwrap();
         assert_eq!(fact.id, "22222222-2222-4222-8222-222222222222");
-        assert_eq!(fact.text, "This project uses pnpm, not npm, for all package management.");
+        assert_eq!(
+            fact.text,
+            "This project uses pnpm, not npm, for all package management."
+        );
         assert_eq!(fact.source, "agent");
         assert_eq!(fact.created_at, "2026-01-01T00:00:00.000Z");
     }
@@ -428,7 +470,10 @@ mod tests {
         assert_eq!(fact.source, "agent");
         assert!(!fact.id.is_empty());
         assert!(!fact.created_at.is_empty());
-        assert!(!path.with_extension("json.tmp").exists(), "temp file must not linger");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must not linger"
+        );
 
         let reloaded = load_impl(&path).unwrap();
         let facts = &reloaded.projects["/ws/project"].facts;
@@ -441,11 +486,21 @@ mod tests {
     #[test]
     fn exact_duplicate_text_is_a_silent_success_not_a_second_copy() {
         let path = temp_path();
-        let first = add_fact_impl(&path, "/ws/project", "Build with `make build`.", "agent").unwrap();
-        let second = add_fact_impl(&path, "/ws/project", "Build with `make build`.", "agent").unwrap();
+        let first =
+            add_fact_impl(&path, "/ws/project", "Build with `make build`.", "agent").unwrap();
+        let second =
+            add_fact_impl(&path, "/ws/project", "Build with `make build`.", "agent").unwrap();
 
-        assert_eq!(first.id, second.id, "duplicate remember must return the existing fact, not a new one");
-        assert_eq!(load_impl(&path).unwrap().projects["/ws/project"].facts.len(), 1);
+        assert_eq!(
+            first.id, second.id,
+            "duplicate remember must return the existing fact, not a new one"
+        );
+        assert_eq!(
+            load_impl(&path).unwrap().projects["/ws/project"]
+                .facts
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -475,7 +530,9 @@ mod tests {
         let err = add_fact_impl(&path, "/ws/project", "one fact too many", "agent").unwrap_err();
         assert!(err.contains("100"), "unexpected error: {err}");
         assert_eq!(
-            load_impl(&path).unwrap().projects["/ws/project"].facts.len(),
+            load_impl(&path).unwrap().projects["/ws/project"]
+                .facts
+                .len(),
             MAX_FACTS_PER_PROJECT
         );
 
@@ -504,7 +561,9 @@ mod tests {
 
         delete_fact_impl(&path, "/ws/project", &b.id).unwrap();
 
-        let facts = load_impl(&path).unwrap().projects["/ws/project"].facts.clone();
+        let facts = load_impl(&path).unwrap().projects["/ws/project"]
+            .facts
+            .clone();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].id, a.id);
 
@@ -518,7 +577,12 @@ mod tests {
 
         delete_fact_impl(&path, "/ws/project", "00000000-0000-0000-0000-000000000000").unwrap();
 
-        assert_eq!(load_impl(&path).unwrap().projects["/ws/project"].facts.len(), 1);
+        assert_eq!(
+            load_impl(&path).unwrap().projects["/ws/project"]
+                .facts
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -528,7 +592,8 @@ mod tests {
         let path = temp_path();
         let original = add_fact_impl(&path, "/ws/project", "uses npm", "agent").unwrap();
 
-        let updated = update_fact_impl(&path, "/ws/project", &original.id, "uses pnpm, not npm").unwrap();
+        let updated =
+            update_fact_impl(&path, "/ws/project", &original.id, "uses pnpm, not npm").unwrap();
 
         assert_eq!(updated.id, original.id);
         assert_eq!(updated.source, original.source);
@@ -536,7 +601,10 @@ mod tests {
         assert_eq!(updated.text, "uses pnpm, not npm");
 
         let reloaded = load_impl(&path).unwrap();
-        assert_eq!(reloaded.projects["/ws/project"].facts[0].text, "uses pnpm, not npm");
+        assert_eq!(
+            reloaded.projects["/ws/project"].facts[0].text,
+            "uses pnpm, not npm"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -546,7 +614,13 @@ mod tests {
         let path = temp_path();
         add_fact_impl(&path, "/ws/project", "stays put", "agent").unwrap();
 
-        let err = update_fact_impl(&path, "/ws/project", "00000000-0000-0000-0000-000000000000", "new text").unwrap_err();
+        let err = update_fact_impl(
+            &path,
+            "/ws/project",
+            "00000000-0000-0000-0000-000000000000",
+            "new text",
+        )
+        .unwrap_err();
         assert!(err.contains("not found"), "unexpected error: {err}");
 
         let _ = std::fs::remove_file(&path);
@@ -558,14 +632,23 @@ mod tests {
         let fact = add_fact_impl(&path, "/ws/project", "original", "agent").unwrap();
 
         let empty_err = update_fact_impl(&path, "/ws/project", &fact.id, "   ").unwrap_err();
-        assert!(empty_err.contains("must not be empty"), "unexpected error: {empty_err}");
+        assert!(
+            empty_err.contains("must not be empty"),
+            "unexpected error: {empty_err}"
+        );
 
         let huge = "a".repeat(MAX_FACT_CHARS + 1);
         let cap_err = update_fact_impl(&path, "/ws/project", &fact.id, &huge).unwrap_err();
-        assert!(cap_err.contains("character limit"), "unexpected error: {cap_err}");
+        assert!(
+            cap_err.contains("character limit"),
+            "unexpected error: {cap_err}"
+        );
 
         // Neither rejected edit should have changed the stored text.
-        assert_eq!(load_impl(&path).unwrap().projects["/ws/project"].facts[0].text, "original");
+        assert_eq!(
+            load_impl(&path).unwrap().projects["/ws/project"].facts[0].text,
+            "original"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -580,7 +663,9 @@ mod tests {
         clear_impl(&path, "/ws/a").unwrap();
 
         let memories = load_impl(&path).unwrap();
-        assert!(!memories.projects.contains_key("/ws/a") || memories.projects["/ws/a"].facts.is_empty());
+        assert!(
+            !memories.projects.contains_key("/ws/a") || memories.projects["/ws/a"].facts.is_empty()
+        );
         assert_eq!(memories.projects["/ws/b"].facts.len(), 1);
 
         let _ = std::fs::remove_file(&path);
@@ -589,7 +674,8 @@ mod tests {
     #[test]
     fn remember_with_no_workspace_saves_under_the_global_scope() {
         let path = temp_path();
-        let fact = add_fact_impl(&path, GLOBAL_SCOPE_KEY, "User's name is Ahmad.", "agent").unwrap();
+        let fact =
+            add_fact_impl(&path, GLOBAL_SCOPE_KEY, "User's name is Ahmad.", "agent").unwrap();
 
         let reloaded = load_impl(&path).unwrap();
         let facts = &reloaded.projects[GLOBAL_SCOPE_KEY].facts;
@@ -607,7 +693,10 @@ mod tests {
 
         let memories = load_impl(&path).unwrap();
         let scopes = vec![GLOBAL_SCOPE_KEY.to_string(), "/ws/project".to_string()];
-        assert_eq!(owning_scope(&memories, &scopes, &global_fact.id), Some(GLOBAL_SCOPE_KEY.to_string()));
+        assert_eq!(
+            owning_scope(&memories, &scopes, &global_fact.id),
+            Some(GLOBAL_SCOPE_KEY.to_string())
+        );
 
         let _ = std::fs::remove_file(&path);
     }

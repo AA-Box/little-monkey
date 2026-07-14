@@ -1,12 +1,20 @@
-import { Children, isValidElement, memo, useState, type ReactNode } from "react";
+import { Children, isValidElement, memo, useEffect, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { Eye, Pencil } from "lucide-react";
+import { Eye, Languages, LoaderCircle, Pencil, X } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { useArtifactStore } from "../../store/artifactStore";
 import { useT } from "../../lib/i18n";
+import {
+  cancelTranslation,
+  defaultTranslationLocale,
+  messageTranslationKey,
+  TRANSLATION_LOCALES,
+  translateMessage,
+} from "../../lib/translation";
+import type { MessageTranslation } from "../../store/sessionStore";
 
 export interface MessageBubbleProps {
   message: ChatMessage;
@@ -28,6 +36,11 @@ export interface MessageBubbleProps {
   onEditMessage?: (index: number, newText: string) => void;
   /** Disables the edit affordance while a turn is in flight. */
   editDisabled?: boolean;
+  /** Original-preserving translations already saved for this message. */
+  translations?: readonly MessageTranslation[];
+  /** Thread-level locale preference. Individual controls can still switch
+   * back to the original without mutating that preference. */
+  preferredTranslationLocale?: string | null;
 }
 
 /**
@@ -161,10 +174,14 @@ function UserBubble({
   content,
   onEdit,
   editDisabled,
+  displayText,
+  translationControls,
 }: {
   content: string | ChatContentPart[];
   onEdit?: (newText: string) => void;
   editDisabled?: boolean;
+  displayText?: string;
+  translationControls?: ReactNode;
 }) {
   // Editing only ever operates on the text portion — an edited-and-resubmitted
   // message doesn't carry its original image attachment forward (matches
@@ -259,14 +276,25 @@ function UserBubble({
               ))}
             </div>
           )}
-          {text && <div className="whitespace-pre-wrap">{text}</div>}
+          {(displayText ?? text) && <div className="whitespace-pre-wrap">{displayText ?? text}</div>}
+          {translationControls}
         </div>
       </div>
     </div>
   );
 }
 
-function AssistantMessage({ content, sessionId, index }: { content: string; sessionId: string; index: number }) {
+function AssistantMessage({
+  content,
+  sessionId,
+  index,
+  translationControls,
+}: {
+  content: string;
+  sessionId: string;
+  index: number;
+  translationControls?: ReactNode;
+}) {
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
@@ -275,6 +303,129 @@ function AssistantMessage({ content, sessionId, index }: { content: string; sess
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
+      {translationControls}
+    </div>
+  );
+}
+
+function sameContent(left: ChatMessage["content"], right: ChatMessage["content"]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function TranslationControls({
+  sessionId,
+  index,
+  message,
+  translations,
+  preferredLocale,
+  disabled,
+  onDisplay,
+}: {
+  sessionId: string;
+  index: number;
+  message: ChatMessage;
+  translations: readonly MessageTranslation[];
+  preferredLocale: string | null;
+  disabled: boolean;
+  onDisplay: (translation: MessageTranslation | null) => void;
+}) {
+  const { t } = useT();
+  const [locale, setLocale] = useState(preferredLocale ?? defaultTranslationLocale());
+  const [running, setRunning] = useState(false);
+  const [showTranslation, setShowTranslation] = useState(Boolean(preferredLocale));
+  const [latest, setLatest] = useState<MessageTranslation | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const saved = [...translations].reverse().find((translation) =>
+    translation.messageIndex === index &&
+    translation.locale.toLowerCase() === locale.toLowerCase() &&
+    sameContent(translation.originalContent, message.content),
+  ) ?? null;
+  const available = latest && latest.locale.toLowerCase() === locale.toLowerCase() && sameContent(latest.originalContent, message.content)
+    ? latest
+    : saved;
+
+  useEffect(() => {
+    if (!preferredLocale) return;
+    setLocale(preferredLocale);
+    setShowTranslation(true);
+  }, [preferredLocale]);
+
+  useEffect(() => {
+    onDisplay(showTranslation ? available : null);
+  }, [available, onDisplay, showTranslation]);
+
+  const start = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      const translation = await translateMessage(sessionId, index, locale);
+      setLatest(translation);
+      setShowTranslation(true);
+      onDisplay(translation);
+    } catch (caught) {
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="mt-2 border-t border-border/70 pt-1.5 text-xs text-muted">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Languages size={13} aria-hidden="true" />
+        <select
+          aria-label={t("Translation.languageLabel")}
+          value={locale}
+          disabled={running}
+          onChange={(event) => {
+            setLocale(event.target.value);
+            setShowTranslation(false);
+            setError(null);
+          }}
+          className="cursor-pointer rounded border border-border bg-background px-1.5 py-0.5 text-xs text-foreground outline-none focus-visible:border-accent"
+        >
+          {TRANSLATION_LOCALES.map(({ code, label }) => <option key={code} value={code}>{label}</option>)}
+        </select>
+        {running ? (
+          <button
+            type="button"
+            onClick={() => cancelTranslation(messageTranslationKey(sessionId, index))}
+            className="flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 hover:bg-surface hover:text-foreground"
+          >
+            <LoaderCircle size={12} className="animate-spin" />
+            {t("Translation.cancel")}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => void start()}
+            disabled={disabled}
+            className="cursor-pointer rounded px-1.5 py-0.5 hover:bg-surface hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {t("Translation.translate")}
+          </button>
+        )}
+        {available && (
+          <button
+            type="button"
+            onClick={() => setShowTranslation((value) => !value)}
+            className="cursor-pointer rounded px-1.5 py-0.5 hover:bg-surface hover:text-foreground"
+          >
+            {showTranslation ? t("Translation.showOriginal") : t("Translation.showTranslation")}
+          </button>
+        )}
+        {available && <span className="text-faint">{t("Translation.preserved")}</span>}
+      </div>
+      {error && (
+        <div className="mt-1 flex items-start justify-between gap-2 rounded bg-danger-soft px-2 py-1 text-danger" role="alert">
+          <span>{t("Translation.error", { error })}</span>
+          <button type="button" onClick={() => setError(null)} aria-label="Dismiss translation error" className="cursor-pointer">
+            <X size={12} />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -292,11 +443,33 @@ function AssistantMessage({ content, sessionId, index }: { content: string; sess
  * expensive enough that re-rendering the whole transcript per token visibly
  * stutters on long conversations).
  */
-function MessageBubble({ message, index, sessionId, onEditMessage, editDisabled }: MessageBubbleProps) {
+function MessageBubble({
+  message,
+  index,
+  sessionId,
+  onEditMessage,
+  editDisabled,
+  translations = [],
+  preferredTranslationLocale = null,
+}: MessageBubbleProps) {
+  const [displayedTranslation, setDisplayedTranslation] = useState<MessageTranslation | null>(null);
+  const controls = (
+    <TranslationControls
+      sessionId={sessionId}
+      index={index}
+      message={message}
+      translations={translations}
+      preferredLocale={preferredTranslationLocale}
+      disabled={editDisabled === true}
+      onDisplay={setDisplayedTranslation}
+    />
+  );
   if (message.role === "user") {
     return (
       <UserBubble
         content={message.content}
+        displayText={displayedTranslation?.translatedText}
+        translationControls={controls}
         onEdit={onEditMessage ? (text) => onEditMessage(index, text) : undefined}
         editDisabled={editDisabled}
       />
@@ -304,7 +477,14 @@ function MessageBubble({ message, index, sessionId, onEditMessage, editDisabled 
   }
 
   if (message.role === "assistant") {
-    return <AssistantMessage content={textContent(message.content)} sessionId={sessionId} index={index} />;
+    return (
+      <AssistantMessage
+        content={displayedTranslation?.translatedText ?? textContent(message.content)}
+        sessionId={sessionId}
+        index={index}
+        translationControls={controls}
+      />
+    );
   }
 
   return null;

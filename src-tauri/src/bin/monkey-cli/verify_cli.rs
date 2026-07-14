@@ -26,7 +26,10 @@ pub fn all_commands_at(configs_path: &Path, root: &Path) -> Vec<VerifyCommand> {
 /// mirroring `runVerificationPhase`'s `enabledCommands` filter on the
 /// frontend (`src/lib/agentLoop.ts`).
 pub fn enabled_commands_at(configs_path: &Path, root: &Path) -> Vec<VerifyCommand> {
-    all_commands_at(configs_path, root).into_iter().filter(|c| c.enabled).collect()
+    all_commands_at(configs_path, root)
+        .into_iter()
+        .filter(|c| c.enabled)
+        .collect()
 }
 
 /// Every configured command (enabled or not) for `root` — used by the
@@ -54,8 +57,16 @@ mod tests {
     use little_monkey_lib::verify::VerifyConfig;
 
     fn temp_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("little_monkey_verify_cli_test_{}_{}_{}", std::process::id(), nanos, name))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_verify_cli_test_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            name
+        ))
     }
 
     fn command(id: &str, enabled: bool) -> VerifyCommand {
@@ -73,7 +84,9 @@ mod tests {
     fn enabled_commands_at_filters_out_disabled_ones() {
         let path = temp_path("config.json");
         let root = Path::new("/some/workspace");
-        let config = VerifyConfig { commands: vec![command("a", true), command("b", false)] };
+        let config = VerifyConfig {
+            commands: vec![command("a", true), command("b", false)],
+        };
         let mut map = std::collections::HashMap::new();
         map.insert(root.to_string_lossy().to_string(), config);
         let json = serde_json::to_string(&map).unwrap();

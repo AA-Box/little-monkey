@@ -33,6 +33,9 @@ mod tests {
     #[test]
     fn data_dir_ends_with_the_app_identifier() {
         let dir = data_dir().expect("dirs::data_dir() should resolve on any supported OS");
-        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some(APP_IDENTIFIER));
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(APP_IDENTIFIER)
+        );
     }
 }

@@ -602,7 +602,7 @@ export function AutomationPanel() {
   const overrideEntries = Object.entries(visionOverrides);
 
   return (
-    <div className="flex flex-col gap-6 p-2">
+    <div className="flex flex-col gap-6 py-2">
       <section>
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.reliabilityHeading")}</h3>
         <div className="divide-y divide-border rounded-lg border border-border bg-background px-3">

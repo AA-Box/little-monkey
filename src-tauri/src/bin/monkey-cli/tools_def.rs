@@ -76,6 +76,22 @@ pub fn tool_definitions() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "glob",
+                "description": "Find files by glob pattern, skipping VCS, dependency, and build directories. Results are workspace-relative, most-recently-modified first, and capped at 300.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob pattern such as **/*.rs or src/**/test_*.py." },
+                        "path": { "type": "string", "description": "Optional workspace-relative directory to search. Defaults to the whole workspace." }
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "grep",
                 "description": "Search for a regular expression pattern across files in the workspace (skipping .git, node_modules, target, and dist), returning matching file, line number, and line text, capped at 200 matches.",
                 "parameters": {
@@ -229,8 +245,7 @@ pub fn search_docs_tool_def(stack_names: &[String]) -> serde_json::Value {
 }
 
 /// The `task` tool — delegates a scoped subtask to a subagent with its own
-/// isolated tool-calling loop and restricted (explore-only) tool set (CLI
-/// parity, docs/roadmap/p3-subagents.md slice 5) — a Rust port of
+/// isolated tool-calling loop and explicit explore/code tool profiles — a Rust port of
 /// `src/lib/tools.ts`'s `TASK_TOOL`. Like [`present_plan_tool_def`] and
 /// [`search_docs_tool_def`], deliberately excluded from [`tool_definitions`]'s
 /// base array (and from [`merged_tool_definitions`]'s output): `agent.rs`'s
@@ -239,9 +254,8 @@ pub fn search_docs_tool_def(stack_names: &[String]) -> serde_json::Value {
 /// model that never had this turned on should never even see the schema).
 /// `agent.rs::execute_tool_call` intercepts the name before the built-in
 /// dispatch, exactly like `present_plan`; there is no `tool_task` Rust
-/// command. The CLI only accepts `profile: "explore"` — see that function's
-/// `"task"` arm doc comment for why `"code"` is rejected rather than
-/// supported (no checkpoints exist here to land its mutations into safely).
+/// command. Code-profile mutations reuse the parent turn checkpoint and the
+/// same permission object; neither profile includes recursive delegation.
 pub fn task_tool_def() -> serde_json::Value {
     serde_json::json!({
         "type": "function",
@@ -255,8 +269,8 @@ pub fn task_tool_def() -> serde_json::Value {
                     "prompt": { "type": "string", "description": "Full, self-contained instructions for the subagent — it has no access to this conversation, so include all necessary context (file paths, what to look for, what to report back)." },
                     "profile": {
                         "type": "string",
-                        "enum": ["explore"],
-                        "description": "Tool access profile for the subagent. Only 'explore' (read-only: read_file, list_dir, grep) is supported on the CLI — there are no checkpoints here to safely land a mutating subagent's writes into."
+                        "enum": ["explore", "code"],
+                        "description": "Tool access profile. 'explore' is read-only (read_file, list_dir, glob, grep). 'code' adds write_file, edit_file, and run_shell; mutations use the parent turn checkpoint and normal permission gate."
                     }
                 },
                 "required": ["description", "prompt", "profile"],
@@ -284,7 +298,13 @@ pub struct McpToolRegistry(pub HashMap<String, (String, String)>);
 fn sanitize_segment(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "_".to_string()
@@ -326,24 +346,39 @@ pub async fn merged_tool_definitions(
     state: &AppState,
     mcp_entries: &[McpServerEntry],
 ) -> (serde_json::Value, McpToolRegistry) {
-    let mut defs: Vec<serde_json::Value> = tool_definitions().as_array().cloned().unwrap_or_default();
+    let mut defs: Vec<serde_json::Value> =
+        tool_definitions().as_array().cloned().unwrap_or_default();
     let mut registry = HashMap::new();
     let mut used: HashSet<String> = HashSet::new();
 
     let guard = state.mcp.lock().await;
     for entry in mcp_entries {
-        let Some(connection) = guard.get(&entry.id) else { continue };
+        let Some(connection) = guard.get(&entry.id) else {
+            continue;
+        };
         let tools: Vec<&mcp::CachedMcpTool> = match &entry.tool_allowlist {
-            Some(allow) => connection.tools.iter().filter(|t| allow.iter().any(|a| a == &t.name)).collect(),
+            Some(allow) => connection
+                .tools
+                .iter()
+                .filter(|t| allow.iter().any(|a| a == &t.name))
+                .collect(),
             None => connection.tools.iter().collect(),
         };
 
         for tool in tools {
-            let base = format!("mcp__{}__{}", sanitize_segment(&entry.id), sanitize_segment(&tool.name));
+            let base = format!(
+                "mcp__{}__{}",
+                sanitize_segment(&entry.id),
+                sanitize_segment(&tool.name)
+            );
             let name = unique_name(base, &mut used);
             registry.insert(name.clone(), (entry.id.clone(), tool.name.clone()));
 
-            let description = format!("[MCP: {}] {}", entry.label, tool.description.clone().unwrap_or_default());
+            let description = format!(
+                "[MCP: {}] {}",
+                entry.label,
+                tool.description.clone().unwrap_or_default()
+            );
             defs.push(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -366,7 +401,11 @@ mod tests {
         McpServerEntry {
             id: id.to_string(),
             label: format!("Server {id}"),
-            transport: mcp::McpTransport::Stdio { command: "echo".to_string(), args: Vec::new(), env: Default::default() },
+            transport: mcp::McpTransport::Stdio {
+                command: "echo".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
             enabled: true,
             tool_allowlist: None,
             timeout_secs: None,
@@ -384,8 +423,14 @@ mod tests {
     fn unique_name_suffixes_on_collision() {
         let mut used = HashSet::new();
         assert_eq!(unique_name("mcp__a__b".to_string(), &mut used), "mcp__a__b");
-        assert_eq!(unique_name("mcp__a__b".to_string(), &mut used), "mcp__a__b_2");
-        assert_eq!(unique_name("mcp__a__b".to_string(), &mut used), "mcp__a__b_3");
+        assert_eq!(
+            unique_name("mcp__a__b".to_string(), &mut used),
+            "mcp__a__b_2"
+        );
+        assert_eq!(
+            unique_name("mcp__a__b".to_string(), &mut used),
+            "mcp__a__b_3"
+        );
     }
 
     #[test]
@@ -393,7 +438,9 @@ mod tests {
         let def = present_plan_tool_def();
         assert_eq!(def["type"], "function");
         assert_eq!(def["function"]["name"], "present_plan");
-        let required = def["function"]["parameters"]["required"].as_array().unwrap();
+        let required = def["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap();
         assert!(required.iter().any(|v| v == "title"));
         assert!(required.iter().any(|v| v == "plan"));
 
@@ -411,8 +458,13 @@ mod tests {
         let names = vec!["Docs".to_string(), "Notes".to_string()];
         let def = search_docs_tool_def(&names);
         assert_eq!(def["function"]["name"], "search_docs");
-        assert!(def["function"]["description"].as_str().unwrap().contains("Docs, Notes"));
-        let required = def["function"]["parameters"]["required"].as_array().unwrap();
+        assert!(def["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Docs, Notes"));
+        let required = def["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap();
         assert!(required.iter().any(|v| v == "query"));
 
         // Only ever appended per-turn by `agent.rs::run_tool_loop` when
@@ -425,18 +477,54 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_def_only_offers_the_explore_profile_and_is_excluded_from_the_base_list() {
+    fn task_tool_def_matches_desktop_profiles_and_is_excluded_from_the_base_list() {
         let def = task_tool_def();
         assert_eq!(def["function"]["name"], "task");
-        let profile_enum = def["function"]["parameters"]["properties"]["profile"]["enum"].as_array().unwrap();
-        assert_eq!(profile_enum, &vec![serde_json::Value::String("explore".to_string())]);
-        assert!(!profile_enum.iter().any(|v| v == "code"));
+        let profile_enum = def["function"]["parameters"]["properties"]["profile"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            profile_enum,
+            &vec![
+                serde_json::Value::String("explore".to_string()),
+                serde_json::Value::String("code".to_string()),
+            ]
+        );
 
         // Only ever appended per-turn by `agent.rs::run_tool_loop` when
         // `--subagents` was given — never part of the base list, and the
         // base list never contains "task" either (agent.rs's depth-1 cap
         // relies on that).
-        assert!(!tool_definitions().as_array().unwrap().iter().any(|t| t["function"]["name"] == "task"));
+        assert!(!tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "task"));
+    }
+
+    #[test]
+    fn base_tool_contract_includes_desktop_glob_capability() {
+        let definitions = tool_definitions();
+        let names = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<HashSet<_>>();
+        for expected in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "run_shell",
+            "remember",
+            "web_fetch",
+            "web_search",
+        ] {
+            assert!(names.contains(expected), "missing CLI tool {expected}");
+        }
     }
 
     #[tokio::test]

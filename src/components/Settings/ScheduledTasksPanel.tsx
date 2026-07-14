@@ -109,8 +109,12 @@ function ScheduleControls({ recipeName }: { recipeName: string }) {
   const entries = useAutomationsStore((s) => s.entries);
   const addEntry = useAutomationsStore((s) => s.addEntry);
   const updateEntry = useAutomationsStore((s) => s.updateEntry);
+  const removeEntry = useAutomationsStore((s) => s.removeEntry);
+  const scheduler = useAutomationsStore((s) => s.scheduler);
   const switchSession = useSessionStore((s) => s.switchSession);
   const entry = entries.find((e) => e.recipeName === recipeName);
+  const scheduleIssue = entry ? scheduler.issues[entry.id] : undefined;
+  const daemonDeliveryAt = entry ? scheduler.lastDeliveryAtMs[entry.id] : undefined;
 
   const [cronDraft, setCronDraft] = useState(entry?.cron ?? "0 3 * * *");
   const [cronDescription, setCronDescription] = useState<{ ok: boolean; message: string } | null>(null);
@@ -163,6 +167,11 @@ function ScheduleControls({ recipeName }: { recipeName: string }) {
         {entry?.lastStatus && (
           <StatusPill tone={RUN_STATUS_TONE[entry.lastStatus] ?? "neutral"}>{entry.lastStatus}</StatusPill>
         )}
+        {entry?.enabled && (
+          <StatusPill tone={scheduler.authority === "daemon" ? (scheduler.daemonRunning ? "success" : "warning") : scheduler.authority === "in_app" ? "neutral" : "warning"}>
+            {scheduler.authority === "daemon" ? "daemon" : scheduler.authority === "in_app" ? "in-app" : "paused"}
+          </StatusPill>
+        )}
         {entry?.lastRunAt && (
           <span className="text-faint">{t("ScheduledTasksPanel.lastRun", { time: new Date(entry.lastRunAt).toLocaleString() })}</span>
         )}
@@ -175,7 +184,20 @@ function ScheduleControls({ recipeName }: { recipeName: string }) {
             {t("ScheduledTasksPanel.viewSession")}
           </button>
         )}
+        {entry && (
+          <IconButton
+            size="sm"
+            onClick={() => removeEntry(entry.id)}
+            aria-label={t("ScheduledTasksPanel.deleteSchedule")}
+          >
+            <Trash2 size={12} />
+          </IconButton>
+        )}
+        {daemonDeliveryAt && (
+          <span className="text-faint">{t("ScheduledTasksPanel.lastDaemonDelivery", { time: new Date(daemonDeliveryAt).toLocaleString() })}</span>
+        )}
       </div>
+      {scheduleIssue && <p className="text-danger">{scheduleIssue}</p>}
       {cronDescription && (
         <p className={cronDescription.ok ? "text-faint" : "text-danger"}>{cronDescription.message}</p>
       )}
@@ -202,6 +224,7 @@ export function ScheduledTasksPanel() {
   const remove = useRecipeStore((s) => s.remove);
   const validate = useRecipeStore((s) => s.validate);
   const readRaw = useRecipeStore((s) => s.readRaw);
+  const scheduler = useAutomationsStore((s) => s.scheduler);
 
   const [editing, setEditing] = useState<{ name: string; content: string; isNew: boolean } | null>(null);
   const [validation, setValidation] = useState<{ ok: boolean; message: string } | null>(null);
@@ -287,6 +310,17 @@ export function ScheduledTasksPanel() {
 
       {listError && <p className="text-xs text-danger">{listError}</p>}
       {actionError && <p className="text-xs text-danger">{actionError}</p>}
+
+      <div className={`rounded-lg border px-3 py-2 text-xs leading-5 ${scheduler.authority === "daemon" ? scheduler.daemonRunning ? "border-success/40 bg-success/5 text-success" : "border-warning/40 bg-warning/5 text-warning" : scheduler.authority === "in_app" ? "border-border bg-surface text-muted" : "border-warning/40 bg-warning/5 text-warning"}`}>
+        {scheduler.authority === "daemon"
+          ? scheduler.daemonRunning
+            ? t("ScheduledTasksPanel.schedulerDaemonRunning")
+            : t("ScheduledTasksPanel.schedulerDaemonStopped")
+          : scheduler.authority === "in_app"
+            ? t("ScheduledTasksPanel.schedulerInApp")
+            : t("ScheduledTasksPanel.schedulerUnknown")}
+        {scheduler.syncError && <p className="mt-1 text-danger">{scheduler.syncError}</p>}
+      </div>
 
       {editing && (
         <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface-2 p-3">

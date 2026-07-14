@@ -6,6 +6,7 @@ import "./index.css";
 import { applyTheme, getStoredTheme } from "./lib/theme";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
 import { hydratePrompts } from "./store/promptStore";
+import { CompanionOverlay } from "./components/Companion";
 
 applyTheme(getStoredTheme());
 
@@ -17,7 +18,17 @@ applyTheme(getStoredTheme());
 // actually lives here in main.tsx (pre-render, not an App.tsx effect), so
 // `hydratePrompts()` follows suit for the same "no user action can race
 // hydration" reason.
-void Promise.all([hydrateSessions(), hydratePrompts()]).finally(() => {
+const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
+
+if (isCompanionOverlay) {
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <CompanionOverlay />
+      </ErrorBoundary>
+    </React.StrictMode>,
+  );
+} else void Promise.all([hydrateSessions(), hydratePrompts()]).finally(() => {
   // Secondary windows opened by the session menu's "Open in > Split view/New
   // window" (see src-tauri/src/system.rs `open_session_window`) load this
   // same entry point with `?session=<id>` — switch to it before the first

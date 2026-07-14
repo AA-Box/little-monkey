@@ -64,9 +64,9 @@ pub fn parse(text: &str) -> Result<ParsedModelfile, String> {
                 }
             }
             "MESSAGE" => {
-                let (role, content_raw) = rest.split_once(char::is_whitespace).ok_or(format!(
-                    "MESSAGE needs a role and content (line {line_no})"
-                ))?;
+                let (role, content_raw) = rest
+                    .split_once(char::is_whitespace)
+                    .ok_or(format!("MESSAGE needs a role and content (line {line_no})"))?;
                 let role = role.to_ascii_lowercase();
                 if !matches!(role.as_str(), "system" | "user" | "assistant") {
                     return Err(format!(
@@ -77,7 +77,9 @@ pub fn parse(text: &str) -> Result<ParsedModelfile, String> {
                 parsed.messages.push(ChatMessage { role, content });
             }
             other => {
-                return Err(format!("Unknown Modelfile instruction '{other}' on line {line_no}"))
+                return Err(format!(
+                    "Unknown Modelfile instruction '{other}' on line {line_no}"
+                ))
             }
         }
     }
@@ -98,13 +100,13 @@ pub fn to_create_request(
         .ok_or("Modelfile has no FROM instruction".to_string())?;
     if std::path::Path::new(&from).exists() {
         return Err(format!(
-            "FROM '{from}' points at a local file/directory. GGUF/safetensors import via monkey-cli create \
+            "FROM '{from}' points at a local file/directory. GGUF/safetensors import via monkey create \
              requires FROM <existing-model>; use `ollama create` for file imports."
         ));
     }
     if parsed.adapter.is_some() {
         return Err(
-            "ADAPTER requires uploading local files, which monkey-cli create doesn't support; \
+            "ADAPTER requires uploading local files, which monkey create doesn't support; \
              use `ollama create` instead."
                 .to_string(),
         );
@@ -116,8 +118,16 @@ pub fn to_create_request(
         adapters: None,
         template: parsed.template,
         system: parsed.system,
-        parameters: if parsed.parameters.is_empty() { None } else { Some(parsed.parameters) },
-        messages: if parsed.messages.is_empty() { None } else { Some(parsed.messages) },
+        parameters: if parsed.parameters.is_empty() {
+            None
+        } else {
+            Some(parsed.parameters)
+        },
+        messages: if parsed.messages.is_empty() {
+            None
+        } else {
+            Some(parsed.messages)
+        },
         license: parsed.license.map(serde_json::Value::String),
         quantize,
         stream: true,
@@ -202,7 +212,10 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.parameters["num_ctx"], serde_json::json!(8192));
         assert_eq!(parsed.parameters["temperature"], serde_json::json!(0.7));
-        assert_eq!(parsed.parameters["penalize_newline"], serde_json::json!(true));
+        assert_eq!(
+            parsed.parameters["penalize_newline"],
+            serde_json::json!(true)
+        );
         assert_eq!(parsed.parameters["mirostat_eta"], serde_json::json!(0.001));
         assert_eq!(parsed.parameters["seed"], serde_json::json!(-1));
     }
@@ -210,7 +223,10 @@ mod tests {
     #[test]
     fn repeated_stop_parameters_accumulate() {
         let parsed = parse("FROM m\nPARAMETER stop \"AI:\"\nPARAMETER stop User:\n").unwrap();
-        assert_eq!(parsed.parameters["stop"], serde_json::json!(["AI:", "User:"]));
+        assert_eq!(
+            parsed.parameters["stop"],
+            serde_json::json!(["AI:", "User:"])
+        );
     }
 
     #[test]
@@ -220,7 +236,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.system.as_deref(), Some("You are terse."));
-        assert_eq!(parsed.template.as_deref(), Some("\n{{ .System }}\n{{ .Prompt }}\n"));
+        assert_eq!(
+            parsed.template.as_deref(),
+            Some("\n{{ .System }}\n{{ .Prompt }}\n")
+        );
     }
 
     #[test]
@@ -238,10 +257,18 @@ mod tests {
 
     #[test]
     fn invalid_input_errors() {
-        assert!(parse("FROM m\nBOGUS thing\n").unwrap_err().contains("BOGUS"));
-        assert!(parse("FROM m\nPARAMETER temperature\n").unwrap_err().contains("PARAMETER"));
-        assert!(parse("FROM m\nMESSAGE narrator hi\n").unwrap_err().contains("role"));
-        assert!(parse("FROM m\nSYSTEM \"\"\"never closed\n").unwrap_err().contains("Unterminated"));
+        assert!(parse("FROM m\nBOGUS thing\n")
+            .unwrap_err()
+            .contains("BOGUS"));
+        assert!(parse("FROM m\nPARAMETER temperature\n")
+            .unwrap_err()
+            .contains("PARAMETER"));
+        assert!(parse("FROM m\nMESSAGE narrator hi\n")
+            .unwrap_err()
+            .contains("role"));
+        assert!(parse("FROM m\nSYSTEM \"\"\"never closed\n")
+            .unwrap_err()
+            .contains("Unterminated"));
     }
 
     #[test]
@@ -269,14 +296,21 @@ mod tests {
             .contains("FROM"));
 
         let dir = std::env::temp_dir();
-        let parsed = ParsedModelfile { from: Some(dir.to_string_lossy().to_string()), ..Default::default() };
-        assert!(to_create_request(parsed, "m", None).unwrap_err().contains("ollama create"));
+        let parsed = ParsedModelfile {
+            from: Some(dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(to_create_request(parsed, "m", None)
+            .unwrap_err()
+            .contains("ollama create"));
 
         let parsed = ParsedModelfile {
             from: Some("qwen3-coder:latest".to_string()),
             adapter: Some("./lora.gguf".to_string()),
             ..Default::default()
         };
-        assert!(to_create_request(parsed, "m", None).unwrap_err().contains("ADAPTER"));
+        assert!(to_create_request(parsed, "m", None)
+            .unwrap_err()
+            .contains("ADAPTER"));
     }
 }

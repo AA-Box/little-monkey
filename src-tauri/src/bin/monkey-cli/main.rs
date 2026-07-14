@@ -1,21 +1,27 @@
 //! LM's terminal agent: same sandboxed file/shell tools and permission
 //! model as the desktop app (reused directly from `little_monkey_lib`), driven from
 //! a shell instead of a WebView. Supports both a one-shot invocation
-//! (`monkey-cli "prompt"`) and an interactive REPL (`monkey-cli`, no prompt), plus
-//! Ollama-CLI-style model management subcommands (`monkey-cli list/pull/run/...`)
+//! (`monkey MODEL "prompt"`) and an interactive REPL (`monkey MODEL`, no prompt), plus
+//! Ollama-CLI-style model management subcommands (`monkey list/pull/run/...`)
 //! spoken directly to the daemon's HTTP API.
 
+mod acp;
 mod agent;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
+mod daemon;
+mod durable_run;
 mod embed_cli;
 mod mcp_cli;
 mod modelfile;
 mod ollama_api;
 mod permission;
+mod plugins_cli;
 mod providers_cli;
 mod repl;
+mod security_cli;
+mod skills_cli;
 mod sse;
 mod stacks_cli;
 mod task;
@@ -23,7 +29,9 @@ mod tools_cli;
 mod tools_def;
 mod verify_cli;
 mod web_cli;
+mod workflow_cli;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
@@ -35,15 +43,22 @@ use little_monkey_lib::{memory, rules, AppState};
 use permission::{PermissionMode, TerminalPermissions};
 
 #[derive(Parser, Debug)]
-#[command(name = "monkey-cli", version, about)]
+#[command(name = "monkey", bin_name = "monkey", version, about)]
 struct Cli {
     /// Ollama-style model management subcommand. Note: a bare first argument
-    /// matching a subcommand name (e.g. `monkey-cli list`) parses as that
+    /// matching a subcommand name (e.g. `monkey list`) parses as that
     /// subcommand, not as a prompt — quote-and-rephrase such prompts.
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
-    /// One-shot prompt. Omit to start an interactive REPL instead.
+    /// Model name in the short form (`monkey llama3.2 "prompt"`), or the
+    /// prompt when a legacy explicit target flag already supplies a model.
+    #[arg(value_name = "MODEL")]
+    model_or_prompt: Option<String>,
+
+    /// One-shot prompt for the short model-first form. Omit it to start an
+    /// interactive REPL with the selected model.
+    #[arg(value_name = "PROMPT")]
     prompt: Option<String>,
 
     /// Workspace root the agent's tools are sandboxed to. Defaults to the
@@ -51,19 +66,18 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     workspace: Option<PathBuf>,
 
-    /// Cloud provider id (e.g. "openai", "anthropic", "gemini",
-    /// "openrouter", or a custom provider's id) — requires a key already
-    /// saved via the desktop app's Settings, and --model.
+    /// Provider id (for example ollama, managed-llama, openai, anthropic,
+    /// gemini, openrouter, or a custom provider id). Use only to override or
+    /// disambiguate automatic local-first model resolution.
     #[arg(long)]
     provider: Option<String>,
 
-    /// Model id for --provider, or for --ollama/--local-url when the
-    /// server serves more than one model.
+    /// Compatibility form for a model id. Prefer the first positional model:
+    /// `monkey [--provider ID] MODEL [PROMPT]`.
     #[arg(long)]
     model: Option<String>,
 
-    /// Talk to a local Ollama daemon (http://127.0.0.1:11434) using this
-    /// model tag.
+    /// Compatibility alias for `--provider ollama MODEL`.
     #[arg(long)]
     ollama: Option<String>,
 
@@ -210,14 +224,12 @@ struct ChatFlags {
     no_verify: bool,
 
     /// Offer the `task` tool this turn, letting the model delegate a scoped
-    /// subtask to a subagent with its own restricted (explore-only:
-    /// read_file/list_dir/grep) tool-calling loop — CLI parity for the
+    /// subtask to a subagent with an explicit explore or code profile — CLI parity for the
     /// desktop app's Subagents feature (docs/roadmap/p3-subagents.md slice
     /// 5). Off by default, same posture as `--verify`/the GUI's
     /// `subagentsEnabled` toggle: running an extra model-initiated loop
-    /// should be opt-in. Only the `explore` profile is supported here — the
-    /// CLI has no per-turn checkpoints to safely land a mutating subagent's
-    /// writes into.
+    /// should be opt-in. Code-profile writes reuse the parent turn checkpoint
+    /// and normal permission gate; neither profile can delegate recursively.
     #[arg(long, global = true)]
     subagents: bool,
 }
@@ -233,20 +245,35 @@ impl ChatFlags {
             num_ctx: self.num_ctx,
             num_predict: self.num_predict,
             system: self.system.clone(),
-            format: self.format.as_deref().map(chat::parse_format_flag).transpose()?,
-            think: self.think.as_deref().map(chat::parse_think_flag).transpose()?,
+            format: self
+                .format
+                .as_deref()
+                .map(chat::parse_format_flag)
+                .transpose()?,
+            think: self
+                .think
+                .as_deref()
+                .map(chat::parse_think_flag)
+                .transpose()?,
             hide_thinking: self.hidethinking,
             keep_alive: self.keepalive.clone(),
+            effort: None,
             verbose: self.verbose,
             attach_images: self.attach_images,
             verify: self.verify && !self.no_verify,
+            verify_max_rounds: None,
             subagents: self.subagents,
+            memory_enabled: None,
+            quiet: false,
         })
     }
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Agent Client Protocol v1 server over newline-delimited JSON-RPC stdio.
+    /// The IDE is a client only; Little Monkey retains approval authority.
+    Acp,
     /// List models available locally
     List,
     /// List running models
@@ -348,6 +375,22 @@ enum Cmd {
     /// docs/roadmap/p3-scheduled-automation.md.
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Validate, run, inspect, and replay the same typed workflows as the
+    /// desktop visual editor.
+    #[command(subcommand)]
+    Workflow(workflow_cli::WorkflowCmd),
+    /// Explicitly installed persistent local background-agent service.
+    #[command(subcommand)]
+    Daemon(daemon::DaemonCmd),
+    /// Discover, preview, install, update, disable, and roll back data-only SKILL.md skills.
+    #[command(subcommand)]
+    Skills(skills_cli::SkillsCmd),
+    /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.
+    #[command(subcommand)]
+    Plugins(plugins_cli::PluginsCmd),
+    /// Inspect local security posture and apply narrowly-scoped safe fixes.
+    #[command(subcommand)]
+    Security(security_cli::SecurityCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -364,6 +407,11 @@ enum TaskCmd {
         /// a param the recipe actually declares.
         #[arg(long = "param", value_name = "KEY=VALUE")]
         param: Vec<String>,
+        /// Stable caller-owned idempotency key for crash/retry safety. The
+        /// raw value is never stored; the ledger receives its SHA-256 digest.
+        /// Falls back to LITTLE_MONKEY_RUN_KEY, then a fresh per-invocation key.
+        #[arg(long, value_name = "KEY")]
+        run_key: Option<String>,
         /// Emit a single JSON result object on stdout instead of plain text.
         #[arg(long)]
         json: bool,
@@ -372,6 +420,13 @@ enum TaskCmd {
     Validate {
         /// Path to the recipe file.
         path: String,
+    },
+    /// Normalizes and compares desktop/CLI durable event streams from one
+    /// JSON fixture (`{"desktop":[...],"cli":[...]}`). Volatile authority
+    /// metadata and model-delta chunk boundaries do not count as differences.
+    Conformance {
+        /// Path to the conformance fixture JSON.
+        fixture: String,
     },
     /// Lists every recipe visible from the current directory (its own
     /// `.littlemonkey/recipes/`) plus the global recipes directory.
@@ -425,35 +480,213 @@ enum EmbedServerCmd {
     Status,
 }
 
-fn resolve_target(cli: &Cli) -> Result<chat::Target, String> {
-    if let Some(provider) = &cli.provider {
-        let model = cli.model.clone().ok_or("--provider requires --model")?;
-        return Ok(chat::Target::Provider { provider_id: provider.clone(), model });
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FlatInvocation {
+    model: Option<String>,
+    prompt: Option<String>,
+}
+
+fn flat_invocation(cli: &Cli) -> Result<FlatInvocation, String> {
+    let explicit_targets = usize::from(cli.provider.is_some())
+        + usize::from(cli.ollama.is_some())
+        + usize::from(cli.local_url.is_some());
+    if explicit_targets > 1 {
+        return Err("Choose only one of --provider, --ollama, or --local-url".to_string());
     }
+    let reject_extra = || {
+        if cli.prompt.is_some() {
+            Err("Too many positional arguments for the legacy target form".to_string())
+        } else {
+            Ok(())
+        }
+    };
+
     if let Some(model) = &cli.ollama {
-        return Ok(chat::Target::Local {
-            base_url: ollama_api::host(),
+        reject_extra()?;
+        return Ok(FlatInvocation {
             model: Some(model.clone()),
-            native_ollama: true,
+            prompt: cli.model_or_prompt.clone(),
         });
+    }
+    if cli.provider.is_some() {
+        if let Some(model) = &cli.model {
+            reject_extra()?;
+            return Ok(FlatInvocation {
+                model: Some(model.clone()),
+                prompt: cli.model_or_prompt.clone(),
+            });
+        }
+        return Ok(FlatInvocation {
+            model: cli.model_or_prompt.clone(),
+            prompt: cli.prompt.clone(),
+        });
+    }
+    if cli.local_url.is_some() {
+        if let Some(model) = &cli.model {
+            reject_extra()?;
+            return Ok(FlatInvocation {
+                model: Some(model.clone()),
+                prompt: cli.model_or_prompt.clone(),
+            });
+        }
+        // One positional keeps the historical `--local-url URL "prompt"`
+        // form (the server may expose one implicit model); two positionals
+        // use the new MODEL PROMPT form.
+        return if cli.prompt.is_some() {
+            Ok(FlatInvocation {
+                model: cli.model_or_prompt.clone(),
+                prompt: cli.prompt.clone(),
+            })
+        } else {
+            Ok(FlatInvocation {
+                model: None,
+                prompt: cli.model_or_prompt.clone(),
+            })
+        };
+    }
+    if let Some(model) = &cli.model {
+        reject_extra()?;
+        return Ok(FlatInvocation {
+            model: Some(model.clone()),
+            prompt: cli.model_or_prompt.clone(),
+        });
+    }
+    Ok(FlatInvocation {
+        model: cli.model_or_prompt.clone(),
+        prompt: cli.prompt.clone(),
+    })
+}
+
+fn native_ollama_target(model: String) -> chat::Target {
+    chat::Target::Local {
+        base_url: ollama_api::host(),
+        model: Some(model),
+        native_ollama: true,
+    }
+}
+
+fn ollama_has_model(tags: &ollama_api::TagsResp, model: &str) -> bool {
+    let wanted = if model.contains(':') {
+        model.to_string()
+    } else {
+        format!("{model}:latest")
+    };
+    tags.models
+        .iter()
+        .any(|entry| entry.name == model || entry.name == wanted)
+}
+
+async fn providers_with_model(model: &str) -> Vec<String> {
+    let custom = providers_cli::load_custom_providers();
+    let mut ids = little_monkey_lib::providers::providers_list_presets()
+        .into_iter()
+        .map(|preset| preset.id)
+        .collect::<BTreeSet<_>>();
+    ids.extend(custom.iter().map(|provider| provider.id.clone()));
+    let checks = ids.into_iter().map(|provider_id| {
+        let custom = custom.clone();
+        let model = model.to_string();
+        async move {
+            let base_url =
+                little_monkey_lib::providers::resolve_base_url(&provider_id, &custom).ok()?;
+            let key = little_monkey_lib::providers::read_key_with_env(&provider_id).ok()?;
+            let models = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                little_monkey_lib::providers::fetch_models(&base_url, &provider_id, &key),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            models
+                .iter()
+                .any(|entry| entry.id == model)
+                .then_some(provider_id)
+        }
+    });
+    let mut matches = futures_util::future::join_all(checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+}
+
+async fn resolve_target(
+    cli: &Cli,
+    invocation: &FlatInvocation,
+    client: &reqwest::Client,
+) -> Result<chat::Target, String> {
+    if let Some(provider) = &cli.provider {
+        let model = invocation
+            .model
+            .clone()
+            .ok_or("--provider requires a positional MODEL (or legacy --model)")?;
+        return match provider.as_str() {
+            "ollama" => Ok(native_ollama_target(model)),
+            "managed-llama" | "llama" | "llama.cpp" => Ok(chat::Target::Local {
+                base_url: "http://127.0.0.1:8090".to_string(),
+                model: Some(model),
+                native_ollama: false,
+            }),
+            _ => Ok(chat::Target::Provider {
+                provider_id: provider.clone(),
+                model,
+            }),
+        };
+    }
+    if cli.ollama.is_some() {
+        return Ok(native_ollama_target(
+            invocation.model.clone().expect("--ollama supplies a model"),
+        ));
     }
     if let Some(base_url) = &cli.local_url {
         return Ok(chat::Target::Local {
             base_url: base_url.clone(),
-            model: cli.model.clone(),
+            model: invocation.model.clone(),
             native_ollama: false,
         });
     }
-    Err(
-        "No model target given. Pass --provider <id> --model <name>, --ollama <model>, or --local-url <url>."
-            .to_string(),
-    )
+
+    let Some(model) = invocation.model.as_deref() else {
+        let tags = ollama_api::tags(client).await.map_err(|error| {
+            format!(
+                "No model was given and no default could be discovered from Ollama: {error}. Try `monkey MODEL` or `monkey --provider ID MODEL`."
+            )
+        })?;
+        let model = tags
+            .models
+            .first()
+            .map(|entry| entry.name.clone())
+            .ok_or("No model was given and Ollama has no installed models")?;
+        return Ok(native_ollama_target(model));
+    };
+
+    if ollama_api::tags(client)
+        .await
+        .is_ok_and(|tags| ollama_has_model(&tags, model))
+    {
+        return Ok(native_ollama_target(model.to_string()));
+    }
+    let providers = providers_with_model(model).await;
+    match providers.as_slice() {
+        [provider] => Ok(chat::Target::Provider {
+            provider_id: provider.clone(),
+            model: model.to_string(),
+        }),
+        [] => Ok(native_ollama_target(model.to_string())),
+        _ => Err(format!(
+            "Model '{model}' is available from multiple providers ({}). Choose one with `--provider ID`.",
+            providers.join(", ")
+        )),
+    }
 }
 
 fn build_state(workspace: &Option<PathBuf>) -> Result<AppState, String> {
     let root = match workspace {
         Some(p) => p.clone(),
-        None => std::env::current_dir().map_err(|e| format!("Failed to resolve current directory: {e}"))?,
+        None => std::env::current_dir()
+            .map_err(|e| format!("Failed to resolve current directory: {e}"))?,
     };
     let canonical = root
         .canonicalize()
@@ -468,7 +701,11 @@ fn build_state(workspace: &Option<PathBuf>) -> Result<AppState, String> {
     let id = canonical.to_string_lossy().to_string();
 
     let state = AppState::default();
-    *state.workspace_roots.lock().unwrap() = vec![WorkspaceRoot { id, path: canonical, label }];
+    *state.workspace_roots.lock().unwrap() = vec![WorkspaceRoot {
+        id,
+        path: canonical,
+        label,
+    }];
     Ok(state)
 }
 
@@ -498,7 +735,9 @@ fn load_prompt_entries_impl(data_dir: &Path) -> Vec<PromptEntry> {
     let Ok(Some(raw)) = prompts::load_impl(&path) else {
         return Vec::new();
     };
-    serde_json::from_str::<PromptsBlob>(&raw).map(|blob| blob.entries).unwrap_or_default()
+    serde_json::from_str::<PromptsBlob>(&raw)
+        .map(|blob| blob.entries)
+        .unwrap_or_default()
 }
 
 /// Resolves the real app-data dir and defers to [`load_prompt_entries_impl`].
@@ -514,7 +753,10 @@ fn load_prompt_entries() -> Vec<PromptEntry> {
 /// Kept as a pure list lookup (rather than doing the loading itself) so it's
 /// unit-testable without touching disk.
 fn find_persona_entry(entries: &[PromptEntry], command: &str) -> Option<PromptEntry> {
-    entries.iter().find(|e| e.kind == "persona" && e.command == command).cloned()
+    entries
+        .iter()
+        .find(|e| e.kind == "persona" && e.command == command)
+        .cloned()
 }
 
 /// Resolves `--persona <command>` against `<data_dir>/prompts.json`; `Err`
@@ -554,7 +796,10 @@ fn format_persona_section(entry: &PromptEntry) -> String {
 /// APPENDS, never replaces, the persona alongside the system text — same
 /// "base prompt carries load-bearing guidance" rationale as
 /// `composeSystemPrompt` on the frontend.
-fn compose_persona_and_system(persona: Option<&PromptEntry>, user_system: Option<&str>) -> Option<String> {
+fn compose_persona_and_system(
+    persona: Option<&PromptEntry>,
+    user_system: Option<&str>,
+) -> Option<String> {
     match (persona, user_system) {
         (Some(p), Some(s)) => Some(format!("{}\n\n{}", format_persona_section(p), s)),
         (Some(p), None) => Some(format_persona_section(p)),
@@ -576,7 +821,11 @@ fn compose_persona_and_system(persona: Option<&PromptEntry>, user_system: Option
 /// say. Returns `None` when there's nothing to say at all (no rules, no
 /// facts, no `--system`) — the same "no system message" behavior as before
 /// this existed.
-fn compose_system_prompt_impl(data_dir: &Path, state: &AppState, user_system: Option<&str>) -> Option<String> {
+fn compose_system_prompt_impl(
+    data_dir: &Path,
+    state: &AppState,
+    user_system: Option<&str>,
+) -> Option<String> {
     let global_path = data_dir.join("MONKEY.md");
     let roots = workspace::all_roots(state).unwrap_or_default();
     let rule_files = rules::read_rules_impl(&global_path, &roots);
@@ -586,7 +835,12 @@ fn compose_system_prompt_impl(data_dir: &Path, state: &AppState, user_system: Op
         .and_then(|root| {
             memory::load_impl(&data_dir.join("memories.json"))
                 .ok()
-                .and_then(|memories| memories.projects.get(&root.to_string_lossy().to_string()).cloned())
+                .and_then(|memories| {
+                    memories
+                        .projects
+                        .get(&root.to_string_lossy().to_string())
+                        .cloned()
+                })
         })
         .map(|project| project.facts)
         .unwrap_or_default();
@@ -617,7 +871,11 @@ fn compose_system_prompt_impl(data_dir: &Path, state: &AppState, user_system: Op
         }
     }
 
-    let rules_and_facts = if sections.is_empty() { None } else { Some(sections.join("\n")) };
+    let rules_and_facts = if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    };
 
     match (rules_and_facts, user_system) {
         (Some(rf), Some(us)) => Some(format!("{rf}\n\n{us}")),
@@ -665,11 +923,25 @@ fn effective_system(cli: &Cli, state: &AppState, user_system: Option<&str>) -> O
 /// into a string (see [`chat_loop`], `repl::run`). An unresolvable
 /// `--persona <command>` is still a hard error here, before any network
 /// target is contacted.
-fn chat_setup(cli: &Cli) -> Result<(AppState, PermissionMode, chat::ChatOptions, Option<PromptEntry>), String> {
+fn chat_setup(
+    cli: &Cli,
+) -> Result<
+    (
+        AppState,
+        PermissionMode,
+        chat::ChatOptions,
+        Option<PromptEntry>,
+    ),
+    String,
+> {
     let state = build_state(&cli.workspace)?;
     let mode = PermissionMode::parse(&cli.permission_mode)?;
     let mut options = cli.chat.to_options()?;
-    let persona = cli.persona.as_deref().map(resolve_persona_entry).transpose()?;
+    let persona = cli
+        .persona
+        .as_deref()
+        .map(resolve_persona_entry)
+        .transpose()?;
     options.system = effective_system(cli, &state, options.system.as_deref());
     Ok((state, mode, options, persona))
 }
@@ -699,24 +971,52 @@ async fn main() {
     let client = reqwest::Client::new();
 
     if let Some(cmd) = &cli.cmd {
-        if let Some(prompt) = &cli.prompt {
-            fail(&format!("unexpected argument '{prompt}' before a subcommand"));
+        if let Some(prompt) = cli.model_or_prompt.as_ref().or(cli.prompt.as_ref()) {
+            fail(&format!(
+                "unexpected argument '{prompt}' before a subcommand"
+            ));
         }
         run_subcommand(&cli, cmd, &client).await;
         return;
     }
 
-    // Classic flat invocation: prompt/REPL against --provider/--ollama/--local-url.
-    let target = match resolve_target(&cli) {
+    let invocation = match flat_invocation(&cli) {
+        Ok(invocation) => invocation,
+        Err(error) => fail(&error),
+    };
+    // Short model-first invocation, with explicit provider/legacy forms kept
+    // as compatibility overrides.
+    let target = match resolve_target(&cli, &invocation, &client).await {
         Ok(t) => t,
         Err(e) => fail(&e),
     };
+    if let chat::Target::Local {
+        model: Some(model),
+        native_ollama: true,
+        ..
+    } = &target
+    {
+        if let Err(error) = cmds::ensure_model(&client, model).await {
+            fail(&error);
+        }
+    }
     let (state, mode, options, persona) = match chat_setup(&cli) {
         Ok(v) => v,
         Err(e) => fail(&e),
     };
     let mcp_entries = resolve_mcp_entries(&cli, &state).await;
-    chat_loop(&client, target, &state, mode, options, persona, cli.prompt.as_deref(), &mcp_entries, &cli.stack).await;
+    chat_loop(
+        &client,
+        target,
+        &state,
+        mode,
+        options,
+        persona,
+        invocation.prompt.as_deref(),
+        &mcp_entries,
+        &cli.stack,
+    )
+    .await;
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -726,19 +1026,44 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Ps => cmds::ps(client).await,
         Cmd::Pull { model, insecure } => cmds::pull(client, model, *insecure).await,
         Cmd::Rm { models } => cmds::rm(client, models).await,
-        Cmd::Cp { source, destination } => cmds::cp(client, source, destination).await,
-        Cmd::Show { model, modelfile, parameters, template, system, license } => {
-            cmds::show(client, model, *modelfile, *parameters, *template, *system, *license).await
+        Cmd::Cp {
+            source,
+            destination,
+        } => cmds::cp(client, source, destination).await,
+        Cmd::Show {
+            model,
+            modelfile,
+            parameters,
+            template,
+            system,
+            license,
+        } => {
+            cmds::show(
+                client,
+                model,
+                *modelfile,
+                *parameters,
+                *template,
+                *system,
+                *license,
+            )
+            .await
         }
         Cmd::Stop { model } => cmds::stop(client, model).await,
         Cmd::Push { model, insecure } => cmds::push(client, model, *insecure).await,
-        Cmd::Create { model, file, quantize } => {
-            cmds::create(client, model, file, quantize.clone()).await
-        }
+        Cmd::Create {
+            model,
+            file,
+            quantize,
+        } => cmds::create(client, model, file, quantize.clone()).await,
         Cmd::Signin => cmds::passthrough("signin"),
         Cmd::Signout => cmds::passthrough("signout"),
         Cmd::Serve => cmds::passthrough("serve"),
-        Cmd::Run { model, prompt, system } => {
+        Cmd::Run {
+            model,
+            prompt,
+            system,
+        } => {
             // Validate chat-side flags before a potentially long auto-pull.
             let (state, mode, mut options, persona) = match chat_setup(cli) {
                 Ok(v) => v,
@@ -763,8 +1088,18 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 native_ollama: true,
             };
             let mcp_entries = resolve_mcp_entries(cli, &state).await;
-            chat_loop(client, target, &state, mode, options, persona, prompt.as_deref(), &mcp_entries, &cli.stack)
-                .await;
+            chat_loop(
+                client,
+                target,
+                &state,
+                mode,
+                options,
+                persona,
+                prompt.as_deref(),
+                &mcp_entries,
+                &cli.stack,
+            )
+            .await;
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -778,7 +1113,9 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
         Cmd::Stacks(action) => match action {
             StacksCmd::List => stacks_cli::list(),
             StacksCmd::Reindex { name } => stacks_cli::reindex(name).await,
-            StacksCmd::EmbedServer(EmbedServerCmd::Start { model_path }) => embed_cli::start(model_path.clone()).await,
+            StacksCmd::EmbedServer(EmbedServerCmd::Start { model_path }) => {
+                embed_cli::start(model_path.clone()).await
+            }
             StacksCmd::EmbedServer(EmbedServerCmd::Stop) => embed_cli::stop(),
             StacksCmd::EmbedServer(EmbedServerCmd::Status) => embed_cli::status(),
         },
@@ -787,14 +1124,75 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             // doc slice 1) — it can't go through the shared `fail()` (always
             // exit 1) below, so it exits directly here instead of returning
             // into the `result` match.
-            TaskCmd::Run { name_or_path, param, json } => {
-                let code = task::run(cli, client, name_or_path, param, *json).await;
+            TaskCmd::Run {
+                name_or_path,
+                param,
+                run_key,
+                json,
+            } => {
+                let code =
+                    task::run(cli, client, name_or_path, param, run_key.as_deref(), *json).await;
                 std::process::exit(code);
             }
             TaskCmd::Validate { path } => task::validate(path),
+            TaskCmd::Conformance { fixture } => task::conformance(fixture),
             TaskCmd::List => task::list(),
             TaskCmd::Schedule { name_or_path, cron } => task::schedule(name_or_path, cron),
         },
+        Cmd::Workflow(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => workflow_cli::run(action, &data_dir),
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Daemon(action) => daemon::run(cli, action).await,
+        Cmd::Skills(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => {
+                    let workspace = cli.workspace.clone().unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                    let workspace = workspace.canonicalize().map_err(|error| {
+                        format!(
+                            "Could not resolve workspace '{}': {error}",
+                            workspace.display()
+                        )
+                    });
+                    match workspace {
+                        Ok(workspace) => skills_cli::run(action, &data_dir, Some(&workspace)),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Plugins(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => plugins_cli::run(action, &data_dir),
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Security(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => {
+                    let workspace = cli.workspace.clone().unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                    let workspace = workspace.canonicalize().ok();
+                    security_cli::run(action, &data_dir, workspace.as_deref())
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Acp => acp::run(cli).await,
     };
     if let Err(e) = result {
         fail(&e);
@@ -808,12 +1206,18 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
 /// the one place the actual routing/proxy/accept-loop logic lives, so this
 /// function is pure CLI-args-to-config wiring, nothing more.
 async fn run_api_serve(port_override: Option<u16>) -> Result<(), String> {
-    let data_dir = app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    let data_dir =
+        app_data_dir().ok_or_else(|| "Could not resolve the app data directory".to_string())?;
     let config_path = data_dir.join("api_server.json");
     let saved_config = little_monkey_lib::server::load_config_impl(&config_path)?;
     let port = port_override.unwrap_or(saved_config.port);
 
-    little_monkey_lib::server::run_cli_server(port, config_path, providers_cli::load_custom_providers).await
+    little_monkey_lib::server::run_cli_server(
+        port,
+        config_path,
+        providers_cli::load_custom_providers,
+    )
+    .await
 }
 
 /// Runs the chat side — a one-shot turn, or the interactive REPL when no
@@ -843,11 +1247,33 @@ async fn chat_loop(
     if !target.is_native()
         && (options.num_ctx.is_some() || options.keep_alive.is_some() || options.think.is_some())
     {
-        eprintln!("Warning: --num-ctx, --keepalive, and --think only apply to Ollama targets; ignoring.");
+        eprintln!(
+            "Warning: --num-ctx, --keepalive, and --think only apply to Ollama targets; ignoring."
+        );
     }
 
+    let prompt_entries = load_prompt_entries();
+    let workspace = workspace::primary_root_canon(state).ok();
+    let discovered_skills = match app_data_dir() {
+        Some(data_dir) => {
+            match skills_cli::discover_for_chat(&data_dir, workspace.as_deref(), &prompt_entries) {
+                Ok(skills) => skills,
+                Err(error) => fail(&format!("Could not load the skill registry: {error}")),
+            }
+        }
+        None => Vec::new(),
+    };
+
     if let Some(prompt) = prompt {
-        options.system = compose_persona_and_system(persona.as_ref(), options.system.as_deref());
+        let base_system = compose_persona_and_system(persona.as_ref(), options.system.as_deref());
+        options.system = match skills_cli::compose_for_prompt(
+            base_system.as_deref(),
+            prompt,
+            &discovered_skills,
+        ) {
+            Ok(system) => system,
+            Err(error) => fail(&error),
+        };
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
         if let Err(e) = agent::run_turn(
@@ -869,12 +1295,24 @@ async fn chat_loop(
         return;
     }
 
-    repl::run(client, target, state, mode, options, persona, mcp_entries, attached_stacks).await;
+    repl::run(
+        client,
+        target,
+        state,
+        mode,
+        options,
+        persona,
+        discovered_skills,
+        mcp_entries,
+        attached_stacks,
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir {
@@ -889,7 +1327,12 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("monkey_cli_main_test_{}_{}_{}", std::process::id(), n, nanos));
+            let path = std::env::temp_dir().join(format!(
+                "monkey_cli_main_test_{}_{}_{}",
+                std::process::id(),
+                n,
+                nanos
+            ));
             std::fs::create_dir_all(&path).unwrap();
             TempDir { path }
         }
@@ -912,12 +1355,77 @@ mod tests {
     }
 
     #[test]
+    fn short_model_first_invocation_parses_without_target_flags() {
+        let cli = Cli::try_parse_from(["monkey", "llama3.2", "Summarize this project"])
+            .expect("short invocation");
+        assert!(cli.cmd.is_none());
+        assert_eq!(
+            flat_invocation(&cli).unwrap(),
+            FlatInvocation {
+                model: Some("llama3.2".to_string()),
+                prompt: Some("Summarize this project".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn help_uses_the_installed_monkey_command_name() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Usage: monkey "), "{help}");
+        assert!(!help.contains("Usage: monkey-cli"), "{help}");
+    }
+
+    #[test]
+    fn provider_is_an_optional_disambiguator_in_the_short_form() {
+        let cli = Cli::try_parse_from([
+            "monkey",
+            "--provider",
+            "openrouter",
+            "shared-model",
+            "Review this",
+        ])
+        .expect("provider short invocation");
+        assert_eq!(cli.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            flat_invocation(&cli).unwrap().model.as_deref(),
+            Some("shared-model")
+        );
+        assert_eq!(
+            flat_invocation(&cli).unwrap().prompt.as_deref(),
+            Some("Review this")
+        );
+    }
+
+    #[test]
+    fn legacy_ollama_form_remains_compatible() {
+        let cli = Cli::try_parse_from(["monkey", "--ollama", "llama3.2", "Hello"])
+            .expect("legacy invocation");
+        assert_eq!(
+            flat_invocation(&cli).unwrap(),
+            FlatInvocation {
+                model: Some("llama3.2".to_string()),
+                prompt: Some("Hello".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn management_subcommands_still_win_over_model_positionals() {
+        let cli = Cli::try_parse_from(["monkey", "list"]).expect("list subcommand");
+        assert!(matches!(cli.cmd, Some(Cmd::List)));
+        assert!(cli.model_or_prompt.is_none());
+    }
+
+    #[test]
     fn no_rules_no_facts_no_system_composes_to_none() {
         let data_dir = TempDir::new();
         let ws = TempDir::new();
         let state = state_with_primary_root(&ws.path);
 
-        assert_eq!(compose_system_prompt_impl(&data_dir.path, &state, None), None);
+        assert_eq!(
+            compose_system_prompt_impl(&data_dir.path, &state, None),
+            None
+        );
     }
 
     #[test]
@@ -994,6 +1502,7 @@ mod tests {
         // above).
         let cli = Cli {
             cmd: None,
+            model_or_prompt: None,
             prompt: None,
             workspace: None,
             provider: None,
@@ -1025,7 +1534,10 @@ mod tests {
             },
         };
 
-        assert_eq!(effective_system(&cli, &state, Some("Only this.")), Some("Only this.".to_string()));
+        assert_eq!(
+            effective_system(&cli, &state, Some("Only this.")),
+            Some("Only this.".to_string())
+        );
         assert_eq!(effective_system(&cli, &state, None), None);
     }
 
@@ -1086,7 +1598,9 @@ mod tests {
 
         let entries = load_prompt_entries_impl(&data_dir.path);
         assert_eq!(entries.len(), 3);
-        assert!(entries.iter().any(|e| e.command == "code-reviewer" && e.kind == "persona"));
+        assert!(entries
+            .iter()
+            .any(|e| e.command == "code-reviewer" && e.kind == "persona"));
     }
 
     #[test]
@@ -1195,7 +1709,9 @@ mod tests {
         // after `chat_setup` (no persona folded in — see its doc comment).
         let system_after_own_override = Some("Reply in French.".to_string());
 
-        let folded = compose_persona_and_system(Some(&persona), system_after_own_override.as_deref()).unwrap();
+        let folded =
+            compose_persona_and_system(Some(&persona), system_after_own_override.as_deref())
+                .unwrap();
         assert!(folded.contains("## Active persona: Code Reviewer"));
         assert!(folded.contains("Review code carefully."));
         assert!(folded.ends_with("Reply in French."));
@@ -1209,6 +1725,7 @@ mod tests {
         // rather than silently proceeding with no persona.
         let cli = Cli {
             cmd: None,
+            model_or_prompt: None,
             prompt: None,
             workspace: None,
             provider: None,

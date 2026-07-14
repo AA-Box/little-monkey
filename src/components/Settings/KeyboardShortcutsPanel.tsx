@@ -351,7 +351,7 @@ export function KeyboardShortcutsPanel() {
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+    <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex max-w-2xl flex-col items-start gap-2">
           <p className="text-sm leading-6 text-muted">

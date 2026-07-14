@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
+    "test:compare:live": "node scripts/smoke-compare-ollama.mjs",
+    "test:git-delivery-action": "node .github/actions/little-monkey-review/review.test.mjs",
     "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
     "stage:cli": "node scripts/stage-cli-sidecar.mjs",

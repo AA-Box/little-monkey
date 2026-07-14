@@ -22,6 +22,8 @@ function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSess
     unread: false,
     archived: false,
     groupId: null,
+    modelTarget: null,
+    comparisonBranch: null,
     workspacePath: null,
     personaId: null,
     attachedStackIds: [],

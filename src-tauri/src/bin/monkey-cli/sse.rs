@@ -110,9 +110,18 @@ impl SseParser {
 
         if let Some(usage) = payload.get("usage") {
             events.push(StreamEvent::Usage {
-                prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                completion_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                total_tokens: usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                prompt_tokens: usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                completion_tokens: usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                total_tokens: usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
             });
         }
 
@@ -121,13 +130,19 @@ impl SseParser {
         };
         let delta = choice.get("delta");
 
-        if let Some(content) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+        if let Some(content) = delta
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+        {
             if !content.is_empty() {
                 events.push(StreamEvent::Delta(content.to_string()));
             }
         }
 
-        if let Some(tool_calls) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
+        if let Some(tool_calls) = delta
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|t| t.as_array())
+        {
             for fragment in tool_calls {
                 let index = fragment.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                 let entry = self.pending.entry(index).or_default();
@@ -151,7 +166,10 @@ impl SseParser {
             }
         }
 
-        let finish_reason_present = choice.get("finish_reason").map(|v| !v.is_null()).unwrap_or(false);
+        let finish_reason_present = choice
+            .get("finish_reason")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
         if finish_reason_present && !self.pending.is_empty() {
             self.flush_pending(events);
         }

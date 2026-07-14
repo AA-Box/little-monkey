@@ -152,8 +152,12 @@ fn settings_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join(SETTINGS_FILE))
 }
@@ -167,7 +171,9 @@ fn settings_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// `checkpoints_cli.rs` calling `checkpoints::begin_impl`.
 pub fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt web_settings.json: {e}")),
+        Ok(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("Corrupt web_settings.json: {e}"))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WebSettings::default()),
         Err(e) => Err(format!("Failed to read web_settings.json: {e}")),
     }
@@ -176,11 +182,13 @@ pub fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
 /// Core save logic: atomic sibling temp file + rename, same idiom as
 /// `sessions.rs`'s `save_to` / `mcp.rs`'s `save_config_impl`.
 fn save_settings_impl(path: &Path, settings: &WebSettings) -> Result<(), String> {
-    let payload =
-        serde_json::to_string_pretty(settings).map_err(|e| format!("Failed to serialize web_settings.json: {e}"))?;
+    let payload = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("Failed to serialize web_settings.json: {e}"))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write web_settings.json: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize web_settings.json: {e}"))?;
+    std::fs::write(&tmp, &payload)
+        .map_err(|e| format!("Failed to write web_settings.json: {e}"))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("Failed to finalize web_settings.json: {e}"))?;
     Ok(())
 }
 
@@ -192,7 +200,9 @@ fn save_settings_impl(path: &Path, settings: &WebSettings) -> Result<(), String>
 fn normalize_base_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return Err(format!("Invalid SearXNG base URL '{raw}': must start with http:// or https://"));
+        return Err(format!(
+            "Invalid SearXNG base URL '{raw}': must start with http:// or https://"
+        ));
     }
     if trimmed.len() <= "https://".len() {
         return Err(format!("Invalid SearXNG base URL '{raw}'"));
@@ -237,7 +247,8 @@ pub fn read_brave_key() -> Result<String, String> {
         .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry.get_password().map_err(|e| match e {
         keyring::Error::NoEntry => {
-            "No Brave API key saved — add one in Settings > Web, or switch the search provider.".to_string()
+            "No Brave API key saved — add one in Settings > Web, or switch the search provider."
+                .to_string()
         }
         other => format!("Failed to read saved Brave API key: {other}"),
     })
@@ -275,9 +286,16 @@ pub fn web_get_settings(app: tauri::AppHandle) -> Result<WebSettings, String> {
 /// same deterministic `web_settings.json.tmp` path at once and leave a
 /// torn/interleaved file for whichever `rename` lands last to publish.
 #[tauri::command]
-pub fn web_set_settings(app: tauri::AppHandle, state: tauri::State<'_, AppState>, settings: WebSettings) -> Result<(), String> {
+pub fn web_set_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    settings: WebSettings,
+) -> Result<(), String> {
     let settings = normalize_and_validate_settings(settings)?;
-    let _guard = state.web_settings_lock.lock().map_err(|_| "Web settings lock poisoned".to_string())?;
+    let _guard = state
+        .web_settings_lock
+        .lock()
+        .map_err(|_| "Web settings lock poisoned".to_string())?;
     save_settings_impl(&settings_file_path(&app)?, &settings)
 }
 
@@ -302,9 +320,11 @@ pub async fn web_set_brave_key(api_key: String) -> Result<(), String> {
 
     brave_search(&api_key, "test", 1).await?;
 
-    let entry =
-        keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT).map_err(|e| format!("Failed to access keychain: {e}"))?;
-    entry.set_password(&api_key).map_err(|e| format!("Failed to save key to keychain: {e}"))
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, BRAVE_KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Failed to access keychain: {e}"))?;
+    entry
+        .set_password(&api_key)
+        .map_err(|e| format!("Failed to save key to keychain: {e}"))
 }
 
 /// Removes the saved Brave API key from the keychain.
@@ -364,7 +384,10 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// module doc for why re-checking every hop is the actual security boundary.
 pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), String> {
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(format!("Refusing to fetch '{}': only http/https URLs are allowed", url));
+        return Err(format!(
+            "Refusing to fetch '{}': only http/https URLs are allowed",
+            url
+        ));
     }
 
     if !url.username().is_empty() || url.password().is_some() {
@@ -380,23 +403,32 @@ pub fn validate_fetch_url(url: &Url, allow_local_network: bool) -> Result<(), St
     // string (`"[::1]"`) that would need to be stripped before it could be
     // reparsed. Using this instead of string-parsing `host_str()` avoids
     // that whole bracket-handling class of bug for IPv6 literals.
-    match url.host().ok_or_else(|| format!("Refusing to fetch '{}': no host", url))? {
+    match url
+        .host()
+        .ok_or_else(|| format!("Refusing to fetch '{}': no host", url))?
+    {
         url::Host::Ipv4(ip) => {
             if is_blocked_ipv4(&ip) {
-                return Err(format!("Refusing to fetch '{}': target host is a local/private address", url));
+                return Err(format!(
+                    "Refusing to fetch '{}': target host is a local/private address",
+                    url
+                ));
             }
         }
         url::Host::Ipv6(ip) => {
             if is_blocked_ipv6(&ip) {
-                return Err(format!("Refusing to fetch '{}': target host is a local/private address", url));
+                return Err(format!(
+                    "Refusing to fetch '{}': target host is a local/private address",
+                    url
+                ));
             }
         }
         url::Host::Domain(domain) => {
             // Resolve and check every address the hostname maps to. The port
             // passed to `ToSocketAddrs` is irrelevant to the lookup itself.
-            let addrs = (domain, 0u16)
-                .to_socket_addrs()
-                .map_err(|e| format!("Refusing to fetch '{}': failed to resolve host: {}", url, e))?;
+            let addrs = (domain, 0u16).to_socket_addrs().map_err(|e| {
+                format!("Refusing to fetch '{}': failed to resolve host: {}", url, e)
+            })?;
             for addr in addrs {
                 if is_blocked_ip(&addr.ip()) {
                     return Err(format!(
@@ -522,7 +554,11 @@ fn extract_readable_content(body: &str, url: &str) -> (Option<String>, String) {
         return fallback();
     }
 
-    let title = if article.title.trim().is_empty() { extract_title(body) } else { Some(article.title) };
+    let title = if article.title.trim().is_empty() {
+        extract_title(body)
+    } else {
+        Some(article.title)
+    };
     (title, article.content.to_string())
 }
 
@@ -533,9 +569,18 @@ fn extract_readable_content(body: &str, url: &str) -> (Option<String>, String) {
 /// `url` is the page's (final, post-redirect) URL — only used for the HTML
 /// branch's readability extraction (see [`extract_readable_content`]), not
 /// otherwise part of content dispatch.
-fn dispatch_content(content_type: &str, body: &str, url: &str) -> Result<(Option<String>, String), String> {
+fn dispatch_content(
+    content_type: &str,
+    body: &str,
+    url: &str,
+) -> Result<(Option<String>, String), String> {
     // Strip any `; charset=...` parameter before matching.
-    let base = content_type.split(';').next().unwrap_or(content_type).trim().to_ascii_lowercase();
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
 
     match base.as_str() {
         "text/html" => {
@@ -631,7 +676,8 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
                 return Ok(Box::new(resolved) as reqwest::dns::Addrs);
             }
 
-            let allowed: Vec<std::net::SocketAddr> = resolved.filter(|addr| !is_blocked_ip(&addr.ip())).collect();
+            let allowed: Vec<std::net::SocketAddr> =
+                resolved.filter(|addr| !is_blocked_ip(&addr.ip())).collect();
             if allowed.is_empty() {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -669,7 +715,9 @@ pub async fn fetch_impl(
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .redirect(build_redirect_policy(settings.allow_local_network))
-        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver { allow_local_network: settings.allow_local_network }))
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver {
+            allow_local_network: settings.allow_local_network,
+        }))
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
@@ -738,9 +786,19 @@ pub async fn tool_web_fetch(
     max_chars: Option<usize>,
     start_index: Option<usize>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<FetchResult, String> {
-    permissions::request_permission(&app, state.inner(), "web_fetch", url.clone(), turn_id.as_deref(), None, None)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "web_fetch",
+        url.clone(),
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
 
@@ -770,7 +828,10 @@ pub async fn tool_web_fetch(
             .tool_cancel
             .lock()
             .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -853,7 +914,8 @@ fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
     let document = scraper::Html::parse_document(html);
     // Both selector strings are fixed and valid at compile time.
     let title_selector = scraper::Selector::parse("a.result__a").expect("valid CSS selector");
-    let snippet_selector = scraper::Selector::parse(".result__snippet").expect("valid CSS selector");
+    let snippet_selector =
+        scraper::Selector::parse(".result__snippet").expect("valid CSS selector");
 
     let snippets: Vec<String> = document
         .select(&snippet_selector)
@@ -872,7 +934,11 @@ fn parse_ddg_results(html: &str, count: usize) -> Vec<SearchResult> {
         let href = title_el.value().attr("href").unwrap_or("");
         let url = decode_ddg_href(href);
         let snippet = snippets.get(index).cloned().unwrap_or_default();
-        results.push(SearchResult { title, url, snippet });
+        results.push(SearchResult {
+            title,
+            url,
+            snippet,
+        });
     }
     results
 }
@@ -906,7 +972,10 @@ async fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchResult>, Stri
         .map_err(|e| format!("Failed to read DuckDuckGo response for '{}': {}", query, e))?;
 
     if !status.is_success() {
-        return Err(format!("DuckDuckGo search for '{}' returned HTTP {}", query, status));
+        return Err(format!(
+            "DuckDuckGo search for '{}' returned HTTP {}",
+            query, status
+        ));
     }
 
     Ok(parse_ddg_results(&body, count))
@@ -948,12 +1017,17 @@ struct BraveResult {
 /// [`SearchResult`]s. Split out from [`brave_search_at`] so a fixture can
 /// exercise the parsing on its own, same reasoning as [`parse_ddg_results`].
 fn parse_brave_response(body: &str, count: usize) -> Result<Vec<SearchResult>, String> {
-    let parsed: BraveResponse = serde_json::from_str(body).map_err(|e| format!("Failed to parse Brave response: {e}"))?;
+    let parsed: BraveResponse =
+        serde_json::from_str(body).map_err(|e| format!("Failed to parse Brave response: {e}"))?;
     let results = parsed.web.map(|w| w.results).unwrap_or_default();
     Ok(results
         .into_iter()
         .take(count)
-        .map(|r| SearchResult { title: r.title, url: r.url, snippet: r.description })
+        .map(|r| SearchResult {
+            title: r.title,
+            url: r.url,
+            snippet: r.description,
+        })
         .collect())
 }
 
@@ -962,7 +1036,12 @@ fn parse_brave_response(body: &str, count: usize) -> Result<Vec<SearchResult>, S
 /// can point it at a local fixture server instead of the real Brave API —
 /// [`brave_search`] is the real-endpoint entry point both `search_impl` and
 /// [`web_set_brave_key`]'s validate-before-store call use.
-async fn brave_search_at(endpoint: &str, api_key: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+async fn brave_search_at(
+    endpoint: &str,
+    api_key: &str,
+    query: &str,
+    count: usize,
+) -> Result<Vec<SearchResult>, String> {
     let client = reqwest::Client::builder()
         .timeout(SEARCH_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -989,14 +1068,22 @@ async fn brave_search_at(endpoint: &str, api_key: &str, query: &str, count: usiz
             "Brave search for '{}' returned HTTP {}{}",
             query,
             status,
-            if body.is_empty() { String::new() } else { format!(": {body}") }
+            if body.is_empty() {
+                String::new()
+            } else {
+                format!(": {body}")
+            }
         ));
     }
 
     parse_brave_response(&body, count)
 }
 
-async fn brave_search(api_key: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+async fn brave_search(
+    api_key: &str,
+    query: &str,
+    count: usize,
+) -> Result<Vec<SearchResult>, String> {
     brave_search_at(BRAVE_SEARCH_ENDPOINT, api_key, query, count).await
 }
 
@@ -1028,7 +1115,11 @@ fn parse_searxng_response(body: &str, count: usize) -> Result<Vec<SearchResult>,
         .results
         .into_iter()
         .take(count)
-        .map(|r| SearchResult { title: r.title, url: r.url, snippet: r.content })
+        .map(|r| SearchResult {
+            title: r.title,
+            url: r.url,
+            snippet: r.content,
+        })
         .collect())
 }
 
@@ -1040,7 +1131,11 @@ fn parse_searxng_response(body: &str, count: usize) -> Result<Vec<SearchResult>,
 /// than a bare "HTTP 403" the user would have to go guess the cause of (the
 /// design doc's own risk note: "needs the explicit error hint or users will
 /// blame the app").
-async fn searxng_search(base_url: &str, query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+async fn searxng_search(
+    base_url: &str,
+    query: &str,
+    count: usize,
+) -> Result<Vec<SearchResult>, String> {
     let client = reqwest::Client::builder()
         .timeout(SEARCH_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -1069,7 +1164,10 @@ async fn searxng_search(base_url: &str, query: &str, count: usize) -> Result<Vec
         .map_err(|e| format!("Failed to read SearXNG response from '{}': {}", base_url, e))?;
 
     if !status.is_success() {
-        return Err(format!("SearXNG search at '{}' returned HTTP {}", base_url, status));
+        return Err(format!(
+            "SearXNG search at '{}' returned HTTP {}",
+            base_url, status
+        ));
     }
 
     parse_searxng_response(&body, count)
@@ -1098,14 +1196,16 @@ pub async fn search_impl(
     query: String,
     count: Option<usize>,
 ) -> Result<Vec<SearchResult>, String> {
-    let count = count.unwrap_or(DEFAULT_SEARCH_COUNT).clamp(1, DEFAULT_SEARCH_COUNT);
+    let count = count
+        .unwrap_or(DEFAULT_SEARCH_COUNT)
+        .clamp(1, DEFAULT_SEARCH_COUNT);
 
     match settings.search_provider {
         SearchProvider::Duckduckgo => ddg_search(&query, count).await,
         SearchProvider::Brave => {
-            let key = brave_key
-                .filter(|k| !k.trim().is_empty())
-                .ok_or_else(|| "Brave search requires an API key — add one in Settings > Web.".to_string())?;
+            let key = brave_key.filter(|k| !k.trim().is_empty()).ok_or_else(|| {
+                "Brave search requires an API key — add one in Settings > Web.".to_string()
+            })?;
             brave_search(&key, &query, count).await
         }
         SearchProvider::Searxng => {
@@ -1113,7 +1213,9 @@ pub async fn search_impl(
                 .searxng_base_url
                 .clone()
                 .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| "SearXNG requires a base URL — set one in Settings > Web.".to_string())?;
+                .ok_or_else(|| {
+                    "SearXNG requires a base URL — set one in Settings > Web.".to_string()
+                })?;
             searxng_search(&base, &query, count).await
         }
     }
@@ -1142,9 +1244,19 @@ pub async fn tool_web_search(
     query: String,
     count: Option<usize>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
-    permissions::request_permission(&app, state.inner(), "web_search", query.clone(), turn_id.as_deref(), None, None)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "web_search",
+        query.clone(),
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
     let brave_key = if settings.search_provider == SearchProvider::Brave {
@@ -1183,7 +1295,10 @@ pub async fn tool_web_search(
             .tool_cancel
             .lock()
             .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -1225,7 +1340,13 @@ mod tests {
 
     #[test]
     fn rejects_each_private_ipv4_range() {
-        for host in ["10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.1.1"] {
+        for host in [
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.1.1",
+        ] {
             let target = format!("http://{host}/");
             assert!(
                 validate_fetch_url(&url(&target), false).is_err(),
@@ -1260,7 +1381,10 @@ mod tests {
     fn rejects_unspecified_ipv4_and_ipv6() {
         for target in ["http://0.0.0.0:8090/v1/chat", "http://[::]:11434/api/tags"] {
             let err = validate_fetch_url(&url(target), false).unwrap_err();
-            assert!(err.contains("local/private"), "unexpected error for {target}: {err}");
+            assert!(
+                err.contains("local/private"),
+                "unexpected error for {target}: {err}"
+            );
         }
     }
 
@@ -1272,16 +1396,23 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_impl_rejects_the_unspecified_address() {
-        let err = fetch_impl(&WebSettings::default(), "http://0.0.0.0:8090/".to_string(), None, None)
-            .await
-            .unwrap_err();
+        let err = fetch_impl(
+            &WebSettings::default(),
+            "http://0.0.0.0:8090/".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("local/private"), "unexpected error: {err}");
     }
 
     #[test]
     fn accepts_public_ipv4_and_ipv6_literals() {
         assert!(validate_fetch_url(&url("http://93.184.216.34/"), false).is_ok());
-        assert!(validate_fetch_url(&url("http://[2606:2800:220:1:248:1893:25c8:1946]/"), false).is_ok());
+        assert!(
+            validate_fetch_url(&url("http://[2606:2800:220:1:248:1893:25c8:1946]/"), false).is_ok()
+        );
     }
 
     #[test]
@@ -1300,11 +1431,17 @@ mod tests {
         let (window, total, truncated) = char_window(content, 5, 5);
         assert_eq!(window, "56789");
         assert_eq!(total, 10);
-        assert!(!truncated, "window covering exactly the tail must not be marked truncated");
+        assert!(
+            !truncated,
+            "window covering exactly the tail must not be marked truncated"
+        );
 
         let (window, _total, truncated) = char_window(content, 0, 100);
         assert_eq!(window, content);
-        assert!(!truncated, "window covering the whole content must not be marked truncated");
+        assert!(
+            !truncated,
+            "window covering the whole content must not be marked truncated"
+        );
     }
 
     #[test]
@@ -1320,7 +1457,8 @@ mod tests {
     #[tokio::test]
     async fn html_is_converted_to_markdown_with_title_extracted() {
         let html = "<html><head><title>Hello World</title></head><body><h1>Heading</h1><p>Some text.</p></body></html>";
-        let (title, markdown) = dispatch_content("text/html; charset=utf-8", html, "https://example.com/").unwrap();
+        let (title, markdown) =
+            dispatch_content("text/html; charset=utf-8", html, "https://example.com/").unwrap();
         assert_eq!(title.as_deref(), Some("Hello World"));
         assert!(markdown.contains("Heading"));
         assert!(markdown.contains("Some text."));
@@ -1328,8 +1466,14 @@ mod tests {
 
     #[tokio::test]
     async fn plain_text_content_types_pass_through_unchanged() {
-        for ct in ["text/plain", "text/markdown", "application/json", "application/xml"] {
-            let (title, content) = dispatch_content(ct, "raw content", "https://example.com/").unwrap();
+        for ct in [
+            "text/plain",
+            "text/markdown",
+            "application/json",
+            "application/xml",
+        ] {
+            let (title, content) =
+                dispatch_content(ct, "raw content", "https://example.com/").unwrap();
             assert!(title.is_none());
             assert_eq!(content, "raw content");
         }
@@ -1343,9 +1487,14 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_impl_rejects_a_disallowed_url_without_making_a_request() {
-        let err = fetch_impl(&WebSettings::default(), "http://127.0.0.1:8090/".to_string(), None, None)
-            .await
-            .unwrap_err();
+        let err = fetch_impl(
+            &WebSettings::default(),
+            "http://127.0.0.1:8090/".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("local/private"), "unexpected error: {err}");
     }
 
@@ -1356,7 +1505,10 @@ mod tests {
         // the *validation* step (it will then fail to connect, since nothing
         // is actually listening on that port in the test environment, but
         // that's a connection error, not a "local/private" rejection).
-        let settings = WebSettings { allow_local_network: true, ..WebSettings::default() };
+        let settings = WebSettings {
+            allow_local_network: true,
+            ..WebSettings::default()
+        };
         let err = fetch_impl(&settings, "http://127.0.0.1:1/".to_string(), None, None)
             .await
             .unwrap_err();
@@ -1397,7 +1549,10 @@ mod tests {
             .unwrap();
 
         let result = client.get(format!("http://{}/", addr)).send().await;
-        assert!(result.is_err(), "expected the redirect to a private IP to be blocked");
+        assert!(
+            result.is_err(),
+            "expected the redirect to a private IP to be blocked"
+        );
     }
 
     /// `reqwest::redirect::Policy::custom` does not get a redirect-loop cap
@@ -1433,15 +1588,26 @@ mod tests {
             }
         });
 
-        let client = reqwest::Client::builder().redirect(build_redirect_policy(true)).build().unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(build_redirect_policy(true))
+            .build()
+            .unwrap();
 
         let started = std::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(5), client.get(format!("http://{addr}/")).send())
-            .await
-            .expect("the hop cap must stop the loop well within the 5s test timeout, not hang until it");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect(
+            "the hop cap must stop the loop well within the 5s test timeout, not hang until it",
+        );
         let elapsed = started.elapsed();
 
-        assert!(result.is_err(), "expected the redirect loop to be capped rather than followed forever");
+        assert!(
+            result.is_err(),
+            "expected the redirect loop to be capped rather than followed forever"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "expected the {MAX_REDIRECT_HOPS}-hop cap to stop the loop quickly, took {elapsed:?}"
@@ -1458,14 +1624,19 @@ mod tests {
     async fn ssrf_guarded_resolver_rejects_a_hostname_resolving_to_loopback() {
         use reqwest::dns::Resolve;
 
-        let resolver = SsrfGuardedResolver { allow_local_network: false };
+        let resolver = SsrfGuardedResolver {
+            allow_local_network: false,
+        };
         let name: reqwest::dns::Name = "localhost".parse().expect("valid dns name");
         // `Addrs` (the `Ok` type) is a boxed `dyn Iterator`, which isn't
         // `Debug` — so this matches manually rather than using
         // `Result::expect_err`, which requires the `Ok` type to be `Debug`.
         match resolver.resolve(name).await {
             Ok(_) => panic!("localhost must not resolve through the guarded resolver"),
-            Err(err) => assert!(err.to_string().contains("local/private"), "unexpected error: {err}"),
+            Err(err) => assert!(
+                err.to_string().contains("local/private"),
+                "unexpected error: {err}"
+            ),
         }
     }
 
@@ -1473,10 +1644,18 @@ mod tests {
     async fn ssrf_guarded_resolver_allows_loopback_when_allow_local_network_is_set() {
         use reqwest::dns::Resolve;
 
-        let resolver = SsrfGuardedResolver { allow_local_network: true };
+        let resolver = SsrfGuardedResolver {
+            allow_local_network: true,
+        };
         let name: reqwest::dns::Name = "localhost".parse().expect("valid dns name");
-        let addrs = resolver.resolve(name).await.expect("allow_local_network must let loopback resolve");
-        assert!(addrs.count() > 0, "expected at least one resolved address for localhost");
+        let addrs = resolver
+            .resolve(name)
+            .await
+            .expect("allow_local_network must let loopback resolve");
+        assert!(
+            addrs.count() > 0,
+            "expected at least one resolved address for localhost"
+        );
     }
 
     /// A trimmed fixture of `html.duckduckgo.com/html/`'s actual result
@@ -1516,13 +1695,19 @@ mod tests {
 
     #[test]
     fn decode_ddg_href_returns_a_bare_href_unchanged() {
-        assert_eq!(decode_ddg_href("https://rust-lang.org/"), "https://rust-lang.org/");
+        assert_eq!(
+            decode_ddg_href("https://rust-lang.org/"),
+            "https://rust-lang.org/"
+        );
     }
 
     #[test]
     fn decode_ddg_href_decodes_a_protocol_relative_uddg_redirect() {
         let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FRust_(programming_language)&rut=abc123";
-        assert_eq!(decode_ddg_href(href), "https://en.wikipedia.org/wiki/Rust_(programming_language)");
+        assert_eq!(
+            decode_ddg_href(href),
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        );
     }
 
     #[test]
@@ -1545,12 +1730,17 @@ mod tests {
 
         assert_eq!(results[0].title, "Rust Programming Language");
         assert_eq!(results[0].url, "https://rust-lang.org/");
-        assert!(results[0].snippet.contains("fast, reliable, and productive"));
+        assert!(results[0]
+            .snippet
+            .contains("fast, reliable, and productive"));
 
         // The uddg-wrapped result: url must be the decoded destination, not
         // the duckduckgo.com redirect.
         assert_eq!(results[1].title, "Rust (programming language) - Wikipedia");
-        assert_eq!(results[1].url, "https://en.wikipedia.org/wiki/Rust_(programming_language)");
+        assert_eq!(
+            results[1].url,
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        );
         assert!(results[1].snippet.contains("general-purpose"));
 
         assert_eq!(results[2].title, "Rust Tutorial - W3Schools");
@@ -1567,7 +1757,10 @@ mod tests {
 
     #[test]
     fn parse_ddg_results_on_unrecognized_markup_returns_no_results_not_an_error() {
-        assert_eq!(parse_ddg_results("<html><body><p>no results here</p></body></html>", 10), Vec::new());
+        assert_eq!(
+            parse_ddg_results("<html><body><p>no results here</p></body></html>", 10),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -1596,19 +1789,46 @@ mod tests {
         // (and repeated runs within the same nanosecond) never collide.
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("little_monkey_web_settings_test_{}_{}_{}_{}", std::process::id(), n, nanos, name))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_web_settings_test_{}_{}_{}_{}",
+            std::process::id(),
+            n,
+            nanos,
+            name
+        ))
     }
 
     #[test]
     fn search_provider_serializes_to_the_expected_strings() {
-        assert_eq!(serde_json::to_string(&SearchProvider::Duckduckgo).unwrap(), "\"duckduckgo\"");
-        assert_eq!(serde_json::to_string(&SearchProvider::Brave).unwrap(), "\"brave\"");
-        assert_eq!(serde_json::to_string(&SearchProvider::Searxng).unwrap(), "\"searxng\"");
+        assert_eq!(
+            serde_json::to_string(&SearchProvider::Duckduckgo).unwrap(),
+            "\"duckduckgo\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SearchProvider::Brave).unwrap(),
+            "\"brave\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SearchProvider::Searxng).unwrap(),
+            "\"searxng\""
+        );
 
-        assert_eq!(serde_json::from_str::<SearchProvider>("\"duckduckgo\"").unwrap(), SearchProvider::Duckduckgo);
-        assert_eq!(serde_json::from_str::<SearchProvider>("\"brave\"").unwrap(), SearchProvider::Brave);
-        assert_eq!(serde_json::from_str::<SearchProvider>("\"searxng\"").unwrap(), SearchProvider::Searxng);
+        assert_eq!(
+            serde_json::from_str::<SearchProvider>("\"duckduckgo\"").unwrap(),
+            SearchProvider::Duckduckgo
+        );
+        assert_eq!(
+            serde_json::from_str::<SearchProvider>("\"brave\"").unwrap(),
+            SearchProvider::Brave
+        );
+        assert_eq!(
+            serde_json::from_str::<SearchProvider>("\"searxng\"").unwrap(),
+            SearchProvider::Searxng
+        );
     }
 
     /// `providers.rs::slugify` only ever produces lowercase alphanumerics and
@@ -1663,8 +1883,22 @@ mod tests {
     #[test]
     fn settings_save_overwrites_previous_content() {
         let path = temp_settings_path("overwrite.json");
-        save_settings_impl(&path, &WebSettings { fetch_max_chars: 1_000, ..WebSettings::default() }).unwrap();
-        save_settings_impl(&path, &WebSettings { fetch_max_chars: 2_000, ..WebSettings::default() }).unwrap();
+        save_settings_impl(
+            &path,
+            &WebSettings {
+                fetch_max_chars: 1_000,
+                ..WebSettings::default()
+            },
+        )
+        .unwrap();
+        save_settings_impl(
+            &path,
+            &WebSettings {
+                fetch_max_chars: 2_000,
+                ..WebSettings::default()
+            },
+        )
+        .unwrap();
         assert_eq!(load_settings_impl(&path).unwrap().fetch_max_chars, 2_000);
         let _ = std::fs::remove_file(&path);
     }
@@ -1689,7 +1923,10 @@ mod tests {
             move || {
                 barrier.wait();
                 for _ in 0..200 {
-                    let settings = WebSettings { fetch_max_chars, ..WebSettings::default() };
+                    let settings = WebSettings {
+                        fetch_max_chars,
+                        ..WebSettings::default()
+                    };
                     let _guard = state.web_settings_lock.lock().unwrap();
                     save_settings_impl(&path, &settings).unwrap();
                 }
@@ -1703,7 +1940,8 @@ mod tests {
 
         // The file must always parse cleanly (never torn/interleaved) and
         // hold exactly one writer's complete settings, never a mix of both.
-        let loaded = load_settings_impl(&path).expect("serialized concurrent saves must never corrupt the file");
+        let loaded = load_settings_impl(&path)
+            .expect("serialized concurrent saves must never corrupt the file");
         assert!(
             loaded.fetch_max_chars == 1_000 || loaded.fetch_max_chars == 2_000,
             "unexpected fetch_max_chars: {}",
@@ -1714,27 +1952,43 @@ mod tests {
 
     #[test]
     fn normalize_and_validate_settings_rejects_a_zero_fetch_max_chars() {
-        let err = normalize_and_validate_settings(WebSettings { fetch_max_chars: 0, ..WebSettings::default() }).unwrap_err();
+        let err = normalize_and_validate_settings(WebSettings {
+            fetch_max_chars: 0,
+            ..WebSettings::default()
+        })
+        .unwrap_err();
         assert!(err.contains("fetch_max_chars"), "unexpected error: {err}");
     }
 
     #[test]
     fn normalize_and_validate_settings_blanks_a_whitespace_only_searxng_url_to_none() {
-        let settings = WebSettings { searxng_base_url: Some("   ".to_string()), ..WebSettings::default() };
+        let settings = WebSettings {
+            searxng_base_url: Some("   ".to_string()),
+            ..WebSettings::default()
+        };
         let normalized = normalize_and_validate_settings(settings).unwrap();
         assert_eq!(normalized.searxng_base_url, None);
     }
 
     #[test]
     fn normalize_and_validate_settings_normalizes_a_trailing_slash_on_the_searxng_url() {
-        let settings = WebSettings { searxng_base_url: Some("https://searx.example.com/".to_string()), ..WebSettings::default() };
+        let settings = WebSettings {
+            searxng_base_url: Some("https://searx.example.com/".to_string()),
+            ..WebSettings::default()
+        };
         let normalized = normalize_and_validate_settings(settings).unwrap();
-        assert_eq!(normalized.searxng_base_url.as_deref(), Some("https://searx.example.com"));
+        assert_eq!(
+            normalized.searxng_base_url.as_deref(),
+            Some("https://searx.example.com")
+        );
     }
 
     #[test]
     fn normalize_and_validate_settings_rejects_a_non_http_searxng_url() {
-        let settings = WebSettings { searxng_base_url: Some("ftp://searx.example.com".to_string()), ..WebSettings::default() };
+        let settings = WebSettings {
+            searxng_base_url: Some("ftp://searx.example.com".to_string()),
+            ..WebSettings::default()
+        };
         let err = normalize_and_validate_settings(settings).unwrap_err();
         assert!(err.contains("http"), "unexpected error: {err}");
     }
@@ -1754,11 +2008,14 @@ mod tests {
     fn parse_brave_response_extracts_title_url_and_snippet() {
         let results = parse_brave_response(BRAVE_FIXTURE_JSON, 10).unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0], SearchResult {
-            title: "Rust Programming Language".to_string(),
-            url: "https://www.rust-lang.org/".to_string(),
-            snippet: "A language empowering everyone.".to_string(),
-        });
+        assert_eq!(
+            results[0],
+            SearchResult {
+                title: "Rust Programming Language".to_string(),
+                url: "https://www.rust-lang.org/".to_string(),
+                snippet: "A language empowering everyone.".to_string(),
+            }
+        );
         assert_eq!(results[1].title, "Rust (programming language) - Wikipedia");
     }
 
@@ -1795,11 +2052,14 @@ mod tests {
     fn parse_searxng_response_extracts_title_url_and_snippet() {
         let results = parse_searxng_response(SEARXNG_FIXTURE_JSON, 10).unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0], SearchResult {
-            title: "Rust Programming Language".to_string(),
-            url: "https://www.rust-lang.org/".to_string(),
-            snippet: "A language empowering everyone.".to_string(),
-        });
+        assert_eq!(
+            results[0],
+            SearchResult {
+                title: "Rust Programming Language".to_string(),
+                url: "https://www.rust-lang.org/".to_string(),
+                snippet: "A language empowering everyone.".to_string(),
+            }
+        );
         assert_eq!(results[1].title, "The Rust Book");
     }
 
@@ -1851,8 +2111,11 @@ mod tests {
     /// developer's real OS keychain.
     #[tokio::test]
     async fn brave_search_at_surfaces_an_unauthorized_response_as_an_error() {
-        let base = spawn_fixed_response_server("401 Unauthorized", "{\"message\":\"Invalid API key\"}");
-        let err = brave_search_at(&base, "a-bad-key", "test", 1).await.unwrap_err();
+        let base =
+            spawn_fixed_response_server("401 Unauthorized", "{\"message\":\"Invalid API key\"}");
+        let err = brave_search_at(&base, "a-bad-key", "test", 1)
+            .await
+            .unwrap_err();
         assert!(err.contains("401"), "unexpected error: {err}");
     }
 
@@ -1860,20 +2123,33 @@ mod tests {
     async fn searxng_search_maps_403_to_an_actionable_hint() {
         let base = spawn_fixed_response_server("403 Forbidden", "");
         let err = searxng_search(&base, "rust", 10).await.unwrap_err();
-        assert!(err.contains("formats") && err.contains("settings.yml"), "unexpected error: {err}");
+        assert!(
+            err.contains("formats") && err.contains("settings.yml"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
     async fn search_impl_rejects_brave_without_a_key() {
-        let settings = WebSettings { search_provider: SearchProvider::Brave, ..WebSettings::default() };
-        let err = search_impl(&settings, None, "rust".to_string(), None).await.unwrap_err();
+        let settings = WebSettings {
+            search_provider: SearchProvider::Brave,
+            ..WebSettings::default()
+        };
+        let err = search_impl(&settings, None, "rust".to_string(), None)
+            .await
+            .unwrap_err();
         assert!(err.contains("API key"), "unexpected error: {err}");
     }
 
     #[tokio::test]
     async fn search_impl_rejects_searxng_without_a_base_url() {
-        let settings = WebSettings { search_provider: SearchProvider::Searxng, ..WebSettings::default() };
-        let err = search_impl(&settings, None, "rust".to_string(), None).await.unwrap_err();
+        let settings = WebSettings {
+            search_provider: SearchProvider::Searxng,
+            ..WebSettings::default()
+        };
+        let err = search_impl(&settings, None, "rust".to_string(), None)
+            .await
+            .unwrap_err();
         assert!(err.contains("base URL"), "unexpected error: {err}");
     }
 
@@ -1906,17 +2182,33 @@ mod tests {
 
     #[test]
     fn extract_readable_content_strips_boilerplate_from_an_article_shaped_page() {
-        let (title, html) = extract_readable_content(ARTICLE_FIXTURE_HTML, "https://example.com/article");
+        let (title, html) =
+            extract_readable_content(ARTICLE_FIXTURE_HTML, "https://example.com/article");
 
         // Readability reports the page's own `<title>` here (not the `<h1>`) —
         // this fixture's title happens to equal the site name, so the useful
         // assertion is on the stripped *content*, not the title text.
         assert!(title.is_some());
-        assert!(html.contains("novel sorting algorithm"), "article body missing from extracted content: {html}");
-        assert!(html.contains("open source software"), "article body missing from extracted content: {html}");
-        assert!(!html.contains("Subscribe Now"), "nav boilerplate leaked into extracted content: {html}");
-        assert!(!html.contains("Trending"), "sidebar boilerplate leaked into extracted content: {html}");
-        assert!(!html.contains("Buy Now and Save"), "header ad boilerplate leaked into extracted content: {html}");
+        assert!(
+            html.contains("novel sorting algorithm"),
+            "article body missing from extracted content: {html}"
+        );
+        assert!(
+            html.contains("open source software"),
+            "article body missing from extracted content: {html}"
+        );
+        assert!(
+            !html.contains("Subscribe Now"),
+            "nav boilerplate leaked into extracted content: {html}"
+        );
+        assert!(
+            !html.contains("Trending"),
+            "sidebar boilerplate leaked into extracted content: {html}"
+        );
+        assert!(
+            !html.contains("Buy Now and Save"),
+            "header ad boilerplate leaked into extracted content: {html}"
+        );
     }
 
     #[test]
@@ -1976,14 +2268,20 @@ mod tests {
         // guard rejects by default (correctly) — this test is exercising
         // pagination, not the guard, so it opts in the same way a real user
         // enabling "allow local network" in Settings would.
-        let settings = WebSettings { allow_local_network: true, ..WebSettings::default() };
+        let settings = WebSettings {
+            allow_local_network: true,
+            ..WebSettings::default()
+        };
 
         let base_a = spawn_content_response_server("text/plain", full_content.clone());
         let first = fetch_impl(&settings, format!("{base_a}/"), Some(3000), Some(0))
             .await
             .expect("first windowed fetch should succeed");
         assert_eq!(first.total_chars, 5000);
-        assert!(first.truncated, "a 3000-char window over 5000 chars of content must report truncated");
+        assert!(
+            first.truncated,
+            "a 3000-char window over 5000 chars of content must report truncated"
+        );
         assert_eq!(first.markdown.chars().count(), 3000);
         assert_eq!(first.markdown, full_content[0..3000]);
 
@@ -1992,13 +2290,19 @@ mod tests {
             .await
             .expect("second windowed fetch should succeed");
         assert_eq!(second.total_chars, 5000);
-        assert!(!second.truncated, "a window reaching the end of the content must not report truncated");
+        assert!(
+            !second.truncated,
+            "a window reaching the end of the content must not report truncated"
+        );
         assert_eq!(second.markdown.chars().count(), 2000);
         assert_eq!(second.markdown, full_content[3000..5000]);
 
         // The actual continuity guarantee `start_index` pagination exists for:
         // paging through both windows reconstructs the original byte-for-byte.
-        assert_eq!(format!("{}{}", first.markdown, second.markdown), full_content);
+        assert_eq!(
+            format!("{}{}", first.markdown, second.markdown),
+            full_content
+        );
     }
 
     /// Spins up a one-shot local HTTP server that accepts the connection but
@@ -2046,7 +2350,10 @@ mod tests {
         let base = spawn_slow_response_server(slow_server_delay, "too slow");
         // Same opt-in as the pagination test above — a 127.0.0.1 test server
         // is exactly what the SSRF guard exists to block by default.
-        let settings = WebSettings { allow_local_network: true, ..WebSettings::default() };
+        let settings = WebSettings {
+            allow_local_network: true,
+            ..WebSettings::default()
+        };
 
         let cancel = std::sync::Arc::new(Notify::new());
         let cancel_signal = cancel.clone();
