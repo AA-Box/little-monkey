@@ -18,7 +18,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
-use crate::{checkpoints, memory, permissions, workspace, AppState};
+use crate::{checkpoints, memory, native_skill_commands, permissions, workspace, AppState};
 
 /// Directory names that are never descended into by [`tool_grep`] — build
 /// output, VCS metadata, and dependency trees are noisy, huge, and almost
@@ -715,6 +715,28 @@ pub async fn tool_remember(
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
     memory::add_fact_impl(&path, &root, &text, "agent")
+}
+
+/// Read one bundled file from an installed native skill's folder — the
+/// progressive-disclosure counterpart to a skill's `resource_files` listing
+/// (see `native_skills.rs`'s `SkillDescriptor.resource_files` and
+/// `NativeSkillManager::read_resource`): the model reads a specific bundled
+/// reference/script only once it actually needs it, instead of the whole
+/// bundle being loaded up front. Read-only, so no `permissions::request_permission`
+/// gate — same posture as `tool_read_file`.
+#[tauri::command]
+pub async fn tool_read_skill_resource(
+    app: tauri::State<'_, AppState>,
+    native: tauri::State<'_, native_skill_commands::NativeSkillsCommandState>,
+    command: String,
+    path: String,
+) -> Result<String, String> {
+    let workspace = native_skill_commands::optional_primary_workspace(&app)?;
+    let manager = native.manager.clone();
+    native_skill_commands::run_blocking(move || {
+        manager.read_resource(&command, &path, workspace.as_deref())
+    })
+    .await
 }
 
 /// Cancel in-flight tool invocations: kills running `tool_run_shell` child

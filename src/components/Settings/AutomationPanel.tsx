@@ -571,6 +571,8 @@ export function AutomationPanel() {
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
   const subagentsEnabled = useSettingsStore((s) => s.subagentsEnabled);
   const setSubagentsEnabled = useSettingsStore((s) => s.setSubagentsEnabled);
+  const skillAutoInvokeEnabled = useSettingsStore((s) => s.skillAutoInvokeEnabled);
+  const setSkillAutoInvokeEnabled = useSettingsStore((s) => s.setSkillAutoInvokeEnabled);
   const maxConcurrentSubagents = useSettingsStore((s) => s.maxConcurrentSubagents);
   const setMaxConcurrentSubagents = useSettingsStore((s) => s.setMaxConcurrentSubagents);
   const subagentProfileModels = useSettingsStore((s) => s.subagentProfileModels);
@@ -785,6 +787,18 @@ export function AutomationPanel() {
             providerModels={providerModels}
             onSet={(providerId, model) => setSubagentProfileModel("code", { providerId, model })}
             onClear={() => clearSubagentProfileModel("code")}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.skillsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={skillAutoInvokeEnabled}
+            onChange={setSkillAutoInvokeEnabled}
+            label={t("AutomationPanel.skillAutoInvokeEnabledLabel")}
+            description={t("AutomationPanel.skillAutoInvokeEnabledDescription")}
           />
         </div>
       </section>

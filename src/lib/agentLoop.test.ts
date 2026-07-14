@@ -4,6 +4,8 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 
 import {
+  allowedToolsRestriction,
+  applyAllowedToolsRestriction,
   attachedStackPromptInfo,
   checkpointChainBlockReason,
   formatMemoryNotice,
@@ -40,6 +42,7 @@ import {
 } from "./agentLoop";
 import { estimateHistoryTokens } from "./contextTrimmer";
 import type { ChatMessage, ToolCall, ToolDef } from "./llamaClient";
+import type { SlashSkill } from "./skills";
 import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore, type ChatSession } from "../store/sessionStore";
@@ -326,6 +329,83 @@ describe("toolsForSettings", () => {
   it("still appends task even when memoryEnabled/webToolsEnabled filtered other tools out", () => {
     const result = toolsForSettings(tools, false, true, true);
     expect(result.map((t) => t.function.name)).toEqual(["write_file", "run_shell", "task"]);
+  });
+
+  it("does not append the skill or read_skill_resource tools when their flags are false (or omitted) — a user who hasn't opted in should never see the schema", () => {
+    expect(toolsForSettings(tools, true, true).some((t) => t.function.name === "skill")).toBe(false);
+    expect(toolsForSettings(tools, true, true, false, false).some((t) => t.function.name === "skill")).toBe(false);
+    expect(toolsForSettings(tools, true, true, false, false, false).some((t) => t.function.name === "read_skill_resource")).toBe(false);
+  });
+
+  it("appends the skill tool when skillToolEnabled is true, and read_skill_resource when readSkillResourceToolEnabled is true, independently", () => {
+    const skillOnly = toolsForSettings(tools, true, true, false, true, false);
+    expect(skillOnly.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "skill"]);
+
+    const resourceOnly = toolsForSettings(tools, true, true, false, false, true);
+    expect(resourceOnly.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "read_skill_resource"]);
+
+    const both = toolsForSettings(tools, true, true, false, true, true);
+    expect(both.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "skill", "read_skill_resource"]);
+  });
+
+  it("appends task, skill, and read_skill_resource together when all three are enabled", () => {
+    const result = toolsForSettings(tools, true, true, true, true, true);
+    expect(result.map((t) => t.function.name)).toEqual(["write_file", "remember", "run_shell", "task", "skill", "read_skill_resource"]);
+  });
+});
+
+describe("allowedToolsRestriction / applyAllowedToolsRestriction", () => {
+  function toolDef(name: string): ToolDef {
+    return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
+  }
+
+  function skill(command: string, allowedTools?: string[]): SlashSkill {
+    return {
+      id: command,
+      source: "native",
+      command,
+      name: command,
+      instructions: `Do ${command}`,
+      version: "1.0.0",
+      contentSha256: "a".repeat(64),
+      permissions: [],
+      allowedTools,
+    };
+  }
+
+  it("is unrestricted (null) when nothing is invoked yet", () => {
+    expect(allowedToolsRestriction(new Set(), [skill("review", ["read_file"])])).toBeNull();
+  });
+
+  it("is unrestricted when the invoked skill declares no allowedTools", () => {
+    expect(allowedToolsRestriction(new Set(["review"]), [skill("review")])).toBeNull();
+  });
+
+  it("restricts to the invoked skill's own allowedTools", () => {
+    const restriction = allowedToolsRestriction(new Set(["review"]), [skill("review", ["read_file", "grep"])]);
+    expect(restriction).toEqual(new Set(["read_file", "grep"]));
+  });
+
+  it("is unrestricted when ANY invoked skill (of several) omits allowedTools", () => {
+    const skills = [skill("review", ["read_file"]), skill("verify")];
+    expect(allowedToolsRestriction(new Set(["review", "verify"]), skills)).toBeNull();
+  });
+
+  it("unions every invoked skill's allowedTools when all of them declare one", () => {
+    const skills = [skill("review", ["read_file"]), skill("verify", ["grep", "read_file"])];
+    const restriction = allowedToolsRestriction(new Set(["review", "verify"]), skills);
+    expect(restriction).toEqual(new Set(["read_file", "grep"]));
+  });
+
+  it("applyAllowedToolsRestriction is a no-op when the restriction is null", () => {
+    const tools = [toolDef("read_file"), toolDef("write_file")];
+    expect(applyAllowedToolsRestriction(tools, null)).toEqual(tools);
+  });
+
+  it("applyAllowedToolsRestriction filters down to the restriction, but always keeps the skill tool itself", () => {
+    const tools = [toolDef("read_file"), toolDef("write_file"), toolDef("skill")];
+    const result = applyAllowedToolsRestriction(tools, new Set(["read_file"]));
+    expect(result.map((t) => t.function.name)).toEqual(["read_file", "skill"]);
   });
 });
 

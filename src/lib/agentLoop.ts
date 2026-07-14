@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { PRESENT_PLAN_TOOL, TASK_TOOL, buildTools } from './tools';
+import { PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -40,6 +40,7 @@ import {
   stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
+  type SkillToolContext,
   type SubagentContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
@@ -51,7 +52,7 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
-import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from './skills';
+import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { getActiveChatTarget, useModelStore } from '../store/modelStore';
@@ -474,14 +475,69 @@ const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
  * is offered. Default `false` mirrors every other call site that doesn't
  * pass it, so `task` is never accidentally offered by an existing caller
  * that hasn't been updated for it.
+ *
+ * `skillToolEnabled`/`readSkillResourceToolEnabled` follow the same posture,
+ * appending `SKILL_INVOKE_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
+ * `runAgentTurnBody`'s call site for exactly what each is computed from.
+ * They're independent: `readSkillResourceToolEnabled` is NOT gated on
+ * `settingsStore.skillAutoInvokeEnabled` at all — reading a bundled file
+ * should work for an explicitly `/command`-invoked skill too, not just an
+ * auto-invoked one.
  */
-export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true, subagentsEnabled = false): ToolDef[] {
+export function toolsForSettings(
+  tools: ToolDef[],
+  memoryEnabled: boolean,
+  webToolsEnabled = true,
+  subagentsEnabled = false,
+  skillToolEnabled = false,
+  readSkillResourceToolEnabled = false,
+): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
-  return subagentsEnabled ? [...filtered, TASK_TOOL] : filtered;
+  return [
+    ...filtered,
+    ...(subagentsEnabled ? [TASK_TOOL] : []),
+    ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
+    ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
+  ];
+}
+
+/**
+ * `allowed-tools` enforcement (see each `SlashSkill.allowedTools`'s doc
+ * comment): every skill invoked so far this turn (explicit AND
+ * model-invoked, both live in `invokedCommands` — see `skillToolContext` in
+ * `runAgentTurnBody`) that declares `allowedTools` narrows what's on offer.
+ * Favors NOT restricting on ambiguity: if any invoked skill omits
+ * `allowedTools` (or none are invoked yet), returns `null` (unrestricted);
+ * only when EVERY invoked skill declares one does this return the union of
+ * their sets, so stacking a restrictive skill with a permissive one never
+ * silently locks the model out of tools the permissive skill actually needs.
+ */
+export function allowedToolsRestriction(
+  invokedCommands: ReadonlySet<string>,
+  availableSkills: SlashSkill[],
+): ReadonlySet<string> | null {
+  const invoked = availableSkills.filter((candidate) => invokedCommands.has(candidate.command));
+  if (invoked.length === 0 || invoked.some((candidate) => !candidate.allowedTools || candidate.allowedTools.length === 0)) {
+    return null;
+  }
+  return new Set(invoked.flatMap((candidate) => candidate.allowedTools ?? []));
+}
+
+/**
+ * Applies `allowedToolsRestriction`'s result (if any) to a per-turn tool
+ * list — the `skill` tool itself always stays offered even under a
+ * restrictive list (deliberate exception): this app stacks up to
+ * `MAX_SKILLS_PER_TURN` skills per turn (unlike a single-skill-at-a-time
+ * model), so a restrictive skill must never strand the model unable to
+ * invoke a different, less-restricted one.
+ */
+export function applyAllowedToolsRestriction(tools: ToolDef[], restriction: ReadonlySet<string> | null): ToolDef[] {
+  if (restriction === null) return tools;
+  return tools.filter((tool) => tool.function.name === 'skill' || restriction.has(tool.function.name));
 }
 
 /** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
@@ -1319,6 +1375,16 @@ export async function runAgentTurn(
   // an internally-generated id, unchanged from before.
   turnIdOverride?: string,
   skillInvocations: SkillInvocationSnapshot[] = [],
+  // Every skill installed/enabled for this session, not just the ones
+  // `skillInvocations` already explicitly invoked — lets the (opt-in, see
+  // `settingsStore.skillAutoInvokeEnabled`) `skill` tool auto-invoke any of
+  // the rest. Only threaded through to `runTurnGuarded`'s in-process loop —
+  // the daemon path (`runDaemonAgentTurn`) has its own independent
+  // Rust-side tool composition (see `daemonDesktopTurn.ts`'s `tool_profile`)
+  // and isn't part of this feature yet, so it's simply never passed there.
+  // Default `[]` mirrors `skillInvocations`'s own default, so every other
+  // caller (`PlanCard.tsx`, `recipeRunner.ts`) is unaffected.
+  availableSkills: SlashSkill[] = [],
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1342,7 +1408,7 @@ export async function runAgentTurn(
     if (route === 'daemon') {
       await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
     } else {
-      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
+      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, availableSkills);
     }
   } finally {
     turnControllers.delete(sessionId);
@@ -1617,6 +1683,7 @@ async function runTurnGuarded(
   signal: AbortSignal,
   turnId: string,
   skillInvocations: SkillInvocationSnapshot[],
+  availableSkills: SlashSkill[] = [],
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -1659,6 +1726,7 @@ async function runTurnGuarded(
       durable,
       signal,
       skillInvocations,
+      availableSkills,
     );
     maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
   } catch (error) {
@@ -1721,6 +1789,7 @@ async function runAgentTurnBody(
   durable: DurableTurnContext,
   signal?: AbortSignal,
   skillInvocations: SkillInvocationSnapshot[] = [],
+  availableSkills: SlashSkill[] = [],
 ): Promise<void> {
   // Every transcript mutation this turn makes is pinned to the session the
   // turn was submitted from — the user may be running another turn in the
@@ -1918,11 +1987,29 @@ async function runAgentTurnBody(
     }
   }
 
-  const toolsForTurn: ToolDef[] = toolsForSettings(
+  // Every command already invoked this turn — explicit `/command`
+  // invocations are already known before the loop starts; a model-invoked
+  // `skill` tool call (see `turnEngine.ts`'s `SkillToolContext`) mutates this
+  // SAME `Set` in place as the turn progresses, so both the catalog
+  // (`composeSkillCatalog`, below) and the `allowed-tools` restriction
+  // (`toolsOfferedThisIteration`, inside the loop) see later model-invoked
+  // skills too, not just the ones known up front.
+  const invokedSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command));
+  const skillToolContext: SkillToolContext = {
+    availableSkills,
+    invokedCommands: invokedSkillCommands,
+    maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+  };
+  const skillToolEnabled =
+    settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
+  const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
+  const baseToolsForTurn: ToolDef[] = toolsForSettings(
     toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
     settings.webToolsEnabled,
-    settings.subagentsEnabled
+    settings.subagentsEnabled,
+    skillToolEnabled,
+    readSkillResourceToolEnabled,
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -2040,12 +2127,28 @@ async function runAgentTurnBody(
     // very next round trip, and a dangling id just resolves to no persona —
     // see `resolvePersona`).
     const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
+    // Recomputed every iteration (not just once before the loop, same
+    // "rebuilt every round trip" stance as `systemMessage` below): a
+    // model-invoked `skill` tool call in an EARLIER iteration of this same
+    // turn may have added to `invokedSkillCommands`, which can newly trigger
+    // (or, if that skill declared no `allowedTools`, newly LIFT) an
+    // `allowed-tools` restriction for this next round trip — see
+    // `allowedToolsRestriction`'s doc comment.
+    const toolsForTurn = applyAllowedToolsRestriction(
+      baseToolsForTurn,
+      allowedToolsRestriction(invokedSkillCommands, availableSkills),
+    );
     const systemMessage: ChatMessage = {
       role: 'system',
-      content: composeSkillSystemPrompt(
-        currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
-        skillInvocations,
-      ),
+      content: [
+        composeSkillSystemPrompt(
+          currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+          skillInvocations,
+        ),
+        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
     };
 
     // Build the wire payload for this request: the system prompt first, then
@@ -2301,6 +2404,8 @@ async function runAgentTurnBody(
         riskAnnotation,
         attachedStackNames,
         subagentContext,
+        undefined,
+        skillToolContext,
       );
       return finishObservedTool(result);
     });
