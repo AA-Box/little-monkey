@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Subcommand, ValueEnum};
 use little_monkey_lib::native_skills::{
-    ExternalSignedSkill, GitSkillRequest, NativeSkillManager, SkillDescriptor, SkillScope,
+    community_skill_git_request, ExternalSignedSkill, GitSkillRequest, NativeSkillManager,
+    SkillDescriptor, SkillScope,
 };
 use little_monkey_lib::prompts::PromptEntry;
 
@@ -79,6 +80,21 @@ pub enum SkillsCmd {
         scope: CliSkillScope,
         #[arg(long)]
         approval_digest: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Install a named community skill from little-monkey's own `skills/`
+    /// directory at a pinned commit — shorthand for `preview-git` /
+    /// `install-git` against that fixed repository, commit, and
+    /// `skills/<name>` subdirectory. Run without `--approval-digest` first to
+    /// preview and see the digest; run again with `--approval-digest` and
+    /// `--yes` to install.
+    Install {
+        name: String,
+        #[arg(long, value_enum, default_value_t = CliSkillScope::Global)]
+        scope: CliSkillScope,
+        #[arg(long)]
+        approval_digest: Option<String>,
         #[arg(long)]
         yes: bool,
     },
@@ -430,6 +446,47 @@ pub fn run(action: &SkillsCmd, data_dir: &Path, workspace: Option<&Path>) -> Res
                 result.active_sha256.unwrap_or_default()
             );
             Ok(())
+        }
+        SkillsCmd::Install {
+            name,
+            scope,
+            approval_digest,
+            yes,
+        } => {
+            let scope = SkillScope::from(*scope);
+            let request = community_skill_git_request(name).map_err(|error| error.to_string())?;
+            match approval_digest {
+                None => {
+                    let preview = manager
+                        .preview_git(&request, scope, workspace_for_scope(scope, workspace)?)
+                        .map_err(|error| error.to_string())?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&preview).map_err(|error| error.to_string())?
+                    );
+                    println!(
+                        "\nRun again with --approval-digest <digest from above> --yes to install."
+                    );
+                    Ok(())
+                }
+                Some(approval_digest) => {
+                    let result = manager
+                        .install_git(
+                            &request,
+                            scope,
+                            workspace_for_scope(scope, workspace)?,
+                            approval_digest,
+                            *yes,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    println!(
+                        "Installed /{} ({})",
+                        result.command,
+                        result.active_sha256.unwrap_or_default()
+                    );
+                    Ok(())
+                }
+            }
         }
         SkillsCmd::Enable { command, scope } | SkillsCmd::Disable { command, scope } => {
             let scope = SkillScope::from(*scope);
