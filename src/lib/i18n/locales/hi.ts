@@ -138,6 +138,7 @@ export const hi: Record<string, string> = {
   "SessionMenu.noGroup": "कोई समूह नहीं",
   "SessionMenu.newGroup": "नया समूह…",
   "SessionMenu.newGroupPlaceholder": "समूह का नाम",
+  "SessionMenu.deleteGroupAriaLabel": "समूह हटाएं",
   "SessionMenu.archive": "संग्रहित करें",
   "SessionMenu.unarchive": "संग्रह से हटाएं",
   "SessionMenu.delete": "हटाएं",

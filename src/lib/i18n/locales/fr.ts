@@ -138,6 +138,7 @@ export const fr: Record<string, string> = {
   "SessionMenu.noGroup": "Aucun groupe",
   "SessionMenu.newGroup": "Nouveau groupe…",
   "SessionMenu.newGroupPlaceholder": "Nom du groupe",
+  "SessionMenu.deleteGroupAriaLabel": "Supprimer le groupe",
   "SessionMenu.archive": "Archiver",
   "SessionMenu.unarchive": "Désarchiver",
   "SessionMenu.delete": "Supprimer",
