@@ -14,7 +14,8 @@ import {
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
 import { useLocaleStore } from "../../store/localeStore";
-import { applyTheme, getStoredTheme, type Theme } from "../../lib/theme";
+import { useResolvedTheme, type Theme } from "../../lib/theme";
+import { useSettingsStore } from "../../store/settingsStore";
 
 const APP_VERSION = "0.1.0";
 
@@ -53,10 +54,12 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }:
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
+  const themePreference = useSettingsStore((state) => state.themePreference);
+  const setThemePreference = useSettingsStore((state) => state.setThemePreference);
 
   const [open, setOpen] = useState(false);
   const [langOpen, setLangOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>(() => getStoredTheme());
+  const theme = useResolvedTheme(themePreference);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -73,8 +76,7 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }:
 
   const handleToggleTheme = () => {
     const next: Theme = theme === "dark" ? "light" : "dark";
-    applyTheme(next);
-    setTheme(next);
+    setThemePreference(next);
     setOpen(false);
   };
 
