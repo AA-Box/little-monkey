@@ -94,6 +94,7 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
   const forkSession = useSessionStore((s) => s.forkSession);
   const moveToGroup = useSessionStore((s) => s.moveToGroup);
   const createGroup = useSessionStore((s) => s.createGroup);
+  const deleteGroup = useSessionStore((s) => s.deleteGroup);
   const archiveSession = useSessionStore((s) => s.archiveSession);
   const unarchiveSession = useSessionStore((s) => s.unarchiveSession);
   const deleteSession = useSessionStore((s) => s.deleteSession);
@@ -443,14 +444,23 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
             </button>
           )}
           {groups.map((group) => (
-            <button
-              key={group.id}
-              type="button"
-              onClick={() => { moveToGroup(session.id, group.id); onClose(); }}
-              className={itemClass}
-            >
-              <span className="truncate">{group.name}</span>
-            </button>
+            <div key={group.id} className="group/grouprow flex items-center hover:bg-surface-2">
+              <button
+                type="button"
+                onClick={() => { moveToGroup(session.id, group.id); onClose(); }}
+                className="flex-1 cursor-pointer truncate px-3 py-1.5 text-left text-sm text-foreground"
+              >
+                <span className="truncate">{group.name}</span>
+              </button>
+              <button
+                type="button"
+                onClick={(event) => { event.stopPropagation(); deleteGroup(group.id); }}
+                aria-label={t("SessionMenu.deleteGroupAriaLabel")}
+                className="mr-1.5 flex h-9 w-9 shrink-0 items-center justify-center rounded text-faint opacity-0 hover:text-danger focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent group-hover/grouprow:opacity-100 group-focus-within/grouprow:opacity-100"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
           ))}
           {groups.length > 0 && <div className="my-1 border-t border-border" />}
           {newGroupOpen ? (

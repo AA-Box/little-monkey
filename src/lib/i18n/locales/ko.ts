@@ -138,6 +138,7 @@ export const ko: Record<string, string> = {
   "SessionMenu.noGroup": "그룹 없음",
   "SessionMenu.newGroup": "새 그룹…",
   "SessionMenu.newGroupPlaceholder": "그룹 이름",
+  "SessionMenu.deleteGroupAriaLabel": "그룹 삭제",
   "SessionMenu.archive": "보관",
   "SessionMenu.unarchive": "보관 취소",
   "SessionMenu.delete": "삭제",
