@@ -138,6 +138,7 @@ export const ja: Record<string, string> = {
   "SessionMenu.noGroup": "グループなし",
   "SessionMenu.newGroup": "新しいグループ…",
   "SessionMenu.newGroupPlaceholder": "グループ名",
+  "SessionMenu.deleteGroupAriaLabel": "グループを削除",
   "SessionMenu.archive": "アーカイブ",
   "SessionMenu.unarchive": "アーカイブ解除",
   "SessionMenu.delete": "削除",

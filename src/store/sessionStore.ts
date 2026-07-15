@@ -354,6 +354,9 @@ export interface SessionStore {
   createGroup: (name: string) => string;
   /** File a session under a group, or clear its group with `null`. */
   moveToGroup: (sessionId: string, groupId: string | null) => void;
+  /** Delete a folder group, unfiling any sessions it held. No-op for
+   * comparison groups or unknown ids. */
+  deleteGroup: (groupId: string) => void;
   /** Captures (or clears) the model target for a normal session. Comparison
    * branch targets are immutable and this action deliberately no-ops for
    * them. The supplied object is cloned before it enters persisted state. */
@@ -1792,6 +1795,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, groupId } : s));
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
+    });
+  },
+
+  deleteGroup: (groupId) => {
+    set((state) => {
+      if (state.groups.find((group) => group.id === groupId)?.kind !== "folder") return state;
+      const groups = state.groups.filter((group) => group.id !== groupId);
+      const sessions = state.sessions.map((s) => (s.groupId === groupId ? { ...s, groupId: null } : s));
+      persist(sessions, state.activeSessionId, groups);
+      return { groups, sessions };
     });
   },
 
