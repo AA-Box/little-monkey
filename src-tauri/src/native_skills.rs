@@ -311,6 +311,43 @@ pub struct GitSkillRequest {
     pub subdirectory: Option<String>,
 }
 
+/// The repository and pinned commit backing `community_skill_git_request`.
+/// Update `COMMUNITY_SKILLS_COMMIT` whenever `skills/` changes on the
+/// branch these constants track, so bare-slug installs keep resolving to a
+/// real, reviewed snapshot rather than a moving ref.
+pub const COMMUNITY_SKILLS_REPOSITORY_URL: &str = "https://github.com/AA-Box/little-monkey";
+pub const COMMUNITY_SKILLS_COMMIT: &str = "c45b3e562fed189599080b3187b49fd12be3489b";
+
+/// Resolves a bare community-skill slug (e.g. `changelog-curator`) to a
+/// `GitSkillRequest` against this repository's own `skills/<slug>` at the
+/// pinned commit above. Pure convenience over `preview_git`/`install_git` —
+/// callers still preview first and pass the returned `approval_digest` back
+/// to install; this only saves typing the repository URL, commit, and
+/// subdirectory by hand.
+pub fn community_skill_git_request(slug: &str) -> Result<GitSkillRequest, SkillError> {
+    let slug = slug.trim();
+    if slug.is_empty() || slug.len() > 64 {
+        return Err(SkillError::Invalid(
+            "skill slug must contain 1 to 64 characters".to_string(),
+        ));
+    }
+    let mut bytes = slug.bytes();
+    let first = bytes.next().unwrap_or_default();
+    if !first.is_ascii_lowercase()
+        || !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(SkillError::Invalid(
+            "skill slug must start with a lowercase letter and contain only lowercase letters, digits, and hyphens"
+                .to_string(),
+        ));
+    }
+    Ok(GitSkillRequest {
+        repository_url: COMMUNITY_SKILLS_REPOSITORY_URL.to_string(),
+        commit: COMMUNITY_SKILLS_COMMIT.to_string(),
+        subdirectory: Some(format!("skills/{slug}")),
+    })
+}
+
 /// One installable skill folder found while scanning a Git checkout whose
 /// root has no `SKILL.md`. Carries a full install preview (including the
 /// approval digest) so the caller can install any subset — or all of them —
