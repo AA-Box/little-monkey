@@ -28,6 +28,7 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-window-state = "2"
 tokio = { version = "1.52.3", features = ["full"] }
 # "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
 # `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
