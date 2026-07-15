@@ -255,6 +255,59 @@ describe("toggleDocChatMode", () => {
   });
 });
 
+describe("deleteGroup", () => {
+  it("deletes a folder group and safely unfiles every session it contained", () => {
+    useSessionStore.setState((state) => ({
+      groups: [
+        { id: "folder", name: "Folder", kind: "folder", createdAt: 1 },
+        { id: "other", name: "Other", kind: "folder", createdAt: 2 },
+      ],
+      sessions: state.sessions.map((session) => ({
+        ...session,
+        groupId: session.id === "a" ? "folder" : "other",
+      })),
+    }));
+
+    useSessionStore.getState().deleteGroup("folder");
+
+    const state = useSessionStore.getState();
+    expect(state.groups.map((group) => group.id)).toEqual(["other"]);
+    expect(state.sessions.find((session) => session.id === "a")?.groupId).toBeNull();
+    expect(state.sessions.find((session) => session.id === "b")?.groupId).toBe("other");
+  });
+
+  it("never deletes comparison groups or changes their branch membership", () => {
+    useSessionStore.setState((state) => ({
+      groups: [{
+        id: "comparison",
+        name: "Comparison",
+        kind: "comparison",
+        createdAt: 1,
+        comparison: {
+          sourceSessionId: "a",
+          prompt: "Compare",
+          baseMessageCount: 0,
+          storedContent: null,
+          wireContent: null,
+          unresolvedReferences: [],
+          effort: null,
+          systemPrompt: null,
+          contextMessages: [],
+          executionPlan: null,
+          synthesis: null,
+        },
+      }],
+      sessions: state.sessions.map((session) => ({ ...session, groupId: "comparison" })),
+    }));
+
+    useSessionStore.getState().deleteGroup("comparison");
+
+    const state = useSessionStore.getState();
+    expect(state.groups).toHaveLength(1);
+    expect(state.sessions.every((session) => session.groupId === "comparison")).toBe(true);
+  });
+});
+
 describe("hydrateSessions docChatMode default", () => {
   it("defaults docChatMode to false for a persisted session predating the field", async () => {
     invokeMock.mockImplementationOnce(async () =>

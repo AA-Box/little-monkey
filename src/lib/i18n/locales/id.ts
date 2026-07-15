@@ -138,6 +138,7 @@ export const id: Record<string, string> = {
   "SessionMenu.noGroup": "Tanpa grup",
   "SessionMenu.newGroup": "Grup baru…",
   "SessionMenu.newGroupPlaceholder": "Nama grup",
+  "SessionMenu.deleteGroupAriaLabel": "Hapus grup",
   "SessionMenu.archive": "Arsipkan",
   "SessionMenu.unarchive": "Batalkan arsip",
   "SessionMenu.delete": "Hapus",
