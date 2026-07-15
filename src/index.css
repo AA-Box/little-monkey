@@ -23,6 +23,8 @@
   --c-success-soft: #f0fdf4;
   --c-warning: #d97706;
   --c-warning-soft: #fffbeb;
+  --app-font-scale: 1;
+  font-size: calc(16px * var(--app-font-scale));
 }
 
 :root[data-theme="dark"] {
@@ -47,6 +49,102 @@
   --c-success-soft: rgba(127, 176, 105, 0.14);
   --c-warning: #d4a24c;
   --c-warning-soft: rgba(212, 162, 76, 0.14);
+}
+
+:root[data-text-scale="small"] {
+  --app-font-scale: 0.94;
+}
+
+:root[data-text-scale="medium"] {
+  --app-font-scale: 1;
+}
+
+:root[data-text-scale="large"] {
+  --app-font-scale: 1.07;
+}
+
+:root[data-accent="indigo"] {
+  --c-accent: #4f46e5;
+  --c-accent-hover: #4338ca;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #eef2ff;
+}
+
+:root[data-theme="dark"][data-accent="indigo"] {
+  --c-accent: #818cf8;
+  --c-accent-hover: #a5b4fc;
+  --c-accent-foreground: #111827;
+  --c-accent-soft: rgba(129, 140, 248, 0.18);
+}
+
+:root[data-accent="blue"] {
+  --c-accent: #2563eb;
+  --c-accent-hover: #1d4ed8;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #dbeafe;
+}
+
+:root[data-theme="dark"][data-accent="blue"] {
+  --c-accent: #60a5fa;
+  --c-accent-hover: #93c5fd;
+  --c-accent-foreground: #0f172a;
+  --c-accent-soft: rgba(96, 165, 250, 0.18);
+}
+
+:root[data-accent="teal"] {
+  --c-accent: #0f766e;
+  --c-accent-hover: #0d9488;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #ccfbf1;
+}
+
+:root[data-theme="dark"][data-accent="teal"] {
+  --c-accent: #2dd4bf;
+  --c-accent-hover: #5eead4;
+  --c-accent-foreground: #10201d;
+  --c-accent-soft: rgba(45, 212, 191, 0.16);
+}
+
+:root[data-accent="rose"] {
+  --c-accent: #e11d48;
+  --c-accent-hover: #be123c;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #ffe4e6;
+}
+
+:root[data-theme="dark"][data-accent="rose"] {
+  --c-accent: #fb7185;
+  --c-accent-hover: #fda4af;
+  --c-accent-foreground: #261015;
+  --c-accent-soft: rgba(251, 113, 133, 0.16);
+}
+
+:root[data-accent="amber"] {
+  --c-accent: #d97706;
+  --c-accent-hover: #b45309;
+  --c-accent-foreground: #18181b;
+  --c-accent-soft: #fef3c7;
+}
+
+:root[data-theme="dark"][data-accent="amber"] {
+  --c-accent: #fbbf24;
+  --c-accent-hover: #fcd34d;
+  --c-accent-foreground: #1f1e1d;
+  --c-accent-soft: rgba(251, 191, 36, 0.16);
+}
+
+:root[data-contrast="high"] {
+  --c-border: #b8b8c2;
+  --c-border-strong: #8b8b99;
+  --c-muted: #3f3f46;
+  --c-faint: #52525b;
+}
+
+:root[data-theme="dark"][data-contrast="high"] {
+  --c-border: #68635c;
+  --c-border-strong: #8c857a;
+  --c-muted: #d6d3cb;
+  --c-faint: #b9b3a8;
 }
 
 @theme {
@@ -99,6 +197,11 @@ body {
 }
 
 ::selection { background-color: var(--color-accent-soft); }
+
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after {
+  animation-duration: 0.01ms !important;
+  transition-duration: 0.01ms !important;
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

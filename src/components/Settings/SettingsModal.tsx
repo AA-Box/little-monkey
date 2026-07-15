@@ -13,6 +13,7 @@ import {
   ListChecks,
   MessageSquare,
   MonitorCheck,
+  Palette,
   Plug,
   ScrollText,
   Search,
@@ -46,6 +47,7 @@ import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
 import { CompanionPanel } from "./CompanionPanel";
 import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
+import { AppearancePanel } from "./AppearancePanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -63,7 +65,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -86,10 +88,11 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   background: Bot,
   companion: Sparkles,
   security: ShieldCheck,
+  appearance: Palette,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
-  { labelKey: "SettingsModal.groupApplication", ids: ["security", "companion", "shortcuts", "usage", "portability"] },
+  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "companion", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "background", "mcp", "prompts", "apiserver"] },
@@ -116,6 +119,7 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   background: "SettingsModal.tabBackgroundAgents",
   companion: "SettingsModal.tabCompanion",
   security: "SettingsModal.tabSecurityDoctor",
+  appearance: "SettingsModal.tabAppearance",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -347,6 +351,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "background" && <BackgroundAgentsPanel />}
               {tab === "companion" && <CompanionPanel />}
               {tab === "security" && <SecurityDoctorPanel />}
+              {tab === "appearance" && <AppearancePanel />}
             </div>
           </div>
         </div>
