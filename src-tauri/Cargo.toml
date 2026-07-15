@@ -2,9 +2,9 @@
 name = "little-monkey"
 version = "0.1.0"
 description = "Little Monkey — a local model runner with agentic file/shell tools"
-authors = ["you"]
+authors = ["Seyed Ahmad Sarollahi"]
 license = "MIT"
-edition = "2021"
+edition = "2026"
 default-run = "little-monkey"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
