@@ -66,6 +66,7 @@ import { useModelStore } from "../../store/modelStore";
 import { useUsageStore } from "../../store/usageStore";
 import { useStackStore } from "../../store/stackStore";
 import { useSkillProposalStore } from "../../store/skillProposalStore";
+import { useBrowserWorkbenchStore } from "../../store/browserWorkbenchStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
 import type { SettingsTab } from "../Settings";
@@ -269,6 +270,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [crewId, setCrewId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
+  const consumeBrowserEvidence = useBrowserWorkbenchStore((state) => state.consumeForChat);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // "@"-mention autocomplete state. `mentionQuery` being non-null is what
@@ -471,6 +474,31 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     slashStartRef.current = null;
     requestAnimationFrame(resizeTextarea);
   }, [sessionId, resizeTextarea]);
+
+  // Browser evidence is never sent directly from the workbench. The user
+  // explicitly stages it here first, where the bounded untrusted summary and
+  // screenshot remain visible and removable before Send.
+  useEffect(() => {
+    if (!pendingBrowserEvidence) return;
+    setInput((current) => [current.trim(), pendingBrowserEvidence.summary].filter(Boolean).join("\n\n"));
+    if (pendingBrowserEvidence.screenshot) {
+      const screenshot = pendingBrowserEvidence.screenshot;
+      setAttachments((current) => [
+        ...current.filter((attachment) => attachment.path !== screenshot.path),
+        {
+          path: screenshot.path,
+          isDir: false,
+          kind: "image",
+          dataUrl: screenshot.dataUrl,
+        },
+      ]);
+    }
+    consumeBrowserEvidence(sessionId, pendingBrowserEvidence.id);
+    requestAnimationFrame(() => {
+      resizeTextarea();
+      textareaRef.current?.focus();
+    });
+  }, [consumeBrowserEvidence, pendingBrowserEvidence, resizeTextarea, sessionId]);
 
   // The separately-capability-scoped companion overlay never writes session
   // state directly. Rust emits its explicit context only to the main window;
