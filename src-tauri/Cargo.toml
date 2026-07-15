@@ -3,6 +3,7 @@ name = "little-monkey"
 version = "0.1.0"
 description = "Little Monkey — a local model runner with agentic file/shell tools"
 authors = ["you"]
+license = "MIT"
 edition = "2021"
 default-run = "little-monkey"
 
