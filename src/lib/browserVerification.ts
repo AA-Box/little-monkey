@@ -18,13 +18,23 @@ export interface BrowserSessionView {
   startedAtMs: number;
   actionCount: number;
   cancelled: boolean;
+  viewport: BrowserViewport;
+}
+
+export interface BrowserViewport {
+  width: number;
+  height: number;
+  deviceScaleFactor: number;
+  mobile: boolean;
 }
 
 export interface BrowserEvidence {
   screenshot: DurableArtifactBlob | null;
   dom: DurableArtifactBlob | null;
+  accessibility: DurableArtifactBlob | null;
   console: DurableArtifactBlob | null;
   network: DurableArtifactBlob | null;
+  performance: DurableArtifactBlob | null;
   actionCount: number;
 }
 
@@ -39,6 +49,18 @@ export interface BrowserInspection {
   title: string;
   dom: DurableArtifactBlob;
   accessibility: DurableArtifactBlob;
+  accessibilityIssues: string[];
+}
+
+export interface BrowserAnnotation {
+  url: string;
+  selector: string;
+  tag: string;
+  role: string;
+  ariaLabel: string;
+  text: string;
+  rect: { x: number; y: number; width: number; height: number };
+  evidence: BrowserEvidence;
 }
 
 export const DEFAULT_BROWSER_LIMITS: BrowserLimits = {
@@ -89,8 +111,20 @@ export function navigateBrowser(sessionId: string, url: string): Promise<Browser
   return invoke("browser_navigate", { sessionId, url });
 }
 
+export function reloadBrowser(sessionId: string): Promise<BrowserActionResult> {
+  return invoke("browser_reload", { sessionId });
+}
+
+export function setBrowserViewport(sessionId: string, viewport: BrowserViewport): Promise<BrowserActionResult> {
+  return invoke("browser_set_viewport", { sessionId, viewport });
+}
+
 export function inspectBrowser(sessionId: string): Promise<BrowserInspection> {
   return invoke("browser_inspect", { sessionId });
+}
+
+export function annotateBrowser(sessionId: string, selector: string): Promise<BrowserAnnotation> {
+  return invoke("browser_annotate", { sessionId, selector });
 }
 
 export function clickBrowser(sessionId: string, selector: string): Promise<BrowserActionResult> {

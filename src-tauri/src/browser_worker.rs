@@ -85,6 +85,27 @@ pub struct BrowserStartRequest {
     pub limits: BrowserLimits,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserViewport {
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: f64,
+    #[serde(default)]
+    pub mobile: bool,
+}
+
+impl Default for BrowserViewport {
+    fn default() -> Self {
+        Self {
+            width: 1440,
+            height: 900,
+            device_scale_factor: 1.0,
+            mobile: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSessionView {
@@ -94,6 +115,7 @@ pub struct BrowserSessionView {
     pub started_at_ms: u64,
     pub action_count: u64,
     pub cancelled: bool,
+    pub viewport: BrowserViewport,
 }
 
 /// Minimal, secret-free grant view consumed by Security Doctor. It exposes
@@ -113,9 +135,33 @@ pub struct BrowserSecurityGrant {
 pub struct BrowserEvidence {
     pub screenshot: Option<ArtifactBlob>,
     pub dom: Option<ArtifactBlob>,
+    pub accessibility: Option<ArtifactBlob>,
     pub console: Option<ArtifactBlob>,
     pub network: Option<ArtifactBlob>,
+    pub performance: Option<ArtifactBlob>,
     pub action_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAnnotationRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAnnotation {
+    pub url: String,
+    pub selector: String,
+    pub tag: String,
+    pub role: String,
+    pub aria_label: String,
+    pub text: String,
+    pub rect: BrowserAnnotationRect,
+    pub evidence: BrowserEvidence,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,6 +171,7 @@ pub struct BrowserInspection {
     pub title: String,
     pub dom: ArtifactBlob,
     pub accessibility: ArtifactBlob,
+    pub accessibility_issues: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -339,9 +386,25 @@ impl BrowserWorkflowAdapter {
             }
             "navigate" => serde_json::to_value(session()?.navigate(&string("url")?)?)
                 .map_err(|error| error.to_string()),
+            "reload" => {
+                serde_json::to_value(session()?.reload()?).map_err(|error| error.to_string())
+            }
+            "set_viewport" => {
+                let viewport: BrowserViewport = serde_json::from_value(
+                    object
+                        .get("viewport")
+                        .cloned()
+                        .ok_or_else(|| "browser set_viewport requires viewport".to_string())?,
+                )
+                .map_err(|error| format!("invalid browser viewport: {error}"))?;
+                serde_json::to_value(session()?.set_viewport(viewport)?)
+                    .map_err(|error| error.to_string())
+            }
             "inspect" => {
                 serde_json::to_value(session()?.inspect()?).map_err(|error| error.to_string())
             }
+            "annotate" => serde_json::to_value(session()?.annotate(&string("selector")?)?)
+                .map_err(|error| error.to_string()),
             "click" => serde_json::to_value(session()?.click(&string("selector")?)?)
                 .map_err(|error| error.to_string()),
             "type_text" => {
@@ -403,6 +466,7 @@ struct OwnedBrowser {
     current_url: Mutex<String>,
     console: Mutex<Vec<Value>>,
     network: Mutex<Vec<Value>>,
+    viewport: Mutex<BrowserViewport>,
 }
 
 impl OwnedBrowser {
@@ -470,6 +534,17 @@ impl OwnedBrowser {
             )?;
             cdp.command("Log.enable", json!({}))?;
             cdp.command("Accessibility.enable", json!({}))?;
+            cdp.command("Performance.enable", json!({}))?;
+            let viewport = BrowserViewport::default();
+            cdp.command(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": viewport.width,
+                    "height": viewport.height,
+                    "deviceScaleFactor": viewport.device_scale_factor,
+                    "mobile": viewport.mobile
+                }),
+            )?;
             cdp.command(
                 "Fetch.enable",
                 json!({
@@ -510,6 +585,7 @@ impl OwnedBrowser {
             current_url: Mutex::new("about:blank".to_string()),
             console: Mutex::new(Vec::new()),
             network: Mutex::new(Vec::new()),
+            viewport: Mutex::new(BrowserViewport::default()),
         });
         browser.navigate(&request.url)?;
         browser.capture_evidence()?;
@@ -528,6 +604,11 @@ impl OwnedBrowser {
             started_at_ms: self.started_at_ms,
             action_count: self.action_count.load(Ordering::SeqCst),
             cancelled: self.cancelled.load(Ordering::SeqCst),
+            viewport: self
+                .viewport
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -631,12 +712,49 @@ impl OwnedBrowser {
         })
     }
 
+    fn reload(&self) -> Result<BrowserActionResult, String> {
+        self.with_cdp(|cdp| {
+            cdp.command("Page.reload", json!({"ignoreCache":true}))?;
+            cdp.wait_for_load(Duration::from_millis(self.limits.timeout_ms))
+        })?;
+        Ok(BrowserActionResult {
+            ok: true,
+            url: self.view().current_url,
+            evidence: self.capture_evidence()?,
+        })
+    }
+
+    fn set_viewport(&self, viewport: BrowserViewport) -> Result<BrowserActionResult, String> {
+        validate_viewport(&viewport)?;
+        self.with_cdp(|cdp| {
+            cdp.command(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": viewport.width,
+                    "height": viewport.height,
+                    "deviceScaleFactor": viewport.device_scale_factor,
+                    "mobile": viewport.mobile
+                }),
+            )?;
+            cdp.wait_quiet(Duration::from_millis(150))
+        })?;
+        *self
+            .viewport
+            .lock()
+            .map_err(|_| "Browser viewport lock is poisoned".to_string())? = viewport;
+        Ok(BrowserActionResult {
+            ok: true,
+            url: self.view().current_url,
+            evidence: self.capture_evidence()?,
+        })
+    }
+
     fn inspect(&self) -> Result<BrowserInspection, String> {
         let payload = self.with_cdp(|cdp| {
             let dom = cdp.command(
                 "Runtime.evaluate",
                 json!({
-                    "expression":"JSON.stringify({title:document.title,url:location.href,html:document.documentElement.outerHTML})",
+                    "expression":"JSON.stringify({title:document.title,url:location.href,html:document.documentElement.outerHTML,accessibilityIssues:[...Array.from(document.querySelectorAll('img:not([alt])')).slice(0,25).map((_,i)=>`Image ${i+1} has no alt attribute`),...Array.from(document.querySelectorAll('button,a[href],input,select,textarea')).filter(e=>!((e.getAttribute('aria-label')||e.getAttribute('aria-labelledby')||e.textContent||e.getAttribute('title')||'').trim())&&!((e instanceof HTMLInputElement)&&['hidden','submit','button','image'].includes(e.type))).slice(0,50).map(e=>`${e.tagName.toLowerCase()} control has no accessible name`),...(!document.documentElement.lang?[`Document has no language attribute`]:[]),...(!document.querySelector('h1')?[`Document has no h1 heading`]:[])]})",
                     "returnByValue":true
                 }),
             )?;
@@ -682,6 +800,125 @@ impl OwnedBrowser {
                 .to_string(),
             dom,
             accessibility,
+            accessibility_issues: dom_value
+                .get("accessibilityIssues")
+                .and_then(Value::as_array)
+                .map(|issues| {
+                    issues
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(100)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    fn performance_snapshot(&self) -> Result<ArtifactBlob, String> {
+        let payload = self.with_cdp(|cdp| {
+            let metrics = cdp.command("Performance.getMetrics", json!({}))?;
+            let timing = cdp.command(
+                "Runtime.evaluate",
+                json!({
+                    "expression":"JSON.stringify({navigation:performance.getEntriesByType('navigation').slice(0,1),paints:performance.getEntriesByType('paint').slice(0,16),resources:performance.getEntriesByType('resource').slice(0,256).map(({name,initiatorType,duration,transferSize,encodedBodySize,decodedBodySize})=>({name,initiatorType,duration,transferSize,encodedBodySize,decodedBodySize}))})",
+                    "returnByValue":true
+                }),
+            )?;
+            Ok(json!({ "metrics": metrics, "timing": timing }))
+        })?;
+        let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > self.limits.max_dom_bytes {
+            return Err("Performance snapshot exceeds its quota".to_string());
+        }
+        self.put_artifact(&bytes)
+    }
+
+    fn annotate(&self, selector: &str) -> Result<BrowserAnnotation, String> {
+        validate_text("selector", selector, MAX_SELECTOR_BYTES)?;
+        let encoded_selector =
+            serde_json::to_string(selector).map_err(|error| error.to_string())?;
+        let payload = self.with_cdp(|cdp| {
+            cdp.command(
+                "Runtime.evaluate",
+                json!({
+                    "expression":format!("(()=>{{const e=document.querySelector({encoded_selector});if(!e)throw new Error('selector not found');e.scrollIntoView({{block:'center',inline:'center'}});const r=e.getBoundingClientRect();const previousOutline=e.style.outline;const previousOutlineOffset=e.style.outlineOffset;e.style.outline='3px solid #f97316';e.style.outlineOffset='3px';return JSON.stringify({{tag:e.tagName.toLowerCase(),role:e.getAttribute('role')||'',ariaLabel:e.getAttribute('aria-label')||'',text:(e.textContent||'').trim().slice(0,2000),rect:{{x:r.x,y:r.y,width:r.width,height:r.height}},previousOutline,previousOutlineOffset}});}})()"),
+                    "returnByValue":true
+                }),
+            )
+        })?;
+        if payload.get("exceptionDetails").is_some() {
+            return Err("Browser annotation selector was not found".to_string());
+        }
+        let serialized = payload
+            .pointer("/result/value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Chromium did not return annotation context".to_string())?;
+        let value: Value = serde_json::from_str(serialized).map_err(|error| error.to_string())?;
+        let previous_outline = serde_json::to_string(
+            value
+                .get("previousOutline")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let previous_offset = serde_json::to_string(
+            value
+                .get("previousOutlineOffset")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let evidence_result = self.capture_evidence();
+        let restore_result = self.with_cdp(|cdp| {
+            cdp.command(
+                "Runtime.evaluate",
+                json!({
+                    "expression":format!("(()=>{{const e=document.querySelector({encoded_selector});if(!e)return false;e.style.outline={previous_outline};e.style.outlineOffset={previous_offset};return true;}})()"),
+                    "returnByValue":true
+                }),
+            )?;
+            Ok(())
+        });
+        let evidence = evidence_result?;
+        restore_result?;
+        let rect = value.get("rect").cloned().unwrap_or(Value::Null);
+        Ok(BrowserAnnotation {
+            url: self.view().current_url,
+            selector: selector.to_string(),
+            tag: value
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            role: value
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            aria_label: value
+                .get("ariaLabel")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            text: value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            rect: BrowserAnnotationRect {
+                x: rect.get("x").and_then(Value::as_f64).unwrap_or_default(),
+                y: rect.get("y").and_then(Value::as_f64).unwrap_or_default(),
+                width: rect
+                    .get("width")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default(),
+                height: rect
+                    .get("height")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default(),
+            },
+            evidence,
         })
     }
 
@@ -758,6 +995,7 @@ impl OwnedBrowser {
         }
         let screenshot = self.screenshot()?;
         let inspection = self.inspect()?;
+        let performance = self.performance_snapshot()?;
         let console = serde_json::to_vec(
             &*self
                 .console
@@ -775,8 +1013,10 @@ impl OwnedBrowser {
         Ok(BrowserEvidence {
             screenshot: Some(screenshot),
             dom: Some(inspection.dom),
+            accessibility: Some(inspection.accessibility),
             console: Some(self.put_artifact(&console)?),
             network: Some(self.put_artifact(&network)?),
+            performance: Some(performance),
             action_count: self.action_count.load(Ordering::SeqCst),
         })
     }
@@ -1308,6 +1548,17 @@ fn validate_limits(limits: &BrowserLimits) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_viewport(viewport: &BrowserViewport) -> Result<(), String> {
+    if !(320..=3840).contains(&viewport.width)
+        || !(320..=2160).contains(&viewport.height)
+        || !viewport.device_scale_factor.is_finite()
+        || !(1.0..=3.0).contains(&viewport.device_scale_factor)
+    {
+        return Err("Browser viewport is outside supported bounds".to_string());
+    }
+    Ok(())
+}
+
 fn reserve_quota(counter: &AtomicU64, limit: u64, bytes: u64) -> Result<(), String> {
     counter
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -1704,12 +1955,47 @@ pub async fn browser_navigate(
 }
 
 #[tauri::command]
+pub async fn browser_reload(
+    state: tauri::State<'_, BrowserCommandState>,
+    session_id: String,
+) -> Result<BrowserActionResult, String> {
+    let session = state.get(&session_id)?;
+    tokio::task::spawn_blocking(move || session.reload())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn browser_set_viewport(
+    state: tauri::State<'_, BrowserCommandState>,
+    session_id: String,
+    viewport: BrowserViewport,
+) -> Result<BrowserActionResult, String> {
+    let session = state.get(&session_id)?;
+    tokio::task::spawn_blocking(move || session.set_viewport(viewport))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn browser_inspect(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,
 ) -> Result<BrowserInspection, String> {
     let session = state.get(&session_id)?;
     tokio::task::spawn_blocking(move || session.inspect())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn browser_annotate(
+    state: tauri::State<'_, BrowserCommandState>,
+    session_id: String,
+    selector: String,
+) -> Result<BrowserAnnotation, String> {
+    let session = state.get(&session_id)?;
+    tokio::task::spawn_blocking(move || session.annotate(&selector))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -1812,6 +2098,32 @@ mod tests {
         );
         assert_eq!(classify_ip("10.1.2.3".parse().unwrap()), IpClass::Private);
         assert_eq!(classify_ip("8.8.8.8".parse().unwrap()), IpClass::Public);
+    }
+
+    #[test]
+    fn viewport_limits_cover_supported_desktop_and_mobile_presets() {
+        assert!(validate_viewport(&BrowserViewport::default()).is_ok());
+        assert!(validate_viewport(&BrowserViewport {
+            width: 390,
+            height: 844,
+            device_scale_factor: 3.0,
+            mobile: true,
+        })
+        .is_ok());
+        assert!(validate_viewport(&BrowserViewport {
+            width: 200,
+            height: 844,
+            device_scale_factor: 2.0,
+            mobile: true,
+        })
+        .is_err());
+        assert!(validate_viewport(&BrowserViewport {
+            width: 1920,
+            height: 1080,
+            device_scale_factor: 4.0,
+            mobile: false,
+        })
+        .is_err());
     }
 
     #[test]
@@ -1971,6 +2283,19 @@ mod tests {
             },
         )
         .unwrap();
+        let viewport = BrowserViewport {
+            width: 390,
+            height: 844,
+            device_scale_factor: 3.0,
+            mobile: true,
+        };
+        browser.set_viewport(viewport.clone()).unwrap();
+        assert_eq!(browser.view().viewport.width, viewport.width);
+        assert_eq!(browser.view().viewport.height, viewport.height);
+        browser.reload().unwrap();
+        let annotation = browser.annotate("#go").unwrap();
+        assert_eq!(annotation.tag, "button");
+        assert!(annotation.evidence.screenshot.is_some());
         let corpus: Value = serde_json::from_str(include_str!(
             "../fixtures/browser-v1/deterministic-flows.json"
         ))
@@ -1994,8 +2319,10 @@ mod tests {
                 let evidence = browser.capture_evidence()?;
                 if evidence.screenshot.is_none()
                     || evidence.dom.is_none()
+                    || evidence.accessibility.is_none()
                     || evidence.console.is_none()
                     || evidence.network.is_none()
+                    || evidence.performance.is_none()
                 {
                     return Err("flow did not persist its full evidence set".to_string());
                 }

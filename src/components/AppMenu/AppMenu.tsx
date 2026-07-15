@@ -19,6 +19,7 @@ interface AppMenuProps {
   onOpenSettings: () => void;
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
+  onOpenBrowserWorkbench: () => void;
 }
 
 interface MenuRowProps {
@@ -46,7 +47,7 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }: AppMenuProps) {
+export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -104,6 +105,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }:
             onClick={() => {
               closeAll();
               onOpenRunCenter();
+            }}
+          />
+          <MenuRow
+            icon={<Globe size={14} className="text-faint" />}
+            label={t("AppMenu.browserWorkbench")}
+            onClick={() => {
+              closeAll();
+              onOpenBrowserWorkbench();
             }}
           />
           <MenuRow

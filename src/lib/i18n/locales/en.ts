@@ -15,6 +15,7 @@ export const en: Record<string, string> = {
   ...ecosystemLocale,
   ...developerLocale,
   "ComparePicker.toolsBadge": "Tools",
+  "AppMenu.browserWorkbench": "Browser Workbench",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",
   "ComparePicker.capabilityUnsupported": "unsupported",
