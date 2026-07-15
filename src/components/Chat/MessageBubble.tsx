@@ -345,9 +345,12 @@ function TranslationControls({
     : saved;
 
   useEffect(() => {
-    if (!preferredLocale) return;
-    setLocale(preferredLocale);
-    setShowTranslation(true);
+    if (preferredLocale) {
+      setLocale(preferredLocale);
+      setShowTranslation(true);
+    } else {
+      setShowTranslation(false);
+    }
   }, [preferredLocale]);
 
   useEffect(() => {
