@@ -7,6 +7,7 @@ import {
   GitPullRequest,
   Globe,
   HelpCircle,
+  LayoutDashboard,
   ListTodo,
   Inbox,
   Newspaper,
@@ -30,6 +31,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDailyBrief: () => void;
+  onOpenWorkCanvas: () => void;
 }
 
 interface MenuRowProps {
@@ -67,6 +69,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDailyBrief,
+  onOpenWorkCanvas,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -157,6 +160,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<LayoutDashboard size={14} className="text-faint" />}
+            label={t("AppMenu.workCanvas")}
+            onClick={() => {
+              closeAll();
+              onOpenWorkCanvas();
             }}
           />
           <MenuRow

@@ -13,6 +13,7 @@ import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { WorkCanvasPanel } from "./components/WorkCanvas";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
@@ -71,6 +72,7 @@ function App() {
     s.sessions.find((session) => session.id === s.activeSessionId)?.crewRun ? s.activeSessionId : null
   );
   const newSession = useSessionStore((s) => s.newSession);
+  const switchSession = useSessionStore((s) => s.switchSession);
   const splitSessionId = useSessionStore((s) => s.splitSessionId);
   const splitTitle = useSessionStore((s) =>
     s.splitSessionId === null ? null : s.sessions.find((x) => x.id === s.splitSessionId)?.title ?? null
@@ -104,6 +106,7 @@ function App() {
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [workCanvasOpen, setWorkCanvasOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -124,6 +127,7 @@ function App() {
     setGlobalSearchOpen(false);
     setAgentInboxOpen(false);
     setDailyBriefOpen(false);
+    setWorkCanvasOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -168,6 +172,7 @@ function App() {
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setDailyBriefOpen(false);
+          setWorkCanvasOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -178,6 +183,7 @@ function App() {
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setDailyBriefOpen(false);
+          setWorkCanvasOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -315,6 +321,24 @@ function App() {
     }
   }, [selectedFile]);
 
+  // Work Canvas "Open" action for a file-reference node: re-reads the file
+  // fresh (same `tool_read_file` path `FileTree.tsx`'s own click handler
+  // uses) and drops it into the same Workspace-panel preview/diff pane, so a
+  // canvas node never carries a stale copy of the file — only ever a live
+  // pointer back to it. Swallows a read failure into the diff pane's own
+  // error slot rather than throwing, since the referenced file may have
+  // since moved or been deleted.
+  const handleOpenFileFromCanvas = useCallback(async (path: string) => {
+    setWorkspacePanelOpen(true);
+    setDiffError(null);
+    try {
+      const content = await invoke<string>("tool_read_file", { path });
+      setSelectedFile({ path, original: content, current: content });
+    } catch (err) {
+      setDiffError(formatError(err));
+    }
+  }, []);
+
   return (
     <div className="flex h-screen w-screen bg-background text-foreground">
       {/* Left sidebar: chat session list, extending to the very top of the
@@ -335,6 +359,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -344,6 +369,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -354,6 +380,7 @@ function App() {
             setIssueToPrOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -364,6 +391,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -374,6 +402,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
@@ -384,6 +413,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
           }}
@@ -394,8 +424,20 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
+            setWorkCanvasOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenWorkCanvas={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setWorkCanvasOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
@@ -420,7 +462,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : workCanvasOpen ? "work-canvas" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -452,6 +494,20 @@ function App() {
                 setAgentInboxOpen(true);
               }}
               onOpenSettingsTab={openSettingsTab}
+            />
+          ) : workCanvasOpen ? (
+            <WorkCanvasPanel
+              onClose={() => setWorkCanvasOpen(false)}
+              onOpenSession={(sessionId) => {
+                setWorkCanvasOpen(false);
+                switchSession(sessionId);
+              }}
+              onOpenRun={(runId) => {
+                setWorkCanvasOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+              onOpenFile={(path) => void handleOpenFileFromCanvas(path)}
             />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
@@ -492,7 +548,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !workCanvasOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
