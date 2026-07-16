@@ -8,6 +8,7 @@ import {
   Globe,
   HelpCircle,
   Search,
+  ServerCog,
   Settings as SettingsIcon,
   SquareTerminal,
 } from "lucide-react";
@@ -23,6 +24,7 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenMcpGenerator: () => void;
   onOpenTerminal: () => void;
 }
 
@@ -51,7 +53,7 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenIssueToPr, onOpenTerminal }: AppMenuProps) {
+export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenIssueToPr, onOpenMcpGenerator, onOpenTerminal }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -125,6 +127,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ServerCog size={14} className="text-faint" />}
+            label={t("AppMenu.mcpGenerator")}
+            onClick={() => {
+              closeAll();
+              onOpenMcpGenerator();
             }}
           />
           <MenuRow
