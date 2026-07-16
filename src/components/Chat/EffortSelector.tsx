@@ -2,38 +2,45 @@ import { useEffect, useRef, useState } from "react";
 
 import { useModelStore } from "../../store/modelStore";
 import type { EffortLevel } from "../../store/modelStore";
+import {
+  effortForProviderModel,
+  effortLevelsForProvider,
+  providerModelTargetKey,
+} from "../../lib/modelTargets";
 import { useT } from "../../lib/i18n";
 
-interface LevelMeta {
-  value: EffortLevel;
+const LEVEL_LABEL_KEYS: Record<EffortLevel, string> = {
+  low: "EffortSelector.levelLow",
+  medium: "EffortSelector.levelMedium",
+  high: "EffortSelector.levelHigh",
+  xhigh: "EffortSelector.levelExtra",
+  max: "EffortSelector.levelMax",
+};
+
+interface SliderPosition {
+  /** `null` is the leading "Default" position: no per-model entry, no effort field sent at all. */
+  value: EffortLevel | null;
   labelKey: string;
 }
 
 /**
- * Left-to-right = faster/cheaper -> smarter/slower, mirroring Claude Code's
- * own effort slider. Sent to Anthropic as `output_config.effort` (see
- * `providers.rs::build_chat_request`) — every other provider ignores it.
- */
-const LEVELS: LevelMeta[] = [
-  { value: "low", labelKey: "EffortSelector.levelLow" },
-  { value: "medium", labelKey: "EffortSelector.levelMedium" },
-  { value: "high", labelKey: "EffortSelector.levelHigh" },
-  { value: "xhigh", labelKey: "EffortSelector.levelExtra" },
-  { value: "max", labelKey: "EffortSelector.levelMax" },
-];
-
-/**
- * Pill button + dropdown slider for Anthropic's `output_config.effort`
- * parameter, mirroring ModeSelector's floating-panel idiom. Only rendered
- * when the active chat target is the Anthropic provider — every other
- * provider either ignores the field or has no equivalent knob, so showing
- * this control there would just be a dead setting.
+ * Pill button + dropdown slider for the per-model reasoning-effort level,
+ * mirroring ModeSelector's floating-panel idiom. Left-to-right = provider
+ * default -> faster/cheaper -> smarter/slower, mirroring Claude Code's own
+ * effort slider. Only rendered when the active chat target belongs to a
+ * provider with an effort knob (see `modelTargets.ts`'s
+ * `effortLevelsForProvider`: all five levels for Anthropic, low/medium/high
+ * for OpenAI/Gemini/OpenRouter) — custom providers, Ollama, and local
+ * llama.cpp have no equivalent, so showing this control there would just be
+ * a dead setting. The Rust proxy owns the wire shape per provider (see
+ * `providers.rs::build_chat_request`).
  */
 export function EffortSelector() {
   const activeProvider = useModelStore((s) => s.activeProvider);
   const activeProviderId = useModelStore((s) => s.activeProviderId);
-  const effort = useModelStore((s) => s.effort);
-  const setEffort = useModelStore((s) => s.setEffort);
+  const activeProviderModel = useModelStore((s) => s.activeProviderModel);
+  const effortByTarget = useModelStore((s) => s.effortByTarget);
+  const setEffortForTarget = useModelStore((s) => s.setEffortForTarget);
 
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -50,12 +57,27 @@ export function EffortSelector() {
     return () => window.removeEventListener("pointerdown", handlePointerDown);
   }, [open]);
 
-  if (activeProvider !== "provider" || activeProviderId !== "anthropic") {
+  const levels =
+    activeProvider === "provider" && activeProviderId
+      ? effortLevelsForProvider(activeProviderId)
+      : null;
+  if (!levels || !activeProviderId || !activeProviderModel) {
     return null;
   }
 
-  const index = Math.max(0, LEVELS.findIndex((l) => l.value === effort));
-  const current = LEVELS[index];
+  const targetKey = providerModelTargetKey(activeProviderId, activeProviderModel);
+  const selected = effortForProviderModel(effortByTarget, activeProviderId, activeProviderModel);
+  // A persisted level this provider doesn't offer (only reachable by hand-
+  // editing storage) renders as its clamped wire equivalent — the top of
+  // this provider's scale, exactly what the Rust proxy would send.
+  const effective = selected && !levels.includes(selected) ? levels[levels.length - 1] : selected;
+
+  const positions: SliderPosition[] = [
+    { value: null, labelKey: "EffortSelector.levelDefault" },
+    ...levels.map((level) => ({ value: level, labelKey: LEVEL_LABEL_KEYS[level] })),
+  ];
+  const index = Math.max(0, positions.findIndex((position) => position.value === (effective ?? null)));
+  const current = positions[index];
 
   return (
     <div ref={containerRef} className="relative inline-block">
@@ -83,18 +105,21 @@ export function EffortSelector() {
           <input
             type="range"
             min={0}
-            max={LEVELS.length - 1}
+            max={positions.length - 1}
             step={1}
             value={index}
-            onChange={(event) => setEffort(LEVELS[Number(event.target.value)].value)}
+            onChange={(event) => setEffortForTarget(targetKey, positions[Number(event.target.value)].value)}
             aria-label={t("EffortSelector.effortLevelAriaLabel")}
             className="mt-1 w-full cursor-pointer accent-accent"
           />
 
           <div className="mt-1 flex justify-between text-[11px] text-faint">
-            {LEVELS.map((level) => (
-              <span key={level.value} className={level.value === effort ? "text-accent" : undefined}>
-                {t(level.labelKey)}
+            {positions.map((position) => (
+              <span
+                key={position.value ?? "default"}
+                className={position === current ? "text-accent" : undefined}
+              >
+                {t(position.labelKey)}
               </span>
             ))}
           </div>
