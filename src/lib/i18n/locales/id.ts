@@ -6,7 +6,6 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
-import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -93,7 +92,6 @@ export const id: Record<string, string> = {
   "Onboarding.finishBody": "Itulah semua yang dicakup panduan ini. Setiap pilihan yang Anda buat bisa diedit nanti dari Pengaturan, dan panduan ini selalu bisa dibuka satu klik lagi dari baris \"Mulai ulang orientasi\" di menu aplikasi.",
   "Onboarding.finishTemplateSummary": "Konten awal \"{{template}}\" Anda sudah siap dilihat di Prompts (dan di Otomasi, jika sebuah resep dibuat).",
   "Onboarding.finishReopenHint": "Buka lagi panduan ini kapan saja dari baris \"Mulai ulang orientasi\" di menu aplikasi.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "Memeriksa seberapa siap issue ini untuk agen…",

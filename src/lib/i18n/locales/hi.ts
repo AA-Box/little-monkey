@@ -6,7 +6,6 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
-import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -93,7 +92,6 @@ export const hi: Record<string, string> = {
   "Onboarding.finishBody": "यह विज़ार्ड बस इतना ही कवर करता है। आपके किए गए हर चुनाव को बाद में सेटिंग्स से संपादित किया जा सकता है, और यह विज़ार्ड ऐप मेनू की \"ऑनबोर्डिंग फिर से शुरू करें\" पंक्ति से हमेशा एक क्लिक दूर है।",
   "Onboarding.finishTemplateSummary": "आपका \"{{template}}\" स्टार्टर कंटेंट Prompts में देखने के लिए तैयार है (और यदि कोई रेसिपी बनी है तो ऑटोमेशन में भी)।",
   "Onboarding.finishReopenHint": "इस विज़ार्ड को कभी भी ऐप मेनू की \"ऑनबोर्डिंग फिर से शुरू करें\" पंक्ति से फिर से खोलें।",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "यह जांचा जा रहा है कि यह इशू एजेंट के लिए कितना तैयार है…",

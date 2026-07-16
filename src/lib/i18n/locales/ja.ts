@@ -6,7 +6,6 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
-import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -93,7 +92,6 @@ export const ja: Record<string, string> = {
   "Onboarding.finishBody": "このウィザードで扱う内容は以上です。行った選択はあとから設定画面で編集できます。またこのウィザードは、アプリメニューの「初回セットアップをやり直す」から、いつでもワンクリックで再度開けます。",
   "Onboarding.finishTemplateSummary": "「{{template}}」の初期コンテンツはPromptsで確認できます(レシピが作成された場合は自動化でも確認できます)。",
   "Onboarding.finishReopenHint": "このウィザードは、アプリメニューの「初回セットアップをやり直す」からいつでも再度開けます。",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "この issue がエージェントにとってどれだけ準備できているか確認しています…",

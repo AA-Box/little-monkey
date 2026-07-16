@@ -6,7 +6,6 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
-import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -93,7 +92,6 @@ export const de: Record<string, string> = {
   "Onboarding.finishBody": "Das war's schon. Jede Wahl, die du getroffen hast, lässt sich später in den Einstellungen ändern, und dieser Assistent ist über die Zeile „Einrichtung neu starten“ im App-Menü jederzeit einen Klick entfernt.",
   "Onboarding.finishTemplateSummary": "Dein Starterinhalt „{{template}}“ ist unter Prompts (und unter Automatisierung, falls ein Rezept angelegt wurde) bereit.",
   "Onboarding.finishReopenHint": "Öffne diesen Assistenten jederzeit erneut über die Zeile „Einrichtung neu starten“ im App-Menü.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "Es wird geprüft, wie einsatzbereit dieses Issue für einen Agenten ist…",
