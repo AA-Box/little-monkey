@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardCheck,
   Compass,
   GitPullRequest,
   Globe,
@@ -35,6 +36,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
+  onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
@@ -76,6 +78,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
+  onOpenEvidenceBoard,
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
@@ -193,6 +196,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardCheck size={14} className="text-faint" />}
+            label={t("AppMenu.evidenceBoard")}
+            onClick={() => {
+              closeAll();
+              onOpenEvidenceBoard();
             }}
           />
           <MenuRow
