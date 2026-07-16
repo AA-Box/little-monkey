@@ -18,6 +18,7 @@ export const en: Record<string, string> = {
   ...inboxLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
+  "AppMenu.sideTasks": "Side Tasks",
   "AppMenu.integratedTerminal": "Integrated terminal",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

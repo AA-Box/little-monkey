@@ -8,12 +8,14 @@ import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
+import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { useRunStore } from "./store/runStore";
+import { useSideTaskStore } from "./store/sideTaskStore";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
@@ -358,6 +360,7 @@ function App() {
             setAgentInboxOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
+          onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
         />
       </aside>
 
@@ -451,6 +454,14 @@ function App() {
           </ErrorBoundary>
         </div>
       )}
+
+      {/* Side Tasks: a collapsible panel that coexists with whatever the
+          main pane is showing (unlike RunCenter/BrowserWorkbench, which
+          replace it) — ROADMAP.md's "Side Tasks" item asks for parallel work
+          that stays visible next to the main chat, not a full-screen swap.
+          Keyed by the active session so a manually-started ("+ New") task is
+          attributed to whichever chat is actually on screen. */}
+      <SideTaskDrawer sessionId={activeSessionId} />
 
       {/* Right: collapsible workspace panel (file tree + diff preview),
           also extending to the top of the window */}
