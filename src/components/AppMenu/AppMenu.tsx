@@ -10,6 +10,7 @@ import {
   Inbox,
   Search,
   Settings as SettingsIcon,
+  ShieldAlert,
   SquareTerminal,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
@@ -26,6 +27,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
+  onOpenRedTeamLab: () => void;
 }
 
 interface MenuRowProps {
@@ -61,6 +63,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
+  onOpenRedTeamLab,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -151,6 +154,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldAlert size={14} className="text-faint" />}
+            label={t("AppMenu.redTeamLab")}
+            onClick={() => {
+              closeAll();
+              onOpenRedTeamLab();
             }}
           />
           <MenuRow
