@@ -10,6 +10,7 @@ import {
   HelpCircle,
   ListTodo,
   Inbox,
+  Network,
   Newspaper,
   Search,
   ServerCog,
@@ -38,6 +39,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenCrossRepoIntelligence: () => void;
 }
 
 interface MenuRowProps {
@@ -79,6 +81,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenCrossRepoIntelligence,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -193,6 +196,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoIntelligence")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoIntelligence();
             }}
           />
           <MenuRow

@@ -9,6 +9,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 
 export const esES: Record<string, string> = {
   ...crewLocale,
@@ -227,6 +228,7 @@ export const esES: Record<string, string> = {
   "McpGenerator.statusNotClean": "No está limpio según el simulador",
   "McpGenerator.statusNotSimulated": "No simulado",
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   // Real Spain Spanish translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumen diario",
   "DailyBriefPanel.title": "Resumen diario",
@@ -1196,5 +1198,44 @@ export const esES: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Esto no es un JSON de instantánea de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "¿Eliminar esta fuente de registro?",
   "EcosystemDiscover.removeRegistry": "Eliminar",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Real Spain Spanish translations, overriding every crossRepoIntelligenceLocale key above.
+  "AppMenu.crossRepoIntelligence": "Inteligencia entre repositorios",
+  "CrossRepoIntelligencePanel.title": "Inteligencia de código entre repositorios",
+  "CrossRepoIntelligencePanel.subtitle": "Busca símbolos en todos los repositorios conectados y analiza el impacto: archivos afectados, responsables, pruebas y pasos de migración.",
+  "CrossRepoIntelligencePanel.close": "Cerrar Inteligencia entre repositorios",
+  "CrossRepoIntelligencePanel.rebuild": "Reconstruir índice",
+  "CrossRepoIntelligencePanel.rebuilding": "Indexando…",
+  "CrossRepoIntelligencePanel.builtAt": "Indexado {{time}} · {{symbolCount}} símbolos en {{fileCount}} archivos",
+  "CrossRepoIntelligencePanel.notBuiltYet": "Genera el índice para buscar símbolos en tus repositorios conectados.",
+  "CrossRepoIntelligencePanel.noWorkspace": "Abre primero una carpeta de espacio de trabajo.",
+  "CrossRepoIntelligencePanel.buildError": "No se pudo generar el índice: {{error}}",
+  "CrossRepoIntelligencePanel.searchLabel": "Buscar símbolos",
+  "CrossRepoIntelligencePanel.searchPlaceholder": "Nombre del símbolo (función, clase, tipo…)",
+  "CrossRepoIntelligencePanel.noMatches": "Ningún símbolo coincide con \"{{query}}\".",
+  "CrossRepoIntelligencePanel.matchesHint": "{{count}} símbolo(s) coincidente(s)",
+  "CrossRepoIntelligencePanel.kind.function": "función",
+  "CrossRepoIntelligencePanel.kind.method": "método",
+  "CrossRepoIntelligencePanel.kind.class": "clase",
+  "CrossRepoIntelligencePanel.kind.interface": "interfaz",
+  "CrossRepoIntelligencePanel.kind.type": "tipo",
+  "CrossRepoIntelligencePanel.kind.const": "constante",
+  "CrossRepoIntelligencePanel.kind.enum": "enum",
+  "CrossRepoIntelligencePanel.kind.struct": "struct",
+  "CrossRepoIntelligencePanel.kind.trait": "trait",
+  "CrossRepoIntelligencePanel.impact.title": "Impacto de \"{{symbol}}\"",
+  "CrossRepoIntelligencePanel.impact.loading": "Analizando el impacto…",
+  "CrossRepoIntelligencePanel.impact.error": "No se pudo analizar el impacto: {{error}}",
+  "CrossRepoIntelligencePanel.impact.affectedRepos": "Repositorios afectados",
+  "CrossRepoIntelligencePanel.impact.affectedFiles": "Archivos afectados",
+  "CrossRepoIntelligencePanel.impact.definitions": "Definiciones",
+  "CrossRepoIntelligencePanel.impact.references": "Referencias",
+  "CrossRepoIntelligencePanel.impact.noReferences": "No se ha encontrado ninguna referencia.",
+  "CrossRepoIntelligencePanel.impact.tests": "Pruebas probables",
+  "CrossRepoIntelligencePanel.impact.noTests": "No se ha encontrado ningún archivo de prueba según la convención de nombres.",
+  "CrossRepoIntelligencePanel.impact.owners": "Responsables",
+  "CrossRepoIntelligencePanel.impact.unassigned": "Sin asignar",
+  "CrossRepoIntelligencePanel.impact.migrationSteps": "Pasos de migración probables",
+  "CrossRepoIntelligencePanel.impact.clear": "Borrar",
+  "CrossRepoIntelligencePanel.footnote": "Alcance del MVP: indexa las raíces del espacio de trabajo conectadas (principal + secundarias) mediante extracción de símbolos basada en reglas y búsqueda de texto, no un AST/grafo de llamadas multilingüe completo.",
 };

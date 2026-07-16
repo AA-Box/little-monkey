@@ -15,6 +15,7 @@ import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { CrossRepoIntelligencePanel } from "./components/CrossRepoIntelligence";
 import { TerminalPanel } from "./components/Terminal";
 import { DebatePanel } from "./components/Debate";
 import { SettingsModal } from "./components/Settings";
@@ -113,6 +114,7 @@ function App() {
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [crossRepoIntelligenceOpen, setCrossRepoIntelligenceOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [debateOpen, setDebateOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
@@ -137,6 +139,7 @@ function App() {
     setAgentInboxOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
+    setCrossRepoIntelligenceOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -182,6 +185,7 @@ function App() {
           setAgentInboxOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setCrossRepoIntelligenceOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -193,6 +197,7 @@ function App() {
           setAgentInboxOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setCrossRepoIntelligenceOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -364,6 +369,7 @@ function App() {
             setAgentInboxOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -376,6 +382,7 @@ function App() {
             setAgentInboxOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -389,6 +396,7 @@ function App() {
             setAgentInboxOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -402,6 +410,7 @@ function App() {
             setAgentInboxOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -414,6 +423,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
@@ -427,6 +437,7 @@ function App() {
             setAgentInboxOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setSopCompilerOpen(true);
           }}
@@ -440,6 +451,7 @@ function App() {
             setAgentInboxOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setMcpGeneratorOpen(true);
           }}
@@ -453,6 +465,7 @@ function App() {
             setGlobalSearchOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
           }}
@@ -466,8 +479,23 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDebateOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenCrossRepoIntelligence={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setCrossRepoIntelligenceOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
@@ -481,6 +509,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setDebateOpen(true);
           }}
@@ -515,7 +544,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -548,6 +577,8 @@ function App() {
               }}
               onOpenSettingsTab={openSettingsTab}
             />
+          ) : crossRepoIntelligenceOpen ? (
+            <CrossRepoIntelligencePanel onClose={() => setCrossRepoIntelligenceOpen(false)} />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : debateOpen ? (
@@ -599,7 +630,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !crossRepoIntelligenceOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

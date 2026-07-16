@@ -12,6 +12,7 @@ import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -28,6 +29,7 @@ export const en: Record<string, string> = {
   ...inboxLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",

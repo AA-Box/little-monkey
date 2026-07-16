@@ -9,6 +9,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -227,6 +228,7 @@ export const ja: Record<string, string> = {
   "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
   "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   // Real Japanese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "デイリーブリーフ",
   "DailyBriefPanel.title": "デイリーブリーフ",
@@ -1196,5 +1198,44 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "有効なレジストリスナップショットのJSONではありません。",
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
-  "EcosystemDiscover.cancel": "キャンセル"
+  "EcosystemDiscover.cancel": "キャンセル",
+  // Real Japanese translations, overriding every crossRepoIntelligenceLocale key above.
+  "AppMenu.crossRepoIntelligence": "クロスリポジトリ インテリジェンス",
+  "CrossRepoIntelligencePanel.title": "クロスリポジトリ コードインテリジェンス",
+  "CrossRepoIntelligencePanel.subtitle": "接続されているすべてのリポジトリでシンボルを検索し、影響範囲(影響を受けるファイル、担当者、テスト、移行手順)を追跡します。",
+  "CrossRepoIntelligencePanel.close": "クロスリポジトリ インテリジェンスを閉じる",
+  "CrossRepoIntelligencePanel.rebuild": "インデックスを再構築",
+  "CrossRepoIntelligencePanel.rebuilding": "インデックス作成中…",
+  "CrossRepoIntelligencePanel.builtAt": "{{time}} にインデックス作成済み · {{fileCount}} ファイル中 {{symbolCount}} シンボル",
+  "CrossRepoIntelligencePanel.notBuiltYet": "接続されたリポジトリでシンボルを検索するには、インデックスを作成してください。",
+  "CrossRepoIntelligencePanel.noWorkspace": "先にワークスペースフォルダを開いてください。",
+  "CrossRepoIntelligencePanel.buildError": "インデックスを作成できませんでした: {{error}}",
+  "CrossRepoIntelligencePanel.searchLabel": "シンボルを検索",
+  "CrossRepoIntelligencePanel.searchPlaceholder": "シンボル名(関数、クラス、型…)",
+  "CrossRepoIntelligencePanel.noMatches": "\"{{query}}\" に一致するシンボルはありません。",
+  "CrossRepoIntelligencePanel.matchesHint": "{{count}} 件の一致するシンボル",
+  "CrossRepoIntelligencePanel.kind.function": "関数",
+  "CrossRepoIntelligencePanel.kind.method": "メソッド",
+  "CrossRepoIntelligencePanel.kind.class": "クラス",
+  "CrossRepoIntelligencePanel.kind.interface": "インターフェース",
+  "CrossRepoIntelligencePanel.kind.type": "型",
+  "CrossRepoIntelligencePanel.kind.const": "定数",
+  "CrossRepoIntelligencePanel.kind.enum": "enum",
+  "CrossRepoIntelligencePanel.kind.struct": "struct",
+  "CrossRepoIntelligencePanel.kind.trait": "trait",
+  "CrossRepoIntelligencePanel.impact.title": "\"{{symbol}}\" の影響",
+  "CrossRepoIntelligencePanel.impact.loading": "影響を追跡中…",
+  "CrossRepoIntelligencePanel.impact.error": "影響を追跡できませんでした: {{error}}",
+  "CrossRepoIntelligencePanel.impact.affectedRepos": "影響を受けるリポジトリ",
+  "CrossRepoIntelligencePanel.impact.affectedFiles": "影響を受けるファイル",
+  "CrossRepoIntelligencePanel.impact.definitions": "定義",
+  "CrossRepoIntelligencePanel.impact.references": "参照",
+  "CrossRepoIntelligencePanel.impact.noReferences": "参照が見つかりませんでした。",
+  "CrossRepoIntelligencePanel.impact.tests": "関連しそうなテスト",
+  "CrossRepoIntelligencePanel.impact.noTests": "命名規則に一致するテストファイルが見つかりませんでした。",
+  "CrossRepoIntelligencePanel.impact.owners": "担当者",
+  "CrossRepoIntelligencePanel.impact.unassigned": "未割り当て",
+  "CrossRepoIntelligencePanel.impact.migrationSteps": "想定される移行手順",
+  "CrossRepoIntelligencePanel.impact.clear": "クリア",
+  "CrossRepoIntelligencePanel.footnote": "MVPの範囲: ルールベースのシンボル抽出とテキスト検索を使用して、接続されたワークスペースのルート(プライマリ+セカンダリ)をインデックス化します — 完全な多言語AST/呼び出しグラフではありません。",
 };

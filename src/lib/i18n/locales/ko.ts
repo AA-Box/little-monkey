@@ -9,6 +9,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -227,6 +228,7 @@ export const ko: Record<string, string> = {
   "McpGenerator.statusNotClean": "시뮬레이터 기준 미통과",
   "McpGenerator.statusNotSimulated": "시뮬레이션되지 않음",
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   // Real Korean translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "데일리 브리핑",
   "DailyBriefPanel.title": "데일리 브리핑",
@@ -1196,5 +1198,44 @@ export const ko: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "유효한 레지스트리 스냅샷 JSON이 아닙니다.",
   "EcosystemDiscover.confirmRemoveRegistry": "이 레지스트리 소스를 제거하시겠습니까?",
   "EcosystemDiscover.removeRegistry": "제거",
-  "EcosystemDiscover.cancel": "취소"
+  "EcosystemDiscover.cancel": "취소",
+  // Real Korean translations, overriding every crossRepoIntelligenceLocale key above.
+  "AppMenu.crossRepoIntelligence": "크로스 레포 인텔리전스",
+  "CrossRepoIntelligencePanel.title": "크로스 레포 코드 인텔리전스",
+  "CrossRepoIntelligencePanel.subtitle": "연결된 모든 레포에서 심볼을 검색한 다음 영향 범위(영향받는 파일, 담당자, 테스트, 마이그레이션 단계)를 추적하세요.",
+  "CrossRepoIntelligencePanel.close": "크로스 레포 인텔리전스 닫기",
+  "CrossRepoIntelligencePanel.rebuild": "인덱스 재구축",
+  "CrossRepoIntelligencePanel.rebuilding": "인덱싱 중…",
+  "CrossRepoIntelligencePanel.builtAt": "{{time}}에 인덱싱됨 · {{fileCount}}개 파일에서 심볼 {{symbolCount}}개",
+  "CrossRepoIntelligencePanel.notBuiltYet": "연결된 레포에서 심볼을 검색하려면 인덱스를 구축하세요.",
+  "CrossRepoIntelligencePanel.noWorkspace": "먼저 워크스페이스 폴더를 여세요.",
+  "CrossRepoIntelligencePanel.buildError": "인덱스를 구축할 수 없습니다: {{error}}",
+  "CrossRepoIntelligencePanel.searchLabel": "심볼 검색",
+  "CrossRepoIntelligencePanel.searchPlaceholder": "심볼 이름(함수, 클래스, 타입…)",
+  "CrossRepoIntelligencePanel.noMatches": "\"{{query}}\"와(과) 일치하는 심볼이 없습니다.",
+  "CrossRepoIntelligencePanel.matchesHint": "일치하는 심볼 {{count}}개",
+  "CrossRepoIntelligencePanel.kind.function": "함수",
+  "CrossRepoIntelligencePanel.kind.method": "메서드",
+  "CrossRepoIntelligencePanel.kind.class": "클래스",
+  "CrossRepoIntelligencePanel.kind.interface": "인터페이스",
+  "CrossRepoIntelligencePanel.kind.type": "타입",
+  "CrossRepoIntelligencePanel.kind.const": "상수",
+  "CrossRepoIntelligencePanel.kind.enum": "enum",
+  "CrossRepoIntelligencePanel.kind.struct": "struct",
+  "CrossRepoIntelligencePanel.kind.trait": "trait",
+  "CrossRepoIntelligencePanel.impact.title": "\"{{symbol}}\"의 영향",
+  "CrossRepoIntelligencePanel.impact.loading": "영향을 추적하는 중…",
+  "CrossRepoIntelligencePanel.impact.error": "영향을 추적할 수 없습니다: {{error}}",
+  "CrossRepoIntelligencePanel.impact.affectedRepos": "영향받는 레포",
+  "CrossRepoIntelligencePanel.impact.affectedFiles": "영향받는 파일",
+  "CrossRepoIntelligencePanel.impact.definitions": "정의",
+  "CrossRepoIntelligencePanel.impact.references": "참조",
+  "CrossRepoIntelligencePanel.impact.noReferences": "참조를 찾을 수 없습니다.",
+  "CrossRepoIntelligencePanel.impact.tests": "관련 가능성이 있는 테스트",
+  "CrossRepoIntelligencePanel.impact.noTests": "명명 규칙과 일치하는 테스트 파일을 찾을 수 없습니다.",
+  "CrossRepoIntelligencePanel.impact.owners": "담당자",
+  "CrossRepoIntelligencePanel.impact.unassigned": "미지정",
+  "CrossRepoIntelligencePanel.impact.migrationSteps": "예상 마이그레이션 단계",
+  "CrossRepoIntelligencePanel.impact.clear": "지우기",
+  "CrossRepoIntelligencePanel.footnote": "MVP 범위: 규칙 기반 심볼 추출과 텍스트 검색을 사용해 연결된 워크스페이스 루트(기본 + 보조)를 인덱싱합니다 — 완전한 다국어 AST/호출 그래프가 아닙니다.",
 };
