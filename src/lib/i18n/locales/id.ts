@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   // Real Indonesian translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Ringkasan Harian",
   "DailyBriefPanel.title": "Ringkasan Harian",
@@ -874,5 +876,34 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ini bukan JSON snapshot registri yang valid.",
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
-  "EcosystemDiscover.cancel": "Batal"
+  "EcosystemDiscover.cancel": "Batal",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "Riset Mendalam",
+  "DeepResearchWorkspacePanel.title": "Ruang Kerja Riset Mendalam",
+  "DeepResearchWorkspacePanel.subtitle": "Rencanakan dan jalankan pertanyaan riset multi-langkah di web, file ruang kerja Anda, dan tumpukan pengetahuan — setiap kesimpulan mengutip buktinya.",
+  "DeepResearchWorkspacePanel.close": "Tutup riset mendalam",
+  "DeepResearchWorkspacePanel.questionLabel": "Pertanyaan riset",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "Apa yang ingin Anda teliti?",
+  "DeepResearchWorkspacePanel.start": "Mulai riset",
+  "DeepResearchWorkspacePanel.cancel": "Batalkan",
+  "DeepResearchWorkspacePanel.planTitle": "Rencana & peta sumber",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} dicari · {{skipped}} dilewati",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} cuplikan bukti",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "Menunggu",
+  "DeepResearchWorkspacePanel.stepStatus.active": "Mencari…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "Dicari",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "Dilewati",
+  "DeepResearchWorkspacePanel.stepStatus.error": "Error",
+  "DeepResearchWorkspacePanel.runStatus.planning": "Merencanakan",
+  "DeepResearchWorkspacePanel.runStatus.researching": "Meneliti",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "Menyintesis",
+  "DeepResearchWorkspacePanel.runStatus.done": "Selesai",
+  "DeepResearchWorkspacePanel.runStatus.error": "Error",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "Dibatalkan",
+  "DeepResearchWorkspacePanel.reportTitle": "Laporan",
+  "DeepResearchWorkspacePanel.noClaims": "Tidak ada kesimpulan berbasis bukti yang dihasilkan untuk proses ini.",
+  "DeepResearchWorkspacePanel.droppedClaims": "{{count}} klaim dibuang karena tidak mengutip bukti yang valid.",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "Pertanyaan terbuka",
+  "DeepResearchWorkspacePanel.emptyState": "Ajukan pertanyaan riset di atas untuk memulai.",
 };

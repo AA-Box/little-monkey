@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const hi: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   // Real Hindi translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "डेली ब्रीफ",
   "DailyBriefPanel.title": "डेली ब्रीफ",
@@ -874,5 +876,34 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "यह एक मान्य रजिस्ट्री स्नैपशॉट JSON नहीं है।",
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
-  "EcosystemDiscover.cancel": "रद्द करें"
+  "EcosystemDiscover.cancel": "रद्द करें",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "गहन शोध",
+  "DeepResearchWorkspacePanel.title": "गहन शोध कार्यक्षेत्र",
+  "DeepResearchWorkspacePanel.subtitle": "वेब, आपकी वर्कस्पेस फ़ाइलों और नॉलेज स्टैक में एक बहु-चरणीय शोध प्रश्न की योजना बनाएं और चलाएं — हर निष्कर्ष अपने प्रमाण का हवाला देता है।",
+  "DeepResearchWorkspacePanel.close": "गहन शोध बंद करें",
+  "DeepResearchWorkspacePanel.questionLabel": "शोध प्रश्न",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "आप क्या शोध करना चाहते हैं?",
+  "DeepResearchWorkspacePanel.start": "शोध शुरू करें",
+  "DeepResearchWorkspacePanel.cancel": "रद्द करें",
+  "DeepResearchWorkspacePanel.planTitle": "योजना और स्रोत मानचित्र",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} खोजे गए · {{skipped}} छोड़े गए",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} प्रमाण अंश",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "प्रतीक्षारत",
+  "DeepResearchWorkspacePanel.stepStatus.active": "खोजा जा रहा है…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "खोजा गया",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "छोड़ दिया गया",
+  "DeepResearchWorkspacePanel.stepStatus.error": "त्रुटि",
+  "DeepResearchWorkspacePanel.runStatus.planning": "योजना बन रही है",
+  "DeepResearchWorkspacePanel.runStatus.researching": "शोध जारी है",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "संश्लेषण हो रहा है",
+  "DeepResearchWorkspacePanel.runStatus.done": "पूर्ण",
+  "DeepResearchWorkspacePanel.runStatus.error": "त्रुटि",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "रद्द किया गया",
+  "DeepResearchWorkspacePanel.reportTitle": "रिपोर्ट",
+  "DeepResearchWorkspacePanel.noClaims": "इस रन के लिए कोई प्रमाण-आधारित निष्कर्ष नहीं निकाला जा सका।",
+  "DeepResearchWorkspacePanel.droppedClaims": "मान्य प्रमाण न देने के कारण {{count}} दावे हटा दिए गए।",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "खुले प्रश्न",
+  "DeepResearchWorkspacePanel.emptyState": "शुरू करने के लिए ऊपर एक शोध प्रश्न पूछें।",
 };

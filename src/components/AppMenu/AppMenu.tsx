@@ -12,6 +12,7 @@ import {
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
+  Telescope,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -28,6 +29,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDailyBrief: () => void;
+  onOpenDeepResearch: () => void;
 }
 
 interface MenuRowProps {
@@ -64,6 +66,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDailyBrief,
+  onOpenDeepResearch,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -154,6 +157,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Telescope size={14} className="text-faint" />}
+            label={t("AppMenu.deepResearch")}
+            onClick={() => {
+              closeAll();
+              onOpenDeepResearch();
             }}
           />
           <MenuRow

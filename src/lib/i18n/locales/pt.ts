@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const pt: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   // Real Portuguese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumo diário",
   "DailyBriefPanel.title": "Resumo diário",
@@ -874,5 +876,34 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Isso não é um JSON de snapshot de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "Pesquisa Aprofundada",
+  "DeepResearchWorkspacePanel.title": "Espaço de Pesquisa Aprofundada",
+  "DeepResearchWorkspacePanel.subtitle": "Planeje e execute uma pergunta de pesquisa em várias etapas na web, nos arquivos do seu espaço de trabalho e nas bases de conhecimento — cada conclusão cita sua evidência.",
+  "DeepResearchWorkspacePanel.close": "Fechar pesquisa aprofundada",
+  "DeepResearchWorkspacePanel.questionLabel": "Pergunta de pesquisa",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "O que você quer pesquisar?",
+  "DeepResearchWorkspacePanel.start": "Iniciar pesquisa",
+  "DeepResearchWorkspacePanel.cancel": "Cancelar",
+  "DeepResearchWorkspacePanel.planTitle": "Plano e mapa de fontes",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} pesquisada(s) · {{skipped}} ignorada(s)",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} trecho(s) de evidência",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "Em fila",
+  "DeepResearchWorkspacePanel.stepStatus.active": "Pesquisando…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "Pesquisada",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "Ignorada",
+  "DeepResearchWorkspacePanel.stepStatus.error": "Erro",
+  "DeepResearchWorkspacePanel.runStatus.planning": "Planejando",
+  "DeepResearchWorkspacePanel.runStatus.researching": "Pesquisando",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "Sintetizando",
+  "DeepResearchWorkspacePanel.runStatus.done": "Concluído",
+  "DeepResearchWorkspacePanel.runStatus.error": "Erro",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "Cancelada",
+  "DeepResearchWorkspacePanel.reportTitle": "Relatório",
+  "DeepResearchWorkspacePanel.noClaims": "Nenhuma conclusão baseada em evidências foi produzida para esta execução.",
+  "DeepResearchWorkspacePanel.droppedClaims": "{{count}} afirmação(ões) foram descartadas por não citarem evidência válida.",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "Perguntas em aberto",
+  "DeepResearchWorkspacePanel.emptyState": "Faça uma pergunta de pesquisa acima para começar.",
 };

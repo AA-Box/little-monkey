@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const ko: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   // Real Korean translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "데일리 브리핑",
   "DailyBriefPanel.title": "데일리 브리핑",
@@ -874,5 +876,34 @@ export const ko: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "유효한 레지스트리 스냅샷 JSON이 아닙니다.",
   "EcosystemDiscover.confirmRemoveRegistry": "이 레지스트리 소스를 제거하시겠습니까?",
   "EcosystemDiscover.removeRegistry": "제거",
-  "EcosystemDiscover.cancel": "취소"
+  "EcosystemDiscover.cancel": "취소",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "심층 리서치",
+  "DeepResearchWorkspacePanel.title": "심층 리서치 워크스페이스",
+  "DeepResearchWorkspacePanel.subtitle": "웹, 작업 공간 파일, 지식 스택에 걸친 다단계 리서치 질문을 계획하고 실행하세요 — 모든 결론은 근거 자료를 인용합니다.",
+  "DeepResearchWorkspacePanel.close": "심층 리서치 닫기",
+  "DeepResearchWorkspacePanel.questionLabel": "리서치 질문",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "무엇을 조사하고 싶으신가요?",
+  "DeepResearchWorkspacePanel.start": "리서치 시작",
+  "DeepResearchWorkspacePanel.cancel": "취소",
+  "DeepResearchWorkspacePanel.planTitle": "계획 및 출처 지도",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "검색됨 {{searched}}개 · 건너뜀 {{skipped}}개",
+  "DeepResearchWorkspacePanel.evidenceCount": "근거 스니펫 {{count}}개",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "대기 중",
+  "DeepResearchWorkspacePanel.stepStatus.active": "검색 중…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "검색됨",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "건너뜀",
+  "DeepResearchWorkspacePanel.stepStatus.error": "오류",
+  "DeepResearchWorkspacePanel.runStatus.planning": "계획 중",
+  "DeepResearchWorkspacePanel.runStatus.researching": "리서치 중",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "종합 중",
+  "DeepResearchWorkspacePanel.runStatus.done": "완료",
+  "DeepResearchWorkspacePanel.runStatus.error": "오류",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "취소됨",
+  "DeepResearchWorkspacePanel.reportTitle": "보고서",
+  "DeepResearchWorkspacePanel.noClaims": "이번 실행에서는 근거가 뒷받침된 결론이 생성되지 않았습니다.",
+  "DeepResearchWorkspacePanel.droppedClaims": "유효한 근거를 인용하지 않아 {{count}}개의 주장이 폐기되었습니다.",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "미해결 질문",
+  "DeepResearchWorkspacePanel.emptyState": "시작하려면 위에 리서치 질문을 입력하세요.",
 };

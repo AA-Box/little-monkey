@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const de: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   // Real German translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Tagesüberblick",
   "DailyBriefPanel.title": "Tagesüberblick",
@@ -874,5 +876,34 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Das ist kein gültiges Registry-Snapshot-JSON.",
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
-  "EcosystemDiscover.cancel": "Abbrechen"
+  "EcosystemDiscover.cancel": "Abbrechen",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "Tiefenrecherche",
+  "DeepResearchWorkspacePanel.title": "Tiefenrecherche-Workspace",
+  "DeepResearchWorkspacePanel.subtitle": "Plane und führe eine mehrstufige Recherchefrage über das Web, deine Workspace-Dateien und Wissensstapel aus – jede Schlussfolgerung verweist auf ihre Belege.",
+  "DeepResearchWorkspacePanel.close": "Tiefenrecherche schließen",
+  "DeepResearchWorkspacePanel.questionLabel": "Recherchefrage",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "Was möchtest du recherchieren?",
+  "DeepResearchWorkspacePanel.start": "Recherche starten",
+  "DeepResearchWorkspacePanel.cancel": "Abbrechen",
+  "DeepResearchWorkspacePanel.planTitle": "Plan & Quellenübersicht",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} durchsucht · {{skipped}} übersprungen",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} Beleg-Ausschnitt(e)",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "Wartet",
+  "DeepResearchWorkspacePanel.stepStatus.active": "Suche läuft…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "Durchsucht",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "Übersprungen",
+  "DeepResearchWorkspacePanel.stepStatus.error": "Fehler",
+  "DeepResearchWorkspacePanel.runStatus.planning": "Planung",
+  "DeepResearchWorkspacePanel.runStatus.researching": "Recherche läuft",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "Zusammenfassung wird erstellt",
+  "DeepResearchWorkspacePanel.runStatus.done": "Fertig",
+  "DeepResearchWorkspacePanel.runStatus.error": "Fehler",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "Abgebrochen",
+  "DeepResearchWorkspacePanel.reportTitle": "Bericht",
+  "DeepResearchWorkspacePanel.noClaims": "Für diesen Lauf wurden keine belegten Schlussfolgerungen erstellt.",
+  "DeepResearchWorkspacePanel.droppedClaims": "{{count}} Aussage(n) wurden verworfen, da sie keine gültigen Belege zitierten.",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "Offene Fragen",
+  "DeepResearchWorkspacePanel.emptyState": "Stelle oben eine Recherchefrage, um zu beginnen.",
 };
