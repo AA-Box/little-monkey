@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { PanelRight, PanelRightClose, X } from "lucide-react";
+import { PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
@@ -9,6 +9,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
 import { GlobalSearch } from "./components/Search";
+import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { useRunStore } from "./store/runStore";
@@ -95,6 +96,7 @@ function App() {
   const [runCenterOpen, setRunCenterOpen] = useState(false);
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -338,12 +340,24 @@ function App() {
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
+          onOpenTerminal={() => setTerminalOpen(true)}
         />
       </aside>
 
       {/* Center: chat, with a drag-region strip standing in for the title bar */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div data-tauri-drag-region className="h-11 shrink-0" />
+        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-end px-2">
+          <IconButton
+            size="sm"
+            variant={terminalOpen ? "secondary" : "ghost"}
+            onClick={() => setTerminalOpen((open) => !open)}
+            disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+            aria-label={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
+            title={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
+          >
+            <SquareTerminal size={15} />
+          </IconButton>
+        </div>
         <SessionGrantBanner />
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
@@ -379,6 +393,9 @@ function App() {
             />
           )}
         </ErrorBoundary>
+        {terminalOpen && (
+          <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
+        )}
       </div>
 
       {/* Split pane: a second, fully independent chat opened via the session
