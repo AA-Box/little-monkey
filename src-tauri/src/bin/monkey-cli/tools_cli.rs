@@ -385,7 +385,7 @@ pub async fn remember(
     let root = workspace::primary_root_canon(state)?;
     let path = memories_file_path()
         .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
-    memory::add_fact_impl(&path, &root.to_string_lossy(), text, "agent")
+    memory::add_fact_impl(&path, &root.to_string_lossy(), text, "agent", None)
 }
 
 #[cfg(test)]
