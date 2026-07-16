@@ -833,6 +833,18 @@ fn run_text_with(
     utf8_stdout(&output)
 }
 
+/// Generic, non-worktree-scoped `gh api <path>` bridge — unlike every other
+/// function in this file (all fixed to the draft-PR-review-comment shapes
+/// M5.4 needs), this is the reusable entry point Knowledge Sync's
+/// `GitHubRepo` connector (`knowledge_service.rs`) calls for arbitrary read
+/// endpoints (repo metadata, commit/compare, git trees, git blobs). Still
+/// goes through the same `GhCliTransport`/`run_gh_process` process boundary
+/// and output cap as every other call in this module, so it inherits the
+/// same "no shell, no stored token, bounded output" posture.
+pub fn gh_api_json(path: &str) -> Result<Value, String> {
+    run_gh_json(vec!["api".to_string(), path.to_string()])
+}
+
 fn run_gh_process(args: &[String], stdin: Option<&[u8]>) -> Result<GitHubOutput, String> {
     let mut command = Command::new("gh");
     command
@@ -914,6 +926,7 @@ mod tests {
     use crate::m5_delivery::git::{commit_paths, create_owned_worktree, git_text};
     use crate::m5_delivery::store::DeliveryStore;
     use crate::m5_delivery::{ReviewFinding, WorktreeCreateRequest};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -949,6 +962,12 @@ mod tests {
         patches: usize,
         draft_bodies: Vec<String>,
         calls: Vec<Vec<String>>,
+        /// Canned `gh api <path>` responses, keyed by the exact path
+        /// argument — backs [`gh_api_json_bridges_arbitrary_read_paths_through_the_fixture_transport`],
+        /// which needs to fixture Knowledge Sync's `GitHubRepo` connector
+        /// reads (commit/compare/tree/blob lookups) that none of this
+        /// struct's other hardcoded arms cover.
+        api_responses: HashMap<String, Value>,
     }
 
     struct FakeGitHub {
@@ -996,6 +1015,11 @@ mod tests {
             state.calls.push(args.to_vec());
             if args == ["--version"] {
                 return Ok(Self::success_text("gh version fixture\n"));
+            }
+            if args.get(0).map(String::as_str) == Some("api") {
+                if let Some(response) = args.get(1).and_then(|path| state.api_responses.get(path)) {
+                    return Ok(Self::success_json(response.clone()));
+                }
             }
             if args.get(0).map(String::as_str) == Some("api")
                 && args.get(1).map(String::as_str) == Some("user")
@@ -1347,5 +1371,57 @@ mod tests {
         let body = state.comment_body.as_deref().unwrap();
         assert!(body.contains("Updated report"));
         assert_eq!(body.matches(REPORT_MARKER_PREFIX).count(), 1);
+    }
+
+    // --- generic `gh api <path>` bridge (Knowledge Sync's GitHubRepo connector) --
+
+    #[test]
+    fn gh_api_json_bridges_arbitrary_read_paths_through_the_fixture_transport() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), true);
+        fake.state.lock().unwrap().api_responses.insert(
+            "repos/owner/repo/commits/main".to_string(),
+            json!({ "sha": "deadbeef" }),
+        );
+        fake.state.lock().unwrap().api_responses.insert(
+            "repos/owner/repo/compare/aaa...deadbeef".to_string(),
+            json!({ "files": [
+                { "filename": "docs/readme.md", "status": "modified" },
+                { "filename": "docs/old.md", "status": "removed" },
+            ] }),
+        );
+
+        let commit = run_json_with(
+            &fake,
+            vec!["api".to_string(), "repos/owner/repo/commits/main".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(commit["sha"], "deadbeef");
+
+        let compare = run_json_with(
+            &fake,
+            vec![
+                "api".to_string(),
+                "repos/owner/repo/compare/aaa...deadbeef".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        let files = compare["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["status"], "modified");
+        assert_eq!(files[1]["status"], "removed");
+    }
+
+    #[test]
+    fn gh_api_json_surfaces_unauthenticated_state_for_arbitrary_paths_too() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), false);
+        let error = run_json_with(
+            &fake,
+            vec!["api".to_string(), "repos/owner/repo/commits/main".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("authentication expired"), "{error}");
     }
 }
