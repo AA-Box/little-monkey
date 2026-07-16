@@ -1,6 +1,11 @@
 import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  ANTHROPIC_EFFORT_FALLBACK_KEY,
+  effortForProviderModel,
+  ollamaModelTargetKey,
+} from "../lib/modelTargets";
 import { useUsageStore } from "./usageStore";
 
 /**
@@ -38,7 +43,7 @@ interface LlamaStatusEvent {
 }
 
 /** localStorage key for the "start with embeddings" preference — mirrors
- * `EFFORT_STORAGE_KEY`'s persistence pattern below. */
+ * `EFFORT_BY_TARGET_STORAGE_KEY`'s persistence pattern below. */
 const EMBEDDINGS_ENABLED_STORAGE_KEY = "little-monkey-llama-embeddings-enabled";
 
 function readInitialEmbeddingsEnabled(): boolean {
@@ -88,25 +93,52 @@ interface OllamaPullProgressEvent {
 export type ActiveProvider = "local" | "ollama" | "provider";
 
 /**
- * Anthropic's `output_config.effort` levels (low/medium/high/xhigh/max) —
- * see `providers.rs::build_chat_request`, which only forwards this for
- * `provider_id === "anthropic"`. Every other provider ignores it.
+ * The app's five-level effort scale — Anthropic's native
+ * `output_config.effort` values. `providers.rs::build_chat_request` shapes
+ * these per provider on the wire: verbatim for Anthropic, clamped onto the
+ * three-level `reasoning_effort` scale for OpenAI/Gemini/OpenRouter, and
+ * omitted entirely for custom providers.
  */
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
-const EFFORT_STORAGE_KEY = "little-monkey-effort";
+/** Legacy single-global effort key (Anthropic-only control) — superseded by
+ * the per-target map below; read once to migrate an existing choice. */
+const LEGACY_EFFORT_STORAGE_KEY = "little-monkey-effort";
+const EFFORT_BY_TARGET_STORAGE_KEY = "little-monkey-effort-by-target";
 const VALID_EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 
-function readInitialEffort(): EffortLevel {
+function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === "string" && (VALID_EFFORT_LEVELS as string[]).includes(value);
+}
+
+function readInitialEffortByTarget(): Record<string, EffortLevel> {
   try {
-    const stored = localStorage.getItem(EFFORT_STORAGE_KEY);
-    if (stored && (VALID_EFFORT_LEVELS as string[]).includes(stored)) {
-      return stored as EffortLevel;
+    const raw = localStorage.getItem(EFFORT_BY_TARGET_STORAGE_KEY);
+    if (raw !== null) {
+      const parsed: unknown = JSON.parse(raw);
+      const map: Record<string, EffortLevel> = {};
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed)) {
+          if (isEffortLevel(value)) map[key] = value;
+        }
+      }
+      return map;
+    }
+    // One-time migration from the legacy single-global control, which only
+    // ever applied to Anthropic: a stored level becomes the Anthropic-wide
+    // fallback entry (per-model keys can't be enumerated at hydration), so
+    // an existing choice keeps affecting every Anthropic model until a
+    // per-model level (or Default) is picked.
+    const legacy = localStorage.getItem(LEGACY_EFFORT_STORAGE_KEY);
+    if (isEffortLevel(legacy)) {
+      const seeded: Record<string, EffortLevel> = { [ANTHROPIC_EFFORT_FALLBACK_KEY]: legacy };
+      localStorage.setItem(EFFORT_BY_TARGET_STORAGE_KEY, JSON.stringify(seeded));
+      return seeded;
     }
   } catch {
-    // Best-effort; fall through to the default.
+    // Best-effort; fall through to the empty default.
   }
-  return "high";
+  return {};
 }
 
 /**
@@ -182,7 +214,7 @@ export interface ModelStore {
   /** Whether the next `start()` should launch llama-server with `--embeddings`
    * (surfaced as a checkbox in the Models panel — see `docs/roadmap/p1-local-api-server.md`
    * phase 3). Persisted to localStorage so the preference survives a restart,
-   * same as `effort` below. Only takes effect on the *next* start — restarting
+   * same as `effortByTarget` below. Only takes effect on the *next* start — restarting
    * a model that's currently running is required to pick up a change, exactly
    * like every other llama-server launch flag (ctx size, gpu layers). */
   embeddingsEnabled: boolean;
@@ -259,10 +291,16 @@ export interface ModelStore {
   /** Select an already-fetched provider model as the active chat target. Instant, no backend call. */
   useProviderModel: (providerId: string, modelId: string) => void;
 
-  /** Anthropic `output_config.effort` level, persisted to localStorage. Only meaningful/sent when chatting against the "anthropic" provider. */
-  effort: EffortLevel;
-  /** Update the effort level and persist it to localStorage. */
-  setEffort: (effort: EffortLevel) => void;
+  /** Per-model effort levels keyed by model-target key (see
+   * `modelTargets.ts`'s `providerModelTargetKey`/`ollamaModelTargetKey`),
+   * persisted to localStorage. A model with no entry sends no effort field
+   * at all — the provider's own default applies (OpenAI hard-errors on
+   * `reasoning_effort` for non-reasoning models, so "unset" must mean
+   * "absent from the request", never a guessed level). */
+  effortByTarget: Record<string, EffortLevel>;
+  /** Set the effort level for one model target — or, with `null`, clear it
+   * back to "Default" (nothing sent) — and persist the map. */
+  setEffortForTarget: (targetKey: string, effort: EffortLevel | null) => void;
 }
 
 export const useModelStore = create<ModelStore>((set, get) => ({
@@ -555,12 +593,27 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     }));
   },
 
-  effort: readInitialEffort(),
+  effortByTarget: readInitialEffortByTarget(),
 
-  setEffort: (effort) => {
-    set({ effort });
+  setEffortForTarget: (targetKey, effort) => {
+    const next = { ...get().effortByTarget };
+    if (effort === null) {
+      delete next[targetKey];
+      // Choosing "Default" for an Anthropic model also retires the migrated
+      // legacy fallback (which only ever exists via the one-time migration
+      // of the old single-global control) — without this, the fallback would
+      // immediately re-apply and "Default" would be unreachable. The old
+      // control was global across Anthropic models anyway, so retiring it
+      // globally on the first explicit Default matches its own semantics.
+      if (targetKey.startsWith(`${ANTHROPIC_EFFORT_FALLBACK_KEY}:`)) {
+        delete next[ANTHROPIC_EFFORT_FALLBACK_KEY];
+      }
+    } else {
+      next[targetKey] = effort;
+    }
+    set({ effortByTarget: next });
     try {
-      localStorage.setItem(EFFORT_STORAGE_KEY, effort);
+      localStorage.setItem(EFFORT_BY_TARGET_STORAGE_KEY, JSON.stringify(next));
     } catch {
       // Best-effort persistence; a failure here shouldn't block the switch.
     }
@@ -646,4 +699,29 @@ export function getActiveChatTarget(): ChatTarget {
     return { kind: "provider", providerId: activeProviderId, model: activeProviderModel };
   }
   return { kind: "local" };
+}
+
+/**
+ * Resolves the effort level to send for a chat target from the per-model
+ * `effortByTarget` map — structurally accepts both `ChatTarget` above and
+ * `turnEngine.ts`'s `ResolvedTarget`. `undefined` means the user left this
+ * model on "Default": no effort field is sent at all and the provider's own
+ * default applies (the Rust proxy additionally owns the per-provider wire
+ * mapping/omission — see `providers.rs::build_chat_request`).
+ */
+export function effortForTarget(
+  target:
+    | { kind: "local" }
+    | { kind: "ollama"; model: string | null }
+    | { kind: "provider"; providerId: string | null; model: string | null },
+): EffortLevel | undefined {
+  const { effortByTarget } = useModelStore.getState();
+  if (target.kind === "provider") {
+    if (!target.providerId || !target.model) return undefined;
+    return effortForProviderModel(effortByTarget, target.providerId, target.model);
+  }
+  if (target.kind === "ollama" && target.model) {
+    return effortByTarget[ollamaModelTargetKey(target.model)];
+  }
+  return undefined;
 }

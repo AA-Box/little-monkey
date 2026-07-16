@@ -58,8 +58,9 @@ pub struct ChatOptions {
     pub think: Option<serde_json::Value>,
     pub hide_thinking: bool,
     pub keep_alive: Option<String>,
-    /// Anthropic `output_config.effort`; desktop snapshots preserve the
-    /// currently selected UI effort without consulting mutable state later.
+    /// Reasoning-effort level, shaped per provider on the wire (see
+    /// `apply_provider_options`); desktop snapshots preserve the currently
+    /// selected UI effort without consulting mutable state later.
     pub effort: Option<String>,
     pub verbose: bool,
     /// Opt-in for attaching prompt-referenced image files on OpenAI-compat
@@ -674,12 +675,28 @@ fn apply_provider_options(
     options: &ChatOptions,
 ) -> Result<(), String> {
     apply_openai_options(body, options);
-    if provider_id == "anthropic" {
-        if let Some(effort) = options.effort.as_deref() {
-            if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
-                return Err(format!("Unknown Anthropic effort level '{effort}'"));
+    if let Some(effort) = options.effort.as_deref() {
+        if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+            return Err(format!("Unknown effort level '{effort}'"));
+        }
+        // Same per-provider shaping as the GUI proxy's
+        // `providers::build_chat_request`: Anthropic's native five-level
+        // field verbatim, the three-level `reasoning_effort` scale (clamped)
+        // for OpenAI/Gemini, OpenRouter's `reasoning.effort` nesting, and
+        // nothing at all for custom/unknown endpoints.
+        match provider_id {
+            "anthropic" => body["output_config"] = serde_json::json!({ "effort": effort }),
+            "openai" | "gemini" => {
+                body["reasoning_effort"] = serde_json::json!(
+                    little_monkey_lib::providers::clamped_reasoning_effort(effort)
+                );
             }
-            body["output_config"] = serde_json::json!({ "effort": effort });
+            "openrouter" => {
+                body["reasoning"] = serde_json::json!({
+                    "effort": little_monkey_lib::providers::clamped_reasoning_effort(effort),
+                });
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -922,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_options_preserve_frozen_anthropic_effort_only_for_anthropic() {
+    fn provider_options_shape_frozen_effort_per_provider() {
         let options = ChatOptions {
             effort: Some("xhigh".to_string()),
             ..Default::default()
@@ -930,10 +947,34 @@ mod tests {
         let mut anthropic = serde_json::json!({});
         apply_provider_options(&mut anthropic, "anthropic", &options).unwrap();
         assert_eq!(anthropic["output_config"]["effort"], "xhigh");
+        assert!(anthropic.get("reasoning_effort").is_none());
 
+        // The three-level reasoning surfaces clamp the two Anthropic-only
+        // top levels down to "high".
         let mut openai = serde_json::json!({});
         apply_provider_options(&mut openai, "openai", &options).unwrap();
         assert!(openai.get("output_config").is_none());
+        assert_eq!(openai["reasoning_effort"], "high");
+
+        let mut gemini = serde_json::json!({});
+        apply_provider_options(&mut gemini, "gemini", &options).unwrap();
+        assert_eq!(gemini["reasoning_effort"], "high");
+
+        let low = ChatOptions {
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let mut openrouter = serde_json::json!({});
+        apply_provider_options(&mut openrouter, "openrouter", &low).unwrap();
+        assert_eq!(openrouter["reasoning"]["effort"], "low");
+        assert!(openrouter.get("reasoning_effort").is_none());
+
+        // Custom/unknown endpoints must never receive a speculative field.
+        let mut custom = serde_json::json!({});
+        apply_provider_options(&mut custom, "my-custom-provider", &options).unwrap();
+        assert!(custom.get("output_config").is_none());
+        assert!(custom.get("reasoning_effort").is_none());
+        assert!(custom.get("reasoning").is_none());
 
         let invalid = ChatOptions {
             effort: Some("impossible".to_string()),
@@ -942,7 +983,7 @@ mod tests {
         assert!(
             apply_provider_options(&mut serde_json::json!({}), "anthropic", &invalid)
                 .unwrap_err()
-                .contains("Unknown Anthropic effort")
+                .contains("Unknown effort")
         );
     }
 
