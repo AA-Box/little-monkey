@@ -9,7 +9,9 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import {
   DEFAULT_HYBRID_CONFIG,
+  connectorUsesAccountReference,
   useKnowledgeV2Store,
+  type KnowledgeConnector,
   type KnowledgeSourceV2,
 } from "./knowledgeV2Store";
 
@@ -126,5 +128,94 @@ describe("knowledgeV2Store", () => {
       chunkOverlap: 120,
     });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "stacks_list");
+  });
+
+  describe("External Knowledge Sync connector shapes", () => {
+    const cases: Array<{ label: string; connector: KnowledgeConnector; usesAccountReference: boolean }> = [
+      {
+        label: "GitHub repo",
+        connector: {
+          kind: "git_hub_repo",
+          owner: "acme",
+          repo: "widgets",
+          git_ref: "main",
+          path_prefix: "docs",
+          connector_account_id: "account-1",
+        },
+        usesAccountReference: true,
+      },
+      {
+        label: "S3 bucket",
+        connector: {
+          kind: "s3_bucket",
+          endpoint: "https://s3.example.com",
+          bucket: "reports",
+          prefix: "2024/",
+          region: "us-east-1",
+          connector_account_id: "account-2",
+        },
+        usesAccountReference: true,
+      },
+      {
+        label: "watched folder",
+        connector: { kind: "watched_folder", path: "/Users/me/Notes", debounce_ms: 2_000 },
+        usesAccountReference: false,
+      },
+      {
+        label: "Notion pages",
+        connector: { kind: "notion_pages", connector_account_id: "account-3", root_id: "root-page-id" },
+        usesAccountReference: true,
+      },
+      {
+        label: "Slack channels",
+        connector: {
+          kind: "slack_channels",
+          connector_account_id: "account-4",
+          channel_ids: ["C0123456789", "C9876543210"],
+        },
+        usesAccountReference: true,
+      },
+      {
+        label: "Jira project",
+        connector: { kind: "jira_project", connector_account_id: "account-5", project_key: "PROJ" },
+        usesAccountReference: true,
+      },
+    ];
+
+    it.each(cases)("adds a $label source with no pasted credential in the payload", async ({ connector }) => {
+      const created = { ...source, connector };
+      invokeMock.mockResolvedValueOnce(created);
+      await useKnowledgeV2Store.getState().addSource("stack-1", "New source", connector);
+      expect(invokeMock).toHaveBeenCalledWith("knowledge_v2_add_source", {
+        stackId: "stack-1",
+        label: "New source",
+        connector,
+        webdavPassword: null,
+      });
+      expect(useKnowledgeV2Store.getState().sources).toContainEqual(created);
+    });
+
+    it.each(cases)("reports connectorUsesAccountReference($usesAccountReference) for $label", ({ connector, usesAccountReference }) => {
+      expect(connectorUsesAccountReference(connector.kind)).toBe(usesAccountReference);
+    });
+
+    it("updates a source that references a connector account without ever sending a secret", async () => {
+      const connector: KnowledgeConnector = {
+        kind: "jira_project",
+        connector_account_id: "account-5",
+        project_key: "PROJ",
+      };
+      const updated = { ...source, connector, enabled: false };
+      invokeMock.mockResolvedValueOnce(updated);
+      await useKnowledgeV2Store.getState().updateSource("source-1", "Jira", false, connector);
+      expect(invokeMock).toHaveBeenCalledWith("knowledge_v2_update_source", {
+        sourceId: "source-1",
+        label: "Jira",
+        enabled: false,
+        connector,
+        webdavPassword: null,
+      });
+      expect(JSON.stringify(invokeMock.mock.calls[0])).not.toContain("secret");
+    });
   });
 });
