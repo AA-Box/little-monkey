@@ -700,6 +700,7 @@ pub fn run() {
             m3_commands::m3_runtimes,
             m3_commands::m3_refresh_runtimes,
             m3_commands::m3_schedule_plan,
+            m3_commands::m3_offload_plan,
             m3_commands::m3_catalog_search,
             m3_commands::m3_model_download,
             m3_commands::m3_model_update,

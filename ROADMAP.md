@@ -951,15 +951,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** User sees a concrete compatibility report before model download, model load, or runtime install.
 
-### 2. Adaptive Runtime Scheduler and Offload Planner
-
-**Status:** Planned
-
-- Plan context size, batch size, GPU layers, projector offload, CPU spill, and parallelism from live memory/VRAM state.
-- Simulate fit before loading a model and explain tradeoffs.
-
-**Acceptance:** A model load shows why a runtime/context/offload plan was selected and how to improve it.
-
 ### 3. Multi-GPU and Heterogeneous Runtime Orchestration
 
 **Status:** Research
