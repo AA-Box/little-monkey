@@ -3,8 +3,9 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
-import { onboardingLocale } from "./onboarding";
 import { issueToPrLocale } from "./issueToPr";
+import { mcpGeneratorLocale } from "./mcpGenerator";
+import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -14,6 +15,8 @@ export const hi: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...issueToPrLocale,
+  ...mcpGeneratorLocale,
   ...onboardingLocale,
   // ऑनबोर्डिंग विज़ार्ड के वास्तविक हिंदी अनुवाद, ऊपर स्प्रेड किए गए अंग्रेज़ी
   // फ़ॉलबैक को ओवरराइड करते हुए।
@@ -89,7 +92,6 @@ export const hi: Record<string, string> = {
   "Onboarding.finishBody": "यह विज़ार्ड बस इतना ही कवर करता है। आपके किए गए हर चुनाव को बाद में सेटिंग्स से संपादित किया जा सकता है, और यह विज़ार्ड ऐप मेनू की \"ऑनबोर्डिंग फिर से शुरू करें\" पंक्ति से हमेशा एक क्लिक दूर है।",
   "Onboarding.finishTemplateSummary": "आपका \"{{template}}\" स्टार्टर कंटेंट Prompts में देखने के लिए तैयार है (और यदि कोई रेसिपी बनी है तो ऑटोमेशन में भी)।",
   "Onboarding.finishReopenHint": "इस विज़ार्ड को कभी भी ऐप मेनू की \"ऑनबोर्डिंग फिर से शुरू करें\" पंक्ति से फिर से खोलें।",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "यह जांचा जा रहा है कि यह इशू एजेंट के लिए कितना तैयार है…",
@@ -143,6 +145,58 @@ export const hi: Record<string, string> = {
   "IssueToPr.worktreeLabel": "स्वयं की ब्रांच",
   "IssueToPr.branchLabel": "ब्रांच",
   "IssueToPr.repositoryLabel": "रिपॉज़िटरी",
+  // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
+  "AppMenu.mcpGenerator": "MCP जेनरेटर",
+  "McpGenerator.title": "MCP सर्वर जेनरेटर और सिम्युलेटर",
+  "McpGenerator.subtitle": "एक लोकल API, CLI टूल, स्क्रिप्ट, या वर्कफ़्लो को टाइप किए गए टूल्स के रूप में बताएं, एक स्टैंडअलोन MCP सर्वर फ़ाइल जनरेट करें, फिर इंस्टॉल के लिए सेव करने से पहले उसके विरुद्ध विरोधी (adversarial) कॉल्स सिम्युलेट करें।",
+  "McpGenerator.close": "MCP जेनरेटर बंद करें",
+  "McpGenerator.formHeading": "सर्वर का विवरण दें",
+  "McpGenerator.nameLabel": "सर्वर का नाम",
+  "McpGenerator.namePlaceholder": "invoice-api",
+  "McpGenerator.descriptionLabel": "विवरण",
+  "McpGenerator.descriptionPlaceholder": "यह सर्वर क्या रैप करता है और क्यों।",
+  "McpGenerator.sourceKindLabel": "स्रोत प्रकार",
+  "McpGenerator.sourceKind.api": "लोकल API",
+  "McpGenerator.sourceKind.cli": "CLI टूल",
+  "McpGenerator.sourceKind.script": "स्क्रिप्ट",
+  "McpGenerator.sourceKind.workflow": "वर्कफ़्लो",
+  "McpGenerator.targetLabel": "लक्ष्य (बेस URL, एक्ज़िक्यूटेबल पथ, या वर्कफ़्लो)",
+  "McpGenerator.targetPlaceholder": "https://api.example.com या /usr/local/bin/tool",
+  "McpGenerator.toolsHeading": "टूल्स",
+  "McpGenerator.addToolButton": "टूल जोड़ें",
+  "McpGenerator.removeToolButton": "टूल हटाएं",
+  "McpGenerator.toolNamePlaceholder": "tool_name",
+  "McpGenerator.toolDescriptionPlaceholder": "यह टूल क्या करता है",
+  "McpGenerator.requiresAuthLabel": "ऑथ टोकन आवश्यक है",
+  "McpGenerator.paramNamePlaceholder": "parameter",
+  "McpGenerator.requiredLabel": "आवश्यक",
+  "McpGenerator.removeParamButton": "पैरामीटर हटाएं",
+  "McpGenerator.addParamButton": "पैरामीटर जोड़ें",
+  "McpGenerator.resetButton": "रीसेट करें",
+  "McpGenerator.generateButton": "सर्वर जनरेट करें",
+  "McpGenerator.generatedHeading": "जनरेट किए गए सर्वर",
+  "McpGenerator.emptyGenerated": "अभी तक कोई सर्वर जनरेट नहीं हुआ। फ़ॉर्म भरें और एक जनरेट करें।",
+  "McpGenerator.toolCount": "{{count}} टूल",
+  "McpGenerator.noSelectionHint": "कोड और सिम्युलेटर रिपोर्ट देखने के लिए एक जनरेट किया गया सर्वर चुनें।",
+  "McpGenerator.runSimulatorButton": "सिम्युलेटर चलाएं",
+  "McpGenerator.saveButton": "डिस्क पर सेव करें",
+  "McpGenerator.saveBlockedHint": "इंस्टॉल के लिए सेव करने से पहले इस सर्वर को सिम्युलेटर पास करना होगा।",
+  "McpGenerator.deleteEntryButton": "हटाएं",
+  "McpGenerator.savedAt": "{{path}} पर सेव किया गया",
+  "McpGenerator.notSimulatorCleanWarning": "सिम्युलेटर-क्लीन नहीं: एक या अधिक फ़िक्स्चर असफल रहे। इस सर्वर को इंस्टॉल करने योग्य बनाने से पहले टूल स्पेक ठीक करें और फिर से जनरेट करें।",
+  "McpGenerator.notSimulatedYetWarning": "अभी तक सिम्युलेट नहीं हुआ। इस सर्वर को इंस्टॉल के लिए सेव करने से पहले सिम्युलेटर चलाएं।",
+  "McpGenerator.simulationHeading": "सिम्युलेटर रिपोर्ट: {{passed}}/{{total}} फ़िक्स्चर पास",
+  "McpGenerator.tableTool": "टूल",
+  "McpGenerator.tableFixture": "फ़िक्स्चर",
+  "McpGenerator.tableOutcome": "परिणाम",
+  "McpGenerator.tableReason": "कारण",
+  "McpGenerator.pass": "पास",
+  "McpGenerator.fail": "फेल",
+  "McpGenerator.injectionDetectedHint": "इस फ़िक्स्चर के इनपुट में प्रॉम्प्ट-इंजेक्शन पैटर्न पाया गया",
+  "McpGenerator.codeHeading": "जनरेट किया गया कोड",
+  "McpGenerator.statusReady": "इंस्टॉल के लिए तैयार",
+  "McpGenerator.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
+  "McpGenerator.statusNotSimulated": "सिम्युलेट नहीं हुआ",
   ...dailyBriefLocale,
   // Real Hindi translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "डेली ब्रीफ",

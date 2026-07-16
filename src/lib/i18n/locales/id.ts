@@ -3,8 +3,9 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
-import { onboardingLocale } from "./onboarding";
 import { issueToPrLocale } from "./issueToPr";
+import { mcpGeneratorLocale } from "./mcpGenerator";
+import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -14,6 +15,8 @@ export const id: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...issueToPrLocale,
+  ...mcpGeneratorLocale,
   ...onboardingLocale,
   // Real Indonesian translations of the onboarding wizard, overriding the
   // English fallback spread in just above.
@@ -89,7 +92,6 @@ export const id: Record<string, string> = {
   "Onboarding.finishBody": "Itulah semua yang dicakup panduan ini. Setiap pilihan yang Anda buat bisa diedit nanti dari Pengaturan, dan panduan ini selalu bisa dibuka satu klik lagi dari baris \"Mulai ulang orientasi\" di menu aplikasi.",
   "Onboarding.finishTemplateSummary": "Konten awal \"{{template}}\" Anda sudah siap dilihat di Prompts (dan di Otomasi, jika sebuah resep dibuat).",
   "Onboarding.finishReopenHint": "Buka lagi panduan ini kapan saja dari baris \"Mulai ulang orientasi\" di menu aplikasi.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "Memeriksa seberapa siap issue ini untuk agen…",
@@ -143,6 +145,58 @@ export const id: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Branch milik sendiri",
   "IssueToPr.branchLabel": "Branch",
   "IssueToPr.repositoryLabel": "Repositori",
+  // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
+  "AppMenu.mcpGenerator": "Generator MCP",
+  "McpGenerator.title": "Generator dan Simulator Server MCP",
+  "McpGenerator.subtitle": "Jelaskan API lokal, alat CLI, skrip, atau alur kerja sebagai tools bertipe, hasilkan satu file server MCP mandiri, lalu simulasikan panggilan adversarial terhadapnya sebelum menyimpannya untuk instalasi.",
+  "McpGenerator.close": "Tutup Generator MCP",
+  "McpGenerator.formHeading": "Jelaskan server",
+  "McpGenerator.nameLabel": "Nama server",
+  "McpGenerator.namePlaceholder": "invoice-api",
+  "McpGenerator.descriptionLabel": "Deskripsi",
+  "McpGenerator.descriptionPlaceholder": "Apa yang dibungkus server ini dan alasannya.",
+  "McpGenerator.sourceKindLabel": "Jenis sumber",
+  "McpGenerator.sourceKind.api": "API lokal",
+  "McpGenerator.sourceKind.cli": "Alat CLI",
+  "McpGenerator.sourceKind.script": "Skrip",
+  "McpGenerator.sourceKind.workflow": "Alur kerja",
+  "McpGenerator.targetLabel": "Target (URL dasar, path eksekutabel, atau alur kerja)",
+  "McpGenerator.targetPlaceholder": "https://api.example.com atau /usr/local/bin/tool",
+  "McpGenerator.toolsHeading": "Tools",
+  "McpGenerator.addToolButton": "Tambah tool",
+  "McpGenerator.removeToolButton": "Hapus tool",
+  "McpGenerator.toolNamePlaceholder": "tool_name",
+  "McpGenerator.toolDescriptionPlaceholder": "Apa yang dilakukan tool ini",
+  "McpGenerator.requiresAuthLabel": "Memerlukan token autentikasi",
+  "McpGenerator.paramNamePlaceholder": "parameter",
+  "McpGenerator.requiredLabel": "Wajib",
+  "McpGenerator.removeParamButton": "Hapus parameter",
+  "McpGenerator.addParamButton": "Tambah parameter",
+  "McpGenerator.resetButton": "Reset",
+  "McpGenerator.generateButton": "Hasilkan server",
+  "McpGenerator.generatedHeading": "Server yang dihasilkan",
+  "McpGenerator.emptyGenerated": "Belum ada server yang dihasilkan. Isi formulir dan hasilkan satu.",
+  "McpGenerator.toolCount": "{{count}} tool",
+  "McpGenerator.noSelectionHint": "Pilih server yang dihasilkan untuk melihat pratinjau kode dan laporan simulator.",
+  "McpGenerator.runSimulatorButton": "Jalankan simulator",
+  "McpGenerator.saveButton": "Simpan ke disk",
+  "McpGenerator.saveBlockedHint": "Server ini harus lulus simulator sebelum dapat disimpan untuk instalasi.",
+  "McpGenerator.deleteEntryButton": "Hapus",
+  "McpGenerator.savedAt": "Disimpan di {{path}}",
+  "McpGenerator.notSimulatorCleanWarning": "Belum bersih menurut simulator: satu atau lebih fixture gagal. Perbaiki spesifikasi tool dan hasilkan ulang sebelum server ini dapat diinstal.",
+  "McpGenerator.notSimulatedYetWarning": "Belum disimulasikan. Jalankan simulator sebelum menyimpan server ini untuk instalasi.",
+  "McpGenerator.simulationHeading": "Laporan simulator: {{passed}}/{{total}} fixture lulus",
+  "McpGenerator.tableTool": "Tool",
+  "McpGenerator.tableFixture": "Fixture",
+  "McpGenerator.tableOutcome": "Hasil",
+  "McpGenerator.tableReason": "Alasan",
+  "McpGenerator.pass": "Lulus",
+  "McpGenerator.fail": "Gagal",
+  "McpGenerator.injectionDetectedHint": "Pola prompt-injection terdeteksi pada input fixture ini",
+  "McpGenerator.codeHeading": "Kode yang dihasilkan",
+  "McpGenerator.statusReady": "Siap diinstal",
+  "McpGenerator.statusNotClean": "Belum bersih menurut simulator",
+  "McpGenerator.statusNotSimulated": "Belum disimulasikan",
   ...dailyBriefLocale,
   // Real Indonesian translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Ringkasan Harian",

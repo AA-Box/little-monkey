@@ -3,8 +3,9 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
-import { onboardingLocale } from "./onboarding";
 import { issueToPrLocale } from "./issueToPr";
+import { mcpGeneratorLocale } from "./mcpGenerator";
+import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -14,6 +15,8 @@ export const ko: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...issueToPrLocale,
+  ...mcpGeneratorLocale,
   ...onboardingLocale,
   // 온보딩 마법사의 실제 한국어 번역. 위에서 스프레드한 영어 대체 문자열을
   // 재정의한다.
@@ -89,7 +92,6 @@ export const ko: Record<string, string> = {
   "Onboarding.finishBody": "이 마법사가 다루는 내용은 여기까지입니다. 여기서 한 모든 선택은 나중에 설정에서 편집할 수 있으며, 이 마법사는 앱 메뉴의 \"온보딩 다시 시작\" 항목을 통해 언제든지 클릭 한 번으로 다시 열 수 있습니다.",
   "Onboarding.finishTemplateSummary": "\"{{template}}\" 시작 콘텐츠는 프롬프트에서 확인할 수 있습니다(레시피가 생성된 경우 자동화에서도 확인할 수 있습니다).",
   "Onboarding.finishReopenHint": "앱 메뉴의 \"온보딩 다시 시작\" 항목을 통해 언제든지 이 마법사를 다시 열 수 있습니다.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "이 이슈가 에이전트에게 얼마나 준비되어 있는지 확인하는 중…",
@@ -143,6 +145,58 @@ export const ko: Record<string, string> = {
   "IssueToPr.worktreeLabel": "소유 브랜치",
   "IssueToPr.branchLabel": "브랜치",
   "IssueToPr.repositoryLabel": "저장소",
+  // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
+  "AppMenu.mcpGenerator": "MCP 생성기",
+  "McpGenerator.title": "MCP 서버 생성기 및 시뮬레이터",
+  "McpGenerator.subtitle": "로컬 API, CLI 도구, 스크립트 또는 워크플로를 타입이 지정된 도구로 설명하고, 독립 실행형 MCP 서버 파일을 생성한 다음, 설치용으로 저장하기 전에 그 파일에 대해 적대적 호출을 시뮬레이션하세요.",
+  "McpGenerator.close": "MCP 생성기 닫기",
+  "McpGenerator.formHeading": "서버 설명",
+  "McpGenerator.nameLabel": "서버 이름",
+  "McpGenerator.namePlaceholder": "invoice-api",
+  "McpGenerator.descriptionLabel": "설명",
+  "McpGenerator.descriptionPlaceholder": "이 서버가 감싸는 대상과 이유.",
+  "McpGenerator.sourceKindLabel": "소스 유형",
+  "McpGenerator.sourceKind.api": "로컬 API",
+  "McpGenerator.sourceKind.cli": "CLI 도구",
+  "McpGenerator.sourceKind.script": "스크립트",
+  "McpGenerator.sourceKind.workflow": "워크플로",
+  "McpGenerator.targetLabel": "대상 (기본 URL, 실행 경로 또는 워크플로)",
+  "McpGenerator.targetPlaceholder": "https://api.example.com 또는 /usr/local/bin/tool",
+  "McpGenerator.toolsHeading": "도구",
+  "McpGenerator.addToolButton": "도구 추가",
+  "McpGenerator.removeToolButton": "도구 제거",
+  "McpGenerator.toolNamePlaceholder": "tool_name",
+  "McpGenerator.toolDescriptionPlaceholder": "이 도구가 하는 일",
+  "McpGenerator.requiresAuthLabel": "인증 토큰 필요",
+  "McpGenerator.paramNamePlaceholder": "parameter",
+  "McpGenerator.requiredLabel": "필수",
+  "McpGenerator.removeParamButton": "매개변수 제거",
+  "McpGenerator.addParamButton": "매개변수 추가",
+  "McpGenerator.resetButton": "초기화",
+  "McpGenerator.generateButton": "서버 생성",
+  "McpGenerator.generatedHeading": "생성된 서버",
+  "McpGenerator.emptyGenerated": "아직 생성된 서버가 없습니다. 양식을 작성하고 하나를 생성하세요.",
+  "McpGenerator.toolCount": "도구 {{count}}개",
+  "McpGenerator.noSelectionHint": "생성된 서버를 선택하면 코드와 시뮬레이터 보고서를 미리 볼 수 있습니다.",
+  "McpGenerator.runSimulatorButton": "시뮬레이터 실행",
+  "McpGenerator.saveButton": "디스크에 저장",
+  "McpGenerator.saveBlockedHint": "이 서버는 설치용으로 저장하기 전에 시뮬레이터를 통과해야 합니다.",
+  "McpGenerator.deleteEntryButton": "삭제",
+  "McpGenerator.savedAt": "{{path}}에 저장됨",
+  "McpGenerator.notSimulatorCleanWarning": "시뮬레이터 기준 미통과: 하나 이상의 픽스처가 실패했습니다. 이 서버를 설치할 수 있으려면 도구 사양을 수정하고 다시 생성하세요.",
+  "McpGenerator.notSimulatedYetWarning": "아직 시뮬레이션되지 않았습니다. 이 서버를 설치용으로 저장하기 전에 시뮬레이터를 실행하세요.",
+  "McpGenerator.simulationHeading": "시뮬레이터 보고서: {{passed}}/{{total}} 픽스처 통과",
+  "McpGenerator.tableTool": "도구",
+  "McpGenerator.tableFixture": "픽스처",
+  "McpGenerator.tableOutcome": "결과",
+  "McpGenerator.tableReason": "사유",
+  "McpGenerator.pass": "통과",
+  "McpGenerator.fail": "실패",
+  "McpGenerator.injectionDetectedHint": "이 픽스처의 입력에서 프롬프트 인젝션 패턴이 감지되었습니다",
+  "McpGenerator.codeHeading": "생성된 코드",
+  "McpGenerator.statusReady": "설치 준비 완료",
+  "McpGenerator.statusNotClean": "시뮬레이터 기준 미통과",
+  "McpGenerator.statusNotSimulated": "시뮬레이션되지 않음",
   ...dailyBriefLocale,
   // Real Korean translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "데일리 브리핑",
