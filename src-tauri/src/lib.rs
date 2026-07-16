@@ -163,6 +163,14 @@ mod run_commands;
 // subcommand exists yet (it emits a launchd/crontab line, no in-process
 // scheduling), but there's no reason to make this one module-private either.
 pub mod automations;
+// Disposable-workspace-copy command execution: risky commands/tests run
+// against `<app_data>/sandbox-runs/<run_id>/workspace` instead of the real
+// workspace, with a restricted env, a wall-clock timeout, and (on macOS) a
+// generated Seatbelt profile. Nothing reaches the real workspace except
+// through the module's own explicit prepare-digest/confirm-phrase promote
+// action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
+// every other execution surface above.
+pub mod sandbox;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -325,6 +333,10 @@ pub struct AppState {
     pub index_cancels: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
     >,
+    /// In-memory registry of prepared-but-unconfirmed sandbox promote
+    /// previews (see `sandbox.rs`'s module doc for why this is intentionally
+    /// not persisted like `m5_delivery`'s SQLite-backed preview store).
+    pub sandbox: sandbox::SandboxState,
 }
 
 impl Default for AppState {
@@ -352,6 +364,7 @@ impl Default for AppState {
             run_ledger: Default::default(),
             stack_cache: Default::default(),
             index_cancels: Default::default(),
+            sandbox: Default::default(),
         }
     }
 }
@@ -691,6 +704,12 @@ pub fn run() {
             run_commands::run_unarchive,
             run_commands::run_events,
             run_commands::run_integrity_check,
+            sandbox::sandbox_run,
+            sandbox::sandbox_list,
+            sandbox::sandbox_diff,
+            sandbox::sandbox_prepare_promote,
+            sandbox::sandbox_execute_promote,
+            sandbox::sandbox_discard,
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
             m3_commands::m3_storage_status,
