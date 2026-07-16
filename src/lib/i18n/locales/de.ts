@@ -11,6 +11,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -273,6 +274,7 @@ export const de: Record<string, string> = {
   "McpGenerator.statusNotClean": "Nicht simulator-sauber",
   "McpGenerator.statusNotSimulated": "Nicht simuliert",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   // Real German translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Tagesüberblick",
   "DailyBriefPanel.title": "Tagesüberblick",
@@ -1283,5 +1285,48 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Das ist kein gültiges Registry-Snapshot-JSON.",
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
-  "EcosystemDiscover.cancel": "Abbrechen"
+  "EcosystemDiscover.cancel": "Abbrechen",
+  // Real German translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "Daten-Notizbuch",
+  "DataNotebookPanel.title": "Daten-Notizbuch und SQL-Labor",
+  "DataNotebookPanel.subtitle": "SQL- und Markdown-Zellen über einem lokalen CSV/JSON-Datensatz, reproduzierbar aus dem gespeicherten Quelltext",
+  "DataNotebookPanel.close": "Daten-Notizbuch schließen",
+  "DataNotebookPanel.notebookListTitle": "Notizbücher",
+  "DataNotebookPanel.newNotebook": "Neues Notizbuch",
+  "DataNotebookPanel.defaultNotebookName": "Unbenanntes Notizbuch",
+  "DataNotebookPanel.emptyState": "Noch keine Notizbücher. Erstellen Sie eines, um zu beginnen.",
+  "DataNotebookPanel.deleteNotebook": "Notizbuch löschen",
+  "DataNotebookPanel.renameNotebook": "Notizbuchname",
+  "DataNotebookPanel.noActiveNotebook": "Wählen Sie ein Notizbuch aus oder erstellen Sie eines, um zu beginnen.",
+  "DataNotebookPanel.persistError": "Einige Änderungen wurden möglicherweise nicht gespeichert: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "Datensatz",
+  "DataNotebookPanel.datasetSection.none": "Noch kein Datensatz importiert.",
+  "DataNotebookPanel.datasetSection.import": "CSV/JSON importieren…",
+  "DataNotebookPanel.datasetSection.clear": "Datensatz entfernen",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} Zeile(n) · Tabelle `{{table}}`",
+  "DataNotebookPanel.importError": "Import fehlgeschlagen: {{error}}",
+  "DataNotebookPanel.addSqlCell": "SQL-Zelle hinzufügen",
+  "DataNotebookPanel.addMarkdownCell": "Markdown-Zelle hinzufügen",
+  "DataNotebookPanel.runAll": "Alle erneut ausführen",
+  "DataNotebookPanel.running": "Wird ausgeführt…",
+  "DataNotebookPanel.exportReport": "Bericht exportieren",
+  "DataNotebookPanel.noCells": "Noch keine Zellen. Fügen Sie eine SQL- oder Markdown-Zelle hinzu, um zu beginnen.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "Ausführen",
+  "DataNotebookPanel.cell.moveUp": "Zelle nach oben verschieben",
+  "DataNotebookPanel.cell.moveDown": "Zelle nach unten verschieben",
+  "DataNotebookPanel.cell.delete": "Zelle löschen",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Markdown schreiben…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "Vorschau",
+  "DataNotebookPanel.cell.markdownEditToggle": "Bearbeiten",
+  "DataNotebookPanel.cell.notRun": "Noch nicht ausgeführt.",
+  "DataNotebookPanel.cell.error": "Fehler: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} Zeile(n) betroffen.",
+  "DataNotebookPanel.cell.noResults": "Keine Ergebnismenge.",
+  "DataNotebookPanel.cell.truncated": "Zeigt die ersten {{shown}} von {{total}} Zeilen.",
+  "DataNotebookPanel.reportModal.title": "Reproduzierbarer Bericht",
+  "DataNotebookPanel.reportModal.copy": "In Zwischenablage kopieren",
+  "DataNotebookPanel.reportModal.copied": "Kopiert!"
 };

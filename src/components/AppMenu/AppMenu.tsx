@@ -6,6 +6,7 @@ import {
   ChevronsUpDown,
   ClipboardCheck,
   Compass,
+  Database,
   GitPullRequest,
   Globe,
   HelpCircle,
@@ -42,6 +43,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenDataNotebook: () => void;
 }
 
 interface MenuRowProps {
@@ -85,6 +87,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenDataNotebook,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -215,6 +218,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenEvidenceBoard();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dataNotebook")}
+            onClick={() => {
+              closeAll();
+              onOpenDataNotebook();
             }}
           />
           <MenuRow

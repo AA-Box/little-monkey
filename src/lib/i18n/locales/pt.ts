@@ -11,6 +11,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -273,6 +274,7 @@ export const pt: Record<string, string> = {
   "McpGenerator.statusNotClean": "Não está limpo pelo simulador",
   "McpGenerator.statusNotSimulated": "Não simulado",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   // Real Portuguese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumo diário",
   "DailyBriefPanel.title": "Resumo diário",
@@ -1283,5 +1285,48 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Isso não é um JSON de snapshot de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Real Portuguese translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "Notebook de Dados",
+  "DataNotebookPanel.title": "Notebook de Dados e Laboratório SQL",
+  "DataNotebookPanel.subtitle": "Células SQL e Markdown sobre um dataset CSV/JSON local, reproduzíveis a partir da fonte salva",
+  "DataNotebookPanel.close": "Fechar Notebook de Dados",
+  "DataNotebookPanel.notebookListTitle": "Notebooks",
+  "DataNotebookPanel.newNotebook": "Novo notebook",
+  "DataNotebookPanel.defaultNotebookName": "Notebook sem título",
+  "DataNotebookPanel.emptyState": "Ainda não há notebooks. Crie um para começar.",
+  "DataNotebookPanel.deleteNotebook": "Excluir notebook",
+  "DataNotebookPanel.renameNotebook": "Nome do notebook",
+  "DataNotebookPanel.noActiveNotebook": "Selecione ou crie um notebook para começar.",
+  "DataNotebookPanel.persistError": "Algumas alterações podem não ter sido salvas: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "Dataset",
+  "DataNotebookPanel.datasetSection.none": "Nenhum dataset importado ainda.",
+  "DataNotebookPanel.datasetSection.import": "Importar CSV/JSON…",
+  "DataNotebookPanel.datasetSection.clear": "Remover dataset",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} linha(s) · tabela `{{table}}`",
+  "DataNotebookPanel.importError": "Falha na importação: {{error}}",
+  "DataNotebookPanel.addSqlCell": "Adicionar célula SQL",
+  "DataNotebookPanel.addMarkdownCell": "Adicionar célula Markdown",
+  "DataNotebookPanel.runAll": "Executar tudo novamente",
+  "DataNotebookPanel.running": "Executando…",
+  "DataNotebookPanel.exportReport": "Exportar relatório",
+  "DataNotebookPanel.noCells": "Ainda não há células. Adicione uma célula SQL ou Markdown para começar.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "Executar",
+  "DataNotebookPanel.cell.moveUp": "Mover célula para cima",
+  "DataNotebookPanel.cell.moveDown": "Mover célula para baixo",
+  "DataNotebookPanel.cell.delete": "Excluir célula",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Escreva markdown…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "Visualizar",
+  "DataNotebookPanel.cell.markdownEditToggle": "Editar",
+  "DataNotebookPanel.cell.notRun": "Ainda não executada.",
+  "DataNotebookPanel.cell.error": "Erro: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} linha(s) afetada(s).",
+  "DataNotebookPanel.cell.noResults": "Nenhum conjunto de resultados.",
+  "DataNotebookPanel.cell.truncated": "Mostrando as primeiras {{shown}} linhas de {{total}}.",
+  "DataNotebookPanel.reportModal.title": "Relatório reproduzível",
+  "DataNotebookPanel.reportModal.copy": "Copiar para a área de transferência",
+  "DataNotebookPanel.reportModal.copied": "Copiado!"
 };

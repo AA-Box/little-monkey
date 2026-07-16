@@ -17,6 +17,7 @@ import { AgentInbox } from "./components/Inbox";
 import { KnowledgeGraphExplorerPanel } from "./components/KnowledgeGraphExplorer";
 import { EvidenceBoardPanel } from "./components/EvidenceBoard";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { DataNotebookPanel } from "./components/DataNotebook";
 import { TerminalPanel } from "./components/Terminal";
 import { DebatePanel } from "./components/Debate";
 import { SettingsModal } from "./components/Settings";
@@ -117,6 +118,7 @@ function App() {
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const [evidenceBoardOpen, setEvidenceBoardOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [dataNotebookOpen, setDataNotebookOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [debateOpen, setDebateOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
@@ -143,6 +145,7 @@ function App() {
     setEvidenceBoardOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
+    setDataNotebookOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -190,6 +193,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setDataNotebookOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -203,6 +207,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setDataNotebookOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -376,6 +381,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -390,6 +396,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -405,6 +412,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -420,6 +428,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -435,6 +444,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
@@ -450,6 +460,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setSopCompilerOpen(true);
           }}
@@ -465,6 +476,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setMcpGeneratorOpen(true);
           }}
@@ -480,6 +492,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
           }}
@@ -495,6 +508,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setKnowledgeGraphOpen(true);
           }}
@@ -510,6 +524,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setEvidenceBoardOpen(true);
           }}
@@ -525,8 +540,25 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenDataNotebook={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setDataNotebookOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
@@ -542,6 +574,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDailyBriefOpen(false);
+            setDataNotebookOpen(false);
             setSettingsInitialTab(undefined);
             setDebateOpen(true);
           }}
@@ -552,6 +585,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDebateOpen(false);
+            setDataNotebookOpen(false);
             setTerminalOpen(false);
             restartOnboarding();
           }}
@@ -576,7 +610,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -613,6 +647,8 @@ function App() {
               }}
               onOpenSettingsTab={openSettingsTab}
             />
+          ) : dataNotebookOpen ? (
+            <DataNotebookPanel onClose={() => setDataNotebookOpen(false)} />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : debateOpen ? (
@@ -664,7 +700,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !dataNotebookOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

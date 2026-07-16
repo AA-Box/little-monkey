@@ -11,6 +11,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 
 export const fr: Record<string, string> = {
   ...crewLocale,
@@ -273,6 +274,7 @@ export const fr: Record<string, string> = {
   "McpGenerator.statusNotClean": "Non validé par le simulateur",
   "McpGenerator.statusNotSimulated": "Non simulé",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   // Real French translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Bilan quotidien",
   "DailyBriefPanel.title": "Bilan quotidien",
@@ -1283,5 +1285,48 @@ export const fr: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ce n'est pas un JSON d'instantané de registre valide.",
   "EcosystemDiscover.confirmRemoveRegistry": "Supprimer cette source de registre ?",
   "EcosystemDiscover.removeRegistry": "Supprimer",
-  "EcosystemDiscover.cancel": "Annuler"
+  "EcosystemDiscover.cancel": "Annuler",
+  // Real French translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "Bloc-notes de données",
+  "DataNotebookPanel.title": "Bloc-notes de données et labo SQL",
+  "DataNotebookPanel.subtitle": "Cellules SQL et Markdown sur un jeu de données CSV/JSON local, reproductibles à partir de la source enregistrée",
+  "DataNotebookPanel.close": "Fermer le bloc-notes de données",
+  "DataNotebookPanel.notebookListTitle": "Blocs-notes",
+  "DataNotebookPanel.newNotebook": "Nouveau bloc-notes",
+  "DataNotebookPanel.defaultNotebookName": "Bloc-notes sans titre",
+  "DataNotebookPanel.emptyState": "Aucun bloc-notes pour l'instant. Créez-en un pour commencer.",
+  "DataNotebookPanel.deleteNotebook": "Supprimer le bloc-notes",
+  "DataNotebookPanel.renameNotebook": "Nom du bloc-notes",
+  "DataNotebookPanel.noActiveNotebook": "Sélectionnez ou créez un bloc-notes pour commencer.",
+  "DataNotebookPanel.persistError": "Certaines modifications risquent de ne pas être enregistrées : {{error}}",
+  "DataNotebookPanel.datasetSection.title": "Jeu de données",
+  "DataNotebookPanel.datasetSection.none": "Aucun jeu de données importé pour l'instant.",
+  "DataNotebookPanel.datasetSection.import": "Importer un CSV/JSON…",
+  "DataNotebookPanel.datasetSection.clear": "Retirer le jeu de données",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} ligne(s) · table `{{table}}`",
+  "DataNotebookPanel.importError": "Échec de l'import : {{error}}",
+  "DataNotebookPanel.addSqlCell": "Ajouter une cellule SQL",
+  "DataNotebookPanel.addMarkdownCell": "Ajouter une cellule Markdown",
+  "DataNotebookPanel.runAll": "Tout réexécuter",
+  "DataNotebookPanel.running": "Exécution…",
+  "DataNotebookPanel.exportReport": "Exporter le rapport",
+  "DataNotebookPanel.noCells": "Aucune cellule pour l'instant. Ajoutez une cellule SQL ou Markdown pour commencer.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "Exécuter",
+  "DataNotebookPanel.cell.moveUp": "Déplacer la cellule vers le haut",
+  "DataNotebookPanel.cell.moveDown": "Déplacer la cellule vers le bas",
+  "DataNotebookPanel.cell.delete": "Supprimer la cellule",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Rédigez du Markdown…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "Aperçu",
+  "DataNotebookPanel.cell.markdownEditToggle": "Modifier",
+  "DataNotebookPanel.cell.notRun": "Pas encore exécutée.",
+  "DataNotebookPanel.cell.error": "Erreur : {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} ligne(s) affectée(s).",
+  "DataNotebookPanel.cell.noResults": "Aucun jeu de résultats.",
+  "DataNotebookPanel.cell.truncated": "Affiche les {{shown}} premières lignes sur {{total}}.",
+  "DataNotebookPanel.reportModal.title": "Rapport reproductible",
+  "DataNotebookPanel.reportModal.copy": "Copier dans le presse-papiers",
+  "DataNotebookPanel.reportModal.copied": "Copié !"
 };

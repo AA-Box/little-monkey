@@ -11,6 +11,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 
 export const es419: Record<string, string> = {
   ...crewLocale,
@@ -273,6 +274,7 @@ export const es419: Record<string, string> = {
   "McpGenerator.statusNotClean": "No está limpio según el simulador",
   "McpGenerator.statusNotSimulated": "No simulado",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   // Real Latin American Spanish translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumen diario",
   "DailyBriefPanel.title": "Resumen diario",
@@ -1283,5 +1285,48 @@ export const es419: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Esto no es un JSON de instantánea de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "¿Eliminar esta fuente de registro?",
   "EcosystemDiscover.removeRegistry": "Eliminar",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Real Latin American Spanish translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "Cuaderno de datos",
+  "DataNotebookPanel.title": "Cuaderno de datos y laboratorio SQL",
+  "DataNotebookPanel.subtitle": "Celdas SQL y Markdown sobre un conjunto de datos CSV/JSON local, reproducibles desde la fuente guardada",
+  "DataNotebookPanel.close": "Cerrar Cuaderno de datos",
+  "DataNotebookPanel.notebookListTitle": "Cuadernos",
+  "DataNotebookPanel.newNotebook": "Nuevo cuaderno",
+  "DataNotebookPanel.defaultNotebookName": "Cuaderno sin título",
+  "DataNotebookPanel.emptyState": "Aún no hay cuadernos. Crea uno para empezar.",
+  "DataNotebookPanel.deleteNotebook": "Eliminar cuaderno",
+  "DataNotebookPanel.renameNotebook": "Nombre del cuaderno",
+  "DataNotebookPanel.noActiveNotebook": "Selecciona o crea un cuaderno para empezar.",
+  "DataNotebookPanel.persistError": "Es posible que algunos cambios no se hayan guardado: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "Conjunto de datos",
+  "DataNotebookPanel.datasetSection.none": "Aún no se ha importado ningún conjunto de datos.",
+  "DataNotebookPanel.datasetSection.import": "Importar CSV/JSON…",
+  "DataNotebookPanel.datasetSection.clear": "Quitar conjunto de datos",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} fila(s) · tabla `{{table}}`",
+  "DataNotebookPanel.importError": "Error al importar: {{error}}",
+  "DataNotebookPanel.addSqlCell": "Agregar celda SQL",
+  "DataNotebookPanel.addMarkdownCell": "Agregar celda Markdown",
+  "DataNotebookPanel.runAll": "Volver a ejecutar todo",
+  "DataNotebookPanel.running": "Ejecutando…",
+  "DataNotebookPanel.exportReport": "Exportar informe",
+  "DataNotebookPanel.noCells": "Aún no hay celdas. Agrega una celda SQL o Markdown para empezar.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "Ejecutar",
+  "DataNotebookPanel.cell.moveUp": "Mover celda hacia arriba",
+  "DataNotebookPanel.cell.moveDown": "Mover celda hacia abajo",
+  "DataNotebookPanel.cell.delete": "Eliminar celda",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Escribe markdown…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "Vista previa",
+  "DataNotebookPanel.cell.markdownEditToggle": "Editar",
+  "DataNotebookPanel.cell.notRun": "Aún no se ha ejecutado.",
+  "DataNotebookPanel.cell.error": "Error: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} fila(s) afectada(s).",
+  "DataNotebookPanel.cell.noResults": "Sin conjunto de resultados.",
+  "DataNotebookPanel.cell.truncated": "Mostrando las primeras {{shown}} filas de {{total}}.",
+  "DataNotebookPanel.reportModal.title": "Informe reproducible",
+  "DataNotebookPanel.reportModal.copy": "Copiar al portapapeles",
+  "DataNotebookPanel.reportModal.copied": "¡Copiado!"
 };

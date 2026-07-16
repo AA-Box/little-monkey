@@ -11,6 +11,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -273,6 +274,7 @@ export const id: Record<string, string> = {
   "McpGenerator.statusNotClean": "Belum bersih menurut simulator",
   "McpGenerator.statusNotSimulated": "Belum disimulasikan",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   // Real Indonesian translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Ringkasan Harian",
   "DailyBriefPanel.title": "Ringkasan Harian",
@@ -1283,5 +1285,48 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ini bukan JSON snapshot registri yang valid.",
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
-  "EcosystemDiscover.cancel": "Batal"
+  "EcosystemDiscover.cancel": "Batal",
+  // Real Indonesian translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "Notebook Data",
+  "DataNotebookPanel.title": "Notebook Data dan Lab SQL",
+  "DataNotebookPanel.subtitle": "Sel SQL dan Markdown di atas dataset CSV/JSON lokal, dapat direproduksi dari sumber tersimpan",
+  "DataNotebookPanel.close": "Tutup Notebook Data",
+  "DataNotebookPanel.notebookListTitle": "Notebook",
+  "DataNotebookPanel.newNotebook": "Notebook baru",
+  "DataNotebookPanel.defaultNotebookName": "Notebook tanpa judul",
+  "DataNotebookPanel.emptyState": "Belum ada notebook. Buat satu untuk memulai.",
+  "DataNotebookPanel.deleteNotebook": "Hapus notebook",
+  "DataNotebookPanel.renameNotebook": "Nama notebook",
+  "DataNotebookPanel.noActiveNotebook": "Pilih atau buat notebook untuk memulai.",
+  "DataNotebookPanel.persistError": "Beberapa perubahan mungkin tidak tersimpan: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "Dataset",
+  "DataNotebookPanel.datasetSection.none": "Belum ada dataset yang diimpor.",
+  "DataNotebookPanel.datasetSection.import": "Impor CSV/JSON…",
+  "DataNotebookPanel.datasetSection.clear": "Hapus dataset",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} baris · tabel `{{table}}`",
+  "DataNotebookPanel.importError": "Impor gagal: {{error}}",
+  "DataNotebookPanel.addSqlCell": "Tambah sel SQL",
+  "DataNotebookPanel.addMarkdownCell": "Tambah sel Markdown",
+  "DataNotebookPanel.runAll": "Jalankan ulang semua",
+  "DataNotebookPanel.running": "Menjalankan…",
+  "DataNotebookPanel.exportReport": "Ekspor laporan",
+  "DataNotebookPanel.noCells": "Belum ada sel. Tambahkan sel SQL atau Markdown untuk memulai.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "Jalankan",
+  "DataNotebookPanel.cell.moveUp": "Pindahkan sel ke atas",
+  "DataNotebookPanel.cell.moveDown": "Pindahkan sel ke bawah",
+  "DataNotebookPanel.cell.delete": "Hapus sel",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Tulis markdown…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "Pratinjau",
+  "DataNotebookPanel.cell.markdownEditToggle": "Edit",
+  "DataNotebookPanel.cell.notRun": "Belum dijalankan.",
+  "DataNotebookPanel.cell.error": "Error: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} baris terpengaruh.",
+  "DataNotebookPanel.cell.noResults": "Tidak ada hasil.",
+  "DataNotebookPanel.cell.truncated": "Menampilkan {{shown}} baris pertama dari {{total}}.",
+  "DataNotebookPanel.reportModal.title": "Laporan yang dapat direproduksi",
+  "DataNotebookPanel.reportModal.copy": "Salin ke clipboard",
+  "DataNotebookPanel.reportModal.copied": "Disalin!"
 };
