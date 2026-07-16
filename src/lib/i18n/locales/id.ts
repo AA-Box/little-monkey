@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Alur Agen Issue-to-PR",
@@ -48,6 +50,33 @@ export const id: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Branch milik sendiri",
   "IssueToPr.branchLabel": "Branch",
   "IssueToPr.repositoryLabel": "Repositori",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "Kompiler SOP-ke-Agen",
+  "SopCompiler.title": "Kompiler SOP-ke-Agen",
+  "SopCompiler.subtitle": "Tempelkan atau impor SOP, runbook, checklist, atau dokumen pelatihan, lalu kompilasikan menjadi draf alur kerja dengan input, gerbang kebijakan, pengujian, dan persyaratan bukti.",
+  "SopCompiler.close": "Tutup Kompiler SOP-ke-Agen",
+  "SopCompiler.sourceLabel": "Teks SOP / runbook / checklist",
+  "SopCompiler.sourcePlaceholder": "Tempelkan teks SOP, runbook, checklist, atau dokumen pelatihan di sini…",
+  "SopCompiler.importButton": "Impor file",
+  "SopCompiler.compileButton": "Kompilasi",
+  "SopCompiler.inactiveNotice": "Mengompilasi tidak pernah menjalankan apa pun — hasilnya adalah draf yang Anda tinjau dan uji sebelum dapat disetujui.",
+  "SopCompiler.draftsHeading": "Draf terkompilasi",
+  "SopCompiler.emptyDrafts": "Belum ada draf terkompilasi. Tempelkan atau impor SOP di atas dan kompilasikan untuk melihat draf di sini.",
+  "SopCompiler.statusDraft": "Draf",
+  "SopCompiler.statusSentForReview": "Dikirim untuk ditinjau",
+  "SopCompiler.stepsHeading": "Langkah-langkah",
+  "SopCompiler.noStepsExtracted": "Tidak ada langkah yang diekstrak.",
+  "SopCompiler.inputsHeading": "Input yang diperlukan",
+  "SopCompiler.required": "wajib",
+  "SopCompiler.optional": "opsional",
+  "SopCompiler.gatesHeading": "Gerbang kebijakan / izin",
+  "SopCompiler.testsHeading": "Daftar periksa penerimaan / pengujian",
+  "SopCompiler.expectedPrefix": "Diharapkan:",
+  "SopCompiler.evidenceHeading": "Bukti yang diperlukan",
+  "SopCompiler.nonGoalsNote": "Alur kerja terkompilasi ini tetap tidak aktif sampai Anda meninjaunya dan mengirimkannya ke Proposal Skill, tempat alur kerja tetap dikarantina sampai disetujui secara eksplisit — tidak ada yang menginstal atau mengaktifkannya secara langsung di sini.",
+  "SopCompiler.sendToReviewButton": "Kirim ke Proposal Skill untuk ditinjau",
+  "SopCompiler.alreadySentButton": "Sudah dikirim untuk ditinjau",
+  "SopCompiler.discardButton": "Buang",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

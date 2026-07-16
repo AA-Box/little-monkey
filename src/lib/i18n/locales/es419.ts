@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 
 export const es419: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const es419: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flujo del agente Issue-to-PR",
@@ -48,6 +50,33 @@ export const es419: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Rama propia",
   "IssueToPr.branchLabel": "Rama",
   "IssueToPr.repositoryLabel": "Repositorio",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "Compilador de SOP a agente",
+  "SopCompiler.title": "Compilador de SOP a agente",
+  "SopCompiler.subtitle": "Pega o importa un SOP, runbook, lista de verificación o documento de capacitación y compílalo en un borrador de flujo de trabajo con entradas, controles de política, pruebas y requisitos de evidencia.",
+  "SopCompiler.close": "Cerrar el compilador de SOP a agente",
+  "SopCompiler.sourceLabel": "Texto del SOP / runbook / lista de verificación",
+  "SopCompiler.sourcePlaceholder": "Pega aquí el texto del SOP, runbook, lista de verificación o documento de capacitación…",
+  "SopCompiler.importButton": "Importar archivo",
+  "SopCompiler.compileButton": "Compilar",
+  "SopCompiler.inactiveNotice": "Compilar nunca ejecuta nada — el resultado es un borrador que revisas y pruebas antes de que pueda aprobarse.",
+  "SopCompiler.draftsHeading": "Borradores compilados",
+  "SopCompiler.emptyDrafts": "Todavía no hay borradores compilados. Pega o importa un SOP arriba y compílalo para ver un borrador aquí.",
+  "SopCompiler.statusDraft": "Borrador",
+  "SopCompiler.statusSentForReview": "Enviado para revisión",
+  "SopCompiler.stepsHeading": "Pasos",
+  "SopCompiler.noStepsExtracted": "No se extrajo ningún paso.",
+  "SopCompiler.inputsHeading": "Entradas requeridas",
+  "SopCompiler.required": "requerido",
+  "SopCompiler.optional": "opcional",
+  "SopCompiler.gatesHeading": "Controles de política / permisos",
+  "SopCompiler.testsHeading": "Lista de pruebas / criterios de aceptación",
+  "SopCompiler.expectedPrefix": "Esperado:",
+  "SopCompiler.evidenceHeading": "Evidencia requerida",
+  "SopCompiler.nonGoalsNote": "Este flujo de trabajo compilado permanece inactivo hasta que lo revises y lo envíes a Propuestas de habilidades, donde queda en cuarentena hasta su aprobación explícita — nada aquí lo instala ni lo activa directamente.",
+  "SopCompiler.sendToReviewButton": "Enviar a Propuestas de habilidades para revisión",
+  "SopCompiler.alreadySentButton": "Ya enviado para revisión",
+  "SopCompiler.discardButton": "Descartar",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

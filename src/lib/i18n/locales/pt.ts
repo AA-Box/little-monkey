@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const pt: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Fluxo de agente Issue-to-PR",
@@ -48,6 +50,33 @@ export const pt: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Branch próprio",
   "IssueToPr.branchLabel": "Branch",
   "IssueToPr.repositoryLabel": "Repositório",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "Compilador de SOP para agente",
+  "SopCompiler.title": "Compilador de SOP para agente",
+  "SopCompiler.subtitle": "Cole ou importe uma SOP, runbook, checklist ou material de treinamento e compile-o em um rascunho de workflow com entradas, gates de política, testes e requisitos de evidência.",
+  "SopCompiler.close": "Fechar o compilador de SOP para agente",
+  "SopCompiler.sourceLabel": "Texto da SOP / runbook / checklist",
+  "SopCompiler.sourcePlaceholder": "Cole aqui o texto da SOP, runbook, checklist ou material de treinamento…",
+  "SopCompiler.importButton": "Importar arquivo",
+  "SopCompiler.compileButton": "Compilar",
+  "SopCompiler.inactiveNotice": "Compilar nunca executa nada — o resultado é um rascunho que você revisa e testa antes que possa ser aprovado.",
+  "SopCompiler.draftsHeading": "Rascunhos compilados",
+  "SopCompiler.emptyDrafts": "Ainda não há rascunhos compilados. Cole ou importe uma SOP acima e compile-a para ver um rascunho aqui.",
+  "SopCompiler.statusDraft": "Rascunho",
+  "SopCompiler.statusSentForReview": "Enviado para revisão",
+  "SopCompiler.stepsHeading": "Etapas",
+  "SopCompiler.noStepsExtracted": "Nenhuma etapa foi extraída.",
+  "SopCompiler.inputsHeading": "Entradas necessárias",
+  "SopCompiler.required": "obrigatório",
+  "SopCompiler.optional": "opcional",
+  "SopCompiler.gatesHeading": "Gates de política / permissão",
+  "SopCompiler.testsHeading": "Checklist de aceitação / teste",
+  "SopCompiler.expectedPrefix": "Esperado:",
+  "SopCompiler.evidenceHeading": "Evidências necessárias",
+  "SopCompiler.nonGoalsNote": "Este workflow compilado permanece inativo até que você o revise e o envie para Propostas de Skill, onde fica em quarentena até ser aprovado explicitamente — nada aqui o instala ou ativa diretamente.",
+  "SopCompiler.sendToReviewButton": "Enviar para Propostas de Skill para revisão",
+  "SopCompiler.alreadySentButton": "Já enviado para revisão",
+  "SopCompiler.discardButton": "Descartar",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

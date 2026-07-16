@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const de: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR-Agentenablauf",
@@ -48,6 +50,33 @@ export const de: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Eigener Branch",
   "IssueToPr.branchLabel": "Branch",
   "IssueToPr.repositoryLabel": "Repository",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "SOP-zu-Agent-Compiler",
+  "SopCompiler.title": "SOP-zu-Agent-Compiler",
+  "SopCompiler.subtitle": "Fügen Sie eine SOP, ein Runbook, eine Checkliste oder ein Schulungsdokument ein oder importieren Sie es und kompilieren Sie es zu einem Workflow-Entwurf mit Eingaben, Richtlinien-Gates, Tests und Nachweisanforderungen.",
+  "SopCompiler.close": "SOP-zu-Agent-Compiler schließen",
+  "SopCompiler.sourceLabel": "SOP-/Runbook-/Checklisten-Text",
+  "SopCompiler.sourcePlaceholder": "Fügen Sie hier den Text der SOP, des Runbooks, der Checkliste oder des Schulungsdokuments ein…",
+  "SopCompiler.importButton": "Datei importieren",
+  "SopCompiler.compileButton": "Kompilieren",
+  "SopCompiler.inactiveNotice": "Das Kompilieren führt nichts aus — das Ergebnis ist ein Entwurf, den Sie prüfen und testen, bevor er genehmigt werden kann.",
+  "SopCompiler.draftsHeading": "Kompilierte Entwürfe",
+  "SopCompiler.emptyDrafts": "Noch keine kompilierten Entwürfe. Fügen Sie oben eine SOP ein oder importieren Sie sie und kompilieren Sie sie, um hier einen Entwurf zu sehen.",
+  "SopCompiler.statusDraft": "Entwurf",
+  "SopCompiler.statusSentForReview": "Zur Prüfung gesendet",
+  "SopCompiler.stepsHeading": "Schritte",
+  "SopCompiler.noStepsExtracted": "Es wurden keine Schritte extrahiert.",
+  "SopCompiler.inputsHeading": "Erforderliche Eingaben",
+  "SopCompiler.required": "erforderlich",
+  "SopCompiler.optional": "optional",
+  "SopCompiler.gatesHeading": "Richtlinien-/Berechtigungs-Gates",
+  "SopCompiler.testsHeading": "Abnahme-/Testcheckliste",
+  "SopCompiler.expectedPrefix": "Erwartet:",
+  "SopCompiler.evidenceHeading": "Erforderliche Nachweise",
+  "SopCompiler.nonGoalsNote": "Dieser kompilierte Workflow bleibt inaktiv, bis Sie ihn prüfen und an die Skill-Vorschläge senden, wo er unter Quarantäne bleibt, bis er ausdrücklich genehmigt wird — nichts hier installiert oder aktiviert ihn direkt.",
+  "SopCompiler.sendToReviewButton": "Zur Prüfung an Skill-Vorschläge senden",
+  "SopCompiler.alreadySentButton": "Bereits zur Prüfung gesendet",
+  "SopCompiler.discardButton": "Verwerfen",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

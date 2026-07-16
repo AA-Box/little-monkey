@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const hi: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "इशू-टू-पीआर",
   "IssueToPr.title": "इशू-टू-पीआर एजेंट फ़्लो",
@@ -48,6 +50,33 @@ export const hi: Record<string, string> = {
   "IssueToPr.worktreeLabel": "स्वयं की ब्रांच",
   "IssueToPr.branchLabel": "ब्रांच",
   "IssueToPr.repositoryLabel": "रिपॉज़िटरी",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "SOP-से-एजेंट कंपाइलर",
+  "SopCompiler.title": "SOP-से-एजेंट कंपाइलर",
+  "SopCompiler.subtitle": "एक SOP, रनबुक, चेकलिस्ट या प्रशिक्षण दस्तावेज़ पेस्ट करें या आयात करें और इसे इनपुट, नीति गेट्स, परीक्षणों और साक्ष्य आवश्यकताओं के साथ एक ड्राफ़्ट वर्कफ़्लो में संकलित करें।",
+  "SopCompiler.close": "SOP-से-एजेंट कंपाइलर बंद करें",
+  "SopCompiler.sourceLabel": "SOP / रनबुक / चेकलिस्ट टेक्स्ट",
+  "SopCompiler.sourcePlaceholder": "यहाँ SOP, रनबुक, चेकलिस्ट या प्रशिक्षण दस्तावेज़ का टेक्स्ट पेस्ट करें…",
+  "SopCompiler.importButton": "फ़ाइल आयात करें",
+  "SopCompiler.compileButton": "संकलित करें",
+  "SopCompiler.inactiveNotice": "संकलन कभी कुछ नहीं चलाता — परिणाम एक ड्राफ़्ट है जिसे आप स्वीकृत होने से पहले समीक्षा और परीक्षण करते हैं।",
+  "SopCompiler.draftsHeading": "संकलित ड्राफ़्ट",
+  "SopCompiler.emptyDrafts": "अभी तक कोई संकलित ड्राफ़्ट नहीं है। ऊपर एक SOP पेस्ट करें या आयात करें और यहाँ ड्राफ़्ट देखने के लिए इसे संकलित करें।",
+  "SopCompiler.statusDraft": "ड्राफ़्ट",
+  "SopCompiler.statusSentForReview": "समीक्षा हेतु भेजा गया",
+  "SopCompiler.stepsHeading": "चरण",
+  "SopCompiler.noStepsExtracted": "कोई चरण नहीं निकाला गया।",
+  "SopCompiler.inputsHeading": "आवश्यक इनपुट",
+  "SopCompiler.required": "आवश्यक",
+  "SopCompiler.optional": "वैकल्पिक",
+  "SopCompiler.gatesHeading": "नीति / अनुमति गेट्स",
+  "SopCompiler.testsHeading": "स्वीकृति / परीक्षण चेकलिस्ट",
+  "SopCompiler.expectedPrefix": "अपेक्षित:",
+  "SopCompiler.evidenceHeading": "आवश्यक साक्ष्य",
+  "SopCompiler.nonGoalsNote": "यह संकलित वर्कफ़्लो तब तक निष्क्रिय रहता है जब तक आप इसकी समीक्षा करके इसे स्किल प्रस्तावों को नहीं भेजते, जहाँ यह स्पष्ट रूप से स्वीकृत होने तक क्वारंटीन में रहता है — यहाँ कुछ भी इसे सीधे स्थापित या सक्रिय नहीं करता।",
+  "SopCompiler.sendToReviewButton": "समीक्षा हेतु स्किल प्रस्तावों को भेजें",
+  "SopCompiler.alreadySentButton": "पहले ही समीक्षा हेतु भेजा जा चुका है",
+  "SopCompiler.discardButton": "अस्वीकार करें",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",
