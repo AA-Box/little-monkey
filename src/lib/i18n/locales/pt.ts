@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const pt: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   // Real Portuguese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumo diário",
   "DailyBriefPanel.title": "Resumo diário",
@@ -874,5 +876,36 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Isso não é um JSON de snapshot de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Real Portuguese translations, overriding every visualEditModeLocale key above.
+  "AppMenu.visualEditMode": "Modo de edição visual de design",
+  "VisualEditModePanel.title": "Modo de edição visual de design",
+  "VisualEditModePanel.subtitle": "Escolha um elemento no Browser Workbench, descreva a alteração, revise o patch do código-fonte",
+  "VisualEditModePanel.close": "Fechar o modo de edição visual de design",
+  "VisualEditModePanel.pickElement.title": "1. Escolha um elemento",
+  "VisualEditModePanel.pickElement.description": "Usa uma sessão do Browser Workbench já aberta — inicie uma pela barra lateral, navegue até sua página e depois selecione-a aqui.",
+  "VisualEditModePanel.pickElement.session": "Sessão do navegador",
+  "VisualEditModePanel.pickElement.noSessions": "Nenhuma sessão do Browser Workbench aberta",
+  "VisualEditModePanel.pickElement.refreshSessions": "Atualizar sessões",
+  "VisualEditModePanel.pickElement.selector": "Seletor CSS",
+  "VisualEditModePanel.pickElement.selectorPlaceholder": "ex.: button.cta, #submit-button",
+  "VisualEditModePanel.pickElement.capture": "Capturar elemento",
+  "VisualEditModePanel.describeChange": "2. Descreva sua alteração",
+  "VisualEditModePanel.describeChangePlaceholder": "ex.: \"deixe este botão maior\" ou \"mude isto para azul\"",
+  "VisualEditModePanel.generate": "Gerar patch",
+  "VisualEditModePanel.generating": "Procurando arquivos-fonte e pedindo um patch ao modelo…",
+  "VisualEditModePanel.empty": "Ainda não há edições visuais — capture um elemento acima e descreva uma alteração para começar.",
+  "VisualEditModePanel.before": "Antes",
+  "VisualEditModePanel.after": "Depois",
+  "VisualEditModePanel.noScreenshot": "Nenhuma captura de tela realizada",
+  "VisualEditModePanel.accept": "Aceitar",
+  "VisualEditModePanel.reject": "Rejeitar",
+  "VisualEditModePanel.replay": "Repetir",
+  "VisualEditModePanel.dismiss": "Descartar",
+  "VisualEditModePanel.acceptedNote": "Gravado em {{file}}",
+  "VisualEditModePanel.status.generating": "gerando",
+  "VisualEditModePanel.status.pending": "aguardando revisão",
+  "VisualEditModePanel.status.accepted": "aceito",
+  "VisualEditModePanel.status.rejected": "rejeitado",
+  "VisualEditModePanel.status.error": "erro"
 };

@@ -12,6 +12,7 @@ import {
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
+  Wand2,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -28,6 +29,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDailyBrief: () => void;
+  onOpenVisualEditMode: () => void;
 }
 
 interface MenuRowProps {
@@ -64,6 +66,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDailyBrief,
+  onOpenVisualEditMode,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -146,6 +149,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<Wand2 size={14} className="text-faint" />}
+            label={t("AppMenu.visualEditMode")}
+            onClick={() => {
+              closeAll();
+              onOpenVisualEditMode();
             }}
           />
           <MenuRow

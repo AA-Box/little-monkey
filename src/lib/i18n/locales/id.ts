@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   // Real Indonesian translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Ringkasan Harian",
   "DailyBriefPanel.title": "Ringkasan Harian",
@@ -874,5 +876,36 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ini bukan JSON snapshot registri yang valid.",
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
-  "EcosystemDiscover.cancel": "Batal"
+  "EcosystemDiscover.cancel": "Batal",
+  // Real Indonesian translations, overriding every visualEditModeLocale key above.
+  "AppMenu.visualEditMode": "Mode Edit Desain Visual",
+  "VisualEditModePanel.title": "Mode Edit Desain Visual",
+  "VisualEditModePanel.subtitle": "Pilih elemen di Browser Workbench, jelaskan perubahannya, tinjau patch kode sumber",
+  "VisualEditModePanel.close": "Tutup Mode Edit Desain Visual",
+  "VisualEditModePanel.pickElement.title": "1. Pilih elemen",
+  "VisualEditModePanel.pickElement.description": "Menggunakan sesi Browser Workbench yang sudah terbuka — mulai sesi dari sidebar terlebih dahulu, buka halaman Anda, lalu pilih di sini.",
+  "VisualEditModePanel.pickElement.session": "Sesi browser",
+  "VisualEditModePanel.pickElement.noSessions": "Tidak ada sesi Browser Workbench yang terbuka",
+  "VisualEditModePanel.pickElement.refreshSessions": "Segarkan sesi",
+  "VisualEditModePanel.pickElement.selector": "Selektor CSS",
+  "VisualEditModePanel.pickElement.selectorPlaceholder": "mis. button.cta, #submit-button",
+  "VisualEditModePanel.pickElement.capture": "Tangkap elemen",
+  "VisualEditModePanel.describeChange": "2. Jelaskan perubahan Anda",
+  "VisualEditModePanel.describeChangePlaceholder": "mis. \"perbesar tombol ini\" atau \"ubah ini jadi biru\"",
+  "VisualEditModePanel.generate": "Buat patch",
+  "VisualEditModePanel.generating": "Mencari file sumber dan meminta model membuat patch…",
+  "VisualEditModePanel.empty": "Belum ada edit visual — tangkap elemen di atas dan jelaskan perubahan untuk memulai.",
+  "VisualEditModePanel.before": "Sebelum",
+  "VisualEditModePanel.after": "Sesudah",
+  "VisualEditModePanel.noScreenshot": "Tidak ada tangkapan layar yang diambil",
+  "VisualEditModePanel.accept": "Terima",
+  "VisualEditModePanel.reject": "Tolak",
+  "VisualEditModePanel.replay": "Putar ulang",
+  "VisualEditModePanel.dismiss": "Abaikan",
+  "VisualEditModePanel.acceptedNote": "Ditulis ke {{file}}",
+  "VisualEditModePanel.status.generating": "sedang dibuat",
+  "VisualEditModePanel.status.pending": "menunggu peninjauan",
+  "VisualEditModePanel.status.accepted": "diterima",
+  "VisualEditModePanel.status.rejected": "ditolak",
+  "VisualEditModePanel.status.error": "kesalahan"
 };

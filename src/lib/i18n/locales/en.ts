@@ -7,6 +7,7 @@ import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
 import { inboxLocale } from "./inbox";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -18,6 +19,7 @@ export const en: Record<string, string> = {
   ...developerLocale,
   ...inboxLocale,
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
