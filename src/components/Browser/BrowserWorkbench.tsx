@@ -5,7 +5,9 @@ import {
   ArrowRight,
   Camera,
   CheckCircle2,
+  Circle,
   Copy,
+  Disc,
   GitCompare,
   Globe2,
   Loader2,
@@ -43,8 +45,21 @@ import {
   typeBrowserText,
 } from "../../lib/browserVerification";
 import { artifactDataUrl, readDurableArtifact } from "../../lib/durableArtifacts";
+import {
+  appendClickStep,
+  appendNavigateStep,
+  appendScrollStep,
+  appendTypeStep,
+  convertRecordingToDraft,
+  createRecording,
+  stopRecording as stopRecordingCapture,
+  type BrowserRecording,
+  type RecordedElementInfo,
+} from "../../lib/workflowRecorder";
 import { useBrowserWorkbenchStore } from "../../store/browserWorkbenchStore";
-import { Button, IconButton } from "../ui";
+import { Button, IconButton, Tabs } from "../ui";
+import { WorkflowDraftReview } from "./WorkflowDraftReview";
+import { WorkflowLibrary } from "./WorkflowLibrary";
 
 const MAX_SNAPSHOTS = 12;
 const MAX_EVIDENCE_EXCERPT = 4_000;
@@ -231,6 +246,18 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"verify" | "workflows">("verify");
+  // Record and Replay Workflows (ROADMAP.md, Phase 1). `recording` is only
+  // non-null while actively capturing — narrow capture boundaries by
+  // construction, since it is scoped to this one component instance's own
+  // `session`/`runId` and cleared whenever that session ends. Stopping
+  // hands the finished, immutable recording to `reviewingRecording`, which
+  // is the only path into the required review step before anything can
+  // ever replay (see `WorkflowDraftReview`).
+  const [recording, setRecording] = useState<BrowserRecording | null>(null);
+  const [reviewingRecording, setReviewingRecording] = useState<BrowserRecording | null>(null);
+  const isRecording = recording !== null;
+  const reviewingDraft = useMemo(() => (reviewingRecording ? convertRecordingToDraft(reviewingRecording) : null), [reviewingRecording]);
 
   const origin = useMemo(() => { try { return exactBrowserOrigin(url); } catch { return null; } }, [url]);
   const local = useMemo(() => { try { return isLoopbackBrowserUrl(url); } catch { return false; } }, [url]);
@@ -280,6 +307,35 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
     if (next) setEvidence(next);
   }, []);
 
+  // Best-effort element metadata for a recorded click/type step — used to
+  // prefer a stable aria-label selector over a brittle one and to detect
+  // credential-like fields (see workflowRecorder.ts). Never blocks the
+  // underlying action: a failed lookup (e.g. the selector already changed
+  // the page) just records the step with `element: null`.
+  async function annotateForRecording(sessionId: string, forSelector: string): Promise<RecordedElementInfo | null> {
+    try {
+      const result = await annotateBrowser(sessionId, forSelector);
+      return { tag: result.tag, role: result.role, ariaLabel: result.ariaLabel, text: result.text };
+    } catch {
+      return null;
+    }
+  }
+
+  function startRecording() {
+    if (!session) return;
+    setReviewingRecording(null);
+    setRecording(createRecording(runId, session.currentUrl || url));
+    setNotice("Recording started. Only this tab's actions are captured.");
+  }
+
+  function stopRecordingNow() {
+    setRecording((current) => {
+      if (!current) return current;
+      setReviewingRecording(stopRecordingCapture(current));
+      return null;
+    });
+  }
+
   async function handleStart() {
     const next = await perform("start", () => startBrowserSession({ runId, url, allowLoopback }));
     if (!next) return;
@@ -297,6 +353,41 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
     setSession({ ...session, currentUrl: result.url, actionCount: result.evidence.actionCount });
     applyEvidence(result.evidence);
     if (remember) rememberUrl(result.url);
+    if (recording) {
+      setRecording((current) => current && appendNavigateStep(current, { url: result.url, screenshotArtifactId: result.evidence.screenshot?.id ?? null }));
+    }
+  }
+
+  async function handleClickAction() {
+    if (!session || !selector) return;
+    const element = recording ? await annotateForRecording(session.sessionId, selector) : null;
+    const result = await perform("click", () => clickBrowser(session.sessionId, selector));
+    if (!result) return;
+    applyEvidence(result.evidence);
+    if (recording) {
+      setRecording((current) => current && appendClickStep(current, { url: result.url, selector, element, screenshotArtifactId: result.evidence.screenshot?.id ?? null }));
+    }
+  }
+
+  async function handleTypeAction() {
+    if (!session || !selector || !text) return;
+    const element = recording ? await annotateForRecording(session.sessionId, selector) : null;
+    const result = await perform("type", () => typeBrowserText(session.sessionId, selector, text));
+    if (!result) return;
+    applyEvidence(result.evidence);
+    if (recording) {
+      setRecording((current) => current && appendTypeStep(current, { url: result.url, selector, rawValue: text, element, screenshotArtifactId: result.evidence.screenshot?.id ?? null }));
+    }
+  }
+
+  async function handleScrollAction() {
+    if (!session) return;
+    const result = await perform("scroll", () => scrollBrowser(session.sessionId, 0, 640));
+    if (!result) return;
+    applyEvidence(result.evidence);
+    if (recording) {
+      setRecording((current) => current && appendScrollStep(current, { url: result.url, x: 0, y: 640, screenshotArtifactId: result.evidence.screenshot?.id ?? null }));
+    }
   }
 
   async function handleHistory(nextIndex: number) {
@@ -391,18 +482,41 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
             <IconButton size="sm" aria-label="Reload" disabled={!session || busy !== null} onClick={() => session && void perform("reload", () => reloadBrowser(session.sessionId)).then((result) => result && applyEvidence(result.evidence))}><RefreshCw size={15} /></IconButton>
             <input aria-label="Browser URL" value={url} onChange={(event) => setUrl(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void (session ? handleNavigate() : handleStart()); }} className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground" />
             {!session ? <Button variant="primary" disabled={!origin || busy !== null || (local && !allowLoopback)} onClick={() => void handleStart()}>{busy === "start" ? <Loader2 size={14} className="animate-spin" /> : <Globe2 size={14} />} Start</Button> : <Button disabled={busy !== null} onClick={() => void handleNavigate()}>Go</Button>}
+            {session && (isRecording
+              ? <Button size="sm" variant="danger" onClick={stopRecordingNow}><Square size={13} />Stop recording</Button>
+              : <Button size="sm" variant="secondary" onClick={startRecording}><Disc size={13} />Record</Button>)}
           </div>
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-faint"><span className="break-all">Exact origin: {origin ?? "invalid URL"}</span>{session && <span>{session.actionCount} recorded actions · {session.sessionId.slice(0, 18)}…</span>}</div>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-faint">
+            <span className="break-all">Exact origin: {origin ?? "invalid URL"}</span>
+            <span className="flex items-center gap-2">
+              {isRecording && <span className="inline-flex items-center gap-1.5 rounded-full border border-danger/40 bg-danger/10 px-2 py-0.5 text-[10px] font-medium text-danger"><Circle size={8} className="animate-pulse fill-current" />Recording · {recording?.steps.length ?? 0} step(s) · this tab only</span>}
+              {session && <span>{session.actionCount} recorded actions · {session.sessionId.slice(0, 18)}…</span>}
+            </span>
+          </div>
           {local && !session && <label className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2 text-xs text-foreground"><input type="checkbox" checked={allowLoopback} onChange={(event) => setAllowLoopback(event.target.checked)} className="mt-0.5" /><span>Grant this task access to loopback preview URLs. Private, link-local, cross-origin, file, upload, download, clipboard, extension, and signed-in profile access remain blocked.</span></label>}
         </div>
 
-        {session ? (
+        <div className="mt-3">
+          <Tabs
+            tabs={[{ id: "verify", label: "Verify" }, { id: "workflows", label: "Workflows" }]}
+            active={activeTab}
+            onChange={(id) => setActiveTab(id === "workflows" ? "workflows" : "verify")}
+          />
+        </div>
+
+        {activeTab === "workflows" && (
+          <div className="mt-3">
+            <WorkflowLibrary />
+          </div>
+        )}
+
+        {activeTab === "verify" && (session ? (
           <div className="mt-3 grid min-h-0 gap-3 xl:grid-cols-[minmax(280px,0.72fr)_minmax(420px,1.28fr)]">
             <div className="space-y-3">
               <div className="rounded-xl border border-border bg-surface p-3"><div className="mb-2 flex items-center justify-between"><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Viewport presets</h3><span className="text-[11px] text-faint">{session.viewport.width}×{session.viewport.height}</span></div><div className="grid grid-cols-2 gap-2">{VIEWPORTS.map(({ id, label, icon: Icon, viewport }) => <Button key={id} size="sm" variant={session.viewport.width === viewport.width && session.viewport.height === viewport.height ? "primary" : "secondary"} disabled={busy !== null} onClick={() => void handleViewport(viewport)}><Icon size={13} />{label}</Button>)}</div></div>
-              <div className="rounded-xl border border-border bg-surface p-3"><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Page actions</h3><label className="mt-3 block text-xs text-muted">CSS selector<input value={selector} onChange={(event) => setSelector(event.target.value)} className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs text-foreground" /></label><label className="mt-2 block text-xs text-muted">Text to type<textarea value={text} onChange={(event) => setText(event.target.value)} className="mt-1 h-20 w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs text-foreground" /></label><div className="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={!selector || busy !== null} onClick={() => session && void perform("click", () => clickBrowser(session.sessionId, selector)).then((result) => result && applyEvidence(result.evidence))}><MousePointerClick size={13} />Click</Button><Button size="sm" disabled={!selector || !text || busy !== null} onClick={() => session && void perform("type", () => typeBrowserText(session.sessionId, selector, text)).then((result) => result && applyEvidence(result.evidence))}><TextCursorInput size={13} />Type</Button><Button size="sm" disabled={busy !== null} onClick={() => session && void perform("scroll", () => scrollBrowser(session.sessionId, 0, 640)).then((result) => result && applyEvidence(result.evidence))}>Scroll</Button><Button size="sm" disabled={!selector || busy !== null} onClick={() => void handleAnnotate()}><Paperclip size={13} />Annotate</Button></div></div>
+              <div className="rounded-xl border border-border bg-surface p-3"><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Page actions</h3><label className="mt-3 block text-xs text-muted">CSS selector<input value={selector} onChange={(event) => setSelector(event.target.value)} className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs text-foreground" /></label><label className="mt-2 block text-xs text-muted">Text to type<textarea value={text} onChange={(event) => setText(event.target.value)} className="mt-1 h-20 w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs text-foreground" /></label><div className="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={!selector || busy !== null} onClick={() => void handleClickAction()}><MousePointerClick size={13} />Click</Button><Button size="sm" disabled={!selector || !text || busy !== null} onClick={() => void handleTypeAction()}><TextCursorInput size={13} />Type</Button><Button size="sm" disabled={busy !== null} onClick={() => void handleScrollAction()}>Scroll</Button><Button size="sm" disabled={!selector || busy !== null} onClick={() => void handleAnnotate()}><Paperclip size={13} />Annotate</Button></div></div>
               <div className="rounded-xl border border-border bg-surface p-3"><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Verification</h3><div className="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={busy !== null} onClick={() => void handleInspect()}><ShieldCheck size={13} />Accessibility + DOM</Button><Button size="sm" disabled={busy !== null} onClick={() => void handleCapture()}><Camera size={13} />Save evidence</Button></div>{inspection && <div className={`mt-3 rounded-md border p-2 text-xs ${inspection.accessibilityIssues.length ? "border-warning/40 bg-warning/10" : "border-success/30 bg-success-soft"}`}><div className="flex items-center gap-1.5 font-medium">{inspection.accessibilityIssues.length ? <AlertTriangle size={13} /> : <CheckCircle2 size={13} />} {inspection.accessibilityIssues.length} accessibility issue(s)</div>{inspection.accessibilityIssues.length > 0 && <ul className="mt-2 list-disc space-y-1 pl-4 text-muted">{inspection.accessibilityIssues.slice(0, 8).map((issue, index) => <li key={`${issue}-${index}`}>{issue}</li>)}</ul>}</div>}</div>
-              <Button variant="danger" disabled={busy !== null} onClick={() => session && void perform("stop", () => stopBrowserSession(session.sessionId)).then((stopped) => { if (stopped !== null) { setSession(null); setEvidence(null); setInspection(null); setAnnotation(null); } })}><Square size={13} />Stop and erase profile</Button>
+              <Button variant="danger" disabled={busy !== null} onClick={() => session && void perform("stop", () => stopBrowserSession(session.sessionId)).then((stopped) => { if (stopped !== null) { setSession(null); setEvidence(null); setInspection(null); setAnnotation(null); setRecording((current) => { if (current) setReviewingRecording(stopRecordingCapture(current)); return null; }); } })}><Square size={13} />Stop and erase profile</Button>
             </div>
 
             <div className="space-y-3">
@@ -410,11 +524,23 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
               <div className="rounded-xl border border-border bg-surface p-3"><div className="mb-3 flex items-center gap-2"><GitCompare size={14} className="text-accent" /><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Screenshot diff</h3><span className="ml-auto text-[11px] text-faint">{snapshots.length} saved</span></div><SnapshotDiff snapshots={snapshots} /></div>
             </div>
           </div>
-        ) : <div className="mt-6 flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-border p-8 text-center"><Globe2 size={28} className="text-faint" /><h3 className="mt-3 text-sm font-medium">Start an isolated verification session</h3><p className="mt-1 max-w-lg text-xs leading-5 text-muted">The workbench grants one exact origin to a disposable Chromium profile. Change origins by stopping the session and reviewing a new grant.</p></div>}
+        ) : <div className="mt-6 flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-border p-8 text-center"><Globe2 size={28} className="text-faint" /><h3 className="mt-3 text-sm font-medium">Start an isolated verification session</h3><p className="mt-1 max-w-lg text-xs leading-5 text-muted">The workbench grants one exact origin to a disposable Chromium profile. Change origins by stopping the session and reviewing a new grant.</p></div>)}
         {busy && <p role="status" className="mt-3 text-xs text-muted">Running {busy}…</p>}
         {notice && <p role="status" className="mt-3 rounded-md border border-success/30 bg-success-soft p-2 text-xs text-success">{notice}</p>}
         {error && <p role="alert" className="mt-3 rounded-md border border-danger/40 bg-danger/10 p-3 text-xs text-danger">{error}</p>}
       </div>
+
+      {reviewingDraft && (
+        <WorkflowDraftReview
+          initialDraft={reviewingDraft}
+          onDiscard={() => setReviewingRecording(null)}
+          onSaved={() => {
+            setReviewingRecording(null);
+            setActiveTab("workflows");
+            setNotice("Workflow saved. Review it any time from the Workflows tab.");
+          }}
+        />
+      )}
     </section>
   );
 }
