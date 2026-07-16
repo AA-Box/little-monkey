@@ -155,6 +155,8 @@ Turn competitor comparison into a repeatable audit, then track the gaps.
 - A checked-in comparison matrix lists competitor capability, Little Monkey status, risk, and priority.
 - Each high-priority gap has a linked roadmap item or explicit non-goal.
 
+See [`docs/competitor-parity-audit.md`](docs/competitor-parity-audit.md) for the current comparison matrix and gap-to-roadmap linkage.
+
 ### Record and Replay Workflows
 
 **Status:** Next
