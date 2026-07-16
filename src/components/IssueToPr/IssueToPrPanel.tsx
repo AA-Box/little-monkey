@@ -20,8 +20,10 @@ import {
 } from "../../lib/gitDelivery";
 import type { IssueToPrRun, IssueToPrStatus } from "../../lib/issueToPr";
 import { isTerminalIssueToPrStatus } from "../../lib/issueToPr";
+import { isSpecTooVague, SPEC_DIMENSIONS } from "../../lib/specScorer";
 import { useT } from "../../lib/i18n";
 import { useIssueToPrStore } from "../../store/issueToPrStore";
+import { useSpecScorerStore } from "../../store/specScorerStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 
 interface IssueToPrPanelProps {
@@ -149,8 +151,24 @@ export function IssueToPrPanel({ onClose, onOpenRunCapsule }: IssueToPrPanelProp
     pr.reset();
   }, [selected?.runId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — advisory only:
+  // scores the selected run's already-fetched issue title/body as soon as a
+  // run is selected (a freshly-started run, or one picked back up from
+  // history), purely so the panel can warn the reader here BEFORE they open
+  // the resulting draft PR — it never gates `store.start()` or anything else
+  // in `issueToPrStore.ts`'s `driveRun`. `scoreRun` itself is a no-op once a
+  // run already has a cached status, so this is safe to call on every
+  // selection change.
+  const specScorer = useSpecScorerStore();
+  useEffect(() => {
+    if (!selected) return;
+    void specScorer.scoreRun(selected.runId, selected.issueTitle, selected.issueBody);
+  }, [selected?.runId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const starting = store.busy.start;
   const activity = selected ? store.activityByRun[selected.runId] : undefined;
+  const specStatus = selected ? specScorer.statusByRun[selected.runId] : undefined;
+  const specScore = selected ? specScorer.scoresByRun[selected.runId] : undefined;
 
   return (
     <section className="flex h-full min-h-0 flex-col" aria-labelledby="issue-to-pr-title">
@@ -247,7 +265,65 @@ export function IssueToPrPanel({ onClose, onOpenRunCapsule }: IssueToPrPanelProp
                 <dd className="font-mono text-foreground">{selected.repositorySlug}</dd>
                 <dt className="text-faint">{t("IssueToPr.branchLabel")}</dt>
                 <dd className="break-all font-mono text-foreground">{selected.branch}</dd>
+                <dt className="text-faint">{t("IssueToPr.worktreeLabel")}</dt>
+                <dd className="break-all font-mono text-foreground">{selected.workspaceLabel}</dd>
               </dl>
+
+              {specStatus === "loading" && (
+                <p className="flex items-center gap-2 text-xs text-muted">
+                  <Loader2 className="animate-spin shrink-0" size={13} />
+                  {t("SpecScorer.scoringLabel")}
+                </p>
+              )}
+
+              {specScore && isSpecTooVague(specScore) && (
+                <div role="alert" className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">
+                  <p className="flex items-center gap-1.5 font-medium text-foreground">
+                    <AlertTriangle size={13} className="shrink-0 text-warning" /> {t("SpecScorer.bannerHeading")}
+                  </p>
+                  <p className="mt-1 text-muted">
+                    {t("SpecScorer.bannerIntro", { score: specScore.overall, summary: specScore.summary })}
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-faint">
+                    <span className="font-semibold text-foreground">{t("SpecScorer.dimensionsHeading")}:</span>
+                    {SPEC_DIMENSIONS.map((dimension) => (
+                      <span key={dimension}>
+                        {t(`SpecScorer.dimension.${dimension}`)} {specScore.dimensions[dimension]}
+                      </span>
+                    ))}
+                  </div>
+                  {specScore.missingInfo.length > 0 && (
+                    <div className="mt-2">
+                      <p className="font-medium text-foreground">{t("SpecScorer.missingInfoHeading")}</p>
+                      <ul className="mt-1 list-disc space-y-0.5 pl-4 text-muted">
+                        {specScore.missingInfo.map((item, index) => (
+                          <li key={index}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <p className="text-faint">{t("SpecScorer.advisoryNote")}</p>
+                    <Button
+                      size="sm"
+                      onClick={() => void specScorer.rescoreRun(selected.runId, selected.issueTitle, selected.issueBody)}
+                    >
+                      <RefreshCw size={12} /> {t("SpecScorer.rescoreButton")}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {specScore && !isSpecTooVague(specScore) && (
+                <p className="flex items-center gap-1.5 text-[11px] text-faint">
+                  <CheckCircle2 size={12} className="shrink-0 text-success" />
+                  {t("SpecScorer.readyNote", { score: specScore.overall })}
+                </p>
+              )}
+
+              {specStatus === "error" && (
+                <p className="text-[11px] text-faint">{t("SpecScorer.errorNote")}</p>
+              )}
 
               {activity && !isTerminalIssueToPrStatus(selected.status) && (
                 <p className="flex items-center gap-2 text-xs text-muted">
@@ -268,7 +344,12 @@ export function IssueToPrPanel({ onClose, onOpenRunCapsule }: IssueToPrPanelProp
                           <XCircle size={13} className="mt-0.5 shrink-0 text-danger" />
                         )}
                         <div className="min-w-0">
-                          <p className="font-mono text-foreground">{check.label}{check.command ? `: ${check.command}` : ""}</p>
+                          <p className="font-mono text-foreground">
+                            {check.label}
+                            {check.command ? `: ${check.command}` : ""}
+                            {" — "}
+                            {check.passed ? t("IssueToPr.checksPassed") : t("IssueToPr.checksFailed")}
+                          </p>
                           {check.outputExcerpt && (
                             <p className="mt-1 whitespace-pre-wrap break-words text-faint">{check.outputExcerpt}</p>
                           )}

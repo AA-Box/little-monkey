@@ -158,14 +158,20 @@ fn is_terminal(status: &str) -> bool {
 
 /// Whether moving a run from `from` to `to` is a legal state-machine step.
 /// Cancelling is allowed from any non-terminal status; failing is allowed
-/// from any status before the PR is opened; everything else must follow the
-/// linear `planning -> implementing -> checking -> opening_pr ->
-/// awaiting_review -> done` path exactly.
+/// from any status before the PR is opened; a non-terminal status reporting
+/// itself again is always allowed (the frontend uses this to attach
+/// metadata — e.g. `durable_run_id` — mid-phase without actually advancing
+/// the phase); everything else must follow the linear `planning ->
+/// implementing -> checking -> opening_pr -> awaiting_review -> done` path
+/// exactly.
 fn valid_transition(from: &str, to: &str) -> bool {
     if to == "cancelled" {
         return !is_terminal(from);
     }
     if to == "failed" {
+        return !is_terminal(from);
+    }
+    if from == to {
         return !is_terminal(from);
     }
     matches!(
@@ -705,6 +711,16 @@ mod tests {
         assert!(!valid_transition("planning", "opening_pr"));
         assert!(!valid_transition("implementing", "awaiting_review"));
         assert!(!valid_transition("done", "implementing"));
+    }
+
+    #[test]
+    fn state_machine_allows_a_non_terminal_status_to_self_report_but_never_a_terminal_one() {
+        for status in ["planning", "implementing", "checking", "opening_pr", "awaiting_review"] {
+            assert!(valid_transition(status, status), "{status} -> {status}");
+        }
+        for terminal in ["done", "failed", "cancelled"] {
+            assert!(!valid_transition(terminal, terminal), "{terminal} -> {terminal}");
+        }
     }
 
     #[test]

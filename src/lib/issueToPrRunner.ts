@@ -38,7 +38,7 @@ import {
   stringifyToolError,
   CANCELLED_TOOL_RESULT,
 } from './turnEngine';
-import { protectToolResult } from './untrustedContent';
+import { protectToolResult, wrapUntrustedContent } from './untrustedContent';
 
 /** Hard cap on model/tool round trips — generous relative to
  * `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS` (15) since a full issue
@@ -109,10 +109,19 @@ export async function runIssueToPrAgent(
   const mcpRegistry = emptyMcpRegistry();
   const systemPrompt = buildSystemPrompt(params);
 
+  // The issue's title/body came from a GitHub API fetch, not the user typing
+  // in this app — on a public repo anyone can open an issue — so it goes
+  // through the same untrusted-content boundary every other external/
+  // model-adjacent input reaches the model through (see `protectToolResult`,
+  // `mentions.ts`, `crewRunner.ts`). The instruction to implement the issue
+  // is the trusted part and stays outside the wrapped block.
+  const issueContent = [`Title: ${params.issueTitle}`, '', params.issueBody.trim() || '(no description provided)'].join(
+    '\n',
+  );
   const userMessage = [
-    `Issue #${params.issueNumber} — ${params.issueTitle}`,
+    `Implement GitHub issue #${params.issueNumber} in ${params.repositorySlug}. The issue's own title and body follow, fetched verbatim from GitHub:`,
     '',
-    params.issueBody.trim() || '(no description provided)',
+    wrapUntrustedContent(`GitHub issue #${params.issueNumber} (${params.repositorySlug})`, issueContent),
   ].join('\n');
 
   let messages: ChatMessage[] = [{ role: 'user', content: userMessage }];
