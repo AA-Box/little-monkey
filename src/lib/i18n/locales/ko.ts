@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const ko: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "이슈-투-PR",
   "IssueToPr.title": "이슈-투-PR 에이전트 흐름",
@@ -48,6 +50,33 @@ export const ko: Record<string, string> = {
   "IssueToPr.worktreeLabel": "소유 브랜치",
   "IssueToPr.branchLabel": "브랜치",
   "IssueToPr.repositoryLabel": "저장소",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "SOP-투-에이전트 컴파일러",
+  "SopCompiler.title": "SOP-투-에이전트 컴파일러",
+  "SopCompiler.subtitle": "SOP, 런북, 체크리스트, 교육 문서를 붙여넣거나 가져와서 입력, 정책 게이트, 테스트, 증빙 요구사항이 포함된 초안 워크플로로 컴파일하세요.",
+  "SopCompiler.close": "SOP-투-에이전트 컴파일러 닫기",
+  "SopCompiler.sourceLabel": "SOP / 런북 / 체크리스트 텍스트",
+  "SopCompiler.sourcePlaceholder": "여기에 SOP, 런북, 체크리스트 또는 교육 문서 텍스트를 붙여넣으세요…",
+  "SopCompiler.importButton": "파일 가져오기",
+  "SopCompiler.compileButton": "컴파일",
+  "SopCompiler.inactiveNotice": "컴파일은 아무것도 실행하지 않습니다 — 결과는 승인되기 전에 검토하고 테스트하는 초안입니다.",
+  "SopCompiler.draftsHeading": "컴파일된 초안",
+  "SopCompiler.emptyDrafts": "아직 컴파일된 초안이 없습니다. 위에 SOP를 붙여넣거나 가져온 후 컴파일하면 여기에 초안이 표시됩니다.",
+  "SopCompiler.statusDraft": "초안",
+  "SopCompiler.statusSentForReview": "검토를 위해 전송됨",
+  "SopCompiler.stepsHeading": "단계",
+  "SopCompiler.noStepsExtracted": "추출된 단계가 없습니다.",
+  "SopCompiler.inputsHeading": "필수 입력",
+  "SopCompiler.required": "필수",
+  "SopCompiler.optional": "선택",
+  "SopCompiler.gatesHeading": "정책 / 권한 게이트",
+  "SopCompiler.testsHeading": "승인 / 테스트 체크리스트",
+  "SopCompiler.expectedPrefix": "예상 결과:",
+  "SopCompiler.evidenceHeading": "필요한 증빙",
+  "SopCompiler.nonGoalsNote": "이 컴파일된 워크플로는 검토 후 스킬 제안으로 보낼 때까지 비활성 상태로 유지되며, 전송 후에도 명시적으로 승인될 때까지 격리 상태로 남습니다 — 여기서 어떤 것도 직접 설치하거나 활성화하지 않습니다.",
+  "SopCompiler.sendToReviewButton": "검토를 위해 스킬 제안으로 보내기",
+  "SopCompiler.alreadySentButton": "이미 검토를 위해 전송됨",
+  "SopCompiler.discardButton": "삭제",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

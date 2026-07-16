@@ -10,6 +10,7 @@ import {
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
+  Workflow,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -23,6 +24,7 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenSopCompiler: () => void;
   onOpenTerminal: () => void;
 }
 
@@ -51,7 +53,7 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenIssueToPr, onOpenTerminal }: AppMenuProps) {
+export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenIssueToPr, onOpenSopCompiler, onOpenTerminal }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -125,6 +127,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<Workflow size={14} className="text-faint" />}
+            label={t("AppMenu.sopCompiler")}
+            onClick={() => {
+              closeAll();
+              onOpenSopCompiler();
             }}
           />
           <MenuRow
