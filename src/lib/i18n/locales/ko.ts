@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const ko: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "지식 그래프 탐색기",
+  "KnowledgeGraphExplorer.title": "지식 그래프 탐색기",
+  "KnowledgeGraphExplorer.subtitle": "지식 스택과 현재 채팅에서 개체/관계 그래프를 구축한 다음, \"X는 Y와 어떻게 관련되어 있나요?\"라는 질문에 근거가 되는 출처 증거와 함께 답합니다.",
+  "KnowledgeGraphExplorer.close": "지식 그래프 탐색기 닫기",
+  "KnowledgeGraphExplorer.sourcesLabel": "소스:",
+  "KnowledgeGraphExplorer.noStacks": "아직 지식 스택이 없습니다 — 설정에서 하나를 추가하거나 아래의 현재 채팅에서 그래프를 구축하세요.",
+  "KnowledgeGraphExplorer.includeSession": "현재 채팅 포함 ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "그래프 구축",
+  "KnowledgeGraphExplorer.partialBuildHeading": "일부 소스는 이번 빌드에 포함할 수 없었습니다:",
+  "KnowledgeGraphExplorer.queryLabel": "관계 질문하기",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Alice는 auth.ts와 어떻게 관련되어 있나요?",
+  "KnowledgeGraphExplorer.askButton": "질문",
+  "KnowledgeGraphExplorer.emptyGraph": "아직 그래프가 없습니다 — 위에서 소스를 선택하고 \"그래프 구축\"을 클릭하세요.",
+  "KnowledgeGraphExplorer.evidenceHeading": "증거",
+  "KnowledgeGraphExplorer.evidenceEmpty": "위에서 관계 질문을 하면 여기에 경로와 그 출처 증거가 표시됩니다.",
+  "KnowledgeGraphExplorer.noEvidence": "이 경로에 대해 기록된 증거 구간이 없습니다.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

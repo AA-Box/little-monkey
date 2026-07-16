@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const pt: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "Explorador de Grafo de Conhecimento",
+  "KnowledgeGraphExplorer.title": "Explorador de Grafo de Conhecimento",
+  "KnowledgeGraphExplorer.subtitle": "Constrói um grafo de entidades/relações a partir das suas stacks de conhecimento e da conversa atual, depois responde \"como X se relaciona com Y?\" com as evidências de origem por trás disso.",
+  "KnowledgeGraphExplorer.close": "Fechar o Explorador de Grafo de Conhecimento",
+  "KnowledgeGraphExplorer.sourcesLabel": "Fontes:",
+  "KnowledgeGraphExplorer.noStacks": "Ainda não há stacks de conhecimento — adicione uma em Configurações, ou construa a partir da conversa atual abaixo.",
+  "KnowledgeGraphExplorer.includeSession": "Incluir a conversa atual ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "Construir grafo",
+  "KnowledgeGraphExplorer.partialBuildHeading": "Algumas fontes não puderam ser incluídas nesta construção:",
+  "KnowledgeGraphExplorer.queryLabel": "Faça uma pergunta de relação",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Como Alice se relaciona com auth.ts?",
+  "KnowledgeGraphExplorer.askButton": "Perguntar",
+  "KnowledgeGraphExplorer.emptyGraph": "Ainda não há grafo — escolha as fontes acima e clique em \"Construir grafo\".",
+  "KnowledgeGraphExplorer.evidenceHeading": "Evidências",
+  "KnowledgeGraphExplorer.evidenceEmpty": "Faça uma pergunta de relação acima para ver aqui o caminho e suas evidências de origem.",
+  "KnowledgeGraphExplorer.noEvidence": "Nenhum trecho de evidência foi registrado para este caminho.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

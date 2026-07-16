@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const fr: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const fr: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "Explorateur de graphe de connaissances",
+  "KnowledgeGraphExplorer.title": "Explorateur de graphe de connaissances",
+  "KnowledgeGraphExplorer.subtitle": "Construit un graphe d'entités et de relations à partir de vos stacks de connaissances et de la conversation en cours, puis répond à « comment X est-il lié à Y ? » avec les preuves sources à l'appui.",
+  "KnowledgeGraphExplorer.close": "Fermer l'explorateur de graphe de connaissances",
+  "KnowledgeGraphExplorer.sourcesLabel": "Sources :",
+  "KnowledgeGraphExplorer.noStacks": "Aucun stack de connaissances pour le moment — ajoutez-en un dans les Paramètres, ou construisez le graphe à partir de la conversation en cours ci-dessous.",
+  "KnowledgeGraphExplorer.includeSession": "Inclure la conversation en cours ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "Construire le graphe",
+  "KnowledgeGraphExplorer.partialBuildHeading": "Certaines sources n'ont pas pu être incluses dans cette construction :",
+  "KnowledgeGraphExplorer.queryLabel": "Posez une question de relation",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Comment Alice est-elle liée à auth.ts ?",
+  "KnowledgeGraphExplorer.askButton": "Demander",
+  "KnowledgeGraphExplorer.emptyGraph": "Aucun graphe pour le moment — choisissez des sources ci-dessus et cliquez sur « Construire le graphe ».",
+  "KnowledgeGraphExplorer.evidenceHeading": "Preuves",
+  "KnowledgeGraphExplorer.evidenceEmpty": "Posez une question de relation ci-dessus pour voir ici le chemin et les preuves sources associées.",
+  "KnowledgeGraphExplorer.noEvidence": "Aucune preuve n'a été enregistrée pour ce chemin.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

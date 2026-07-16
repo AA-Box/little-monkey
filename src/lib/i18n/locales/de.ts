@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const de: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "Wissensgraph-Explorer",
+  "KnowledgeGraphExplorer.title": "Wissensgraph-Explorer",
+  "KnowledgeGraphExplorer.subtitle": "Erstellt einen Entitäts-/Beziehungsgraphen aus Ihren Wissens-Stacks und dem aktuellen Chat und beantwortet dann „Wie hängt X mit Y zusammen?“ mit den zugrunde liegenden Quellenbelegen.",
+  "KnowledgeGraphExplorer.close": "Wissensgraph-Explorer schließen",
+  "KnowledgeGraphExplorer.sourcesLabel": "Quellen:",
+  "KnowledgeGraphExplorer.noStacks": "Noch keine Wissens-Stacks — fügen Sie einen in den Einstellungen hinzu oder erstellen Sie den Graphen unten aus dem aktuellen Chat.",
+  "KnowledgeGraphExplorer.includeSession": "Aktuellen Chat einbeziehen ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "Graph erstellen",
+  "KnowledgeGraphExplorer.partialBuildHeading": "Einige Quellen konnten in diesen Build nicht einbezogen werden:",
+  "KnowledgeGraphExplorer.queryLabel": "Eine Beziehungsfrage stellen",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Wie hängt Alice mit auth.ts zusammen?",
+  "KnowledgeGraphExplorer.askButton": "Fragen",
+  "KnowledgeGraphExplorer.emptyGraph": "Noch kein Graph — wählen Sie oben Quellen aus und klicken Sie auf „Graph erstellen“.",
+  "KnowledgeGraphExplorer.evidenceHeading": "Belege",
+  "KnowledgeGraphExplorer.evidenceEmpty": "Stellen Sie oben eine Beziehungsfrage, um hier den Pfad und die zugehörigen Quellenbelege zu sehen.",
+  "KnowledgeGraphExplorer.noEvidence": "Für diesen Pfad wurden keine Belegstellen erfasst.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",
