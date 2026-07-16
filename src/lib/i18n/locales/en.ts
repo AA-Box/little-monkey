@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
 import { inboxLocale } from "./inbox";
+import { redTeamLabLocale } from "./redTeamLab";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const en: Record<string, string> = {
   ...ecosystemLocale,
   ...developerLocale,
   ...inboxLocale,
+  ...redTeamLabLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
