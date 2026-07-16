@@ -177,6 +177,12 @@ pub mod automations;
 // GitHub issue and carrying it through a reviewable owned-branch/PR loop on
 // top of the `m5_delivery` GitHub/worktree primitives.
 pub mod issue_to_pr;
+// Human Approval Chains (ROADMAP.md Phase 3): multi-step approval workflows
+// (a sequence of stages, each with its own timeout/escalation) layered on top
+// of `permissions.rs`'s existing single-shot request/response system. A new,
+// independent state machine — see the module doc for why it isn't an
+// extension of `PermissionState`.
+pub mod approval_chains;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -362,6 +368,10 @@ pub struct AppState {
     pub index_cancels: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
     >,
+    /// In-flight Human Approval Chain stages (ROADMAP.md, Phase 3) — see
+    /// `approval_chains.rs`'s module doc. A separate state machine from
+    /// `permissions` above, not an extension of it.
+    pub approval_chains: approval_chains::ApprovalChainState,
 }
 
 impl Default for AppState {
@@ -391,6 +401,7 @@ impl Default for AppState {
             run_ledger: Default::default(),
             stack_cache: Default::default(),
             index_cancels: Default::default(),
+            approval_chains: Default::default(),
         }
     }
 }
@@ -908,6 +919,11 @@ pub fn run() {
             issue_to_pr::issue_to_pr_cancel,
             issue_to_pr::issue_to_pr_advance,
             issue_to_pr::issue_to_pr_run_checks,
+            approval_chains::approval_chains_list_templates,
+            approval_chains::approval_chains_start,
+            approval_chains::approval_chain_respond,
+            approval_chains::approval_chains_get,
+            approval_chains::approval_chains_history,
             m7_companion::m7_overlay_show,
             m7_companion::m7_overlay_hide,
             m7_companion::m7_overlay_submit,

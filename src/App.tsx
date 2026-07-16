@@ -17,7 +17,7 @@ import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore } from "./store/sideTaskStore";
-import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
+import { ArtifactPane, FileTree, DiffViewer, PermissionModal, ApprovalChainModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
@@ -555,6 +555,7 @@ function App() {
       </aside>
 
       <PermissionModal />
+      <ApprovalChainModal />
       <SettingsModal
         open={settingsOpen}
         onClose={() => {

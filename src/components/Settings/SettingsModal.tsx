@@ -12,6 +12,7 @@ import {
   GitPullRequest,
   Inbox,
   ListChecks,
+  ListOrdered,
   MessageSquare,
   MonitorCheck,
   Palette,
@@ -49,6 +50,7 @@ import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
 import { TriagePanel } from "../Triage/TriagePanel";
+import { ApprovalChainsPanel } from "./ApprovalChainsPanel";
 import { CompanionPanel } from "./CompanionPanel";
 import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
 import { AppearancePanel } from "./AppearancePanel";
@@ -69,7 +71,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance" | "triage";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance" | "triage" | "approvalchains";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -95,10 +97,11 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   security: ShieldCheck,
   appearance: Palette,
   triage: Inbox,
+  approvalchains: ListOrdered,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
-  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "companion", "shortcuts", "usage", "portability"] },
+  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "approvalchains", "companion", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "mcp", "connectors", "prompts", "apiserver"] },
@@ -128,6 +131,7 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   security: "SettingsModal.tabSecurityDoctor",
   appearance: "SettingsModal.tabAppearance",
   triage: "SettingsModal.tabTriage",
+  approvalchains: "SettingsModal.tabApprovalChains",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -358,6 +362,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "browser" && <BrowserVerificationPanel />}
               {tab === "gitdelivery" && <GitDeliveryPanel />}
               {tab === "triage" && <TriagePanel />}
+              {tab === "approvalchains" && <ApprovalChainsPanel />}
               {tab === "background" && <BackgroundAgentsPanel />}
               {tab === "companion" && <CompanionPanel />}
               {tab === "security" && <SecurityDoctorPanel />}
