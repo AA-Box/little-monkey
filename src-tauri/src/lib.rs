@@ -168,6 +168,10 @@ mod run_commands;
 // subcommand exists yet (it emits a launchd/crontab line, no in-process
 // scheduling), but there's no reason to make this one module-private either.
 pub mod automations;
+// Issue-to-PR Agent Flow (ROADMAP.md Phase 3): orchestrates picking up a
+// GitHub issue and carrying it through a reviewable owned-branch/PR loop on
+// top of the `m5_delivery` GitHub/worktree primitives.
+pub mod issue_to_pr;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -876,6 +880,12 @@ pub fn run() {
             m5_delivery::m5_github_checks,
             m5_delivery::m5_review_pull_request,
             m5_delivery::m5_review_reports,
+            issue_to_pr::issue_to_pr_start,
+            issue_to_pr::issue_to_pr_status,
+            issue_to_pr::issue_to_pr_list,
+            issue_to_pr::issue_to_pr_cancel,
+            issue_to_pr::issue_to_pr_advance,
+            issue_to_pr::issue_to_pr_run_checks,
             m7_companion::m7_overlay_show,
             m7_companion::m7_overlay_hide,
             m7_companion::m7_overlay_submit,

@@ -8,6 +8,7 @@ import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
+import { IssueToPrPanel } from "./components/IssueToPr";
 import { GlobalSearch } from "./components/Search";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
@@ -95,6 +96,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [runCenterOpen, setRunCenterOpen] = useState(false);
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
+  const [issueToPrOpen, setIssueToPrOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
@@ -112,6 +114,7 @@ function App() {
   const openSettingsTab = useCallback((tab: SettingsTab) => {
     setRunCenterOpen(false);
     setBrowserWorkbenchOpen(false);
+    setIssueToPrOpen(false);
     setGlobalSearchOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
@@ -316,12 +319,14 @@ function App() {
           onOpenSettings={() => {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
             setSettingsOpen(false);
             setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
@@ -330,15 +335,25 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
           onOpenBrowserWorkbench={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
+            setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
+          }}
+          onOpenIssueToPr={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setSettingsInitialTab(undefined);
+            setIssueToPrOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
         />
@@ -362,7 +377,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : runCenterOpen ? "run-center" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -374,6 +389,15 @@ function App() {
             />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
+          ) : issueToPrOpen ? (
+            <IssueToPrPanel
+              onClose={() => setIssueToPrOpen(false)}
+              onOpenRunCapsule={(runId) => {
+                setIssueToPrOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
@@ -402,7 +426,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !runCenterOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
