@@ -6,6 +6,7 @@ import {
   ChevronsUpDown,
   Globe,
   HelpCircle,
+  ListTodo,
   Inbox,
   Search,
   Settings as SettingsIcon,
@@ -22,6 +23,7 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
 }
@@ -56,6 +58,7 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
 }: AppMenuProps) {
@@ -132,6 +135,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<ListTodo size={14} className="text-faint" />}
+            label={t("AppMenu.sideTasks")}
+            onClick={() => {
+              closeAll();
+              onOpenSideTasks();
             }}
           />
           <MenuRow

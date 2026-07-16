@@ -80,6 +80,11 @@ export interface MessageListProps {
    * render only their branch suffix, but artifact/checkpoint actions still
    * need indices into the full persisted transcript. */
   messageIndexOffset?: number;
+  /** Threaded straight through to every `MessageBubble` — see that
+   * component's own `onStartSideTask` doc comment. Omitted entirely hides
+   * the affordance (e.g. inside a subagent's own mini-transcript, which
+   * never renders through this list at all). */
+  onStartSideTask?: (index: number) => void;
 }
 
 type TimelineItem =
@@ -807,6 +812,7 @@ export default function MessageList({
   editingDisabled,
   onRetry,
   messageIndexOffset = 0,
+  onStartSideTask,
 }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -856,6 +862,7 @@ export default function MessageList({
                   editDisabled={editingDisabled}
                   translations={messageTranslations}
                   preferredTranslationLocale={preferredTranslationLocale}
+                  onStartSideTask={onStartSideTask}
                 />
               );
             }
