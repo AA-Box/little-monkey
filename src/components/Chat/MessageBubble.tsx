@@ -1,7 +1,7 @@
 import { Children, isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { Eye, Languages, LoaderCircle, Pencil, X } from "lucide-react";
+import { Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
@@ -36,6 +36,13 @@ export interface MessageBubbleProps {
   onEditMessage?: (index: number, newText: string) => void;
   /** Disables the edit affordance while a turn is in flight. */
   editDisabled?: boolean;
+  /** Present to show a "Start side task" hover action on both user and
+   * assistant bubbles (ROADMAP.md's "Side Tasks" acceptance: start a side
+   * task "from selected chat context") — omitted entirely hides the
+   * affordance, same convention as `onEditMessage`. Called with this
+   * message's own transcript `index`; the handler (`ChatWindow.tsx`) reads
+   * the message back out to build the side task's seed. */
+  onStartSideTask?: (index: number) => void;
   /** Original-preserving translations already saved for this message. */
   translations?: readonly MessageTranslation[];
   /** Thread-level locale preference. Individual controls can still switch
@@ -176,12 +183,14 @@ function UserBubble({
   editDisabled,
   displayText,
   translationControls,
+  onStartSideTask,
 }: {
   content: string | ChatContentPart[];
   onEdit?: (newText: string) => void;
   editDisabled?: boolean;
   displayText?: string;
   translationControls?: ReactNode;
+  onStartSideTask?: () => void;
 }) {
   // Editing only ever operates on the text portion — an edited-and-resubmitted
   // message doesn't carry its original image attachment forward (matches
@@ -252,9 +261,20 @@ function UserBubble({
   return (
     <div className="group flex justify-end">
       <div className="flex max-w-[75%] items-start gap-1.5">
-        {(translationControls || onEdit) && (
+        {(translationControls || onEdit || onStartSideTask) && (
           <div className="mt-1.5 flex shrink-0 items-center gap-0.5">
             {translationControls}
+            {onStartSideTask && (
+              <button
+                type="button"
+                onClick={onStartSideTask}
+                aria-label="Start side task from this message"
+                title="Start side task from this message"
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+              >
+                <Split size={13} />
+              </button>
+            )}
             {onEdit && (
               <button
                 type="button"
@@ -293,17 +313,32 @@ function AssistantMessage({
   sessionId,
   index,
   translationControls,
+  onStartSideTask,
 }: {
   content: string;
   sessionId: string;
   index: number;
   translationControls?: ReactNode;
+  onStartSideTask?: () => void;
 }) {
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
     <div className="group relative w-full min-w-0">
-      <div className="mb-1.5 text-xs font-medium text-muted">{t("MessageBubble.assistantName")}</div>
+      <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted">
+        {t("MessageBubble.assistantName")}
+        {onStartSideTask && (
+          <button
+            type="button"
+            onClick={onStartSideTask}
+            aria-label="Start side task from this message"
+            title="Start side task from this message"
+            className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+          >
+            <Split size={12} />
+          </button>
+        )}
+      </div>
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
@@ -515,6 +550,7 @@ function MessageBubble({
   editDisabled,
   translations = [],
   preferredTranslationLocale = null,
+  onStartSideTask,
 }: MessageBubbleProps) {
   const [displayedTranslation, setDisplayedTranslation] = useState<MessageTranslation | null>(null);
   const controls = textContent(message.content).trim() ? (
@@ -529,6 +565,7 @@ function MessageBubble({
       align={message.role === "user" ? "end" : "start"}
     />
   ) : null;
+  const startSideTask = onStartSideTask ? () => onStartSideTask(index) : undefined;
   if (message.role === "user") {
     return (
       <UserBubble
@@ -537,6 +574,7 @@ function MessageBubble({
         translationControls={controls}
         onEdit={onEditMessage ? (text) => onEditMessage(index, text) : undefined}
         editDisabled={editDisabled}
+        onStartSideTask={startSideTask}
       />
     );
   }
@@ -548,6 +586,7 @@ function MessageBubble({
         sessionId={sessionId}
         index={index}
         translationControls={controls}
+        onStartSideTask={startSideTask}
       />
     );
   }
