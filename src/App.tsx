@@ -13,6 +13,7 @@ import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { BriefStudioPanel } from "./components/BriefStudio";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
@@ -104,6 +105,7 @@ function App() {
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [briefStudioOpen, setBriefStudioOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -124,6 +126,7 @@ function App() {
     setGlobalSearchOpen(false);
     setAgentInboxOpen(false);
     setDailyBriefOpen(false);
+    setBriefStudioOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -168,6 +171,7 @@ function App() {
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setDailyBriefOpen(false);
+          setBriefStudioOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -178,6 +182,7 @@ function App() {
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setDailyBriefOpen(false);
+          setBriefStudioOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -335,6 +340,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setBriefStudioOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -344,6 +350,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setBriefStudioOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -354,6 +361,7 @@ function App() {
             setIssueToPrOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setBriefStudioOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -364,6 +372,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setBriefStudioOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -374,6 +383,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setBriefStudioOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
@@ -384,6 +394,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setDailyBriefOpen(false);
+            setBriefStudioOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
           }}
@@ -394,8 +405,20 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
+            setBriefStudioOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenBriefStudio={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setBriefStudioOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
@@ -420,7 +443,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : briefStudioOpen ? "brief-studio" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -453,6 +476,8 @@ function App() {
               }}
               onOpenSettingsTab={openSettingsTab}
             />
+          ) : briefStudioOpen ? (
+            <BriefStudioPanel onClose={() => setBriefStudioOpen(false)} />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : issueToPrOpen ? (
@@ -492,7 +517,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !briefStudioOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

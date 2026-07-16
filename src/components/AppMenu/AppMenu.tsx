@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  BookOpenText,
   Check,
   ChevronRight,
   ChevronsUpDown,
@@ -30,6 +31,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDailyBrief: () => void;
+  onOpenBriefStudio: () => void;
 }
 
 interface MenuRowProps {
@@ -67,6 +69,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDailyBrief,
+  onOpenBriefStudio,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -165,6 +168,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<BookOpenText size={14} className="text-faint" />}
+            label={t("AppMenu.briefStudio")}
+            onClick={() => {
+              closeAll();
+              onOpenBriefStudio();
             }}
           />
           <MenuRow
