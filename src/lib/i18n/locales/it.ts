@@ -6,7 +6,6 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
-import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -93,7 +92,6 @@ export const it: Record<string, string> = {
   "Onboarding.finishBody": "Questo è tutto ciò che copre questa procedura guidata. Ogni scelta fatta è modificabile in seguito dalle Impostazioni, e questa procedura guidata è sempre a un clic di distanza dalla voce \"Riavvia la configurazione iniziale\" nel menu dell'app.",
   "Onboarding.finishTemplateSummary": "Il tuo contenuto iniziale \"{{template}}\" è pronto da vedere in Prompt (e in Automazione, se è stata creata una ricetta).",
   "Onboarding.finishReopenHint": "Riapri questa procedura guidata in qualsiasi momento dalla voce \"Riavvia la configurazione iniziale\" nel menu dell'app.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "Verifica di quanto questo issue sia pronto per un agente…",

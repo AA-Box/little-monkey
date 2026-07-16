@@ -6,7 +6,6 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
-import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -93,7 +92,6 @@ export const ko: Record<string, string> = {
   "Onboarding.finishBody": "이 마법사가 다루는 내용은 여기까지입니다. 여기서 한 모든 선택은 나중에 설정에서 편집할 수 있으며, 이 마법사는 앱 메뉴의 \"온보딩 다시 시작\" 항목을 통해 언제든지 클릭 한 번으로 다시 열 수 있습니다.",
   "Onboarding.finishTemplateSummary": "\"{{template}}\" 시작 콘텐츠는 프롬프트에서 확인할 수 있습니다(레시피가 생성된 경우 자동화에서도 확인할 수 있습니다).",
   "Onboarding.finishReopenHint": "앱 메뉴의 \"온보딩 다시 시작\" 항목을 통해 언제든지 이 마법사를 다시 열 수 있습니다.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "이 이슈가 에이전트에게 얼마나 준비되어 있는지 확인하는 중…",
