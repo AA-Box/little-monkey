@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const id: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "Penjelajah Grafik Pengetahuan",
+  "KnowledgeGraphExplorer.title": "Penjelajah Grafik Pengetahuan",
+  "KnowledgeGraphExplorer.subtitle": "Membangun grafik entitas/hubungan dari stack pengetahuan Anda dan obrolan saat ini, lalu menjawab \"bagaimana X terkait dengan Y?\" beserta bukti sumbernya.",
+  "KnowledgeGraphExplorer.close": "Tutup Penjelajah Grafik Pengetahuan",
+  "KnowledgeGraphExplorer.sourcesLabel": "Sumber:",
+  "KnowledgeGraphExplorer.noStacks": "Belum ada stack pengetahuan — tambahkan satu di Pengaturan, atau bangun dari obrolan saat ini di bawah.",
+  "KnowledgeGraphExplorer.includeSession": "Sertakan obrolan saat ini ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "Bangun grafik",
+  "KnowledgeGraphExplorer.partialBuildHeading": "Beberapa sumber tidak dapat disertakan dalam pembuatan ini:",
+  "KnowledgeGraphExplorer.queryLabel": "Ajukan pertanyaan hubungan",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Bagaimana Alice terkait dengan auth.ts?",
+  "KnowledgeGraphExplorer.askButton": "Tanya",
+  "KnowledgeGraphExplorer.emptyGraph": "Belum ada grafik — pilih sumber di atas dan klik \"Bangun grafik\".",
+  "KnowledgeGraphExplorer.evidenceHeading": "Bukti",
+  "KnowledgeGraphExplorer.evidenceEmpty": "Ajukan pertanyaan hubungan di atas untuk melihat jalur dan bukti sumbernya di sini.",
+  "KnowledgeGraphExplorer.noEvidence": "Tidak ada bagian bukti yang tercatat untuk jalur ini.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

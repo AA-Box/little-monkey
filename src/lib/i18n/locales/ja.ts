@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const ja: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "ナレッジグラフ・エクスプローラー",
+  "KnowledgeGraphExplorer.title": "ナレッジグラフ・エクスプローラー",
+  "KnowledgeGraphExplorer.subtitle": "ナレッジスタックと現在のチャットからエンティティ・関係グラフを構築し、「XはYとどう関連していますか?」という質問に、その根拠となるソースの証拠とともに回答します。",
+  "KnowledgeGraphExplorer.close": "ナレッジグラフ・エクスプローラーを閉じる",
+  "KnowledgeGraphExplorer.sourcesLabel": "ソース:",
+  "KnowledgeGraphExplorer.noStacks": "ナレッジスタックがまだありません — 設定で追加するか、下の現在のチャットからグラフを構築してください。",
+  "KnowledgeGraphExplorer.includeSession": "現在のチャットを含める ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "グラフを構築",
+  "KnowledgeGraphExplorer.partialBuildHeading": "一部のソースは今回のビルドに含めることができませんでした:",
+  "KnowledgeGraphExplorer.queryLabel": "関係についての質問をする",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Aliceはauth.tsとどう関連していますか?",
+  "KnowledgeGraphExplorer.askButton": "質問する",
+  "KnowledgeGraphExplorer.emptyGraph": "まだグラフがありません — 上でソースを選び、「グラフを構築」をクリックしてください。",
+  "KnowledgeGraphExplorer.evidenceHeading": "証拠",
+  "KnowledgeGraphExplorer.evidenceEmpty": "上で関係についての質問をすると、ここにパスとその根拠となるソースの証拠が表示されます。",
+  "KnowledgeGraphExplorer.noEvidence": "このパスに記録された証拠スパンはありません。",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

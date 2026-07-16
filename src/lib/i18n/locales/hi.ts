@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,24 @@ export const hi: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "नॉलेज ग्राफ़ एक्सप्लोरर",
+  "KnowledgeGraphExplorer.title": "नॉलेज ग्राफ़ एक्सप्लोरर",
+  "KnowledgeGraphExplorer.subtitle": "आपके नॉलेज स्टैक्स और मौजूदा चैट से एक इकाई/संबंध ग्राफ़ बनाता है, फिर \"X, Y से कैसे संबंधित है?\" का उत्तर उसके पीछे के स्रोत प्रमाण के साथ देता है।",
+  "KnowledgeGraphExplorer.close": "नॉलेज ग्राफ़ एक्सप्लोरर बंद करें",
+  "KnowledgeGraphExplorer.sourcesLabel": "स्रोत:",
+  "KnowledgeGraphExplorer.noStacks": "अभी तक कोई नॉलेज स्टैक नहीं है — सेटिंग्स में एक जोड़ें, या नीचे मौजूदा चैट से ग्राफ़ बनाएं।",
+  "KnowledgeGraphExplorer.includeSession": "मौजूदा चैट शामिल करें ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "ग्राफ़ बनाएं",
+  "KnowledgeGraphExplorer.partialBuildHeading": "कुछ स्रोत इस बिल्ड में शामिल नहीं किए जा सके:",
+  "KnowledgeGraphExplorer.queryLabel": "एक संबंध प्रश्न पूछें",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Alice, auth.ts से कैसे संबंधित है?",
+  "KnowledgeGraphExplorer.askButton": "पूछें",
+  "KnowledgeGraphExplorer.emptyGraph": "अभी तक कोई ग्राफ़ नहीं है — ऊपर स्रोत चुनें और \"ग्राफ़ बनाएं\" पर क्लिक करें।",
+  "KnowledgeGraphExplorer.evidenceHeading": "प्रमाण",
+  "KnowledgeGraphExplorer.evidenceEmpty": "यहां पथ और उसके स्रोत प्रमाण देखने के लिए ऊपर एक संबंध प्रश्न पूछें।",
+  "KnowledgeGraphExplorer.noEvidence": "इस पथ के लिए कोई प्रमाण अंश दर्ज नहीं किया गया।",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

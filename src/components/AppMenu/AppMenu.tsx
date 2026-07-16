@@ -8,6 +8,7 @@ import {
   HelpCircle,
   ListTodo,
   Inbox,
+  Network,
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
@@ -25,6 +26,7 @@ interface AppMenuProps {
   onOpenBrowserWorkbench: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
+  onOpenKnowledgeGraph: () => void;
   onOpenTerminal: () => void;
 }
 
@@ -60,6 +62,7 @@ export function AppMenu({
   onOpenBrowserWorkbench,
   onOpenSideTasks,
   onOpenAgentInbox,
+  onOpenKnowledgeGraph,
   onOpenTerminal,
 }: AppMenuProps) {
   const { t } = useT();
@@ -143,6 +146,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.knowledgeGraphExplorer")}
+            onClick={() => {
+              closeAll();
+              onOpenKnowledgeGraph();
             }}
           />
           <MenuRow
