@@ -9,11 +9,14 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
 import { IssueToPrPanel } from "./components/IssueToPr";
+import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
+import { AgentInbox } from "./components/Inbox";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { useRunStore } from "./store/runStore";
+import { useSideTaskStore } from "./store/sideTaskStore";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
@@ -98,6 +101,7 @@ function App() {
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [issueToPrOpen, setIssueToPrOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -116,6 +120,7 @@ function App() {
     setBrowserWorkbenchOpen(false);
     setIssueToPrOpen(false);
     setGlobalSearchOpen(false);
+    setAgentInboxOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -158,6 +163,7 @@ function App() {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
           setGlobalSearchOpen(false);
+          setAgentInboxOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -166,6 +172,7 @@ function App() {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
           setGlobalSearchOpen(false);
+          setAgentInboxOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -321,6 +328,7 @@ function App() {
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -328,6 +336,7 @@ function App() {
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -336,6 +345,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -344,6 +354,7 @@ function App() {
             setRunCenterOpen(false);
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -352,10 +363,21 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
+          onOpenAgentInbox={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setIssueToPrOpen(false);
+            setSettingsInitialTab(undefined);
+            setAgentInboxOpen(true);
+          }}
           onOpenTerminal={() => setTerminalOpen(true)}
+          onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
         />
       </aside>
 
@@ -377,12 +399,21 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
               onOpenRun={(runId) => {
                 setGlobalSearchOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
+          ) : agentInboxOpen ? (
+            <AgentInbox
+              onClose={() => setAgentInboxOpen(false)}
+              onOpenRunCenter={(runId) => {
+                setAgentInboxOpen(false);
                 setRunCenterOpen(true);
                 void useRunStore.getState().selectRun(runId);
               }}
@@ -426,7 +457,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
@@ -449,6 +480,14 @@ function App() {
           </ErrorBoundary>
         </div>
       )}
+
+      {/* Side Tasks: a collapsible panel that coexists with whatever the
+          main pane is showing (unlike RunCenter/BrowserWorkbench, which
+          replace it) — ROADMAP.md's "Side Tasks" item asks for parallel work
+          that stays visible next to the main chat, not a full-screen swap.
+          Keyed by the active session so a manually-started ("+ New") task is
+          attributed to whichever chat is actually on screen. */}
+      <SideTaskDrawer sessionId={activeSessionId} />
 
       {/* Right: collapsible workspace panel (file tree + diff preview),
           also extending to the top of the window */}

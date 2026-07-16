@@ -7,6 +7,8 @@ import {
   GitPullRequest,
   Globe,
   HelpCircle,
+  ListTodo,
+  Inbox,
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
@@ -23,6 +25,8 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenSideTasks: () => void;
+  onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
 }
 
@@ -51,7 +55,16 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenIssueToPr, onOpenTerminal }: AppMenuProps) {
+export function AppMenu({
+  onOpenSettings,
+  onOpenRunCenter,
+  onOpenGlobalSearch,
+  onOpenBrowserWorkbench,
+  onOpenIssueToPr,
+  onOpenSideTasks,
+  onOpenAgentInbox,
+  onOpenTerminal,
+}: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -104,6 +117,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             }}
           />
           <MenuRow
+            icon={<Inbox size={14} className="text-faint" />}
+            label={t("AppMenu.agentInbox")}
+            onClick={() => {
+              closeAll();
+              onOpenAgentInbox();
+            }}
+          />
+          <MenuRow
             icon={<Activity size={14} className="text-faint" />}
             label={t("AppMenu.runCenter")}
             onClick={() => {
@@ -125,6 +146,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ListTodo size={14} className="text-faint" />}
+            label={t("AppMenu.sideTasks")}
+            onClick={() => {
+              closeAll();
+              onOpenSideTasks();
             }}
           />
           <MenuRow
