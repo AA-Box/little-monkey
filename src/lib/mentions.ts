@@ -21,6 +21,9 @@ export interface ResolvedTextReference {
   isDir: boolean;
   /** File content (isDir false) or a newline-joined directory listing (isDir true). */
   content: string;
+  /** Inline terminal evidence is still untrusted context, but it is not a
+   * workspace file and should be labeled accurately in the model payload. */
+  source?: 'workspace' | 'terminal';
 }
 
 /** Shape returned per-entry by the Rust `tool_list_dir` command. */
@@ -81,10 +84,18 @@ export function truncateMentionContent(content: string): string {
  */
 export function composeReferencedText(userText: string, textRefs: ResolvedTextReference[]): string {
   if (textRefs.length === 0) return userText;
-  const sections = textRefs.map(({ path, isDir, content }) => {
+  const sections = textRefs.map(({ path, isDir, content, source }) => {
     const bounded = isDir ? content : truncateMentionContent(content);
     const rendered = isDir ? bounded : `\`\`\`\n${bounded}\n\`\`\``;
-    return `### ${path}\n${wrapUntrustedContent(isDir ? `workspace directory ${path}` : `workspace file ${path}`, rendered)}`;
+    const sourceDescription = source === 'terminal'
+      ? `terminal evidence ${path}`
+      : isDir
+        ? `workspace directory ${path}`
+        : `workspace file ${path}`;
+    return `### ${path}\n${wrapUntrustedContent(sourceDescription, rendered)}`;
   });
-  return `Referenced files:\n\n${sections.join('\n\n')}\n\n---\n\n${userText}`;
+  const heading = textRefs.some((reference) => reference.source === 'terminal')
+    ? 'Referenced context:'
+    : 'Referenced files:';
+  return `${heading}\n\n${sections.join('\n\n')}\n\n---\n\n${userText}`;
 }
