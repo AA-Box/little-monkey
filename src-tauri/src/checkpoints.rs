@@ -58,7 +58,7 @@ const MAX_CHECKPOINTS: usize = 20;
 const MANIFEST_FILE: &str = "manifest.json";
 
 /// Current on-disk manifest schema version — see [`CheckpointManifest`].
-const MANIFEST_VERSION: u8 = 2;
+const MANIFEST_VERSION: u8 = 3;
 
 /// One file recorded in a checkpoint.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -78,6 +78,22 @@ pub struct CheckpointEntry {
     /// hence `serde(default)` for read-compatibility.
     #[serde(default)]
     pub redo: Option<String>,
+    /// Backup file name inside `<dir>/after/`, snapshotting this file's
+    /// post-turn content — written by `end_impl` right after the turn's own
+    /// mutations finish, BEFORE anything else can touch the file (unlike
+    /// `redo`, which is only captured later, at whatever moment `revert_impl`
+    /// eventually runs, and can therefore reflect *other* turns' edits made
+    /// in between). This is what makes checkpoint preview/compare possible
+    /// without restoring anything: the true "before -> after" diff for a
+    /// turn is knowable immediately, never just at revert time. `None` if
+    /// the file no longer existed when the turn ended (deleted by e.g. a
+    /// shell command during the same turn) or the snapshot copy failed
+    /// (best-effort, mirrors `redo`). Absent from manifests written before
+    /// this field existed (v1/v2), hence `serde(default)` for
+    /// read-compatibility — see [`preview_impl`]'s fallback chain for how
+    /// those older checkpoints still get a (less certain) preview.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// The versioned on-disk `manifest.json` (v2). v1 manifests were a bare
@@ -405,6 +421,7 @@ pub fn record_original(state: &AppState, id: Option<&str>, resolved: &Path) -> R
         path: path_str,
         backup,
         redo: None,
+        after: None,
     });
     Ok(())
 }
@@ -485,6 +502,11 @@ fn write_manifest(dir: &Path, manifest: &CheckpointManifest) -> Result<(), Strin
     Ok(())
 }
 
+/// Subdirectory (inside a checkpoint's own dir) holding "after" backups —
+/// see [`CheckpointEntry::after`]'s doc comment for why this is captured
+/// here, at turn-end, rather than only ever at revert time like `redo/`.
+const AFTER_DIR: &str = "after";
+
 /// Core end logic: close checkpoint `id`, persist its manifest (or discard
 /// the empty directory), and report what was touched plus the metadata the
 /// frontend embeds in the transcript's checkpoint notice.
@@ -516,6 +538,24 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         });
     }
 
+    // Snapshot each touched file's post-turn ("after") content now, while
+    // it's still guaranteed to be exactly what this turn produced — see
+    // `CheckpointEntry::after`'s doc comment. Best-effort, like `redo`: a
+    // copy failure just leaves `after: None` for that entry rather than
+    // failing the whole `checkpoint_end` call, since this is purely an
+    // enrichment for later preview/compare, not something revert depends on.
+    let mut entries = active.entries.clone();
+    let after_dir = active.dir.join(AFTER_DIR);
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let target = Path::new(&entry.path);
+        if target.is_file() && std::fs::create_dir_all(&after_dir).is_ok() {
+            let after_name = format!("{}.bak", i);
+            if std::fs::copy(target, after_dir.join(&after_name)).is_ok() {
+                entry.after = Some(after_name);
+            }
+        }
+    }
+
     let manifest = CheckpointManifest {
         version: MANIFEST_VERSION,
         created_at_ms: active.created_at_ms,
@@ -525,13 +565,13 @@ pub fn end_impl(state: &AppState, id: &str) -> Result<CheckpointSummary, String>
         shell_ran: active.shell_ran,
         reverted: false,
         prev_id: active.prev_id,
-        entries: active.entries.clone(),
+        entries: entries.clone(),
     };
     write_manifest(&active.dir, &manifest)?;
 
     Ok(CheckpointSummary {
         id: id.to_string(),
-        files: active.entries.iter().map(|e| e.path.clone()).collect(),
+        files: entries.iter().map(|e| e.path.clone()).collect(),
         anchor_index: active.anchor_index,
         label: active.label,
         shell_ran: active.shell_ran,
@@ -681,6 +721,553 @@ pub fn reapply_impl(base_dir: &Path, id: &str) -> Result<u32, String> {
     }
 
     Ok(reapplied)
+}
+
+// ---------------------------------------------------------------------------
+// Preview, compare, and rollback-simulation — read-only layers built on top
+// of the revert/reapply mechanism above (Checkpoint Preview and State-Aware
+// Rollback, ROADMAP.md Phase 1). None of what follows mutates a checkpoint's
+// manifest, its backup files, or the live workspace; it only reads what
+// `record_original`/`end_impl`/`revert_impl` already captured.
+// ---------------------------------------------------------------------------
+
+/// One line in a computed diff, tagged with how it differs between "before"
+/// and "after".
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
+/// A computed line-level diff between two texts. `truncated` is set (with
+/// `lines` left empty) when the inputs are too large to diff cheaply — see
+/// [`diff_lines`]'s size guard — so callers can show "diff too large to
+/// display" instead of hanging or an incomplete render.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffResult {
+    pub lines: Vec<DiffLine>,
+    pub truncated: bool,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Upper bound on `before_lines.len() * after_lines.len()` before
+/// [`diff_lines`] gives up and reports `truncated: true` instead of running
+/// its O(n*m) LCS table — a large enough file pair (e.g. two ~2000-line
+/// files) would otherwise allocate tens of megabytes and spend real time on
+/// a diff nobody asked for eagerly (this runs synchronously on a
+/// `#[tauri::command]` call, not in the background).
+const MAX_DIFF_CELLS: usize = 4_000_000;
+
+/// Files larger than this (either side) skip line-splitting and diffing
+/// entirely — a binary-adjacent or generated file can be well under
+/// [`MAX_DIFF_CELLS`] in line count while still being multiple megabytes of
+/// single-line content (e.g. minified JS, a lockfile with one huge line).
+const MAX_DIFF_BYTES: usize = 2_000_000;
+
+/// Computes a line-level diff between `before` and `after` via the standard
+/// LCS (longest common subsequence) dynamic-programming table, then
+/// backtracks it into a sequence of context/added/removed lines. Pure and
+/// deterministic — no filesystem access — so it's directly unit-testable.
+pub fn diff_lines(before: &str, after: &str) -> DiffResult {
+    let before_lines: Vec<&str> = if before.is_empty() { Vec::new() } else { before.split('\n').collect() };
+    let after_lines: Vec<&str> = if after.is_empty() { Vec::new() } else { after.split('\n').collect() };
+
+    let n = before_lines.len();
+    let m = after_lines.len();
+
+    if n.saturating_mul(m) > MAX_DIFF_CELLS {
+        return DiffResult { lines: Vec::new(), truncated: true, added: 0, removed: 0 };
+    }
+
+    // lcs[i][j] = length of the longest common subsequence of
+    // before_lines[i..] and after_lines[j..].
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if before_lines[i] == after_lines[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if before_lines[i] == after_lines[j] {
+            lines.push(DiffLine { kind: DiffLineKind::Context, text: before_lines[i].to_string() });
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            lines.push(DiffLine { kind: DiffLineKind::Removed, text: before_lines[i].to_string() });
+            removed += 1;
+            i += 1;
+        } else {
+            lines.push(DiffLine { kind: DiffLineKind::Added, text: after_lines[j].to_string() });
+            added += 1;
+            j += 1;
+        }
+    }
+    while i < n {
+        lines.push(DiffLine { kind: DiffLineKind::Removed, text: before_lines[i].to_string() });
+        removed += 1;
+        i += 1;
+    }
+    while j < m {
+        lines.push(DiffLine { kind: DiffLineKind::Added, text: after_lines[j].to_string() });
+        added += 1;
+        j += 1;
+    }
+
+    DiffResult { lines, truncated: false, added, removed }
+}
+
+/// Where a [`FilePreviewEntry`]'s "after" content came from — callers use
+/// this to decide how much to trust it (see [`CheckpointEntry::after`]'s doc
+/// comment for the full reasoning).
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SnapshotSource {
+    /// Captured at `checkpoint_end`, immediately after the turn's own
+    /// mutations — exact, unaffected by anything that happened later.
+    Captured,
+    /// Captured at revert time (`redo/`) — also exact, just captured later;
+    /// only used as a fallback for pre-v3 manifests reverted before this
+    /// feature existed.
+    Redo,
+    /// No stored snapshot exists; fell back to reading the CURRENT live
+    /// workspace file. Exact only if nothing has touched this path since the
+    /// turn ended — a best-effort fallback for pre-v3 manifests that were
+    /// never reverted.
+    Live,
+    /// No content available from any source.
+    Unavailable,
+}
+
+/// What kind of change (if any) a checkpoint made to one file, as far as the
+/// available snapshots can determine.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChangeStatus {
+    Added,
+    Modified,
+    Deleted,
+    Unchanged,
+    /// The before/after state can't be fully determined (always a pre-v3
+    /// manifest whose `after` was never captured, combined with no usable
+    /// `redo`/live fallback either) — surfaced honestly rather than guessed.
+    Unknown,
+}
+
+/// One file's preview within a checkpoint: what changed, how certain the
+/// "after" side is, and (when computable) the actual diff.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePreviewEntry {
+    pub path: String,
+    pub status: FileChangeStatus,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+    pub after_source: SnapshotSource,
+    pub binary: bool,
+    pub diff: Option<DiffResult>,
+}
+
+/// Reads checkpoint entry `entry`'s pre-turn ("before") content, if any.
+fn read_before(dir: &Path, entry: &CheckpointEntry) -> Option<Vec<u8>> {
+    entry.backup.as_ref().and_then(|name| std::fs::read(dir.join(name)).ok())
+}
+
+/// Manifest schema version from which `end_impl` always attempts an "after"
+/// snapshot for every entry (see [`CheckpointEntry::after`]). Below this
+/// version, a missing `entry.after` means "this feature didn't exist yet",
+/// not "we looked and found nothing" — [`read_after`] uses this to decide
+/// whether a missing snapshot is trustworthy evidence of deletion.
+const AFTER_CAPTURE_MANIFEST_VERSION: u8 = 3;
+
+/// Resolves checkpoint entry `entry`'s post-turn ("after") content, in order
+/// of preference: the exact snapshot captured at `checkpoint_end` time, then
+/// (only if `reverted`) the exact `redo/` snapshot captured at revert time,
+/// then (only if NOT reverted) the current live workspace file as a
+/// best-effort approximation. See [`SnapshotSource`] for what each source
+/// implies about certainty.
+///
+/// `after_capture_attempted` (true for `manifest.version >=
+/// AFTER_CAPTURE_MANIFEST_VERSION`) matters for the "entry.after is None"
+/// case: on a v3+ manifest that means `end_impl` looked right at turn-end
+/// and there was genuinely nothing there (the file was deleted, e.g. by a
+/// shell command later in the same turn) — reported as `Captured` with no
+/// bytes, not silently downgraded to a guess. On an older manifest it means
+/// the capture step never ran at all, so the caller falls through to the
+/// live/redo fallbacks instead.
+fn read_after(
+    dir: &Path,
+    entry: &CheckpointEntry,
+    reverted: bool,
+    after_capture_attempted: bool,
+) -> (Option<Vec<u8>>, SnapshotSource) {
+    if let Some(name) = &entry.after {
+        if let Ok(bytes) = std::fs::read(dir.join(AFTER_DIR).join(name)) {
+            return (Some(bytes), SnapshotSource::Captured);
+        }
+    }
+    if after_capture_attempted {
+        // v3+: end_impl definitively looked at turn-end. No stored snapshot
+        // means the file genuinely didn't exist then, not "unknown".
+        return (None, SnapshotSource::Captured);
+    }
+    if reverted {
+        if let Some(name) = &entry.redo {
+            if let Ok(bytes) = std::fs::read(dir.join(REDO_DIR).join(name)) {
+                return (Some(bytes), SnapshotSource::Redo);
+            }
+        }
+        // Reverted with no redo backup: the live file now holds the BEFORE
+        // state, not after — nothing usable to show as "after".
+        return (None, SnapshotSource::Unavailable);
+    }
+    match std::fs::read(&entry.path) {
+        Ok(bytes) => (Some(bytes), SnapshotSource::Live),
+        Err(_) => (None, SnapshotSource::Unavailable),
+    }
+}
+
+/// Builds one file's [`FilePreviewEntry`] from its checkpoint entry.
+/// `manifest_version` decides how much [`read_after`]'s fallback chain can
+/// trust a missing snapshot — see that function's and
+/// [`AFTER_CAPTURE_MANIFEST_VERSION`]'s doc comments.
+fn build_file_preview(dir: &Path, entry: &CheckpointEntry, reverted: bool, manifest_version: u8) -> FilePreviewEntry {
+    let before = read_before(dir, entry);
+    let after_capture_attempted = manifest_version >= AFTER_CAPTURE_MANIFEST_VERSION;
+    let (after, after_source) = read_after(dir, entry, reverted, after_capture_attempted);
+    let existed_before = entry.backup.is_some();
+
+    let before_bytes = before.as_ref().map(Vec::len).unwrap_or(0);
+    let after_bytes = after.as_ref().map(Vec::len).unwrap_or(0);
+
+    let before_text = before.as_deref().and_then(|b| std::str::from_utf8(b).ok());
+    let after_text = after.as_deref().and_then(|b| std::str::from_utf8(b).ok());
+    let binary = (before.is_some() && before_text.is_none()) || (after.is_some() && after_text.is_none());
+
+    // Only `Captured`/`Redo` are exact snapshots taken AT the relevant
+    // moment; `Live`/`Unavailable` are best-effort or empty, so a `None`
+    // paired with either of those is genuinely unknown, never a confirmed
+    // deletion.
+    let after_confident = matches!(after_source, SnapshotSource::Captured | SnapshotSource::Redo);
+
+    let status = match (existed_before, &after) {
+        (true, Some(after_bytes_vec)) => {
+            if before.as_deref() == Some(after_bytes_vec.as_slice()) {
+                FileChangeStatus::Unchanged
+            } else {
+                FileChangeStatus::Modified
+            }
+        }
+        (true, None) => {
+            if after_confident {
+                FileChangeStatus::Deleted
+            } else {
+                FileChangeStatus::Unknown
+            }
+        }
+        (false, Some(_)) => FileChangeStatus::Added,
+        (false, None) => {
+            // Created and then removed again within the very same turn: the
+            // net effect on disk is nothing, but it's a KNOWN nothing when
+            // an exact snapshot confirms it (not a guess).
+            if after_confident {
+                FileChangeStatus::Unchanged
+            } else {
+                FileChangeStatus::Unknown
+            }
+        }
+    };
+
+    let diff = if binary || status == FileChangeStatus::Unknown {
+        None
+    } else if before_bytes.max(after_bytes) > MAX_DIFF_BYTES {
+        Some(DiffResult { lines: Vec::new(), truncated: true, added: 0, removed: 0 })
+    } else {
+        Some(diff_lines(before_text.unwrap_or(""), after_text.unwrap_or("")))
+    };
+
+    FilePreviewEntry {
+        path: entry.path.clone(),
+        status,
+        before_bytes,
+        after_bytes,
+        after_source,
+        binary,
+        diff,
+    }
+}
+
+/// Full preview of one checkpoint: its metadata plus a per-file breakdown of
+/// what changed. Read-only — never touches the live workspace beyond reading
+/// files that were already going to be read for the fallback `Live` source.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointPreview {
+    pub id: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub session_id: String,
+    pub anchor_index: usize,
+    pub shell_ran: bool,
+    pub reverted: bool,
+    pub files: Vec<FilePreviewEntry>,
+}
+
+/// Core preview logic, parameterized by base dir for testability.
+pub fn preview_impl(base_dir: &Path, id: &str) -> Result<CheckpointPreview, String> {
+    validate_id(id)?;
+    let dir = base_dir.join(id);
+    let manifest = read_manifest(base_dir, id)?;
+    let files = manifest
+        .entries
+        .iter()
+        .map(|entry| build_file_preview(&dir, entry, manifest.reverted, manifest.version))
+        .collect();
+    Ok(CheckpointPreview {
+        id: id.to_string(),
+        label: manifest.label,
+        created_at_ms: manifest.created_at_ms,
+        session_id: manifest.session_id,
+        anchor_index: manifest.anchor_index,
+        shell_ran: manifest.shell_ran,
+        reverted: manifest.reverted,
+        files,
+    })
+}
+
+/// Lists a checkpoint's per-file preview (status, diff, provenance) without
+/// touching the live workspace beyond reading files for the best-effort
+/// `Live` fallback source. Read-only UI plumbing, like `checkpoint_list` —
+/// intentionally NOT routed through the permission system.
+#[tauri::command]
+pub fn checkpoint_preview(app: tauri::AppHandle, id: String) -> Result<CheckpointPreview, String> {
+    preview_impl(&checkpoints_base_dir(&app)?, &id)
+}
+
+/// One file's side-by-side comparison across two checkpoints (which need not
+/// be adjacent, or even from the same session).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareFileEntry {
+    pub path: String,
+    pub in_a: bool,
+    pub in_b: bool,
+    pub a: Option<FilePreviewEntry>,
+    pub b: Option<FilePreviewEntry>,
+    /// Diff between checkpoint A's resulting content and checkpoint B's —
+    /// the actual "what differs between these two checkpoints" comparison,
+    /// distinct from either checkpoint's own before/after turn diff. `None`
+    /// when either side's "after" content isn't available/text.
+    pub between: Option<DiffResult>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointCompareResult {
+    pub a: CheckpointPreview,
+    pub b: CheckpointPreview,
+    pub files: Vec<CompareFileEntry>,
+}
+
+/// Core compare logic: the union of every file either checkpoint touched,
+/// each with its own per-checkpoint preview plus a direct A-vs-B diff of
+/// their resulting content. Entirely read-only — reads each checkpoint's
+/// manifest and backups independently; never restores either one.
+pub fn compare_impl(base_dir: &Path, id_a: &str, id_b: &str) -> Result<CheckpointCompareResult, String> {
+    let preview_a = preview_impl(base_dir, id_a)?;
+    let preview_b = preview_impl(base_dir, id_b)?;
+
+    let mut paths: Vec<String> = Vec::new();
+    for f in preview_a.files.iter().chain(preview_b.files.iter()) {
+        if !paths.contains(&f.path) {
+            paths.push(f.path.clone());
+        }
+    }
+
+    let dir_a = base_dir.join(id_a);
+    let dir_b = base_dir.join(id_b);
+    let manifest_a = read_manifest(base_dir, id_a)?;
+    let manifest_b = read_manifest(base_dir, id_b)?;
+
+    let files = paths
+        .into_iter()
+        .map(|path| {
+            let a = preview_a.files.iter().find(|f| f.path == path).cloned();
+            let b = preview_b.files.iter().find(|f| f.path == path).cloned();
+
+            let a_text = manifest_a.entries.iter().find(|e| e.path == path).and_then(|e| {
+                let attempted = manifest_a.version >= AFTER_CAPTURE_MANIFEST_VERSION;
+                let (bytes, _src) = read_after(&dir_a, e, manifest_a.reverted, attempted);
+                bytes.and_then(|b| String::from_utf8(b).ok())
+            });
+            let b_text = manifest_b.entries.iter().find(|e| e.path == path).and_then(|e| {
+                let attempted = manifest_b.version >= AFTER_CAPTURE_MANIFEST_VERSION;
+                let (bytes, _src) = read_after(&dir_b, e, manifest_b.reverted, attempted);
+                bytes.and_then(|b| String::from_utf8(b).ok())
+            });
+
+            let between = match (&a_text, &b_text) {
+                (Some(ta), Some(tb)) if ta.len().max(tb.len()) <= MAX_DIFF_BYTES => Some(diff_lines(ta, tb)),
+                (Some(_), Some(_)) => Some(DiffResult { lines: Vec::new(), truncated: true, added: 0, removed: 0 }),
+                _ => None,
+            };
+
+            CompareFileEntry { path, in_a: a.is_some(), in_b: b.is_some(), a, b, between }
+        })
+        .collect();
+
+    Ok(CheckpointCompareResult { a: preview_a, b: preview_b, files })
+}
+
+/// Compares checkpoints `id_a` and `id_b` without restoring either one. Like
+/// `checkpoint_preview`, read-only UI plumbing, not permission-gated.
+#[tauri::command]
+pub fn checkpoint_compare(app: tauri::AppHandle, id_a: String, id_b: String) -> Result<CheckpointCompareResult, String> {
+    compare_impl(&checkpoints_base_dir(&app)?, &id_a, &id_b)
+}
+
+/// What reverting one file entry will actually do to the live workspace,
+/// determined by comparing its CURRENT content against what the checkpoint
+/// would restore — not just assumed from `backup`/`None` the way
+/// `revert_impl` itself does, since a simulation's whole point is to catch
+/// the case where reality has drifted from that assumption.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RestoreAction {
+    /// The live file will be overwritten with the checkpoint's pre-turn
+    /// content.
+    Restore,
+    /// The live file (created by this turn) will be deleted.
+    Delete,
+    /// The live file already matches the pre-turn content — reverting this
+    /// entry would be a no-op.
+    NoOp,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorePlanEntry {
+    pub path: String,
+    pub action: RestoreAction,
+    /// True when the live file no longer matches what THIS checkpoint's turn
+    /// itself produced (its captured/live "after" state) — meaning something
+    /// else has touched the file since this turn ended, so reverting now
+    /// would discard that other change too, not just this turn's. `false`
+    /// when the after-state is unknown (a pre-v3 manifest with nothing to
+    /// compare against) — absence of evidence isn't evidence of drift.
+    pub drifted: bool,
+}
+
+/// A read-only "what will happen if I revert this checkpoint right now"
+/// report — the rollback-simulation step the UI runs before actually calling
+/// `checkpoint_revert`. Never mutates anything.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreSimulation {
+    pub id: String,
+    pub already_reverted: bool,
+    pub files: Vec<RestorePlanEntry>,
+    /// True when this turn ran a shell command — file restore will proceed
+    /// as planned below, but that external side effect is NOT reversed by
+    /// it and must be reconciled manually. This is the one external-effect
+    /// signal the backend itself can see (`record_shell`); the frontend's
+    /// `checkpointReconciliation.ts` adds finer-grained tool-level detail
+    /// (network calls, MCP tool calls) from the transcript, which isn't
+    /// visible from the checkpoint manifest alone.
+    pub needs_reconciliation: bool,
+}
+
+/// Core simulate-restore logic, parameterized by base dir for testability.
+/// Read-only: every comparison is against the CURRENT live file, never
+/// followed by a write.
+pub fn simulate_restore_impl(base_dir: &Path, id: &str) -> Result<RestoreSimulation, String> {
+    validate_id(id)?;
+    let dir = base_dir.join(id);
+    let manifest = read_manifest(base_dir, id)?;
+
+    if manifest.reverted {
+        return Ok(RestoreSimulation {
+            id: id.to_string(),
+            already_reverted: true,
+            files: Vec::new(),
+            needs_reconciliation: manifest.shell_ran,
+        });
+    }
+
+    let files = manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let target = Path::new(&entry.path);
+            let live = std::fs::read(target).ok();
+            let before = read_before(&dir, entry);
+
+            let will_be_noop = match (&entry.backup, &live) {
+                (Some(_), Some(live_bytes)) => before.as_deref() == Some(live_bytes.as_slice()),
+                (None, None) => true,
+                _ => false,
+            };
+            let action = if will_be_noop {
+                RestoreAction::NoOp
+            } else if entry.backup.is_some() {
+                RestoreAction::Restore
+            } else {
+                RestoreAction::Delete
+            };
+
+            // Drift: does the live file currently match what THIS turn
+            // produced? Only meaningful when we actually know the turn's
+            // "after" state (never trust a Live-sourced "after" to detect
+            // drift against itself — it IS the live file by definition).
+            let after_capture_attempted = manifest.version >= AFTER_CAPTURE_MANIFEST_VERSION;
+            let (after, after_source) = read_after(&dir, entry, false, after_capture_attempted);
+            let drifted = match after_source {
+                SnapshotSource::Captured | SnapshotSource::Redo => match (&after, &live) {
+                    (Some(a), Some(l)) => a != l,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => true,
+                    (None, None) => false,
+                },
+                SnapshotSource::Live | SnapshotSource::Unavailable => false,
+            };
+
+            RestorePlanEntry { path: entry.path.clone(), action, drifted }
+        })
+        .collect();
+
+    Ok(RestoreSimulation {
+        id: id.to_string(),
+        already_reverted: false,
+        files,
+        needs_reconciliation: manifest.shell_ran,
+    })
+}
+
+/// Simulates reverting checkpoint `id` without actually doing it — the
+/// rollback-simulation step the UI runs before `checkpoint_revert`. Like
+/// `checkpoint_preview`, read-only and not permission-gated.
+#[tauri::command]
+pub fn checkpoint_simulate_restore(app: tauri::AppHandle, id: String) -> Result<RestoreSimulation, String> {
+    simulate_restore_impl(&checkpoints_base_dir(&app)?, &id)
 }
 
 /// Core list logic, parameterized by base dir for testability: scans every
@@ -1845,5 +2432,397 @@ mod tests {
             let file_str = file.to_string_lossy().to_string();
             assert_eq!(entries.iter().filter(|e| e.path == file_str).count(), 1);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // diff_lines
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn diff_lines_reports_no_changes_for_identical_text() {
+        let result = diff_lines("a\nb\nc", "a\nb\nc");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.removed, 0);
+        assert!(!result.truncated);
+        assert!(result.lines.iter().all(|l| l.kind == DiffLineKind::Context));
+    }
+
+    #[test]
+    fn diff_lines_detects_a_pure_addition() {
+        let result = diff_lines("a\nb", "a\nb\nc");
+        assert_eq!(result.added, 1);
+        assert_eq!(result.removed, 0);
+        assert_eq!(
+            result.lines.last(),
+            Some(&DiffLine { kind: DiffLineKind::Added, text: "c".to_string() })
+        );
+    }
+
+    #[test]
+    fn diff_lines_detects_a_pure_removal() {
+        let result = diff_lines("a\nb\nc", "a\nc");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.removed, 1);
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Removed && l.text == "b")
+        );
+    }
+
+    #[test]
+    fn diff_lines_detects_a_modification_as_remove_plus_add() {
+        let result = diff_lines("hello world", "hello there");
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.added, 1);
+    }
+
+    #[test]
+    fn diff_lines_treats_empty_before_as_entirely_added() {
+        let result = diff_lines("", "x\ny");
+        assert_eq!(result.added, 2);
+        assert_eq!(result.removed, 0);
+    }
+
+    #[test]
+    fn diff_lines_treats_empty_after_as_entirely_removed() {
+        let result = diff_lines("x\ny", "");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.removed, 2);
+    }
+
+    #[test]
+    fn diff_lines_is_a_noop_for_two_empty_strings() {
+        let result = diff_lines("", "");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.removed, 0);
+        assert!(result.lines.is_empty());
+    }
+
+    #[test]
+    fn diff_lines_truncates_when_the_input_is_too_large_to_diff_cheaply() {
+        // Comfortably over MAX_DIFF_CELLS (4,000,000): 2100 * 2100 > 4.4M.
+        let before = (0..2100).map(|i| format!("before-{i}")).collect::<Vec<_>>().join("\n");
+        let after = (0..2100).map(|i| format!("after-{i}")).collect::<Vec<_>>().join("\n");
+        let result = diff_lines(&before, &after);
+        assert!(result.truncated, "oversized diff must report truncated: true");
+        assert!(result.lines.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // preview_impl / compare_impl
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn preview_reports_modified_added_and_deleted_files_with_exact_after_snapshots() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let modified = ws.path.join("modified.txt");
+        std::fs::write(&modified, "line1\nline2\nline3").unwrap();
+        let created = ws.path.join("created.txt");
+        let deleted = ws.path.join("deleted.txt");
+        std::fs::write(&deleted, "goodbye").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &modified).unwrap();
+        std::fs::write(&modified, "line1\nCHANGED\nline3").unwrap();
+        record_original(&state, Some(&id), &created).unwrap();
+        std::fs::write(&created, "brand new").unwrap();
+        record_original(&state, Some(&id), &deleted).unwrap();
+        std::fs::remove_file(&deleted).unwrap(); // simulates a shell-driven delete mid-turn
+        end_impl(&state, &id).unwrap();
+
+        let preview = preview_impl(&base.path, &id).unwrap();
+        assert_eq!(preview.files.len(), 3);
+
+        let modified_entry = preview.files.iter().find(|f| f.path.ends_with("modified.txt")).unwrap();
+        assert_eq!(modified_entry.status, FileChangeStatus::Modified);
+        assert_eq!(modified_entry.after_source, SnapshotSource::Captured);
+        let diff = modified_entry.diff.as_ref().unwrap();
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+
+        let created_entry = preview.files.iter().find(|f| f.path.ends_with("created.txt")).unwrap();
+        assert_eq!(created_entry.status, FileChangeStatus::Added);
+        assert_eq!(created_entry.after_source, SnapshotSource::Captured);
+        assert_eq!(created_entry.diff.as_ref().unwrap().added, 1);
+
+        let deleted_entry = preview.files.iter().find(|f| f.path.ends_with("deleted.txt")).unwrap();
+        assert_eq!(
+            deleted_entry.status,
+            FileChangeStatus::Deleted,
+            "a file gone by checkpoint_end time must be confidently reported as Deleted, not guessed at"
+        );
+        assert_eq!(deleted_entry.after_source, SnapshotSource::Captured);
+    }
+
+    #[test]
+    fn preview_reports_unchanged_when_content_is_identical() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("same.txt");
+        std::fs::write(&file, "same content").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        // Rewritten with the exact same bytes — a no-op mutation.
+        std::fs::write(&file, "same content").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let preview = preview_impl(&base.path, &id).unwrap();
+        assert_eq!(preview.files[0].status, FileChangeStatus::Unchanged);
+    }
+
+    #[test]
+    fn preview_falls_back_to_live_file_for_a_pre_v3_manifest_never_reverted() {
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("legacy.txt");
+        std::fs::write(&file, "post-turn content").unwrap();
+
+        // Hand-written v2 manifest with no "after" key at all, mirroring a
+        // checkpoint written before this feature existed.
+        let id = "00000000-0000-4000-8000-00000000v2prev";
+        let dir = base.path.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0.bak"), "pre-turn content").unwrap();
+        let manifest = format!(
+            r#"{{"version":2,"created_at_ms":1,"session_id":"s","anchor_index":0,"label":"l","shell_ran":false,"reverted":false,"prev_id":null,"entries":[{{"path":{:?},"backup":"0.bak"}}]}}"#,
+            file.to_string_lossy()
+        );
+        std::fs::write(dir.join(MANIFEST_FILE), manifest).unwrap();
+
+        let preview = preview_impl(&base.path, id).unwrap();
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(preview.files[0].after_source, SnapshotSource::Live);
+        assert_eq!(preview.files[0].status, FileChangeStatus::Modified);
+    }
+
+    #[test]
+    fn preview_reports_unknown_rather_than_guessing_when_nothing_is_available() {
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+        // File never actually created on disk anywhere — no live fallback,
+        // no captured/redo snapshot either (hand-written v1-shaped entry).
+        let missing = ws.path.join("never_existed.txt");
+
+        let id = "00000000-0000-4000-8000-00000000nofil";
+        let dir = base.path.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = format!(r#"[{{"path":{:?},"backup":null}}]"#, missing.to_string_lossy());
+        std::fs::write(dir.join(MANIFEST_FILE), raw).unwrap();
+
+        let preview = preview_impl(&base.path, id).unwrap();
+        assert_eq!(preview.files[0].status, FileChangeStatus::Unknown);
+        assert!(preview.files[0].diff.is_none());
+    }
+
+    #[test]
+    fn compare_returns_the_union_of_files_touched_by_either_checkpoint() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let only_a = ws.path.join("only_a.txt");
+        std::fs::write(&only_a, "a-content").unwrap();
+        let shared = ws.path.join("shared.txt");
+        std::fs::write(&shared, "v1").unwrap();
+
+        let id_a = begin(&state, &base.path);
+        record_original(&state, Some(&id_a), &only_a).unwrap();
+        std::fs::write(&only_a, "a-mutated").unwrap();
+        record_original(&state, Some(&id_a), &shared).unwrap();
+        std::fs::write(&shared, "v2").unwrap();
+        end_impl(&state, &id_a).unwrap();
+
+        let only_b = ws.path.join("only_b.txt");
+        std::fs::write(&only_b, "b-content").unwrap();
+        let id_b = begin(&state, &base.path);
+        record_original(&state, Some(&id_b), &shared).unwrap();
+        std::fs::write(&shared, "v3").unwrap();
+        record_original(&state, Some(&id_b), &only_b).unwrap();
+        std::fs::write(&only_b, "b-mutated").unwrap();
+        end_impl(&state, &id_b).unwrap();
+
+        let compare = compare_impl(&base.path, &id_a, &id_b).unwrap();
+        assert_eq!(compare.files.len(), 3, "must be the union, not intersection, of touched files");
+
+        let only_a_entry = compare.files.iter().find(|f| f.path.ends_with("only_a.txt")).unwrap();
+        assert!(only_a_entry.in_a && !only_a_entry.in_b);
+
+        let only_b_entry = compare.files.iter().find(|f| f.path.ends_with("only_b.txt")).unwrap();
+        assert!(!only_b_entry.in_a && only_b_entry.in_b);
+
+        let shared_entry = compare.files.iter().find(|f| f.path.ends_with("shared.txt")).unwrap();
+        assert!(shared_entry.in_a && shared_entry.in_b);
+        let between = shared_entry.between.as_ref().expect("both sides have text content");
+        // A's resulting content was "v2", B's was "v3" — one line differs.
+        assert_eq!(between.added, 1);
+        assert_eq!(between.removed, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // simulate_restore_impl
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn simulate_restore_plans_a_restore_and_a_delete_with_no_drift() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let existing = ws.path.join("existing.txt");
+        std::fs::write(&existing, "original").unwrap();
+        let created = ws.path.join("created.txt");
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &existing).unwrap();
+        std::fs::write(&existing, "mutated").unwrap();
+        record_original(&state, Some(&id), &created).unwrap();
+        std::fs::write(&created, "brand new").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert!(!sim.already_reverted);
+        assert!(!sim.needs_reconciliation, "no shell command ran");
+
+        let existing_plan = sim.files.iter().find(|f| f.path.ends_with("existing.txt")).unwrap();
+        assert_eq!(existing_plan.action, RestoreAction::Restore);
+        assert!(!existing_plan.drifted, "nothing touched the file since the turn ended");
+
+        let created_plan = sim.files.iter().find(|f| f.path.ends_with("created.txt")).unwrap();
+        assert_eq!(created_plan.action, RestoreAction::Delete);
+        assert!(!created_plan.drifted);
+    }
+
+    #[test]
+    fn simulate_restore_reports_no_op_when_the_live_file_already_matches_before() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "mutated").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        // Something (e.g. the user, or an earlier manual edit) already put
+        // the file back to its pre-turn content before the simulation runs.
+        std::fs::write(&file, "original").unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        let plan = sim.files.iter().find(|f| f.path.ends_with("f.txt")).unwrap();
+        assert_eq!(plan.action, RestoreAction::NoOp);
+    }
+
+    #[test]
+    fn simulate_restore_flags_drift_when_something_else_touched_the_file_since() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "this-turns-content").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        // A DIFFERENT, later change (another turn, or a manual edit) landed
+        // on top of this turn's content before the simulation runs.
+        std::fs::write(&file, "someone-elses-later-edit").unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        let plan = sim.files.iter().find(|f| f.path.ends_with("f.txt")).unwrap();
+        assert_eq!(plan.action, RestoreAction::Restore);
+        assert!(
+            plan.drifted,
+            "live content no longer matches what this turn produced, so revert would also discard the later edit"
+        );
+    }
+
+    #[test]
+    fn simulate_restore_flags_needs_reconciliation_when_a_shell_command_ran() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        record_shell(&state, Some(&id)).unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert!(
+            sim.needs_reconciliation,
+            "a shell command's side effects can't be undone by file restore and must be flagged"
+        );
+    }
+
+    #[test]
+    fn simulate_restore_on_an_already_reverted_checkpoint_reports_no_planned_changes() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let file = ws.path.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        end_impl(&state, &id).unwrap();
+        revert_impl(&base.path, &id).unwrap();
+
+        let sim = simulate_restore_impl(&base.path, &id).unwrap();
+        assert!(sim.already_reverted);
+        assert!(sim.files.is_empty());
+    }
+
+    /// Pins the exact JSON wire format every enum in this module serializes
+    /// to — the frontend (`src/lib/checkpointPreview.ts`) hand-maintains
+    /// matching string-literal union types with no shared codegen, so a
+    /// silent drift here (e.g. `RestoreAction::NoOp` serializing to anything
+    /// other than `"noOp"`, the least obvious of these under
+    /// `rename_all = "camelCase"`) would desync the two without either side
+    /// failing to compile.
+    #[test]
+    fn enum_wire_format_matches_the_hand_maintained_frontend_types() {
+        assert_eq!(serde_json::to_string(&DiffLineKind::Context).unwrap(), "\"context\"");
+        assert_eq!(serde_json::to_string(&DiffLineKind::Added).unwrap(), "\"added\"");
+        assert_eq!(serde_json::to_string(&DiffLineKind::Removed).unwrap(), "\"removed\"");
+
+        assert_eq!(serde_json::to_string(&SnapshotSource::Captured).unwrap(), "\"captured\"");
+        assert_eq!(serde_json::to_string(&SnapshotSource::Redo).unwrap(), "\"redo\"");
+        assert_eq!(serde_json::to_string(&SnapshotSource::Live).unwrap(), "\"live\"");
+        assert_eq!(serde_json::to_string(&SnapshotSource::Unavailable).unwrap(), "\"unavailable\"");
+
+        assert_eq!(serde_json::to_string(&FileChangeStatus::Added).unwrap(), "\"added\"");
+        assert_eq!(serde_json::to_string(&FileChangeStatus::Modified).unwrap(), "\"modified\"");
+        assert_eq!(serde_json::to_string(&FileChangeStatus::Deleted).unwrap(), "\"deleted\"");
+        assert_eq!(serde_json::to_string(&FileChangeStatus::Unchanged).unwrap(), "\"unchanged\"");
+        assert_eq!(serde_json::to_string(&FileChangeStatus::Unknown).unwrap(), "\"unknown\"");
+
+        assert_eq!(serde_json::to_string(&RestoreAction::Restore).unwrap(), "\"restore\"");
+        assert_eq!(serde_json::to_string(&RestoreAction::Delete).unwrap(), "\"delete\"");
+        assert_eq!(
+            serde_json::to_string(&RestoreAction::NoOp).unwrap(),
+            "\"noOp\"",
+            "the two-word Rust variant NoOp must serialize to camelCase noOp, not noop or no_op"
+        );
     }
 }

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import {
   ecosystemClient,
+  type AdditionalRegistryRecord,
   type ApprovedInstallPreview,
   type InstalledPackageState,
   type McpOAuthServerRegistration,
@@ -10,6 +11,7 @@ import {
   type PackageCatalogEntry,
   type PluginRuntimeDescriptor,
   type PortablePackageExport,
+  type RegistrySnapshot,
   type SemanticVersion,
   type WorkflowDefinition,
   type WorkflowIr,
@@ -173,6 +175,7 @@ interface EcosystemStore {
   catalog: PackageCatalogEntry[];
   installed: InstalledPackageState[];
   plugins: PluginRuntimeDescriptor[];
+  registrySources: AdditionalRegistryRecord[];
   installPreview: ApprovedInstallPreview | null;
   workflows: WorkflowDefinition[];
   workflowIr: WorkflowIr | null;
@@ -195,8 +198,14 @@ interface EcosystemStore {
   pinPackage: (packageId: string, version: SemanticVersion | null) => Promise<void>;
   rollbackPackage: (packageId: string) => Promise<void>;
   uninstallPackage: (packageId: string) => Promise<void>;
+  setPackageTeamApproved: (packageId: string, teamApproved: boolean) => Promise<void>;
   activatePluginWorkflow: (packageId: string, contentPath: string) => Promise<void>;
   deactivatePluginWorkflow: (packageId: string, contentPath: string) => Promise<void>;
+
+  refreshRegistrySources: () => Promise<void>;
+  addRegistrySource: (sourceId: string, displayName: string, location: string) => Promise<AdditionalRegistryRecord>;
+  removeRegistrySource: (sourceId: string) => Promise<void>;
+  verifyRegistrySource: (sourceId: string, snapshot: RegistrySnapshot) => Promise<AdditionalRegistryRecord>;
 
   registerOAuth: (registration: McpOAuthServerRegistration) => Promise<void>;
   refreshOAuthServers: () => Promise<void>;
@@ -243,6 +252,7 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => {
     catalog: [],
     installed: [],
     plugins: [],
+    registrySources: [],
     installPreview: null,
     workflows: [],
     workflowIr: null,
@@ -344,6 +354,9 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => {
       replaceInstalled(await ecosystemClient.uninstallPackage(packageId));
       await get().refreshPluginRuntime();
     }),
+    setPackageTeamApproved: (packageId, teamApproved) => perform(`package-team-approved-${packageId}`, async () => {
+      replaceInstalled(await ecosystemClient.setPackageTeamApproved(packageId, teamApproved));
+    }),
     activatePluginWorkflow: (packageId, contentPath) => perform(`plugin-workflow-${packageId}-${contentPath}`, async () => {
       await ecosystemClient.activatePluginWorkflow(packageId, contentPath);
       await Promise.all([get().refreshPluginRuntime(), get().refreshWorkflows()]);
@@ -351,6 +364,31 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => {
     deactivatePluginWorkflow: (packageId, contentPath) => perform(`plugin-workflow-${packageId}-${contentPath}`, async () => {
       await ecosystemClient.deactivatePluginWorkflow(packageId, contentPath);
       await Promise.all([get().refreshPluginRuntime(), get().refreshWorkflows()]);
+    }),
+
+    refreshRegistrySources: () => perform("registry-sources", async () => {
+      set({ registrySources: await ecosystemClient.listRegistrySources() });
+    }),
+    addRegistrySource: (sourceId, displayName, location) => perform("registry-source-add", async () => {
+      const record = await ecosystemClient.addRegistrySource(sourceId, displayName, location);
+      set((state) => ({
+        registrySources: [...state.registrySources.filter((item) => item.source.source_id !== sourceId), record]
+          .sort((left, right) => left.source.source_id.localeCompare(right.source.source_id)),
+      }));
+      return record;
+    }),
+    removeRegistrySource: (sourceId) => perform(`registry-source-remove-${sourceId}`, async () => {
+      await ecosystemClient.removeRegistrySource(sourceId);
+      set((state) => ({
+        registrySources: state.registrySources.filter((item) => item.source.source_id !== sourceId),
+      }));
+    }),
+    verifyRegistrySource: (sourceId, snapshot) => perform(`registry-source-verify-${sourceId}`, async () => {
+      const record = await ecosystemClient.verifyRegistrySource(sourceId, snapshot);
+      set((state) => ({
+        registrySources: state.registrySources.map((item) => (item.source.source_id === sourceId ? record : item)),
+      }));
+      return record;
     }),
 
     registerOAuth: (registration) => perform("oauth-register", async () => {
