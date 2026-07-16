@@ -9,6 +9,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
 import { GlobalSearch } from "./components/Search";
+import { CommandPalette } from "./components/Palette";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { useRunStore } from "./store/runStore";
@@ -35,6 +36,7 @@ import {
 import { onRunCancellationRequested } from "./lib/runProtocol";
 import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
+import { paletteClient } from "./lib/paletteClient";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
  * (captured the moment it was opened) so edits made by the agent afterwards
@@ -95,6 +97,7 @@ function App() {
   const [runCenterOpen, setRunCenterOpen] = useState(false);
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -111,6 +114,7 @@ function App() {
     setRunCenterOpen(false);
     setBrowserWorkbenchOpen(false);
     setGlobalSearchOpen(false);
+    setCommandPaletteOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -119,6 +123,20 @@ function App() {
   const handleManagePrompts = useCallback(() => {
     openSettingsTab("prompts");
   }, [openSettingsTab]);
+
+  // Opens the Global Command Palette over whatever's currently shown —
+  // triggered by the in-window shortcut below (Cmd/Ctrl+Shift+K, only while
+  // focused) and by the OS-level global shortcut (works even unfocused; see
+  // `src-tauri/src/command_palette.rs`, which shows/focuses this window and
+  // emits `palette://open` for the listener further down).
+  const openCommandPalette = useCallback(() => {
+    setSettingsOpen(false);
+    setRunCenterOpen(false);
+    setBrowserWorkbenchOpen(false);
+    setGlobalSearchOpen(false);
+    setSettingsInitialTab(undefined);
+    setCommandPaletteOpen(true);
+  }, []);
 
   // App-wide accelerators. The same definitions are rendered by the
   // Keyboard Shortcuts Settings panel, so a displayed binding always has a
@@ -166,6 +184,7 @@ function App() {
         },
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
+        openCommandPalette: () => openCommandPalette(),
         sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
         sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
         sessionRename: () => activeSession && session.requestRename(activeSession.id),
@@ -194,7 +213,23 @@ function App() {
     // that stop bubbling for their own local Enter/Escape handling.
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [newSession, openSettingsTab, permissionPending]);
+  }, [newSession, openCommandPalette, openSettingsTab, permissionPending]);
+
+  // The OS-level global shortcut (works even when Little Monkey isn't the
+  // focused app) is registered in Rust and, on press, shows/focuses this
+  // window and emits this event — see `command_palette::show_palette`.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void paletteClient.onOpen(openCommandPalette).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [openCommandPalette]);
 
   useEffect(() => {
     void refreshRoots();
@@ -315,12 +350,14 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
             setSettingsOpen(false);
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -328,6 +365,7 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setCommandPaletteOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -335,9 +373,11 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
+          onOpenCommandPalette={openCommandPalette}
         />
       </aside>
 
@@ -474,6 +514,12 @@ function App() {
         ))}
       </aside>
 
+      {commandPaletteOpen && (
+        <CommandPalette
+          onClose={() => setCommandPaletteOpen(false)}
+          onOpenSettingsTab={openSettingsTab}
+        />
+      )}
       <PermissionModal />
       <SettingsModal
         open={settingsOpen}

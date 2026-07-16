@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  Command,
   Globe,
   HelpCircle,
   Search,
@@ -20,6 +21,7 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenCommandPalette: () => void;
 }
 
 interface MenuRowProps {
@@ -47,7 +49,13 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench }: AppMenuProps) {
+export function AppMenu({
+  onOpenSettings,
+  onOpenRunCenter,
+  onOpenGlobalSearch,
+  onOpenBrowserWorkbench,
+  onOpenCommandPalette,
+}: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -97,6 +105,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenGlobalSearch();
+            }}
+          />
+          <MenuRow
+            icon={<Command size={14} className="text-faint" />}
+            label={t("AppMenu.commandPalette")}
+            onClick={() => {
+              closeAll();
+              onOpenCommandPalette();
             }}
           />
           <MenuRow

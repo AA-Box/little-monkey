@@ -69,6 +69,12 @@ pub mod m3_runtime_hub;
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
 pub mod m7_companion;
+// Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
+// shortcut's persisted configuration and "bring the palette to the front"
+// action. The palette itself renders inside the main window and dispatches
+// every command through the exact same Tauri commands chat/recipes/
+// knowledge/permissions already expose — see the module doc for why.
+pub mod command_palette;
 // Apple-Silicon-only MLX lifecycle adapter. The module reports explicit
 // unsupported capability on every other platform rather than implying a
 // portable backend.
@@ -368,12 +374,36 @@ pub fn run() {
     let configured_companion_shortcut = m7_state
         .overlay_shortcut()
         .expect("failed to load the configured companion shortcut");
-    let companion_shortcut = tauri_plugin_global_shortcut::Builder::new()
+    let palette_state = command_palette::CommandPaletteState::production(&app_data_dir)
+        .expect("failed to initialize the command palette");
+    let configured_palette_shortcut = palette_state
+        .shortcut()
+        .expect("failed to load the configured command palette shortcut");
+    // Both global OS-level shortcuts (the companion overlay's and the
+    // command palette's) share one `tauri_plugin_global_shortcut` plugin
+    // registration — a Tauri app manages exactly one instance of each
+    // plugin — and one dispatching handler that tells them apart by
+    // comparing the fired `Shortcut` against each feature's configured,
+    // already-parsed value (`Shortcut`/`HotKey` derives `PartialEq`).
+    let companion_shortcut_parsed = configured_companion_shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .expect("the configured companion shortcut must be valid");
+    let palette_shortcut_parsed = configured_palette_shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .expect("the configured command palette shortcut must be valid");
+    let global_shortcuts = tauri_plugin_global_shortcut::Builder::new()
         .with_shortcut(configured_companion_shortcut.as_str())
         .expect("the configured companion shortcut must be valid")
-        .with_handler(|app, _shortcut, event| {
-            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+        .with_shortcut(configured_palette_shortcut.as_str())
+        .expect("the configured command palette shortcut must be valid")
+        .with_handler(move |app, shortcut, event| {
+            if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                return;
+            }
+            if *shortcut == companion_shortcut_parsed {
                 let _ = m7_companion::show_overlay(app);
+            } else if *shortcut == palette_shortcut_parsed {
+                let _ = command_palette::show_palette(app);
             }
         })
         .build();
@@ -383,7 +413,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(companion_shortcut)
+        .plugin(global_shortcuts)
         .manage(AppState::default())
         .manage(m3_state)
         .manage(m3_http_server::M3HttpServerState::default())
@@ -391,6 +421,7 @@ pub fn run() {
         .manage(native_skills_state)
         .manage(browser_state)
         .manage(m7_state)
+        .manage(palette_state)
         // Tier-2 interactive-artifact protocol — serves a previously
         // `artifact_publish`-ed document by id with a strict per-document
         // CSP (`connect-src 'none'`, no capability granted to this scheme —
@@ -846,6 +877,9 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            command_palette::palette_show,
+            command_palette::palette_config_get,
+            command_palette::palette_config_save,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
