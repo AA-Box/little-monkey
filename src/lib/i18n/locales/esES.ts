@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
@@ -16,6 +17,7 @@ export const esES: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,
   // Real Peninsular Spanish translations of the onboarding wizard,
@@ -145,6 +147,33 @@ export const esES: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Rama propia",
   "IssueToPr.branchLabel": "Rama",
   "IssueToPr.repositoryLabel": "Repositorio",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "Compilador de SOP a agente",
+  "SopCompiler.title": "Compilador de SOP a agente",
+  "SopCompiler.subtitle": "Pega o importa un SOP, runbook, checklist o documento de formación y compílalo en un borrador de flujo de trabajo con entradas, controles de política, pruebas y requisitos de evidencia.",
+  "SopCompiler.close": "Cerrar el compilador de SOP a agente",
+  "SopCompiler.sourceLabel": "Texto del SOP / runbook / checklist",
+  "SopCompiler.sourcePlaceholder": "Pega aquí el texto del SOP, runbook, checklist o documento de formación…",
+  "SopCompiler.importButton": "Importar archivo",
+  "SopCompiler.compileButton": "Compilar",
+  "SopCompiler.inactiveNotice": "Compilar nunca ejecuta nada: el resultado es un borrador que revisas y pruebas antes de que pueda aprobarse.",
+  "SopCompiler.draftsHeading": "Borradores compilados",
+  "SopCompiler.emptyDrafts": "Todavía no hay borradores compilados. Pega o importa un SOP arriba y compílalo para ver un borrador aquí.",
+  "SopCompiler.statusDraft": "Borrador",
+  "SopCompiler.statusSentForReview": "Enviado para revisión",
+  "SopCompiler.stepsHeading": "Pasos",
+  "SopCompiler.noStepsExtracted": "No se ha extraído ningún paso.",
+  "SopCompiler.inputsHeading": "Entradas necesarias",
+  "SopCompiler.required": "obligatorio",
+  "SopCompiler.optional": "opcional",
+  "SopCompiler.gatesHeading": "Controles de política / permisos",
+  "SopCompiler.testsHeading": "Lista de pruebas / criterios de aceptación",
+  "SopCompiler.expectedPrefix": "Esperado:",
+  "SopCompiler.evidenceHeading": "Evidencias necesarias",
+  "SopCompiler.nonGoalsNote": "Este flujo de trabajo compilado permanece inactivo hasta que lo revises y lo envíes a Propuestas de habilidades, donde queda en cuarentena hasta su aprobación explícita: nada aquí lo instala ni lo activa directamente.",
+  "SopCompiler.sendToReviewButton": "Enviar a Propuestas de habilidades para revisión",
+  "SopCompiler.alreadySentButton": "Ya enviado para revisión",
+  "SopCompiler.discardButton": "Descartar",
   // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
   "AppMenu.mcpGenerator": "Generador de MCP",
   "McpGenerator.title": "Generador y simulador de servidores MCP",

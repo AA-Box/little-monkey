@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
@@ -16,6 +17,7 @@ export const fr: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,
   // Real French translations of the onboarding wizard, overriding the
@@ -145,6 +147,33 @@ export const fr: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Branche possédée",
   "IssueToPr.branchLabel": "Branche",
   "IssueToPr.repositoryLabel": "Dépôt",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "Compilateur SOP vers agent",
+  "SopCompiler.title": "Compilateur SOP vers agent",
+  "SopCompiler.subtitle": "Collez ou importez une procédure (SOP), un runbook, une checklist ou un document de formation, puis compilez-le en un brouillon de workflow avec entrées, points de contrôle de politique, tests et exigences de preuves.",
+  "SopCompiler.close": "Fermer le compilateur SOP vers agent",
+  "SopCompiler.sourceLabel": "Texte de la SOP / du runbook / de la checklist",
+  "SopCompiler.sourcePlaceholder": "Collez ici le texte de la SOP, du runbook, de la checklist ou du document de formation…",
+  "SopCompiler.importButton": "Importer un fichier",
+  "SopCompiler.compileButton": "Compiler",
+  "SopCompiler.inactiveNotice": "La compilation n'exécute jamais rien — le résultat est un brouillon que vous examinez et testez avant qu'il puisse être approuvé.",
+  "SopCompiler.draftsHeading": "Brouillons compilés",
+  "SopCompiler.emptyDrafts": "Aucun brouillon compilé pour le moment. Collez ou importez une SOP ci-dessus et compilez-la pour voir un brouillon ici.",
+  "SopCompiler.statusDraft": "Brouillon",
+  "SopCompiler.statusSentForReview": "Envoyé pour révision",
+  "SopCompiler.stepsHeading": "Étapes",
+  "SopCompiler.noStepsExtracted": "Aucune étape n'a été extraite.",
+  "SopCompiler.inputsHeading": "Entrées requises",
+  "SopCompiler.required": "requis",
+  "SopCompiler.optional": "optionnel",
+  "SopCompiler.gatesHeading": "Points de contrôle de politique / permission",
+  "SopCompiler.testsHeading": "Liste de tests / critères d'acceptation",
+  "SopCompiler.expectedPrefix": "Attendu :",
+  "SopCompiler.evidenceHeading": "Preuves requises",
+  "SopCompiler.nonGoalsNote": "Ce workflow compilé reste inactif tant que vous ne l'avez pas examiné et envoyé aux propositions de compétences, où il reste mis en quarantaine jusqu'à approbation explicite — rien ici ne l'installe ni ne l'active directement.",
+  "SopCompiler.sendToReviewButton": "Envoyer aux propositions de compétences pour révision",
+  "SopCompiler.alreadySentButton": "Déjà envoyé pour révision",
+  "SopCompiler.discardButton": "Ignorer",
   // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
   "AppMenu.mcpGenerator": "Générateur MCP",
   "McpGenerator.title": "Générateur et simulateur de serveurs MCP",

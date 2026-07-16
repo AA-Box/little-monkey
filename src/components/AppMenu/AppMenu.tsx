@@ -15,6 +15,7 @@ import {
   ServerCog,
   Settings as SettingsIcon,
   SquareTerminal,
+  Workflow,
   Swords,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
@@ -29,6 +30,7 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
@@ -69,6 +71,7 @@ export function AppMenu({
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
   onOpenIssueToPr,
+  onOpenSopCompiler,
   onOpenMcpGenerator,
   onOpenSideTasks,
   onOpenAgentInbox,
@@ -166,6 +169,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<Workflow size={14} className="text-faint" />}
+            label={t("AppMenu.sopCompiler")}
+            onClick={() => {
+              closeAll();
+              onOpenSopCompiler();
             }}
           />
           <MenuRow
