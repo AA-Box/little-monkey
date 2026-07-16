@@ -32,7 +32,8 @@ import {
 } from "../../lib/daemonClient";
 import { useT } from "../../lib/i18n";
 import { initializeRunStore, useRunStore } from "../../store/runStore";
-import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { Button, IconButton, StatusPill, Tabs, type PillTone } from "../ui";
+import { RunCapsulePanel } from "./RunCapsulePanel";
 
 interface RunCenterProps {
   onClose: () => void;
@@ -131,6 +132,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [managedRunIds, setManagedRunIds] = useState<string[]>([]);
+  const [detailTab, setDetailTab] = useState<"capsule" | "events">("capsule");
 
   useEffect(() => {
     void initializeRunStore();
@@ -146,6 +148,10 @@ export function RunCenter({ onClose }: RunCenterProps) {
   const events = selectedRunId ? eventsByRun[selectedRunId] ?? [] : [];
   const approvals = useMemo(() => pendingApprovals(events), [events]);
   const daemonManaged = selectedRunId ? isDaemonManagedRun(selectedRunId, managedRunIds) : false;
+
+  useEffect(() => {
+    setDetailTab("capsule");
+  }, [selectedRunId]);
 
   async function decide(approval: PendingApproval, decision: PermissionDecision) {
     if (!selectedRunId) return;
@@ -235,6 +241,22 @@ export function RunCenter({ onClose }: RunCenterProps) {
     }
   }
 
+  async function replaySafeCapsule() {
+    if (!selectedRunId || !daemonManaged) {
+      throw new Error(t("RunCapsule.replayEngineUnavailable"));
+    }
+    setActionBusy("capsule-replay");
+    try {
+      // Never acknowledge side effects from the capsule surface. The daemon
+      // independently rechecks its durable mutation markers and refuses a
+      // retry if the frontend's conservative classifier missed a boundary.
+      await daemonRetry(selectedRunId, false);
+      await refresh();
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   return (
     <section className="flex min-h-0 flex-1 flex-col" aria-labelledby="run-center-title">
       <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
@@ -274,8 +296,8 @@ export function RunCenter({ onClose }: RunCenterProps) {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1">
-        <nav className="flex w-72 shrink-0 flex-col overflow-y-auto border-r border-border bg-surface [overscroll-behavior:contain]" aria-label={t("RunCenter.runHistory")}>
+      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+        <nav className="flex max-h-56 w-full shrink-0 flex-col overflow-y-auto border-b border-border bg-surface [overscroll-behavior:contain] md:max-h-none md:w-72 md:border-b-0 md:border-r" aria-label={t("RunCenter.runHistory")}>
           <label className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 text-xs text-muted">
             <input
               type="checkbox"
@@ -386,30 +408,50 @@ export function RunCenter({ onClose }: RunCenterProps) {
                 </section>
               )}
 
-              <section aria-labelledby="run-events-title">
-                <h3 id="run-events-title" className="text-sm font-semibold">{t("RunCenter.eventHistory")}</h3>
-                {detailLoading && events.length === 0 ? (
-                  <p className="mt-2 text-sm text-faint">{t("RunCenter.loading")}</p>
-                ) : events.length === 0 ? (
-                  <p className="mt-2 rounded-lg border border-dashed border-border p-4 text-sm text-faint">{t("RunCenter.noEvents")}</p>
-                ) : (
-                  <ol className="mt-2 space-y-2">
-                    {events.map((event) => (
-                      <li key={event.event_id} className="rounded-lg border border-border bg-surface p-3">
-                        <div className="flex items-center justify-between gap-3 text-xs">
-                          <span className="font-medium">#{event.sequence} · {eventTitle(event, t)}</span>
-                          <time className="text-faint" dateTime={new Date(event.occurred_at_ms).toISOString()}>{formatTime(event.occurred_at_ms)}</time>
-                        </div>
-                        {(event.actor_id || event.emitter.kind) && <p className="mt-1 text-[11px] text-faint">{event.actor_id ? `${t("RunCenter.actor")}: ${event.actor_id} · ` : ""}{event.emitter.kind}</p>}
-                        <details className="mt-2 text-xs">
-                          <summary className="cursor-pointer text-muted hover:text-foreground">{t("RunCenter.details")}</summary>
-                          <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background p-2 text-[11px]">{JSON.stringify(event.event.payload, null, 2)}</pre>
-                        </details>
-                      </li>
-                    ))}
-                  </ol>
-                )}
-              </section>
+              <Tabs
+                tabs={[
+                  { id: "capsule", label: t("RunCapsule.tab") },
+                  { id: "events", label: t("RunCenter.eventHistory") },
+                ]}
+                active={detailTab}
+                onChange={(id) => setDetailTab(id === "events" ? "events" : "capsule")}
+              />
+
+              {detailTab === "capsule" ? (
+                <RunCapsulePanel
+                  run={selectedRun}
+                  events={events}
+                  runs={runs}
+                  daemonManaged={daemonManaged}
+                  actionBusy={actionBusy !== null}
+                  onReplay={replaySafeCapsule}
+                />
+              ) : (
+                <section aria-labelledby="run-events-title">
+                  <h3 id="run-events-title" className="text-sm font-semibold">{t("RunCenter.eventHistory")}</h3>
+                  {detailLoading && events.length === 0 ? (
+                    <p className="mt-2 text-sm text-faint">{t("RunCenter.loading")}</p>
+                  ) : events.length === 0 ? (
+                    <p className="mt-2 rounded-lg border border-dashed border-border p-4 text-sm text-faint">{t("RunCenter.noEvents")}</p>
+                  ) : (
+                    <ol className="mt-2 space-y-2">
+                      {events.map((event) => (
+                        <li key={event.event_id} className="rounded-lg border border-border bg-surface p-3">
+                          <div className="flex items-center justify-between gap-3 text-xs">
+                            <span className="font-medium">#{event.sequence} · {eventTitle(event, t)}</span>
+                            <time className="text-faint" dateTime={new Date(event.occurred_at_ms).toISOString()}>{formatTime(event.occurred_at_ms)}</time>
+                          </div>
+                          {(event.actor_id || event.emitter.kind) && <p className="mt-1 text-[11px] text-faint">{event.actor_id ? `${t("RunCenter.actor")}: ${event.actor_id} · ` : ""}{event.emitter.kind}</p>}
+                          <details className="mt-2 text-xs">
+                            <summary className="cursor-pointer text-muted hover:text-foreground">{t("RunCenter.details")}</summary>
+                            <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background p-2 text-[11px]">{JSON.stringify(event.event.payload, null, 2)}</pre>
+                          </details>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </section>
+              )}
             </div>
           )}
         </div>

@@ -101,6 +101,16 @@ describe("ecosystemStore", () => {
     });
   });
 
+  it("drops the tombstoned state from the installed list on uninstall", async () => {
+    useEcosystemStore.setState({ installed: [installed] });
+    invokeMock
+      .mockResolvedValueOnce({ ...installed, sequence: 2, active_version: null, enabled: false, tombstoned: true })
+      .mockResolvedValueOnce([]);
+    await useEcosystemStore.getState().uninstallPackage("first-party.skill");
+    expect(invokeMock).toHaveBeenCalledWith("m4_packages_uninstall", { packageId: "first-party.skill" });
+    expect(useEcosystemStore.getState().installed).toEqual([]);
+  });
+
   it("restores OAuth registrations and exposes only token metadata", async () => {
     const registration = {
       server: { contract_version: 1, issuer: "https://auth.example/", authorization_endpoint: "https://auth.example/authorize", token_endpoint: "https://auth.example/token", revocation_endpoint: null, supported_scopes: ["read"], supports_pkce_s256: true },

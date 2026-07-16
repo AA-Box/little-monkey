@@ -230,12 +230,13 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => {
   };
 
   const replaceInstalled = (next: InstalledPackageState) => {
-    set((state) => ({
-      installed: [
-        ...state.installed.filter((item) => item.package_id !== next.package_id),
-        next,
-      ].sort((left, right) => left.package_id.localeCompare(right.package_id)),
-    }));
+    set((state) => {
+      const others = state.installed.filter((item) => item.package_id !== next.package_id);
+      return {
+        installed: (next.tombstoned ? others : [...others, next])
+          .sort((left, right) => left.package_id.localeCompare(right.package_id)),
+      };
+    });
   };
 
   return {

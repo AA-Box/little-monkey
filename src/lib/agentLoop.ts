@@ -55,7 +55,7 @@ import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPromp
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
-import { getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -1050,7 +1050,7 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
         ],
         [],
         undefined,
-        useModelStore.getState().effort,
+        effortForTarget(target),
         sessionId,
       );
       if (summary.streamError) throw new Error(summary.streamError);
@@ -1079,7 +1079,7 @@ function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot 
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
     providerModels: state.providerModels,
-    effort: state.effort,
+    effortByTarget: state.effortByTarget,
   });
   if (target.kind === 'local') {
     return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
@@ -1232,9 +1232,14 @@ export interface AttachmentRef {
   path: string;
   isDir: boolean;
   /** Set at pick-time in `ChatWindow.tsx` for image files — its presence (alongside `dataUrl`) is what routes this attachment to the vision content-part path instead of the text-inlining path below. */
-  kind?: 'image';
+  kind?: 'image' | 'inline_text';
   /** The already-base64-encoded `data:` URL for an image attachment, read once at pick-time (see `imageAttachment.ts`) so this module never re-reads the file. */
   dataUrl?: string;
+  /** Bounded, user-approved inline text. Currently used by terminal evidence
+   * so it never needs to masquerade as a readable workspace path. */
+  content?: string;
+  /** Optional chip label for virtual attachments such as terminal evidence. */
+  label?: string;
 }
 
 /** A single resolved image attachment, ready to become a `ChatContentPart`. */
@@ -1262,10 +1267,24 @@ export async function resolveReferences(
 ): Promise<{ textRefs: ResolvedTextReference[]; images: ResolvedImage[]; unresolved: string[] }> {
   const images: ResolvedImage[] = [];
   const textAttachments: AttachmentRef[] = [];
+  const textRefs: ResolvedTextReference[] = [];
+  const inlinePaths = new Set<string>();
 
   for (const attachment of attachments) {
     if (attachment.kind === 'image') {
       if (attachment.dataUrl) images.push({ path: attachment.path, dataUrl: attachment.dataUrl });
+      continue;
+    }
+    if (attachment.kind === 'inline_text') {
+      if (attachment.content && !inlinePaths.has(attachment.path)) {
+        inlinePaths.add(attachment.path);
+        textRefs.push({
+          path: attachment.path,
+          isDir: false,
+          content: attachment.content,
+          source: 'terminal',
+        });
+      }
       continue;
     }
     textAttachments.push(attachment);
@@ -1279,7 +1298,6 @@ export async function resolveReferences(
     merged.set(attachment.path, attachment.isDir);
   }
 
-  const textRefs: ResolvedTextReference[] = [];
   const unresolved: string[] = [];
 
   for (const [path, isDir] of merged) {
@@ -1588,7 +1606,7 @@ async function runDaemonAgentTurn(
     verifyEnabled: settings.verifyEnabled,
     verifyMaxRounds: settings.verifyMaxRounds,
     subagentsEnabled: settings.subagentsEnabled,
-    effort: useModelStore.getState().effort,
+    effort: effortForTarget(resolvedTarget) ?? null,
     mcpServers: useMcpStore.getState().servers,
     attachedStackIds,
     attachedStackNames: attachedStacks.map((stack) => stack.name),
@@ -1893,9 +1911,11 @@ async function runAgentTurnBody(
   let sequenceIndex = 0;
   let target = sequence[0];
 
-  const effort = useModelStore.getState().effort;
+  // Per-model, so it must track the target: re-resolved below whenever a
+  // failover switch changes `target` mid-turn.
+  let effort = effortForTarget(primaryTarget);
 
-  // Read once per turn, like `effort` above — not re-derived on every
+  // Read once per turn — not re-derived on every
   // tool-calling round trip, so a mode switch mid-turn (possible via the
   // split pane's shared global mode, or the user clicking Approve on a plan
   // card mid-turn) never changes what's offered partway through this turn's
@@ -2244,6 +2264,7 @@ async function runAgentTurnBody(
         .catch((error) => console.error('Failed to close failed-over durable run', error));
       sequenceIndex += 1;
       target = sequence[sequenceIndex];
+      effort = effortForTarget(target);
       durable.recorder = await startDurableRecorder(
         target,
         `${turnId}-failover-${sequenceIndex}`,

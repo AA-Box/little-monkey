@@ -809,6 +809,50 @@ describe("attemptStream / recordUsage", () => {
   });
 });
 
+// Effort used to be forwarded for Anthropic only; it now travels for EVERY
+// provider target, because the Rust proxy owns the per-provider wire
+// mapping/omission (verbatim output_config.effort for Anthropic, clamped
+// reasoning_effort for OpenAI/Gemini/OpenRouter, dropped entirely for custom
+// endpoints — see providers.rs::build_chat_request and its tests).
+describe("attemptStream / effort forwarding", () => {
+  async function* fakeDoneStream(): AsyncGenerator<StreamEvent> {
+    yield { type: "done" };
+  }
+
+  beforeEach(() => {
+    streamProviderChatMock.mockReset();
+    streamProviderChatMock.mockImplementation(() => fakeDoneStream());
+  });
+
+  it.each(["anthropic", "openai", "gemini", "openrouter"])(
+    "forwards the resolved effort to the provider proxy for %s targets",
+    async (providerId) => {
+      const target: ResolvedTarget = { kind: "provider", providerId, model: "some-model" };
+
+      await attemptStream(target, [], [], undefined, "max", "session-1");
+
+      expect(streamProviderChatMock).toHaveBeenCalledTimes(1);
+      expect(streamProviderChatMock.mock.calls[0][5]).toBe("max");
+    },
+  );
+
+  it("still forwards effort for a custom provider — the Rust side omits it from that wire request", async () => {
+    const target: ResolvedTarget = { kind: "provider", providerId: "my-custom-provider", model: "m" };
+
+    await attemptStream(target, [], [], undefined, "high", "session-1");
+
+    expect(streamProviderChatMock.mock.calls[0][5]).toBe("high");
+  });
+
+  it("forwards undefined (Default: no effort field at all) when the caller resolved none", async () => {
+    const target: ResolvedTarget = { kind: "provider", providerId: "openai", model: "gpt-test" };
+
+    await attemptStream(target, [], [], undefined, undefined, "session-1");
+
+    expect(streamProviderChatMock.mock.calls[0][5]).toBeUndefined();
+  });
+});
+
 // `isToolCallAllowed` now lives here (moved from `agentLoop.ts`, which
 // re-exports it for backward compatibility — see that module's own doc
 // comment) specifically so `subagent.ts`'s child tool-calling loop can reuse
