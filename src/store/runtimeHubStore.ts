@@ -12,6 +12,9 @@ import {
   type M3CatalogSourceConfig,
   type M3CatalogMatch,
   type M3CleanupReport,
+  type M3ComponentCatalogEntry,
+  type M3ComponentUpdateCheck,
+  type M3InstalledComponent,
   type M3InstalledModel,
   type M3HttpServerStatus,
   type M3LoadModelRequest,
@@ -32,7 +35,7 @@ import {
   type SettingValue,
 } from "../lib/runtimeHubClient";
 
-export type RuntimeHubSection = "overview" | "models" | "catalogs" | "runtimes" | "api" | "lan";
+export type RuntimeHubSection = "overview" | "models" | "components" | "catalogs" | "runtimes" | "api" | "lan";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -58,6 +61,9 @@ interface RuntimeHubStoreState {
   profile: HardwareProfile | null;
   storage: M3StorageStatus | null;
   installedModels: M3InstalledModel[];
+  installedComponents: M3InstalledComponent[];
+  componentRegistry: M3ComponentCatalogEntry[];
+  componentUpdateChecks: M3ComponentUpdateCheck[];
   catalogSources: M3CatalogSourceConfig[];
   runtimes: M3RuntimeCapability[];
   runtimeDetails: Record<string, RuntimeDetail>;
@@ -92,6 +98,10 @@ interface RuntimeHubStoreState {
   deleteModel: (assetId: string) => Promise<void>;
   cleanupOrphans: () => Promise<void>;
   replaceCatalogSources: (sources: M3CatalogSourceConfig[]) => Promise<void>;
+  refreshComponents: () => Promise<void>;
+  installComponent: (entry: M3ComponentCatalogEntry) => Promise<void>;
+  activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
+  replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
@@ -245,6 +255,9 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     profile: null,
     storage: null,
     installedModels: [],
+    installedComponents: [],
+    componentRegistry: [],
+    componentUpdateChecks: [],
     catalogSources: [],
     runtimes: [],
     runtimeDetails: {},
@@ -271,7 +284,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     dismissPairedToken: () => set({ pairedToken: null }),
 
     refresh: async () => {
-      await Promise.all([get().refreshOverview(), get().refreshLan()]);
+      await Promise.all([get().refreshOverview(), get().refreshLan(), get().refreshComponents()]);
     },
 
     refreshOverview: async () => {
@@ -403,6 +416,85 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       try {
         const catalogSources = await runtimeHubClient.catalogReplaceSources(sources);
         set({ catalogSources, catalogResults: [] });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    refreshComponents: async () => {
+      const key = "components";
+      begin(key);
+      try {
+        const [installedComponents, componentRegistry] = await Promise.all([
+          runtimeHubClient.componentInstalled(),
+          runtimeHubClient.componentListRegistry({
+            operationId: createM3OperationId("component-registry-list"),
+            timeoutMs: 30_000,
+          }),
+        ]);
+        const componentUpdateChecks = installedComponents.length
+          ? await runtimeHubClient.componentCheckUpdates({
+              operationId: createM3OperationId("component-check-updates"),
+              timeoutMs: 30_000,
+            })
+          : [];
+        set({ installedComponents, componentRegistry, componentUpdateChecks });
+      } catch (error) {
+        // Soft-fails like `refreshLan`: a component-hub hiccup should not
+        // block the rest of the Runtime Hub overview from loading.
+        fail(key, error);
+      } finally {
+        finish(key);
+      }
+    },
+
+    installComponent: async (entry) => {
+      const key = `component-install:${entry.componentId}`;
+      const operationId = createM3OperationId("component-install");
+      begin(key, operationId);
+      try {
+        await runtimeHubClient.componentInstall({
+          operationId,
+          timeoutMs: null,
+          request: { entry },
+        });
+        await get().refreshComponents();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    activateComponentVersion: async (componentId, versionKey) => {
+      const key = `component-activate:${componentId}`;
+      const operationId = createM3OperationId("component-activate");
+      begin(key, operationId);
+      try {
+        await runtimeHubClient.componentActivateVersion({
+          operationId,
+          timeoutMs: 30_000,
+          request: { componentId, versionKey },
+        });
+        await get().refreshComponents();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    replaceComponentRegistry: async (entries) => {
+      const key = "component-registry";
+      begin(key);
+      try {
+        const componentRegistry = await runtimeHubClient.componentReplaceRegistryEntries(entries);
+        set({ componentRegistry });
       } catch (error) {
         fail(key, error);
         throw error;
