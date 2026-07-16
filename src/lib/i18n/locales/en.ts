@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
+import { inboxLocale } from "./inbox";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const en: Record<string, string> = {
   ...portabilityLocale,
   ...ecosystemLocale,
   ...developerLocale,
+  ...inboxLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.integratedTerminal": "Integrated terminal",

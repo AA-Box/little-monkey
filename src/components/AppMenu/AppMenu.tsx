@@ -6,6 +6,7 @@ import {
   ChevronsUpDown,
   Globe,
   HelpCircle,
+  Inbox,
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
@@ -21,6 +22,7 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
 }
 
@@ -49,7 +51,14 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenTerminal }: AppMenuProps) {
+export function AppMenu({
+  onOpenSettings,
+  onOpenRunCenter,
+  onOpenGlobalSearch,
+  onOpenBrowserWorkbench,
+  onOpenAgentInbox,
+  onOpenTerminal,
+}: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -99,6 +108,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenGlobalSearch();
+            }}
+          />
+          <MenuRow
+            icon={<Inbox size={14} className="text-faint" />}
+            label={t("AppMenu.agentInbox")}
+            onClick={() => {
+              closeAll();
+              onOpenAgentInbox();
             }}
           />
           <MenuRow
