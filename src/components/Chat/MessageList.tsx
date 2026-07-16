@@ -7,6 +7,7 @@ import {
   Brain,
   ChevronRight,
   ClipboardCheck,
+  Eye,
   FilePenLine,
   FileSearch,
   FileText,
@@ -60,6 +61,7 @@ import { useRulesStore } from "../../store/rulesStore";
 import MessageBubble from "./MessageBubble";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
+import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
@@ -394,8 +396,19 @@ const CheckpointRow = memo(function CheckpointRow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const turnRunning = useSessionStore(selectTurnRunning(sessionId));
+
+  // Notices recorded before manifest v2 (see `CheckpointNotice`'s doc
+  // comment) never got an `anchorIndex`/`label` at all — the preview modal
+  // needs both (it identifies the turn's own message range from them), so
+  // there's nothing to preview for those, same as they already can't offer
+  // conversation rewind.
+  const previewSubject =
+    typeof notice.anchorIndex === "number" && typeof notice.label === "string"
+      ? { id: notice.id, anchorIndex: notice.anchorIndex, label: notice.label, shellRan: Boolean(notice.shellRan), reverted: Boolean(notice.reverted) }
+      : null;
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -483,6 +496,16 @@ const CheckpointRow = memo(function CheckpointRow({
           <span title={notice.files.join("\n")}>
             {t("MessageList.checkpointFilesChanged", { count: notice.files.length, files: fileNames.join(", ") })}
           </span>
+          {previewSubject && (
+            <button
+              type="button"
+              onClick={() => setPreviewOpen(true)}
+              className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground"
+            >
+              <Eye size={11} />
+              {t("CheckpointTimeline.previewButton")}
+            </button>
+          )}
           {notice.reverted ? (
             <>
               <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
@@ -552,6 +575,14 @@ const CheckpointRow = memo(function CheckpointRow({
         )}
         {error && <div className="text-danger">{error}</div>}
       </div>
+      {previewOpen && previewSubject && (
+        <CheckpointPreviewModal
+          sessionId={sessionId}
+          checkpoint={previewSubject}
+          onClose={() => setPreviewOpen(false)}
+          onChanged={() => void useCheckpointStore.getState().refresh(sessionId)}
+        />
+      )}
     </div>
   );
 });
