@@ -548,8 +548,14 @@ impl PackageRegistryService {
         Ok(self.store.export_active(package_id)?)
     }
 
+    /// Lists installed package states, excluding tombstoned (uninstalled) entries.
     pub fn installed(&self) -> Result<Vec<InstalledPackageState>, M4ServiceError> {
-        Ok(self.store.list_installed()?)
+        Ok(self
+            .store
+            .list_installed()?
+            .into_iter()
+            .filter(|state| !state.tombstoned)
+            .collect())
     }
 
     /// Produces one consolidated runtime/health view across all installed
@@ -563,17 +569,24 @@ impl PackageRegistryService {
         oauth_origins: &BTreeSet<String>,
         activated_workflow_ids: &BTreeSet<String>,
     ) -> Result<Vec<PluginRuntimeDescriptor>, M4ServiceError> {
-        let states = self.store.list_installed()?;
+        // Tombstones are durable reinstall/audit metadata, not installed
+        // plugins. Exposing them here created a ghost blocked runtime card:
+        // export_active correctly returned NotInstalled, but the UI still
+        // rendered the historical package as corrupt. Building on installed()
+        // keeps this view aligned with the Settings installed list, so a
+        // non-tombstoned state without an active version still surfaces as a
+        // blocked runtime instead of silently disappearing.
+        let states = self.installed()?;
         let enabled_packages = states
             .iter()
-            .filter(|state| state.enabled && !state.revoked && !state.tombstoned)
+            .filter(|state| state.enabled && !state.revoked)
             .map(|state| state.package_id.clone())
             .collect::<BTreeSet<_>>();
         let mut plugins = Vec::with_capacity(states.len());
 
         for state in states {
             let active = state.active_version;
-            let blocked = state.revoked || state.tombstoned || active.is_none();
+            let blocked = state.revoked || active.is_none();
             let rollback_target = state
                 .activation_history
                 .iter()
@@ -2388,7 +2401,133 @@ mod tests {
                 .unwrap()
                 .tombstoned
         );
+        assert!(service.installed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uninstall_removes_plugin_from_installed_and_runtime_views() {
+        let directory = TempDirectory::new("plugin-runtime-uninstall");
+        let service = package_service(&directory.0);
+        let now = FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS;
+        let package = service
+            .seed_first_party(now)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.manifest.package_id == "com.littlemonkey.skill.review")
+            .unwrap();
+        let preview = service
+            .preview(&package.manifest.package_id, package.manifest.version, now)
+            .unwrap();
+        service
+            .install(
+                &PackageInstallAuthorization {
+                    package_id: package.manifest.package_id.clone(),
+                    version: package.manifest.version,
+                    approval_digest: preview.approval_digest,
+                    approved: true,
+                },
+                now,
+            )
+            .unwrap();
         assert_eq!(service.installed().unwrap().len(), 1);
+        assert_eq!(
+            service
+                .plugin_runtime(
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        service.uninstall(&package.manifest.package_id).unwrap();
+
+        assert!(service.installed().unwrap().is_empty());
+        assert!(service
+            .plugin_runtime(
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap()
+            .is_empty());
+
+        // Tombstone metadata still exists internally so reinstall sequencing
+        // and audit history remain intact; it is simply no longer a runtime.
+        assert!(service
+            .store
+            .installed(&package.manifest.package_id)
+            .unwrap()
+            .is_some_and(|state| state.tombstoned));
+    }
+
+    #[test]
+    fn plugin_runtime_reports_blocked_package_without_active_version() {
+        let directory = TempDirectory::new("plugin-runtime-active-none");
+        let service = package_service(&directory.0);
+        let now = FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS;
+        let package = service
+            .seed_first_party(now)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.manifest.package_id == "com.littlemonkey.skill.review")
+            .unwrap();
+        let preview = service
+            .preview(&package.manifest.package_id, package.manifest.version, now)
+            .unwrap();
+        service
+            .install(
+                &PackageInstallAuthorization {
+                    package_id: package.manifest.package_id.clone(),
+                    version: package.manifest.version,
+                    approval_digest: preview.approval_digest,
+                    approved: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Simulate a state written by an older schema or foreign tool: not
+        // tombstoned, yet without an active version. validate() accepts it,
+        // so both views must agree on how it is reported.
+        let mut state = service
+            .store
+            .installed(&package.manifest.package_id)
+            .unwrap()
+            .unwrap();
+        state.active_version = None;
+        state.sequence += 1;
+        let state_directory = fs::read_dir(directory.0.join("state"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap();
+        fs::write(
+            state_directory.join(format!("state-{:020}-manual.json", state.sequence)),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let installed = service.installed().unwrap();
+        assert_eq!(installed.len(), 1);
+        assert!(installed[0].active_version.is_none());
+
+        let plugins = service
+            .plugin_runtime(
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].health, PluginRuntimeHealth::Blocked);
+        assert!(plugins[0].version.is_none());
+        assert!(!plugins[0].issues.is_empty());
     }
 
     #[test]
