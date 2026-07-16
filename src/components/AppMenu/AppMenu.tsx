@@ -4,11 +4,15 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  Compass,
+  GitPullRequest,
   Globe,
   HelpCircle,
   ListTodo,
   Inbox,
+  Newspaper,
   Search,
+  ServerCog,
   Settings as SettingsIcon,
   SquareTerminal,
   Swords,
@@ -24,10 +28,14 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenIssueToPr: () => void;
+  onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDebate: () => void;
+  onRestartOnboarding: () => void;
+  onOpenDailyBrief: () => void;
 }
 
 interface MenuRowProps {
@@ -60,10 +68,14 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenIssueToPr,
+  onOpenMcpGenerator,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDebate,
+  onRestartOnboarding,
+  onOpenDailyBrief,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -117,6 +129,14 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Newspaper size={14} className="text-faint" />}
+            label={t("AppMenu.dailyBrief")}
+            onClick={() => {
+              closeAll();
+              onOpenDailyBrief();
+            }}
+          />
+          <MenuRow
             icon={<Inbox size={14} className="text-faint" />}
             label={t("AppMenu.agentInbox")}
             onClick={() => {
@@ -138,6 +158,22 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<GitPullRequest size={14} className="text-faint" />}
+            label={t("AppMenu.issueToPr")}
+            onClick={() => {
+              closeAll();
+              onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ServerCog size={14} className="text-faint" />}
+            label={t("AppMenu.mcpGenerator")}
+            onClick={() => {
+              closeAll();
+              onOpenMcpGenerator();
             }}
           />
           <MenuRow
@@ -216,6 +252,14 @@ export function AppMenu({
             )}
           </div>
 
+          <MenuRow
+            icon={<Compass size={14} className="text-faint" />}
+            label={t("AppMenu.restartOnboarding")}
+            onClick={() => {
+              closeAll();
+              onRestartOnboarding();
+            }}
+          />
           <MenuRow
             icon={<HelpCircle size={14} className="text-faint" />}
             label={t("AppMenu.getHelp")}
