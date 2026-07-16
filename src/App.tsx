@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { PanelRight, PanelRightClose, X } from "lucide-react";
+import { PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
+import { BrowserWorkbench } from "./components/Browser";
 import { GlobalSearch } from "./components/Search";
+import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { useRunStore } from "./store/runStore";
@@ -92,7 +94,9 @@ function App() {
   const [diffError, setDiffError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [runCenterOpen, setRunCenterOpen] = useState(false);
+  const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -107,6 +111,7 @@ function App() {
 
   const openSettingsTab = useCallback((tab: SettingsTab) => {
     setRunCenterOpen(false);
+    setBrowserWorkbenchOpen(false);
     setGlobalSearchOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
@@ -148,6 +153,7 @@ function App() {
       const actions: Record<ShortcutIdForScope<"global">, () => void> = {
         newSession: () => {
           setRunCenterOpen(false);
+          setBrowserWorkbenchOpen(false);
           setGlobalSearchOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
@@ -155,6 +161,7 @@ function App() {
         },
         openSettings: () => {
           setRunCenterOpen(false);
+          setBrowserWorkbenchOpen(false);
           setGlobalSearchOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
@@ -308,11 +315,13 @@ function App() {
         <AppMenu
           onOpenSettings={() => {
             setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
             setSettingsOpen(false);
+            setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
@@ -320,20 +329,40 @@ function App() {
           onOpenGlobalSearch={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
+          onOpenBrowserWorkbench={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setGlobalSearchOpen(false);
+            setSettingsInitialTab(undefined);
+            setBrowserWorkbenchOpen(true);
+          }}
+          onOpenTerminal={() => setTerminalOpen(true)}
         />
       </aside>
 
       {/* Center: chat, with a drag-region strip standing in for the title bar */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div data-tauri-drag-region className="h-11 shrink-0" />
+        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-end px-2">
+          <IconButton
+            size="sm"
+            variant={terminalOpen ? "secondary" : "ghost"}
+            onClick={() => setTerminalOpen((open) => !open)}
+            disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+            aria-label={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
+            title={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
+          >
+            <SquareTerminal size={15} />
+          </IconButton>
+        </div>
         <SessionGrantBanner />
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : runCenterOpen ? "run-center" : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : runCenterOpen ? "run-center" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -345,6 +374,13 @@ function App() {
             />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
+          ) : browserWorkbenchOpen ? (
+            <BrowserWorkbench
+              key={activeSessionId}
+              taskId={activeSessionId}
+              chatSessionId={activeSessionId}
+              onClose={() => setBrowserWorkbenchOpen(false)}
+            />
           ) : activeComparisonId ? (
             <CompareView groupId={activeComparisonId} />
           ) : activeCrewSessionId ? (
@@ -357,13 +393,16 @@ function App() {
             />
           )}
         </ErrorBoundary>
+        {terminalOpen && (
+          <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
+        )}
       </div>
 
       {/* Split pane: a second, fully independent chat opened via the session
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !runCenterOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !runCenterOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

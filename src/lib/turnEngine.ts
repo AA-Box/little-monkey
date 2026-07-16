@@ -664,7 +664,11 @@ export async function attemptStream(
           wireHistory,
           tools,
           signal,
-          target.providerId === 'anthropic' ? effort : undefined,
+          // Forwarded for every provider target — the Rust proxy owns the
+          // per-provider wire mapping/omission (verbatim for Anthropic,
+          // clamped reasoning_effort for OpenAI/Gemini/OpenRouter, nothing
+          // for custom endpoints; see providers.rs::build_chat_request).
+          effort,
           runId,
         )
       : streamChat(

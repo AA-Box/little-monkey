@@ -29,10 +29,21 @@ use crate::AppState;
 
 const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
 
-/// Valid values for Anthropic's `output_config.effort` field — the same set
-/// the native Messages API accepts. Ignored for every other provider (their
-/// OpenAI-compatible surfaces have no equivalent knob).
+/// Valid values for the app's effort scale — the five levels Anthropic's
+/// native `output_config.effort` field accepts. Other providers with a
+/// reasoning knob get a clamped subset on the wire (see
+/// `clamped_reasoning_effort`); providers without one get nothing.
 const VALID_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Maps the app's five-level effort scale onto the three-level
+/// `reasoning_effort` scale OpenAI-compatible reasoning surfaces accept:
+/// `xhigh`/`max` clamp down to `high`, everything else passes through.
+pub fn clamped_reasoning_effort(effort: &str) -> &str {
+    match effort {
+        "xhigh" | "max" => "high",
+        other => other,
+    }
+}
 
 /// A single built-in provider preset.
 struct ProviderPresetDef {
@@ -659,15 +670,19 @@ pub fn providers_cancel_chat(app: AppHandle, request_id: String) -> Result<(), S
 /// streaming proxy (below) and the CLI, which talks to the same providers
 /// directly — no WebView/keychain-proxy split needed in a terminal.
 ///
-/// `effort` maps to Anthropic's native `output_config.effort` field
-/// (low/medium/high/xhigh/max — see platform.claude.com's effort docs). It's
-/// not part of the OpenAI chat/completions schema (OpenAI's own
-/// `reasoning_effort` is a different field the Anthropic compat layer
-/// ignores), but the compat layer forwards unrecognized top-level JSON keys
-/// straight through to the underlying Messages API request, the same way it
-/// documents doing for `thinking`. Only sent for `provider_id == "anthropic"`
-/// — every other provider either has no such knob or a differently-shaped
-/// one, and sending it there would be a meaningless extra field at best.
+/// `effort` is shaped per provider. Anthropic gets its native
+/// `output_config.effort` field verbatim (low/medium/high/xhigh/max — see
+/// platform.claude.com's effort docs): it's not part of the OpenAI
+/// chat/completions schema, but Anthropic's compat layer forwards
+/// unrecognized top-level JSON keys straight through to the underlying
+/// Messages API request, the same way it documents doing for `thinking`.
+/// OpenAI and Gemini's compat surface take the OpenAI-schema
+/// `reasoning_effort` field, and OpenRouter normalizes the same scale under
+/// `reasoning.effort` — all three only know low/medium/high, so the two
+/// Anthropic-only top levels clamp down to `high`. Custom/unknown providers
+/// get nothing: OpenAI-compatible servers commonly hard-reject
+/// `reasoning_effort` on non-reasoning models, so an unknowable endpoint
+/// must never receive a speculative field.
 pub fn build_chat_request(
     client: &reqwest::Client,
     base_url: &str,
@@ -700,9 +715,16 @@ pub fn build_chat_request(
         body["stream_options"] = json!({ "include_usage": true });
     }
 
-    if provider_id == "anthropic" {
-        if let Some(effort) = effort {
-            body["output_config"] = json!({ "effort": effort });
+    if let Some(effort) = effort {
+        match provider_id {
+            "anthropic" => body["output_config"] = json!({ "effort": effort }),
+            "openai" | "gemini" => {
+                body["reasoning_effort"] = json!(clamped_reasoning_effort(effort));
+            }
+            "openrouter" => {
+                body["reasoning"] = json!({ "effort": clamped_reasoning_effort(effort) });
+            }
+            _ => {}
         }
     }
 
@@ -891,46 +913,97 @@ mod tests {
         assert_eq!(unique_slug("Mistral", &existing), "mistral");
     }
 
-    #[test]
-    fn build_chat_request_adds_output_config_effort_for_anthropic_only() {
+    fn request_body(provider_id: &str, effort: Option<&str>) -> serde_json::Value {
         let client = reqwest::Client::new();
-
-        let anthropic_req = build_chat_request(
+        let request = build_chat_request(
             &client,
-            "https://api.anthropic.com/v1",
-            "anthropic",
+            "https://example.com/v1",
+            provider_id,
             "key",
-            "claude-opus-4-8",
+            "some-model",
             &[],
             &[],
-            Some("xhigh"),
+            effort,
         )
         .build()
         .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(anthropic_req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(body["output_config"]["effort"], "xhigh");
+        serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn build_chat_request_sends_anthropic_effort_verbatim_at_all_five_levels() {
+        for level in VALID_EFFORT_LEVELS {
+            let body = request_body("anthropic", Some(level));
+            assert_eq!(body["output_config"]["effort"], *level);
+            assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("reasoning").is_none());
+            assert!(body.get("stream_options").is_none());
+        }
+    }
+
+    #[test]
+    fn build_chat_request_clamps_effort_to_reasoning_effort_for_openai_and_gemini() {
+        for provider in ["openai", "gemini"] {
+            for (level, wire) in [
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "high"),
+                ("xhigh", "high"),
+                ("max", "high"),
+            ] {
+                let body = request_body(provider, Some(level));
+                assert_eq!(body["reasoning_effort"], wire, "{provider} {level}");
+                assert!(body.get("output_config").is_none());
+                assert!(body.get("reasoning").is_none());
+            }
+        }
+        // The OpenAI-only stream_options extension is orthogonal to effort.
+        assert_eq!(
+            request_body("openai", Some("max"))["stream_options"]["include_usage"],
+            true
+        );
+        assert!(request_body("gemini", Some("max"))
+            .get("stream_options")
+            .is_none());
+    }
+
+    #[test]
+    fn build_chat_request_nests_clamped_effort_under_reasoning_for_openrouter() {
+        assert_eq!(
+            request_body("openrouter", Some("medium"))["reasoning"]["effort"],
+            "medium"
+        );
+        let clamped = request_body("openrouter", Some("max"));
+        assert_eq!(clamped["reasoning"]["effort"], "high");
+        assert!(clamped.get("reasoning_effort").is_none());
+        assert!(clamped.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_chat_request_omits_effort_entirely_for_custom_providers() {
+        let body = request_body("my-custom-provider", Some("max"));
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn build_chat_request_omits_every_effort_field_when_effort_is_none() {
+        for provider in ["anthropic", "openai", "gemini", "openrouter", "custom-x"] {
+            let body = request_body(provider, None);
+            assert!(body.get("output_config").is_none(), "{provider}");
+            assert!(body.get("reasoning_effort").is_none(), "{provider}");
+            assert!(body.get("reasoning").is_none(), "{provider}");
+        }
+    }
+
+    #[test]
+    fn build_chat_request_offers_tools_with_auto_tool_choice_only_when_tools_exist() {
+        let body = request_body("openai", None);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
-        assert!(body.get("stream_options").is_none());
 
-        let openai_req = build_chat_request(
-            &client,
-            "https://api.openai.com/v1",
-            "openai",
-            "key",
-            "gpt-4o",
-            &[],
-            &[],
-            Some("xhigh"),
-        )
-        .build()
-        .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(openai_req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert!(body.get("output_config").is_none());
-        assert_eq!(body["stream_options"]["include_usage"], true);
-
+        let client = reqwest::Client::new();
         let tool_req = build_chat_request(
             &client,
             "https://api.openai.com/v1",

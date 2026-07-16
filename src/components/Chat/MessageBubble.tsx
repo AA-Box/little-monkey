@@ -1,4 +1,4 @@
-import { Children, isValidElement, memo, useEffect, useState, type ReactNode } from "react";
+import { Children, isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { Eye, Languages, LoaderCircle, Pencil, X } from "lucide-react";
@@ -252,16 +252,21 @@ function UserBubble({
   return (
     <div className="group flex justify-end">
       <div className="flex max-w-[75%] items-start gap-1.5">
-        {onEdit && (
-          <button
-            type="button"
-            onClick={() => setEditing(true)}
-            disabled={editDisabled}
-            aria-label={t("MessageBubble.editMessageAriaLabel")}
-            className="mt-2.5 shrink-0 cursor-pointer text-faint opacity-0 transition-opacity duration-150 hover:text-foreground group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
-          >
-            <Pencil size={13} />
-          </button>
+        {(translationControls || onEdit) && (
+          <div className="mt-1.5 flex shrink-0 items-center gap-0.5">
+            {translationControls}
+            {onEdit && (
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                disabled={editDisabled}
+                aria-label={t("MessageBubble.editMessageAriaLabel")}
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
+              >
+                <Pencil size={13} />
+              </button>
+            )}
+          </div>
         )}
         <div className="flex flex-col gap-2 rounded-2xl border border-border bg-surface-2 px-4 py-2 text-sm text-foreground">
           {images.length > 0 && (
@@ -277,7 +282,6 @@ function UserBubble({
             </div>
           )}
           {(displayText ?? text) && <div className="whitespace-pre-wrap">{displayText ?? text}</div>}
-          {translationControls}
         </div>
       </div>
     </div>
@@ -298,12 +302,12 @@ function AssistantMessage({
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
-    <div className="w-full min-w-0">
+    <div className="group relative w-full min-w-0">
       <div className="mb-1.5 text-xs font-medium text-muted">{t("MessageBubble.assistantName")}</div>
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
-      {translationControls}
+      {translationControls && <div className="absolute -bottom-5 left-0 z-10">{translationControls}</div>}
     </div>
   );
 }
@@ -320,6 +324,7 @@ function TranslationControls({
   preferredLocale,
   disabled,
   onDisplay,
+  align,
 }: {
   sessionId: string;
   index: number;
@@ -328,6 +333,7 @@ function TranslationControls({
   preferredLocale: string | null;
   disabled: boolean;
   onDisplay: (translation: MessageTranslation | null) => void;
+  align: "start" | "end";
 }) {
   const { t } = useT();
   const [locale, setLocale] = useState(preferredLocale ?? defaultTranslationLocale());
@@ -335,6 +341,8 @@ function TranslationControls({
   const [showTranslation, setShowTranslation] = useState(Boolean(preferredLocale));
   const [latest, setLatest] = useState<MessageTranslation | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
   const saved = [...translations].reverse().find((translation) =>
     translation.messageIndex === index &&
     translation.locale.toLowerCase() === locale.toLowerCase() &&
@@ -345,14 +353,26 @@ function TranslationControls({
     : saved;
 
   useEffect(() => {
-    if (!preferredLocale) return;
-    setLocale(preferredLocale);
-    setShowTranslation(true);
+    if (preferredLocale) {
+      setLocale(preferredLocale);
+      setShowTranslation(true);
+    } else {
+      setShowTranslation(false);
+    }
   }, [preferredLocale]);
 
   useEffect(() => {
     onDisplay(showTranslation ? available : null);
   }, [available, onDisplay, showTranslation]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [menuOpen]);
 
   const start = async () => {
     setRunning(true);
@@ -361,6 +381,7 @@ function TranslationControls({
       const translation = await translateMessage(sessionId, index, locale);
       setLatest(translation);
       setShowTranslation(true);
+      setMenuOpen(false);
       onDisplay(translation);
     } catch (caught) {
       if (!(caught instanceof DOMException && caught.name === "AbortError")) {
@@ -371,59 +392,102 @@ function TranslationControls({
     }
   };
 
+  const controlVisible = menuOpen || running || available !== null || preferredLocale !== null;
+
   return (
-    <div className="mt-2 border-t border-border/70 pt-1.5 text-xs text-muted">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Languages size={13} aria-hidden="true" />
-        <select
-          aria-label={t("Translation.languageLabel")}
-          value={locale}
-          disabled={running}
-          onChange={(event) => {
-            setLocale(event.target.value);
-            setShowTranslation(false);
-            setError(null);
-          }}
-          className="cursor-pointer rounded border border-border bg-background px-1.5 py-0.5 text-xs text-foreground outline-none focus-visible:border-accent"
+    <div
+      ref={containerRef}
+      className={`relative flex items-center gap-0.5 text-xs text-muted transition-opacity duration-150 ${controlVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          setMenuOpen(false);
+        }
+      }}
+    >
+      <button
+        type="button"
+        aria-label={running ? t("Translation.cancel") : t("Translation.translate")}
+        aria-haspopup="dialog"
+        aria-expanded={menuOpen}
+        title={running ? t("Translation.cancel") : t("Translation.translate")}
+        disabled={disabled && !running}
+        onClick={() => {
+          if (running) cancelTranslation(messageTranslationKey(sessionId, index));
+          else setMenuOpen((value) => !value);
+        }}
+        className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
+      </button>
+
+      {available && (
+        <button
+          type="button"
+          onClick={() => setShowTranslation((value) => !value)}
+          className="flex h-7 cursor-pointer items-center gap-1 rounded-md px-1.5 text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground"
+          title={showTranslation ? t("Translation.showOriginal") : t("Translation.showTranslation")}
         >
-          {TRANSLATION_LOCALES.map(({ code, label }) => <option key={code} value={code}>{label}</option>)}
-        </select>
-        {running ? (
-          <button
-            type="button"
-            onClick={() => cancelTranslation(messageTranslationKey(sessionId, index))}
-            className="flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 hover:bg-surface hover:text-foreground"
-          >
-            <LoaderCircle size={12} className="animate-spin" />
-            {t("Translation.cancel")}
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={() => void start()}
-            disabled={disabled}
-            className="cursor-pointer rounded px-1.5 py-0.5 hover:bg-surface hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {t("Translation.translate")}
-          </button>
-        )}
-        {available && (
-          <button
-            type="button"
-            onClick={() => setShowTranslation((value) => !value)}
-            className="cursor-pointer rounded px-1.5 py-0.5 hover:bg-surface hover:text-foreground"
-          >
-            {showTranslation ? t("Translation.showOriginal") : t("Translation.showTranslation")}
-          </button>
-        )}
-        {available && <span className="text-faint">{t("Translation.preserved")}</span>}
-      </div>
-      {error && (
-        <div className="mt-1 flex items-start justify-between gap-2 rounded bg-danger-soft px-2 py-1 text-danger" role="alert">
-          <span>{t("Translation.error", { error })}</span>
-          <button type="button" onClick={() => setError(null)} aria-label="Dismiss translation error" className="cursor-pointer">
-            <X size={12} />
-          </button>
+          <Eye size={12} />
+          <span>{showTranslation ? t("Translation.showOriginal") : t("Translation.showTranslation")}</span>
+        </button>
+      )}
+
+      {menuOpen && (
+        <div
+          role="dialog"
+          aria-label={t("Translation.translate")}
+          className={`absolute top-full z-30 mt-1 w-64 rounded-xl border border-border bg-background p-3 text-left shadow-lg ${align === "end" ? "right-0" : "left-0"}`}
+        >
+          <label className="block text-[11px] font-medium text-muted">
+            {t("Translation.languageLabel")}
+            <select
+              autoFocus
+              value={locale}
+              disabled={running}
+              onChange={(event) => {
+                setLocale(event.target.value);
+                setShowTranslation(false);
+                setError(null);
+              }}
+              className="mt-1.5 w-full cursor-pointer rounded-md border border-border bg-background px-2.5 py-2 text-xs text-foreground outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/20"
+            >
+              {TRANSLATION_LOCALES.map(({ code, label }) => <option key={code} value={code}>{label}</option>)}
+            </select>
+          </label>
+
+          <div className="mt-2.5 flex items-center justify-between gap-2">
+            {available ? <span className="text-[10px] text-faint">{t("Translation.preserved")}</span> : <span />}
+            {running ? (
+              <button
+                type="button"
+                onClick={() => cancelTranslation(messageTranslationKey(sessionId, index))}
+                className="flex min-h-8 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-xs text-muted hover:bg-surface-2 hover:text-foreground"
+              >
+                <LoaderCircle size={12} className="animate-spin" />
+                {t("Translation.cancel")}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void start()}
+                disabled={disabled}
+                className="flex min-h-8 cursor-pointer items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-accent-foreground hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Languages size={12} />
+                {t("Translation.translate")}
+              </button>
+            )}
+          </div>
+
+          {error && (
+            <div className="mt-2 flex items-start justify-between gap-2 rounded-md bg-danger-soft px-2 py-1.5 text-[11px] leading-relaxed text-danger" role="alert">
+              <span>{t("Translation.error", { error })}</span>
+              <button type="button" onClick={() => setError(null)} aria-label="Dismiss translation error" className="shrink-0 cursor-pointer rounded p-0.5 hover:bg-danger/10">
+                <X size={12} />
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -453,7 +517,7 @@ function MessageBubble({
   preferredTranslationLocale = null,
 }: MessageBubbleProps) {
   const [displayedTranslation, setDisplayedTranslation] = useState<MessageTranslation | null>(null);
-  const controls = (
+  const controls = textContent(message.content).trim() ? (
     <TranslationControls
       sessionId={sessionId}
       index={index}
@@ -462,8 +526,9 @@ function MessageBubble({
       preferredLocale={preferredTranslationLocale}
       disabled={editDisabled === true}
       onDisplay={setDisplayedTranslation}
+      align={message.role === "user" ? "end" : "start"}
     />
-  );
+  ) : null;
   if (message.role === "user") {
     return (
       <UserBubble

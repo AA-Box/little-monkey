@@ -66,7 +66,9 @@ import { useModelStore } from "../../store/modelStore";
 import { useUsageStore } from "../../store/usageStore";
 import { useStackStore } from "../../store/stackStore";
 import { useSkillProposalStore } from "../../store/skillProposalStore";
+import { useBrowserWorkbenchStore } from "../../store/browserWorkbenchStore";
 import { useMcpStore } from "../../store/mcpStore";
+import { useTerminalStore } from "../../store/terminalStore";
 import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
 import type { SettingsTab } from "../Settings";
 
@@ -269,6 +271,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [crewId, setCrewId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
+  const consumeBrowserEvidence = useBrowserWorkbenchStore((state) => state.consumeForChat);
+  const pendingTerminalEvidence = useTerminalStore((state) => state.pendingEvidenceByChat[sessionId] ?? null);
+  const consumeTerminalEvidence = useTerminalStore((state) => state.consumeEvidence);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // "@"-mention autocomplete state. `mentionQuery` being non-null is what
@@ -471,6 +477,58 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     slashStartRef.current = null;
     requestAnimationFrame(resizeTextarea);
   }, [sessionId, resizeTextarea]);
+
+  // Browser evidence is never sent directly from the workbench. The user
+  // explicitly stages it here first, where the bounded untrusted summary and
+  // screenshot remain visible and removable before Send.
+  useEffect(() => {
+    if (!pendingBrowserEvidence) return;
+    setInput((current) => [current.trim(), pendingBrowserEvidence.summary].filter(Boolean).join("\n\n"));
+    if (pendingBrowserEvidence.screenshot) {
+      const screenshot = pendingBrowserEvidence.screenshot;
+      setAttachments((current) => [
+        ...current.filter((attachment) => attachment.path !== screenshot.path),
+        {
+          path: screenshot.path,
+          isDir: false,
+          kind: "image",
+          dataUrl: screenshot.dataUrl,
+        },
+      ]);
+    }
+    consumeBrowserEvidence(sessionId, pendingBrowserEvidence.id);
+    requestAnimationFrame(() => {
+      resizeTextarea();
+      textareaRef.current?.focus();
+    });
+  }, [consumeBrowserEvidence, pendingBrowserEvidence, resizeTextarea, sessionId]);
+
+  // Terminal evidence crosses into a model turn only after TerminalPanel's
+  // explicit review confirmation. It then appears as a normal removable
+  // composer attachment and still waits for the user's final Send action.
+  useEffect(() => {
+    if (!pendingTerminalEvidence?.length) return;
+    const evidence = consumeTerminalEvidence(sessionId);
+    if (evidence.length === 0) return;
+    setAttachments((current) => {
+      const existing = new Set(current.map((attachment) => attachment.path));
+      const additions: AttachmentRef[] = evidence
+        .filter((entry) => !existing.has(entry.path))
+        .map((entry) => ({
+          path: entry.path,
+          isDir: false,
+          kind: "inline_text",
+          content: entry.content,
+          label: entry.label,
+        }));
+      return additions.length > 0 ? [...current, ...additions] : current;
+    });
+    setInput((current) => current.trim() ? current : t("TerminalPanel.defaultPrompt"));
+    requestAnimationFrame(() => {
+      resizeTextarea();
+      textareaRef.current?.focus();
+    });
+  }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
 
   // The separately-capability-scoped companion overlay never writes session
   // state directly. Rust emits its explicit context only to the main window;
@@ -1207,7 +1265,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
               <div className="mb-1.5 flex flex-wrap gap-1.5">
                 {attachments.map((attachment) => {
                   const segments = attachment.path.split(/[\\/]/).filter(Boolean);
-                  const name = segments[segments.length - 1] ?? attachment.path;
+                  const name = attachment.label ?? segments[segments.length - 1] ?? attachment.path;
                   return (
                     <AttachmentChip
                       key={attachment.path}

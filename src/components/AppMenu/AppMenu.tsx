@@ -6,15 +6,13 @@ import {
   ChevronsUpDown,
   Globe,
   HelpCircle,
-  Moon,
   Search,
   Settings as SettingsIcon,
-  Sun,
+  SquareTerminal,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
 import { useLocaleStore } from "../../store/localeStore";
-import { applyTheme, getStoredTheme, type Theme } from "../../lib/theme";
 
 const APP_VERSION = "0.1.0";
 
@@ -22,6 +20,8 @@ interface AppMenuProps {
   onOpenSettings: () => void;
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
+  onOpenBrowserWorkbench: () => void;
+  onOpenTerminal: () => void;
 }
 
 interface MenuRowProps {
@@ -46,17 +46,16 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
 /**
  * Sidebar footer: replaces the account/org switcher row a hosted app would
  * show here (no accounts in this local app) with an app-branded trigger that
- * opens Settings, theme, and a language flyout (native-name list with a
+ * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }: AppMenuProps) {
+export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenTerminal }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
 
   const [open, setOpen] = useState(false);
   const [langOpen, setLangOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>(() => getStoredTheme());
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -70,13 +69,6 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }:
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
   }, [open]);
-
-  const handleToggleTheme = () => {
-    const next: Theme = theme === "dark" ? "light" : "dark";
-    applyTheme(next);
-    setTheme(next);
-    setOpen(false);
-  };
 
   const closeAll = () => {
     setOpen(false);
@@ -118,6 +110,22 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }:
             }}
           />
           <MenuRow
+            icon={<Globe size={14} className="text-faint" />}
+            label={t("AppMenu.browserWorkbench")}
+            onClick={() => {
+              closeAll();
+              onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<SquareTerminal size={14} className="text-faint" />}
+            label={t("AppMenu.integratedTerminal")}
+            onClick={() => {
+              closeAll();
+              onOpenTerminal();
+            }}
+          />
+          <MenuRow
             icon={<SettingsIcon size={14} className="text-faint" />}
             label={t("AppMenu.settings")}
             onClick={() => {
@@ -125,18 +133,6 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch }:
               onOpenSettings();
             }}
           />
-          <MenuRow
-            icon={
-              theme === "dark" ? (
-                <Sun size={14} className="text-faint" />
-              ) : (
-                <Moon size={14} className="text-faint" />
-              )
-            }
-            label={theme === "dark" ? t("AppMenu.switchToLightTheme") : t("AppMenu.switchToDarkTheme")}
-            onClick={handleToggleTheme}
-          />
-
           <div className="my-1 border-t border-border" />
 
           <div
