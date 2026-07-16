@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 
 export const it: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,40 @@ export const it: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
+  // Trust Scorecards (ROADMAP.md Phase 7) — real translations overriding the English `trustScorecardsLocale` defaults spread above.
+  "AppMenu.trustScorecards": "Schede di fiducia",
+  "TrustScorecards.title": "Schede di fiducia",
+  "TrustScorecards.subtitle": "Confronta qualità, costo, privacy, sicurezza, affidabilità e provenienza di ogni modello, connettore, server MCP, skill, workflow e plugin — con le prove esatte da cui è stato ricavato ogni punteggio.",
+  "TrustScorecards.close": "Chiudi Schede di fiducia",
+  "TrustScorecards.refresh": "Aggiorna schede",
+  "TrustScorecards.loading": "Valutazione delle entità…",
+  "TrustScorecards.empty": "Nulla da valutare per ora — collega prima un modello, un connettore, un server MCP, uno skill, un workflow o un plugin.",
+  "TrustScorecards.filterAll": "Tutti",
+  "TrustScorecards.searchPlaceholder": "Cerca per nome…",
+  "TrustScorecards.columnName": "Nome",
+  "TrustScorecards.columnKind": "Tipo",
+  "TrustScorecards.columnDimension": "Dimensione",
+  "TrustScorecards.expandEvidence": "Mostra prove",
+  "TrustScorecards.selectForCompare": "Seleziona {{name}} per il confronto",
+  "TrustScorecards.compareButton": "Confronta {{count}}",
+  "TrustScorecards.compareTitle": "Confronto di {{count}} profili di fiducia",
+  "TrustScorecards.kind.model": "Modello",
+  "TrustScorecards.kind.connector": "Connettore",
+  "TrustScorecards.kind.mcp_server": "Server MCP",
+  "TrustScorecards.kind.skill": "Skill",
+  "TrustScorecards.kind.workflow": "Workflow",
+  "TrustScorecards.kind.plugin": "Plugin",
+  "TrustScorecards.dimension.quality": "Qualità",
+  "TrustScorecards.dimension.cost": "Costo",
+  "TrustScorecards.dimension.privacy": "Privacy",
+  "TrustScorecards.dimension.security": "Sicurezza",
+  "TrustScorecards.dimension.reliability": "Affidabilità",
+  "TrustScorecards.dimension.provenance": "Provenienza",
+  "TrustScorecards.level.good": "Buono",
+  "TrustScorecards.level.fair": "Discreto",
+  "TrustScorecards.level.poor": "Scarso",
+  "TrustScorecards.level.unknown": "Prove insufficienti",
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flusso agente Issue-to-PR",

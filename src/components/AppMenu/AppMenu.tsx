@@ -9,6 +9,7 @@ import {
   HelpCircle,
   Search,
   Settings as SettingsIcon,
+  ShieldCheck,
   SquareTerminal,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
@@ -23,6 +24,7 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenTrustScorecards: () => void;
   onOpenTerminal: () => void;
 }
 
@@ -51,7 +53,15 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenIssueToPr, onOpenTerminal }: AppMenuProps) {
+export function AppMenu({
+  onOpenSettings,
+  onOpenRunCenter,
+  onOpenGlobalSearch,
+  onOpenBrowserWorkbench,
+  onOpenIssueToPr,
+  onOpenTrustScorecards,
+  onOpenTerminal,
+}: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -125,6 +135,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldCheck size={14} className="text-faint" />}
+            label={t("AppMenu.trustScorecards")}
+            onClick={() => {
+              closeAll();
+              onOpenTrustScorecards();
             }}
           />
           <MenuRow
