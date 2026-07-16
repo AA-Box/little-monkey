@@ -96,7 +96,9 @@ export interface ModelTargetInventoryInput {
   readonly ollamaReachable: boolean;
   readonly providers: readonly ProviderConfig[];
   readonly providerModels: Readonly<Record<string, readonly ProviderModelInfo[]>>;
-  readonly effort?: EffortLevel;
+  /** Per-model effort choices keyed by target key — see `modelStore.ts`'s
+   * `effortByTarget`. A model with no entry snapshots no effort at all. */
+  readonly effortByTarget?: Readonly<Record<string, EffortLevel>>;
   readonly ollamaBaseUrl?: string;
 }
 
@@ -152,6 +154,46 @@ export function ollamaModelTargetKey(model: string): string {
 
 export function providerModelTargetKey(providerId: string, model: string): string {
   return `provider:${encodeKeyPart(providerId)}:${encodeKeyPart(model)}`;
+}
+
+/** Providers with a reasoning-effort knob, and the levels each accepts.
+ * Anthropic's native `output_config.effort` takes all five levels; OpenAI,
+ * Gemini, and OpenRouter expose a three-level `reasoning_effort` scale (the
+ * Rust proxy clamps `xhigh`/`max` down to `high` on the wire — see
+ * `providers.rs::build_chat_request`). Custom providers are deliberately
+ * absent: their endpoints are unknowable and OpenAI-compatible servers
+ * commonly hard-reject a `reasoning_effort` field on non-reasoning models,
+ * so no effort is ever captured or sent for them. */
+const PROVIDER_EFFORT_LEVELS: Readonly<Record<string, readonly EffortLevel[]>> = {
+  anthropic: EFFORT_LEVELS,
+  openai: ["low", "medium", "high"],
+  gemini: ["low", "medium", "high"],
+  openrouter: ["low", "medium", "high"],
+};
+
+/** The effort levels selectable for `providerId`, or `null` when the
+ * provider has no effort knob at all (custom endpoints, unknown ids). */
+export function effortLevelsForProvider(providerId: string): readonly EffortLevel[] | null {
+  return PROVIDER_EFFORT_LEVELS[providerId] ?? null;
+}
+
+/** Provider-scope fallback entry `modelStore.ts`'s one-time migration seeds
+ * from the legacy single-global (Anthropic-only) effort setting. It applies
+ * to any Anthropic model without its own per-model entry, preserving the
+ * pre-migration behavior where one slider covered every Anthropic model. */
+export const ANTHROPIC_EFFORT_FALLBACK_KEY = "provider:anthropic";
+
+/** Resolves the effort to use for one provider model from a per-target map:
+ * the model's own entry first, then (Anthropic only) the migrated legacy
+ * fallback. `undefined` means "send no effort field at all". */
+export function effortForProviderModel(
+  effortByTarget: Readonly<Record<string, EffortLevel>> | undefined,
+  providerId: string,
+  model: string,
+): EffortLevel | undefined {
+  const exact = effortByTarget?.[providerModelTargetKey(providerId, model)];
+  if (exact) return exact;
+  return providerId === "anthropic" ? effortByTarget?.[ANTHROPIC_EFFORT_FALLBACK_KEY] : undefined;
 }
 
 function capability(state: CapabilityState, evidence: string): CapabilityAssessment {
@@ -220,8 +262,11 @@ function ollamaTarget(
 function providerTarget(
   provider: ProviderConfig,
   model: ProviderModelInfo,
-  effort: EffortLevel | undefined,
+  effortByTarget: Readonly<Record<string, EffortLevel>> | undefined,
 ): ProviderModelTargetSnapshot {
+  const effort = effortLevelsForProvider(provider.id)
+    ? effortForProviderModel(effortByTarget, provider.id, model.id)
+    : undefined;
   const snapshot: ProviderModelTargetSnapshot = {
     kind: "provider",
     key: providerModelTargetKey(provider.id, model.id),
@@ -240,7 +285,7 @@ function providerTarget(
       "available",
       "Provider credentials are configured; request reachability is checked when the turn starts.",
     ),
-    ...(provider.id === "anthropic" && effort ? { effort } : {}),
+    ...(effort ? { effort } : {}),
   };
   return freezeTarget(snapshot);
 }
@@ -285,7 +330,7 @@ export function buildModelTargetInventory(input: ModelTargetInventoryInput): Mod
     const targets: ProviderModelTargetSnapshot[] = [];
     for (const model of input.providerModels[provider.id] ?? []) {
       if (!model.id.trim()) continue;
-      const target = providerTarget(provider, model, input.effort);
+      const target = providerTarget(provider, model, input.effortByTarget);
       if (seenKeys.has(target.key)) continue;
       seenKeys.add(target.key);
       targets.push(target);

@@ -89,7 +89,7 @@ export function CrewPicker({ value, onChange, disabled = false }: CrewPickerProp
       ollamaReachable: state.ollamaReachable,
       providers: state.providers,
       providerModels: state.providerModels,
-      effort: state.effort,
+      effortByTarget: state.effortByTarget,
       activeProvider: state.activeProvider,
       activeOllamaModel: state.activeOllamaModel,
       activeProviderId: state.activeProviderId,
@@ -104,7 +104,7 @@ export function CrewPicker({ value, onChange, disabled = false }: CrewPickerProp
     ollamaReachable: modelState.ollamaReachable,
     providers: modelState.providers,
     providerModels: modelState.providerModels,
-    effort: modelState.effort,
+    effortByTarget: modelState.effortByTarget,
   }), [modelState]);
   const availableTargets = inventory.targets.filter((target) => target.availability.status === "available");
   const selectedCrew = crews.find((crew) => crew.id === value) ?? null;

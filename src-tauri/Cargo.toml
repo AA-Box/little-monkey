@@ -28,6 +28,7 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-window-state = "2"
 tokio = { version = "1.52.3", features = ["full"] }
 # "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
 # `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
@@ -164,6 +165,11 @@ system-memory = "0.1.7"
 # to be installed on a user's machine; backup/limits support bounded portable
 # snapshots and hostile-input guardrails.
 rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
+# terminal.rs: one cross-platform pseudoterminal implementation for the
+# in-app terminal. The frontend intentionally stays a thin line-oriented
+# terminal surface; process ownership, output bounds, cancellation, and
+# workspace validation all remain in Rust.
+portable-pty = "0.9.0"
 
 # cli_install.rs (Windows only — macOS/Linux use a plain symlink via
 # `std::os::unix::fs::symlink`, no extra dependency needed): adds the CLI

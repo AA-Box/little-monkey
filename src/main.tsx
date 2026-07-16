@@ -3,12 +3,17 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
-import { applyTheme, getStoredTheme } from "./lib/theme";
+import { applyAppearance, subscribeToSystemTheme } from "./lib/theme";
+import { useSettingsStore } from "./store/settingsStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
 import { hydratePrompts } from "./store/promptStore";
 import { CompanionOverlay } from "./components/Companion";
 
-applyTheme(getStoredTheme());
+applyAppearance(useSettingsStore.getState());
+subscribeToSystemTheme(() => {
+  const settings = useSettingsStore.getState();
+  if (settings.themePreference === "system") applyAppearance(settings);
+});
 
 // Sessions (and the prompt/persona library, same file-based pattern — see
 // src-tauri/src/prompts.rs) are persisted in files in the app data dir and

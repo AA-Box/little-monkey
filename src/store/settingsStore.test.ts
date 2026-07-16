@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { THEME_STORAGE_KEY } from "../lib/theme";
 import { STORAGE_KEY, useSettingsStore } from "./settingsStore";
 
 describe("settingsStore.checkpointRetention", () => {
@@ -519,5 +520,108 @@ describe("settingsStore.subagentProfileModels", () => {
     const fresh = await import("./settingsStore");
     expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({ code: { providerId: "x", model: "y" } });
     localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.appearance", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      themePreference: "system",
+      accentColor: "default",
+      textScale: "medium",
+      motionPreference: "system",
+      highContrastEnabled: false,
+    });
+  });
+
+  it("defaults to the standard appearance when nothing is persisted", async () => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(THEME_STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState()).toMatchObject({
+      themePreference: "system",
+      accentColor: "default",
+      textScale: "medium",
+      motionPreference: "system",
+      highContrastEnabled: false,
+    });
+  });
+
+  it("updates every appearance field through its setter", () => {
+    const settings = useSettingsStore.getState();
+    settings.setThemePreference("dark");
+    settings.setAccentColor("teal");
+    settings.setTextScale("large");
+    settings.setMotionPreference("reduced");
+    settings.setHighContrastEnabled(true);
+
+    expect(useSettingsStore.getState()).toMatchObject({
+      themePreference: "dark",
+      accentColor: "teal",
+      textScale: "large",
+      motionPreference: "reduced",
+      highContrastEnabled: true,
+    });
+  });
+
+  it("persists appearance across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setThemePreference("dark");
+    useSettingsStore.getState().setAccentColor("rose");
+    useSettingsStore.getState().setTextScale("small");
+    useSettingsStore.getState().setMotionPreference("reduced");
+    useSettingsStore.getState().setHighContrastEnabled(true);
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState()).toMatchObject({
+      themePreference: "dark",
+      accentColor: "rose",
+      textScale: "small",
+      motionPreference: "reduced",
+      highContrastEnabled: true,
+    });
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(THEME_STORAGE_KEY);
+  });
+
+  it("falls back for malformed persisted appearance fields", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        themePreference: "midnight",
+        accentColor: "ultraviolet",
+        textScale: "giant",
+        motionPreference: "spinny",
+        highContrastEnabled: "yes",
+      }),
+    );
+    localStorage.removeItem(THEME_STORAGE_KEY);
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState()).toMatchObject({
+      themePreference: "system",
+      accentColor: "default",
+      textScale: "medium",
+      motionPreference: "system",
+      highContrastEnabled: false,
+    });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("migrates the old theme-only storage key when the settings blob is absent", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.setItem(THEME_STORAGE_KEY, "dark");
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().themePreference).toBe("dark");
+    localStorage.removeItem(THEME_STORAGE_KEY);
   });
 });

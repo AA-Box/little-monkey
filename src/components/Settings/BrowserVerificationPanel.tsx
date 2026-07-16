@@ -48,7 +48,7 @@ export function BrowserVerificationPanel() {
   }, [url]);
 
   useEffect(() => {
-    void listBrowserSessions().then((sessions) => setSession(sessions[0] ?? null)).catch(() => undefined);
+    void listBrowserSessions().then((sessions) => setSession(sessions.find((candidate) => candidate.runId.startsWith("settings-browser-")) ?? null)).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -91,7 +91,7 @@ export function BrowserVerificationPanel() {
         <div className="mt-2 flex flex-col gap-2 sm:flex-row">
           <input id="browser-url" value={url} onChange={(event) => setUrl(event.target.value)} className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground" />
           {!session ? (
-            <Button variant="primary" disabled={!origin || busy !== null || (local && !allowLoopback)} onClick={() => void perform("start", () => startBrowserSession({ runId: `browser-${crypto.randomUUID()}`, url, allowLoopback }), (next) => setSession(next))}>
+            <Button variant="primary" disabled={!origin || busy !== null || (local && !allowLoopback)} onClick={() => void perform("start", () => startBrowserSession({ runId: `settings-browser-${crypto.randomUUID()}`, url, allowLoopback }), (next) => setSession(next))}>
               {busy === "start" ? <Loader2 size={14} className="animate-spin" /> : <ExternalLink size={14} />} Start
             </Button>
           ) : (
