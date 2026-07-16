@@ -13,6 +13,7 @@ import { inboxLocale } from "./inbox";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { migrationAgentLocale } from "./migrationAgent";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -30,6 +31,7 @@ export const en: Record<string, string> = {
   ...knowledgeGraphExplorerLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
+  ...migrationAgentLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",

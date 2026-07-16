@@ -11,6 +11,7 @@ import { BrowserWorkbench } from "./components/Browser";
 import { IssueToPrPanel } from "./components/IssueToPr";
 import { SopCompilerPanel } from "./components/SopCompiler";
 import { McpGeneratorPanel } from "./components/McpGenerator";
+import { MigrationAgentPanel } from "./components/MigrationAgent";
 import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
@@ -112,6 +113,7 @@ function App() {
   const [issueToPrOpen, setIssueToPrOpen] = useState(false);
   const [sopCompilerOpen, setSopCompilerOpen] = useState(false);
   const [mcpGeneratorOpen, setMcpGeneratorOpen] = useState(false);
+  const [migrationAgentOpen, setMigrationAgentOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
@@ -137,6 +139,7 @@ function App() {
     setIssueToPrOpen(false);
     setSopCompilerOpen(false);
     setMcpGeneratorOpen(false);
+    setMigrationAgentOpen(false);
     setGlobalSearchOpen(false);
     setAgentInboxOpen(false);
     setKnowledgeGraphOpen(false);
@@ -184,6 +187,8 @@ function App() {
         newSession: () => {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
+          setIssueToPrOpen(false);
+          setMigrationAgentOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setKnowledgeGraphOpen(false);
@@ -197,6 +202,8 @@ function App() {
         openSettings: () => {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
+          setIssueToPrOpen(false);
+          setMigrationAgentOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setKnowledgeGraphOpen(false);
@@ -370,6 +377,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
@@ -384,6 +392,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
@@ -400,6 +409,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
@@ -414,6 +424,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
@@ -429,6 +440,7 @@ function App() {
             setBrowserWorkbenchOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
@@ -445,6 +457,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
@@ -460,6 +473,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setSopCompilerOpen(false);
+            setMigrationAgentOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
@@ -468,6 +482,22 @@ function App() {
             setSettingsInitialTab(undefined);
             setMcpGeneratorOpen(true);
           }}
+          onOpenMigrationAgent={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setAgentInboxOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setMigrationAgentOpen(true);
+          }}
           onOpenAgentInbox={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -475,6 +505,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
@@ -520,6 +551,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
@@ -549,6 +581,8 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDebateOpen(false);
@@ -576,7 +610,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : migrationAgentOpen ? "migration-agent" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -636,6 +670,15 @@ function App() {
             />
           ) : mcpGeneratorOpen ? (
             <McpGeneratorPanel onClose={() => setMcpGeneratorOpen(false)} />
+          ) : migrationAgentOpen ? (
+            <MigrationAgentPanel
+              onClose={() => setMigrationAgentOpen(false)}
+              onOpenRunCapsule={(runId) => {
+                setMigrationAgentOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
@@ -664,7 +707,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !migrationAgentOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
