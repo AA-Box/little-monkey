@@ -204,7 +204,7 @@ function targetInventoryInput() {
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
     providerModels: state.providerModels,
-    effort: state.effort,
+    effortByTarget: state.effortByTarget,
   };
 }
 

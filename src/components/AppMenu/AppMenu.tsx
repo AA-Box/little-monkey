@@ -7,8 +7,10 @@ import {
   Globe,
   HelpCircle,
   ListTodo,
+  Inbox,
   Search,
   Settings as SettingsIcon,
+  SquareTerminal,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -22,6 +24,8 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenSideTasks: () => void;
+  onOpenAgentInbox: () => void;
+  onOpenTerminal: () => void;
 }
 
 interface MenuRowProps {
@@ -49,7 +53,15 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
  * opens Settings and a language flyout (native-name list with a
  * checkmark on the active locale, mirroring the reference language picker).
  */
-export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, onOpenBrowserWorkbench, onOpenSideTasks }: AppMenuProps) {
+export function AppMenu({
+  onOpenSettings,
+  onOpenRunCenter,
+  onOpenGlobalSearch,
+  onOpenBrowserWorkbench,
+  onOpenSideTasks,
+  onOpenAgentInbox,
+  onOpenTerminal,
+}: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
   const setLocale = useLocaleStore((state) => state.setLocale);
@@ -102,6 +114,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             }}
           />
           <MenuRow
+            icon={<Inbox size={14} className="text-faint" />}
+            label={t("AppMenu.agentInbox")}
+            onClick={() => {
+              closeAll();
+              onOpenAgentInbox();
+            }}
+          />
+          <MenuRow
             icon={<Activity size={14} className="text-faint" />}
             label={t("AppMenu.runCenter")}
             onClick={() => {
@@ -123,6 +143,14 @@ export function AppMenu({ onOpenSettings, onOpenRunCenter, onOpenGlobalSearch, o
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<SquareTerminal size={14} className="text-faint" />}
+            label={t("AppMenu.integratedTerminal")}
+            onClick={() => {
+              closeAll();
+              onOpenTerminal();
             }}
           />
           <MenuRow
