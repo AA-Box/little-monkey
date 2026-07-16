@@ -9,6 +9,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
 import { IssueToPrPanel } from "./components/IssueToPr";
+import { SecurityAutofixPanel } from "./components/SecurityAutofix";
 import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
@@ -100,6 +101,7 @@ function App() {
   const [runCenterOpen, setRunCenterOpen] = useState(false);
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [issueToPrOpen, setIssueToPrOpen] = useState(false);
+  const [securityAutofixOpen, setSecurityAutofixOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
@@ -119,6 +121,7 @@ function App() {
     setRunCenterOpen(false);
     setBrowserWorkbenchOpen(false);
     setIssueToPrOpen(false);
+    setSecurityAutofixOpen(false);
     setGlobalSearchOpen(false);
     setAgentInboxOpen(false);
     setSettingsInitialTab(tab);
@@ -162,6 +165,7 @@ function App() {
         newSession: () => {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
+          setSecurityAutofixOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setSettingsOpen(false);
@@ -171,6 +175,7 @@ function App() {
         openSettings: () => {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
+          setSecurityAutofixOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setSettingsInitialTab(undefined);
@@ -327,6 +332,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setSecurityAutofixOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setSettingsOpen(true);
@@ -335,6 +341,7 @@ function App() {
             setSettingsOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setSecurityAutofixOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
@@ -345,6 +352,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setSecurityAutofixOpen(false);
             setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
@@ -353,6 +361,7 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setIssueToPrOpen(false);
+            setSecurityAutofixOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
@@ -362,10 +371,21 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setSecurityAutofixOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
+          }}
+          onOpenSecurityAutofix={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setSettingsInitialTab(undefined);
+            setSecurityAutofixOpen(true);
           }}
           onOpenAgentInbox={() => {
             setSettingsOpen(false);
@@ -373,6 +393,7 @@ function App() {
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
             setIssueToPrOpen(false);
+            setSecurityAutofixOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
           }}
@@ -399,7 +420,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -425,6 +446,15 @@ function App() {
               onClose={() => setIssueToPrOpen(false)}
               onOpenRunCapsule={(runId) => {
                 setIssueToPrOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
+          ) : securityAutofixOpen ? (
+            <SecurityAutofixPanel
+              onClose={() => setSecurityAutofixOpen(false)}
+              onOpenRunCapsule={(runId) => {
+                setSecurityAutofixOpen(false);
                 setRunCenterOpen(true);
                 void useRunStore.getState().selectRun(runId);
               }}
@@ -457,7 +487,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !runCenterOpen && !issueToPrOpen && !securityAutofixOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

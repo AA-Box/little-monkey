@@ -9,6 +9,7 @@ import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { inboxLocale } from "./inbox";
 import { approvalChainsLocale } from "./approvalChains";
+import { securityAutofixLocale } from "./securityAutofix";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -22,6 +23,7 @@ export const en: Record<string, string> = {
   ...triageLocale,
   ...inboxLocale,
   ...approvalChainsLocale,
+  ...securityAutofixLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
