@@ -14,6 +14,7 @@ import { AgentInbox } from "./components/Inbox";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
+import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore } from "./store/sideTaskStore";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
@@ -27,6 +28,7 @@ import { usePermissionStore } from "./store/permissionStore";
 import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
 import { hydrateAutomations } from "./store/automationsStore";
+import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
 import { useT } from "./lib/i18n";
@@ -90,6 +92,8 @@ function App() {
   const connectMcp = useMcpStore((s) => s.connect);
   const activeArtifact = useArtifactStore((s) => s.active);
   const permissionPending = usePermissionStore((s) => s.pending !== null);
+  const hasCompletedOnboarding = useOnboardingStore((s) => s.hasCompletedOnboarding);
+  const restartOnboarding = useOnboardingStore((s) => s.restartOnboarding);
 
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
@@ -307,6 +311,17 @@ function App() {
     }
   }, [selectedFile]);
 
+  // First-run onboarding (ROADMAP.md Phase 6): a Tauri-only, full-screen
+  // wizard that replaces the entire shell below until it's finished or
+  // explicitly skipped. Plain-browser dev (`vite` without the Tauri shell)
+  // never shows it — same `isTauri()` guard every other Tauri-only boot
+  // effect above already uses — so it can't block local frontend-only
+  // development. Placed after every hook above so hook call order never
+  // depends on this condition.
+  if (isTauri() && !hasCompletedOnboarding) {
+    return <OnboardingWizard />;
+  }
+
   return (
     <div className="flex h-screen w-screen bg-background text-foreground">
       {/* Left sidebar: chat session list, extending to the very top of the
@@ -361,6 +376,15 @@ function App() {
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
+          onRestartOnboarding={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setTerminalOpen(false);
+            restartOnboarding();
+          }}
         />
       </aside>
 
