@@ -163,6 +163,12 @@ mod run_commands;
 // subcommand exists yet (it emits a launchd/crontab line, no in-process
 // scheduling), but there's no reason to make this one module-private either.
 pub mod automations;
+// Visible per-workspace data boundary in front of outbound sends to a cloud
+// model: reuses `knowledge_pipeline::SensitiveDataScanner` for detection and
+// adds only a persisted policy and the two-phase (`RequireApproval`)
+// confirm-then-send commands. Kept destination-agnostic (see its own module
+// doc) so a future connector/MCP-result/paired-device call site is additive.
+pub mod privacy_firewall;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -325,6 +331,22 @@ pub struct AppState {
     pub index_cancels: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
     >,
+    /// Serializes `privacy_firewall/<workspace>.json` read-modify-write
+    /// cycles (see `privacy_firewall::privacy_firewall_save_policy`) — same
+    /// reasoning as `mcp_config_lock`/`web_settings_lock` above: a
+    /// synchronous command Tauri can dispatch onto genuinely concurrent OS
+    /// threads, so without a shared lock two concurrent policy edits (e.g.
+    /// two Settings toggles fired close together) could both load the same
+    /// "before" file and the later save silently clobbers the earlier one's
+    /// change.
+    pub privacy_firewall_lock: std::sync::Mutex<()>,
+    /// Previewed-but-not-yet-decided `RequireApproval` sends, keyed by the
+    /// previewed content's own SHA-256 digest — the server-side half of
+    /// `privacy_firewall`'s two-phase prepare/execute pattern (mirrors
+    /// `m5_delivery`'s confirmation-preview shape). Entries are single-use
+    /// and TTL-bounded; see `privacy_firewall::{prepare_send_impl,
+    /// execute_send_impl}`.
+    pub pending_privacy_sends: privacy_firewall::PendingPrivacySends,
 }
 
 impl Default for AppState {
@@ -352,6 +374,8 @@ impl Default for AppState {
             run_ledger: Default::default(),
             stack_cache: Default::default(),
             index_cancels: Default::default(),
+            privacy_firewall_lock: Default::default(),
+            pending_privacy_sends: Default::default(),
         }
     }
 }
@@ -864,6 +888,11 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            privacy_firewall::privacy_firewall_get_policy,
+            privacy_firewall::privacy_firewall_save_policy,
+            privacy_firewall::privacy_firewall_preview,
+            privacy_firewall::privacy_firewall_prepare_send,
+            privacy_firewall::privacy_firewall_execute_send,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

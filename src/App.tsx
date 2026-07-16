@@ -3,7 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
-import { ChatSessionList, ChatWindow, CompareView, CrewView } from "./components/Chat";
+import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
@@ -529,6 +529,7 @@ function App() {
       </aside>
 
       <PermissionModal />
+      <PrivacyFirewallGate />
       <SettingsModal
         open={settingsOpen}
         onClose={() => {
