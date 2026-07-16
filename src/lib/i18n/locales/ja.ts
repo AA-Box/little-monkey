@@ -3,8 +3,9 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
-import { onboardingLocale } from "./onboarding";
 import { issueToPrLocale } from "./issueToPr";
+import { mcpGeneratorLocale } from "./mcpGenerator";
+import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -14,6 +15,8 @@ export const ja: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...issueToPrLocale,
+  ...mcpGeneratorLocale,
   ...onboardingLocale,
   // オンボーディングウィザードの実際の日本語訳。上でスプレッドした英語の
   // フォールバックを上書きする。
@@ -89,7 +92,6 @@ export const ja: Record<string, string> = {
   "Onboarding.finishBody": "このウィザードで扱う内容は以上です。行った選択はあとから設定画面で編集できます。またこのウィザードは、アプリメニューの「初回セットアップをやり直す」から、いつでもワンクリックで再度開けます。",
   "Onboarding.finishTemplateSummary": "「{{template}}」の初期コンテンツはPromptsで確認できます(レシピが作成された場合は自動化でも確認できます)。",
   "Onboarding.finishReopenHint": "このウィザードは、アプリメニューの「初回セットアップをやり直す」からいつでも再度開けます。",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "この issue がエージェントにとってどれだけ準備できているか確認しています…",
@@ -143,6 +145,58 @@ export const ja: Record<string, string> = {
   "IssueToPr.worktreeLabel": "専用ブランチ",
   "IssueToPr.branchLabel": "ブランチ",
   "IssueToPr.repositoryLabel": "リポジトリ",
+  // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
+  "AppMenu.mcpGenerator": "MCPジェネレーター",
+  "McpGenerator.title": "MCPサーバー ジェネレーター＆シミュレーター",
+  "McpGenerator.subtitle": "ローカルAPI、CLIツール、スクリプト、またはワークフローを型付きツールとして記述し、独立したMCPサーバーファイルを生成します。インストール用に保存する前に、そのファイルに対して敵対的な呼び出しをシミュレートします。",
+  "McpGenerator.close": "MCPジェネレーターを閉じる",
+  "McpGenerator.formHeading": "サーバーを記述",
+  "McpGenerator.nameLabel": "サーバー名",
+  "McpGenerator.namePlaceholder": "invoice-api",
+  "McpGenerator.descriptionLabel": "説明",
+  "McpGenerator.descriptionPlaceholder": "このサーバーが何をラップしているか、その理由。",
+  "McpGenerator.sourceKindLabel": "ソースの種類",
+  "McpGenerator.sourceKind.api": "ローカルAPI",
+  "McpGenerator.sourceKind.cli": "CLIツール",
+  "McpGenerator.sourceKind.script": "スクリプト",
+  "McpGenerator.sourceKind.workflow": "ワークフロー",
+  "McpGenerator.targetLabel": "対象（ベースURL、実行パス、またはワークフロー）",
+  "McpGenerator.targetPlaceholder": "https://api.example.com または /usr/local/bin/tool",
+  "McpGenerator.toolsHeading": "ツール",
+  "McpGenerator.addToolButton": "ツールを追加",
+  "McpGenerator.removeToolButton": "ツールを削除",
+  "McpGenerator.toolNamePlaceholder": "tool_name",
+  "McpGenerator.toolDescriptionPlaceholder": "このツールが行うこと",
+  "McpGenerator.requiresAuthLabel": "認証トークンが必要",
+  "McpGenerator.paramNamePlaceholder": "parameter",
+  "McpGenerator.requiredLabel": "必須",
+  "McpGenerator.removeParamButton": "パラメータを削除",
+  "McpGenerator.addParamButton": "パラメータを追加",
+  "McpGenerator.resetButton": "リセット",
+  "McpGenerator.generateButton": "サーバーを生成",
+  "McpGenerator.generatedHeading": "生成されたサーバー",
+  "McpGenerator.emptyGenerated": "まだサーバーは生成されていません。フォームに入力して生成してください。",
+  "McpGenerator.toolCount": "{{count}} 個のツール",
+  "McpGenerator.noSelectionHint": "生成されたサーバーを選択すると、コードとシミュレーターのレポートをプレビューできます。",
+  "McpGenerator.runSimulatorButton": "シミュレーターを実行",
+  "McpGenerator.saveButton": "ディスクに保存",
+  "McpGenerator.saveBlockedHint": "このサーバーはインストール用に保存する前にシミュレーターに合格する必要があります。",
+  "McpGenerator.deleteEntryButton": "削除",
+  "McpGenerator.savedAt": "{{path}} に保存しました",
+  "McpGenerator.notSimulatorCleanWarning": "シミュレーターでクリーンではありません：1つ以上のフィクスチャが失敗しました。ツール仕様を修正し、このサーバーをインストールできるようにする前に再生成してください。",
+  "McpGenerator.notSimulatedYetWarning": "まだシミュレートされていません。このサーバーをインストール用に保存する前にシミュレーターを実行してください。",
+  "McpGenerator.simulationHeading": "シミュレーターレポート：{{passed}}/{{total}} 件のフィクスチャが合格",
+  "McpGenerator.tableTool": "ツール",
+  "McpGenerator.tableFixture": "フィクスチャ",
+  "McpGenerator.tableOutcome": "結果",
+  "McpGenerator.tableReason": "理由",
+  "McpGenerator.pass": "合格",
+  "McpGenerator.fail": "不合格",
+  "McpGenerator.injectionDetectedHint": "このフィクスチャの入力にプロンプトインジェクションのパターンが検出されました",
+  "McpGenerator.codeHeading": "生成されたコード",
+  "McpGenerator.statusReady": "インストール準備完了",
+  "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
+  "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
   // Real Japanese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "デイリーブリーフ",

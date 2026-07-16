@@ -12,6 +12,7 @@ import {
   Inbox,
   Newspaper,
   Search,
+  ServerCog,
   Settings as SettingsIcon,
   SquareTerminal,
 } from "lucide-react";
@@ -27,6 +28,7 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
@@ -65,6 +67,7 @@ export function AppMenu({
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
   onOpenIssueToPr,
+  onOpenMcpGenerator,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
@@ -160,6 +163,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ServerCog size={14} className="text-faint" />}
+            label={t("AppMenu.mcpGenerator")}
+            onClick={() => {
+              closeAll();
+              onOpenMcpGenerator();
             }}
           />
           <MenuRow

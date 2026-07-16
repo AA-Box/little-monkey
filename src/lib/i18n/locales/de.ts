@@ -3,8 +3,9 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
-import { onboardingLocale } from "./onboarding";
 import { issueToPrLocale } from "./issueToPr";
+import { mcpGeneratorLocale } from "./mcpGenerator";
+import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -14,6 +15,8 @@ export const de: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...issueToPrLocale,
+  ...mcpGeneratorLocale,
   ...onboardingLocale,
   // Real German translations of the onboarding wizard, overriding the
   // English fallback spread in just above.
@@ -89,7 +92,6 @@ export const de: Record<string, string> = {
   "Onboarding.finishBody": "Das war's schon. Jede Wahl, die du getroffen hast, lässt sich später in den Einstellungen ändern, und dieser Assistent ist über die Zeile „Einrichtung neu starten“ im App-Menü jederzeit einen Klick entfernt.",
   "Onboarding.finishTemplateSummary": "Dein Starterinhalt „{{template}}“ ist unter Prompts (und unter Automatisierung, falls ein Rezept angelegt wurde) bereit.",
   "Onboarding.finishReopenHint": "Öffne diesen Assistenten jederzeit erneut über die Zeile „Einrichtung neu starten“ im App-Menü.",
-  ...issueToPrLocale,
   ...specScorerLocale,
   // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
   "SpecScorer.scoringLabel": "Es wird geprüft, wie einsatzbereit dieses Issue für einen Agenten ist…",
@@ -143,6 +145,58 @@ export const de: Record<string, string> = {
   "IssueToPr.worktreeLabel": "Eigener Branch",
   "IssueToPr.branchLabel": "Branch",
   "IssueToPr.repositoryLabel": "Repository",
+  // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
+  "AppMenu.mcpGenerator": "MCP-Generator",
+  "McpGenerator.title": "MCP-Server-Generator und -Simulator",
+  "McpGenerator.subtitle": "Beschreiben Sie eine lokale API, ein CLI-Tool, ein Skript oder einen Workflow als typisierte Tools, erzeugen Sie eine eigenständige MCP-Server-Datei und simulieren Sie dann feindselige Aufrufe dagegen, bevor Sie sie zur Installation speichern.",
+  "McpGenerator.close": "MCP-Generator schließen",
+  "McpGenerator.formHeading": "Server beschreiben",
+  "McpGenerator.nameLabel": "Servername",
+  "McpGenerator.namePlaceholder": "invoice-api",
+  "McpGenerator.descriptionLabel": "Beschreibung",
+  "McpGenerator.descriptionPlaceholder": "Was dieser Server umhüllt und warum.",
+  "McpGenerator.sourceKindLabel": "Quellart",
+  "McpGenerator.sourceKind.api": "Lokale API",
+  "McpGenerator.sourceKind.cli": "CLI-Tool",
+  "McpGenerator.sourceKind.script": "Skript",
+  "McpGenerator.sourceKind.workflow": "Workflow",
+  "McpGenerator.targetLabel": "Ziel (Basis-URL, ausführbarer Pfad oder Workflow)",
+  "McpGenerator.targetPlaceholder": "https://api.example.com oder /usr/local/bin/tool",
+  "McpGenerator.toolsHeading": "Tools",
+  "McpGenerator.addToolButton": "Tool hinzufügen",
+  "McpGenerator.removeToolButton": "Tool entfernen",
+  "McpGenerator.toolNamePlaceholder": "tool_name",
+  "McpGenerator.toolDescriptionPlaceholder": "Was dieses Tool tut",
+  "McpGenerator.requiresAuthLabel": "Erfordert Auth-Token",
+  "McpGenerator.paramNamePlaceholder": "parameter",
+  "McpGenerator.requiredLabel": "Erforderlich",
+  "McpGenerator.removeParamButton": "Parameter entfernen",
+  "McpGenerator.addParamButton": "Parameter hinzufügen",
+  "McpGenerator.resetButton": "Zurücksetzen",
+  "McpGenerator.generateButton": "Server generieren",
+  "McpGenerator.generatedHeading": "Generierte Server",
+  "McpGenerator.emptyGenerated": "Noch keine Server generiert. Füllen Sie das Formular aus und generieren Sie einen.",
+  "McpGenerator.toolCount": "{{count}} Tool(s)",
+  "McpGenerator.noSelectionHint": "Wählen Sie einen generierten Server, um Code und Simulationsbericht anzuzeigen.",
+  "McpGenerator.runSimulatorButton": "Simulator ausführen",
+  "McpGenerator.saveButton": "Auf Festplatte speichern",
+  "McpGenerator.saveBlockedHint": "Dieser Server muss den Simulator bestehen, bevor er zur Installation gespeichert werden kann.",
+  "McpGenerator.deleteEntryButton": "Löschen",
+  "McpGenerator.savedAt": "Gespeichert unter {{path}}",
+  "McpGenerator.notSimulatorCleanWarning": "Nicht simulator-sauber: Mindestens eine Testfixture ist fehlgeschlagen. Korrigieren Sie die Tool-Spezifikation und generieren Sie neu, bevor dieser Server installiert werden kann.",
+  "McpGenerator.notSimulatedYetWarning": "Noch nicht simuliert. Führen Sie den Simulator aus, bevor Sie diesen Server zur Installation speichern.",
+  "McpGenerator.simulationHeading": "Simulationsbericht: {{passed}}/{{total}} Fixtures bestanden",
+  "McpGenerator.tableTool": "Tool",
+  "McpGenerator.tableFixture": "Fixture",
+  "McpGenerator.tableOutcome": "Ergebnis",
+  "McpGenerator.tableReason": "Grund",
+  "McpGenerator.pass": "Bestanden",
+  "McpGenerator.fail": "Fehlgeschlagen",
+  "McpGenerator.injectionDetectedHint": "In dieser Fixture-Eingabe wurde ein Prompt-Injection-Muster erkannt",
+  "McpGenerator.codeHeading": "Generierter Code",
+  "McpGenerator.statusReady": "Bereit zur Installation",
+  "McpGenerator.statusNotClean": "Nicht simulator-sauber",
+  "McpGenerator.statusNotSimulated": "Nicht simuliert",
   ...dailyBriefLocale,
   // Real German translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Tagesüberblick",
