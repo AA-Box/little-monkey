@@ -57,6 +57,11 @@ pub mod native_skills;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
+// Operational-health diagnostics (reachability/liveness of app-owned
+// services), sibling to `security_doctor` (which audits posture, not
+// health). Self-contained: engine + thin command layer live in one file,
+// same convention as `ollama`/`llama`/`server`/`mcp`/`stacks`.
+pub mod diagnostics;
 pub mod workflow_core;
 // Runtime/model hub service plus its thin desktop command layer. The hub
 // composes Ollama, managed llama.cpp, MLX, catalog/download, and API policy
@@ -755,6 +760,9 @@ pub fn run() {
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
             security_commands::security_audit,
+            diagnostics::diagnostics_run,
+            diagnostics::diagnostics_apply_fix,
+            diagnostics::diagnostics_export_bundle,
             m4_commands::m4_packages_preview,
             m4_commands::m4_packages_install,
             m4_commands::m4_packages_update,
