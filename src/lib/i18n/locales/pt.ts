@@ -101,6 +101,8 @@ export const pt: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "Espaço de trabalho do terminal",
   "TerminalPanel.newTerminal": "Novo terminal",
   "TerminalPanel.closePanel": "Fechar painel do terminal",
+  "TerminalPanel.expandPanel": "Expandir painel do terminal",
+  "TerminalPanel.collapsePanel": "Recolher painel do terminal",
   "TerminalPanel.dismiss": "Dispensar",
   "TerminalPanel.loading": "Carregando sessões do terminal…",
   "TerminalPanel.emptyTitle": "Nenhuma sessão de terminal",

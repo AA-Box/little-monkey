@@ -101,6 +101,8 @@ export const hi: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "टर्मिनल वर्कस्पेस",
   "TerminalPanel.newTerminal": "नया टर्मिनल",
   "TerminalPanel.closePanel": "टर्मिनल पैनल बंद करें",
+  "TerminalPanel.expandPanel": "टर्मिनल पैनल बड़ा करें",
+  "TerminalPanel.collapsePanel": "टर्मिनल पैनल छोटा करें",
   "TerminalPanel.dismiss": "खारिज करें",
   "TerminalPanel.loading": "टर्मिनल सत्र लोड हो रहे हैं…",
   "TerminalPanel.emptyTitle": "कोई टर्मिनल सत्र नहीं",

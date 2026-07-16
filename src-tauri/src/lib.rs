@@ -538,6 +538,7 @@ pub fn run() {
             permissions::get_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,
+            terminal::terminal_identity,
             terminal::terminal_create,
             terminal::terminal_list,
             terminal::terminal_execute,

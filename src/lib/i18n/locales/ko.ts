@@ -101,6 +101,8 @@ export const ko: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "터미널 워크스페이스",
   "TerminalPanel.newTerminal": "새 터미널",
   "TerminalPanel.closePanel": "터미널 패널 닫기",
+  "TerminalPanel.expandPanel": "터미널 패널 확대",
+  "TerminalPanel.collapsePanel": "터미널 패널 축소",
   "TerminalPanel.dismiss": "닫기",
   "TerminalPanel.loading": "터미널 세션을 불러오는 중…",
   "TerminalPanel.emptyTitle": "터미널 세션 없음",
