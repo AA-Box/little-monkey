@@ -101,6 +101,8 @@ export const de: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "Terminal-Arbeitsbereich",
   "TerminalPanel.newTerminal": "Neues Terminal",
   "TerminalPanel.closePanel": "Terminal-Panel schließen",
+  "TerminalPanel.expandPanel": "Terminal-Panel vergrößern",
+  "TerminalPanel.collapsePanel": "Terminal-Panel verkleinern",
   "TerminalPanel.dismiss": "Ausblenden",
   "TerminalPanel.loading": "Terminal-Sitzungen werden geladen…",
   "TerminalPanel.emptyTitle": "Keine Terminal-Sitzung",

@@ -106,6 +106,8 @@ export const en: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "Terminal workspace",
   "TerminalPanel.newTerminal": "New terminal",
   "TerminalPanel.closePanel": "Close terminal panel",
+  "TerminalPanel.expandPanel": "Expand terminal panel",
+  "TerminalPanel.collapsePanel": "Collapse terminal panel",
   "TerminalPanel.dismiss": "Dismiss",
   "TerminalPanel.loading": "Loading terminal sessions…",
   "TerminalPanel.emptyTitle": "No terminal session",

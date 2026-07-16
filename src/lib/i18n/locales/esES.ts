@@ -101,6 +101,8 @@ export const esES: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "Espacio de trabajo del terminal",
   "TerminalPanel.newTerminal": "Nuevo terminal",
   "TerminalPanel.closePanel": "Cerrar panel del terminal",
+  "TerminalPanel.expandPanel": "Ampliar panel del terminal",
+  "TerminalPanel.collapsePanel": "Contraer panel del terminal",
   "TerminalPanel.dismiss": "Descartar",
   "TerminalPanel.loading": "Cargando sesiones del terminal…",
   "TerminalPanel.emptyTitle": "Sin sesión de terminal",

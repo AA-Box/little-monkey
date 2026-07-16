@@ -101,6 +101,8 @@ export const es419: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "Espacio de trabajo de la terminal",
   "TerminalPanel.newTerminal": "Nueva terminal",
   "TerminalPanel.closePanel": "Cerrar panel de terminal",
+  "TerminalPanel.expandPanel": "Expandir panel de terminal",
+  "TerminalPanel.collapsePanel": "Contraer panel de terminal",
   "TerminalPanel.dismiss": "Descartar",
   "TerminalPanel.loading": "Cargando sesiones de terminal…",
   "TerminalPanel.emptyTitle": "Sin sesión de terminal",

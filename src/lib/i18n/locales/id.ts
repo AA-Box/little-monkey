@@ -101,6 +101,8 @@ export const id: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "Ruang kerja terminal",
   "TerminalPanel.newTerminal": "Terminal baru",
   "TerminalPanel.closePanel": "Tutup panel terminal",
+  "TerminalPanel.expandPanel": "Perbesar panel terminal",
+  "TerminalPanel.collapsePanel": "Perkecil panel terminal",
   "TerminalPanel.dismiss": "Tutup",
   "TerminalPanel.loading": "Memuat sesi terminal…",
   "TerminalPanel.emptyTitle": "Tidak ada sesi terminal",

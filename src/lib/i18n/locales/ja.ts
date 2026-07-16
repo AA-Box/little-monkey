@@ -101,6 +101,8 @@ export const ja: Record<string, string> = {
   "TerminalPanel.workspaceLabel": "ターミナルのワークスペース",
   "TerminalPanel.newTerminal": "新しいターミナル",
   "TerminalPanel.closePanel": "ターミナルパネルを閉じる",
+  "TerminalPanel.expandPanel": "ターミナルパネルを拡大",
+  "TerminalPanel.collapsePanel": "ターミナルパネルを縮小",
   "TerminalPanel.dismiss": "閉じる",
   "TerminalPanel.loading": "ターミナルセッションを読み込んでいます…",
   "TerminalPanel.emptyTitle": "ターミナルセッションがありません",
