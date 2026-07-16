@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const ja: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR エージェントフロー",
@@ -885,5 +887,40 @@ export const ja: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "埋め込み",
   "ApiServerPanel.backend.local": "ローカルモデル",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "クラウドプロバイダー"
+  "ApiServerPanel.backend.providers": "クラウドプロバイダー",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "受信トリアージ",
+  "TriagePanel.description": "GitHub の issue/PR、Slack チャンネル、Jira の issue を対象とした読み取り専用のランク付けキューと、返信・コメント・ステータス更新の下書き生成のみを提供します。明示的な承認なしに投稿・送信・更新されることはありません。",
+  "TriagePanel.nonGoalNotice": "Gmail と Outlook のトリアージには対応していません。どちらも実際の受信箱へのアクセスには登録済みの OAuth アプリが必要ですが、このビルドはトークン/キーチェーンのみを使用するため非対応です。ここでは GitHub、Slack、Jira のみを実装しています。",
+  "TriagePanel.sourcesHeading": "更新するキュー",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "オーナー(例: acme)",
+  "TriagePanel.githubRepoPlaceholder": "リポジトリ(例: widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "接続済みアカウントを選択…",
+  "TriagePanel.slackChannelPlaceholder": "チャンネル ID(例: C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "プロジェクトキー(例: PROJ)",
+  "TriagePanel.addSourceButton": "追加",
+  "TriagePanel.removeSourceButton": "削除",
+  "TriagePanel.refreshQueueButton": "キューを更新",
+  "TriagePanel.refreshingButton": "更新中…",
+  "TriagePanel.queueHeading": "キュー",
+  "TriagePanel.itemCountLabel": "{{count}} 件",
+  "TriagePanel.emptyQueueState": "まだ項目がありません。上でキューを追加して更新してください。",
+  "TriagePanel.noSelectionState": "項目を選択すると詳細を確認し、返信の下書きを作成できます。",
+  "TriagePanel.rankScoreLabel": "緊急度スコア",
+  "TriagePanel.openSourceLink": "ソースを開く",
+  "TriagePanel.actionReply": "Slack 返信",
+  "TriagePanel.actionComment": "GitHub コメント",
+  "TriagePanel.actionStatusUpdate": "Jira ステータス更新",
+  "TriagePanel.noDraftYet": "まだ下書きがありません — 下で生成してください。",
+  "TriagePanel.noModelSelectedNotice": "下書きを生成するには、設定 → AI プロバイダーでクラウド AI プロバイダーとモデルを選択してください。",
+  "TriagePanel.generateDraftButton": "下書きを生成",
+  "TriagePanel.regenerateButton": "再生成",
+  "TriagePanel.generatingButton": "生成中…",
+  "TriagePanel.approveAndSendButton": "承認して送信",
+  "TriagePanel.sendingButton": "送信中…",
+  "TriagePanel.discardButton": "破棄",
+  "TriagePanel.discardedNotice": "このセッションの表示から破棄されました。",
 };

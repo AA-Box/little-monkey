@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const hi: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "इशू-टू-पीआर",
   "IssueToPr.title": "इशू-टू-पीआर एजेंट फ़्लो",
@@ -885,5 +887,40 @@ export const hi: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "एम्बेडिंग",
   "ApiServerPanel.backend.local": "लोकल मॉडल",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "क्लाउड प्रोवाइडर"
+  "ApiServerPanel.backend.providers": "क्लाउड प्रोवाइडर",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "इनबॉक्स ट्राएज",
+  "TriagePanel.description": "GitHub इशू/PR, स्लैक चैनल और जीरा इशू के लिए केवल-पठन, प्राथमिकता क्रम में सूचियाँ, साथ ही केवल-ड्राफ्ट उत्तर/टिप्पणी/स्थिति-अपडेट जनरेशन। आपकी स्पष्ट स्वीकृति के बिना कुछ भी पोस्ट, भेजा या अपडेट नहीं किया जाता।",
+  "TriagePanel.nonGoalNotice": "Gmail और Outlook ट्राएज समर्थित नहीं हैं: दोनों केवल एक पंजीकृत OAuth ऐप के ज़रिए ही असली इनबॉक्स तक पहुँच देते हैं, जिसका उपयोग यह केवल-टोकन/कीचेन बिल्ड नहीं करता। यहाँ केवल GitHub, Slack और Jira लागू किए गए हैं।",
+  "TriagePanel.sourcesHeading": "रीफ़्रेश करने के लिए क्यू",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "स्वामी (जैसे acme)",
+  "TriagePanel.githubRepoPlaceholder": "रिपॉज़िटरी (जैसे widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "जुड़ा हुआ खाता चुनें…",
+  "TriagePanel.slackChannelPlaceholder": "चैनल आईडी (जैसे C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "प्रोजेक्ट कुंजी (जैसे PROJ)",
+  "TriagePanel.addSourceButton": "जोड़ें",
+  "TriagePanel.removeSourceButton": "हटाएं",
+  "TriagePanel.refreshQueueButton": "क्यू रीफ़्रेश करें",
+  "TriagePanel.refreshingButton": "रीफ़्रेश हो रहा है…",
+  "TriagePanel.queueHeading": "क्यू",
+  "TriagePanel.itemCountLabel": "{{count}} आइटम",
+  "TriagePanel.emptyQueueState": "अभी तक कोई आइटम नहीं। ऊपर एक क्यू जोड़ें और रीफ़्रेश करें।",
+  "TriagePanel.noSelectionState": "विवरण देखने और प्रतिक्रिया का मसौदा तैयार करने के लिए एक आइटम चुनें।",
+  "TriagePanel.rankScoreLabel": "तात्कालिकता स्कोर",
+  "TriagePanel.openSourceLink": "स्रोत खोलें",
+  "TriagePanel.actionReply": "Slack उत्तर",
+  "TriagePanel.actionComment": "GitHub टिप्पणी",
+  "TriagePanel.actionStatusUpdate": "Jira स्थिति अपडेट",
+  "TriagePanel.noDraftYet": "अभी तक कोई मसौदा नहीं — नीचे एक बनाएं।",
+  "TriagePanel.noModelSelectedNotice": "मसौदा बनाने के लिए सेटिंग्स → AI प्रदाता में एक क्लाउड AI प्रदाता और मॉडल चुनें।",
+  "TriagePanel.generateDraftButton": "मसौदा बनाएं",
+  "TriagePanel.regenerateButton": "फिर से बनाएं",
+  "TriagePanel.generatingButton": "बनाया जा रहा है…",
+  "TriagePanel.approveAndSendButton": "स्वीकृत करें और भेजें",
+  "TriagePanel.sendingButton": "भेजा जा रहा है…",
+  "TriagePanel.discardButton": "अस्वीकार करें",
+  "TriagePanel.discardedNotice": "इस सत्र के दृश्य से हटा दिया गया।",
 };

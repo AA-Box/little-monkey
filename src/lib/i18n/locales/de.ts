@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const de: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR-Agentenablauf",
@@ -885,5 +887,40 @@ export const de: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "Embeddings",
   "ApiServerPanel.backend.local": "Lokales Modell",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "Cloud-Anbieter"
+  "ApiServerPanel.backend.providers": "Cloud-Anbieter",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "Posteingang-Triage",
+  "TriagePanel.description": "Schreibgeschützte, priorisierte Warteschlangen für GitHub-Issues/PRs, Slack-Kanäle und Jira-Issues, mit Entwürfen für Antworten/Kommentare/Statusaktualisierungen. Ohne deine ausdrückliche Freigabe wird nichts veröffentlicht, gesendet oder aktualisiert.",
+  "TriagePanel.nonGoalNotice": "Gmail- und Outlook-Triage werden nicht unterstützt: Beide geben nur über eine registrierte OAuth-Anwendung Zugriff auf ein echtes Postfach, was dieser reine Token-/Schlüsselbund-Build nicht verwendet. Nur GitHub, Slack und Jira sind hier implementiert.",
+  "TriagePanel.sourcesHeading": "Zu aktualisierende Warteschlangen",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "Eigentümer (z. B. acme)",
+  "TriagePanel.githubRepoPlaceholder": "Repository (z. B. widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "Verbundenes Konto auswählen…",
+  "TriagePanel.slackChannelPlaceholder": "Kanal-ID (z. B. C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "Projektschlüssel (z. B. PROJ)",
+  "TriagePanel.addSourceButton": "Hinzufügen",
+  "TriagePanel.removeSourceButton": "Entfernen",
+  "TriagePanel.refreshQueueButton": "Warteschlange aktualisieren",
+  "TriagePanel.refreshingButton": "Wird aktualisiert…",
+  "TriagePanel.queueHeading": "Warteschlange",
+  "TriagePanel.itemCountLabel": "{{count}} Einträge",
+  "TriagePanel.emptyQueueState": "Noch keine Einträge. Füge oben eine Warteschlange hinzu und aktualisiere.",
+  "TriagePanel.noSelectionState": "Wähle einen Eintrag aus, um Details zu sehen und eine Antwort zu entwerfen.",
+  "TriagePanel.rankScoreLabel": "Dringlichkeitswert",
+  "TriagePanel.openSourceLink": "Quelle öffnen",
+  "TriagePanel.actionReply": "Slack-Antwort",
+  "TriagePanel.actionComment": "GitHub-Kommentar",
+  "TriagePanel.actionStatusUpdate": "Jira-Statusaktualisierung",
+  "TriagePanel.noDraftYet": "Noch kein Entwurf — unten einen erstellen.",
+  "TriagePanel.noModelSelectedNotice": "Wähle unter Einstellungen → KI-Anbieter einen Cloud-KI-Anbieter und ein Modell aus, um einen Entwurf zu erstellen.",
+  "TriagePanel.generateDraftButton": "Entwurf erstellen",
+  "TriagePanel.regenerateButton": "Neu erstellen",
+  "TriagePanel.generatingButton": "Wird erstellt…",
+  "TriagePanel.approveAndSendButton": "Freigeben & senden",
+  "TriagePanel.sendingButton": "Wird gesendet…",
+  "TriagePanel.discardButton": "Verwerfen",
+  "TriagePanel.discardedNotice": "In dieser Sitzung verworfen.",
 };

@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const pt: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Fluxo de agente Issue-to-PR",
@@ -885,5 +887,40 @@ export const pt: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "Embeddings",
   "ApiServerPanel.backend.local": "Modelo local",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "Provedores de nuvem"
+  "ApiServerPanel.backend.providers": "Provedores de nuvem",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "Triagem da caixa de entrada",
+  "TriagePanel.description": "Filas classificadas somente leitura para issues/PRs do GitHub, canais do Slack e issues do Jira, com geração apenas de rascunhos de resposta/comentário/atualização de status. Nada é publicado, enviado ou atualizado sem sua aprovação explícita.",
+  "TriagePanel.nonGoalNotice": "A triagem do Gmail e do Outlook não é suportada: ambos só expõem uma caixa de entrada real por meio de um aplicativo OAuth registrado, que esta versão baseada apenas em token/chaveiro não utiliza. Somente GitHub, Slack e Jira estão implementados aqui.",
+  "TriagePanel.sourcesHeading": "Filas para atualizar",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "Proprietário (ex.: acme)",
+  "TriagePanel.githubRepoPlaceholder": "Repositório (ex.: widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "Selecione uma conta conectada…",
+  "TriagePanel.slackChannelPlaceholder": "ID do canal (ex.: C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "Chave do projeto (ex.: PROJ)",
+  "TriagePanel.addSourceButton": "Adicionar",
+  "TriagePanel.removeSourceButton": "Remover",
+  "TriagePanel.refreshQueueButton": "Atualizar fila",
+  "TriagePanel.refreshingButton": "Atualizando…",
+  "TriagePanel.queueHeading": "Fila",
+  "TriagePanel.itemCountLabel": "{{count}} itens",
+  "TriagePanel.emptyQueueState": "Nenhum item ainda. Adicione uma fila acima e atualize.",
+  "TriagePanel.noSelectionState": "Selecione um item para ver os detalhes e redigir uma resposta.",
+  "TriagePanel.rankScoreLabel": "Pontuação de urgência",
+  "TriagePanel.openSourceLink": "Abrir origem",
+  "TriagePanel.actionReply": "Resposta no Slack",
+  "TriagePanel.actionComment": "Comentário no GitHub",
+  "TriagePanel.actionStatusUpdate": "Atualização de status no Jira",
+  "TriagePanel.noDraftYet": "Ainda sem rascunho — gere um abaixo.",
+  "TriagePanel.noModelSelectedNotice": "Selecione um provedor de IA em nuvem e um modelo em Configurações → Provedores de IA para gerar um rascunho.",
+  "TriagePanel.generateDraftButton": "Gerar rascunho",
+  "TriagePanel.regenerateButton": "Gerar novamente",
+  "TriagePanel.generatingButton": "Gerando…",
+  "TriagePanel.approveAndSendButton": "Aprovar e enviar",
+  "TriagePanel.sendingButton": "Enviando…",
+  "TriagePanel.discardButton": "Descartar",
+  "TriagePanel.discardedNotice": "Descartado desta sessão.",
 };

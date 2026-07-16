@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const ko: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "이슈-투-PR",
   "IssueToPr.title": "이슈-투-PR 에이전트 흐름",
@@ -885,5 +887,40 @@ export const ko: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "임베딩",
   "ApiServerPanel.backend.local": "로컬 모델",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "클라우드 제공업체"
+  "ApiServerPanel.backend.providers": "클라우드 제공업체",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "받은편지함 트리아지",
+  "TriagePanel.description": "GitHub 이슈/PR, Slack 채널, Jira 이슈에 대한 읽기 전용 우선순위 대기열과 답장/댓글/상태 업데이트 초안 생성만 제공합니다. 명시적으로 승인하지 않으면 아무것도 게시, 전송, 업데이트되지 않습니다.",
+  "TriagePanel.nonGoalNotice": "Gmail 및 Outlook 트리아지는 지원되지 않습니다. 둘 다 등록된 OAuth 앱을 통해서만 실제 받은편지함에 접근할 수 있는데, 이 빌드는 토큰/키체인만 사용합니다. 여기서는 GitHub, Slack, Jira만 구현되어 있습니다.",
+  "TriagePanel.sourcesHeading": "새로고침할 대기열",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "소유자(예: acme)",
+  "TriagePanel.githubRepoPlaceholder": "저장소(예: widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "연결된 계정 선택…",
+  "TriagePanel.slackChannelPlaceholder": "채널 ID(예: C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "프로젝트 키(예: PROJ)",
+  "TriagePanel.addSourceButton": "추가",
+  "TriagePanel.removeSourceButton": "제거",
+  "TriagePanel.refreshQueueButton": "대기열 새로고침",
+  "TriagePanel.refreshingButton": "새로고침 중…",
+  "TriagePanel.queueHeading": "대기열",
+  "TriagePanel.itemCountLabel": "{{count}}개 항목",
+  "TriagePanel.emptyQueueState": "아직 항목이 없습니다. 위에서 대기열을 추가하고 새로고침하세요.",
+  "TriagePanel.noSelectionState": "항목을 선택하면 세부 정보를 보고 답장 초안을 작성할 수 있습니다.",
+  "TriagePanel.rankScoreLabel": "긴급도 점수",
+  "TriagePanel.openSourceLink": "원본 열기",
+  "TriagePanel.actionReply": "Slack 답장",
+  "TriagePanel.actionComment": "GitHub 댓글",
+  "TriagePanel.actionStatusUpdate": "Jira 상태 업데이트",
+  "TriagePanel.noDraftYet": "아직 초안이 없습니다 — 아래에서 생성하세요.",
+  "TriagePanel.noModelSelectedNotice": "초안을 생성하려면 설정 → AI 제공자에서 클라우드 AI 제공자와 모델을 선택하세요.",
+  "TriagePanel.generateDraftButton": "초안 생성",
+  "TriagePanel.regenerateButton": "다시 생성",
+  "TriagePanel.generatingButton": "생성 중…",
+  "TriagePanel.approveAndSendButton": "승인 및 전송",
+  "TriagePanel.sendingButton": "전송 중…",
+  "TriagePanel.discardButton": "삭제",
+  "TriagePanel.discardedNotice": "이 세션 화면에서 삭제되었습니다.",
 };

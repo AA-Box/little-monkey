@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const fr: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const fr: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flux d'agent Issue-to-PR",
@@ -885,5 +887,40 @@ export const fr: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "Embeddings",
   "ApiServerPanel.backend.local": "Modèle local",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "Fournisseurs cloud"
+  "ApiServerPanel.backend.providers": "Fournisseurs cloud",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "Tri de la boîte de réception",
+  "TriagePanel.description": "Files d'attente classées en lecture seule pour les issues/PR GitHub, les canaux Slack et les tickets Jira, avec génération de brouillons de réponse/commentaire/mise à jour de statut uniquement. Rien n'est publié, envoyé ou mis à jour sans votre approbation explicite.",
+  "TriagePanel.nonGoalNotice": "Le tri Gmail et Outlook n'est pas pris en charge : les deux n'exposent une véritable boîte de réception que via une application OAuth enregistrée, que cette version basée uniquement sur des jetons/trousseau n'utilise pas. Seuls GitHub, Slack et Jira sont implémentés ici.",
+  "TriagePanel.sourcesHeading": "Files à actualiser",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "Propriétaire (ex. acme)",
+  "TriagePanel.githubRepoPlaceholder": "Dépôt (ex. widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "Sélectionner un compte connecté…",
+  "TriagePanel.slackChannelPlaceholder": "ID de canal (ex. C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "Clé de projet (ex. PROJ)",
+  "TriagePanel.addSourceButton": "Ajouter",
+  "TriagePanel.removeSourceButton": "Supprimer",
+  "TriagePanel.refreshQueueButton": "Actualiser la file",
+  "TriagePanel.refreshingButton": "Actualisation…",
+  "TriagePanel.queueHeading": "File d'attente",
+  "TriagePanel.itemCountLabel": "{{count}} éléments",
+  "TriagePanel.emptyQueueState": "Aucun élément pour l'instant. Ajoutez une file ci-dessus puis actualisez.",
+  "TriagePanel.noSelectionState": "Sélectionnez un élément pour voir ses détails et rédiger une réponse.",
+  "TriagePanel.rankScoreLabel": "Score d'urgence",
+  "TriagePanel.openSourceLink": "Ouvrir la source",
+  "TriagePanel.actionReply": "Réponse Slack",
+  "TriagePanel.actionComment": "Commentaire GitHub",
+  "TriagePanel.actionStatusUpdate": "Mise à jour de statut Jira",
+  "TriagePanel.noDraftYet": "Pas encore de brouillon — générez-en un ci-dessous.",
+  "TriagePanel.noModelSelectedNotice": "Sélectionnez un fournisseur d'IA cloud et un modèle dans Paramètres → Fournisseurs IA pour générer un brouillon.",
+  "TriagePanel.generateDraftButton": "Générer un brouillon",
+  "TriagePanel.regenerateButton": "Régénérer",
+  "TriagePanel.generatingButton": "Génération…",
+  "TriagePanel.approveAndSendButton": "Approuver et envoyer",
+  "TriagePanel.sendingButton": "Envoi…",
+  "TriagePanel.discardButton": "Ignorer",
+  "TriagePanel.discardedNotice": "Ignoré pour cette session.",
 };

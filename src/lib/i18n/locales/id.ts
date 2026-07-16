@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...triageLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Alur Agen Issue-to-PR",
@@ -885,5 +887,40 @@ export const id: Record<string, string> = {
   "ApiServerPanel.scope.embeddings": "Embedding",
   "ApiServerPanel.backend.local": "Model lokal",
   "ApiServerPanel.backend.ollama": "Ollama",
-  "ApiServerPanel.backend.providers": "Penyedia cloud"
+  "ApiServerPanel.backend.providers": "Penyedia cloud",
+  // Inbox Triage Agents (ROADMAP.md Phase 3) — real translations overriding the English `triageLocale` defaults spread above.
+  "SettingsModal.tabTriage": "Triase Kotak Masuk",
+  "TriagePanel.description": "Antrean berperingkat yang hanya-baca untuk isu/PR GitHub, kanal Slack, dan isu Jira, dengan pembuatan draf balasan/komentar/pembaruan status saja. Tidak ada yang diposting, dikirim, atau diperbarui tanpa persetujuan eksplisit Anda.",
+  "TriagePanel.nonGoalNotice": "Triase Gmail dan Outlook tidak didukung: keduanya hanya mengekspos kotak masuk asli melalui aplikasi OAuth terdaftar, yang tidak digunakan oleh build berbasis token/keychain ini. Hanya GitHub, Slack, dan Jira yang diimplementasikan di sini.",
+  "TriagePanel.sourcesHeading": "Antrean untuk disegarkan",
+  "TriagePanel.sourceGithub": "GitHub",
+  "TriagePanel.sourceSlack": "Slack",
+  "TriagePanel.sourceJira": "Jira",
+  "TriagePanel.githubOwnerPlaceholder": "Pemilik (mis. acme)",
+  "TriagePanel.githubRepoPlaceholder": "Repo (mis. widgets)",
+  "TriagePanel.selectConnectorPlaceholder": "Pilih akun yang terhubung…",
+  "TriagePanel.slackChannelPlaceholder": "ID kanal (mis. C0123456789)",
+  "TriagePanel.jiraProjectPlaceholder": "Kunci proyek (mis. PROJ)",
+  "TriagePanel.addSourceButton": "Tambah",
+  "TriagePanel.removeSourceButton": "Hapus",
+  "TriagePanel.refreshQueueButton": "Segarkan antrean",
+  "TriagePanel.refreshingButton": "Menyegarkan…",
+  "TriagePanel.queueHeading": "Antrean",
+  "TriagePanel.itemCountLabel": "{{count}} item",
+  "TriagePanel.emptyQueueState": "Belum ada item. Tambahkan antrean di atas lalu segarkan.",
+  "TriagePanel.noSelectionState": "Pilih item untuk melihat detail dan membuat draf tanggapan.",
+  "TriagePanel.rankScoreLabel": "Skor urgensi",
+  "TriagePanel.openSourceLink": "Buka sumber",
+  "TriagePanel.actionReply": "Balasan Slack",
+  "TriagePanel.actionComment": "Komentar GitHub",
+  "TriagePanel.actionStatusUpdate": "Pembaruan status Jira",
+  "TriagePanel.noDraftYet": "Belum ada draf — buat di bawah ini.",
+  "TriagePanel.noModelSelectedNotice": "Pilih penyedia AI cloud dan model di Pengaturan → Penyedia AI untuk membuat draf.",
+  "TriagePanel.generateDraftButton": "Buat draf",
+  "TriagePanel.regenerateButton": "Buat ulang",
+  "TriagePanel.generatingButton": "Membuat…",
+  "TriagePanel.approveAndSendButton": "Setujui & kirim",
+  "TriagePanel.sendingButton": "Mengirim…",
+  "TriagePanel.discardButton": "Buang",
+  "TriagePanel.discardedNotice": "Dibuang dari tampilan sesi ini.",
 };
