@@ -830,20 +830,16 @@ fn compose_system_prompt_impl(
     let roots = workspace::all_roots(state).unwrap_or_default();
     let rule_files = rules::read_rules_impl(&global_path, &roots);
 
-    let facts = workspace::primary_root_canon(state)
+    // Shares `memory.rs`'s `list_impl` with the desktop app's `memory_list`
+    // command (see `systemPrompt.ts`'s `factsLines`) instead of hand-rolling
+    // a second project-facts lookup here — that's also what makes a
+    // disabled/deleted fact excluded from the CLI's prompt the same way it
+    // is from the desktop app's, and (as a side benefit) picks up global
+    // (all-project) facts here too, which this used to leave out.
+    let root = workspace::primary_root_canon(state)
         .ok()
-        .and_then(|root| {
-            memory::load_impl(&data_dir.join("memories.json"))
-                .ok()
-                .and_then(|memories| {
-                    memories
-                        .projects
-                        .get(&root.to_string_lossy().to_string())
-                        .cloned()
-                })
-        })
-        .map(|project| project.facts)
-        .unwrap_or_default();
+        .map(|root| root.to_string_lossy().to_string());
+    let facts = memory::list_impl(&data_dir.join("memories.json"), root.as_deref()).unwrap_or_default();
 
     let mut sections: Vec<String> = Vec::new();
     if !rule_files.is_empty() {
@@ -1469,6 +1465,7 @@ mod tests {
             &ws_canon.to_string_lossy(),
             "Uses pnpm, not npm.",
             "agent",
+            None,
         )
         .unwrap();
         assert_eq!(fact.source, "agent");
@@ -1476,6 +1473,37 @@ mod tests {
         let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
         assert!(prompt.contains("## Remembered facts"));
         assert!(prompt.contains("- Uses pnpm, not npm."));
+    }
+
+    #[test]
+    fn a_disabled_fact_is_excluded_from_the_cli_system_prompt() {
+        // The CLI's own proof of the same CRITICAL Memory Studio guarantee
+        // covered for the desktop app in `memory.rs`'s
+        // `disabled_and_deleted_facts_are_excluded_from_list_impl`: a
+        // disabled memory must not enter a future prompt, on *either*
+        // surface that assembles one from `memories.json`.
+        let data_dir = TempDir::new();
+        let ws = TempDir::new();
+        let ws_canon = ws.path.canonicalize().unwrap();
+        let state = state_with_primary_root(&ws.path);
+        let memories_path = data_dir.path.join("memories.json");
+
+        memory::add_fact_impl(&memories_path, &ws_canon.to_string_lossy(), "keep me", "agent", None)
+            .unwrap();
+        let disabled = memory::add_fact_impl(
+            &memories_path,
+            &ws_canon.to_string_lossy(),
+            "disable me",
+            "agent",
+            None,
+        )
+        .unwrap();
+        memory::set_enabled_impl(&memories_path, &ws_canon.to_string_lossy(), &disabled.id, false)
+            .unwrap();
+
+        let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
+        assert!(prompt.contains("- keep me"));
+        assert!(!prompt.contains("disable me"));
     }
 
     #[test]
