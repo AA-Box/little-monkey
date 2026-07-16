@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardCheck,
   Globe,
   HelpCircle,
   ListTodo,
@@ -26,6 +27,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
+  onOpenEvidenceBoard: () => void;
 }
 
 interface MenuRowProps {
@@ -61,6 +63,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
+  onOpenEvidenceBoard,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -143,6 +146,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardCheck size={14} className="text-faint" />}
+            label={t("AppMenu.evidenceBoard")}
+            onClick={() => {
+              closeAll();
+              onOpenEvidenceBoard();
             }}
           />
           <MenuRow
