@@ -105,6 +105,7 @@ pub mod stacks;
 pub mod prompts;
 mod sessions;
 mod system;
+mod terminal;
 mod tools;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
@@ -188,6 +189,10 @@ pub struct AppState {
     /// Attached workspace folders, primary first. Empty means no workspace
     /// is open. See `workspace.rs`.
     pub workspace_roots: std::sync::Mutex<Vec<workspace::WorkspaceRoot>>,
+    /// Real PTY-backed interactive terminal tabs. Process ownership is kept
+    /// in Rust so every WebView observes one lifecycle and workspace changes
+    /// can terminate shells before their roots are detached.
+    pub terminal: terminal::TerminalManager,
     pub permissions: permissions::PermissionState,
     /// Cancellation handles for in-flight `providers_stream_chat` requests,
     /// keyed by `request_id` — see `providers::providers_cancel_chat`.
@@ -329,6 +334,7 @@ impl Default for AppState {
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
             workspace_roots: Default::default(),
+            terminal: Default::default(),
             permissions: Default::default(),
             stream_cancels: Default::default(),
             checkpoints: Default::default(),
@@ -532,6 +538,15 @@ pub fn run() {
             permissions::get_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,
+            terminal::terminal_create,
+            terminal::terminal_list,
+            terminal::terminal_execute,
+            terminal::terminal_interrupt,
+            terminal::terminal_resize,
+            terminal::terminal_kill,
+            terminal::terminal_restart,
+            terminal::terminal_close,
+            terminal::terminal_history,
             tools::tool_read_file,
             tools::tool_list_dir,
             tools::tool_grep,
@@ -887,6 +902,7 @@ pub fn run() {
             let _ = companion.emergency_stop();
 
             let state = app_handle.state::<AppState>();
+            state.terminal.kill_all(Some(app_handle));
             tauri::async_runtime::block_on(mcp::disconnect_all(state.inner()));
             llama::stop_all_blocking(state.inner());
         }
