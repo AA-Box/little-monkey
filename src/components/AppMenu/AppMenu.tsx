@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  Compass,
   GitPullRequest,
   Globe,
   HelpCircle,
@@ -29,6 +30,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
+  onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
 }
 
@@ -66,6 +68,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
+  onRestartOnboarding,
   onOpenDailyBrief,
 }: AppMenuProps) {
   const { t } = useT();
@@ -227,6 +230,14 @@ export function AppMenu({
             )}
           </div>
 
+          <MenuRow
+            icon={<Compass size={14} className="text-faint" />}
+            label={t("AppMenu.restartOnboarding")}
+            onClick={() => {
+              closeAll();
+              onRestartOnboarding();
+            }}
+          />
           <MenuRow
             icon={<HelpCircle size={14} className="text-faint" />}
             label={t("AppMenu.getHelp")}
