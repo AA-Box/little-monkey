@@ -165,6 +165,11 @@ system-memory = "0.1.7"
 # to be installed on a user's machine; backup/limits support bounded portable
 # snapshots and hostile-input guardrails.
 rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
+# terminal.rs: one cross-platform pseudoterminal implementation for the
+# in-app terminal. The frontend intentionally stays a thin line-oriented
+# terminal surface; process ownership, output bounds, cancellation, and
+# workspace validation all remain in Rust.
+portable-pty = "0.9.0"
 
 # cli_install.rs (Windows only — macOS/Linux use a plain symlink via
 # `std::os::unix::fs::symlink`, no extra dependency needed): adds the CLI

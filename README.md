@@ -2,7 +2,7 @@
 
 Little Monkey is a local-first Tauri desktop workspace for agentic AI. It can run against managed `llama.cpp`, Ollama, MLX on supported Apple Silicon, or OpenAI-compatible providers that you configure. The React UI and Rust backend share workspace, permission, run, model, package, browser, Git, and background-service contracts instead of treating each surface as a separate product.
 
-The current working tree includes functional M1–M7 implementations. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations) and tracked precisely in [ROADMAP.md](ROADMAP.md).
+The current working tree includes the shipped foundations described below. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations). Future product proposals and their acceptance boundaries live in [ROADMAP.md](ROADMAP.md).
 
 ## Features
 
@@ -302,7 +302,7 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - GitHub delivery needs local `git` plus authenticated `gh`; hosted Actions need user-supplied provider credentials, while Ollama review needs a user-owned self-hosted runner.
 - The local OCR, speech, meeting, and image paths require configured binaries/models/endpoints. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no Little Monkey relay, account service, RBAC/SSO plane, or hosted GPU.
-- M8 release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim.
+- Release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim.
 
 ## Project layout
 
@@ -313,5 +313,5 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - `.github/actions/little-monkey-review/` — reusable PR-review action implementation and contract test.
 - `src-tauri/fixtures/` — deterministic browser and knowledge acceptance fixtures.
 - `graphify-out/` — generated architecture graph and wiki; run `graphify update .` after code changes.
-- [ROADMAP.md](ROADMAP.md) — milestone design, dependency order, implementation status, acceptance gates, and remaining external evidence.
+- [ROADMAP.md](ROADMAP.md) — future product phases, scoped acceptance boundaries, research items, and explicit non-goals.
 - [roadmap_audit_report.md](roadmap_audit_report.md) — preserved historical audit followed by a current working-tree closeout.

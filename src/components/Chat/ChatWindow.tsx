@@ -67,7 +67,9 @@ import { useUsageStore } from "../../store/usageStore";
 import { useStackStore } from "../../store/stackStore";
 import { useSkillProposalStore } from "../../store/skillProposalStore";
 import { useBrowserWorkbenchStore } from "../../store/browserWorkbenchStore";
+import { useSideTaskStore } from "../../store/sideTaskStore";
 import { useMcpStore } from "../../store/mcpStore";
+import { useTerminalStore } from "../../store/terminalStore";
 import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
 import type { SettingsTab } from "../Settings";
 
@@ -272,6 +274,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
   const consumeBrowserEvidence = useBrowserWorkbenchStore((state) => state.consumeForChat);
+  const pendingTerminalEvidence = useTerminalStore((state) => state.pendingEvidenceByChat[sessionId] ?? null);
+  const consumeTerminalEvidence = useTerminalStore((state) => state.consumeEvidence);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // "@"-mention autocomplete state. `mentionQuery` being non-null is what
@@ -499,6 +503,33 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       textareaRef.current?.focus();
     });
   }, [consumeBrowserEvidence, pendingBrowserEvidence, resizeTextarea, sessionId]);
+
+  // Terminal evidence crosses into a model turn only after TerminalPanel's
+  // explicit review confirmation. It then appears as a normal removable
+  // composer attachment and still waits for the user's final Send action.
+  useEffect(() => {
+    if (!pendingTerminalEvidence?.length) return;
+    const evidence = consumeTerminalEvidence(sessionId);
+    if (evidence.length === 0) return;
+    setAttachments((current) => {
+      const existing = new Set(current.map((attachment) => attachment.path));
+      const additions: AttachmentRef[] = evidence
+        .filter((entry) => !existing.has(entry.path))
+        .map((entry) => ({
+          path: entry.path,
+          isDir: false,
+          kind: "inline_text",
+          content: entry.content,
+          label: entry.label,
+        }));
+      return additions.length > 0 ? [...current, ...additions] : current;
+    });
+    setInput((current) => current.trim() ? current : t("TerminalPanel.defaultPrompt"));
+    requestAnimationFrame(() => {
+      resizeTextarea();
+      textareaRef.current?.focus();
+    });
+  }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
 
   // The separately-capability-scoped companion overlay never writes session
   // state directly. Rust emits its explicit context only to the main window;
@@ -873,6 +904,31 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     [sending, prepareTurnInstructions, sendTurn, sessionId]
   );
 
+  // Entry point for ROADMAP.md's "Side Tasks" item: "start a side task from
+  // selected chat context" — the `Split` hover button `MessageBubble.tsx`
+  // renders on every user/assistant bubble calls this with the message's
+  // own transcript index. Opens the side-task composer prefilled with that
+  // message's text as the seed prompt; nothing runs until the user reviews
+  // and clicks "Start side task" there (`SideTaskComposer.tsx`) — this
+  // handler itself never starts anything.
+  const handleStartSideTask = useCallback(
+    (index: number) => {
+      const source = sessionMessages(sessionId)[index];
+      if (!source) return;
+      const text = textContent(source.content).trim();
+      if (!text) return;
+      const roleLabel = source.role === "user" ? "Your message" : "Assistant message";
+      useSideTaskStore.getState().openComposer({
+        title: text.length > 60 ? `${text.slice(0, 60)}…` : text,
+        prompt: text,
+        profile: "explore",
+        source: { kind: "chat_message", label: roleLabel, excerpt: text.length > 240 ? `${text.slice(0, 240)}…` : text },
+        sessionId,
+      });
+    },
+    [sessionId]
+  );
+
   // Regenerate the last turn: drop everything from the last user message
   // onward (its whole downstream reply included) and resubmit that message —
   // the same mechanics as editing a past message, just without changing the
@@ -1162,6 +1218,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         onEditUserMessage={handleEditMessage}
         editingDisabled={sending}
         onRetry={handleRetry}
+        onStartSideTask={handleStartSideTask}
       />
 
       {error && (
@@ -1235,7 +1292,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
               <div className="mb-1.5 flex flex-wrap gap-1.5">
                 {attachments.map((attachment) => {
                   const segments = attachment.path.split(/[\\/]/).filter(Boolean);
-                  const name = segments[segments.length - 1] ?? attachment.path;
+                  const name = attachment.label ?? segments[segments.length - 1] ?? attachment.path;
                   return (
                     <AttachmentChip
                       key={attachment.path}
