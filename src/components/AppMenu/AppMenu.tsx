@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardList,
   Globe,
   HelpCircle,
   ListTodo,
@@ -28,6 +29,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDailyBrief: () => void;
+  onOpenPmCopilot: () => void;
 }
 
 interface MenuRowProps {
@@ -64,6 +66,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDailyBrief,
+  onOpenPmCopilot,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -154,6 +157,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardList size={14} className="text-faint" />}
+            label={t("AppMenu.pmCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenPmCopilot();
             }}
           />
           <MenuRow
