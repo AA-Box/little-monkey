@@ -8,6 +8,7 @@ import {
   HelpCircle,
   ListTodo,
   Inbox,
+  Newspaper,
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
@@ -26,6 +27,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
+  onOpenDailyBrief: () => void;
 }
 
 interface MenuRowProps {
@@ -61,6 +63,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
+  onOpenDailyBrief,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -111,6 +114,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenGlobalSearch();
+            }}
+          />
+          <MenuRow
+            icon={<Newspaper size={14} className="text-faint" />}
+            label={t("AppMenu.dailyBrief")}
+            onClick={() => {
+              closeAll();
+              onOpenDailyBrief();
             }}
           />
           <MenuRow
