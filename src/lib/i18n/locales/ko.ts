@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const ko: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   // Real Korean translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "데일리 브리핑",
   "DailyBriefPanel.title": "데일리 브리핑",
@@ -56,6 +58,39 @@ export const ko: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "모델 저장소 사용량: {{quota}} 중 {{used}}",
   "DailyBriefPanel.runtime.open": "설정 › 런타임 허브에서 열기",
   "DailyBriefPanel.runtime.error": "런타임 허브 개요 새로고침 실패: {{error}}",
+  // Real Korean translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "크로스 레포 변경 플래너",
+  "CrossRepoChangePlanner.title": "크로스 레포 변경 플래너",
+  "CrossRepoChangePlanner.subtitle": "조율이 필요한 변경 사항을 한 번만 설명하세요. 루트 폴더별로 위험 및 롤백 참고 사항이 포함된 순서가 지정된 계획을 검토한 다음, 어떤 저장소든 손대기 전에 승인하세요.",
+  "CrossRepoChangePlanner.close": "크로스 레포 변경 플래너 닫기",
+  "CrossRepoChangePlanner.noRootsWarning": "연결된 워크스페이스 루트 폴더가 없습니다. 크로스 레포 변경을 계획하기 전에 기본 폴더를 열고(선택적으로 보조 폴더도 추가하세요).",
+  "CrossRepoChangePlanner.descriptionLabel": "조율이 필요한 변경 사항을 설명하세요",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "예: API, 웹 클라이언트, 문서에서 `widgetId` 필드 이름을 `widgetKey`로 변경합니다.",
+  "CrossRepoChangePlanner.generateButton": "계획 생성",
+  "CrossRepoChangePlanner.statusDraft": "초안 — 아직 승인되지 않음",
+  "CrossRepoChangePlanner.statusApproved": "승인됨",
+  "CrossRepoChangePlanner.approveButton": "계획 승인",
+  "CrossRepoChangePlanner.approveGateNote": "이 계획을 승인하기 전까지는 어떤 저장소도 변경되지 않습니다. 필요하면 먼저 단계의 텍스트나 순서를 편집하세요.",
+  "CrossRepoChangePlanner.startOverButton": "다시 시작",
+  "CrossRepoChangePlanner.moveUp": "단계 위로 이동",
+  "CrossRepoChangePlanner.moveDown": "단계 아래로 이동",
+  "CrossRepoChangePlanner.dependsOn": "의존 대상: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "요약",
+  "CrossRepoChangePlanner.changesLabel": "변경 내용",
+  "CrossRepoChangePlanner.risksLabel": "문제가 될 수 있는 부분",
+  "CrossRepoChangePlanner.rollbackLabel": "롤백",
+  "CrossRepoChangePlanner.branchSectionHeading": "브랜치 생성",
+  "CrossRepoChangePlanner.branchCreated": "브랜치 생성됨: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "GitHub 저장소",
+  "CrossRepoChangePlanner.baseRefLabel": "기준 참조",
+  "CrossRepoChangePlanner.branchPrefixLabel": "소유 브랜치 접두사",
+  "CrossRepoChangePlanner.labelLabel": "작업 라벨",
+  "CrossRepoChangePlanner.createBranchButton": "브랜치 생성",
+  "CrossRepoChangePlanner.approveFirstHint": "이 단계의 브랜치를 생성하려면 먼저 계획을 승인하세요.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "확인하려면 {{phrase}}(을)를 입력하세요",
+  "CrossRepoChangePlanner.confirmCancel": "취소",
+  "CrossRepoChangePlanner.confirmExecute": "확인",
+  "CrossRepoChangePlanner.pushFollowUpNote": "이 작업은 앱이 소유한 로컬 브랜치만 생성합니다. 브랜치 푸시와 초안 PR 열기는 Issue-to-PR 흐름과 동일한 확인 문구 입력 단계를 거쳐 설정 → Git 전달에서 수동으로 이어서 진행해야 합니다.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

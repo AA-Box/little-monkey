@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 
 export const fr: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const fr: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   // Real French translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Bilan quotidien",
   "DailyBriefPanel.title": "Bilan quotidien",
@@ -56,6 +58,39 @@ export const fr: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "{{used}} utilisés sur {{quota}} de stockage des modèles",
   "DailyBriefPanel.runtime.open": "Ouvrir dans Paramètres › Runtime Hub",
   "DailyBriefPanel.runtime.error": "Échec de l'actualisation de l'aperçu du Runtime Hub : {{error}}",
+  // Real French translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "Planificateur de changements inter-dépôts",
+  "CrossRepoChangePlanner.title": "Planificateur de changements inter-dépôts",
+  "CrossRepoChangePlanner.subtitle": "Décrivez une fois un changement coordonné. Passez en revue un plan ordonné par dossier avec risques et consignes de retour arrière, puis approuvez-le avant que quoi que ce soit ne touche un dépôt.",
+  "CrossRepoChangePlanner.close": "Fermer le planificateur de changements inter-dépôts",
+  "CrossRepoChangePlanner.noRootsWarning": "Aucun dossier de l'espace de travail n'est attaché. Ouvrez un dossier principal (et éventuellement des dossiers secondaires) avant de planifier un changement inter-dépôts.",
+  "CrossRepoChangePlanner.descriptionLabel": "Décrivez le changement coordonné",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "ex. Renommer le champ `widgetId` en `widgetKey` dans l'API, le client web et la documentation.",
+  "CrossRepoChangePlanner.generateButton": "Générer le plan",
+  "CrossRepoChangePlanner.statusDraft": "Brouillon — pas encore approuvé",
+  "CrossRepoChangePlanner.statusApproved": "Approuvé",
+  "CrossRepoChangePlanner.approveButton": "Approuver le plan",
+  "CrossRepoChangePlanner.approveGateNote": "Aucun dépôt n'est touché tant que vous n'approuvez pas ce plan. Modifiez d'abord le texte ou l'ordre des étapes si besoin.",
+  "CrossRepoChangePlanner.startOverButton": "Recommencer",
+  "CrossRepoChangePlanner.moveUp": "Déplacer l'étape vers le haut",
+  "CrossRepoChangePlanner.moveDown": "Déplacer l'étape vers le bas",
+  "CrossRepoChangePlanner.dependsOn": "Dépend de : {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "Résumé",
+  "CrossRepoChangePlanner.changesLabel": "Ce qui change",
+  "CrossRepoChangePlanner.risksLabel": "Ce qui pourrait casser",
+  "CrossRepoChangePlanner.rollbackLabel": "Retour arrière",
+  "CrossRepoChangePlanner.branchSectionHeading": "Création de branche",
+  "CrossRepoChangePlanner.branchCreated": "Branche créée : {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "Dépôt GitHub",
+  "CrossRepoChangePlanner.baseRefLabel": "Référence de base",
+  "CrossRepoChangePlanner.branchPrefixLabel": "Préfixe de branche possédée",
+  "CrossRepoChangePlanner.labelLabel": "Libellé de la tâche",
+  "CrossRepoChangePlanner.createBranchButton": "Créer la branche",
+  "CrossRepoChangePlanner.approveFirstHint": "Approuvez le plan avant de créer une branche pour cette étape.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "Tapez {{phrase}} pour confirmer",
+  "CrossRepoChangePlanner.confirmCancel": "Annuler",
+  "CrossRepoChangePlanner.confirmExecute": "Confirmer",
+  "CrossRepoChangePlanner.pushFollowUpNote": "Cela ne crée que des branches locales possédées par l'application. Pousser une branche et ouvrir une PR en brouillon reste une action manuelle ultérieure dans Réglages → Livraison Git, avec la même étape de confirmation par saisie de phrase, exactement comme le flux Issue-to-PR.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

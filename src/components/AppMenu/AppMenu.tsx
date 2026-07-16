@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  GitBranch,
   Globe,
   HelpCircle,
   ListTodo,
@@ -28,6 +29,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onOpenDailyBrief: () => void;
+  onOpenCrossRepoChangePlanner: () => void;
 }
 
 interface MenuRowProps {
@@ -64,6 +66,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenTerminal,
   onOpenDailyBrief,
+  onOpenCrossRepoChangePlanner,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -162,6 +165,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<GitBranch size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoChangePlanner")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoChangePlanner();
             }}
           />
           <MenuRow

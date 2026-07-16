@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const hi: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   // Real Hindi translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "डेली ब्रीफ",
   "DailyBriefPanel.title": "डेली ब्रीफ",
@@ -56,6 +58,39 @@ export const hi: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "मॉडल स्टोरेज का {{quota}} में से {{used}} उपयोग हुआ",
   "DailyBriefPanel.runtime.open": "सेटिंग्स › रनटाइम हब में खोलें",
   "DailyBriefPanel.runtime.error": "रनटाइम हब का अवलोकन रीफ़्रेश करने में विफल: {{error}}",
+  // Real Hindi translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "क्रॉस-रेपो चेंज प्लानर",
+  "CrossRepoChangePlanner.title": "क्रॉस-रेपो चेंज प्लानर",
+  "CrossRepoChangePlanner.subtitle": "एक समन्वित बदलाव का विवरण एक बार दें। हर रूट फ़ोल्डर के लिए क्रमबद्ध योजना, जोखिम और रोलबैक नोट्स के साथ समीक्षा करें, और किसी भी रिपॉज़िटरी को छूने से पहले उसे मंज़ूर करें।",
+  "CrossRepoChangePlanner.close": "क्रॉस-रेपो चेंज प्लानर बंद करें",
+  "CrossRepoChangePlanner.noRootsWarning": "कोई वर्कस्पेस रूट फ़ोल्डर जुड़ा नहीं है। क्रॉस-रेपो बदलाव की योजना बनाने से पहले एक प्राथमिक फ़ोल्डर खोलें (और वैकल्पिक रूप से द्वितीयक फ़ोल्डर जोड़ें)।",
+  "CrossRepoChangePlanner.descriptionLabel": "समन्वित बदलाव का विवरण दें",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "उदा. API, वेब क्लाइंट और दस्तावेज़ों में फ़ील्ड `widgetId` का नाम बदलकर `widgetKey` करें।",
+  "CrossRepoChangePlanner.generateButton": "योजना बनाएं",
+  "CrossRepoChangePlanner.statusDraft": "ड्राफ़्ट — अभी मंज़ूर नहीं",
+  "CrossRepoChangePlanner.statusApproved": "मंज़ूर",
+  "CrossRepoChangePlanner.approveButton": "योजना मंज़ूर करें",
+  "CrossRepoChangePlanner.approveGateNote": "जब तक आप इस योजना को मंज़ूर नहीं करते, कोई रिपॉज़िटरी नहीं छुई जाएगी। ज़रूरत हो तो पहले किसी चरण का टेक्स्ट या क्रम बदलें।",
+  "CrossRepoChangePlanner.startOverButton": "फिर से शुरू करें",
+  "CrossRepoChangePlanner.moveUp": "चरण ऊपर ले जाएं",
+  "CrossRepoChangePlanner.moveDown": "चरण नीचे ले जाएं",
+  "CrossRepoChangePlanner.dependsOn": "निर्भर है: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "सारांश",
+  "CrossRepoChangePlanner.changesLabel": "क्या बदलेगा",
+  "CrossRepoChangePlanner.risksLabel": "क्या बिगड़ सकता है",
+  "CrossRepoChangePlanner.rollbackLabel": "रोलबैक",
+  "CrossRepoChangePlanner.branchSectionHeading": "ब्रांच बनाना",
+  "CrossRepoChangePlanner.branchCreated": "ब्रांच बनाई गई: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "GitHub रिपॉज़िटरी",
+  "CrossRepoChangePlanner.baseRefLabel": "बेस रेफ़",
+  "CrossRepoChangePlanner.branchPrefixLabel": "स्वामित्व वाला ब्रांच प्रीफ़िक्स",
+  "CrossRepoChangePlanner.labelLabel": "टास्क लेबल",
+  "CrossRepoChangePlanner.createBranchButton": "ब्रांच बनाएं",
+  "CrossRepoChangePlanner.approveFirstHint": "इस चरण के लिए ब्रांच बनाने से पहले योजना को मंज़ूर करें।",
+  "CrossRepoChangePlanner.confirmTypePhrase": "पुष्टि के लिए {{phrase}} टाइप करें",
+  "CrossRepoChangePlanner.confirmCancel": "रद्द करें",
+  "CrossRepoChangePlanner.confirmExecute": "पुष्टि करें",
+  "CrossRepoChangePlanner.pushFollowUpNote": "यह केवल स्थानीय स्वामित्व वाली ब्रांच बनाता है। ब्रांच पुश करना और ड्राफ़्ट PR खोलना Settings → Git डिलीवरी में एक मैन्युअल फ़ॉलो-अप कार्रवाई बनी रहती है, ठीक Issue-to-PR फ़्लो जैसे ही पुष्टि-वाक्यांश टाइप करने वाले चरण के साथ।",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

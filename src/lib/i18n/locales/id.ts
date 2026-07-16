@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,7 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   // Real Indonesian translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Ringkasan Harian",
   "DailyBriefPanel.title": "Ringkasan Harian",
@@ -56,6 +58,39 @@ export const id: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "{{used}} terpakai dari {{quota}} penyimpanan model",
   "DailyBriefPanel.runtime.open": "Buka di Pengaturan › Runtime Hub",
   "DailyBriefPanel.runtime.error": "Gagal menyegarkan ringkasan Runtime Hub: {{error}}",
+  // Real Indonesian translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "Perencana Perubahan Lintas-Repo",
+  "CrossRepoChangePlanner.title": "Perencana Perubahan Lintas-Repo",
+  "CrossRepoChangePlanner.subtitle": "Jelaskan perubahan terkoordinasi sekali saja. Tinjau rencana berurutan per folder root dengan catatan risiko dan rollback, lalu setujui sebelum ada repositori yang tersentuh.",
+  "CrossRepoChangePlanner.close": "Tutup Perencana Perubahan Lintas-Repo",
+  "CrossRepoChangePlanner.noRootsWarning": "Tidak ada folder ruang kerja yang terpasang. Buka folder utama (dan opsional lampirkan folder sekunder) sebelum merencanakan perubahan lintas-repo.",
+  "CrossRepoChangePlanner.descriptionLabel": "Jelaskan perubahan terkoordinasi",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "mis. Ganti nama kolom `widgetId` menjadi `widgetKey` di API, klien web, dan dokumentasi.",
+  "CrossRepoChangePlanner.generateButton": "Buat rencana",
+  "CrossRepoChangePlanner.statusDraft": "Draf — belum disetujui",
+  "CrossRepoChangePlanner.statusApproved": "Disetujui",
+  "CrossRepoChangePlanner.approveButton": "Setujui rencana",
+  "CrossRepoChangePlanner.approveGateNote": "Tidak ada repositori yang tersentuh sampai Anda menyetujui rencana ini. Edit dulu teks atau urutan langkah jika perlu.",
+  "CrossRepoChangePlanner.startOverButton": "Mulai ulang",
+  "CrossRepoChangePlanner.moveUp": "Pindahkan langkah ke atas",
+  "CrossRepoChangePlanner.moveDown": "Pindahkan langkah ke bawah",
+  "CrossRepoChangePlanner.dependsOn": "Bergantung pada: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "Ringkasan",
+  "CrossRepoChangePlanner.changesLabel": "Apa yang berubah",
+  "CrossRepoChangePlanner.risksLabel": "Apa yang bisa rusak",
+  "CrossRepoChangePlanner.rollbackLabel": "Rollback",
+  "CrossRepoChangePlanner.branchSectionHeading": "Pembuatan branch",
+  "CrossRepoChangePlanner.branchCreated": "Branch dibuat: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "Repositori GitHub",
+  "CrossRepoChangePlanner.baseRefLabel": "Ref dasar",
+  "CrossRepoChangePlanner.branchPrefixLabel": "Prefiks branch milik aplikasi",
+  "CrossRepoChangePlanner.labelLabel": "Label tugas",
+  "CrossRepoChangePlanner.createBranchButton": "Buat branch",
+  "CrossRepoChangePlanner.approveFirstHint": "Setujui rencana sebelum membuat branch untuk langkah ini.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "Ketik {{phrase}} untuk mengonfirmasi",
+  "CrossRepoChangePlanner.confirmCancel": "Batal",
+  "CrossRepoChangePlanner.confirmExecute": "Konfirmasi",
+  "CrossRepoChangePlanner.pushFollowUpNote": "Ini hanya membuat branch lokal milik aplikasi. Mendorong (push) branch dan membuka draf PR tetap menjadi tindakan lanjutan manual di Pengaturan → Pengiriman Git, dengan langkah konfirmasi ketik-frasa yang sama, persis seperti alur Issue-to-PR.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",
