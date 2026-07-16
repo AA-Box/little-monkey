@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  GitPullRequest,
   Globe,
   HelpCircle,
   ListTodo,
@@ -24,6 +25,7 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenIssueToPr: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
@@ -60,6 +62,7 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenIssueToPr,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
@@ -146,6 +149,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<GitPullRequest size={14} className="text-faint" />}
+            label={t("AppMenu.issueToPr")}
+            onClick={() => {
+              closeAll();
+              onOpenIssueToPr();
             }}
           />
           <MenuRow
