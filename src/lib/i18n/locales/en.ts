@@ -8,6 +8,7 @@ import { developerLocale } from "./developer";
 import { issueToPrLocale } from "./issueToPr";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
+import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
 
 export const en: Record<string, string> = {
@@ -21,6 +22,7 @@ export const en: Record<string, string> = {
   ...issueToPrLocale,
   ...specScorerLocale,
   ...inboxLocale,
+  ...onboardingLocale,
   ...dailyBriefLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
