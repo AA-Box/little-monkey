@@ -55,12 +55,14 @@ const installed = {
   revoked: false,
   tombstoned: false,
   approved_permissions: [],
+  local_install_count: 1,
+  team_approved: false,
 } satisfies InstalledPackageState;
 
 beforeEach(() => {
   invokeMock.mockReset();
   useEcosystemStore.setState({
-    catalog: [], installed: [], plugins: [], installPreview: null, workflows: [], workflowIr: null,
+    catalog: [], installed: [], plugins: [], registrySources: [], installPreview: null, workflows: [], workflowIr: null,
     histories: [], activeRunId: null, inspectedNode: null, oauthServers: [], oauthMetadata: {},
     busy: {}, error: null,
   });
@@ -169,5 +171,38 @@ describe("ecosystemStore", () => {
     await promise;
     expect(useEcosystemStore.getState().activeRunId).toBeNull();
     expect(useEcosystemStore.getState().histories).toEqual([history]);
+  });
+
+  it("toggles the local team-approved flag without touching any other installed state", async () => {
+    useEcosystemStore.setState({ installed: [installed] });
+    invokeMock.mockResolvedValueOnce({ ...installed, team_approved: true });
+    await useEcosystemStore.getState().setPackageTeamApproved("first-party.skill", true);
+    expect(invokeMock).toHaveBeenCalledWith("m4_packages_set_team_approved", {
+      packageId: "first-party.skill",
+      teamApproved: true,
+    });
+    expect(useEcosystemStore.getState().installed).toEqual([{ ...installed, team_approved: true }]);
+  });
+
+  it("manages additional registry sources through list/add/remove/verify", async () => {
+    const record = {
+      source: { source_id: "team-catalog", display_name: "Team Catalog", location: "https://team.example.com/registry.json", added_unix_ms: 1 },
+      verified: null,
+      last_verification_error: null,
+    };
+    invokeMock.mockResolvedValueOnce(record);
+    const added = await useEcosystemStore.getState().addRegistrySource("team-catalog", "Team Catalog", "https://team.example.com/registry.json");
+    expect(added).toEqual(record);
+    expect(useEcosystemStore.getState().registrySources).toEqual([record]);
+
+    const verifiedRecord = { ...record, verified: { snapshot: { registry_id: "team-catalog", packages: {} }, verified_unix_ms: 2, snapshot_sha256: "c".repeat(64) } };
+    invokeMock.mockResolvedValueOnce(verifiedRecord);
+    await useEcosystemStore.getState().verifyRegistrySource("team-catalog", { registry_id: "team-catalog" } as never);
+    expect(useEcosystemStore.getState().registrySources).toEqual([verifiedRecord]);
+
+    invokeMock.mockResolvedValueOnce(true);
+    await useEcosystemStore.getState().removeRegistrySource("team-catalog");
+    expect(invokeMock).toHaveBeenCalledWith("m4_registries_remove", { sourceId: "team-catalog" });
+    expect(useEcosystemStore.getState().registrySources).toEqual([]);
   });
 });

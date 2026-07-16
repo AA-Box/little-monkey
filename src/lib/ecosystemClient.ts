@@ -37,6 +37,17 @@ export interface PackageContentReference {
   sha256: string;
 }
 
+export type VulnerabilitySeverity = "low" | "medium" | "high" | "critical";
+
+/** Manifest-declared only — there is no live CVE/vulnerability feed. */
+export interface VulnerabilityNotice {
+  notice_id: string;
+  severity: VulnerabilitySeverity;
+  summary: string;
+  affected_versions: SemanticVersion[];
+  advisory_url: string | null;
+}
+
 export interface PackageAssistantComposition {
   persona_content_path: string;
   skill_package_ids: string[];
@@ -54,6 +65,7 @@ export interface PackageManifest {
   content: PackageContentReference[];
   assistant?: PackageAssistantComposition | null;
   permissions: PackagePermission[];
+  vulnerability_notices?: VulnerabilityNotice[];
   mcp_requirements: unknown[];
   provenance: {
     publisher: string;
@@ -126,6 +138,10 @@ export interface InstalledPackageState {
   revoked: boolean;
   tombstoned: boolean;
   approved_permissions: PackagePermission[];
+  /** Local-only counter; there is no hosted install telemetry in this app. */
+  local_install_count: number;
+  /** Locally user-set flag, independent of any role/permission system. */
+  team_approved: boolean;
 }
 
 export interface ActiveSkillDescriptor {
@@ -196,6 +212,38 @@ export interface PortablePackageExport {
   bundle_sha256: string;
   manifest: PackageManifest;
   files_hex: Record<string, string>;
+}
+
+export interface RegistrySnapshot {
+  schema_version: number;
+  registry_id: string;
+  sequence: number;
+  generated_unix_ms: number;
+  refresh_after_unix_ms: number;
+  expires_unix_ms: number;
+  packages: Record<string, unknown[]>;
+  revocations: unknown[];
+  signature: { trust_root_id: string; key_id: string; algorithm: string; signature_hex: string };
+}
+
+export interface VerifiedRegistryState {
+  snapshot: RegistrySnapshot;
+  verified_unix_ms: number;
+  snapshot_sha256: string;
+}
+
+/** The roadmap's "private/team catalog": a user-added registry source. */
+export interface AdditionalRegistrySource {
+  source_id: string;
+  display_name: string;
+  location: string;
+  added_unix_ms: number;
+}
+
+export interface AdditionalRegistryRecord {
+  source: AdditionalRegistrySource;
+  verified: VerifiedRegistryState | null;
+  last_verification_error: string | null;
 }
 
 export interface OAuthServerMetadata {
@@ -543,6 +591,25 @@ export const ecosystemClient = {
     invoke<InstalledPackageState>("m4_packages_uninstall", { packageId }),
   exportPackage: (packageId: string) =>
     invoke<PortablePackageExport>("m4_packages_export", { packageId }),
+  setPackageTeamApproved: (packageId: string, teamApproved: boolean) =>
+    invoke<InstalledPackageState>("m4_packages_set_team_approved", { packageId, teamApproved }),
+
+  listRegistrySources: () => invoke<AdditionalRegistryRecord[]>("m4_registries_list"),
+  addRegistrySource: (
+    sourceId: string,
+    displayName: string,
+    location: string,
+    nowUnixMs = Date.now(),
+  ) => invoke<AdditionalRegistryRecord>("m4_registries_add", {
+    sourceId,
+    displayName,
+    location,
+    nowUnixMs,
+  }),
+  removeRegistrySource: (sourceId: string) =>
+    invoke<boolean>("m4_registries_remove", { sourceId }),
+  verifyRegistrySource: (sourceId: string, snapshot: RegistrySnapshot, nowUnixMs = Date.now()) =>
+    invoke<AdditionalRegistryRecord>("m4_registries_verify", { sourceId, snapshot, nowUnixMs }),
   activatePluginWorkflow: (packageId: string, contentPath: string) =>
     invoke<WorkflowIr>("m4_plugins_activate_workflow", { packageId, contentPath }),
   deactivatePluginWorkflow: (packageId: string, contentPath: string) =>
