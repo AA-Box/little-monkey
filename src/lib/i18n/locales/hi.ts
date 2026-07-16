@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const hi: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "इशू-टू-पीआर",
   "IssueToPr.title": "इशू-टू-पीआर एजेंट फ़्लो",
@@ -923,4 +925,28 @@ export const hi: Record<string, string> = {
   "TriagePanel.sendingButton": "भेजा जा रहा है…",
   "TriagePanel.discardButton": "अस्वीकार करें",
   "TriagePanel.discardedNotice": "इस सत्र के दृश्य से हटा दिया गया।",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "अनुमोदन शृंखलाएँ",
+  "ApprovalChainsPanel.templatesHeading": "शृंखला टेम्पलेट",
+  "ApprovalChainsPanel.description": "एकल-चरण अनुमति संकेत के ऊपर बनाए गए बहु-चरण अनुमोदन वर्कफ़्लो: प्रत्येक चरण को क्रम से स्वीकृत करना होगा, और किसी भी चरण पर अस्वीकृति या समय-सीमा समाप्त होने से पूरी शृंखला रुक जाती है।",
+  "ApprovalChainsPanel.runTestChainButton": "परीक्षण शृंखला चलाएँ",
+  "ApprovalChainsPanel.runningButton": "चल रहा है…",
+  "ApprovalChainsPanel.stageTimeout": "{{seconds}} सेकंड की समय-सीमा",
+  "ApprovalChainsPanel.noTemplatesState": "कोई शृंखला टेम्पलेट उपलब्ध नहीं है।",
+  "ApprovalChainsPanel.historyHeading": "इतिहास",
+  "ApprovalChainsPanel.refreshButton": "ताज़ा करें",
+  "ApprovalChainsPanel.emptyHistoryState": "अभी तक कोई शृंखला रन नहीं है। इसे यहाँ दिखाने के लिए ऊपर एक परीक्षण शृंखला चलाएँ।",
+  "ApprovalChainsPanel.testRunDetail": "सेटिंग्स → अनुमोदन शृंखलाएँ से शुरू किया गया मैन्युअल परीक्षण रन।",
+  "ApprovalChainsPanel.status.pending": "लंबित",
+  "ApprovalChainsPanel.status.approved": "स्वीकृत",
+  "ApprovalChainsPanel.status.rejected": "अस्वीकृत",
+  "ApprovalChainsPanel.status.expired": "समय-समाप्त",
+  "ApprovalChainsPanel.decision.allow": "स्वीकृत",
+  "ApprovalChainsPanel.decision.deny": "अस्वीकृत",
+  "ApprovalChainsPanel.decision.expired": "समय-समाप्त",
+  "ApprovalChainModal.title": "अनुमोदन आवश्यक",
+  "ApprovalChainModal.stageProgress": "चरण {{current}} में से {{total}}",
+  "ApprovalChainModal.timeRemaining": "शेष समय: {{time}}",
+  "ApprovalChainModal.denyButton": "अस्वीकार करें",
+  "ApprovalChainModal.approveButton": "स्वीकृत करें",
 };

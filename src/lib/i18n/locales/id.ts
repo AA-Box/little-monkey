@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const id: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Alur Agen Issue-to-PR",
@@ -923,4 +925,28 @@ export const id: Record<string, string> = {
   "TriagePanel.sendingButton": "Mengirim…",
   "TriagePanel.discardButton": "Buang",
   "TriagePanel.discardedNotice": "Dibuang dari tampilan sesi ini.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "Rantai Persetujuan",
+  "ApprovalChainsPanel.templatesHeading": "Templat rantai",
+  "ApprovalChainsPanel.description": "Alur kerja persetujuan multi-tahap yang dibangun di atas prompt izin sekali jalan: setiap tahap harus disetujui secara berurutan, dan penolakan atau waktu habis di tahap mana pun akan menghentikan seluruh rantai.",
+  "ApprovalChainsPanel.runTestChainButton": "Jalankan rantai uji",
+  "ApprovalChainsPanel.runningButton": "Sedang berjalan…",
+  "ApprovalChainsPanel.stageTimeout": "Batas waktu {{seconds}} dtk",
+  "ApprovalChainsPanel.noTemplatesState": "Tidak ada templat rantai yang tersedia.",
+  "ApprovalChainsPanel.historyHeading": "Riwayat",
+  "ApprovalChainsPanel.refreshButton": "Segarkan",
+  "ApprovalChainsPanel.emptyHistoryState": "Belum ada rantai yang berjalan. Jalankan rantai uji di atas agar muncul di sini.",
+  "ApprovalChainsPanel.testRunDetail": "Rantai uji manual dimulai dari Pengaturan → Rantai Persetujuan.",
+  "ApprovalChainsPanel.status.pending": "Menunggu",
+  "ApprovalChainsPanel.status.approved": "Disetujui",
+  "ApprovalChainsPanel.status.rejected": "Ditolak",
+  "ApprovalChainsPanel.status.expired": "Kedaluwarsa",
+  "ApprovalChainsPanel.decision.allow": "Diizinkan",
+  "ApprovalChainsPanel.decision.deny": "Ditolak",
+  "ApprovalChainsPanel.decision.expired": "Kedaluwarsa",
+  "ApprovalChainModal.title": "Persetujuan diperlukan",
+  "ApprovalChainModal.stageProgress": "Tahap {{current}} dari {{total}}",
+  "ApprovalChainModal.timeRemaining": "Waktu tersisa: {{time}}",
+  "ApprovalChainModal.denyButton": "Tolak",
+  "ApprovalChainModal.approveButton": "Setujui",
 };

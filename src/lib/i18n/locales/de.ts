@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const de: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR-Agentenablauf",
@@ -923,4 +925,28 @@ export const de: Record<string, string> = {
   "TriagePanel.sendingButton": "Wird gesendet…",
   "TriagePanel.discardButton": "Verwerfen",
   "TriagePanel.discardedNotice": "In dieser Sitzung verworfen.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "Freigabeketten",
+  "ApprovalChainsPanel.templatesHeading": "Ketten-Vorlagen",
+  "ApprovalChainsPanel.description": "Mehrstufige Freigabe-Workflows, aufbauend auf der einmaligen Berechtigungsabfrage: Jede Stufe muss der Reihe nach freigegeben werden, und eine Ablehnung oder ein Zeitlimit in einer beliebigen Stufe stoppt die gesamte Kette.",
+  "ApprovalChainsPanel.runTestChainButton": "Testkette ausführen",
+  "ApprovalChainsPanel.runningButton": "Wird ausgeführt…",
+  "ApprovalChainsPanel.stageTimeout": "{{seconds}}s Zeitlimit",
+  "ApprovalChainsPanel.noTemplatesState": "Keine Ketten-Vorlagen verfügbar.",
+  "ApprovalChainsPanel.historyHeading": "Verlauf",
+  "ApprovalChainsPanel.refreshButton": "Aktualisieren",
+  "ApprovalChainsPanel.emptyHistoryState": "Noch keine Kettenläufe. Führe oben eine Testkette aus, damit sie hier erscheint.",
+  "ApprovalChainsPanel.testRunDetail": "Manueller Testlauf, gestartet über Einstellungen → Freigabeketten.",
+  "ApprovalChainsPanel.status.pending": "Ausstehend",
+  "ApprovalChainsPanel.status.approved": "Freigegeben",
+  "ApprovalChainsPanel.status.rejected": "Abgelehnt",
+  "ApprovalChainsPanel.status.expired": "Abgelaufen",
+  "ApprovalChainsPanel.decision.allow": "Zugelassen",
+  "ApprovalChainsPanel.decision.deny": "Abgelehnt",
+  "ApprovalChainsPanel.decision.expired": "Abgelaufen",
+  "ApprovalChainModal.title": "Freigabe erforderlich",
+  "ApprovalChainModal.stageProgress": "Stufe {{current}} von {{total}}",
+  "ApprovalChainModal.timeRemaining": "Verbleibende Zeit: {{time}}",
+  "ApprovalChainModal.denyButton": "Ablehnen",
+  "ApprovalChainModal.approveButton": "Freigeben",
 };

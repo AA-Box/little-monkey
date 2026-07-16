@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const ko: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "이슈-투-PR",
   "IssueToPr.title": "이슈-투-PR 에이전트 흐름",
@@ -923,4 +925,28 @@ export const ko: Record<string, string> = {
   "TriagePanel.sendingButton": "전송 중…",
   "TriagePanel.discardButton": "삭제",
   "TriagePanel.discardedNotice": "이 세션 화면에서 삭제되었습니다.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "승인 체인",
+  "ApprovalChainsPanel.templatesHeading": "체인 템플릿",
+  "ApprovalChainsPanel.description": "단일 권한 확인 위에 구축된 다단계 승인 워크플로입니다. 각 단계는 순서대로 승인되어야 하며, 어느 단계에서든 거부되거나 시간이 초과되면 전체 체인이 중단됩니다.",
+  "ApprovalChainsPanel.runTestChainButton": "테스트 체인 실행",
+  "ApprovalChainsPanel.runningButton": "실행 중…",
+  "ApprovalChainsPanel.stageTimeout": "제한 시간 {{seconds}}초",
+  "ApprovalChainsPanel.noTemplatesState": "사용 가능한 체인 템플릿이 없습니다.",
+  "ApprovalChainsPanel.historyHeading": "기록",
+  "ApprovalChainsPanel.refreshButton": "새로고침",
+  "ApprovalChainsPanel.emptyHistoryState": "아직 실행된 체인이 없습니다. 위에서 테스트 체인을 실행하면 여기에 표시됩니다.",
+  "ApprovalChainsPanel.testRunDetail": "설정 → 승인 체인에서 시작된 수동 테스트 실행입니다.",
+  "ApprovalChainsPanel.status.pending": "대기 중",
+  "ApprovalChainsPanel.status.approved": "승인됨",
+  "ApprovalChainsPanel.status.rejected": "거부됨",
+  "ApprovalChainsPanel.status.expired": "만료됨",
+  "ApprovalChainsPanel.decision.allow": "허용됨",
+  "ApprovalChainsPanel.decision.deny": "거부됨",
+  "ApprovalChainsPanel.decision.expired": "만료됨",
+  "ApprovalChainModal.title": "승인이 필요합니다",
+  "ApprovalChainModal.stageProgress": "{{total}}단계 중 {{current}}단계",
+  "ApprovalChainModal.timeRemaining": "남은 시간: {{time}}",
+  "ApprovalChainModal.denyButton": "거부",
+  "ApprovalChainModal.approveButton": "승인",
 };

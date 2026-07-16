@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const pt: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const pt: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Fluxo de agente Issue-to-PR",
@@ -923,4 +925,28 @@ export const pt: Record<string, string> = {
   "TriagePanel.sendingButton": "Enviando…",
   "TriagePanel.discardButton": "Descartar",
   "TriagePanel.discardedNotice": "Descartado desta sessão.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "Cadeias de aprovação",
+  "ApprovalChainsPanel.templatesHeading": "Modelos de cadeia",
+  "ApprovalChainsPanel.description": "Fluxos de aprovação em várias etapas construídos sobre a solicitação de permissão única: cada etapa deve ser aprovada em ordem, e uma recusa ou expiração de tempo em qualquer etapa interrompe toda a cadeia.",
+  "ApprovalChainsPanel.runTestChainButton": "Executar cadeia de teste",
+  "ApprovalChainsPanel.runningButton": "Executando…",
+  "ApprovalChainsPanel.stageTimeout": "Tempo limite de {{seconds}}s",
+  "ApprovalChainsPanel.noTemplatesState": "Nenhum modelo de cadeia disponível.",
+  "ApprovalChainsPanel.historyHeading": "Histórico",
+  "ApprovalChainsPanel.refreshButton": "Atualizar",
+  "ApprovalChainsPanel.emptyHistoryState": "Nenhuma cadeia executada ainda. Execute uma cadeia de teste acima para vê-la aparecer aqui.",
+  "ApprovalChainsPanel.testRunDetail": "Execução de teste manual iniciada em Configurações → Cadeias de aprovação.",
+  "ApprovalChainsPanel.status.pending": "Pendente",
+  "ApprovalChainsPanel.status.approved": "Aprovada",
+  "ApprovalChainsPanel.status.rejected": "Rejeitada",
+  "ApprovalChainsPanel.status.expired": "Expirada",
+  "ApprovalChainsPanel.decision.allow": "Permitido",
+  "ApprovalChainsPanel.decision.deny": "Negado",
+  "ApprovalChainsPanel.decision.expired": "Expirado",
+  "ApprovalChainModal.title": "Aprovação necessária",
+  "ApprovalChainModal.stageProgress": "Etapa {{current}} de {{total}}",
+  "ApprovalChainModal.timeRemaining": "Tempo restante: {{time}}",
+  "ApprovalChainModal.denyButton": "Recusar",
+  "ApprovalChainModal.approveButton": "Aprovar",
 };

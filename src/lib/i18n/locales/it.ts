@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const it: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const it: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flusso agente Issue-to-PR",
@@ -923,4 +925,28 @@ export const it: Record<string, string> = {
   "TriagePanel.sendingButton": "Invio…",
   "TriagePanel.discardButton": "Scarta",
   "TriagePanel.discardedNotice": "Scartato dalla vista di questa sessione.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "Catene di approvazione",
+  "ApprovalChainsPanel.templatesHeading": "Modelli di catena",
+  "ApprovalChainsPanel.description": "Flussi di approvazione multi-fase costruiti sopra la richiesta di permesso singola: ogni fase deve essere approvata in ordine e un rifiuto o un timeout in qualsiasi fase interrompe l'intera catena.",
+  "ApprovalChainsPanel.runTestChainButton": "Esegui catena di prova",
+  "ApprovalChainsPanel.runningButton": "In esecuzione…",
+  "ApprovalChainsPanel.stageTimeout": "Timeout di {{seconds}}s",
+  "ApprovalChainsPanel.noTemplatesState": "Nessun modello di catena disponibile.",
+  "ApprovalChainsPanel.historyHeading": "Cronologia",
+  "ApprovalChainsPanel.refreshButton": "Aggiorna",
+  "ApprovalChainsPanel.emptyHistoryState": "Nessuna catena eseguita finora. Esegui una catena di prova qui sopra per vederla comparire qui.",
+  "ApprovalChainsPanel.testRunDetail": "Esecuzione di prova manuale avviata da Impostazioni → Catene di approvazione.",
+  "ApprovalChainsPanel.status.pending": "In attesa",
+  "ApprovalChainsPanel.status.approved": "Approvata",
+  "ApprovalChainsPanel.status.rejected": "Rifiutata",
+  "ApprovalChainsPanel.status.expired": "Scaduta",
+  "ApprovalChainsPanel.decision.allow": "Consentito",
+  "ApprovalChainsPanel.decision.deny": "Rifiutato",
+  "ApprovalChainsPanel.decision.expired": "Scaduto",
+  "ApprovalChainModal.title": "Approvazione richiesta",
+  "ApprovalChainModal.stageProgress": "Fase {{current}} di {{total}}",
+  "ApprovalChainModal.timeRemaining": "Tempo rimanente: {{time}}",
+  "ApprovalChainModal.denyButton": "Rifiuta",
+  "ApprovalChainModal.approveButton": "Approva",
 };

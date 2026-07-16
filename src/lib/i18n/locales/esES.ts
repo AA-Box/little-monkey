@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const esES: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const esES: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flujo del agente Issue-to-PR",
@@ -923,4 +925,28 @@ export const esES: Record<string, string> = {
   "TriagePanel.sendingButton": "Enviando…",
   "TriagePanel.discardButton": "Descartar",
   "TriagePanel.discardedNotice": "Descartado de la vista de esta sesión.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "Cadenas de aprobación",
+  "ApprovalChainsPanel.templatesHeading": "Plantillas de cadena",
+  "ApprovalChainsPanel.description": "Flujos de aprobación de varios pasos que se añaden a la solicitud de permiso de un solo paso: cada etapa debe aprobarse por orden, y una denegación o un tiempo de espera agotado en cualquier etapa detiene toda la cadena.",
+  "ApprovalChainsPanel.runTestChainButton": "Ejecutar cadena de prueba",
+  "ApprovalChainsPanel.runningButton": "Ejecutando…",
+  "ApprovalChainsPanel.stageTimeout": "Tiempo límite: {{seconds}} s",
+  "ApprovalChainsPanel.noTemplatesState": "No hay plantillas de cadena disponibles.",
+  "ApprovalChainsPanel.historyHeading": "Historial",
+  "ApprovalChainsPanel.refreshButton": "Actualizar",
+  "ApprovalChainsPanel.emptyHistoryState": "Todavía no se ha ejecutado ninguna cadena. Ejecuta una cadena de prueba arriba para verla aparecer aquí.",
+  "ApprovalChainsPanel.testRunDetail": "Ejecución de prueba manual iniciada desde Ajustes → Cadenas de aprobación.",
+  "ApprovalChainsPanel.status.pending": "Pendiente",
+  "ApprovalChainsPanel.status.approved": "Aprobada",
+  "ApprovalChainsPanel.status.rejected": "Rechazada",
+  "ApprovalChainsPanel.status.expired": "Caducada",
+  "ApprovalChainsPanel.decision.allow": "Permitido",
+  "ApprovalChainsPanel.decision.deny": "Denegado",
+  "ApprovalChainsPanel.decision.expired": "Caducado",
+  "ApprovalChainModal.title": "Se requiere aprobación",
+  "ApprovalChainModal.stageProgress": "Etapa {{current}} de {{total}}",
+  "ApprovalChainModal.timeRemaining": "Tiempo restante: {{time}}",
+  "ApprovalChainModal.denyButton": "Rechazar",
+  "ApprovalChainModal.approveButton": "Aprobar",
 };

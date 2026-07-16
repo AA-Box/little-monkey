@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const ja: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR エージェントフロー",
@@ -923,4 +925,28 @@ export const ja: Record<string, string> = {
   "TriagePanel.sendingButton": "送信中…",
   "TriagePanel.discardButton": "破棄",
   "TriagePanel.discardedNotice": "このセッションの表示から破棄されました。",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "承認チェーン",
+  "ApprovalChainsPanel.templatesHeading": "チェーンテンプレート",
+  "ApprovalChainsPanel.description": "単発の権限確認の上に構築された複数段階の承認ワークフローです。各段階は順番に承認される必要があり、いずれかの段階で拒否またはタイムアウトするとチェーン全体が停止します。",
+  "ApprovalChainsPanel.runTestChainButton": "テストチェーンを実行",
+  "ApprovalChainsPanel.runningButton": "実行中…",
+  "ApprovalChainsPanel.stageTimeout": "タイムアウト {{seconds}} 秒",
+  "ApprovalChainsPanel.noTemplatesState": "利用可能なチェーンテンプレートがありません。",
+  "ApprovalChainsPanel.historyHeading": "履歴",
+  "ApprovalChainsPanel.refreshButton": "更新",
+  "ApprovalChainsPanel.emptyHistoryState": "まだチェーンの実行がありません。上のテストチェーンを実行するとここに表示されます。",
+  "ApprovalChainsPanel.testRunDetail": "設定 → 承認チェーンから開始した手動テスト実行です。",
+  "ApprovalChainsPanel.status.pending": "保留中",
+  "ApprovalChainsPanel.status.approved": "承認済み",
+  "ApprovalChainsPanel.status.rejected": "却下",
+  "ApprovalChainsPanel.status.expired": "期限切れ",
+  "ApprovalChainsPanel.decision.allow": "許可",
+  "ApprovalChainsPanel.decision.deny": "拒否",
+  "ApprovalChainsPanel.decision.expired": "期限切れ",
+  "ApprovalChainModal.title": "承認が必要です",
+  "ApprovalChainModal.stageProgress": "ステージ {{current}} / {{total}}",
+  "ApprovalChainModal.timeRemaining": "残り時間: {{time}}",
+  "ApprovalChainModal.denyButton": "拒否",
+  "ApprovalChainModal.approveButton": "承認",
 };

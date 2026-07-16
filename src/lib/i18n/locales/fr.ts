@@ -5,6 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
+import { approvalChainsLocale } from "./approvalChains";
 
 export const fr: Record<string, string> = {
   ...crewLocale,
@@ -14,6 +15,7 @@ export const fr: Record<string, string> = {
   ...portabilityLocale,
   ...issueToPrLocale,
   ...triageLocale,
+  ...approvalChainsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flux d'agent Issue-to-PR",
@@ -923,4 +925,28 @@ export const fr: Record<string, string> = {
   "TriagePanel.sendingButton": "Envoi…",
   "TriagePanel.discardButton": "Ignorer",
   "TriagePanel.discardedNotice": "Ignoré pour cette session.",
+  // Human Approval Chains (ROADMAP.md Phase 3) — real translations overriding the English `approvalChainsLocale` defaults spread above.
+  "SettingsModal.tabApprovalChains": "Chaînes d'approbation",
+  "ApprovalChainsPanel.templatesHeading": "Modèles de chaîne",
+  "ApprovalChainsPanel.description": "Des workflows d'approbation en plusieurs étapes qui viennent compléter la demande de permission classique : chaque étape doit être approuvée dans l'ordre, et un refus ou un délai dépassé à n'importe quelle étape arrête toute la chaîne.",
+  "ApprovalChainsPanel.runTestChainButton": "Lancer une chaîne de test",
+  "ApprovalChainsPanel.runningButton": "Exécution…",
+  "ApprovalChainsPanel.stageTimeout": "Délai de {{seconds}} s",
+  "ApprovalChainsPanel.noTemplatesState": "Aucun modèle de chaîne disponible.",
+  "ApprovalChainsPanel.historyHeading": "Historique",
+  "ApprovalChainsPanel.refreshButton": "Actualiser",
+  "ApprovalChainsPanel.emptyHistoryState": "Aucune exécution de chaîne pour l'instant. Lancez une chaîne de test ci-dessus pour la voir apparaître ici.",
+  "ApprovalChainsPanel.testRunDetail": "Exécution de test manuelle lancée depuis Paramètres → Chaînes d'approbation.",
+  "ApprovalChainsPanel.status.pending": "En attente",
+  "ApprovalChainsPanel.status.approved": "Approuvée",
+  "ApprovalChainsPanel.status.rejected": "Rejetée",
+  "ApprovalChainsPanel.status.expired": "Expirée",
+  "ApprovalChainsPanel.decision.allow": "Autorisé",
+  "ApprovalChainsPanel.decision.deny": "Refusé",
+  "ApprovalChainsPanel.decision.expired": "Expiré",
+  "ApprovalChainModal.title": "Approbation requise",
+  "ApprovalChainModal.stageProgress": "Étape {{current}} sur {{total}}",
+  "ApprovalChainModal.timeRemaining": "Temps restant : {{time}}",
+  "ApprovalChainModal.denyButton": "Refuser",
+  "ApprovalChainModal.approveButton": "Approuver",
 };
