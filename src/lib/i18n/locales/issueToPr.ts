@@ -1,0 +1,45 @@
+/**
+ * Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — English source strings,
+ * spread into every locale's dictionary below with a REAL translation per
+ * locale (see `de.ts`/`fr.ts`/etc.), matching this app's normal per-locale
+ * i18n convention rather than the shared-English-only shortcut a few older
+ * feature areas (`runs.ts`, `crew.ts`, …) still use.
+ */
+export const issueToPrLocale: Record<string, string> = {
+  "AppMenu.issueToPr": "Issue-to-PR",
+  "IssueToPr.title": "Issue-to-PR Agent Flow",
+  "IssueToPr.subtitle": "Paste a GitHub issue URL and watch Little Monkey plan, implement, check, and ready a draft PR on its own owned branch.",
+  "IssueToPr.close": "Close Issue-to-PR",
+  "IssueToPr.urlLabel": "GitHub issue URL",
+  "IssueToPr.urlPlaceholder": "https://github.com/owner/repo/issues/42",
+  "IssueToPr.startButton": "Start",
+  "IssueToPr.runsHeading": "Runs",
+  "IssueToPr.emptyRuns": "No issue-to-PR runs yet. Paste an issue URL above to start one.",
+  "IssueToPr.statusPlanning": "Planning",
+  "IssueToPr.statusImplementing": "Implementing",
+  "IssueToPr.statusChecking": "Checking",
+  "IssueToPr.statusOpeningPr": "Ready to open PR",
+  "IssueToPr.statusAwaitingReview": "Awaiting review",
+  "IssueToPr.statusDone": "Done",
+  "IssueToPr.statusFailed": "Failed",
+  "IssueToPr.statusCancelled": "Cancelled",
+  "IssueToPr.currentActivity": "Current activity: {{activity}}",
+  "IssueToPr.checksHeading": "Checks",
+  "IssueToPr.checksPassed": "Passed",
+  "IssueToPr.checksFailed": "Failed",
+  "IssueToPr.errorHeading": "Error",
+  "IssueToPr.cancelButton": "Cancel run",
+  "IssueToPr.markDoneButton": "Mark done",
+  "IssueToPr.openPrHeading": "Ready to open the draft PR",
+  "IssueToPr.openPrDescription": "This pushes the owned branch and opens a draft PR — both are real GitHub writes and require typing the confirmation phrase, exactly like every other Git delivery mutation.",
+  "IssueToPr.pushAndOpenPrButton": "Push branch and open draft PR",
+  "IssueToPr.viewCapsuleButton": "View run capsule",
+  "IssueToPr.openPrLinkButton": "Open PR on GitHub",
+  "IssueToPr.nonGoalsNote": "Merge, force-push, branch deletion, and PR review-thread resolution always stay outside this flow — a human reviews and merges from GitHub.",
+  "IssueToPr.confirmTypePhrase": "Type {{phrase}} to confirm",
+  "IssueToPr.confirmCancel": "Cancel",
+  "IssueToPr.confirmExecute": "Confirm",
+  "IssueToPr.worktreeLabel": "Owned branch",
+  "IssueToPr.branchLabel": "Branch",
+  "IssueToPr.repositoryLabel": "Repository",
+};

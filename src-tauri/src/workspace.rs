@@ -362,7 +362,11 @@ pub fn set_primary_workspace_root(
     Ok(info)
 }
 
-fn add_secondary_workspace_root_impl(
+/// `pub(crate)` (rather than private) so `issue_to_pr.rs` can attach an
+/// owned worktree as a secondary root directly from `&AppState` — the same
+/// "core logic factored out for reuse" reasoning as every other
+/// `*_impl` function in this file, just needed by another module for once.
+pub(crate) fn add_secondary_workspace_root_impl(
     state: &AppState,
     path: String,
 ) -> Result<WorkspaceRootInfo, String> {
