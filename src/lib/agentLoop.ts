@@ -1224,9 +1224,14 @@ export interface AttachmentRef {
   path: string;
   isDir: boolean;
   /** Set at pick-time in `ChatWindow.tsx` for image files — its presence (alongside `dataUrl`) is what routes this attachment to the vision content-part path instead of the text-inlining path below. */
-  kind?: 'image';
+  kind?: 'image' | 'inline_text';
   /** The already-base64-encoded `data:` URL for an image attachment, read once at pick-time (see `imageAttachment.ts`) so this module never re-reads the file. */
   dataUrl?: string;
+  /** Bounded, user-approved inline text. Currently used by terminal evidence
+   * so it never needs to masquerade as a readable workspace path. */
+  content?: string;
+  /** Optional chip label for virtual attachments such as terminal evidence. */
+  label?: string;
 }
 
 /** A single resolved image attachment, ready to become a `ChatContentPart`. */
@@ -1254,10 +1259,24 @@ export async function resolveReferences(
 ): Promise<{ textRefs: ResolvedTextReference[]; images: ResolvedImage[]; unresolved: string[] }> {
   const images: ResolvedImage[] = [];
   const textAttachments: AttachmentRef[] = [];
+  const textRefs: ResolvedTextReference[] = [];
+  const inlinePaths = new Set<string>();
 
   for (const attachment of attachments) {
     if (attachment.kind === 'image') {
       if (attachment.dataUrl) images.push({ path: attachment.path, dataUrl: attachment.dataUrl });
+      continue;
+    }
+    if (attachment.kind === 'inline_text') {
+      if (attachment.content && !inlinePaths.has(attachment.path)) {
+        inlinePaths.add(attachment.path);
+        textRefs.push({
+          path: attachment.path,
+          isDir: false,
+          content: attachment.content,
+          source: 'terminal',
+        });
+      }
       continue;
     }
     textAttachments.push(attachment);
@@ -1271,7 +1290,6 @@ export async function resolveReferences(
     merged.set(attachment.path, attachment.isDir);
   }
 
-  const textRefs: ResolvedTextReference[] = [];
   const unresolved: string[] = [];
 
   for (const [path, isDir] of merged) {
