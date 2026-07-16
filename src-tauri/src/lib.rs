@@ -93,6 +93,11 @@ mod git;
 // this module's Tauri-command surface stays desktop-app-only).
 pub mod llama;
 pub mod mcp;
+// Connector Catalog: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/S3
+// connections, verified live before saving, secrets in the OS keychain only.
+// AppHandle-free core (bar the `AppState` config lock), same *_impl split as
+// `mcp`/`providers` above.
+pub mod connectors;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -239,6 +244,20 @@ pub struct AppState {
     /// `load_config_impl`/`save_config_impl` pair with no `.await` in
     /// between, so there's nothing async to ever hold it across.
     pub mcp_config_lock: std::sync::Mutex<()>,
+    /// Serializes `connectors.json` read-modify-write cycles (see
+    /// `connectors.rs`) — same reasoning as `mcp_config_lock` protects
+    /// `mcp_servers.json`: `connectors_add_github`/`connectors_remove` are
+    /// synchronous commands (Tauri can dispatch those onto genuinely
+    /// concurrent OS threads) and `connectors_add_token`/`connectors_add_s3`/
+    /// `connectors_reverify` are async commands (the tokio runtime can run
+    /// those in parallel too), so without a shared lock two concurrent
+    /// config-mutating calls could both load the same "before" catalog and
+    /// the later save silently clobbers the earlier one's change. A plain
+    /// `std::sync::Mutex`: every critical section this guards is a
+    /// synchronous `load_config_impl`/`save_config_impl` pair, acquired only
+    /// around that pair (never across the `.await`ed verification call
+    /// itself), so there's nothing async to ever hold it across.
+    pub connectors_config_lock: std::sync::Mutex<()>,
     /// Serializes the permission-granted mutation itself (checkpoint backup +
     /// the actual file write) in `tool_write_file`/`tool_edit_file` — same
     /// "two unsynchronized concurrent writers can silently clobber each
@@ -342,6 +361,7 @@ impl Default for AppState {
             tool_cancel: Default::default(),
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
+            connectors_config_lock: Default::default(),
             file_write_lock: Default::default(),
             mcp: Default::default(),
             web_settings_lock: Default::default(),
@@ -518,6 +538,13 @@ pub fn run() {
             ollama::ollama_import_model,
             ollama::ollama_remove_model,
             ollama::ollama_signin,
+            connectors::connectors_list,
+            connectors::connectors_add_github,
+            connectors::connectors_add_token,
+            connectors::connectors_add_s3,
+            connectors::connectors_remove,
+            connectors::connectors_reverify,
+            connectors::connectors_export_audit,
             providers::providers_list_presets,
             providers::providers_list_configured,
             providers::providers_add_custom,
