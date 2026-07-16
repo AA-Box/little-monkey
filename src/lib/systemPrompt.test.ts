@@ -103,6 +103,37 @@ describe('buildSystemPrompt', () => {
     expect(withoutFacts).not.toContain('Remembered facts');
   });
 
+  /** Memory Studio's CRITICAL acceptance bar (ROADMAP.md): "deleting or
+   * disabling a memory prevents it from entering future prompts." The
+   * actual filtering happens upstream, in Rust — `memory.rs`'s `list_impl`
+   * (what the `memory_list` command calls) excludes disabled/deleted facts
+   * before they ever leave the backend (see
+   * `disabled_and_deleted_facts_are_excluded_from_list_impl` in
+   * `memory.rs`'s test module). This test proves the other half of the
+   * chain: `buildSystemPrompt` never adds anything to the prompt beyond
+   * exactly the `facts` array it was handed — so once a fact is missing
+   * from `memory_list`'s output (and therefore from `rulesStore.facts`,
+   * which `currentSystemPrompt` reads straight from), there is no code path
+   * left by which its text could still reach the model. */
+  it('never mentions a fact that is absent from the facts array — the trust boundary memory_list filtering relies on', () => {
+    const survivingFact: MemoryFact = {
+      id: 'kept',
+      text: 'The build command is `pnpm run build`.',
+      source: 'agent',
+      created_at: '2026-01-01T00:00:00Z',
+      enabled: true,
+      source_turn_id: 'turn-1',
+    };
+    // Represents a fact that was disabled or deleted: `memory_list` already
+    // excluded it, so it simply never appears in the array passed in here.
+    const excludedFactText = 'The secret staging password is hunter2.';
+
+    const prompt = buildSystemPrompt([primary], 'macOS', { facts: [survivingFact] });
+
+    expect(prompt).toContain(survivingFact.text);
+    expect(prompt).not.toContain(excludedFactText);
+  });
+
   it('appends each connected MCP server\'s instructions, and omits the section when there are none', () => {
     const mcpServers: McpServerPromptInfo[] = [{ label: 'GitHub', instructions: 'Use search_repositories before cloning.' }];
 

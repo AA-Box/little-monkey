@@ -16,6 +16,13 @@ function errorText(error: unknown): string {
 const controllers = new Map<string, AbortController>();
 let unlisten: (() => void) | null = null;
 
+/** Test-only: clears in-flight run controllers. This module's `controllers`
+ * map is process-lifetime by design (see the comment above it), which means
+ * it otherwise leaks across every test in the same file. */
+export function __resetIssueToPrControllersForTests(): void {
+  controllers.clear();
+}
+
 interface IssueToPrState {
   runs: IssueToPrRun[];
   selectedRunId: string | null;
@@ -107,8 +114,12 @@ export const useIssueToPrStore = create<IssueToPrState>((set, get) => {
         return;
       }
       if (result.durableRunId) {
+        // Self-report onto "implementing" (the status this run was moved to
+        // a few lines up) rather than the closed-over `run.status`, which is
+        // still this run's value from before `start()` kicked off the drive
+        // and would make the Rust state machine reject the whole call.
         await api
-          .advanceIssueToPr(run.runId, run.status, { durableRunId: result.durableRunId })
+          .advanceIssueToPr(run.runId, "implementing", { durableRunId: result.durableRunId })
           .catch(() => {});
       }
       await api.runIssueToPrChecks(run.runId);
@@ -117,6 +128,46 @@ export const useIssueToPrStore = create<IssueToPrState>((set, get) => {
     } finally {
       controllers.delete(run.runId);
     }
+  };
+
+  /** Picks a non-terminal run back up after an app restart (or a fresh
+   * `init()` in a process that never drove it) — without this, a run left
+   * in "planning"/"implementing"/"checking"/"opening_pr" when the app closed
+   * has no driver in the new process's `controllers` map and sits stuck
+   * forever with Cancel as the only (also inert) action. Takes the
+   * `controllers` slot synchronously before any `await` so a second `init()`
+   * call racing this one can never double-drive the same run. */
+  const resumeOrphanedRun = (run: IssueToPrRun): void => {
+    if (controllers.has(run.runId) || isTerminalIssueToPrStatus(run.status)) return;
+    if (run.status === "opening_pr" || run.status === "awaiting_review") {
+      // Waiting on a human action (push+open-PR, or mark-done) in the panel
+      // — nothing to re-drive.
+      return;
+    }
+    if (run.status === "checking") {
+      const controller = new AbortController();
+      controllers.set(run.runId, controller);
+      void (async () => {
+        try {
+          // Reconfirm the authoritative status before re-triggering a real
+          // mutation — the list snapshot this loop iterated over can be
+          // stale by the time this async resume actually runs.
+          const latest = await api.getIssueToPrStatus(run.runId).catch(() => run);
+          if (latest.status === "checking") await api.runIssueToPrChecks(run.runId);
+        } catch (error) {
+          await api.advanceIssueToPr(run.runId, "failed", { error: errorText(error) }).catch(() => {});
+        } finally {
+          controllers.delete(run.runId);
+        }
+      })();
+      return;
+    }
+    // "planning" or "implementing": re-run the headless agent turn against
+    // the same owned worktree. Any files it already wrote are still on disk,
+    // so the agent picks up from there instead of losing progress; the self-
+    // transition `implementing` -> `implementing` this triggers is a legal
+    // no-op on the Rust side (see `issue_to_pr.rs`'s `valid_transition`).
+    void driveRun(run);
   };
 
   return {
@@ -134,6 +185,9 @@ export const useIssueToPrStore = create<IssueToPrState>((set, get) => {
         unlisten = await api.listenIssueToPrProgress(onProgress);
       }
       await get().refresh();
+      for (const run of get().runs) {
+        resumeOrphanedRun(run);
+      }
     },
 
     refresh: () =>

@@ -22,7 +22,7 @@ vi.mock("../lib/issueToPr", async (importOriginal) => ({
 vi.mock("../lib/issueToPrRunner", () => runner);
 
 import type { IssueToPrRun } from "../lib/issueToPr";
-import { useIssueToPrStore } from "./issueToPrStore";
+import { __resetIssueToPrControllersForTests, useIssueToPrStore } from "./issueToPrStore";
 
 function fixtureRun(overrides: Partial<IssueToPrRun> = {}): IssueToPrRun {
   return {
@@ -69,11 +69,24 @@ let capturedOnProgress: ((run: IssueToPrRun) => void) | null = null;
 beforeEach(() => {
   for (const mock of Object.values(api)) mock.mockReset();
   runner.runIssueToPrAgent.mockReset();
+  __resetIssueToPrControllersForTests();
   api.listenIssueToPrProgress.mockImplementation(async (onProgress: (run: IssueToPrRun) => void) => {
     capturedOnProgress = onProgress;
     return () => {};
   });
   api.listIssueToPrRuns.mockResolvedValue([]);
+  // Safe fallbacks so an incidental resume-on-init drive (see the "resumes"
+  // tests below, and `init()`'s own auto-resume loop firing for any
+  // non-terminal run any test happens to list) never crashes on an
+  // unconfigured mock returning `undefined` instead of a `Promise`.
+  api.advanceIssueToPr.mockResolvedValue(fixtureRun());
+  api.runIssueToPrChecks.mockResolvedValue(fixtureRun());
+  api.getIssueToPrStatus.mockResolvedValue(fixtureRun());
+  runner.runIssueToPrAgent.mockResolvedValue({
+    outcome: "cancelled",
+    summary: "Cancelled by the user.",
+    durableRunId: null,
+  });
   useIssueToPrStore.setState({
     runs: [],
     selectedRunId: null,
@@ -210,5 +223,93 @@ describe("issueToPrStore", () => {
     api.advanceIssueToPr.mockResolvedValueOnce({ ...run, status: "done" });
     await useIssueToPrStore.getState().markDone(run.runId);
     expect(useIssueToPrStore.getState().runs.find((r) => r.runId === run.runId)?.status).toBe("done");
+  });
+
+  it("a completed agent turn self-reports its durableRunId onto the run's CURRENT status, not the stale one captured at start()", async () => {
+    const run = fixtureRun();
+    api.startIssueToPr.mockResolvedValue(run);
+    api.advanceIssueToPr.mockResolvedValue({ ...run, status: "implementing" });
+    runner.runIssueToPrAgent.mockResolvedValue({
+      outcome: "completed",
+      summary: "Implemented the fix.",
+      durableRunId: "run-abc",
+    });
+    api.runIssueToPrChecks.mockResolvedValue({ ...run, status: "opening_pr" });
+
+    await useIssueToPrStore.getState().start(run.issueUrl);
+    await flush();
+
+    expect(api.advanceIssueToPr).toHaveBeenCalledWith(run.runId, "implementing", { durableRunId: "run-abc" });
+  });
+
+  it("init re-drives a run left in implementing from a previous process (no controller tracked for it yet)", async () => {
+    const run = fixtureRun({ status: "implementing" });
+    api.listIssueToPrRuns.mockResolvedValue([run]);
+    runner.runIssueToPrAgent.mockResolvedValue({
+      outcome: "completed",
+      summary: "Implemented the fix.",
+      durableRunId: null,
+    });
+    api.runIssueToPrChecks.mockResolvedValue({ ...run, status: "opening_pr" });
+
+    await useIssueToPrStore.getState().init();
+    await flush();
+
+    expect(api.advanceIssueToPr).toHaveBeenCalledWith(run.runId, "implementing");
+    expect(runner.runIssueToPrAgent).toHaveBeenCalledWith(expect.objectContaining({ runId: run.runId }));
+    expect(api.runIssueToPrChecks).toHaveBeenCalledWith(run.runId);
+  });
+
+  it("init re-runs checks (without re-invoking the agent) for a run left in checking, after reconfirming the point-in-time status", async () => {
+    const run = fixtureRun({ status: "checking" });
+    api.listIssueToPrRuns.mockResolvedValue([run]);
+    api.getIssueToPrStatus.mockResolvedValue(run);
+
+    await useIssueToPrStore.getState().init();
+    await flush();
+
+    expect(api.getIssueToPrStatus).toHaveBeenCalledWith(run.runId);
+    expect(api.runIssueToPrChecks).toHaveBeenCalledWith(run.runId);
+    expect(runner.runIssueToPrAgent).not.toHaveBeenCalled();
+  });
+
+  it("init does not re-run checks for a run in checking if a point-in-time reconfirm shows it already moved on", async () => {
+    const run = fixtureRun({ status: "checking" });
+    api.listIssueToPrRuns.mockResolvedValue([run]);
+    api.getIssueToPrStatus.mockResolvedValue({ ...run, status: "opening_pr" });
+
+    await useIssueToPrStore.getState().init();
+    await flush();
+
+    expect(api.runIssueToPrChecks).not.toHaveBeenCalled();
+  });
+
+  it("init never re-drives a run waiting on a human action (opening_pr or awaiting_review)", async () => {
+    const openingPr = fixtureRun({ runId: "i2p-open", status: "opening_pr" });
+    const awaitingReview = fixtureRun({ runId: "i2p-review", status: "awaiting_review" });
+    api.listIssueToPrRuns.mockResolvedValue([openingPr, awaitingReview]);
+
+    await useIssueToPrStore.getState().init();
+    await flush();
+
+    expect(api.getIssueToPrStatus).not.toHaveBeenCalled();
+    expect(api.runIssueToPrChecks).not.toHaveBeenCalled();
+    expect(runner.runIssueToPrAgent).not.toHaveBeenCalled();
+  });
+
+  it("init never re-drives a run that already has an in-flight controller tracked for it", async () => {
+    const run = fixtureRun({ status: "implementing" });
+    api.startIssueToPr.mockResolvedValue(run);
+    api.advanceIssueToPr.mockResolvedValue({ ...run, status: "implementing" });
+    runner.runIssueToPrAgent.mockImplementation(() => new Promise(() => {})); // never resolves — still "in flight"
+    await useIssueToPrStore.getState().start(run.issueUrl);
+    await flush();
+    const callsBeforeInit = runner.runIssueToPrAgent.mock.calls.length;
+
+    api.listIssueToPrRuns.mockResolvedValue([run]);
+    await useIssueToPrStore.getState().init();
+    await flush();
+
+    expect(runner.runIssueToPrAgent.mock.calls.length).toBe(callsBeforeInit);
   });
 });

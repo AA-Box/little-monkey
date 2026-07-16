@@ -25,11 +25,12 @@ use crate::mcp_app_core::{
 };
 use crate::package_ecosystem::{
     install_preview, signed_first_party_catalog, verify_package, verify_registry_snapshot,
-    ConnectorAuthKind, ContentKind, InstallEnvironment, InstallPreview, InstallTrustPolicy,
-    InstalledPackageState, McpRequirementKind, PackageBundle, PackageError, PackageKind,
-    PackageLimits, PackageManifest, PackagePermission, PackageStore, PermissionApproval,
-    PortablePackageExport, RegistrySnapshot, SemanticVersion, SignatureVerifier, TrustEvidence,
-    TrustStore, VerifiedPackage, VerifiedRegistryState,
+    AdditionalRegistryRecord, AdditionalRegistrySource, ConnectorAuthKind, ContentKind,
+    InstallEnvironment, InstallPreview, InstallTrustPolicy, InstalledPackageState,
+    McpRequirementKind, PackageBundle, PackageError, PackageKind, PackageLimits, PackageManifest,
+    PackagePermission, PackageStore, PermissionApproval, PortablePackageExport, RegistrySnapshot,
+    SemanticVersion, SignatureVerifier, TrustEvidence, TrustStore, VerifiedPackage,
+    VerifiedRegistryState,
 };
 use crate::workflow_core::{
     adapt_legacy_recipe, compile_workflow, plan_replay, reconcile_node, DaemonCapability,
@@ -528,6 +529,19 @@ impl PackageRegistryService {
         Ok(self.store.set_enabled(package_id, enabled)?)
     }
 
+    /// Sets the local "team approved" flag on an installed package. This is
+    /// deliberately not gated behind any role/permission check here — it is
+    /// a plain, locally-observed toggle intended for `PackageKind::Collection`
+    /// packages so a separate Team Mode feature, present or not, never has a
+    /// hard dependency on this field.
+    pub fn set_team_approved(
+        &self,
+        package_id: &str,
+        team_approved: bool,
+    ) -> Result<InstalledPackageState, M4ServiceError> {
+        Ok(self.store.set_team_approved(package_id, team_approved)?)
+    }
+
     pub fn pin(
         &self,
         package_id: &str,
@@ -546,6 +560,72 @@ impl PackageRegistryService {
 
     pub fn export(&self, package_id: &str) -> Result<PortablePackageExport, M4ServiceError> {
         Ok(self.store.export_active(package_id)?)
+    }
+
+    /// Lists every user-added registry source (the roadmap's "private/team
+    /// catalog"), including ones that have never successfully verified.
+    pub fn list_registry_sources(&self) -> Result<Vec<AdditionalRegistryRecord>, M4ServiceError> {
+        Ok(self.store.list_registry_sources()?)
+    }
+
+    pub fn add_registry_source(
+        &self,
+        source_id: String,
+        display_name: String,
+        location: String,
+        now_unix_ms: u64,
+    ) -> Result<AdditionalRegistryRecord, M4ServiceError> {
+        Ok(self.store.add_registry_source(AdditionalRegistrySource {
+            source_id,
+            display_name,
+            location,
+            added_unix_ms: now_unix_ms,
+        })?)
+    }
+
+    pub fn remove_registry_source(&self, source_id: &str) -> Result<bool, M4ServiceError> {
+        Ok(self.store.remove_registry_source(source_id)?)
+    }
+
+    /// Verifies a caller-supplied registry snapshot for one added source
+    /// through the exact same Ed25519 trust chain
+    /// ([`verify_registry_snapshot`]) as the built-in first-party registry —
+    /// never a bypass. Packages from this source only become visible once
+    /// this call succeeds; a failed verification is persisted as an error
+    /// (returned in `last_verification_error` on the record below, not as a
+    /// service error) and never marks the source trusted, but a previously
+    /// verified snapshot is retained rather than discarded.
+    pub fn verify_registry_source(
+        &self,
+        source_id: &str,
+        snapshot: RegistrySnapshot,
+        now_unix_ms: u64,
+    ) -> Result<AdditionalRegistryRecord, M4ServiceError> {
+        let previous = self
+            .store
+            .list_registry_sources()?
+            .into_iter()
+            .find(|record| record.source.source_id == source_id)
+            .ok_or_else(|| {
+                M4ServiceError::NotFound(format!("registry source {source_id} is not registered"))
+            })?
+            .verified;
+        match verify_registry_snapshot(
+            &snapshot,
+            &self.trust_store,
+            previous.as_ref(),
+            self.verifier.as_ref(),
+            now_unix_ms,
+        ) {
+            Ok(verified) => Ok(self
+                .store
+                .record_registry_verification(source_id, Some(verified), None)?),
+            Err(error) => Ok(self.store.record_registry_verification(
+                source_id,
+                None,
+                Some(error.to_string()),
+            )?),
+        }
     }
 
     /// Lists installed package states, excluding tombstoned (uninstalled) entries.

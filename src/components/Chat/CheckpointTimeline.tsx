@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Ban, FilePenLine, History, MessageSquareX, RefreshCw, TerminalSquare, Undo2 } from "lucide-react";
+import { Ban, Eye, FilePenLine, GitCompareArrows, History, MessageSquareX, RefreshCw, TerminalSquare, Undo2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
 import {
@@ -12,6 +12,8 @@ import {
 } from "../../lib/agentLoop";
 import { selectTurnRunning, sessionMessages, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore, type CheckpointInfo } from "../../store/checkpointStore";
+import { CheckpointCompareModal } from "./CheckpointCompareModal";
+import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 
 /** The three restore scopes offered per row — same semantics as
  * `MessageList.tsx`'s `CheckpointRow` (Claude Code /rewind: code only /
@@ -69,6 +71,7 @@ function TimelineRow({
   info,
   chainBlockedReason,
   onChanged,
+  onPreview,
 }: {
   sessionId: string;
   info: CheckpointInfo;
@@ -79,6 +82,11 @@ function TimelineRow({
    * can't guarantee full coverage across that span. */
   chainBlockedReason: string | null;
   onChanged: () => void;
+  /** Opens the read-only preview/rollback-simulation modal for this
+   * checkpoint (see `CheckpointPreviewModal.tsx`) — the safer path than the
+   * quick "Restore" menu below, since it shows exactly what would change
+   * before anything is actually restored. */
+  onPreview: () => void;
 }) {
   const { t } = useT();
   const turnRunning = useSessionStore(selectTurnRunning(sessionId));
@@ -174,6 +182,14 @@ function TimelineRow({
       </div>
       {error && <div className="text-xs text-danger">{error}</div>}
       <div className="mt-1 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={onPreview}
+          className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted transition-colors hover:text-foreground"
+        >
+          <Eye size={11} />
+          {t("CheckpointTimeline.previewButton")}
+        </button>
         {info.reverted ? (
           info.reapplyable && (
             <button
@@ -318,6 +334,8 @@ export function CheckpointTimeline({ sessionId }: { sessionId: string }) {
   const loading = useCheckpointStore((s) => Boolean(s.loadingSessions[sessionId]));
   const listError = useCheckpointStore((s) => s.errorsBySession[sessionId] ?? null);
   const refresh = useCheckpointStore((s) => s.refresh);
+  const [previewing, setPreviewing] = useState<CheckpointInfo | null>(null);
+  const [comparing, setComparing] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -348,8 +366,18 @@ export function CheckpointTimeline({ sessionId }: { sessionId: string }) {
 
       {open && (
         <div className="absolute bottom-full right-0 z-20 mb-1 max-h-96 w-80 overflow-y-auto rounded-lg border border-border bg-background shadow-lg">
-          <div className="sticky top-0 border-b border-border bg-background px-3 py-2">
+          <div className="sticky top-0 flex items-center justify-between gap-2 border-b border-border bg-background px-3 py-2">
             <p className="text-sm font-semibold text-foreground">{t("CheckpointTimeline.heading")}</p>
+            {checkpoints.length >= 2 && (
+              <button
+                type="button"
+                onClick={() => setComparing(true)}
+                className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted transition-colors hover:text-foreground"
+              >
+                <GitCompareArrows size={11} />
+                {t("CheckpointCompare.openButton")}
+              </button>
+            )}
           </div>
           {loading ? (
             <p className="px-3 py-4 text-center text-xs text-faint">{t("CheckpointTimeline.loading")}</p>
@@ -373,11 +401,24 @@ export function CheckpointTimeline({ sessionId }: { sessionId: string }) {
                   info={info}
                   chainBlockedReason={chainBlockedReason}
                   onChanged={() => void refresh(sessionId)}
+                  onPreview={() => setPreviewing(info)}
                 />
               );
             })
           )}
         </div>
+      )}
+
+      {previewing && (
+        <CheckpointPreviewModal
+          sessionId={sessionId}
+          checkpoint={previewing}
+          onClose={() => setPreviewing(null)}
+          onChanged={() => void refresh(sessionId)}
+        />
+      )}
+      {comparing && checkpoints.length >= 2 && (
+        <CheckpointCompareModal checkpoints={checkpoints} onClose={() => setComparing(false)} />
       )}
     </div>
   );
