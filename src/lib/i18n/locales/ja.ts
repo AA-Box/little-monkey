@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
@@ -16,6 +17,7 @@ export const ja: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,
   // オンボーディングウィザードの実際の日本語訳。上でスプレッドした英語の
@@ -145,6 +147,33 @@ export const ja: Record<string, string> = {
   "IssueToPr.worktreeLabel": "専用ブランチ",
   "IssueToPr.branchLabel": "ブランチ",
   "IssueToPr.repositoryLabel": "リポジトリ",
+  // SOP-to-Agent Compiler (ROADMAP.md Phase 7, item 24) — real translations overriding the English `sopCompilerLocale` defaults spread above.
+  "AppMenu.sopCompiler": "SOP→エージェント コンパイラ",
+  "SopCompiler.title": "SOP→エージェント コンパイラ",
+  "SopCompiler.subtitle": "SOP、ランブック、チェックリスト、トレーニング資料を貼り付けるかインポートし、入力・ポリシーゲート・テスト・証跡要件を備えたドラフトのワークフローにコンパイルします。",
+  "SopCompiler.close": "SOP→エージェント コンパイラを閉じる",
+  "SopCompiler.sourceLabel": "SOP / ランブック / チェックリストのテキスト",
+  "SopCompiler.sourcePlaceholder": "SOP、ランブック、チェックリスト、トレーニング資料のテキストをここに貼り付けてください…",
+  "SopCompiler.importButton": "ファイルをインポート",
+  "SopCompiler.compileButton": "コンパイル",
+  "SopCompiler.inactiveNotice": "コンパイルでは何も実行されません — 結果は、承認される前にレビューとテストを行うドラフトです。",
+  "SopCompiler.draftsHeading": "コンパイル済みドラフト",
+  "SopCompiler.emptyDrafts": "まだコンパイル済みのドラフトはありません。上でSOPを貼り付けるかインポートしてコンパイルすると、ここにドラフトが表示されます。",
+  "SopCompiler.statusDraft": "ドラフト",
+  "SopCompiler.statusSentForReview": "レビューに送信済み",
+  "SopCompiler.stepsHeading": "手順",
+  "SopCompiler.noStepsExtracted": "手順は抽出されませんでした。",
+  "SopCompiler.inputsHeading": "必要な入力",
+  "SopCompiler.required": "必須",
+  "SopCompiler.optional": "任意",
+  "SopCompiler.gatesHeading": "ポリシー / 権限ゲート",
+  "SopCompiler.testsHeading": "受け入れ / テストチェックリスト",
+  "SopCompiler.expectedPrefix": "期待される結果:",
+  "SopCompiler.evidenceHeading": "必要な証跡",
+  "SopCompiler.nonGoalsNote": "このコンパイル済みワークフローは、レビューしてスキル提案に送信するまで非アクティブのままです。送信後も明示的に承認されるまで隔離された状態が保たれます — ここでの操作が直接インストールまたは有効化することはありません。",
+  "SopCompiler.sendToReviewButton": "レビューのためにスキル提案に送信",
+  "SopCompiler.alreadySentButton": "すでにレビューに送信済み",
+  "SopCompiler.discardButton": "破棄",
   // MCP Server Generator and Simulator (ROADMAP.md Phase 7) — real translations overriding the English `mcpGeneratorLocale` defaults spread above.
   "AppMenu.mcpGenerator": "MCPジェネレーター",
   "McpGenerator.title": "MCPサーバー ジェネレーター＆シミュレーター",
