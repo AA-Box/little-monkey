@@ -5,10 +5,12 @@ import {
   ChevronRight,
   ChevronsUpDown,
   Compass,
+  GitPullRequest,
   Globe,
   HelpCircle,
   ListTodo,
   Inbox,
+  Newspaper,
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
@@ -24,10 +26,12 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenIssueToPr: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
   onRestartOnboarding: () => void;
+  onOpenDailyBrief: () => void;
 }
 
 interface MenuRowProps {
@@ -60,10 +64,12 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenIssueToPr,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
   onRestartOnboarding,
+  onOpenDailyBrief,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -117,6 +123,14 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Newspaper size={14} className="text-faint" />}
+            label={t("AppMenu.dailyBrief")}
+            onClick={() => {
+              closeAll();
+              onOpenDailyBrief();
+            }}
+          />
+          <MenuRow
             icon={<Inbox size={14} className="text-faint" />}
             label={t("AppMenu.agentInbox")}
             onClick={() => {
@@ -138,6 +152,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<GitPullRequest size={14} className="text-faint" />}
+            label={t("AppMenu.issueToPr")}
+            onClick={() => {
+              closeAll();
+              onOpenIssueToPr();
             }}
           />
           <MenuRow

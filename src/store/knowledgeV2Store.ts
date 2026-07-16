@@ -31,7 +31,46 @@ export type KnowledgeConnector =
       username: string;
       credential_ref: string;
       allow_loopback: boolean;
-    };
+    }
+  | {
+      kind: "git_hub_repo";
+      owner: string;
+      repo: string;
+      git_ref: string | null;
+      path_prefix: string | null;
+      connector_account_id: string;
+    }
+  | {
+      kind: "s3_bucket";
+      endpoint: string;
+      bucket: string;
+      prefix: string | null;
+      region: string;
+      connector_account_id: string;
+    }
+  | { kind: "watched_folder"; path: string; debounce_ms: number }
+  | { kind: "notion_pages"; connector_account_id: string; root_id: string }
+  | { kind: "slack_channels"; connector_account_id: string; channel_ids: string[] }
+  | { kind: "jira_project"; connector_account_id: string; project_key: string };
+
+/**
+ * True for every connector kind whose credential is a Connector Catalog
+ * reference (`connector_account_id`, see `connectorsStore.ts`) rather than a
+ * pasted secret handled directly by this panel — generalizes the WebDAV-
+ * specific `webdavPassword` plumbing's underlying idea (never store a raw
+ * secret in this store) to every connector added after it.
+ */
+export function connectorUsesAccountReference(
+  kind: KnowledgeConnector["kind"],
+): kind is "git_hub_repo" | "s3_bucket" | "notion_pages" | "slack_channels" | "jira_project" {
+  return (
+    kind === "git_hub_repo" ||
+    kind === "s3_bucket" ||
+    kind === "notion_pages" ||
+    kind === "slack_channels" ||
+    kind === "jira_project"
+  );
+}
 
 export interface ConnectorObjectState {
   object_id: string;
