@@ -13,6 +13,7 @@ import {
   type M3CatalogMatch,
   type M3CleanupReport,
   type M3InstalledModel,
+  type M3HardwareCompatibilityReport,
   type M3HttpServerStatus,
   type M3LoadModelRequest,
   type M3RuntimeCapability,
@@ -56,6 +57,7 @@ interface RuntimeHubStoreState {
   section: RuntimeHubSection;
   hardware: HardwareSnapshot | null;
   profile: HardwareProfile | null;
+  compatibilityReport: M3HardwareCompatibilityReport | null;
   storage: M3StorageStatus | null;
   installedModels: M3InstalledModel[];
   catalogSources: M3CatalogSourceConfig[];
@@ -84,6 +86,7 @@ interface RuntimeHubStoreState {
   dismissPairedToken: () => void;
   refresh: () => Promise<void>;
   refreshOverview: () => Promise<void>;
+  refreshCompatibilityReport: () => Promise<void>;
   searchCatalog: (query?: string) => Promise<void>;
   downloadModel: (match: M3CatalogMatch) => Promise<void>;
   updateModel: (assetId: string, match: M3CatalogMatch) => Promise<void>;
@@ -243,6 +246,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     section: "overview",
     hardware: null,
     profile: null,
+    compatibilityReport: null,
     storage: null,
     installedModels: [],
     catalogSources: [],
@@ -291,6 +295,24 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       } catch (error) {
         fail(key, error);
         throw error;
+      } finally {
+        finish(key);
+      }
+      // Kept out of the Promise.all above and never rethrown: the Hardware
+      // Compatibility Matrix / Driver Doctor report is diagnostic, additive
+      // information, so a failure here must never block the rest of the
+      // Runtime Hub (hardware/profile/storage/models/runtimes) from loading.
+      await get().refreshCompatibilityReport();
+    },
+
+    refreshCompatibilityReport: async () => {
+      const key = "compatibility";
+      begin(key);
+      try {
+        const compatibilityReport = await runtimeHubClient.hardwareCompatibilityReport();
+        set({ compatibilityReport });
+      } catch (error) {
+        fail(key, error);
       } finally {
         finish(key);
       }
