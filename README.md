@@ -22,6 +22,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Use workspace-scoped file read/list, glob, grep, edit/write, shell, memory, web fetch/search, knowledge search, MCP, subagent, plan, and verification tools.
 - Choose `manual`, `plan`, `acceptEdits`, `smart`, `auto`, or `bypass` permission modes. Sensitive paths have a deterministic risk floor, shell execution is kept behind the stronger policy, and unattended recipes cannot use `bypass`.
 - Checkpoint every mutating turn, then revert or re-apply file changes, rewind the conversation, or do both from the timeline.
+- Preview a checkpoint's per-file diff, artifacts, screenshots, and verification state before restoring it, compare any two checkpoints read-only, and run a rollback simulation that shows exactly what will change — with file, artifact, conversation, and external (shell/network/MCP) state distinguished, and effects that can't be safely undone marked `needs_reconciliation` rather than silently skipped.
 - Configure post-edit lint/build/test commands. Failures can return to the model for a bounded repair loop and are recorded as verification events.
 - Treat retrieved pages, RAG chunks, MCP results, subprocess output, GitHub content, browser evidence, subagent reports, and other model output as untrusted data before it re-enters a model prompt.
 - Inspect local posture in **Settings → Security Doctor**, or run `monkey security audit`. It checks app-data permissions, API/webhook listeners, remote TLS posture, MCP origins, installed skill integrity, and active browser/companion grants without contacting a model. `--fix` is limited to private app-owned modes and disabling clearly unsafe listeners; it does not delete user data or rotate credentials.
@@ -38,6 +39,7 @@ The current working tree includes the shipped foundations described below. Some 
 ### Runtime and API Hub
 
 - Inspect CPU/memory and runtime inventory, estimate model fit, search configured catalogs, resume verified downloads, activate/roll back model versions, prune old versions, clean owned orphan data, and load/unload supported runtimes.
+- Track each installed model's source registry, license, quantization, chat template, and multimodal projector in a content-addressed, digest-verified manifest; reuse an already-verified payload across asset variants/versions instead of re-downloading identical bytes, and never trust a corrupt local copy for reuse.
 - Manage Ollama, `llama.cpp`, and MLX through one runtime contract with capability preflight, owned-process shutdown, logs, metrics, cancellation, and resource-aware scheduling.
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
