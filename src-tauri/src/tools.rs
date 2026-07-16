@@ -714,7 +714,7 @@ pub async fn tool_remember(
         .memory_lock
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root, &text, "agent")
+    memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())
 }
 
 /// Read one bundled file from an installed native skill's folder — the
