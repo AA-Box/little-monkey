@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { specScorerLocale } from "./specScorer";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,23 @@ export const ja: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...specScorerLocale,
+  // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
+  "SpecScorer.scoringLabel": "この issue がエージェントにとってどれだけ準備できているか確認しています…",
+  "SpecScorer.bannerHeading": "この issue は自律実行には曖昧すぎる可能性があります",
+  "SpecScorer.bannerIntro": "エージェント対応スコア: {{score}}/100 — {{summary}}",
+  "SpecScorer.missingInfoHeading": "自律実行を開始する前に、次の点に回答してください:",
+  "SpecScorer.dimensionsHeading": "スコアの内訳",
+  "SpecScorer.dimension.clarity": "明確さ",
+  "SpecScorer.dimension.scope": "範囲",
+  "SpecScorer.dimension.missingContext": "不足しているコンテキスト",
+  "SpecScorer.dimension.testability": "検証可能性",
+  "SpecScorer.dimension.dependencies": "依存関係",
+  "SpecScorer.dimension.agentReadiness": "エージェント対応度",
+  "SpecScorer.readyNote": "エージェント対応チェックに合格しました ({{score}}/100)。",
+  "SpecScorer.advisoryNote": "あくまで参考情報です — このまま実行を開始することもできます。",
+  "SpecScorer.rescoreButton": "再チェック",
+  "SpecScorer.errorNote": "現在この issue のエージェント対応度を確認できませんでした。",
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR エージェントフロー",

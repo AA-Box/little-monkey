@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { specScorerLocale } from "./specScorer";
 
 export const it: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,23 @@ export const it: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...specScorerLocale,
+  // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
+  "SpecScorer.scoringLabel": "Verifica di quanto questo issue sia pronto per un agente…",
+  "SpecScorer.bannerHeading": "Questo issue potrebbe essere troppo vago per un'esecuzione autonoma",
+  "SpecScorer.bannerIntro": "Punteggio di prontezza per l'agente: {{score}}/100 — {{summary}}",
+  "SpecScorer.missingInfoHeading": "Rispondi a queste domande prima di avviare un'esecuzione autonoma:",
+  "SpecScorer.dimensionsHeading": "Dettaglio del punteggio",
+  "SpecScorer.dimension.clarity": "Chiarezza",
+  "SpecScorer.dimension.scope": "Ambito",
+  "SpecScorer.dimension.missingContext": "Contesto mancante",
+  "SpecScorer.dimension.testability": "Testabilità",
+  "SpecScorer.dimension.dependencies": "Dipendenze",
+  "SpecScorer.dimension.agentReadiness": "Prontezza per l'agente",
+  "SpecScorer.readyNote": "Verifica di prontezza superata ({{score}}/100).",
+  "SpecScorer.advisoryNote": "Solo a scopo informativo — puoi comunque avviare un'esecuzione.",
+  "SpecScorer.rescoreButton": "Ricontrolla",
+  "SpecScorer.errorNote": "Al momento non è stato possibile verificare la prontezza di questo issue.",
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flusso agente Issue-to-PR",

@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { specScorerLocale } from "./specScorer";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,23 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...specScorerLocale,
+  // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
+  "SpecScorer.scoringLabel": "Memeriksa seberapa siap issue ini untuk agen…",
+  "SpecScorer.bannerHeading": "Issue ini mungkin terlalu samar untuk dijalankan secara otonom",
+  "SpecScorer.bannerIntro": "Skor kesiapan agen: {{score}}/100 — {{summary}}",
+  "SpecScorer.missingInfoHeading": "Jawab ini sebelum memulai proses otonom:",
+  "SpecScorer.dimensionsHeading": "Rincian skor",
+  "SpecScorer.dimension.clarity": "Kejelasan",
+  "SpecScorer.dimension.scope": "Cakupan",
+  "SpecScorer.dimension.missingContext": "Konteks yang hilang",
+  "SpecScorer.dimension.testability": "Keterujian",
+  "SpecScorer.dimension.dependencies": "Dependensi",
+  "SpecScorer.dimension.agentReadiness": "Kesiapan agen",
+  "SpecScorer.readyNote": "Pemeriksaan kesiapan agen berhasil ({{score}}/100).",
+  "SpecScorer.advisoryNote": "Hanya bersifat saran — Anda tetap bisa memulai proses ini.",
+  "SpecScorer.rescoreButton": "Periksa ulang",
+  "SpecScorer.errorNote": "Tidak dapat memeriksa kesiapan agen untuk issue ini saat ini.",
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Alur Agen Issue-to-PR",

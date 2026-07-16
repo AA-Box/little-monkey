@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { specScorerLocale } from "./specScorer";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,23 @@ export const ko: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...specScorerLocale,
+  // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
+  "SpecScorer.scoringLabel": "이 이슈가 에이전트에게 얼마나 준비되어 있는지 확인하는 중…",
+  "SpecScorer.bannerHeading": "이 이슈는 자율 실행을 하기에는 너무 모호할 수 있습니다",
+  "SpecScorer.bannerIntro": "에이전트 준비도 점수: {{score}}/100 — {{summary}}",
+  "SpecScorer.missingInfoHeading": "자율 실행을 시작하기 전에 다음에 답변하세요:",
+  "SpecScorer.dimensionsHeading": "점수 세부 내역",
+  "SpecScorer.dimension.clarity": "명확성",
+  "SpecScorer.dimension.scope": "범위",
+  "SpecScorer.dimension.missingContext": "누락된 맥락",
+  "SpecScorer.dimension.testability": "테스트 가능성",
+  "SpecScorer.dimension.dependencies": "의존성",
+  "SpecScorer.dimension.agentReadiness": "에이전트 준비도",
+  "SpecScorer.readyNote": "에이전트 준비도 검사를 통과했습니다 ({{score}}/100).",
+  "SpecScorer.advisoryNote": "참고용입니다 — 그래도 실행을 시작할 수 있습니다.",
+  "SpecScorer.rescoreButton": "다시 확인",
+  "SpecScorer.errorNote": "지금은 이 이슈의 에이전트 준비도를 확인할 수 없습니다.",
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "이슈-투-PR",
   "IssueToPr.title": "이슈-투-PR 에이전트 흐름",
