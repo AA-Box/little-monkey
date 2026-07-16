@@ -497,6 +497,13 @@ pub fn run() {
             // A persisted M3 policy represents an explicit user opt-in. Start
             // its separate, capability-scoped compatibility listener without
             // blocking app launch; failures remain visible in Runtime Hub.
+            // Reconciles every enabled `WatchedFolder` Knowledge Sync source
+            // against the live filesystem-watcher registry so a watcher
+            // started in a previous session resumes across app restarts —
+            // afterward, `knowledge_service`'s add/update/remove-source
+            // commands keep it in sync as the catalog changes.
+            knowledge_service::sync_watched_folder_watchers(app.handle());
+
             let m3_http_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let hub = m3_http_app

@@ -148,7 +148,7 @@ fn keychain_account(provider: ConnectorProvider, id: &str) -> String {
 /// path. AppHandle-free via `app_paths::data_dir()` — unlike `mcp.rs`'s
 /// `config_file_path`, this needs no `AppHandle` at all, so every command
 /// below (bar the ones that also need `AppState`) is a plain function.
-fn config_file_path() -> Result<PathBuf, String> {
+pub(crate) fn config_file_path() -> Result<PathBuf, String> {
     let dir = crate::app_paths::data_dir()
         .ok_or_else(|| "Failed to resolve app data dir".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
@@ -190,7 +190,7 @@ fn validate_label(label: &str) -> Result<(), String> {
 
 // --- SSRF-hardened verification HTTP calls ---------------------------------
 
-async fn resolve_host(url: &Url) -> Result<Vec<IpAddr>, String> {
+pub(crate) async fn resolve_host(url: &Url) -> Result<Vec<IpAddr>, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
@@ -213,7 +213,7 @@ async fn resolve_host(url: &Url) -> Result<Vec<IpAddr>, String> {
 /// `scheme://host[:port]` for `url` — used both as the single allowed origin
 /// passed to `UrlSourcePolicy` (pinning a user-supplied Jira site/S3 endpoint
 /// to itself) and, for Slack/Notion, as the fixed well-known origin.
-fn origin_of(url: &Url) -> Result<String, String> {
+pub(crate) fn origin_of(url: &Url) -> Result<String, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
@@ -237,7 +237,7 @@ fn origin_of(url: &Url) -> Result<String, String> {
 /// Slack/Notion pass their own fixed hostname; Jira/S3 pass the origin
 /// derived from whatever site URL/endpoint the user just typed (see the
 /// module doc).
-async fn verified_call(
+pub(crate) async fn verified_call(
     method: reqwest::Method,
     url: &Url,
     allowed_origin: &str,
@@ -388,7 +388,7 @@ async fn verify_jira(site_url: &str, email: &str, token: &str) -> Result<String,
 
 // --- S3 SigV4 (used only by `verify_s3`) -----------------------------------
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -428,7 +428,7 @@ fn validate_s3_region(region: &str) -> Result<(), String> {
     }
 }
 
-fn host_header_value(url: &Url) -> Result<String, String> {
+pub(crate) fn host_header_value(url: &Url) -> Result<String, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
@@ -438,18 +438,63 @@ fn host_header_value(url: &Url) -> Result<String, String> {
     }
 }
 
-/// AWS Signature Version 4 for a single header-only request (no query
-/// string, no body) — the one shape `verify_s3`'s bucket-existence `HEAD`
-/// check ever needs. Hand-rolled rather than pulling in an AWS SDK or
-/// `aws-sigv4` crate: the algorithm is short, fully deterministic, and this
-/// is the only request shape ever signed here. See this file's tests for the
-/// well-known empty-payload SHA-256 constant AWS's own docs publish and an
-/// RFC 4231 HMAC-SHA-256 test vector, which together anchor the two
-/// primitives this builds on.
-fn sigv4_authorization(
+/// URI-encodes one path/query component per the SigV4 spec: unreserved
+/// characters (`A-Za-z0-9-_.~`) pass through unescaped, everything else is
+/// percent-encoded — including `/` when `encode_slash` is set, which AWS
+/// requires for query-string *values* but forbids for path *segments*
+/// (a path's `/` separators must stay literal). Used by
+/// [`Knowledge S3Bucket`](crate::knowledge_service)'s `ListObjectsV2`/
+/// `GetObject` request builders, which need query-string and multi-segment
+/// object-key encoding that [`sigv4_authorization`]'s original HEAD-only
+/// shape never required.
+pub(crate) fn sigv4_uri_encode(value: &str, encode_slash: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if unreserved || (byte == b'/' && !encode_slash) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Builds a SigV4 canonical query string from already-decoded `(key, value)`
+/// pairs: each value is percent-encoded (slashes included, per spec), then
+/// pairs are sorted lexicographically by key as SigV4 canonicalization
+/// requires — the params here (`list-type`, `prefix`, `continuation-token`,
+/// `max-keys`) never repeat a key, so a stable sort by key alone is enough.
+pub(crate) fn sigv4_canonical_query(params: &[(&str, &str)]) -> String {
+    let mut encoded = params
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                sigv4_uri_encode(key, true),
+                sigv4_uri_encode(value, true)
+            )
+        })
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoded.join("&")
+}
+
+/// AWS Signature Version 4 for a single request with no body (works for both
+/// a header-only `HEAD`/`GET` request and one carrying a query string, since
+/// `canonical_querystring` is threaded through explicitly rather than
+/// hardcoded empty). Hand-rolled rather than pulling in an AWS SDK or
+/// `aws-sigv4` crate: the algorithm is short, fully deterministic, and every
+/// request shape this app ever signs (S3 bucket verification, and Knowledge
+/// Sync's `ListObjectsV2`/`GetObject` calls) is covered by this one function.
+/// See this file's tests for the well-known empty-payload SHA-256 constant
+/// AWS's own docs publish and an RFC 4231 HMAC-SHA-256 test vector, which
+/// together anchor the two primitives this builds on.
+pub(crate) fn sigv4_authorization(
     method: &str,
     host_header: &str,
     canonical_uri: &str,
+    canonical_querystring: &str,
     access_key: &str,
     secret_key: &str,
     region: &str,
@@ -461,8 +506,9 @@ fn sigv4_authorization(
     let canonical_headers = format!(
         "host:{host_header}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
     );
-    let canonical_request =
-        format!("{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
     let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
@@ -476,6 +522,38 @@ fn sigv4_authorization(
     format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
     )
+}
+
+/// Convenience wrapper around [`sigv4_authorization`] that also stamps the
+/// current time and returns the three headers (`x-amz-date`,
+/// `x-amz-content-sha256`, `authorization`) a signed, bodyless S3 request
+/// needs — used by Knowledge Sync's `S3Bucket` connector for both
+/// `ListObjectsV2` (with a query string) and `GetObject` (without one).
+pub(crate) fn sigv4_signed_headers(
+    method: &str,
+    host_header: &str,
+    canonical_uri: &str,
+    canonical_querystring: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+) -> Vec<(&'static str, String)> {
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let authorization = sigv4_authorization(
+        method,
+        host_header,
+        canonical_uri,
+        canonical_querystring,
+        access_key,
+        secret_key,
+        region,
+        &amz_date,
+    );
+    vec![
+        ("x-amz-date", amz_date),
+        ("x-amz-content-sha256", sha256_hex(b"")),
+        ("authorization", authorization),
+    ]
 }
 
 /// Verifies S3/R2 credentials with a path-style `HEAD /{bucket}` — enough to
@@ -499,15 +577,14 @@ async fn verify_s3(
     let mut url = base;
     url.set_path(&format!("/{bucket}"));
 
-    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let authorization = sigv4_authorization(
+    let headers = sigv4_signed_headers(
         "HEAD",
         &host_header,
         url.path(),
+        "",
         access_key,
         secret_key,
         region,
-        &amz_date,
     );
 
     verified_call(
@@ -515,11 +592,10 @@ async fn verify_s3(
         &url,
         &origin,
         false,
-        &[
-            ("x-amz-date", amz_date.clone()),
-            ("x-amz-content-sha256", sha256_hex(b"")),
-            ("authorization", authorization),
-        ],
+        &headers
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect::<Vec<_>>(),
         None,
     )
     .await?;
@@ -528,7 +604,27 @@ async fn verify_s3(
 
 // --- credential + connection-metadata helpers -------------------------------
 
-fn read_credential(account: &ConnectorAccount) -> Result<String, String> {
+/// Looks up one catalog account by id — used by Knowledge Sync's
+/// `connector_account_id`-referencing connectors (GitHub is the one
+/// exception: it never stores a credential, so it resolves through
+/// `m5_delivery::github`'s `gh` bridge instead of this catalog).
+pub fn account_by_id(id: &str) -> Result<ConnectorAccount, String> {
+    load_config_impl(&config_file_path()?)?
+        .accounts
+        .into_iter()
+        .find(|account| account.id == id)
+        .ok_or_else(|| format!("Unknown connector account '{id}'"))
+}
+
+/// Public alias for [`read_credential`] — Knowledge Sync's connectors live in
+/// `knowledge_service.rs`, a different module, so the bot/integration/API
+/// token or S3 secret key an account's `credential_ref` points at needs a
+/// crate-visible accessor rather than duplicating the keychain lookup.
+pub fn credential_for_account(account: &ConnectorAccount) -> Result<String, String> {
+    read_credential(account)
+}
+
+pub(crate) fn read_credential(account: &ConnectorAccount) -> Result<String, String> {
     let credential_ref = account
         .credential_ref
         .as_deref()
@@ -539,7 +635,7 @@ fn read_credential(account: &ConnectorAccount) -> Result<String, String> {
         .map_err(|e| format!("Failed to read saved credential: {e}"))
 }
 
-fn jira_connection(account: &ConnectorAccount) -> Result<(String, String), String> {
+pub(crate) fn jira_connection(account: &ConnectorAccount) -> Result<(String, String), String> {
     let connection = account
         .connection
         .as_ref()
@@ -557,7 +653,7 @@ fn jira_connection(account: &ConnectorAccount) -> Result<(String, String), Strin
     Ok((site_url, email))
 }
 
-fn s3_connection(account: &ConnectorAccount) -> Result<(String, String, String, String), String> {
+pub(crate) fn s3_connection(account: &ConnectorAccount) -> Result<(String, String, String, String), String> {
     let connection = account
         .connection
         .as_ref()
@@ -1603,6 +1699,7 @@ mod tests {
             "HEAD",
             "s3.amazonaws.com",
             "/my-bucket",
+            "",
             "AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "us-east-1",
@@ -1630,5 +1727,74 @@ mod tests {
         assert!(validate_s3_region("auto").is_ok());
         assert!(validate_s3_region("").is_err());
         assert!(validate_s3_region("écho").is_err());
+    }
+
+    #[test]
+    fn sigv4_uri_encode_leaves_unreserved_characters_untouched_and_escapes_the_rest() {
+        assert_eq!(sigv4_uri_encode("abcXYZ019-_.~", false), "abcXYZ019-_.~");
+        assert_eq!(sigv4_uri_encode("a b/c", true), "a%20b%2Fc");
+        assert_eq!(
+            sigv4_uri_encode("a b/c", false),
+            "a%20b/c",
+            "path-segment encoding must leave '/' as a literal separator"
+        );
+    }
+
+    #[test]
+    fn sigv4_canonical_query_sorts_params_lexicographically_by_key() {
+        let query = sigv4_canonical_query(&[
+            ("prefix", "reports/2024"),
+            ("list-type", "2"),
+            ("continuation-token", "abc def"),
+        ]);
+        assert_eq!(
+            query,
+            "continuation-token=abc%20def&list-type=2&prefix=reports%2F2024"
+        );
+    }
+
+    #[test]
+    fn sigv4_authorization_with_a_query_string_differs_from_the_bodyless_signature() {
+        let bodyless = sigv4_authorization(
+            "GET",
+            "examplebucket.s3.amazonaws.com",
+            "/",
+            "",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            "20130524T000000Z",
+        );
+        let with_query = sigv4_authorization(
+            "GET",
+            "examplebucket.s3.amazonaws.com",
+            "/",
+            "list-type=2&prefix=notes%2F",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            "20130524T000000Z",
+        );
+        assert_ne!(
+            bodyless, with_query,
+            "the query string must be part of what gets signed"
+        );
+        assert!(with_query.contains("Signature="));
+    }
+
+    #[test]
+    fn sigv4_signed_headers_produces_the_three_headers_a_bodyless_request_needs() {
+        let headers = sigv4_signed_headers(
+            "GET",
+            "my-bucket.example.com",
+            "/",
+            "list-type=2",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+        );
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["x-amz-date", "x-amz-content-sha256", "authorization"]);
+        assert!(headers[2].1.starts_with("AWS4-HMAC-SHA256 Credential="));
     }
 }
