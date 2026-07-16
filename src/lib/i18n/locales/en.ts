@@ -10,8 +10,10 @@ import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 
 export const en: Record<string, string> = {
+  ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
   ...searchLocale,

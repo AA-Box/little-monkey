@@ -13,6 +13,7 @@ import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { AgentInbox } from "./components/Inbox";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { SyntheticMonitoringPanel } from "./components/SyntheticMonitoring";
 import { TerminalPanel } from "./components/Terminal";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
@@ -33,6 +34,7 @@ import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
+import { startSyntheticMonitoringScheduler } from "./store/syntheticMonitoringStore";
 import { useT } from "./lib/i18n";
 import {
   detectShortcutPlatform,
@@ -108,6 +110,7 @@ function App() {
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [syntheticMonitoringOpen, setSyntheticMonitoringOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -128,6 +131,7 @@ function App() {
     setGlobalSearchOpen(false);
     setAgentInboxOpen(false);
     setDailyBriefOpen(false);
+    setSyntheticMonitoringOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -172,6 +176,7 @@ function App() {
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setDailyBriefOpen(false);
+          setSyntheticMonitoringOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -182,6 +187,7 @@ function App() {
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
           setDailyBriefOpen(false);
+          setSyntheticMonitoringOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
@@ -243,7 +249,12 @@ function App() {
     void hydrateAutomations();
     if (isTauri() && getCurrentWindow().label === "main") {
       startScheduler();
-      return startBackupScheduler();
+      const stopBackupScheduler = startBackupScheduler();
+      const stopSyntheticMonitoringScheduler = startSyntheticMonitoringScheduler();
+      return () => {
+        stopBackupScheduler();
+        stopSyntheticMonitoringScheduler();
+      };
     }
     return undefined;
   }, []);
@@ -350,6 +361,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -359,6 +371,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -369,6 +382,7 @@ function App() {
             setIssueToPrOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -379,6 +393,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -389,6 +404,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
@@ -399,6 +415,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
           }}
@@ -409,8 +426,20 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenSyntheticMonitoring={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setSyntheticMonitoringOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
@@ -420,6 +449,7 @@ function App() {
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
+            setSyntheticMonitoringOpen(false);
             setTerminalOpen(false);
             restartOnboarding();
           }}
@@ -444,7 +474,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : syntheticMonitoringOpen ? "synthetic-monitoring" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -477,6 +507,8 @@ function App() {
               }}
               onOpenSettingsTab={openSettingsTab}
             />
+          ) : syntheticMonitoringOpen ? (
+            <SyntheticMonitoringPanel onClose={() => setSyntheticMonitoringOpen(false)} />
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : issueToPrOpen ? (
@@ -516,7 +548,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !syntheticMonitoringOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

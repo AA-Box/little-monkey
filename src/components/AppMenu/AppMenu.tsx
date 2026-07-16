@@ -11,6 +11,7 @@ import {
   ListTodo,
   Inbox,
   Newspaper,
+  Radar,
   Search,
   Settings as SettingsIcon,
   SquareTerminal,
@@ -32,6 +33,7 @@ interface AppMenuProps {
   onOpenTerminal: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenSyntheticMonitoring: () => void;
 }
 
 interface MenuRowProps {
@@ -70,6 +72,7 @@ export function AppMenu({
   onOpenTerminal,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenSyntheticMonitoring,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -160,6 +163,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<Radar size={14} className="text-faint" />}
+            label={t("AppMenu.syntheticMonitoring")}
+            onClick={() => {
+              closeAll();
+              onOpenSyntheticMonitoring();
             }}
           />
           <MenuRow
