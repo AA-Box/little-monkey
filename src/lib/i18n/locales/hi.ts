@@ -1167,5 +1167,14 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "यह एक मान्य रजिस्ट्री स्नैपशॉट JSON नहीं है।",
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
-  "EcosystemDiscover.cancel": "रद्द करें"
+  "EcosystemDiscover.cancel": "रद्द करें",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Hindi
+  // translations, overriding the searchLocale keys above.
+  "GlobalSearch.source.session": "चैट",
+  "GlobalSearch.source.task": "कार्य",
+  "GlobalSearch.source.workspace_file": "फ़ाइल",
+  "GlobalSearch.source.knowledge": "ज्ञान",
+  "GlobalSearch.source.browser_evidence": "ब्राउज़र प्रमाण",
+  "GlobalSearch.source.connected_app": "कनेक्टेड ऐप",
+  "GlobalSearch.accessFilteredNotice": "कुछ परिणाम छोड़ दिए गए क्योंकि आपकी मौजूदा डिवाइस या वर्कस्पेस पहुंच उन्हें कवर नहीं करती ({{count}} छिपाए गए)।",
 };

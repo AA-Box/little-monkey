@@ -1167,5 +1167,14 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Das ist kein gültiges Registry-Snapshot-JSON.",
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
-  "EcosystemDiscover.cancel": "Abbrechen"
+  "EcosystemDiscover.cancel": "Abbrechen",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real German
+  // translations, overriding the searchLocale keys of the same name above.
+  "GlobalSearch.source.session": "Chat",
+  "GlobalSearch.source.task": "Aufgabe",
+  "GlobalSearch.source.workspace_file": "Datei",
+  "GlobalSearch.source.knowledge": "Wissen",
+  "GlobalSearch.source.browser_evidence": "Browser-Nachweis",
+  "GlobalSearch.source.connected_app": "Verbundene App",
+  "GlobalSearch.accessFilteredNotice": "Einige Ergebnisse wurden weggelassen, weil dein aktueller Geräte- oder Arbeitsbereichszugriff sie nicht abdeckt ({{count}} ausgeblendet).",
 };

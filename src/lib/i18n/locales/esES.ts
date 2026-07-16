@@ -1167,5 +1167,14 @@ export const esES: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Esto no es un JSON de instantánea de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "¿Eliminar esta fuente de registro?",
   "EcosystemDiscover.removeRegistry": "Eliminar",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Spain
+  // Spanish translations, overriding the searchLocale keys above.
+  "GlobalSearch.source.session": "Chat",
+  "GlobalSearch.source.task": "Tarea",
+  "GlobalSearch.source.workspace_file": "Archivo",
+  "GlobalSearch.source.knowledge": "Conocimiento",
+  "GlobalSearch.source.browser_evidence": "Evidencia del navegador",
+  "GlobalSearch.source.connected_app": "Aplicación conectada",
+  "GlobalSearch.accessFilteredNotice": "Se han omitido algunos resultados porque tu acceso actual al dispositivo o al espacio de trabajo no los cubre ({{count}} ocultos).",
 };

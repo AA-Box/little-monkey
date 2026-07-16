@@ -1167,5 +1167,14 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ini bukan JSON snapshot registri yang valid.",
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
-  "EcosystemDiscover.cancel": "Batal"
+  "EcosystemDiscover.cancel": "Batal",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Indonesian
+  // translations, overriding the searchLocale keys above.
+  "GlobalSearch.source.session": "Obrolan",
+  "GlobalSearch.source.task": "Tugas",
+  "GlobalSearch.source.workspace_file": "Berkas",
+  "GlobalSearch.source.knowledge": "Pengetahuan",
+  "GlobalSearch.source.browser_evidence": "Bukti peramban",
+  "GlobalSearch.source.connected_app": "Aplikasi terhubung",
+  "GlobalSearch.accessFilteredNotice": "Beberapa hasil disembunyikan karena akses perangkat atau ruang kerja Anda saat ini tidak mencakupnya ({{count}} disembunyikan).",
 };
