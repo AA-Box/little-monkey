@@ -4,6 +4,7 @@ import {
   BookOpen,
   Bot,
   Boxes,
+  Brain,
   Cloud,
   Cpu,
   Keyboard,
@@ -33,6 +34,7 @@ import { AddCustomProviderForm } from "./AddCustomProviderForm";
 import { AutomationPanel } from "./AutomationPanel";
 import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
+import { MemoryStudioPanel } from "./MemoryStudioPanel";
 import { McpPanel } from "./McpPanel";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
@@ -67,7 +69,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -76,6 +78,7 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   knowledge: BookOpen,
   automation: Zap,
   rules: ScrollText,
+  memorystudio: Brain,
   mcp: Plug,
   connectors: PlugZap,
   prompts: MessageSquare,
@@ -97,7 +100,7 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "companion", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
-  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks"] },
+  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "background", "mcp", "connectors", "prompts", "apiserver"] },
 ];
 
@@ -108,6 +111,7 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   knowledge: "SettingsModal.tabKnowledge",
   automation: "SettingsModal.tabAutomation",
   rules: "SettingsModal.tabRules",
+  memorystudio: "SettingsModal.tabMemoryStudio",
   mcp: "SettingsModal.tabMcp",
   connectors: "SettingsModal.tabConnectors",
   prompts: "SettingsModal.tabPrompts",
@@ -341,6 +345,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "knowledge" && <KnowledgePanel />}
               {tab === "automation" && <AutomationPanel />}
               {tab === "rules" && <RulesMemoryPanel />}
+              {tab === "memorystudio" && <MemoryStudioPanel />}
               {tab === "mcp" && <McpPanel />}
               {tab === "connectors" && <ConnectorsPanel />}
               {tab === "prompts" && <PromptLibraryPanel />}

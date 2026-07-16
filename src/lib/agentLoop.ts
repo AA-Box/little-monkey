@@ -989,6 +989,14 @@ async function resolveBaseUrl(): Promise<string> {
  * (its API key lives in the OS keychain, never here); local llama.cpp and
  * the unauthenticated local Ollama daemon both use the direct-`fetch`
  * `streamChat` path.
+ *
+ * Exported so `sideTaskRunner.ts` can default a newly-started side task onto
+ * whatever model the main chat is currently using, without re-implementing
+ * this resolution logic (or the local-runtime `resolveBaseUrl` lookup a
+ * from-scratch version would need) a second time — a side task's own loop is
+ * deliberately independent of the parent turn (see that module's doc
+ * comment), but "which model is active right now" is still a single, shared
+ * piece of app state both should read the same way.
  */
 /** Exported (in addition to the module's own uses above) so
  * `issueToPrRunner.ts` can resolve the exact same active-target rules for
