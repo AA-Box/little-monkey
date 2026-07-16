@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { teamModeLocale } from "./teamMode";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -10,6 +11,32 @@ export const id: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...teamModeLocale,
+  // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
+  "SettingsModal.tabTeamMode": "Tim",
+  "TeamModePanel.membersHeading": "Anggota tim",
+  "TeamModePanel.membersDescription": "Pengalih profil lokal bernama untuk menentukan siapa yang sedang mengoperasikan mesin ini saat ini — bukan batas autentikasi. Siapa pun yang memiliki akses lokal ke aplikasi ini sudah memiliki kendali penuh atasnya; ini hanya mengubah atribusi audit dan siapa yang dapat merespons permintaan izin.",
+  "TeamModePanel.dismissError": "Tutup",
+  "TeamModePanel.activeSwitcherLabel": "Anggota aktif",
+  "TeamModePanel.activeSwitcherNone": "Tidak ada yang dipilih",
+  "TeamModePanel.membersEmpty": "Belum ada anggota tim yang dikonfigurasi — aplikasi ini berperilaku persis seperti untuk pengguna tunggal hingga Anda menambahkan satu.",
+  "TeamModePanel.addNameLabel": "Nama tampilan",
+  "TeamModePanel.addNamePlaceholder": "mis. Alex",
+  "TeamModePanel.addRoleLabel": "Peran",
+  "TeamModePanel.addButton": "Tambah anggota",
+  "TeamModePanel.firstMemberIsOwnerHint": "Anggota pertama yang Anda tambahkan selalu menjadi Pemilik, apa pun peran yang dipilih.",
+  "TeamModePanel.auditHeading": "Ekspor audit",
+  "TeamModePanel.auditDescription": "Laporan yang telah disamarkan dari eksekusi terbaru dan keputusan izin — kunci penyedia, token, atau rahasia lainnya tidak pernah disertakan.",
+  "TeamModePanel.exportButton": "Ekspor laporan audit",
+  "TeamModePanel.roleOwner": "Pemilik",
+  "TeamModePanel.roleApprover": "Penyetuju",
+  "TeamModePanel.roleOperator": "Operator",
+  "TeamModePanel.roleViewer": "Penampil",
+  "TeamModePanel.activeBadge": "Aktif",
+  "TeamModePanel.lastActive": "Terakhir aktif {{date}}",
+  "TeamModePanel.roleSelectAriaLabel": "Peran untuk {{name}}",
+  "TeamModePanel.removeButton": "Hapus {{name}}",
+  "TeamModePanel.removeConfirm": "Hapus {{name}} dari tim ini? Tindakan ini tidak dapat dibatalkan.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

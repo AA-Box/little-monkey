@@ -163,6 +163,11 @@ mod run_commands;
 // subcommand exists yet (it emits a launchd/crontab line, no in-process
 // scheduling), but there's no reason to make this one module-private either.
 pub mod automations;
+// Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
+// Phase 6): a named local profile switcher, capability-checked roles, and a
+// redacted audit export layered over `run_ledger`/`permissions`. See the
+// module doc for exactly what it is (and, just as importantly, is not).
+pub mod team_mode;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -325,6 +330,13 @@ pub struct AppState {
     pub index_cancels: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
     >,
+    /// Serializes `team_members.json` read-modify-write cycles (see
+    /// `team_mode.rs`) so two concurrent member-roster mutations (e.g. an add
+    /// racing a role change, or two removes racing each other) can never both
+    /// load the same "before" file and have the later save silently clobber
+    /// the earlier one's change — same reasoning as `connectors_config_lock`/
+    /// `memory_lock` above protect their own files.
+    pub team_members_lock: std::sync::Mutex<()>,
 }
 
 impl Default for AppState {
@@ -352,6 +364,7 @@ impl Default for AppState {
             run_ledger: Default::default(),
             stack_cache: Default::default(),
             index_cancels: Default::default(),
+            team_members_lock: Default::default(),
         }
     }
 }
@@ -680,6 +693,12 @@ pub fn run() {
             automations::cron_validate,
             automations::cron_next,
             automations::cron_previous,
+            team_mode::team_members_list,
+            team_mode::team_members_add,
+            team_mode::team_members_update_role,
+            team_mode::team_members_remove,
+            team_mode::team_members_set_active,
+            team_mode::team_audit_export,
             run_commands::run_protocol_version,
             run_commands::run_submit,
             run_commands::run_append_event,
