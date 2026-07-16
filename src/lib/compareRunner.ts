@@ -115,8 +115,11 @@ function targetInventoryInput() {
 
 /** Rechecks availability without replacing the immutable values the user
  * selected. A disappearing provider/model fails before sessions are created
- * instead of producing four misleading empty result cards. */
-function preflightTarget(target: ModelTargetSnapshot): void {
+ * instead of producing four misleading empty result cards. Exported so
+ * `compareLabRunner.ts` (Model Compare Lab, ROADMAP.md Phase 2) can reuse the
+ * exact same availability check for its own batched/looped fan-out instead
+ * of duplicating it. */
+export function preflightTarget(target: ModelTargetSnapshot): void {
   const fresh = buildModelTargetInventory(targetInventoryInput());
   const freshByKey = new Map(fresh.targets.map((target) => [target.key, target]));
   const current = freshByKey.get(target.key);
@@ -133,7 +136,11 @@ function preflightTargets(targets: readonly ModelTargetSnapshot[]): void {
   for (const target of targets) preflightTarget(target);
 }
 
-async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarget> {
+/** Resolves a frozen `ModelTargetSnapshot` into the live wire target
+ * `attemptStream` needs, re-checking a local llama.cpp target is still the
+ * exact model resident in the managed runtime. Exported for
+ * `compareLabRunner.ts`'s reuse — see `preflightTarget`'s doc comment. */
+export async function resolveTarget(target: ModelTargetSnapshot): Promise<ResolvedTarget> {
   if (target.kind === "provider") {
     return { kind: "provider", providerId: target.providerId, model: target.model };
   }
