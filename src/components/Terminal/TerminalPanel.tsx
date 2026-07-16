@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
+  Box,
   Paperclip,
   Plus,
   RefreshCw,
@@ -16,6 +17,7 @@ import { useTerminalStore, buildTerminalEvidence, readableTerminalOutput } from 
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { Button, IconButton, StatusPill } from "../ui";
 import type { PillTone } from "../ui";
+import { SandboxPanel } from "./SandboxPanel";
 
 const MAX_HIGHLIGHT_MATCHES = 500;
 
@@ -84,6 +86,7 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [evidencePreview, setEvidencePreview] = useState<ReturnType<typeof buildTerminalEvidence> | null>(null);
   const [attachedNotice, setAttachedNotice] = useState(false);
+  const [sandboxOpen, setSandboxOpen] = useState(false);
   const outputRef = useRef<HTMLPreElement>(null);
   const followOutputRef = useRef(true);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -306,6 +309,9 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
             <Button size="sm" variant="secondary" onClick={prepareEvidence} disabled={!readableOutput.trim()}>
               <Paperclip size={12} /> {t("TerminalPanel.attach")}
             </Button>
+            <Button size="sm" variant="secondary" onClick={() => setSandboxOpen(true)}>
+              <Box size={12} /> {t("SandboxPanel.openButton")}
+            </Button>
           </div>
 
           {active.output_truncated && (
@@ -390,6 +396,10 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {sandboxOpen && (
+        <SandboxPanel initialCommand={command} onClose={() => setSandboxOpen(false)} />
       )}
     </section>
   );
