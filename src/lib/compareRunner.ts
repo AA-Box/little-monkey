@@ -108,7 +108,7 @@ function targetInventoryInput() {
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
     providerModels: state.providerModels,
-    effort: state.effort,
+    effortByTarget: state.effortByTarget,
   };
 }
 
@@ -481,7 +481,6 @@ export async function startComparison(
   if (mentionMessage) contextMessages.push(mentionMessage);
   const sourcesMessage = await retrieveSources(source.attachedStackIds, normalizedPrompt, source.docChatMode);
   if (sourcesMessage) contextMessages.push(sourcesMessage);
-  const effort = useModelStore.getState().effort;
   const draftExecutionPlan = buildComparisonExecutionPlan(targetSnapshots, await memoryInfoPromise);
   const residentOllamaModels =
     draftExecutionPlan.mode === "local_sequential" &&
@@ -509,7 +508,10 @@ export async function startComparison(
     storedContent: cloneValue(storedContent),
     wireContent: cloneValue(wireContent),
     unresolvedReferences: [...unresolved],
-    effort,
+    // Effort is per-model now, frozen on each target snapshot itself;
+    // `metadata.effort` remains only so comparisons persisted before the
+    // per-model split still retry with their original global level.
+    effort: null,
     systemPrompt,
     contextMessages: cloneValue(contextMessages),
     executionPlan,
@@ -540,7 +542,7 @@ export async function startComparison(
         sessionId,
         target,
         wireHistory,
-        target.effort ?? effort,
+        target.effort,
         executionPlan,
       );
     }),
@@ -572,7 +574,8 @@ export function stopComparison(groupId: string): void {
 }
 
 /** Retries exactly one branch from the persisted frozen input. Changed
- * files, persona/rules, stacks, global effort, and active model are ignored. */
+ * files, persona/rules, stacks, per-model effort settings, and active model
+ * are ignored. */
 export function retryComparisonBranch(sessionId: string): Promise<void> {
   if (branchControllers.has(sessionId)) {
     return Promise.reject(new Error("Wait for this branch to stop before retrying it."));

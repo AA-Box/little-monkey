@@ -266,7 +266,7 @@ beforeEach(() => {
     activeProvider: "provider",
     activeProviderId: PROVIDER_A.id,
     activeProviderModel: "alpha",
-    effort: "high",
+    effortByTarget: {},
   });
   useUsageStore.setState({ usageBySession: {}, contextLimit: null });
   useUsageHistoryStore.setState({
@@ -717,7 +717,12 @@ describe("retryComparisonBranch", () => {
       },
     );
 
-    const handle = await startComparison("source", "Use @facts.md and @missing.md", [], [TARGET_A, TARGET_B]);
+    // Effort is frozen per-model onto the target snapshot itself now (see
+    // `modelTargets.ts`'s `providerTarget`) — bake one on here so this test
+    // can assert a retry keeps using it even after the live per-model
+    // selection changes below.
+    const targetAWithEffort: ModelTargetSnapshot = { ...TARGET_A, effort: "high" };
+    const handle = await startComparison("source", "Use @facts.md and @missing.md", [], [targetAWithEffort, TARGET_B]);
     await handle.done;
     const metadata = useSessionStore.getState().groups.find((group) => group.id === handle.groupId)?.comparison;
     expect(metadata?.systemPrompt).toContain("ORIGINAL SYSTEM PROMPT");
@@ -747,8 +752,9 @@ describe("retryComparisonBranch", () => {
       activeProvider: "provider",
       activeProviderId: PROVIDER_B.id,
       activeProviderModel: "beta",
-      effort: "low",
     });
+    // Live per-model effort changes after the freeze must not leak into a retry.
+    useModelStore.getState().setEffortForTarget(targetAWithEffort.key, "low");
 
     await retryComparisonBranch(handle.sessionIds[0]);
 

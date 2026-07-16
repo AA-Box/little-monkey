@@ -55,7 +55,7 @@ import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPromp
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
-import { getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -1042,7 +1042,7 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
         ],
         [],
         undefined,
-        useModelStore.getState().effort,
+        effortForTarget(target),
         sessionId,
       );
       if (summary.streamError) throw new Error(summary.streamError);
@@ -1071,7 +1071,7 @@ function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot 
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
     providerModels: state.providerModels,
-    effort: state.effort,
+    effortByTarget: state.effortByTarget,
   });
   if (target.kind === 'local') {
     return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
@@ -1580,7 +1580,7 @@ async function runDaemonAgentTurn(
     verifyEnabled: settings.verifyEnabled,
     verifyMaxRounds: settings.verifyMaxRounds,
     subagentsEnabled: settings.subagentsEnabled,
-    effort: useModelStore.getState().effort,
+    effort: effortForTarget(resolvedTarget) ?? null,
     mcpServers: useMcpStore.getState().servers,
     attachedStackIds,
     attachedStackNames: attachedStacks.map((stack) => stack.name),
@@ -1885,9 +1885,11 @@ async function runAgentTurnBody(
   let sequenceIndex = 0;
   let target = sequence[0];
 
-  const effort = useModelStore.getState().effort;
+  // Per-model, so it must track the target: re-resolved below whenever a
+  // failover switch changes `target` mid-turn.
+  let effort = effortForTarget(primaryTarget);
 
-  // Read once per turn, like `effort` above — not re-derived on every
+  // Read once per turn — not re-derived on every
   // tool-calling round trip, so a mode switch mid-turn (possible via the
   // split pane's shared global mode, or the user clicking Approve on a plan
   // card mid-turn) never changes what's offered partway through this turn's
@@ -2236,6 +2238,7 @@ async function runAgentTurnBody(
         .catch((error) => console.error('Failed to close failed-over durable run', error));
       sequenceIndex += 1;
       target = sequence[sequenceIndex];
+      effort = effortForTarget(target);
       durable.recorder = await startDurableRecorder(
         target,
         `${turnId}-failover-${sequenceIndex}`,
