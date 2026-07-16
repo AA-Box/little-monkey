@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
+import { specScorerLocale } from "./specScorer";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -12,6 +13,23 @@ export const hi: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...issueToPrLocale,
+  ...specScorerLocale,
+  // Agent-Ready Spec Scorer (ROADMAP.md Phase 7, item 4) — real translations overriding the English `specScorerLocale` defaults spread above.
+  "SpecScorer.scoringLabel": "यह जांचा जा रहा है कि यह इशू एजेंट के लिए कितना तैयार है…",
+  "SpecScorer.bannerHeading": "यह इशू स्वायत्त रन के लिए बहुत अस्पष्ट हो सकता है",
+  "SpecScorer.bannerIntro": "एजेंट-तैयारी स्कोर: {{score}}/100 — {{summary}}",
+  "SpecScorer.missingInfoHeading": "स्वायत्त रन शुरू करने से पहले इनका उत्तर दें:",
+  "SpecScorer.dimensionsHeading": "स्कोर का विवरण",
+  "SpecScorer.dimension.clarity": "स्पष्टता",
+  "SpecScorer.dimension.scope": "दायरा",
+  "SpecScorer.dimension.missingContext": "अनुपलब्ध संदर्भ",
+  "SpecScorer.dimension.testability": "परीक्षणीयता",
+  "SpecScorer.dimension.dependencies": "निर्भरताएँ",
+  "SpecScorer.dimension.agentReadiness": "एजेंट-तैयारी",
+  "SpecScorer.readyNote": "एजेंट-तैयारी जांच सफल रही ({{score}}/100)।",
+  "SpecScorer.advisoryNote": "केवल सलाहकार — आप फिर भी रन शुरू कर सकते हैं।",
+  "SpecScorer.rescoreButton": "फिर से जांचें",
+  "SpecScorer.errorNote": "अभी इस इशू की एजेंट-तैयारी जांच नहीं हो सकी।",
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "इशू-टू-पीआर",
   "IssueToPr.title": "इशू-टू-पीआर एजेंट फ़्लो",
