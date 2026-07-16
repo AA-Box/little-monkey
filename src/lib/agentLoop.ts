@@ -990,7 +990,11 @@ async function resolveBaseUrl(): Promise<string> {
  * the unauthenticated local Ollama daemon both use the direct-`fetch`
  * `streamChat` path.
  */
-async function resolveTarget(): Promise<ResolvedTarget> {
+/** Exported (in addition to the module's own uses above) so
+ * `issueToPrRunner.ts` can resolve the exact same active-target rules for
+ * its own headless, panel-driven agent turn — see that module's doc comment
+ * for why it reuses this rather than re-deriving target resolution. */
+export async function resolveTarget(): Promise<ResolvedTarget> {
   const target = getActiveChatTarget();
 
   if (target.kind === 'provider') {
@@ -1061,7 +1065,10 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
  * contains its endpoint/model/capability evidence. The inventory is built
  * once at run start; later global model changes cannot rewrite the ledger
  * snapshot. */
-function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+/** Exported so `issueToPrRunner.ts` can build the `target` field
+ * `beginDurableRun` needs for its own headless run, the same reuse reasoning
+ * as `resolveTarget` above. */
+export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
   const state = useModelStore.getState();
   const inventory = buildModelTargetInventory({
     installed: state.installed,
