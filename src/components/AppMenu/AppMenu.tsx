@@ -15,6 +15,7 @@ import {
   ServerCog,
   Settings as SettingsIcon,
   SquareTerminal,
+  Swords,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -32,6 +33,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenTerminal: () => void;
+  onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
 }
@@ -71,6 +73,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenTerminal,
+  onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
 }: AppMenuProps) {
@@ -187,6 +190,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<Swords size={14} className="text-faint" />}
+            label={t("AppMenu.debate")}
+            onClick={() => {
+              closeAll();
+              onOpenDebate();
             }}
           />
           <MenuRow
