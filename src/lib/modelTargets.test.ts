@@ -7,8 +7,11 @@ import type {
   ProviderModelInfo,
 } from "../store/modelStore";
 import {
+  ANTHROPIC_EFFORT_FALLBACK_KEY,
   assertValidComparisonTargets,
   buildModelTargetInventory,
+  effortForProviderModel,
+  effortLevelsForProvider,
   findActiveModelTarget,
   isModelTargetSnapshot,
   localModelTargetKey,
@@ -72,7 +75,7 @@ function inventoryInput(overrides: Partial<ModelTargetInventoryInput> = {}): Mod
     ollamaReachable: false,
     providers: [],
     providerModels: {},
-    effort: "high",
+    effortByTarget: {},
     ...overrides,
   };
 }
@@ -128,10 +131,11 @@ describe("buildModelTargetInventory", () => {
     expect(inventory.targets.filter((target) => target.kind === "local")).toEqual([]);
   });
 
-  it("groups models for connected providers and snapshots effort only for Anthropic", () => {
+  it("groups models for connected providers and snapshots each model's own effort for effort-capable providers", () => {
     const providers = [
       provider(),
       provider({ id: "openai", label: "OpenAI" }),
+      provider({ id: "custom-x", label: "Custom X", is_custom: true }),
       provider({ id: "disconnected", label: "Disconnected", has_key: false }),
     ];
     const inventory = buildModelTargetInventory(
@@ -141,18 +145,26 @@ describe("buildModelTargetInventory", () => {
         providers,
         providerModels: {
           anthropic: [providerModel("claude-sonnet"), providerModel("claude-sonnet")],
-          openai: [providerModel("gpt-5")],
+          openai: [providerModel("gpt-5"), providerModel("gpt-5-mini")],
+          "custom-x": [providerModel("mystery-model")],
           disconnected: [providerModel("hidden")],
         },
-        effort: "xhigh",
+        effortByTarget: {
+          [providerModelTargetKey("anthropic", "claude-sonnet")]: "xhigh",
+          [providerModelTargetKey("openai", "gpt-5")]: "low",
+          // A custom provider has no effort knob: even a (hand-edited)
+          // stored entry must never be snapshotted onto its targets.
+          [providerModelTargetKey("custom-x", "mystery-model")]: "high",
+        },
       }),
     );
 
     expect(inventory.groups.map((group) => [group.key, group.label])).toEqual([
       ["provider:anthropic", "Anthropic"],
       ["provider:openai", "OpenAI"],
+      ["provider:custom-x", "Custom X"],
     ]);
-    expect(inventory.targets).toHaveLength(2);
+    expect(inventory.targets).toHaveLength(4);
     expect(inventory.targets[0]).toMatchObject({
       kind: "provider",
       providerId: "anthropic",
@@ -164,8 +176,32 @@ describe("buildModelTargetInventory", () => {
       },
       availability: { status: "available" },
     });
-    expect(inventory.targets[1]).not.toHaveProperty("effort");
+    expect(inventory.targets[1]).toMatchObject({ providerId: "openai", model: "gpt-5", effort: "low" });
+    expect(inventory.targets[2]).not.toHaveProperty("effort");
+    expect(inventory.targets[3]).not.toHaveProperty("effort");
     expect(inventory.targets.some((target) => target.displayName === "hidden")).toBe(false);
+  });
+
+  it("applies the migrated legacy fallback entry to Anthropic models only, below any per-model entry", () => {
+    const inventory = buildModelTargetInventory(
+      inventoryInput({
+        active: null,
+        installed: [],
+        providers: [provider(), provider({ id: "openai", label: "OpenAI" })],
+        providerModels: {
+          anthropic: [providerModel("claude-sonnet"), providerModel("claude-haiku")],
+          openai: [providerModel("gpt-5")],
+        },
+        effortByTarget: {
+          [ANTHROPIC_EFFORT_FALLBACK_KEY]: "max",
+          [providerModelTargetKey("anthropic", "claude-haiku")]: "low",
+        },
+      }),
+    );
+
+    expect(inventory.targets[0]).toMatchObject({ model: "claude-sonnet", effort: "max" });
+    expect(inventory.targets[1]).toMatchObject({ model: "claude-haiku", effort: "low" });
+    expect(inventory.targets[2]).not.toHaveProperty("effort");
   });
 
   it("groups every Ollama tag, preserving reported capabilities and daemon availability", () => {
@@ -224,6 +260,32 @@ describe("stable target keys", () => {
     expect(providerModelTargetKey("custom:one", "org/model:7b")).toBe(
       "provider:custom%3Aone:org%2Fmodel%3A7b",
     );
+  });
+});
+
+describe("per-provider effort capability", () => {
+  it("offers all five levels for Anthropic and the clamped three for the other mapped providers", () => {
+    expect(effortLevelsForProvider("anthropic")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    for (const providerId of ["openai", "gemini", "openrouter"]) {
+      expect(effortLevelsForProvider(providerId)).toEqual(["low", "medium", "high"]);
+    }
+  });
+
+  it("offers no levels at all for custom/unknown providers", () => {
+    expect(effortLevelsForProvider("my-custom-provider")).toBeNull();
+    expect(effortLevelsForProvider("")).toBeNull();
+  });
+
+  it("resolves a model's own entry first, then the Anthropic-only legacy fallback, then nothing", () => {
+    const map = {
+      [providerModelTargetKey("anthropic", "claude-sonnet")]: "low",
+      [ANTHROPIC_EFFORT_FALLBACK_KEY]: "max",
+    } as const;
+    expect(effortForProviderModel(map, "anthropic", "claude-sonnet")).toBe("low");
+    expect(effortForProviderModel(map, "anthropic", "claude-haiku")).toBe("max");
+    expect(effortForProviderModel(map, "openai", "gpt-5")).toBeUndefined();
+    expect(effortForProviderModel({}, "anthropic", "claude-sonnet")).toBeUndefined();
+    expect(effortForProviderModel(undefined, "anthropic", "claude-sonnet")).toBeUndefined();
   });
 });
 

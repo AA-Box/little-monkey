@@ -109,7 +109,7 @@ export function CompareTargetPicker({ value, onChange, disabled = false }: Compa
       ollamaReachable: state.ollamaReachable,
       providers: state.providers,
       providerModels: state.providerModels,
-      effort: state.effort,
+      effortByTarget: state.effortByTarget,
       activeProvider: state.activeProvider,
       activeOllamaModel: state.activeOllamaModel,
       activeProviderId: state.activeProviderId,
@@ -128,7 +128,7 @@ export function CompareTargetPicker({ value, onChange, disabled = false }: Compa
         ollamaReachable: modelState.ollamaReachable,
         providers: modelState.providers,
         providerModels: modelState.providerModels,
-        effort: modelState.effort,
+        effortByTarget: modelState.effortByTarget,
       }),
     [modelState],
   );
