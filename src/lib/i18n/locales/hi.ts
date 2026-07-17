@@ -16,6 +16,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
@@ -421,6 +422,7 @@ export const hi: Record<string, string> = {
   "McpGenerator.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
   "McpGenerator.statusNotSimulated": "सिम्युलेट नहीं हुआ",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Hindi translations, overriding every workCanvasLocale key above.
@@ -1677,6 +1679,49 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
   "EcosystemDiscover.cancel": "रद्द करें",
+  // Real Hindi translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "डेटा नोटबुक",
+  "DataNotebookPanel.title": "डेटा नोटबुक और SQL लैब",
+  "DataNotebookPanel.subtitle": "स्थानीय CSV/JSON डेटासेट पर SQL और मार्कडाउन सेल, सहेजे गए स्रोत से पुनरुत्पादनीय",
+  "DataNotebookPanel.close": "डेटा नोटबुक बंद करें",
+  "DataNotebookPanel.notebookListTitle": "नोटबुक",
+  "DataNotebookPanel.newNotebook": "नई नोटबुक",
+  "DataNotebookPanel.defaultNotebookName": "शीर्षक रहित नोटबुक",
+  "DataNotebookPanel.emptyState": "अभी तक कोई नोटबुक नहीं है। शुरू करने के लिए एक बनाएं।",
+  "DataNotebookPanel.deleteNotebook": "नोटबुक हटाएं",
+  "DataNotebookPanel.renameNotebook": "नोटबुक का नाम",
+  "DataNotebookPanel.noActiveNotebook": "शुरू करने के लिए एक नोटबुक चुनें या बनाएं।",
+  "DataNotebookPanel.persistError": "कुछ बदलाव सहेजे नहीं जा सके: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "डेटासेट",
+  "DataNotebookPanel.datasetSection.none": "अभी तक कोई डेटासेट आयात नहीं किया गया।",
+  "DataNotebookPanel.datasetSection.import": "CSV/JSON आयात करें…",
+  "DataNotebookPanel.datasetSection.clear": "डेटासेट हटाएं",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} पंक्ति(याँ) · तालिका `{{table}}`",
+  "DataNotebookPanel.importError": "आयात विफल: {{error}}",
+  "DataNotebookPanel.addSqlCell": "SQL सेल जोड़ें",
+  "DataNotebookPanel.addMarkdownCell": "मार्कडाउन सेल जोड़ें",
+  "DataNotebookPanel.runAll": "सभी को फिर से चलाएं",
+  "DataNotebookPanel.running": "चल रहा है…",
+  "DataNotebookPanel.exportReport": "रिपोर्ट निर्यात करें",
+  "DataNotebookPanel.noCells": "अभी तक कोई सेल नहीं है। शुरू करने के लिए एक SQL या मार्कडाउन सेल जोड़ें।",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "मार्कडाउन",
+  "DataNotebookPanel.cell.run": "चलाएं",
+  "DataNotebookPanel.cell.moveUp": "सेल ऊपर ले जाएं",
+  "DataNotebookPanel.cell.moveDown": "सेल नीचे ले जाएं",
+  "DataNotebookPanel.cell.delete": "सेल हटाएं",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "मार्कडाउन लिखें…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "पूर्वावलोकन",
+  "DataNotebookPanel.cell.markdownEditToggle": "संपादित करें",
+  "DataNotebookPanel.cell.notRun": "अभी तक नहीं चलाया गया।",
+  "DataNotebookPanel.cell.error": "त्रुटि: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} पंक्ति(याँ) प्रभावित।",
+  "DataNotebookPanel.cell.noResults": "कोई परिणाम सेट नहीं।",
+  "DataNotebookPanel.cell.truncated": "{{total}} में से पहली {{shown}} पंक्तियाँ दिखाई जा रही हैं।",
+  "DataNotebookPanel.reportModal.title": "पुनरुत्पादनीय रिपोर्ट",
+  "DataNotebookPanel.reportModal.copy": "क्लिपबोर्ड पर कॉपी करें",
+  "DataNotebookPanel.reportModal.copied": "कॉपी हो गया!",
 
   // Synthetic Monitoring Agent (ROADMAP.md Phase 7, item 17) — real translations overriding the English `syntheticMonitoringLocale` defaults spread above.
   "AppMenu.syntheticMonitoring": "सिंथेटिक मॉनिटरिंग",

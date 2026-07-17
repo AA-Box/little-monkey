@@ -16,6 +16,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
@@ -421,6 +422,7 @@ export const it: Record<string, string> = {
   "McpGenerator.statusNotClean": "Non pulito secondo il simulatore",
   "McpGenerator.statusNotSimulated": "Non simulato",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Italian translations, overriding every workCanvasLocale key above.
@@ -1677,6 +1679,49 @@ export const it: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Rimuovere questa fonte di registro?",
   "EcosystemDiscover.removeRegistry": "Rimuovi",
   "EcosystemDiscover.cancel": "Annulla",
+  // Real Italian translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "Blocco note dati",
+  "DataNotebookPanel.title": "Blocco note dati e SQL Lab",
+  "DataNotebookPanel.subtitle": "Celle SQL e Markdown su un dataset CSV/JSON locale, riproducibili dalla sorgente salvata",
+  "DataNotebookPanel.close": "Chiudi Blocco note dati",
+  "DataNotebookPanel.notebookListTitle": "Blocchi note",
+  "DataNotebookPanel.newNotebook": "Nuovo blocco note",
+  "DataNotebookPanel.defaultNotebookName": "Blocco note senza titolo",
+  "DataNotebookPanel.emptyState": "Nessun blocco note ancora. Creane uno per iniziare.",
+  "DataNotebookPanel.deleteNotebook": "Elimina blocco note",
+  "DataNotebookPanel.renameNotebook": "Nome del blocco note",
+  "DataNotebookPanel.noActiveNotebook": "Seleziona o crea un blocco note per iniziare.",
+  "DataNotebookPanel.persistError": "Alcune modifiche potrebbero non essere salvate: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "Dataset",
+  "DataNotebookPanel.datasetSection.none": "Nessun dataset importato ancora.",
+  "DataNotebookPanel.datasetSection.import": "Importa CSV/JSON…",
+  "DataNotebookPanel.datasetSection.clear": "Rimuovi dataset",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} riga/e · tabella `{{table}}`",
+  "DataNotebookPanel.importError": "Importazione non riuscita: {{error}}",
+  "DataNotebookPanel.addSqlCell": "Aggiungi cella SQL",
+  "DataNotebookPanel.addMarkdownCell": "Aggiungi cella Markdown",
+  "DataNotebookPanel.runAll": "Riesegui tutto",
+  "DataNotebookPanel.running": "Esecuzione…",
+  "DataNotebookPanel.exportReport": "Esporta report",
+  "DataNotebookPanel.noCells": "Nessuna cella ancora. Aggiungi una cella SQL o Markdown per iniziare.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "Esegui",
+  "DataNotebookPanel.cell.moveUp": "Sposta cella in alto",
+  "DataNotebookPanel.cell.moveDown": "Sposta cella in basso",
+  "DataNotebookPanel.cell.delete": "Elimina cella",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Scrivi markdown…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "Anteprima",
+  "DataNotebookPanel.cell.markdownEditToggle": "Modifica",
+  "DataNotebookPanel.cell.notRun": "Non ancora eseguita.",
+  "DataNotebookPanel.cell.error": "Errore: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} riga/e interessata/e.",
+  "DataNotebookPanel.cell.noResults": "Nessun risultato.",
+  "DataNotebookPanel.cell.truncated": "Vengono mostrate le prime {{shown}} righe su {{total}}.",
+  "DataNotebookPanel.reportModal.title": "Report riproducibile",
+  "DataNotebookPanel.reportModal.copy": "Copia negli appunti",
+  "DataNotebookPanel.reportModal.copied": "Copiato!",
 
   // Synthetic Monitoring Agent (ROADMAP.md Phase 7, item 17) — real translations overriding the English `syntheticMonitoringLocale` defaults spread above.
   "AppMenu.syntheticMonitoring": "Monitoraggio sintetico",
