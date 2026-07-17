@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
@@ -17,6 +18,32 @@ export const ja: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...teamModeLocale,
+  // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
+  "SettingsModal.tabTeamMode": "チーム",
+  "TeamModePanel.membersHeading": "チームメンバー",
+  "TeamModePanel.membersDescription": "今このマシンを操作しているのが誰かを示す、名前付きのローカルプロファイル切り替え機能です — 認証の境界ではありません。このアプリにローカルでアクセスできる人は誰でもすでに全操作が可能であり、これは監査上の帰属先と、権限リクエストに応答できる人を変えるだけです。",
+  "TeamModePanel.dismissError": "閉じる",
+  "TeamModePanel.activeSwitcherLabel": "アクティブなメンバー",
+  "TeamModePanel.activeSwitcherNone": "選択されていません",
+  "TeamModePanel.membersEmpty": "まだチームメンバーが設定されていません — メンバーを追加するまで、このアプリは単独ユーザー向けとまったく同じように動作します。",
+  "TeamModePanel.addNameLabel": "表示名",
+  "TeamModePanel.addNamePlaceholder": "例: Alex",
+  "TeamModePanel.addRoleLabel": "役割",
+  "TeamModePanel.addButton": "メンバーを追加",
+  "TeamModePanel.firstMemberIsOwnerHint": "最初に追加したメンバーは、選択した役割に関係なく常にオーナーになります。",
+  "TeamModePanel.auditHeading": "監査エクスポート",
+  "TeamModePanel.auditDescription": "最近の実行と権限決定に関する編集済み(redacted)レポートです — プロバイダーキー、トークン、その他の秘密情報が含まれることはありません。",
+  "TeamModePanel.exportButton": "監査レポートをエクスポート",
+  "TeamModePanel.roleOwner": "オーナー",
+  "TeamModePanel.roleApprover": "承認者",
+  "TeamModePanel.roleOperator": "オペレーター",
+  "TeamModePanel.roleViewer": "閲覧者",
+  "TeamModePanel.activeBadge": "アクティブ",
+  "TeamModePanel.lastActive": "最終アクティブ: {{date}}",
+  "TeamModePanel.roleSelectAriaLabel": "{{name}} の役割",
+  "TeamModePanel.removeButton": "{{name}} を削除",
+  "TeamModePanel.removeConfirm": "{{name}} をこのチームから削除しますか? この操作は元に戻せません。",
   ...knowledgeGraphExplorerLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "ナレッジグラフ・エクスプローラー",

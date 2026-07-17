@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
@@ -17,6 +18,32 @@ export const ko: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...teamModeLocale,
+  // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
+  "SettingsModal.tabTeamMode": "팀",
+  "TeamModePanel.membersHeading": "팀 구성원",
+  "TeamModePanel.membersDescription": "지금 이 기기를 사용하고 있는 사람이 누구인지 나타내는 이름 지정 로컬 프로필 전환기입니다 — 인증 경계가 아닙니다. 이 앱에 로컬로 접근할 수 있는 사람은 이미 모든 작업을 수행할 수 있으며, 이는 감사 귀속과 권한 요청에 응답할 수 있는 사람만 변경합니다.",
+  "TeamModePanel.dismissError": "닫기",
+  "TeamModePanel.activeSwitcherLabel": "활성 구성원",
+  "TeamModePanel.activeSwitcherNone": "선택된 사람 없음",
+  "TeamModePanel.membersEmpty": "아직 구성된 팀 구성원이 없습니다 — 구성원을 추가하기 전까지 이 앱은 단일 사용자용과 정확히 동일하게 동작합니다.",
+  "TeamModePanel.addNameLabel": "표시 이름",
+  "TeamModePanel.addNamePlaceholder": "예: Alex",
+  "TeamModePanel.addRoleLabel": "역할",
+  "TeamModePanel.addButton": "구성원 추가",
+  "TeamModePanel.firstMemberIsOwnerHint": "추가한 첫 번째 구성원은 선택한 역할과 관계없이 항상 소유자가 됩니다.",
+  "TeamModePanel.auditHeading": "감사 내보내기",
+  "TeamModePanel.auditDescription": "최근 실행 및 권한 결정에 대한 수정(redacted)된 보고서입니다 — 공급자 키, 토큰 또는 기타 비밀 정보는 절대 포함되지 않습니다.",
+  "TeamModePanel.exportButton": "감사 보고서 내보내기",
+  "TeamModePanel.roleOwner": "소유자",
+  "TeamModePanel.roleApprover": "승인자",
+  "TeamModePanel.roleOperator": "운영자",
+  "TeamModePanel.roleViewer": "뷰어",
+  "TeamModePanel.activeBadge": "활성",
+  "TeamModePanel.lastActive": "마지막 활동 {{date}}",
+  "TeamModePanel.roleSelectAriaLabel": "{{name}}의 역할",
+  "TeamModePanel.removeButton": "{{name}} 제거",
+  "TeamModePanel.removeConfirm": "{{name}}을(를) 이 팀에서 제거하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
   ...knowledgeGraphExplorerLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "지식 그래프 탐색기",

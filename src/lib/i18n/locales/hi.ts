@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
@@ -17,6 +18,32 @@ export const hi: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...teamModeLocale,
+  // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
+  "SettingsModal.tabTeamMode": "टीम",
+  "TeamModePanel.membersHeading": "टीम के सदस्य",
+  "TeamModePanel.membersDescription": "यह तय करने के लिए एक नामांकित स्थानीय प्रोफ़ाइल स्विचर कि अभी इस मशीन को कौन चला रहा है — यह कोई प्रमाणीकरण सीमा नहीं है। इस ऐप तक स्थानीय पहुँच रखने वाला कोई भी व्यक्ति पहले से ही इसमें पूरी तरह सक्षम है; यह केवल ऑडिट एट्रिब्यूशन और यह बदलता है कि अनुमति अनुरोधों का जवाब कौन दे सकता है।",
+  "TeamModePanel.dismissError": "खारिज करें",
+  "TeamModePanel.activeSwitcherLabel": "सक्रिय सदस्य",
+  "TeamModePanel.activeSwitcherNone": "कोई नहीं चुना गया",
+  "TeamModePanel.membersEmpty": "अभी तक कोई टीम सदस्य कॉन्फ़िगर नहीं किया गया है — जब तक आप एक नहीं जोड़ते, यह ऐप बिल्कुल वैसे ही व्यवहार करता है जैसे एकल उपयोगकर्ता के लिए करता है।",
+  "TeamModePanel.addNameLabel": "प्रदर्शन नाम",
+  "TeamModePanel.addNamePlaceholder": "जैसे Alex",
+  "TeamModePanel.addRoleLabel": "भूमिका",
+  "TeamModePanel.addButton": "सदस्य जोड़ें",
+  "TeamModePanel.firstMemberIsOwnerHint": "आपके द्वारा जोड़ा गया पहला सदस्य हमेशा स्वामी (Owner) बन जाता है, चाहे कोई भी भूमिका चुनी गई हो।",
+  "TeamModePanel.auditHeading": "ऑडिट निर्यात",
+  "TeamModePanel.auditDescription": "हाल की रन्स और अनुमति निर्णयों की एक संपादित (redacted) रिपोर्ट — इसमें कभी भी प्रोवाइडर कीज़, टोकन या अन्य गुप्त जानकारी शामिल नहीं होती।",
+  "TeamModePanel.exportButton": "ऑडिट रिपोर्ट निर्यात करें",
+  "TeamModePanel.roleOwner": "स्वामी",
+  "TeamModePanel.roleApprover": "अनुमोदक",
+  "TeamModePanel.roleOperator": "ऑपरेटर",
+  "TeamModePanel.roleViewer": "दर्शक",
+  "TeamModePanel.activeBadge": "सक्रिय",
+  "TeamModePanel.lastActive": "अंतिम बार सक्रिय {{date}}",
+  "TeamModePanel.roleSelectAriaLabel": "{{name}} के लिए भूमिका",
+  "TeamModePanel.removeButton": "{{name}} को हटाएँ",
+  "TeamModePanel.removeConfirm": "क्या {{name}} को इस टीम से हटाना है? इसे पूर्ववत नहीं किया जा सकता।",
   ...knowledgeGraphExplorerLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "नॉलेज ग्राफ़ एक्सप्लोरर",
