@@ -951,15 +951,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Multi-device execution never silently degrades correctness and always reports actual placement.
 
-### 4. Runtime Component Update Channels
-
-**Status:** Planned
-
-- Manage versioned `llama.cpp`, MLX, Metal, CUDA, ROCm, Vulkan, tokenizer, converter, and projector components.
-- Provide stable, beta, and pinned channels with rollback.
-
-**Acceptance:** Runtime updates can be installed, verified, rolled back, and tied to compatibility notes.
-
 ### 6. Modelfile Studio and Import Hardening
 
 **Status:** Planned
