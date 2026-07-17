@@ -893,6 +893,7 @@ pub fn run() {
             m3_commands::m3_runtime_config,
             m3_commands::m3_api_dispatch,
             m3_commands::m3_api_cancel_inference,
+            m3_commands::m3_compatibility_matrix,
             m3_commands::m3_lan_validate_policy,
             m3_commands::m3_lan_configure,
             m3_commands::m3_lan_disable,

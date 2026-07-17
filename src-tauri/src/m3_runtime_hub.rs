@@ -7,12 +7,15 @@
 //! without weakening the validation and persistence rules here.
 
 use crate::compatibility_hub::{
-    compatibility_conformance_manifest, encode_response, encode_stream_event, ApiBackend, ApiScope,
-    AuthorizationRequest, AuthorizedToken, CanonicalContent, CanonicalInferenceRequest,
-    CanonicalInferenceResponse, CanonicalMessage, CanonicalRole, CanonicalStreamEvent,
-    CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError, CompatibilityProtocol,
-    LanAccessController, LanEntropySource, LanServerPolicy, LanStateProtector, PairedToken,
-    PairingChallengeView, PairingRequest, ProtocolStreamFrame, ScopedTokenView, SecurityAuditEvent,
+    compatibility_conformance_manifest, encode_embeddings_response, encode_ollama_chat_response,
+    encode_response, encode_stream_event, translate_embeddings_request,
+    translate_ollama_chat_request, ApiBackend, ApiScope, AuthorizationRequest, AuthorizedToken,
+    CanonicalContent, CanonicalEmbeddingRequest, CanonicalEmbeddingResponse,
+    CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage, CanonicalRole,
+    CanonicalStreamEvent, CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError,
+    CompatibilityProtocol, LanAccessController, LanEntropySource, LanServerPolicy,
+    LanStateProtector, PairedToken, PairingChallengeView, PairingRequest, ProtocolStreamFrame,
+    ScopedTokenView, SecurityAuditEvent,
 };
 use crate::mlx_runtime::{
     MlxGenerationRequest, MlxGenerationSummary, MlxMessage, MlxOperationContext, MlxProcessMetrics,
@@ -1145,7 +1148,74 @@ pub struct M3RuntimeCapabilityView {
     pub can_logs: bool,
     pub can_metrics: bool,
     pub can_infer: bool,
+    /// Whether this runtime's transport genuinely reaches an embeddings
+    /// endpoint (Ollama's daemon today — the managed llama.cpp chat
+    /// instance and MLX do not run with embeddings support). A per-model
+    /// `capabilities.embeddings` check still gates individual requests.
+    pub can_embed: bool,
     pub settings: Vec<AdvancedSettingCapability>,
+}
+
+/// Phase 8 item 11 (OpenAI/Ollama API compatibility harness) result: one
+/// row per route × backend × (optionally) model. See
+/// [`M3RuntimeHub::compatibility_matrix`] for how rows are derived and
+/// `m3_compatibility_harness.rs` for the real HTTP-level regression tests
+/// this surfaces the current capability picture for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3CompatibilityStatus {
+    Pass,
+    Unsupported,
+    Fail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3CompatibilityMatrixRow {
+    pub method: String,
+    pub route: String,
+    pub backend: ApiBackend,
+    pub runtime_id: String,
+    pub model_id: Option<String>,
+    pub status: M3CompatibilityStatus,
+    pub reason: String,
+}
+
+impl M3CompatibilityMatrixRow {
+    fn new(
+        method: &str,
+        route: &str,
+        backend: ApiBackend,
+        runtime_id: &str,
+        model_id: Option<&str>,
+        status: M3CompatibilityStatus,
+        reason: &str,
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            route: route.to_string(),
+            backend,
+            runtime_id: runtime_id.to_string(),
+            model_id: model_id.map(str::to_string),
+            status,
+            reason: reason.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3CompatibilityMatrixReport {
+    pub generated_at_ms: u64,
+    pub rows: Vec<M3CompatibilityMatrixRow>,
+}
+
+fn capability_status(supported: bool) -> M3CompatibilityStatus {
+    if supported {
+        M3CompatibilityStatus::Pass
+    } else {
+        M3CompatibilityStatus::Unsupported
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1200,6 +1270,24 @@ pub trait M3InferenceEngine: Send + Sync {
         request_id: &'a str,
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool>;
+
+    /// Generates embeddings for a batch of text inputs. The default rejects
+    /// with `Unsupported` — only engines that genuinely reach a backend
+    /// capable of producing real vectors (see
+    /// `OpenAiCompatibleM3InferenceEngine` in `m3_production.rs`) override
+    /// this; nothing here ever fabricates a vector.
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            Err(M3HubError::Unsupported(format!(
+                "model {} does not have an embeddings-capable inference engine",
+                request.model
+            )))
+        })
+    }
 }
 
 pub trait M3RuntimeDriver: Send + Sync {
@@ -1253,6 +1341,25 @@ pub trait M3RuntimeDriver: Send + Sync {
         request_id: &'a str,
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool>;
+
+    /// Generates embeddings through this runtime. The default rejects with
+    /// `Unsupported` — see [`M3InferenceEngine::embed`]'s doc for why this
+    /// stays an honest rejection rather than a fabricated vector wherever a
+    /// driver does not override it (for example the managed MLX driver,
+    /// which has no embeddings support today).
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        let runtime_id = self.descriptor().runtime_id;
+        Box::pin(async move {
+            Err(M3HubError::Unsupported(format!(
+                "runtime {runtime_id} does not support embeddings generation for model {}",
+                request.model
+            )))
+        })
+    }
 }
 
 pub struct RuntimeAdapterM3Driver {
@@ -1317,6 +1424,10 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
             can_logs: source.can_tail_logs,
             can_metrics: true,
             can_infer: true,
+            // Ollama's daemon serves an OpenAI-compatible `/v1/embeddings`
+            // endpoint alongside chat; the managed llama.cpp chat instance
+            // is started without `--embeddings` and therefore cannot.
+            can_embed: self.descriptor.kind == M3RuntimeKind::Ollama,
             settings: source.settings,
         }
     }
@@ -1505,6 +1616,14 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
     ) -> M3HubFuture<'a, bool> {
         self.inference.cancel(request_id, context)
     }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        self.inference.embed(request, context)
+    }
 }
 
 pub struct MlxM3Driver {
@@ -1590,6 +1709,7 @@ impl M3RuntimeDriver for MlxM3Driver {
             can_logs: installed,
             can_metrics: installed,
             can_infer: installed,
+            can_embed: false,
             settings: Vec::new(),
         }
     }
@@ -1949,6 +2069,139 @@ impl M3RuntimeHub {
 
     pub fn conformance_manifest(&self) -> CompatibilityConformanceManifest {
         compatibility_conformance_manifest()
+    }
+
+    /// Builds a compatibility matrix — one row per advertised route, per
+    /// configured runtime, and (for capability-specific routes) per
+    /// installed model. This is deliberately capability-derived rather than
+    /// a live per-cell network probe: it reflects the same runtime/model
+    /// capability state (`can_infer`, `can_embed`,
+    /// `M3ModelCapabilities`) that already gates real requests, kept
+    /// accurate by runtime reconciliation. Regressions in the actual wire
+    /// behavior are caught by the `m3_compatibility_harness` integration
+    /// test suite, which spins up the real HTTP server and makes real
+    /// requests; this method is what the Runtime/API Hub UI renders.
+    pub fn compatibility_matrix(&self) -> M3HubResult<M3CompatibilityMatrixReport> {
+        let runtimes = self.list_runtimes()?;
+        let installed = self.list_installed_models()?;
+        let mut rows = Vec::new();
+        for runtime in &runtimes {
+            let backend = runtime.descriptor.api_backend;
+            let runtime_id = runtime.descriptor.runtime_id.clone();
+            rows.push(M3CompatibilityMatrixRow::new(
+                "GET",
+                "/v1/models",
+                backend,
+                &runtime_id,
+                None,
+                M3CompatibilityStatus::Pass,
+                "runtime is registered and discoverable",
+            ));
+            rows.push(M3CompatibilityMatrixRow::new(
+                "GET",
+                "/api/tags",
+                backend,
+                &runtime_id,
+                None,
+                M3CompatibilityStatus::Pass,
+                "native-Ollama listing reshapes the same discovery data as /v1/models",
+            ));
+            let infer_status = if runtime.can_infer {
+                (
+                    M3CompatibilityStatus::Pass,
+                    "runtime driver supports inference".to_string(),
+                )
+            } else {
+                (
+                    M3CompatibilityStatus::Unsupported,
+                    "runtime driver does not support inference".to_string(),
+                )
+            };
+            for (method, route) in [
+                ("POST", "/v1/chat/completions"),
+                ("POST", "/v1/responses"),
+                ("POST", "/v1/messages"),
+                ("POST", "/api/chat"),
+            ] {
+                rows.push(M3CompatibilityMatrixRow::new(
+                    method,
+                    route,
+                    backend,
+                    &runtime_id,
+                    None,
+                    infer_status.0,
+                    &infer_status.1,
+                ));
+            }
+            rows.push(M3CompatibilityMatrixRow::new(
+                "POST",
+                "/v1/embeddings",
+                backend,
+                &runtime_id,
+                None,
+                if runtime.can_embed {
+                    M3CompatibilityStatus::Pass
+                } else {
+                    M3CompatibilityStatus::Unsupported
+                },
+                if runtime.can_embed {
+                    "runtime driver reaches a genuine embeddings endpoint"
+                } else {
+                    "runtime driver has no embeddings-capable endpoint configured"
+                },
+            ));
+            for model in installed
+                .iter()
+                .filter(|model| model.runtime == runtime.descriptor.kind)
+            {
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/chat/completions (tool calls)",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(model.capabilities.tool_calling),
+                    if model.capabilities.tool_calling {
+                        "model advertises tool calling"
+                    } else {
+                        "model does not advertise tool calling"
+                    },
+                ));
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/chat/completions (json schema)",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(model.capabilities.structured_output),
+                    if model.capabilities.structured_output {
+                        "model advertises structured output"
+                    } else {
+                        "model does not advertise structured output"
+                    },
+                ));
+                let embeddings_ok = runtime.can_embed && model.capabilities.embeddings;
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/embeddings",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(embeddings_ok),
+                    if embeddings_ok {
+                        "model advertises embeddings on an embeddings-capable runtime"
+                    } else if !runtime.can_embed {
+                        "runtime driver has no embeddings-capable endpoint configured"
+                    } else {
+                        "model does not advertise embeddings"
+                    },
+                ));
+            }
+        }
+        Ok(M3CompatibilityMatrixReport {
+            generated_at_ms: self.clock.now_ms()?,
+            rows,
+        })
     }
 
     pub fn hardware_snapshot(&self) -> M3HubResult<HardwareSnapshot> {
@@ -3047,6 +3300,45 @@ pub struct M3CancelInferenceRequest {
     pub now_ms: u64,
 }
 
+/// Dispatch envelope for `POST /v1/embeddings`. Distinct from
+/// [`M3ApiDispatchRequest`] because embeddings have no
+/// [`CompatibilityProtocol`] of their own — see
+/// [`translate_embeddings_request`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3EmbeddingDispatchRequest {
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+    pub caller: M3ApiCaller,
+    pub now_ms: u64,
+}
+
+/// Dispatch envelope for the Ollama-native `POST /api/chat`. Reuses the
+/// `ChatCompletions` scope for authorization since it is the same
+/// underlying operation as `/v1/chat/completions`, just a different wire
+/// format — not a new, less-guarded route class.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3OllamaChatDispatchRequest {
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+    pub caller: M3ApiCaller,
+    pub now_ms: u64,
+}
+
+/// Result of dispatching the Ollama-native `/api/chat` endpoint: the
+/// encoded body plus whether the request asked for `stream` framing (the
+/// HTTP layer uses this only to pick a Content-Type; see
+/// [`translate_ollama_chat_request`]'s doc for the streaming limitation).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3OllamaChatDispatchResponse {
+    pub body: Value,
+    pub stream_requested: bool,
+}
+
 impl M3RuntimeHub {
     pub async fn dispatch_api(
         &self,
@@ -3067,7 +3359,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
@@ -3105,7 +3397,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
@@ -3118,6 +3410,77 @@ impl M3RuntimeHub {
         runtime.stream(&canonical, &mut encoding, context).await
     }
 
+    /// Dispatches `POST /v1/embeddings`: translates the request, resolves
+    /// the runtime, authorizes with the `Embeddings` scope, and calls the
+    /// runtime driver's `embed()` — which honestly rejects with
+    /// `Unsupported` unless it genuinely reaches a backend capable of
+    /// producing real vectors.
+    pub async fn dispatch_embeddings(
+        &self,
+        request: &M3EmbeddingDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3ApiDispatchResponse> {
+        context.preflight("dispatch embeddings request")?;
+        let canonical = translate_embeddings_request(&request.request_id, &request.body)?;
+        let runtime = self.runtime(&request.runtime_id)?;
+        self.authorize_api(
+            &request.caller,
+            ApiScope::Embeddings,
+            &runtime.descriptor(),
+            &canonical.model,
+            request.body.len() as u64,
+            request.now_ms,
+        )?;
+        let response = runtime.embed(&canonical, context).await?;
+        if response.model != canonical.model {
+            return Err(M3HubError::Runtime(
+                "embeddings driver returned a response for another model".to_string(),
+            ));
+        }
+        Ok(M3ApiDispatchResponse {
+            status: 200,
+            body: encode_embeddings_response(&response)?,
+        })
+    }
+
+    /// Dispatches the Ollama-native `POST /api/chat`: translates the
+    /// request into the same canonical inference representation used by
+    /// `/v1/chat/completions`, authorizes with the `ChatCompletions` scope
+    /// (same operation, different wire format), calls the resolved
+    /// runtime's `complete()` (always non-streaming — see
+    /// [`M3OllamaChatDispatchResponse`]'s doc), and encodes an
+    /// Ollama-native response with a real measured `total_duration`.
+    pub async fn dispatch_ollama_chat(
+        &self,
+        request: &M3OllamaChatDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3OllamaChatDispatchResponse> {
+        context.preflight("dispatch ollama-native chat request")?;
+        let (canonical, stream_requested) =
+            translate_ollama_chat_request(&request.request_id, &request.body)?;
+        let runtime = self.runtime(&request.runtime_id)?;
+        self.authorize_api(
+            &request.caller,
+            ApiScope::ChatCompletions,
+            &runtime.descriptor(),
+            &canonical.model,
+            request.body.len() as u64,
+            request.now_ms,
+        )?;
+        let started_at = std::time::Instant::now();
+        let response = runtime.complete(&canonical, context).await?;
+        let total_duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if response.model != canonical.model {
+            return Err(M3HubError::Runtime(
+                "inference driver returned a response for another model".to_string(),
+            ));
+        }
+        Ok(M3OllamaChatDispatchResponse {
+            body: encode_ollama_chat_response(&response, total_duration_ns)?,
+            stream_requested,
+        })
+    }
+
     pub async fn cancel_inference(
         &self,
         request: &M3CancelInferenceRequest,
@@ -3128,7 +3491,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &request.model_id,
             0,
@@ -3140,7 +3503,7 @@ impl M3RuntimeHub {
     fn authorize_api(
         &self,
         caller: &M3ApiCaller,
-        protocol: CompatibilityProtocol,
+        scope: ApiScope,
         runtime: &M3RuntimeDescriptor,
         model_id: &str,
         input_bytes: u64,
@@ -3154,7 +3517,7 @@ impl M3RuntimeHub {
             } => {
                 self.lan_controller()?.authorize(&AuthorizationRequest {
                     bearer_token: bearer_token.clone(),
-                    scope: protocol_scope(protocol),
+                    scope,
                     backend: runtime.api_backend,
                     model_id: Some(model_id.to_string()),
                     input_bytes,

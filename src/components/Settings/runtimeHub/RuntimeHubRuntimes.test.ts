@@ -108,6 +108,7 @@ function runtimeCapability(runtimeId: string, kind: M3RuntimeCapability["descrip
     canLogs: false,
     canMetrics: true,
     canInfer: true,
+    canEmbed: false,
     settings: [],
   };
 }

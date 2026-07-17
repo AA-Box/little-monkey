@@ -102,6 +102,7 @@ const capability = {
   canLogs: true,
   canMetrics: true,
   canInfer: true,
+  canEmbed: false,
   settings: [],
 };
 const policy = {

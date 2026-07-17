@@ -8,6 +8,7 @@ export type ApiScope =
   | "chat_completions"
   | "responses"
   | "messages"
+  | "embeddings"
   | "model_discover"
   | "model_download"
   | "model_load"
@@ -397,7 +398,30 @@ export interface M3RuntimeCapability {
   canLogs: boolean;
   canMetrics: boolean;
   canInfer: boolean;
+  /** Whether this runtime's transport genuinely reaches an embeddings
+   * endpoint (Ollama's daemon today). See the Compatibility tab. */
+  canEmbed: boolean;
   settings: AdvancedSettingCapability[];
+}
+
+/** Phase 8 item 11: OpenAI/Ollama API compatibility matrix — one row per
+ * route x backend x (optionally) model, derived from real runtime/model
+ * capability state. See `RuntimeHubCompatibilityMatrix.tsx`. */
+export type M3CompatibilityStatus = "pass" | "unsupported" | "fail";
+
+export interface M3CompatibilityMatrixRow {
+  method: string;
+  route: string;
+  backend: ApiBackend;
+  runtimeId: string;
+  modelId: string | null;
+  status: M3CompatibilityStatus;
+  reason: string;
+}
+
+export interface M3CompatibilityMatrixReport {
+  generatedAtMs: number;
+  rows: M3CompatibilityMatrixRow[];
 }
 
 export interface RuntimeDescriptor {
@@ -677,6 +701,7 @@ export const runtimeHubClient = {
     invoke<M3ApiDispatchResponse>("m3_api_dispatch", args),
   apiCancelInference: (args: OperationArgs & { request: M3CancelInferenceRequest }) =>
     invoke<boolean>("m3_api_cancel_inference", args),
+  compatibilityMatrix: () => invoke<M3CompatibilityMatrixReport>("m3_compatibility_matrix"),
   lanValidatePolicy: (policy: LanServerPolicy) => invoke<void>("m3_lan_validate_policy", { policy }),
   lanConfigure: (policy: LanServerPolicy) => invoke<LanServerPolicy>("m3_lan_configure", { policy }),
   lanDisable: (confirmation: string) => invoke<boolean>("m3_lan_disable", { confirmation }),

@@ -996,15 +996,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Tool-call parsing failures produce safe errors, not accidental tool execution or corrupted arguments.
 
-### 11. OpenAI and Ollama API Compatibility Harness
-
-**Status:** Planned
-
-- Test `/v1/models`, chat/completions, embeddings, streaming/SSE, JSON schema, tool calls, model tags, and Ollama-native endpoints.
-- Keep a compatibility matrix per backend and model.
-
-**Acceptance:** API compatibility regressions are caught before release and shown in Runtime/API Hub.
-
 ### 12. Multimodal Projector and Vision Model Manager
 
 **Status:** Planned
