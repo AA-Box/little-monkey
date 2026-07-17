@@ -270,6 +270,13 @@ pub enum RunKind {
     Browser,
     Acp,
     Background,
+    /// A command executed inside a disposable copy of the workspace (see
+    /// `sandbox.rs`). Distinct from `Background`: the workspace root grant
+    /// for this kind is informational/read provenance only — the run itself
+    /// never writes to the real workspace directly, only to its own
+    /// ephemeral copy, and any change that should land in the real
+    /// workspace requires a separate, explicit promote confirmation.
+    Sandboxed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
