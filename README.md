@@ -47,6 +47,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
 - Store private keys and provider credentials in the OS keychain; persisted configuration contains references rather than plaintext key material.
+- Capture per-load and per-request runtime traces in a **Telemetry** tab — load timing, memory/VRAM headroom and offload placement reused from the offload planner, sampler stats actually used, and token counts/throughput — and export a redacted support bundle (recent traces, a bounded runtime log tail, hardware/compatibility context) with a preview of exactly what is included/excluded before it is written to disk. Prompt/response text, API keys/tokens, private keys, and home-directory usernames are stripped by default; fields a runtime genuinely does not report are marked `unavailable` rather than fabricated.
 
 ### Skills, plugins, MCP Apps, and workflows
 

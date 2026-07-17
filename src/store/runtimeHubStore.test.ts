@@ -44,6 +44,10 @@ const mocks = vi.hoisted(() => ({
     httpServerStop: vi.fn(),
     httpServerStatus: vi.fn(),
     httpServerStoreTlsIdentity: vi.fn(),
+    telemetryRecordLoad: vi.fn(),
+    telemetryRecordRequest: vi.fn(),
+    telemetryRecentTraces: vi.fn(),
+    telemetrySupportBundle: vi.fn(),
   },
 }));
 

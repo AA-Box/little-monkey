@@ -33,12 +33,27 @@ import {
   type PairingRequest,
   type RuntimeInventory,
   type RuntimeLogTail,
+  type RuntimeTraceRecord,
   type ScopedToken,
   type SecurityAuditEvent,
   type SettingValue,
+  type SupportBundle,
 } from "../lib/runtimeHubClient";
+import {
+  extractModelIdFromRequestBody,
+  extractSamplerStatsFromRequestBody,
+  extractTokenTimingFromResponseBody,
+} from "../lib/runtimeTelemetry";
 
-export type RuntimeHubSection = "overview" | "models" | "components" | "catalogs" | "runtimes" | "api" | "lan";
+export type RuntimeHubSection =
+  | "overview"
+  | "models"
+  | "components"
+  | "catalogs"
+  | "runtimes"
+  | "api"
+  | "lan"
+  | "telemetry";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -87,6 +102,8 @@ interface RuntimeHubStoreState {
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
   offloadPlans: Record<string, OffloadPlan>;
+  traces: RuntimeTraceRecord[];
+  supportBundle: SupportBundle | null;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -127,6 +144,9 @@ interface RuntimeHubStoreState {
   startHttpServer: () => Promise<void>;
   stopHttpServer: () => Promise<void>;
   storeTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) => Promise<string>;
+  refreshTraces: (runtimeId?: string | null) => Promise<void>;
+  exportSupportBundle: () => Promise<SupportBundle>;
+  clearSupportBundle: () => void;
 }
 
 function errorMessage(error: unknown): string {
@@ -285,6 +305,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     cleanupReport: null,
     schedulingPlan: null,
     offloadPlans: {},
+    traces: [],
+    supportBundle: null,
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -639,10 +661,36 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const key = `load:${request.runtimeId}`;
       const operationId = createM3OperationId("runtime-load");
       begin(key, operationId);
+      const startedAtMs = Date.now();
+      // Reuses whatever offload plan `previewOffloadPlan` already computed
+      // for this runtime (the Runtime Hub's load flow always previews one
+      // before offering the load action) — this trace never computes its
+      // own placement/memory numbers, only reports the planner's.
+      const offloadPlan = get().offloadPlans[request.runtimeId] ?? null;
+      const recordTrace = (loadError: unknown) => {
+        // Wrapped in `Promise.resolve` (rather than chaining `.catch`
+        // directly off the client call) so this stays safe even if the
+        // client returns a non-promise, which test mocks default to.
+        void Promise.resolve(
+          runtimeHubClient.telemetryRecordLoad({
+            runtimeId: request.runtimeId,
+            modelId: request.assetId,
+            startedAtMs,
+            readyAtMs: Date.now(),
+            offloadPlan,
+            errorMessage: loadError === undefined ? null : errorMessage(loadError),
+          }),
+        ).catch(() => {
+          // Telemetry capture is best-effort and must never surface as a
+          // load failure to the user.
+        });
+      };
       try {
         await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
         await get().refreshRuntime(request.runtimeId);
+        recordTrace(undefined);
       } catch (error) {
+        recordTrace(error);
         fail(key, error);
         throw error;
       } finally {
@@ -688,10 +736,36 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const key = "api";
       const operationId = createM3OperationId("api-dispatch");
       begin(key, operationId);
+      const startedAtMs = Date.now();
+      // Only ever plucks a fixed allowlist of numeric sampler/usage keys —
+      // see `extractSamplerStatsFromRequestBody`/`extractTokenTimingFromResponseBody`
+      // in `lib/runtimeTelemetry.ts`. This request body is a free-form
+      // diagnostics payload the user can type anything into, so this is the
+      // one place in the Runtime Hub that must not assume the body is
+      // free of prompt content.
+      const sampler = extractSamplerStatsFromRequestBody(request.body);
+      const modelId = extractModelIdFromRequestBody(request.body) ?? request.requestId;
+      const recordTrace = (responseBody: unknown, dispatchError: unknown) => {
+        void Promise.resolve(
+          runtimeHubClient.telemetryRecordRequest({
+            runtimeId: request.runtimeId,
+            modelId,
+            startedAtMs,
+            endedAtMs: Date.now(),
+            sampler,
+            tokens: extractTokenTimingFromResponseBody(responseBody),
+            errorMessage: dispatchError === undefined ? null : errorMessage(dispatchError),
+          }),
+        ).catch(() => {
+          // Best-effort, same as `loadModel`'s trace capture.
+        });
+      };
       try {
         const apiResult = await runtimeHubClient.apiDispatch({ operationId, timeoutMs: 120_000, request });
         set({ apiResult });
+        recordTrace(apiResult.body, undefined);
       } catch (error) {
+        recordTrace(null, error);
         fail(key, error);
         throw error;
       } finally {
@@ -879,6 +953,38 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         finish(key);
       }
     },
+
+    refreshTraces: async (runtimeId = null) => {
+      const key = "telemetry-traces";
+      begin(key);
+      try {
+        const traces = await runtimeHubClient.telemetryRecentTraces(runtimeId, 100);
+        set({ traces });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    exportSupportBundle: async () => {
+      const key = "telemetry-support-bundle";
+      const operationId = createM3OperationId("telemetry-support-bundle");
+      begin(key, operationId);
+      try {
+        const supportBundle = await runtimeHubClient.telemetrySupportBundle({ operationId, timeoutMs: 30_000 });
+        set({ supportBundle });
+        return supportBundle;
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    clearSupportBundle: () => set({ supportBundle: null }),
   };
 });
 
