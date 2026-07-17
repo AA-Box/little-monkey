@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
@@ -356,6 +357,7 @@ export const pt: Record<string, string> = {
   "McpGenerator.statusNotClean": "Não está limpo pelo simulador",
   "McpGenerator.statusNotSimulated": "Não simulado",
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Portuguese translations, overriding every dailyBriefLocale key above.
@@ -1459,6 +1461,35 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
   "EcosystemDiscover.cancel": "Cancelar",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "Pesquisa Aprofundada",
+  "DeepResearchWorkspacePanel.title": "Espaço de Pesquisa Aprofundada",
+  "DeepResearchWorkspacePanel.subtitle": "Planeje e execute uma pergunta de pesquisa em várias etapas na web, nos arquivos do seu espaço de trabalho e nas bases de conhecimento — cada conclusão cita sua evidência.",
+  "DeepResearchWorkspacePanel.close": "Fechar pesquisa aprofundada",
+  "DeepResearchWorkspacePanel.questionLabel": "Pergunta de pesquisa",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "O que você quer pesquisar?",
+  "DeepResearchWorkspacePanel.start": "Iniciar pesquisa",
+  "DeepResearchWorkspacePanel.cancel": "Cancelar",
+  "DeepResearchWorkspacePanel.planTitle": "Plano e mapa de fontes",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} pesquisada(s) · {{skipped}} ignorada(s)",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} trecho(s) de evidência",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "Em fila",
+  "DeepResearchWorkspacePanel.stepStatus.active": "Pesquisando…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "Pesquisada",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "Ignorada",
+  "DeepResearchWorkspacePanel.stepStatus.error": "Erro",
+  "DeepResearchWorkspacePanel.runStatus.planning": "Planejando",
+  "DeepResearchWorkspacePanel.runStatus.researching": "Pesquisando",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "Sintetizando",
+  "DeepResearchWorkspacePanel.runStatus.done": "Concluído",
+  "DeepResearchWorkspacePanel.runStatus.error": "Erro",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "Cancelada",
+  "DeepResearchWorkspacePanel.reportTitle": "Relatório",
+  "DeepResearchWorkspacePanel.noClaims": "Nenhuma conclusão baseada em evidências foi produzida para esta execução.",
+  "DeepResearchWorkspacePanel.droppedClaims": "{{count}} afirmação(ões) foram descartadas por não citarem evidência válida.",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "Perguntas em aberto",
+  "DeepResearchWorkspacePanel.emptyState": "Faça uma pergunta de pesquisa acima para começar.",
   ...briefStudioLocale,
   // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Portuguese translations overriding the English `briefStudioLocale` defaults spread above.
   "AppMenu.briefStudio": "Estúdio de Resumos",

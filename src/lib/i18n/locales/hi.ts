@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
@@ -356,6 +357,7 @@ export const hi: Record<string, string> = {
   "McpGenerator.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
   "McpGenerator.statusNotSimulated": "सिम्युलेट नहीं हुआ",
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Hindi translations, overriding every dailyBriefLocale key above.
@@ -1459,6 +1461,35 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
   "EcosystemDiscover.cancel": "रद्द करें",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "गहन शोध",
+  "DeepResearchWorkspacePanel.title": "गहन शोध कार्यक्षेत्र",
+  "DeepResearchWorkspacePanel.subtitle": "वेब, आपकी वर्कस्पेस फ़ाइलों और नॉलेज स्टैक में एक बहु-चरणीय शोध प्रश्न की योजना बनाएं और चलाएं — हर निष्कर्ष अपने प्रमाण का हवाला देता है।",
+  "DeepResearchWorkspacePanel.close": "गहन शोध बंद करें",
+  "DeepResearchWorkspacePanel.questionLabel": "शोध प्रश्न",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "आप क्या शोध करना चाहते हैं?",
+  "DeepResearchWorkspacePanel.start": "शोध शुरू करें",
+  "DeepResearchWorkspacePanel.cancel": "रद्द करें",
+  "DeepResearchWorkspacePanel.planTitle": "योजना और स्रोत मानचित्र",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} खोजे गए · {{skipped}} छोड़े गए",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} प्रमाण अंश",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "प्रतीक्षारत",
+  "DeepResearchWorkspacePanel.stepStatus.active": "खोजा जा रहा है…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "खोजा गया",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "छोड़ दिया गया",
+  "DeepResearchWorkspacePanel.stepStatus.error": "त्रुटि",
+  "DeepResearchWorkspacePanel.runStatus.planning": "योजना बन रही है",
+  "DeepResearchWorkspacePanel.runStatus.researching": "शोध जारी है",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "संश्लेषण हो रहा है",
+  "DeepResearchWorkspacePanel.runStatus.done": "पूर्ण",
+  "DeepResearchWorkspacePanel.runStatus.error": "त्रुटि",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "रद्द किया गया",
+  "DeepResearchWorkspacePanel.reportTitle": "रिपोर्ट",
+  "DeepResearchWorkspacePanel.noClaims": "इस रन के लिए कोई प्रमाण-आधारित निष्कर्ष नहीं निकाला जा सका।",
+  "DeepResearchWorkspacePanel.droppedClaims": "मान्य प्रमाण न देने के कारण {{count}} दावे हटा दिए गए।",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "खुले प्रश्न",
+  "DeepResearchWorkspacePanel.emptyState": "शुरू करने के लिए ऊपर एक शोध प्रश्न पूछें।",
   ...briefStudioLocale,
   // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Hindi translations overriding the English `briefStudioLocale` defaults spread above.
   "AppMenu.briefStudio": "ब्रीफ़ स्टूडियो",
