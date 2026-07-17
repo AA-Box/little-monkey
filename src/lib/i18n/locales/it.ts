@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -18,6 +19,7 @@ export const it: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "Esploratore del grafo della conoscenza",
   "KnowledgeGraphExplorer.title": "Esploratore del grafo della conoscenza",
@@ -35,6 +37,29 @@ export const it: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "Prove",
   "KnowledgeGraphExplorer.evidenceEmpty": "Fai una domanda sulla relazione qui sopra per vedere qui il percorso e le relative prove di origine.",
   "KnowledgeGraphExplorer.noEvidence": "Nessun frammento di prova registrato per questo percorso.",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "Copilota per fogli di calcolo",
+  "SpreadsheetCopilot.title": "Copilota per fogli di calcolo",
+  "SpreadsheetCopilot.subtitle": "Carica un CSV, descrivi una colonna calcolata, un passaggio di pulizia o un riepilogo, e rivedi le celle esatte citate prima di approvare la scrittura.",
+  "SpreadsheetCopilot.close": "Chiudi Copilota per fogli di calcolo",
+  "SpreadsheetCopilot.loadButton": "Apri CSV…",
+  "SpreadsheetCopilot.noFileHint": "Apri un file CSV per iniziare.",
+  "SpreadsheetCopilot.requestLabel": "Descrivi un'operazione",
+  "SpreadsheetCopilot.requestPlaceholder": "es. Aggiungi una colonna che moltiplica quantità per prezzo",
+  "SpreadsheetCopilot.proposeButton": "Proponi",
+  "SpreadsheetCopilot.noProposalHint": "Descrivi un'operazione e fai clic su Proponi per vedere qui una modifica confrontabile — nulla viene scritto nel file finché non approvi.",
+  "SpreadsheetCopilot.citedRangesHeading": "Celle / intervalli citati",
+  "SpreadsheetCopilot.diffHeading": "Modifiche alle celle ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(nuova cella)",
+  "SpreadsheetCopilot.diffBlank": "(vuoto)",
+  "SpreadsheetCopilot.approveWarning": "L'approvazione scrive questa modifica nel file CSV su disco. Rifiuta se le celle o i valori citati sembrano errati.",
+  "SpreadsheetCopilot.rejectButton": "Rifiuta",
+  "SpreadsheetCopilot.approveButton": "Approva e scrivi il file",
+  "SpreadsheetCopilot.emptyState": "Apri un file CSV sopra per caricarlo nella griglia.",
+  "SpreadsheetCopilot.gridChangedCell": "Modificata dalla proposta in sospeso",
+  "SpreadsheetCopilot.gridCitedCell": "Citata dalla proposta in sospeso",
+  "SpreadsheetCopilot.gridEmptyHeader": "vuoto",
+  "SpreadsheetCopilot.gridTruncated": "Vengono mostrate le prime {{shown}} righe su {{total}}.",
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,

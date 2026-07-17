@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -18,6 +19,7 @@ export const id: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "Penjelajah Grafik Pengetahuan",
   "KnowledgeGraphExplorer.title": "Penjelajah Grafik Pengetahuan",
@@ -35,6 +37,29 @@ export const id: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "Bukti",
   "KnowledgeGraphExplorer.evidenceEmpty": "Ajukan pertanyaan hubungan di atas untuk melihat jalur dan bukti sumbernya di sini.",
   "KnowledgeGraphExplorer.noEvidence": "Tidak ada bagian bukti yang tercatat untuk jalur ini.",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "Kopilot Spreadsheet",
+  "SpreadsheetCopilot.title": "Kopilot Spreadsheet",
+  "SpreadsheetCopilot.subtitle": "Muat CSV, jelaskan kolom hasil hitung, langkah pembersihan, atau ringkasan, lalu tinjau sel persis yang dirujuk sebelum menyetujui penulisan.",
+  "SpreadsheetCopilot.close": "Tutup Kopilot Spreadsheet",
+  "SpreadsheetCopilot.loadButton": "Buka CSV…",
+  "SpreadsheetCopilot.noFileHint": "Buka file CSV untuk memulai.",
+  "SpreadsheetCopilot.requestLabel": "Jelaskan operasi",
+  "SpreadsheetCopilot.requestPlaceholder": "mis. Tambahkan kolom yang mengalikan kuantitas dengan harga",
+  "SpreadsheetCopilot.proposeButton": "Usulkan",
+  "SpreadsheetCopilot.noProposalHint": "Jelaskan operasi lalu klik Usulkan untuk melihat perubahan yang dapat dibandingkan di sini — tidak ada yang ditulis ke file sampai Anda menyetujuinya.",
+  "SpreadsheetCopilot.citedRangesHeading": "Sel / rentang yang dirujuk",
+  "SpreadsheetCopilot.diffHeading": "Perubahan sel ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(sel baru)",
+  "SpreadsheetCopilot.diffBlank": "(kosong)",
+  "SpreadsheetCopilot.approveWarning": "Menyetujui akan menulis perubahan ini ke file CSV di disk. Tolak jika sel atau nilai yang dirujuk terlihat salah.",
+  "SpreadsheetCopilot.rejectButton": "Tolak",
+  "SpreadsheetCopilot.approveButton": "Setujui & tulis file",
+  "SpreadsheetCopilot.emptyState": "Buka file CSV di atas untuk memuatnya ke dalam grid.",
+  "SpreadsheetCopilot.gridChangedCell": "Diubah oleh usulan yang tertunda",
+  "SpreadsheetCopilot.gridCitedCell": "Dirujuk oleh usulan yang tertunda",
+  "SpreadsheetCopilot.gridEmptyHeader": "kosong",
+  "SpreadsheetCopilot.gridTruncated": "Menampilkan {{shown}} baris pertama dari {{total}}.",
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,

@@ -11,6 +11,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -28,6 +29,7 @@ export const en: Record<string, string> = {
   ...specScorerLocale,
   ...inboxLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
   "ComparePicker.toolsBadge": "Tools",

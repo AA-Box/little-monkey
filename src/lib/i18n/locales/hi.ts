@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -18,6 +19,7 @@ export const hi: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "नॉलेज ग्राफ़ एक्सप्लोरर",
   "KnowledgeGraphExplorer.title": "नॉलेज ग्राफ़ एक्सप्लोरर",
@@ -35,6 +37,29 @@ export const hi: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "प्रमाण",
   "KnowledgeGraphExplorer.evidenceEmpty": "यहां पथ और उसके स्रोत प्रमाण देखने के लिए ऊपर एक संबंध प्रश्न पूछें।",
   "KnowledgeGraphExplorer.noEvidence": "इस पथ के लिए कोई प्रमाण अंश दर्ज नहीं किया गया।",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "स्प्रेडशीट कोपायलट",
+  "SpreadsheetCopilot.title": "स्प्रेडशीट कोपायलट",
+  "SpreadsheetCopilot.subtitle": "एक CSV लोड करें, एक परिकलित कॉलम, सफाई चरण, या सारांश का वर्णन करें, और लिखने को स्वीकृत करने से पहले उद्धृत सटीक सेल की समीक्षा करें।",
+  "SpreadsheetCopilot.close": "स्प्रेडशीट कोपायलट बंद करें",
+  "SpreadsheetCopilot.loadButton": "CSV खोलें…",
+  "SpreadsheetCopilot.noFileHint": "शुरू करने के लिए एक CSV फ़ाइल खोलें।",
+  "SpreadsheetCopilot.requestLabel": "एक ऑपरेशन का वर्णन करें",
+  "SpreadsheetCopilot.requestPlaceholder": "उदा. एक कॉलम जोड़ें जो मात्रा को कीमत से गुणा करे",
+  "SpreadsheetCopilot.proposeButton": "प्रस्तावित करें",
+  "SpreadsheetCopilot.noProposalHint": "एक ऑपरेशन का वर्णन करें और यहाँ तुलनीय बदलाव देखने के लिए प्रस्तावित करें पर क्लिक करें — जब तक आप स्वीकृति नहीं देते, फ़ाइल में कुछ भी नहीं लिखा जाता।",
+  "SpreadsheetCopilot.citedRangesHeading": "उद्धृत सेल / श्रेणियाँ",
+  "SpreadsheetCopilot.diffHeading": "सेल परिवर्तन ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(नया सेल)",
+  "SpreadsheetCopilot.diffBlank": "(खाली)",
+  "SpreadsheetCopilot.approveWarning": "स्वीकृति देने पर यह परिवर्तन डिस्क पर CSV फ़ाइल में लिखा जाएगा। यदि उद्धृत सेल या मान गलत लगें तो अस्वीकार करें।",
+  "SpreadsheetCopilot.rejectButton": "अस्वीकार करें",
+  "SpreadsheetCopilot.approveButton": "स्वीकृत करें और फ़ाइल लिखें",
+  "SpreadsheetCopilot.emptyState": "ग्रिड में लोड करने के लिए ऊपर एक CSV फ़ाइल खोलें।",
+  "SpreadsheetCopilot.gridChangedCell": "लंबित प्रस्ताव द्वारा बदला गया",
+  "SpreadsheetCopilot.gridCitedCell": "लंबित प्रस्ताव द्वारा उद्धृत",
+  "SpreadsheetCopilot.gridEmptyHeader": "खाली",
+  "SpreadsheetCopilot.gridTruncated": "कुल {{total}} में से पहली {{shown}} पंक्तियाँ दिखाई जा रही हैं।",
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,

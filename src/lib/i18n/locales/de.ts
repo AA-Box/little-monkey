@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -18,6 +19,7 @@ export const de: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "Wissensgraph-Explorer",
   "KnowledgeGraphExplorer.title": "Wissensgraph-Explorer",
@@ -35,6 +37,29 @@ export const de: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "Belege",
   "KnowledgeGraphExplorer.evidenceEmpty": "Stellen Sie oben eine Beziehungsfrage, um hier den Pfad und die zugehörigen Quellenbelege zu sehen.",
   "KnowledgeGraphExplorer.noEvidence": "Für diesen Pfad wurden keine Belegstellen erfasst.",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "Tabellen-Copilot",
+  "SpreadsheetCopilot.title": "Tabellen-Copilot",
+  "SpreadsheetCopilot.subtitle": "Laden Sie eine CSV-Datei, beschreiben Sie eine berechnete Spalte, einen Bereinigungsschritt oder eine Zusammenfassung, und prüfen Sie die genau referenzierten Zellen, bevor Sie das Schreiben genehmigen.",
+  "SpreadsheetCopilot.close": "Tabellen-Copilot schließen",
+  "SpreadsheetCopilot.loadButton": "CSV öffnen…",
+  "SpreadsheetCopilot.noFileHint": "Öffnen Sie eine CSV-Datei, um zu beginnen.",
+  "SpreadsheetCopilot.requestLabel": "Operation beschreiben",
+  "SpreadsheetCopilot.requestPlaceholder": "z. B. Fügen Sie eine Spalte hinzu, die Menge mit Preis multipliziert",
+  "SpreadsheetCopilot.proposeButton": "Vorschlagen",
+  "SpreadsheetCopilot.noProposalHint": "Beschreiben Sie eine Operation und klicken Sie auf „Vorschlagen“, um hier eine vergleichbare Änderung zu sehen — nichts wird in die Datei geschrieben, bevor Sie zustimmen.",
+  "SpreadsheetCopilot.citedRangesHeading": "Referenzierte Zellen/Bereiche",
+  "SpreadsheetCopilot.diffHeading": "Zelländerungen ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(neue Zelle)",
+  "SpreadsheetCopilot.diffBlank": "(leer)",
+  "SpreadsheetCopilot.approveWarning": "Die Genehmigung schreibt diese Änderung in die CSV-Datei auf der Festplatte. Lehnen Sie ab, wenn die referenzierten Zellen oder Werte falsch aussehen.",
+  "SpreadsheetCopilot.rejectButton": "Ablehnen",
+  "SpreadsheetCopilot.approveButton": "Genehmigen & Datei schreiben",
+  "SpreadsheetCopilot.emptyState": "Öffnen Sie oben eine CSV-Datei, um sie in das Raster zu laden.",
+  "SpreadsheetCopilot.gridChangedCell": "Durch den ausstehenden Vorschlag geändert",
+  "SpreadsheetCopilot.gridCitedCell": "Vom ausstehenden Vorschlag referenziert",
+  "SpreadsheetCopilot.gridEmptyHeader": "leer",
+  "SpreadsheetCopilot.gridTruncated": "Zeigt die ersten {{shown}} von {{total}} Zeilen.",
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,

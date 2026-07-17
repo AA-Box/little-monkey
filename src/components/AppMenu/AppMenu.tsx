@@ -17,6 +17,7 @@ import {
   ServerCog,
   Settings as SettingsIcon,
   SquareTerminal,
+  Table2,
   Workflow,
   Swords,
 } from "lucide-react";
@@ -37,6 +38,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
+  onOpenSpreadsheetCopilot: () => void;
   onOpenTerminal: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
@@ -80,6 +82,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
+  onOpenSpreadsheetCopilot,
   onOpenTerminal,
   onOpenEvidenceBoard,
   onOpenDebate,
@@ -207,6 +210,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenKnowledgeGraph();
+            }}
+          />
+          <MenuRow
+            icon={<Table2 size={14} className="text-faint" />}
+            label={t("AppMenu.spreadsheetCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenSpreadsheetCopilot();
             }}
           />
           <MenuRow

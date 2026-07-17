@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -18,6 +19,7 @@ export const ja: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "ナレッジグラフ・エクスプローラー",
   "KnowledgeGraphExplorer.title": "ナレッジグラフ・エクスプローラー",
@@ -35,6 +37,29 @@ export const ja: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "証拠",
   "KnowledgeGraphExplorer.evidenceEmpty": "上で関係についての質問をすると、ここにパスとその根拠となるソースの証拠が表示されます。",
   "KnowledgeGraphExplorer.noEvidence": "このパスに記録された証拠スパンはありません。",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "スプレッドシート・コパイロット",
+  "SpreadsheetCopilot.title": "スプレッドシート・コパイロット",
+  "SpreadsheetCopilot.subtitle": "CSVを読み込み、計算列、クリーンアップ手順、または要約を記述すると、書き込みを承認する前に引用された正確なセルを確認できます。",
+  "SpreadsheetCopilot.close": "スプレッドシート・コパイロットを閉じる",
+  "SpreadsheetCopilot.loadButton": "CSVを開く…",
+  "SpreadsheetCopilot.noFileHint": "開始するにはCSVファイルを開いてください。",
+  "SpreadsheetCopilot.requestLabel": "操作を記述してください",
+  "SpreadsheetCopilot.requestPlaceholder": "例:数量と価格を掛け合わせた列を追加",
+  "SpreadsheetCopilot.proposeButton": "提案する",
+  "SpreadsheetCopilot.noProposalHint": "操作を記述して「提案する」をクリックすると、ここに比較可能な変更が表示されます — 承認するまでファイルには何も書き込まれません。",
+  "SpreadsheetCopilot.citedRangesHeading": "引用されたセル/範囲",
+  "SpreadsheetCopilot.diffHeading": "セルの変更 ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(新しいセル)",
+  "SpreadsheetCopilot.diffBlank": "(空白)",
+  "SpreadsheetCopilot.approveWarning": "承認すると、この変更がディスク上のCSVファイルに書き込まれます。引用されたセルや値が間違っているように見える場合は却下してください。",
+  "SpreadsheetCopilot.rejectButton": "却下",
+  "SpreadsheetCopilot.approveButton": "承認してファイルを書き込む",
+  "SpreadsheetCopilot.emptyState": "上のCSVファイルを開いてグリッドに読み込んでください。",
+  "SpreadsheetCopilot.gridChangedCell": "保留中の提案によって変更されたセル",
+  "SpreadsheetCopilot.gridCitedCell": "保留中の提案によって引用されたセル",
+  "SpreadsheetCopilot.gridEmptyHeader": "空白",
+  "SpreadsheetCopilot.gridTruncated": "{{total}}行中、最初の{{shown}}行を表示しています。",
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
