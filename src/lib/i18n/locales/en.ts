@@ -14,6 +14,7 @@ import { paletteLocale } from "./palette";
 import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { specScorerLocale } from "./specScorer";
 import { privacyFirewallLocale } from "./privacyFirewall";
 import { sandboxLocale } from "./sandbox";
@@ -53,6 +54,7 @@ export const en: Record<string, string> = {
   ...trustScorecardsLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...specScorerLocale,
   ...privacyFirewallLocale,
   ...sandboxLocale,

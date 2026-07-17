@@ -19,6 +19,7 @@ import {
   Inbox,
   Network,
   Newspaper,
+  Plug,
   Radar,
   Search,
   ServerCog,
@@ -49,6 +50,7 @@ interface AppMenuProps {
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
+  onOpenConnectorBuilder: () => void;
   onOpenMigrationAgent: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
@@ -108,6 +110,7 @@ export function AppMenu({
   onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
+  onOpenConnectorBuilder,
   onOpenMigrationAgent,
   onOpenSideTasks,
   onOpenAgentInbox,
@@ -283,6 +286,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
+            icon={<Plug size={14} className="text-faint" />}
+            label={t("AppMenu.connectorBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenConnectorBuilder();
             }}
           />
           <MenuRow
