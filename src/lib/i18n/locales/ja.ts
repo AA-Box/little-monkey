@@ -1458,6 +1458,15 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
   "EcosystemDiscover.cancel": "キャンセル",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Japanese
+  // translations, overriding the searchLocale keys above.
+  "GlobalSearch.source.session": "チャット",
+  "GlobalSearch.source.task": "タスク",
+  "GlobalSearch.source.workspace_file": "ファイル",
+  "GlobalSearch.source.knowledge": "ナレッジ",
+  "GlobalSearch.source.browser_evidence": "ブラウザの証跡",
+  "GlobalSearch.source.connected_app": "連携アプリ",
+  "GlobalSearch.accessFilteredNotice": "現在のデバイスまたはワークスペースのアクセス権が対象外のため、一部の結果は非表示になっています({{count}}件非表示)。",
   // Real Japanese translations, overriding every visualEditModeLocale key above.
   "AppMenu.visualEditMode": "ビジュアルデザイン編集モード",
   "VisualEditModePanel.title": "ビジュアルデザイン編集モード",

@@ -1458,6 +1458,15 @@ export const fr: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Supprimer cette source de registre ?",
   "EcosystemDiscover.removeRegistry": "Supprimer",
   "EcosystemDiscover.cancel": "Annuler",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real French
+  // translations, overriding the searchLocale keys above.
+  "GlobalSearch.source.session": "Discussion",
+  "GlobalSearch.source.task": "Tâche",
+  "GlobalSearch.source.workspace_file": "Fichier",
+  "GlobalSearch.source.knowledge": "Connaissances",
+  "GlobalSearch.source.browser_evidence": "Preuve du navigateur",
+  "GlobalSearch.source.connected_app": "Application connectée",
+  "GlobalSearch.accessFilteredNotice": "Certains résultats ont été omis car votre accès actuel à l'appareil ou à l'espace de travail ne les couvre pas ({{count}} masqués).",
   // Real French translations, overriding every visualEditModeLocale key above.
   "AppMenu.visualEditMode": "Mode d'édition visuelle du design",
   "VisualEditModePanel.title": "Mode d'édition visuelle du design",
