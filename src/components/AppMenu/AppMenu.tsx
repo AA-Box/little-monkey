@@ -60,6 +60,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenGoldenDatasetBuilder: () => void;
   onOpenDataNotebook: () => void;
   onOpenSyntheticMonitoring: () => void;
   onOpenCrossRepoIntelligence: () => void;
@@ -118,6 +119,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenGoldenDatasetBuilder,
   onOpenDataNotebook,
   onOpenSyntheticMonitoring,
   onOpenCrossRepoIntelligence,
@@ -353,6 +355,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenEvidenceBoard();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.goldenDatasetBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenGoldenDatasetBuilder();
             }}
           />
           <MenuRow
