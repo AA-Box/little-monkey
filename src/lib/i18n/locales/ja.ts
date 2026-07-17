@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
@@ -356,6 +357,7 @@ export const ja: Record<string, string> = {
   "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
   "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Japanese translations, overriding every dailyBriefLocale key above.
@@ -1459,6 +1461,35 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
   "EcosystemDiscover.cancel": "キャンセル",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "ディープリサーチ",
+  "DeepResearchWorkspacePanel.title": "ディープリサーチ ワークスペース",
+  "DeepResearchWorkspacePanel.subtitle": "Web、ワークスペースのファイル、ナレッジスタックにまたがる多段階の調査を計画・実行します。すべての結論は根拠となる証拠を引用します。",
+  "DeepResearchWorkspacePanel.close": "ディープリサーチを閉じる",
+  "DeepResearchWorkspacePanel.questionLabel": "調査したい質問",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "何を調査しますか?",
+  "DeepResearchWorkspacePanel.start": "調査を開始",
+  "DeepResearchWorkspacePanel.cancel": "キャンセル",
+  "DeepResearchWorkspacePanel.planTitle": "計画とソースマップ",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "検索済み {{searched}} 件 · スキップ {{skipped}} 件",
+  "DeepResearchWorkspacePanel.evidenceCount": "証拠スニペット {{count}} 件",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "待機中",
+  "DeepResearchWorkspacePanel.stepStatus.active": "検索中…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "検索済み",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "スキップ",
+  "DeepResearchWorkspacePanel.stepStatus.error": "エラー",
+  "DeepResearchWorkspacePanel.runStatus.planning": "計画中",
+  "DeepResearchWorkspacePanel.runStatus.researching": "調査中",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "統合中",
+  "DeepResearchWorkspacePanel.runStatus.done": "完了",
+  "DeepResearchWorkspacePanel.runStatus.error": "エラー",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "キャンセル済み",
+  "DeepResearchWorkspacePanel.reportTitle": "レポート",
+  "DeepResearchWorkspacePanel.noClaims": "この実行では、証拠に基づく結論は生成されませんでした。",
+  "DeepResearchWorkspacePanel.droppedClaims": "有効な証拠を引用していないため、{{count}} 件の主張が破棄されました。",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "未解決の質問",
+  "DeepResearchWorkspacePanel.emptyState": "上に調査したい質問を入力して開始してください。",
   ...briefStudioLocale,
   // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Japanese translations overriding the English `briefStudioLocale` defaults spread above.
   "AppMenu.briefStudio": "ブリーフスタジオ",

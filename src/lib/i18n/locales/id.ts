@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
@@ -356,6 +357,7 @@ export const id: Record<string, string> = {
   "McpGenerator.statusNotClean": "Belum bersih menurut simulator",
   "McpGenerator.statusNotSimulated": "Belum disimulasikan",
   ...dailyBriefLocale,
+  ...deepResearchLocale,
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Indonesian translations, overriding every dailyBriefLocale key above.
@@ -1459,6 +1461,35 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
   "EcosystemDiscover.cancel": "Batal",
+  // Real translations for Deep Research Workspace (ROADMAP Phase 7),
+  // overriding the English deepResearchLocale spread above.
+  "AppMenu.deepResearch": "Riset Mendalam",
+  "DeepResearchWorkspacePanel.title": "Ruang Kerja Riset Mendalam",
+  "DeepResearchWorkspacePanel.subtitle": "Rencanakan dan jalankan pertanyaan riset multi-langkah di web, file ruang kerja Anda, dan tumpukan pengetahuan — setiap kesimpulan mengutip buktinya.",
+  "DeepResearchWorkspacePanel.close": "Tutup riset mendalam",
+  "DeepResearchWorkspacePanel.questionLabel": "Pertanyaan riset",
+  "DeepResearchWorkspacePanel.questionPlaceholder": "Apa yang ingin Anda teliti?",
+  "DeepResearchWorkspacePanel.start": "Mulai riset",
+  "DeepResearchWorkspacePanel.cancel": "Batalkan",
+  "DeepResearchWorkspacePanel.planTitle": "Rencana & peta sumber",
+  "DeepResearchWorkspacePanel.sourceMapSummary": "{{searched}} dicari · {{skipped}} dilewati",
+  "DeepResearchWorkspacePanel.evidenceCount": "{{count}} cuplikan bukti",
+  "DeepResearchWorkspacePanel.stepStatus.queued": "Menunggu",
+  "DeepResearchWorkspacePanel.stepStatus.active": "Mencari…",
+  "DeepResearchWorkspacePanel.stepStatus.searched": "Dicari",
+  "DeepResearchWorkspacePanel.stepStatus.skipped": "Dilewati",
+  "DeepResearchWorkspacePanel.stepStatus.error": "Error",
+  "DeepResearchWorkspacePanel.runStatus.planning": "Merencanakan",
+  "DeepResearchWorkspacePanel.runStatus.researching": "Meneliti",
+  "DeepResearchWorkspacePanel.runStatus.synthesizing": "Menyintesis",
+  "DeepResearchWorkspacePanel.runStatus.done": "Selesai",
+  "DeepResearchWorkspacePanel.runStatus.error": "Error",
+  "DeepResearchWorkspacePanel.runStatus.cancelled": "Dibatalkan",
+  "DeepResearchWorkspacePanel.reportTitle": "Laporan",
+  "DeepResearchWorkspacePanel.noClaims": "Tidak ada kesimpulan berbasis bukti yang dihasilkan untuk proses ini.",
+  "DeepResearchWorkspacePanel.droppedClaims": "{{count}} klaim dibuang karena tidak mengutip bukti yang valid.",
+  "DeepResearchWorkspacePanel.openQuestionsTitle": "Pertanyaan terbuka",
+  "DeepResearchWorkspacePanel.emptyState": "Ajukan pertanyaan riset di atas untuk memulai.",
   ...briefStudioLocale,
   // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Indonesian translations overriding the English `briefStudioLocale` defaults spread above.
   "AppMenu.briefStudio": "Studio Ringkasan",

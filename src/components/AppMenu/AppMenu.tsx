@@ -22,6 +22,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Telescope,
   Wand2,
   Workflow,
   Swords,
@@ -51,6 +52,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenDeepResearch: () => void;
   onOpenBriefStudio: () => void;
   onOpenCrossRepoChangePlanner: () => void;
   onOpenVisualEditMode: () => void;
@@ -100,6 +102,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenDeepResearch,
   onOpenBriefStudio,
   onOpenCrossRepoChangePlanner,
   onOpenVisualEditMode,
@@ -241,6 +244,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Telescope size={14} className="text-faint" />}
+            label={t("AppMenu.deepResearch")}
+            onClick={() => {
+              closeAll();
+              onOpenDeepResearch();
             }}
           />
           <MenuRow
