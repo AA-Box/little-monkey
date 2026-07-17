@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
@@ -19,6 +20,50 @@ export const ko: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...diagnosticsLocale,
+  // Real Korean translations for the Self-Healing Diagnostics feature,
+  // overriding diagnosticsLocale's English defaults above.
+  "SettingsModal.tabDiagnostics": "진단",
+  "DiagnosticsPanel.title": "자가 복구 진단",
+  "DiagnosticsPanel.description": "Little Monkey가 직접 관리하는 서비스가 실제로 연결 가능한지 확인합니다 — 로컬 모델, 로컬 API 서버, MCP 서버, OS 키체인, 지식 인덱스, 백그라운드 자동화. 점검은 읽기 전용이며, 수정은 항상 별도의 명시적 단계입니다.",
+  "DiagnosticsPanel.runDiagnosis": "진단 실행",
+  "DiagnosticsPanel.rerun": "다시 실행",
+  "DiagnosticsPanel.exportBundle": "지원 번들 내보내기",
+  "DiagnosticsPanel.applyFix": "안전한 수정 적용",
+  "DiagnosticsPanel.fixableBadge": "안전한 수정 사용 가능",
+  "DiagnosticsPanel.emptyTitle": "현재 상태를 보려면 진단을 실행하세요",
+  "DiagnosticsPanel.emptyBody": "이 세션에서는 아직 아무것도 점검되지 않았습니다.",
+  "DiagnosticsPanel.generatedAt": "확인 시각 {{time}}",
+  "DiagnosticsPanel.healthyStatus": "미해결 경고나 심각한 문제가 없습니다",
+  "DiagnosticsPanel.unhealthyStatus": "심각 {{critical}}건, 경고 {{warnings}}건",
+  "DiagnosticsPanel.summaryPassed": "통과",
+  "DiagnosticsPanel.summaryWarnings": "경고",
+  "DiagnosticsPanel.summaryCritical": "심각",
+  "DiagnosticsPanel.summaryFixed": "수정됨",
+  "DiagnosticsPanel.summaryInfo": "정보",
+  "DiagnosticsPanel.summaryNotConfigured": "미지원",
+  "DiagnosticsPanel.statusPass": "통과",
+  "DiagnosticsPanel.statusInfo": "정보",
+  "DiagnosticsPanel.statusWarning": "경고",
+  "DiagnosticsPanel.statusCritical": "심각",
+  "DiagnosticsPanel.statusFixed": "수정됨",
+  "DiagnosticsPanel.statusNotConfigured": "미지원",
+  "DiagnosticsPanel.remediationLabel": "다음 단계",
+  "DiagnosticsPanel.dismiss": "닫기",
+  "DiagnosticsPanel.bundleTitle": "지원 번들",
+  "DiagnosticsPanel.bundleDescription": "이 진단 결과와 앱 버전, 플랫폼 정보를 포함한 편집(비식별화)된 스냅샷입니다 — 프롬프트, 대화, 비밀 정보는 포함되지 않습니다. 지원 요청에 복사해 붙여넣으세요.",
+  "DiagnosticsPanel.bundleCopy": "클립보드에 복사",
+  "DiagnosticsPanel.bundleCopied": "복사됨",
+  "DiagnosticsPanel.subsystemOllama": "Ollama",
+  "DiagnosticsPanel.subsystemLlama": "로컬 채팅 모델",
+  "DiagnosticsPanel.subsystemEmbedLlama": "로컬 임베딩 모델",
+  "DiagnosticsPanel.subsystemApiServer": "로컬 API 서버",
+  "DiagnosticsPanel.subsystemMcp": "MCP 서버",
+  "DiagnosticsPanel.subsystemKnowledgeIndex": "지식 인덱스",
+  "DiagnosticsPanel.subsystemAutomationDaemon": "백그라운드 자동화",
+  "DiagnosticsPanel.subsystemKeychain": "OS 키체인",
+  "DiagnosticsPanel.subsystemConnectors": "커넥터",
+  "DiagnosticsPanel.subsystemRemotePairing": "원격 페어링 / 모바일",
   ...teamModeLocale,
   // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
   "SettingsModal.tabTeamMode": "팀",

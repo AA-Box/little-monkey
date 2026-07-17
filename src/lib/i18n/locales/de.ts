@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
@@ -19,6 +20,50 @@ export const de: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...diagnosticsLocale,
+  // Real German translations for the Self-Healing Diagnostics feature,
+  // overriding diagnosticsLocale's English defaults above.
+  "SettingsModal.tabDiagnostics": "Diagnose",
+  "DiagnosticsPanel.title": "Selbstheilende Diagnose",
+  "DiagnosticsPanel.description": "Prüfen Sie, ob die von Little Monkey selbst verwalteten Dienste tatsächlich erreichbar sind – lokale Modelle, der lokale API-Server, MCP-Server, der Systemschlüsselbund, Wissensindizes und Hintergrundautomatisierung. Prüfungen sind rein lesend; Korrekturen sind immer ein separater, expliziter Schritt.",
+  "DiagnosticsPanel.runDiagnosis": "Diagnose ausführen",
+  "DiagnosticsPanel.rerun": "Erneut ausführen",
+  "DiagnosticsPanel.exportBundle": "Support-Paket exportieren",
+  "DiagnosticsPanel.applyFix": "Sichere Korrektur anwenden",
+  "DiagnosticsPanel.fixableBadge": "Sichere Korrektur verfügbar",
+  "DiagnosticsPanel.emptyTitle": "Diagnose ausführen, um den aktuellen Status zu sehen",
+  "DiagnosticsPanel.emptyBody": "In dieser Sitzung wurde noch nichts geprüft.",
+  "DiagnosticsPanel.generatedAt": "Geprüft {{time}}",
+  "DiagnosticsPanel.healthyStatus": "Keine offenen Warnungen oder kritischen Befunde",
+  "DiagnosticsPanel.unhealthyStatus": "{{critical}} kritische(r) und {{warnings}} Warnbefund(e)",
+  "DiagnosticsPanel.summaryPassed": "Bestanden",
+  "DiagnosticsPanel.summaryWarnings": "Warnungen",
+  "DiagnosticsPanel.summaryCritical": "Kritisch",
+  "DiagnosticsPanel.summaryFixed": "Behoben",
+  "DiagnosticsPanel.summaryInfo": "Info",
+  "DiagnosticsPanel.summaryNotConfigured": "Nicht verfügbar",
+  "DiagnosticsPanel.statusPass": "bestanden",
+  "DiagnosticsPanel.statusInfo": "info",
+  "DiagnosticsPanel.statusWarning": "warnung",
+  "DiagnosticsPanel.statusCritical": "kritisch",
+  "DiagnosticsPanel.statusFixed": "behoben",
+  "DiagnosticsPanel.statusNotConfigured": "nicht verfügbar",
+  "DiagnosticsPanel.remediationLabel": "Nächster Schritt",
+  "DiagnosticsPanel.dismiss": "Verwerfen",
+  "DiagnosticsPanel.bundleTitle": "Support-Paket",
+  "DiagnosticsPanel.bundleDescription": "Ein geschwärzter Schnappschuss dieser Diagnose sowie Ihre App-Version und Plattform – keine Prompts, Chats oder Geheimnisse. Fügen Sie ihn in eine Support-Anfrage ein.",
+  "DiagnosticsPanel.bundleCopy": "In die Zwischenablage kopieren",
+  "DiagnosticsPanel.bundleCopied": "Kopiert",
+  "DiagnosticsPanel.subsystemOllama": "Ollama",
+  "DiagnosticsPanel.subsystemLlama": "Lokales Chat-Modell",
+  "DiagnosticsPanel.subsystemEmbedLlama": "Lokales Embedding-Modell",
+  "DiagnosticsPanel.subsystemApiServer": "Lokaler API-Server",
+  "DiagnosticsPanel.subsystemMcp": "MCP-Server",
+  "DiagnosticsPanel.subsystemKnowledgeIndex": "Wissensindizes",
+  "DiagnosticsPanel.subsystemAutomationDaemon": "Hintergrundautomatisierung",
+  "DiagnosticsPanel.subsystemKeychain": "Systemschlüsselbund",
+  "DiagnosticsPanel.subsystemConnectors": "Connectors",
+  "DiagnosticsPanel.subsystemRemotePairing": "Remote-Kopplung / Mobil",
   ...teamModeLocale,
   // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
   "SettingsModal.tabTeamMode": "Team",
