@@ -8,6 +8,7 @@ import { developerLocale } from "./developer";
 import { issueToPrLocale } from "./issueToPr";
 import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
@@ -29,6 +30,7 @@ export const en: Record<string, string> = {
   ...issueToPrLocale,
   ...trustScorecardsLocale,
   ...sopCompilerLocale,
+  ...dbAdminGuardrailsLocale,
   ...mcpGeneratorLocale,
   ...specScorerLocale,
   ...inboxLocale,

@@ -21,6 +21,7 @@ import { EvidenceBoardPanel } from "./components/EvidenceBoard";
 import { DailyBriefPanel } from "./components/DailyBrief";
 import { TerminalPanel } from "./components/Terminal";
 import { DebatePanel } from "./components/Debate";
+import { DatabaseAdminGuardrailsPanel } from "./components/DatabaseAdminGuardrails";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
@@ -123,6 +124,7 @@ function App() {
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [debateOpen, setDebateOpen] = useState(false);
+  const [dbAdminGuardrailsOpen, setDbAdminGuardrailsOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -148,6 +150,7 @@ function App() {
     setKnowledgeGraphOpen(false);
     setEvidenceBoardOpen(false);
     setDebateOpen(false);
+    setDbAdminGuardrailsOpen(false);
     setDailyBriefOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
@@ -196,6 +199,7 @@ function App() {
           setKnowledgeGraphOpen(false);
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
+          setDbAdminGuardrailsOpen(false);
           setDailyBriefOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
@@ -210,6 +214,7 @@ function App() {
           setKnowledgeGraphOpen(false);
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
+          setDbAdminGuardrailsOpen(false);
           setDailyBriefOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
@@ -385,6 +390,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsOpen(true);
           }}
@@ -401,6 +407,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
@@ -418,6 +425,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
@@ -435,6 +443,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
@@ -452,6 +461,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
@@ -469,6 +479,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setTrustScorecardsOpen(true);
@@ -486,6 +497,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setSopCompilerOpen(true);
@@ -502,6 +514,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setMcpGeneratorOpen(true);
@@ -518,6 +531,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
@@ -534,6 +548,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setRedTeamLabOpen(true);
@@ -550,6 +565,7 @@ function App() {
             setRedTeamLabOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setKnowledgeGraphOpen(true);
@@ -566,6 +582,7 @@ function App() {
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setEvidenceBoardOpen(true);
@@ -583,6 +600,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
           }}
@@ -602,8 +620,27 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDailyBriefOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setSettingsInitialTab(undefined);
             setDebateOpen(true);
+          }}
+          onOpenDbAdminGuardrails={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDailyBriefOpen(false);
+            setDebateOpen(false);
+            setSettingsInitialTab(undefined);
+            setDbAdminGuardrailsOpen(true);
           }}
           onRestartOnboarding={() => {
             setSettingsOpen(false);
@@ -612,6 +649,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setTerminalOpen(false);
             restartOnboarding();
           }}
@@ -636,7 +674,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : dbAdminGuardrailsOpen ? "db-admin-guardrails" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -679,6 +717,8 @@ function App() {
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : debateOpen ? (
             <DebatePanel onClose={() => setDebateOpen(false)} />
+          ) : dbAdminGuardrailsOpen ? (
+            <DatabaseAdminGuardrailsPanel onClose={() => setDbAdminGuardrailsOpen(false)} />
           ) : issueToPrOpen ? (
             <IssueToPrPanel
               onClose={() => setIssueToPrOpen(false)}
@@ -728,7 +768,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !dbAdminGuardrailsOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
