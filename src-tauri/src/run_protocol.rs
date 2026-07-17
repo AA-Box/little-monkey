@@ -270,6 +270,10 @@ pub enum RunKind {
     Browser,
     Acp,
     Background,
+    /// Evidence ledger for a remote desktop-control session: periodic and
+    /// start/stop screenshots recorded as `ArtifactAdded` events (see
+    /// `daemon/remote/desktop.rs`).
+    RemoteDesktopControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

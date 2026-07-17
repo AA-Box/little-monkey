@@ -382,7 +382,12 @@ pub fn run() {
     let configured_companion_shortcut = m7_state
         .overlay_shortcut()
         .expect("failed to load the configured companion shortcut");
-    let desktop_control_state = desktop_control::DesktopControlState::production();
+    // Machine-wide lock at <app_data>/desktop_control.lock so the local app
+    // and the resident daemon (which constructs its own DesktopControlState)
+    // can never drive real OS input simultaneously.
+    let desktop_control_state = desktop_control::DesktopControlState::production_with_lock(
+        app_data_dir.join("desktop_control.lock"),
+    );
     // Fixed (not user-configurable, unlike the companion overlay shortcut
     // above) global emergency-stop hotkey — see ROADMAP.md's Safe Desktop
     // Control acceptance criteria ("Emergency stop hotkey") and the design
