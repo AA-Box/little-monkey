@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const pt: Record<string, string> = {
@@ -354,6 +355,7 @@ export const pt: Record<string, string> = {
   "McpGenerator.statusNotClean": "Não está limpo pelo simulador",
   "McpGenerator.statusNotSimulated": "Não simulado",
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Portuguese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumo diário",
@@ -399,6 +401,39 @@ export const pt: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "{{used}} usados de {{quota}} de armazenamento de modelos",
   "DailyBriefPanel.runtime.open": "Abrir em Configurações › Runtime Hub",
   "DailyBriefPanel.runtime.error": "Falha ao atualizar a visão geral do Runtime Hub: {{error}}",
+  // Real Portuguese translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "Planejador de Mudanças entre Repositórios",
+  "CrossRepoChangePlanner.title": "Planejador de Mudanças entre Repositórios",
+  "CrossRepoChangePlanner.subtitle": "Descreva uma mudança coordenada uma vez. Revise um plano ordenado por pasta raiz com notas de risco e reversão e aprove-o antes que qualquer repositório seja alterado.",
+  "CrossRepoChangePlanner.close": "Fechar o Planejador de Mudanças entre Repositórios",
+  "CrossRepoChangePlanner.noRootsWarning": "Nenhuma pasta do workspace está conectada. Abra uma pasta primária (e, opcionalmente, conecte pastas secundárias) antes de planejar uma mudança entre repositórios.",
+  "CrossRepoChangePlanner.descriptionLabel": "Descreva a mudança coordenada",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "ex.: Renomeie o campo `widgetId` para `widgetKey` na API, no cliente web e na documentação.",
+  "CrossRepoChangePlanner.generateButton": "Gerar plano",
+  "CrossRepoChangePlanner.statusDraft": "Rascunho — ainda não aprovado",
+  "CrossRepoChangePlanner.statusApproved": "Aprovado",
+  "CrossRepoChangePlanner.approveButton": "Aprovar plano",
+  "CrossRepoChangePlanner.approveGateNote": "Nenhum repositório é alterado até você aprovar este plano. Edite antes o texto ou a ordem das etapas, se necessário.",
+  "CrossRepoChangePlanner.startOverButton": "Recomeçar",
+  "CrossRepoChangePlanner.moveUp": "Mover etapa para cima",
+  "CrossRepoChangePlanner.moveDown": "Mover etapa para baixo",
+  "CrossRepoChangePlanner.dependsOn": "Depende de: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "Resumo",
+  "CrossRepoChangePlanner.changesLabel": "O que muda",
+  "CrossRepoChangePlanner.risksLabel": "O que pode dar errado",
+  "CrossRepoChangePlanner.rollbackLabel": "Reversão",
+  "CrossRepoChangePlanner.branchSectionHeading": "Criação de branch",
+  "CrossRepoChangePlanner.branchCreated": "Branch criada: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "Repositório do GitHub",
+  "CrossRepoChangePlanner.baseRefLabel": "Ref base",
+  "CrossRepoChangePlanner.branchPrefixLabel": "Prefixo da branch própria",
+  "CrossRepoChangePlanner.labelLabel": "Rótulo da tarefa",
+  "CrossRepoChangePlanner.createBranchButton": "Criar branch",
+  "CrossRepoChangePlanner.approveFirstHint": "Aprove o plano antes de criar uma branch para esta etapa.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "Digite {{phrase}} para confirmar",
+  "CrossRepoChangePlanner.confirmCancel": "Cancelar",
+  "CrossRepoChangePlanner.confirmExecute": "Confirmar",
+  "CrossRepoChangePlanner.pushFollowUpNote": "Isso cria apenas branches locais de propriedade do app. Enviar (push) uma branch e abrir um PR de rascunho continua sendo uma ação manual de acompanhamento em Configurações → Entrega Git, com a mesma etapa de confirmação por digitação da frase, exatamente como no fluxo Issue-to-PR.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

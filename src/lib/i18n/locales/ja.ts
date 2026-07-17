@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const ja: Record<string, string> = {
@@ -354,6 +355,7 @@ export const ja: Record<string, string> = {
   "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
   "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Japanese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "デイリーブリーフ",
@@ -399,6 +401,39 @@ export const ja: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "モデルストレージ使用量: {{quota}} 中 {{used}}",
   "DailyBriefPanel.runtime.open": "設定 › Runtime Hub で開く",
   "DailyBriefPanel.runtime.error": "Runtime Hub の概要の更新に失敗しました: {{error}}",
+  // Real Japanese translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "クロスリポジトリ変更プランナー",
+  "CrossRepoChangePlanner.title": "クロスリポジトリ変更プランナー",
+  "CrossRepoChangePlanner.subtitle": "調整が必要な変更を一度説明するだけで、ルートフォルダーごとのリスクとロールバックの注記付きの順序立てた計画を確認し、リポジトリに手を加える前に承認できます。",
+  "CrossRepoChangePlanner.close": "クロスリポジトリ変更プランナーを閉じる",
+  "CrossRepoChangePlanner.noRootsWarning": "ワークスペースのルートフォルダーが接続されていません。クロスリポジトリの変更を計画する前に、プライマリフォルダーを開いてください(任意でセカンダリフォルダーも追加できます)。",
+  "CrossRepoChangePlanner.descriptionLabel": "調整が必要な変更を説明してください",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "例: API、Web クライアント、ドキュメントで `widgetId` フィールドを `widgetKey` に名前変更する。",
+  "CrossRepoChangePlanner.generateButton": "計画を生成",
+  "CrossRepoChangePlanner.statusDraft": "下書き — 未承認",
+  "CrossRepoChangePlanner.statusApproved": "承認済み",
+  "CrossRepoChangePlanner.approveButton": "計画を承認",
+  "CrossRepoChangePlanner.approveGateNote": "この計画を承認するまで、どのリポジトリにも手が加えられません。必要であれば先に各ステップのテキストや順序を編集してください。",
+  "CrossRepoChangePlanner.startOverButton": "最初からやり直す",
+  "CrossRepoChangePlanner.moveUp": "ステップを上に移動",
+  "CrossRepoChangePlanner.moveDown": "ステップを下に移動",
+  "CrossRepoChangePlanner.dependsOn": "依存先: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "概要",
+  "CrossRepoChangePlanner.changesLabel": "変更内容",
+  "CrossRepoChangePlanner.risksLabel": "起こりうる問題",
+  "CrossRepoChangePlanner.rollbackLabel": "ロールバック",
+  "CrossRepoChangePlanner.branchSectionHeading": "ブランチ作成",
+  "CrossRepoChangePlanner.branchCreated": "ブランチを作成しました: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "GitHub リポジトリ",
+  "CrossRepoChangePlanner.baseRefLabel": "ベース参照",
+  "CrossRepoChangePlanner.branchPrefixLabel": "所有ブランチのプレフィックス",
+  "CrossRepoChangePlanner.labelLabel": "タスクラベル",
+  "CrossRepoChangePlanner.createBranchButton": "ブランチを作成",
+  "CrossRepoChangePlanner.approveFirstHint": "このステップのブランチを作成する前に計画を承認してください。",
+  "CrossRepoChangePlanner.confirmTypePhrase": "確認するには {{phrase}} と入力してください",
+  "CrossRepoChangePlanner.confirmCancel": "キャンセル",
+  "CrossRepoChangePlanner.confirmExecute": "確認",
+  "CrossRepoChangePlanner.pushFollowUpNote": "この操作はアプリ所有のローカルブランチを作成するだけです。ブランチのプッシュとドラフト PR の作成は、Issue-to-PR フローと全く同じ確認フレーズ入力ステップを伴う、設定 → Git 配信での手動フォローアップのままです。",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",
