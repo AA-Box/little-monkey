@@ -105,7 +105,14 @@ jobs:
         shell: pwsh
         run: |
           pnpm stage:cli:placeholder
-          cargo test --manifest-path src-tauri/Cargo.toml --no-run
+          cargo test --manifest-path src-tauri/Cargo.toml --no-run -vv 2>&1 | Tee-Object -FilePath build.log
+          Write-Host "--- rustc invocations mentioning getrandom ---"
+          Select-String -Path build.log -Pattern "Running.*getrandom" -Context 0,0 | ForEach-Object { $_.Line }
+          Write-Host "--- lines mentioning getrandom_backend cfg ---"
+          Select-String -Path build.log -Pattern "getrandom_backend" | ForEach-Object { $_.Line }
+          Write-Host "--- cargo config resolution ---"
+          cargo config get --manifest-path src-tauri/Cargo.toml build 2>&1
+          cargo config get --manifest-path src-tauri/Cargo.toml target.'cfg(target_os = "windows")' 2>&1
 
       - uses: ilammy/msvc-dev-cmd@v1
         if: startsWith(matrix.os, 'windows')
