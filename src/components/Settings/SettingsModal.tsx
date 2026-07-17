@@ -11,9 +11,12 @@ import {
   HardDrive,
   Gauge,
   GitPullRequest,
+  Inbox,
   ListChecks,
+  Lock,
   MessageSquare,
   MonitorCheck,
+  MousePointerClick,
   Palette,
   Plug,
   PlugZap,
@@ -22,7 +25,9 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
+  Stethoscope,
   Terminal,
+  Users,
   X,
   Zap,
   type LucideIcon,
@@ -49,9 +54,14 @@ import { RuntimeHubPanel } from "./RuntimeHubPanel";
 import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
+import { TriagePanel } from "../Triage/TriagePanel";
 import { CompanionPanel } from "./CompanionPanel";
 import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
+import { PrivacyFirewallPanel } from "./PrivacyFirewallPanel";
+import { DesktopControlPanel } from "./DesktopControlPanel";
+import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { AppearancePanel } from "./AppearancePanel";
+import { TeamModePanel } from "./TeamModePanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -69,7 +79,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -94,14 +104,19 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   background: Bot,
   companion: Sparkles,
   security: ShieldCheck,
+  privacy: Lock,
+  diagnostics: Stethoscope,
   appearance: Palette,
+  triage: Inbox,
+  desktopcontrol: MousePointerClick,
+  team: Users,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
-  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "companion", "shortcuts", "usage", "portability"] },
+  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "privacy", "diagnostics", "team", "companion", "desktopcontrol", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "background", "mcp", "connectors", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "mcp", "connectors", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
@@ -127,7 +142,12 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   background: "SettingsModal.tabBackgroundAgents",
   companion: "SettingsModal.tabCompanion",
   security: "SettingsModal.tabSecurityDoctor",
+  privacy: "SettingsModal.tabPrivacyFirewall",
+  diagnostics: "SettingsModal.tabDiagnostics",
   appearance: "SettingsModal.tabAppearance",
+  triage: "SettingsModal.tabTriage",
+  desktopcontrol: "SettingsModal.tabDesktopControl",
+  team: "SettingsModal.tabTeamMode",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -358,10 +378,15 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "runtimehub" && <RuntimeHubPanel />}
               {tab === "browser" && <BrowserVerificationPanel />}
               {tab === "gitdelivery" && <GitDeliveryPanel />}
+              {tab === "triage" && <TriagePanel />}
               {tab === "background" && <BackgroundAgentsPanel />}
               {tab === "companion" && <CompanionPanel />}
               {tab === "security" && <SecurityDoctorPanel />}
+              {tab === "privacy" && <PrivacyFirewallPanel />}
+              {tab === "diagnostics" && <DiagnosticsPanel />}
               {tab === "appearance" && <AppearancePanel />}
+              {tab === "desktopcontrol" && <DesktopControlPanel />}
+              {tab === "team" && <TeamModePanel />}
             </div>
           </div>
         </div>
