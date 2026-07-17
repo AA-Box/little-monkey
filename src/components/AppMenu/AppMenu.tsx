@@ -19,6 +19,7 @@ import {
   Inbox,
   Network,
   Newspaper,
+  Plug,
   Radar,
   Search,
   ServerCog,
@@ -26,6 +27,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Table2,
   Telescope,
   Wand2,
   Workflow,
@@ -48,16 +50,19 @@ interface AppMenuProps {
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
+  onOpenConnectorBuilder: () => void;
   onOpenMigrationAgent: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
+  onOpenSpreadsheetCopilot: () => void;
   onOpenTerminal: () => void;
   onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenGoldenDatasetBuilder: () => void;
   onOpenDataNotebook: () => void;
   onOpenSyntheticMonitoring: () => void;
   onOpenCrossRepoIntelligence: () => void;
@@ -105,16 +110,19 @@ export function AppMenu({
   onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
+  onOpenConnectorBuilder,
   onOpenMigrationAgent,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
+  onOpenSpreadsheetCopilot,
   onOpenTerminal,
   onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenGoldenDatasetBuilder,
   onOpenDataNotebook,
   onOpenSyntheticMonitoring,
   onOpenCrossRepoIntelligence,
@@ -281,6 +289,14 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Plug size={14} className="text-faint" />}
+            label={t("AppMenu.connectorBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenConnectorBuilder();
+            }}
+          />
+          <MenuRow
             icon={<GitBranch size={14} className="text-faint" />}
             label={t("AppMenu.migrationAgent")}
             onClick={() => {
@@ -337,11 +353,27 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Table2 size={14} className="text-faint" />}
+            label={t("AppMenu.spreadsheetCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenSpreadsheetCopilot();
+            }}
+          />
+          <MenuRow
             icon={<ClipboardCheck size={14} className="text-faint" />}
             label={t("AppMenu.evidenceBoard")}
             onClick={() => {
               closeAll();
               onOpenEvidenceBoard();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.goldenDatasetBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenGoldenDatasetBuilder();
             }}
           />
           <MenuRow
