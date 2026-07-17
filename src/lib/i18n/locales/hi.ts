@@ -1322,7 +1322,7 @@ export const hi: Record<string, string> = {
   "RedTeamLab.source.screenshotOcr": "स्क्रीनशॉट OCR",
   "RedTeamLab.source.knowledgeSource": "ज्ञान स्रोत",
   "RedTeamLab.source.webSearchResult": "वेब खोज परिणाम",
-  "RedTeamLab.source.subagentOutput": "सब-एजेंट आउटपुट"
+  "RedTeamLab.source.subagentOutput": "सब-एजेंट आउटपुट",
 
   "EcosystemDiscover.searchLabel": "डिस्कवरी हब में खोजें",
   "EcosystemDiscover.searchPlaceholder": "पैकेज, प्रकाशक या क्षमताएं खोजें…",

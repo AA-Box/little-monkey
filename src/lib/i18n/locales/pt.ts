@@ -1322,7 +1322,7 @@ export const pt: Record<string, string> = {
   "RedTeamLab.source.screenshotOcr": "OCR de captura de tela",
   "RedTeamLab.source.knowledgeSource": "Fonte de conhecimento",
   "RedTeamLab.source.webSearchResult": "Resultado de busca na web",
-  "RedTeamLab.source.subagentOutput": "Saída de subagente"
+  "RedTeamLab.source.subagentOutput": "Saída de subagente",
 
   "EcosystemDiscover.searchLabel": "Pesquisar no hub de descoberta",
   "EcosystemDiscover.searchPlaceholder": "Pesquisar pacotes, publicadores ou recursos…",
