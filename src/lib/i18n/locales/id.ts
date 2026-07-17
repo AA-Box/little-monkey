@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
@@ -359,6 +360,7 @@ export const id: Record<string, string> = {
   "McpGenerator.statusNotClean": "Belum bersih menurut simulator",
   "McpGenerator.statusNotSimulated": "Belum disimulasikan",
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Indonesian translations, overriding every workCanvasLocale key above.
   "AppMenu.workCanvas": "Kanvas Kerja",
@@ -1555,6 +1557,45 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
   "EcosystemDiscover.cancel": "Batal",
+  // Real Indonesian translations, overriding every crossRepoIntelligenceLocale key above.
+  "AppMenu.crossRepoIntelligence": "Intelijen Lintas-Repo",
+  "CrossRepoIntelligencePanel.title": "Intelijen Kode Lintas-Repo",
+  "CrossRepoIntelligencePanel.subtitle": "Cari simbol di semua repo yang terhubung, lalu telusuri dampaknya — file yang terpengaruh, pemilik, tes, dan langkah migrasi.",
+  "CrossRepoIntelligencePanel.close": "Tutup Intelijen Lintas-Repo",
+  "CrossRepoIntelligencePanel.rebuild": "Bangun ulang indeks",
+  "CrossRepoIntelligencePanel.rebuilding": "Mengindeks…",
+  "CrossRepoIntelligencePanel.builtAt": "Diindeks {{time}} · {{symbolCount}} simbol di {{fileCount}} file",
+  "CrossRepoIntelligencePanel.notBuiltYet": "Bangun indeks untuk mencari simbol di repo yang terhubung.",
+  "CrossRepoIntelligencePanel.noWorkspace": "Buka folder workspace terlebih dahulu.",
+  "CrossRepoIntelligencePanel.buildError": "Indeks tidak dapat dibangun: {{error}}",
+  "CrossRepoIntelligencePanel.searchLabel": "Cari simbol",
+  "CrossRepoIntelligencePanel.searchPlaceholder": "Nama simbol (fungsi, kelas, tipe…)",
+  "CrossRepoIntelligencePanel.noMatches": "Tidak ada simbol yang cocok dengan \"{{query}}\".",
+  "CrossRepoIntelligencePanel.matchesHint": "{{count}} simbol cocok",
+  "CrossRepoIntelligencePanel.kind.function": "fungsi",
+  "CrossRepoIntelligencePanel.kind.method": "metode",
+  "CrossRepoIntelligencePanel.kind.class": "kelas",
+  "CrossRepoIntelligencePanel.kind.interface": "interface",
+  "CrossRepoIntelligencePanel.kind.type": "tipe",
+  "CrossRepoIntelligencePanel.kind.const": "konstanta",
+  "CrossRepoIntelligencePanel.kind.enum": "enum",
+  "CrossRepoIntelligencePanel.kind.struct": "struct",
+  "CrossRepoIntelligencePanel.kind.trait": "trait",
+  "CrossRepoIntelligencePanel.impact.title": "Dampak dari \"{{symbol}}\"",
+  "CrossRepoIntelligencePanel.impact.loading": "Melacak dampak…",
+  "CrossRepoIntelligencePanel.impact.error": "Dampak tidak dapat dilacak: {{error}}",
+  "CrossRepoIntelligencePanel.impact.affectedRepos": "Repo yang terpengaruh",
+  "CrossRepoIntelligencePanel.impact.affectedFiles": "File yang terpengaruh",
+  "CrossRepoIntelligencePanel.impact.definitions": "Definisi",
+  "CrossRepoIntelligencePanel.impact.references": "Referensi",
+  "CrossRepoIntelligencePanel.impact.noReferences": "Tidak ada referensi ditemukan.",
+  "CrossRepoIntelligencePanel.impact.tests": "Kemungkinan tes",
+  "CrossRepoIntelligencePanel.impact.noTests": "Tidak ada file tes yang cocok berdasarkan konvensi penamaan.",
+  "CrossRepoIntelligencePanel.impact.owners": "Pemilik",
+  "CrossRepoIntelligencePanel.impact.unassigned": "Belum ditetapkan",
+  "CrossRepoIntelligencePanel.impact.migrationSteps": "Kemungkinan langkah migrasi",
+  "CrossRepoIntelligencePanel.impact.clear": "Hapus",
+  "CrossRepoIntelligencePanel.footnote": "Cakupan MVP: mengindeks root workspace yang terhubung (primer + sekunder) menggunakan ekstraksi simbol berbasis regex dan pencarian teks — bukan AST/grafik panggilan multi-bahasa yang lengkap.",
   // Real translations for Deep Research Workspace (ROADMAP Phase 7),
   // overriding the English deepResearchLocale spread above.
   "AppMenu.deepResearch": "Riset Mendalam",

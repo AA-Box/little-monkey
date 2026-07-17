@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
@@ -359,6 +360,7 @@ export const hi: Record<string, string> = {
   "McpGenerator.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
   "McpGenerator.statusNotSimulated": "सिम्युलेट नहीं हुआ",
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Hindi translations, overriding every workCanvasLocale key above.
   "AppMenu.workCanvas": "वर्क कैनवस",
@@ -1555,6 +1557,45 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
   "EcosystemDiscover.cancel": "रद्द करें",
+  // Real Hindi translations, overriding every crossRepoIntelligenceLocale key above.
+  "AppMenu.crossRepoIntelligence": "क्रॉस-रीपो इंटेलिजेंस",
+  "CrossRepoIntelligencePanel.title": "क्रॉस-रीपो कोड इंटेलिजेंस",
+  "CrossRepoIntelligencePanel.subtitle": "हर जुड़े हुए रीपो में सिंबल खोजें, फिर प्रभाव का पता लगाएं — प्रभावित फ़ाइलें, स्वामी, टेस्ट और माइग्रेशन चरण।",
+  "CrossRepoIntelligencePanel.close": "क्रॉस-रीपो इंटेलिजेंस बंद करें",
+  "CrossRepoIntelligencePanel.rebuild": "इंडेक्स फिर से बनाएं",
+  "CrossRepoIntelligencePanel.rebuilding": "इंडेक्सिंग हो रही है…",
+  "CrossRepoIntelligencePanel.builtAt": "{{time}} पर इंडेक्स किया गया · {{fileCount}} फ़ाइलों में {{symbolCount}} सिंबल",
+  "CrossRepoIntelligencePanel.notBuiltYet": "अपने जुड़े हुए रीपो में सिंबल खोजने के लिए इंडेक्स बनाएं।",
+  "CrossRepoIntelligencePanel.noWorkspace": "पहले एक वर्कस्पेस फ़ोल्डर खोलें।",
+  "CrossRepoIntelligencePanel.buildError": "इंडेक्स नहीं बनाया जा सका: {{error}}",
+  "CrossRepoIntelligencePanel.searchLabel": "सिंबल खोजें",
+  "CrossRepoIntelligencePanel.searchPlaceholder": "सिंबल का नाम (फ़ंक्शन, क्लास, टाइप…)",
+  "CrossRepoIntelligencePanel.noMatches": "\"{{query}}\" से कोई सिंबल मेल नहीं खाता।",
+  "CrossRepoIntelligencePanel.matchesHint": "{{count}} मेल खाते सिंबल",
+  "CrossRepoIntelligencePanel.kind.function": "फ़ंक्शन",
+  "CrossRepoIntelligencePanel.kind.method": "मेथड",
+  "CrossRepoIntelligencePanel.kind.class": "क्लास",
+  "CrossRepoIntelligencePanel.kind.interface": "इंटरफ़ेस",
+  "CrossRepoIntelligencePanel.kind.type": "टाइप",
+  "CrossRepoIntelligencePanel.kind.const": "कॉन्स्ट",
+  "CrossRepoIntelligencePanel.kind.enum": "एनम",
+  "CrossRepoIntelligencePanel.kind.struct": "स्ट्रक्ट",
+  "CrossRepoIntelligencePanel.kind.trait": "ट्रेट",
+  "CrossRepoIntelligencePanel.impact.title": "\"{{symbol}}\" का प्रभाव",
+  "CrossRepoIntelligencePanel.impact.loading": "प्रभाव का पता लगाया जा रहा है…",
+  "CrossRepoIntelligencePanel.impact.error": "प्रभाव का पता नहीं लगाया जा सका: {{error}}",
+  "CrossRepoIntelligencePanel.impact.affectedRepos": "प्रभावित रीपो",
+  "CrossRepoIntelligencePanel.impact.affectedFiles": "प्रभावित फ़ाइलें",
+  "CrossRepoIntelligencePanel.impact.definitions": "परिभाषाएं",
+  "CrossRepoIntelligencePanel.impact.references": "संदर्भ",
+  "CrossRepoIntelligencePanel.impact.noReferences": "कोई संदर्भ नहीं मिला।",
+  "CrossRepoIntelligencePanel.impact.tests": "संभावित टेस्ट",
+  "CrossRepoIntelligencePanel.impact.noTests": "नामकरण परंपरा के अनुसार कोई मेल खाती टेस्ट फ़ाइल नहीं मिली।",
+  "CrossRepoIntelligencePanel.impact.owners": "स्वामी",
+  "CrossRepoIntelligencePanel.impact.unassigned": "असाइन नहीं किया गया",
+  "CrossRepoIntelligencePanel.impact.migrationSteps": "संभावित माइग्रेशन चरण",
+  "CrossRepoIntelligencePanel.impact.clear": "साफ़ करें",
+  "CrossRepoIntelligencePanel.footnote": "MVP दायरा: नियम-आधारित सिंबल एक्सट्रैक्शन और टेक्स्ट सर्च का उपयोग करके जुड़े हुए वर्कस्पेस रूट्स (प्राइमरी + सेकेंडरी) को इंडेक्स करता है — पूर्ण बहु-भाषा AST/कॉल-ग्राफ नहीं।",
   // Real translations for Deep Research Workspace (ROADMAP Phase 7),
   // overriding the English deepResearchLocale spread above.
   "AppMenu.deepResearch": "गहन शोध",
