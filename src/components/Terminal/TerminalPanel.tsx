@@ -1,53 +1,49 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Terminal as XTerm } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 import {
   AlertTriangle,
+  Box,
+  Maximize2,
+  Minimize2,
+  PanelBottom,
+  PanelRight,
   Paperclip,
   Plus,
   RefreshCw,
-  Search,
   ShieldCheck,
-  Square,
   TerminalSquare,
   X,
 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
-import { useTerminalStore, buildTerminalEvidence, readableTerminalOutput } from "../../store/terminalStore";
+import { useTerminalStore, buildTerminalEvidence } from "../../store/terminalStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
-import { Button, IconButton, StatusPill } from "../ui";
-import type { PillTone } from "../ui";
+import { Button, IconButton } from "../ui";
+import { SandboxPanel } from "./SandboxPanel";
 
-const MAX_HIGHLIGHT_MATCHES = 500;
-
-function statusTone(status: "running" | "exited" | "killed" | "error"): PillTone {
-  if (status === "running") return "success";
-  if (status === "error") return "danger";
-  if (status === "killed") return "warning";
-  return "neutral";
-}
-
-function highlightedOutput(text: string, query: string): { content: ReactNode; count: number; limited: boolean } {
-  const needle = query.trim().toLocaleLowerCase();
-  if (!needle) return { content: text, count: 0, limited: false };
-
-  const lower = text.toLocaleLowerCase();
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  let count = 0;
-  while (cursor < text.length) {
-    const index = lower.indexOf(needle, cursor);
-    if (index < 0 || count >= MAX_HIGHLIGHT_MATCHES) break;
-    if (index > cursor) parts.push(text.slice(cursor, index));
-    parts.push(
-      <mark key={`${index}:${count}`} className="rounded-sm bg-warning-soft px-0.5 text-warning">
-        {text.slice(index, index + needle.length)}
-      </mark>,
-    );
-    count += 1;
-    cursor = index + needle.length;
-  }
-  if (cursor < text.length) parts.push(text.slice(cursor));
-  return { content: parts, count, limited: count >= MAX_HIGHLIGHT_MATCHES && lower.indexOf(needle, cursor) >= 0 };
+/** Reads the app's themed color custom properties into concrete values for
+ * xterm's theme object (xterm cannot consume `var(...)` references). The
+ * cursor colors are explicit — without them xterm's defaults can collapse
+ * into the background in a light theme, leaving the cursor invisible. */
+function xtermTheme(): {
+  background: string;
+  foreground: string;
+  cursor: string;
+  cursorAccent: string;
+  selectionBackground: string;
+} {
+  const styles = getComputedStyle(document.documentElement);
+  const background = styles.getPropertyValue("--c-background").trim() || "#ffffff";
+  const foreground = styles.getPropertyValue("--c-foreground").trim() || "#1a1a1a";
+  return {
+    background,
+    foreground,
+    cursor: foreground,
+    cursorAccent: background,
+    selectionBackground: styles.getPropertyValue("--c-accent-soft").trim() || "#b3d4fc",
+  };
 }
 
 interface TerminalPanelProps {
@@ -60,38 +56,41 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   const roots = useWorkspaceStore((state) => state.roots);
   const sessions = useTerminalStore((state) => state.sessions);
   const activeSessionId = useTerminalStore((state) => state.activeSessionId);
-  const histories = useTerminalStore((state) => state.historyByWorkspace);
   const initialized = useTerminalStore((state) => state.initialized);
   const busy = useTerminalStore((state) => state.busy);
   const error = useTerminalStore((state) => state.error);
   const initialize = useTerminalStore((state) => state.initialize);
   const createSession = useTerminalStore((state) => state.createSession);
   const setActive = useTerminalStore((state) => state.setActive);
-  const execute = useTerminalStore((state) => state.execute);
-  const interrupt = useTerminalStore((state) => state.interrupt);
-  const kill = useTerminalStore((state) => state.kill);
+  const write = useTerminalStore((state) => state.write);
   const restart = useTerminalStore((state) => state.restart);
   const close = useTerminalStore((state) => state.close);
   const resize = useTerminalStore((state) => state.resize);
-  const loadHistory = useTerminalStore((state) => state.loadHistory);
   const queueEvidence = useTerminalStore((state) => state.queueEvidence);
   const clearError = useTerminalStore((state) => state.clearError);
+  const dock = useTerminalStore((state) => state.dock);
+  const setDock = useTerminalStore((state) => state.setDock);
+  const panelSize = useTerminalStore((state) => state.panelSize);
+  const setPanelSize = useTerminalStore((state) => state.setPanelSize);
 
   const defaultRoot = primaryRoot(roots);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState(defaultRoot?.id ?? "");
-  const [command, setCommand] = useState("");
-  const [search, setSearch] = useState("");
-  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [evidencePreview, setEvidencePreview] = useState<ReturnType<typeof buildTerminalEvidence> | null>(null);
   const [attachedNotice, setAttachedNotice] = useState(false);
-  const outputRef = useRef<HTMLPreElement>(null);
-  const followOutputRef = useRef(true);
-  const panelRef = useRef<HTMLDivElement>(null);
+  const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const hostRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<XTerm | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  /** Length of `active.output` already written to the emulator — new store
+   * chunks are appended as deltas. When the bounded tail slides (256KB cap)
+   * the prefix assumption breaks; the emulator is then reset and replayed. */
+  const writtenRef = useRef(0);
 
   const active = sessions.find((session) => session.id === activeSessionId) ?? null;
-  const readableOutput = useMemo(() => readableTerminalOutput(active?.output ?? ""), [active?.output]);
-  const searchResult = useMemo(() => highlightedOutput(readableOutput, search), [readableOutput, search]);
-  const history = active ? histories[active.workspace_id] ?? [] : [];
+  const activeId = active?.id ?? null;
+  const activeStatus = active?.status ?? null;
 
   useEffect(() => {
     void initialize();
@@ -101,70 +100,141 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
     if (!selectedWorkspaceId && defaultRoot) setSelectedWorkspaceId(defaultRoot.id);
   }, [defaultRoot, selectedWorkspaceId]);
 
-  useEffect(() => {
-    if (active) void loadHistory(active.workspace_id);
-  }, [active?.workspace_id, loadHistory]);
-
-  useEffect(() => {
-    const node = outputRef.current;
-    if (node && followOutputRef.current) node.scrollTop = node.scrollHeight;
-  }, [active?.output]);
-
-  // Keep the kernel PTY dimensions aligned with the visible panel. This is
-  // best-effort and intentionally approximate because the line-oriented UI
-  // uses the app's monospace font rather than a canvas terminal renderer.
-  useEffect(() => {
-    const node = panelRef.current;
-    if (!node || !active) return;
-    const observer = new ResizeObserver((entries) => {
-      const rect = entries[0]?.contentRect;
-      if (!rect) return;
-      const cols = Math.max(20, Math.floor(rect.width / 8));
-      const rows = Math.max(2, Math.floor(rect.height / 18));
-      void resize(active.id, rows, cols);
-    });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [active?.id, resize]);
-
   const startTerminal = useCallback(async () => {
     if (!selectedWorkspaceId) return;
     try {
       await createSession(selectedWorkspaceId);
-      setCommand("");
-      setHistoryIndex(null);
     } catch {
       // The store owns the visible error text.
     }
   }, [createSession, selectedWorkspaceId]);
 
-  const submitCommand = useCallback(async () => {
-    if (!active || active.status !== "running" || !command.trim() || busy) return;
-    const pending = command;
-    try {
-      await execute(active.id, pending);
-      setCommand("");
-      setHistoryIndex(null);
-      followOutputRef.current = true;
-    } catch {
-      // The command remains in the field after denial/failure for review.
-    }
-  }, [active, busy, command, execute]);
+  // Auto-start, once per workspace, so opening the panel (or switching its
+  // workspace selector) behaves like VSCode's integrated terminal (the panel
+  // only mounts when `terminalOpen` — see App.tsx — so "open" and "start"
+  // are already the same user action). Terminal actions are user-initiated
+  // and carry no permission gate (see terminal.rs's module doc — the
+  // `run_shell` gate belongs to the agent's shell tool, not the user's own
+  // typing). A failed attempt is not retried automatically for that
+  // workspace — the button remains as a manual fallback. Tracked by
+  // workspace id (not a single mount-scoped flag) so switching the
+  // workspace selector without closing the panel still auto-starts for the
+  // newly selected one, instead of silently requiring the manual button.
+  const autoStartedWorkspacesRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!initialized || busy || !selectedWorkspaceId) return;
+    if (autoStartedWorkspacesRef.current.has(selectedWorkspaceId)) return;
+    if (sessions.some((session) => session.workspace_id === selectedWorkspaceId)) return;
+    autoStartedWorkspacesRef.current.add(selectedWorkspaceId);
+    void startTerminal();
+  }, [initialized, busy, selectedWorkspaceId, sessions, startTerminal]);
 
-  const moveHistory = useCallback((direction: -1 | 1) => {
-    if (history.length === 0) return;
-    const current = historyIndex ?? history.length;
-    const next = Math.min(history.length, Math.max(0, current + direction));
-    setHistoryIndex(next === history.length ? null : next);
-    setCommand(next === history.length ? "" : history[next] ?? "");
-  }, [history, historyIndex]);
+  // One emulator instance per visible session: (re)created when the active
+  // session changes, torn down with the panel. Keystrokes go straight to the
+  // PTY (`terminal_write`); the user's real shell handles line editing,
+  // history, and completions — there is no separate command input.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || !activeId) return;
+
+    const term = new XTerm({
+      convertEol: false,
+      cursorBlink: true,
+      fontSize: 12,
+      fontFamily:
+        'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace',
+      theme: xtermTheme(),
+      allowProposedApi: true,
+      scrollback: 5000,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+    fit.fit();
+    termRef.current = term;
+    fitRef.current = fit;
+    writtenRef.current = 0;
+
+    const replay = useTerminalStore.getState().sessions.find((session) => session.id === activeId)?.output ?? "";
+    if (replay) {
+      term.write(replay);
+      writtenRef.current = replay.length;
+    }
+
+    const data = term.onData((chunk) => {
+      void write(activeId, chunk);
+    });
+
+    // Keep the kernel PTY dimensions in lockstep with the emulator grid.
+    const observer = new ResizeObserver(() => {
+      fit.fit();
+      void resize(activeId, term.rows, term.cols);
+    });
+    observer.observe(host);
+    void resize(activeId, term.rows, term.cols);
+
+    term.focus();
+
+    return () => {
+      observer.disconnect();
+      data.dispose();
+      term.dispose();
+      termRef.current = null;
+      fitRef.current = null;
+      writtenRef.current = 0;
+    };
+  }, [activeId, resize, write]);
+
+  // Streams store output into the emulator as deltas (the store remains the
+  // single source of truth so evidence capture and session replay keep
+  // working). A slid bounded tail (or restart) resets and replays.
+  const output = active?.output ?? "";
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    if (output.length >= writtenRef.current) {
+      const delta = output.slice(writtenRef.current);
+      if (delta) term.write(delta);
+      writtenRef.current = output.length;
+    } else {
+      term.reset();
+      term.write(output);
+      writtenRef.current = output.length;
+    }
+  }, [output]);
+
+  // Re-fit when the expanded height toggles (height transition ends fast;
+  // ResizeObserver above also fires, this makes the refit immediate).
+  useEffect(() => {
+    fitRef.current?.fit();
+  }, [expanded, dock, panelSize]);
+
+  // Drag-to-resize: the handle sits on the edge facing the chat (top edge
+  // when bottom-docked, left edge when right-docked). Pointer capture keeps
+  // the drag alive when the cursor leaves the thin handle strip.
+  const onResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startCoord = dock === "bottom" ? event.clientY : event.clientX;
+    const startSize = dock === "bottom" ? panelSize.bottom : panelSize.right;
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    const move = (moveEvent: PointerEvent) => {
+      const delta = startCoord - (dock === "bottom" ? moveEvent.clientY : moveEvent.clientX);
+      setPanelSize(dock, startSize + delta);
+    };
+    const up = () => {
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", up);
+      target.removeEventListener("pointercancel", up);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", up);
+    target.addEventListener("pointercancel", up);
+  }, [dock, panelSize, setPanelSize]);
 
   const prepareEvidence = useCallback(() => {
     if (!active) return;
-    const selection = window.getSelection();
-    const selected = selection?.anchorNode && outputRef.current?.contains(selection.anchorNode)
-      ? selection.toString().trim()
-      : "";
+    const selected = termRef.current?.getSelection().trim() ?? "";
     const evidence = buildTerminalEvidence(active, selected || undefined);
     if (!evidence.content) return;
     setEvidencePreview(evidence);
@@ -180,13 +250,107 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
 
   return (
     <section
-      ref={panelRef}
-      className="relative flex h-[min(42vh,24rem)] min-h-56 shrink-0 flex-col border-t border-border bg-surface"
+      className={`flex flex-col overflow-hidden border-border bg-background ${
+        expanded
+          ? "fixed inset-0 z-40 border"
+          : dock === "bottom"
+            ? "relative min-h-44 shrink-0 rounded-t-xl border shadow-sm"
+            : "relative h-full min-w-56 shrink-0 border-l"
+      }`}
+      style={expanded ? undefined : dock === "bottom" ? { height: panelSize.bottom } : { width: panelSize.right }}
       aria-label={t("TerminalPanel.title")}
     >
-      <div className="flex min-h-10 shrink-0 items-center gap-1 border-b border-border px-2">
-        <TerminalSquare size={15} className="shrink-0 text-faint" />
-        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-1 [scrollbar-width:thin]">
+      {!expanded && (
+        <div
+          role="separator"
+          aria-orientation={dock === "bottom" ? "horizontal" : "vertical"}
+          onPointerDown={onResizeStart}
+          className={`absolute z-10 ${
+            dock === "bottom"
+              ? "inset-x-0 top-0 h-1.5 cursor-ns-resize"
+              : "inset-y-0 left-0 w-1.5 cursor-ew-resize"
+          } bg-transparent transition-colors hover:bg-accent/40 active:bg-accent/60`}
+        />
+      )}
+      {/* Title row keeps only the always-reachable controls (new tab, dock
+          toggle, expand, close) so a narrow right-docked column can never
+          push them off-screen; per-session actions live on their own
+          horizontally scrollable row below. */}
+      <div className="flex min-h-10 shrink-0 items-center gap-1.5 bg-surface px-3 py-1.5">
+        <span className="truncate whitespace-nowrap text-sm font-medium text-foreground">{t("TerminalPanel.title")}</span>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          onClick={() => void startTerminal()}
+          disabled={!selectedWorkspaceId || busy}
+          aria-label={t("TerminalPanel.newTerminal")}
+          title={t("TerminalPanel.newTerminal")}
+        >
+          <Plus size={14} />
+        </IconButton>
+        <div className="flex-1" />
+        {roots.length > 1 && (
+          <select
+            value={selectedWorkspaceId}
+            onChange={(event) => setSelectedWorkspaceId(event.target.value)}
+            aria-label={t("TerminalPanel.workspaceLabel")}
+            className="hidden max-w-40 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground sm:block"
+          >
+            {roots.map((root) => <option key={root.id} value={root.id}>{root.label}</option>)}
+          </select>
+        )}
+        {active && (
+          <>
+            <IconButton
+              size="sm"
+              variant="ghost"
+              onClick={prepareEvidence}
+              disabled={!active.output.trim()}
+              aria-label={t("TerminalPanel.attach")}
+              title={t("TerminalPanel.attach")}
+            >
+              <Paperclip size={14} />
+            </IconButton>
+            <IconButton
+              size="sm"
+              variant="ghost"
+              onClick={() => setSandboxOpen(true)}
+              aria-label={t("SandboxPanel.openButton")}
+              title={t("SandboxPanel.openButton")}
+            >
+              <Box size={14} />
+            </IconButton>
+          </>
+        )}
+        <IconButton
+          size="sm"
+          variant="ghost"
+          onClick={() => setDock(dock === "bottom" ? "right" : "bottom")}
+          aria-label={t(dock === "bottom" ? "TerminalPanel.dockRight" : "TerminalPanel.dockBottom")}
+          title={t(dock === "bottom" ? "TerminalPanel.dockRight" : "TerminalPanel.dockBottom")}
+        >
+          {dock === "bottom" ? <PanelRight size={14} /> : <PanelBottom size={14} />}
+        </IconButton>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          onClick={() => setExpanded((value) => !value)}
+          aria-label={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
+          title={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
+        >
+          {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+        </IconButton>
+        <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("TerminalPanel.closePanel")}>
+          <X size={14} />
+        </IconButton>
+      </div>
+
+
+      {/* Session tabs get a dedicated strip: sharing the header row with the
+          Kill/Restart/Attach controls let flexbox squeeze the tab list into
+          an unreadable sliver as soon as a couple of terminals were open. */}
+      {sessions.length > 1 && (
+        <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-border bg-surface px-3 py-1 [scrollbar-width:thin]">
           {sessions.map((session, index) => (
             <div
               key={session.id}
@@ -215,35 +379,18 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
             </div>
           ))}
         </div>
-        {roots.length > 1 && (
-          <select
-            value={selectedWorkspaceId}
-            onChange={(event) => setSelectedWorkspaceId(event.target.value)}
-            aria-label={t("TerminalPanel.workspaceLabel")}
-            className="hidden max-w-40 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground sm:block"
-          >
-            {roots.map((root) => <option key={root.id} value={root.id}>{root.label}</option>)}
-          </select>
-        )}
-        <IconButton
-          size="sm"
-          variant="ghost"
-          onClick={() => void startTerminal()}
-          disabled={!selectedWorkspaceId || busy}
-          aria-label={t("TerminalPanel.newTerminal")}
-          title={t("TerminalPanel.newTerminal")}
-        >
-          <Plus size={14} />
-        </IconButton>
-        <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("TerminalPanel.closePanel")}>
-          <X size={14} />
-        </IconButton>
-      </div>
+      )}
 
       {error && (
         <div className="flex items-center justify-between gap-3 border-b border-danger bg-danger-soft px-3 py-1.5 text-xs text-danger">
           <span className="min-w-0 truncate">{error}</span>
           <button type="button" onClick={clearError} className="shrink-0 underline">{t("TerminalPanel.dismiss")}</button>
+        </div>
+      )}
+
+      {active?.output_truncated && (
+        <div className="border-b border-warning/30 bg-warning-soft px-3 py-1 text-[11px] text-warning">
+          {t("TerminalPanel.outputTruncated")}
         </div>
       )}
 
@@ -273,89 +420,17 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
           </Button>
         </div>
       ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-2 py-1.5">
-            <StatusPill tone={statusTone(active.status)}>{t(`TerminalPanel.status.${active.status}`)}</StatusPill>
-            <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-faint" title={active.workspace_path}>
-              {active.workspace_path}
-            </span>
-            <div className="relative flex min-w-36 flex-1 items-center sm:max-w-64">
-              <Search size={12} className="pointer-events-none absolute left-2 text-faint" />
-              <input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder={t("TerminalPanel.searchPlaceholder")}
-                aria-label={t("TerminalPanel.searchLabel")}
-                className="w-full rounded-md border border-border bg-background py-1 pl-7 pr-12 text-xs text-foreground outline-none focus:border-accent"
-              />
-              {search.trim() && (
-                <span className="pointer-events-none absolute right-2 text-[10px] text-faint">
-                  {searchResult.limited ? `${searchResult.count}+` : searchResult.count}
-                </span>
-              )}
-            </div>
-            <Button size="sm" variant="ghost" onClick={() => void interrupt(active.id)} disabled={active.status !== "running"}>
-              ^C
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => void kill(active.id)} disabled={active.status !== "running"}>
-              <Square size={11} className="fill-current" /> {t("TerminalPanel.kill")}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => void restart(active.id)} disabled={busy}>
-              <RefreshCw size={12} /> {t("TerminalPanel.restart")}
-            </Button>
-            <Button size="sm" variant="secondary" onClick={prepareEvidence} disabled={!readableOutput.trim()}>
-              <Paperclip size={12} /> {t("TerminalPanel.attach")}
-            </Button>
-          </div>
-
-          {active.output_truncated && (
-            <div className="border-b border-warning/30 bg-warning-soft px-3 py-1 text-[11px] text-warning">
-              {t("TerminalPanel.outputTruncated")}
+        <div className="relative min-h-0 flex-1">
+          <div ref={hostRef} className="absolute inset-0 px-2 py-1" aria-label={t("TerminalPanel.outputLabel")} />
+          {activeStatus !== "running" && (
+            <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 border-t border-border bg-surface px-3 py-1.5 text-xs text-muted">
+              <span className="min-w-0 truncate">{t("TerminalPanel.restartToContinue")}</span>
+              <Button size="sm" variant="secondary" onClick={() => active && void restart(active.id)} disabled={busy}>
+                <RefreshCw size={12} /> {t("TerminalPanel.restart")}
+              </Button>
             </div>
           )}
-
-          <pre
-            ref={outputRef}
-            tabIndex={0}
-            onScroll={(event) => {
-              const node = event.currentTarget;
-              followOutputRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
-            }}
-            className="min-h-0 flex-1 select-text overflow-auto whitespace-pre-wrap break-words bg-[#0d1117] px-3 py-2 font-mono text-xs leading-5 text-[#d1d5db] outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent [overscroll-behavior:contain]"
-            aria-label={t("TerminalPanel.outputLabel")}
-          >
-            {searchResult.content || t("TerminalPanel.awaitingOutput")}
-          </pre>
-
-          <div className="flex shrink-0 items-center gap-2 border-t border-border bg-background px-2 py-2">
-            <span className="select-none font-mono text-sm text-success">$</span>
-            <input
-              value={command}
-              onChange={(event) => setCommand(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void submitCommand();
-                } else if (event.key === "ArrowUp") {
-                  event.preventDefault();
-                  moveHistory(-1);
-                } else if (event.key === "ArrowDown") {
-                  event.preventDefault();
-                  moveHistory(1);
-                }
-              }}
-              disabled={active.status !== "running" || busy}
-              placeholder={active.status === "running" ? t("TerminalPanel.commandPlaceholder") : t("TerminalPanel.restartToContinue")}
-              aria-label={t("TerminalPanel.commandLabel")}
-              className="min-w-0 flex-1 bg-transparent font-mono text-sm text-foreground outline-none placeholder:text-faint disabled:opacity-50"
-              autoComplete="off"
-              spellCheck={false}
-            />
-            <Button size="sm" variant="primary" onClick={() => void submitCommand()} disabled={active.status !== "running" || busy || !command.trim()}>
-              {t("TerminalPanel.run")}
-            </Button>
-          </div>
-        </>
+        </div>
       )}
 
       {attachedNotice && (
@@ -381,7 +456,7 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
                 <AlertTriangle size={13} /> {t("TerminalPanel.evidenceTruncated")}
               </div>
             )}
-            <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-[#0d1117] p-3 font-mono text-xs leading-5 text-[#d1d5db]">
+            <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-surface-2 p-3 font-mono text-xs leading-5 text-foreground">
               {evidencePreview.content}
             </pre>
             <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-end">
@@ -390,6 +465,10 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {sandboxOpen && (
+        <SandboxPanel initialCommand="" onClose={() => setSandboxOpen(false)} />
       )}
     </section>
   );

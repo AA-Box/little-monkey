@@ -1,10 +1,13 @@
 //! Workspace-scoped interactive terminal sessions.
 //!
 //! Each tab owns a real OS pseudoterminal. A tab can only be created for an
-//! exact, currently attached canonical workspace root; start/restart and
-//! every submitted command reuse the existing `run_shell` permission gate.
-//! PTY output is retained in a bounded in-memory tail and mirrored to the
-//! frontend over events. Command history is persisted per canonical root.
+//! exact, currently attached canonical workspace root. These commands are
+//! user-initiated (typed/clicked in the terminal panel), so they carry no
+//! `run_shell` permission gate — the user approving their own keystrokes
+//! protects nothing; that gate exists for the *agent's* shell tool
+//! (tools.rs), which remains fully gated. PTY output is retained in a
+//! bounded in-memory tail and mirrored to the frontend over events. Command
+//! history is persisted per canonical root.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,7 +21,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-use crate::{app_paths, permissions, workspace, AppState};
+use crate::{app_paths, workspace, AppState};
 
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_EVENT_CHUNK_BYTES: usize = 32 * 1024;
@@ -35,6 +38,36 @@ pub enum TerminalStatus {
     Exited,
     Killed,
     Error,
+}
+
+/// Local OS identity shown in the prompt line (`user@host`). Never carries
+/// workspace or secret data — purely cosmetic, read once per app launch.
+#[derive(Clone, Debug, Serialize)]
+pub struct TerminalIdentity {
+    pub user: String,
+    pub host: String,
+}
+
+#[tauri::command]
+pub fn terminal_identity() -> TerminalIdentity {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    let host = std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+    TerminalIdentity { user, host }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -428,14 +461,6 @@ fn spawn_session<R: tauri::Runtime>(
     Ok(view)
 }
 
-fn high_shell_risk(reason: &str) -> Option<permissions::RiskAssessment> {
-    permissions::compute_risk(
-        None,
-        Some("high".to_string()),
-        Some(reason.to_string()),
-    )
-}
-
 #[tauri::command]
 pub async fn terminal_create(
     app: tauri::AppHandle,
@@ -444,21 +469,7 @@ pub async fn terminal_create(
     rows: Option<u16>,
     cols: Option<u16>,
 ) -> Result<TerminalSessionView, String> {
-    let root = exact_workspace_root(state.inner(), &workspace_id)?;
-    permissions::request_permission(
-        &app,
-        state.inner(),
-        "run_shell",
-        format!(
-            "Open an interactive terminal in '{}'.\n\nThe shell runs as your OS user and can access resources outside this workspace. Each command submitted through Little Monkey is separately approval-gated.",
-            root.display()
-        ),
-        None,
-        None,
-        high_shell_risk("Interactive shells can run arbitrary programs with the current user's access"),
-        None,
-    )
-    .await?;
+    exact_workspace_root(state.inner(), &workspace_id)?;
     spawn_session(&app, state.inner(), workspace_id, rows, cols)
 }
 
@@ -471,7 +482,6 @@ pub fn terminal_list(
 
 #[tauri::command]
 pub async fn terminal_execute(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     session_id: String,
     command: String,
@@ -495,26 +505,7 @@ pub async fn terminal_execute(
         return Err("Terminal is not running; restart it before sending a command".to_string());
     }
     exact_workspace_root(state.inner(), &before.workspace_id)?;
-
-    permissions::request_permission(
-        &app,
-        state.inner(),
-        "run_shell",
-        command.clone(),
-        None,
-        None,
-        high_shell_risk("Interactive terminal command with the current user's access"),
-        None,
-    )
-    .await?;
-
-    // Revalidate after the asynchronous approval: the workspace may have
-    // changed or the user may have killed the tab while the modal was open.
-    let after = process.view()?;
-    if after.status != TerminalStatus::Running {
-        return Err("Terminal stopped before the command was approved".to_string());
-    }
-    exact_workspace_root(state.inner(), &after.workspace_id)?;
+    let after = before;
 
     {
         let mut writer = lock(&process.writer, "Terminal input")?;
@@ -528,6 +519,41 @@ pub async fn terminal_execute(
     let _history_guard = lock(&state.terminal.history_lock, "Terminal history")?;
     append_history(&history_path, &after.workspace_id, command)?;
     Ok(())
+}
+
+/// Upper bound for one raw input write — far above any human keystroke burst
+/// or paste the UI should forward in a single IPC call, low enough to keep a
+/// misbehaving caller from queueing unbounded PTY input.
+const MAX_WRITE_BYTES: usize = 64 * 1024;
+
+/// Raw keystroke path for the embedded terminal emulator: bytes go to the
+/// PTY exactly as typed (arrows, tab, control characters, bracketed paste),
+/// so the user's real shell provides its own line editing, history, and
+/// completions. User-initiated like every command in this module — no
+/// permission gate (see the module doc).
+#[tauri::command]
+pub fn terminal_write(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if data.len() > MAX_WRITE_BYTES {
+        return Err(format!(
+            "Input exceeds the {MAX_WRITE_BYTES}-byte terminal write limit"
+        ));
+    }
+    let process = state.terminal.get(&session_id)?;
+    if process.view()?.status != TerminalStatus::Running {
+        return Err("Terminal is not running; restart it before typing".to_string());
+    }
+    let mut writer = lock(&process.writer, "Terminal input")?;
+    writer
+        .write_all(data.as_bytes())
+        .and_then(|_| writer.flush())
+        .map_err(|error| format!("Failed to write terminal input: {error}"))
 }
 
 #[tauri::command]
@@ -581,18 +607,7 @@ pub async fn terminal_restart(
 ) -> Result<TerminalSessionView, String> {
     let old = state.terminal.get(&session_id)?;
     let old_view = old.view()?;
-    let root = exact_workspace_root(state.inner(), &old_view.workspace_id)?;
-    permissions::request_permission(
-        &app,
-        state.inner(),
-        "run_shell",
-        format!("Restart the interactive terminal in '{}'", root.display()),
-        None,
-        None,
-        high_shell_risk("Restarting an interactive shell runs its startup configuration"),
-        None,
-    )
-    .await?;
+    exact_workspace_root(state.inner(), &old_view.workspace_id)?;
     if let Some(process) = state.terminal.remove(&session_id)? {
         let view = process.kill()?;
         emit_status(Some(&app), view);
@@ -768,6 +783,13 @@ mod tests {
                 label: "terminal-test".to_string(),
             });
         state
+    }
+
+    #[test]
+    fn terminal_identity_never_returns_empty_fields() {
+        let identity = terminal_identity();
+        assert!(!identity.user.is_empty());
+        assert!(!identity.host.is_empty());
     }
 
     #[test]

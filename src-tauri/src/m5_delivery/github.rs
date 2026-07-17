@@ -833,6 +833,91 @@ fn run_text_with(
     utf8_stdout(&output)
 }
 
+/// Generic, non-worktree-scoped `gh api <path>` bridge — unlike every other
+/// function in this file (all fixed to the draft-PR-review-comment shapes
+/// M5.4 needs), this is the reusable entry point Knowledge Sync's
+/// `GitHubRepo` connector (`knowledge_service.rs`) calls for arbitrary read
+/// endpoints (repo metadata, commit/compare, git trees, git blobs). Still
+/// goes through the same `GhCliTransport`/`run_gh_process` process boundary
+/// and output cap as every other call in this module, so it inherits the
+/// same "no shell, no stored token, bounded output" posture.
+pub fn gh_api_json(path: &str) -> Result<Value, String> {
+    run_gh_json(vec!["api".to_string(), path.to_string()])
+}
+
+/// Paginated counterpart to `gh_api_json` — appends `--paginate --slurp` so
+/// the GitHub CLI itself walks every `Link: rel="next"` page and hands back
+/// one JSON array-of-pages, which this flattens into a single array capped
+/// at `max_items` (same "stop accumulating rather than erroring" posture as
+/// `list_issue_comments_with`'s own cap). Inbox Triage's GitHub source
+/// (`triage.rs::collect_github`) uses this so its staleness ranking is not
+/// silently limited to whatever single page a plain `per_page` query
+/// returns — a real risk given `sort=updated` ranking is exactly what a
+/// staleness queue needs to see past.
+pub fn gh_api_paginated_json(path: &str, max_items: usize) -> Result<Vec<Value>, String> {
+    gh_api_paginated_json_with(&GhCliTransport, path, max_items)
+}
+
+fn gh_api_paginated_json_with(
+    transport: &impl GitHubTransport,
+    path: &str,
+    max_items: usize,
+) -> Result<Vec<Value>, String> {
+    let value = run_json_with(
+        transport,
+        vec![
+            "api".to_string(),
+            "--paginate".to_string(),
+            "--slurp".to_string(),
+            path.to_string(),
+        ],
+        None,
+    )?;
+    let pages = value
+        .as_array()
+        .ok_or_else(|| "GitHub pagination returned invalid JSON".to_string())?;
+    let mut items = Vec::new();
+    'pages: for page in pages {
+        let page = page
+            .as_array()
+            .ok_or_else(|| "GitHub page is not an array".to_string())?;
+        for entry in page {
+            if items.len() >= max_items {
+                break 'pages;
+            }
+            items.push(entry.clone());
+        }
+    }
+    Ok(items)
+}
+
+/// Generic, non-worktree-scoped `gh api --method POST <path>` bridge —
+/// [`gh_api_json`]'s write counterpart, reused by Inbox Triage's GitHub
+/// comment-posting action (`triage.rs`). Unlike `publish_review_report`
+/// (this file's other comment-posting function), this has no worktree
+/// marker, ownership check, or dedup-by-marker lookup: those exist because
+/// `publish_review_report` posts against a Little-Monkey-owned draft PR
+/// branch, whereas a triage comment targets an arbitrary issue/PR the caller
+/// names directly, exactly like [`gh_api_json`]'s read side. The permission
+/// gate lives one layer up, at the `#[tauri::command]` that calls this — this
+/// function only shapes and sends the `gh` call, same posture as
+/// `gh_api_json`.
+pub fn gh_api_post_json(path: &str, body: &Value) -> Result<Value, String> {
+    let payload = serde_json::to_vec(body).map_err(|error| error.to_string())?;
+    run_json_with(
+        &GhCliTransport,
+        vec![
+            "api".to_string(),
+            "--method".to_string(),
+            "POST".to_string(),
+            path.to_string(),
+            "--input".to_string(),
+            "-".to_string(),
+        ],
+        Some(&payload),
+    )
+}
+
 fn run_gh_process(args: &[String], stdin: Option<&[u8]>) -> Result<GitHubOutput, String> {
     let mut command = Command::new("gh");
     command
@@ -914,6 +999,7 @@ mod tests {
     use crate::m5_delivery::git::{commit_paths, create_owned_worktree, git_text};
     use crate::m5_delivery::store::DeliveryStore;
     use crate::m5_delivery::{ReviewFinding, WorktreeCreateRequest};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -949,6 +1035,12 @@ mod tests {
         patches: usize,
         draft_bodies: Vec<String>,
         calls: Vec<Vec<String>>,
+        /// Canned `gh api <path>` responses, keyed by the exact path
+        /// argument — backs [`gh_api_json_bridges_arbitrary_read_paths_through_the_fixture_transport`],
+        /// which needs to fixture Knowledge Sync's `GitHubRepo` connector
+        /// reads (commit/compare/tree/blob lookups) that none of this
+        /// struct's other hardcoded arms cover.
+        api_responses: HashMap<String, Value>,
     }
 
     struct FakeGitHub {
@@ -996,6 +1088,11 @@ mod tests {
             state.calls.push(args.to_vec());
             if args == ["--version"] {
                 return Ok(Self::success_text("gh version fixture\n"));
+            }
+            if args.get(0).map(String::as_str) == Some("api") {
+                if let Some(response) = args.get(1).and_then(|path| state.api_responses.get(path)) {
+                    return Ok(Self::success_json(response.clone()));
+                }
             }
             if args.get(0).map(String::as_str) == Some("api")
                 && args.get(1).map(String::as_str) == Some("user")
@@ -1096,6 +1193,15 @@ mod tests {
                         }
                     } } }
                 })));
+            }
+            if args.get(0).map(String::as_str) == Some("api")
+                && args.iter().any(|arg| arg == "--paginate")
+                && args.iter().any(|arg| arg.contains("issues?state=open"))
+            {
+                return Ok(Self::success_json(json!([
+                    [ { "number": 1, "title": "Page one item" } ],
+                    [ { "number": 2, "title": "Page two item" } ],
+                ])));
             }
             if args.get(0).map(String::as_str) == Some("api")
                 && args.iter().any(|arg| arg.contains("comments?per_page=100"))
@@ -1347,5 +1453,106 @@ mod tests {
         let body = state.comment_body.as_deref().unwrap();
         assert!(body.contains("Updated report"));
         assert_eq!(body.matches(REPORT_MARKER_PREFIX).count(), 1);
+    }
+
+    // --- generic `gh api <path>` bridge (Knowledge Sync's GitHubRepo connector) --
+
+    #[test]
+    fn gh_api_json_bridges_arbitrary_read_paths_through_the_fixture_transport() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), true);
+        fake.state.lock().unwrap().api_responses.insert(
+            "repos/owner/repo/commits/main".to_string(),
+            json!({ "sha": "deadbeef" }),
+        );
+        fake.state.lock().unwrap().api_responses.insert(
+            "repos/owner/repo/compare/aaa...deadbeef".to_string(),
+            json!({ "files": [
+                { "filename": "docs/readme.md", "status": "modified" },
+                { "filename": "docs/old.md", "status": "removed" },
+            ] }),
+        );
+
+        let commit = run_json_with(
+            &fake,
+            vec!["api".to_string(), "repos/owner/repo/commits/main".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(commit["sha"], "deadbeef");
+
+        let compare = run_json_with(
+            &fake,
+            vec![
+                "api".to_string(),
+                "repos/owner/repo/compare/aaa...deadbeef".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        let files = compare["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["status"], "modified");
+        assert_eq!(files[1]["status"], "removed");
+    }
+
+    #[test]
+    fn gh_api_json_surfaces_unauthenticated_state_for_arbitrary_paths_too() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), false);
+        let error = run_json_with(
+            &fake,
+            vec!["api".to_string(), "repos/owner/repo/commits/main".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("authentication expired"), "{error}");
+    }
+
+    #[test]
+    fn gh_api_paginated_json_flattens_every_page_up_to_the_fixture_transport() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), true);
+        let items = gh_api_paginated_json_with(
+            &fake,
+            "repos/owner/repo/issues?state=open&per_page=100&sort=updated&direction=asc",
+            100,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["number"], 1);
+        assert_eq!(items[1]["number"], 2);
+    }
+
+    #[test]
+    fn gh_api_paginated_json_stops_accumulating_once_max_items_is_reached() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), true);
+        let items = gh_api_paginated_json_with(
+            &fake,
+            "repos/owner/repo/issues?state=open&per_page=100&sort=updated&direction=asc",
+            1,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["number"], 1);
+    }
+
+    #[test]
+    fn gh_api_post_json_bridges_an_arbitrary_write_path_through_the_fixture_transport() {
+        let fake = FakeGitHub::new("deadbeef".to_string(), "main".to_string(), true);
+        let response = run_json_with(
+            &fake,
+            vec![
+                "api".to_string(),
+                "--method".to_string(),
+                "POST".to_string(),
+                "repos/owner/repo/issues/9/comments".to_string(),
+                "--input".to_string(),
+                "-".to_string(),
+            ],
+            Some(br#"{"body":"Draft reply from triage"}"#),
+        )
+        .unwrap();
+        assert_eq!(response["id"], 99);
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.posts, 1);
+        assert_eq!(state.comment_body.as_deref(), Some("Draft reply from triage"));
     }
 }
