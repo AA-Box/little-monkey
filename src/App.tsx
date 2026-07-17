@@ -13,6 +13,7 @@ import { SecurityAutofixPanel } from "./components/SecurityAutofix";
 import { TrustScorecardsPanel } from "./components/TrustScorecards";
 import { SopCompilerPanel } from "./components/SopCompiler";
 import { McpGeneratorPanel } from "./components/McpGenerator";
+import { MigrationAgentPanel } from "./components/MigrationAgent";
 import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
 import { CommandPalette } from "./components/Palette";
@@ -130,6 +131,7 @@ function App() {
   const [trustScorecardsOpen, setTrustScorecardsOpen] = useState(false);
   const [sopCompilerOpen, setSopCompilerOpen] = useState(false);
   const [mcpGeneratorOpen, setMcpGeneratorOpen] = useState(false);
+  const [migrationAgentOpen, setMigrationAgentOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
@@ -168,6 +170,7 @@ function App() {
     setTrustScorecardsOpen(false);
     setSopCompilerOpen(false);
     setMcpGeneratorOpen(false);
+    setMigrationAgentOpen(false);
     setGlobalSearchOpen(false);
     setCommandPaletteOpen(false);
     setAgentInboxOpen(false);
@@ -240,6 +243,8 @@ function App() {
         newSession: () => {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
+          setIssueToPrOpen(false);
+          setMigrationAgentOpen(false);
           setSecurityAutofixOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
@@ -264,6 +269,8 @@ function App() {
         openSettings: () => {
           setRunCenterOpen(false);
           setBrowserWorkbenchOpen(false);
+          setIssueToPrOpen(false);
+          setMigrationAgentOpen(false);
           setSecurityAutofixOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
@@ -490,6 +497,7 @@ function App() {
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
@@ -517,6 +525,7 @@ function App() {
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
@@ -549,6 +558,7 @@ function App() {
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -575,6 +585,7 @@ function App() {
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
@@ -603,6 +614,7 @@ function App() {
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
@@ -659,6 +671,7 @@ function App() {
             setGlobalSearchOpen(false);
             setTrustScorecardsOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
@@ -679,6 +692,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setSopCompilerOpen(false);
+            setMigrationAgentOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
@@ -692,6 +706,22 @@ function App() {
             setSettingsInitialTab(undefined);
             setMcpGeneratorOpen(true);
           }}
+          onOpenMigrationAgent={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setAgentInboxOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setMigrationAgentOpen(true);
+          }}
           onOpenAgentInbox={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -700,6 +730,7 @@ function App() {
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setRedTeamLabOpen(false);
@@ -783,6 +814,7 @@ function App() {
             setIssueToPrOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
@@ -1079,6 +1111,8 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setMigrationAgentOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setSyntheticMonitoringOpen(false);
@@ -1108,7 +1142,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : migrationAgentOpen ? "migration-agent" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -1177,7 +1211,6 @@ function App() {
             <CrossRepoIntelligencePanel onClose={() => setCrossRepoIntelligenceOpen(false)} />
           ) : visualEditModeOpen ? (
             <VisualEditModePanel onClose={() => setVisualEditModeOpen(false)} />
-
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : debateOpen ? (
@@ -1212,6 +1245,15 @@ function App() {
             />
           ) : mcpGeneratorOpen ? (
             <McpGeneratorPanel onClose={() => setMcpGeneratorOpen(false)} />
+          ) : migrationAgentOpen ? (
+            <MigrationAgentPanel
+              onClose={() => setMigrationAgentOpen(false)}
+              onOpenRunCapsule={(runId) => {
+                setMigrationAgentOpen(false);
+                setRunCenterOpen(true);
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
@@ -1240,7 +1282,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !migrationAgentOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

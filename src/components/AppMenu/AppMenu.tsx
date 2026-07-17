@@ -48,6 +48,7 @@ interface AppMenuProps {
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
+  onOpenMigrationAgent: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
@@ -104,6 +105,7 @@ export function AppMenu({
   onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
+  onOpenMigrationAgent,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
@@ -276,6 +278,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
+            icon={<GitBranch size={14} className="text-faint" />}
+            label={t("AppMenu.migrationAgent")}
+            onClick={() => {
+              closeAll();
+              onOpenMigrationAgent();
             }}
           />
           <MenuRow
