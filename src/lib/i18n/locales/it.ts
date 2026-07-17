@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -16,6 +17,24 @@ export const it: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...knowledgeGraphExplorerLocale,
+  // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
+  "AppMenu.knowledgeGraphExplorer": "Esploratore del grafo della conoscenza",
+  "KnowledgeGraphExplorer.title": "Esploratore del grafo della conoscenza",
+  "KnowledgeGraphExplorer.subtitle": "Costruisce un grafo di entità/relazioni dai tuoi stack di conoscenza e dalla chat corrente, poi risponde a \"come è collegato X a Y?\" con le prove di origine a supporto.",
+  "KnowledgeGraphExplorer.close": "Chiudi Esploratore del grafo della conoscenza",
+  "KnowledgeGraphExplorer.sourcesLabel": "Fonti:",
+  "KnowledgeGraphExplorer.noStacks": "Ancora nessuno stack di conoscenza — aggiungine uno nelle Impostazioni, oppure costruisci il grafo dalla chat corrente qui sotto.",
+  "KnowledgeGraphExplorer.includeSession": "Includi la chat corrente ({{title}})",
+  "KnowledgeGraphExplorer.buildButton": "Costruisci grafo",
+  "KnowledgeGraphExplorer.partialBuildHeading": "Alcune fonti non hanno potuto essere incluse in questa build:",
+  "KnowledgeGraphExplorer.queryLabel": "Fai una domanda sulla relazione",
+  "KnowledgeGraphExplorer.queryPlaceholder": "Come è collegata Alice a auth.ts?",
+  "KnowledgeGraphExplorer.askButton": "Chiedi",
+  "KnowledgeGraphExplorer.emptyGraph": "Ancora nessun grafo — scegli le fonti sopra e clicca su \"Costruisci grafo\".",
+  "KnowledgeGraphExplorer.evidenceHeading": "Prove",
+  "KnowledgeGraphExplorer.evidenceEmpty": "Fai una domanda sulla relazione qui sopra per vedere qui il percorso e le relative prove di origine.",
+  "KnowledgeGraphExplorer.noEvidence": "Nessun frammento di prova registrato per questo percorso.",
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,

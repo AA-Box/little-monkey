@@ -11,6 +11,7 @@ import {
   HelpCircle,
   ListTodo,
   Inbox,
+  Network,
   Newspaper,
   Search,
   ServerCog,
@@ -35,6 +36,7 @@ interface AppMenuProps {
   onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
+  onOpenKnowledgeGraph: () => void;
   onOpenTerminal: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
@@ -77,6 +79,7 @@ export function AppMenu({
   onOpenMcpGenerator,
   onOpenSideTasks,
   onOpenAgentInbox,
+  onOpenKnowledgeGraph,
   onOpenTerminal,
   onOpenEvidenceBoard,
   onOpenDebate,
@@ -196,6 +199,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.knowledgeGraphExplorer")}
+            onClick={() => {
+              closeAll();
+              onOpenKnowledgeGraph();
             }}
           />
           <MenuRow
