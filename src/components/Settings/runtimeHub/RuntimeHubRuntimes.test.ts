@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { keepAliveForRuntime } from "./RuntimeHubRuntimes";
+import type {
+  HardwareSnapshot,
+  M3InstalledModel,
+  M3RuntimeCapability,
+  RunningModel,
+  RuntimeStatus,
+} from "../../../lib/runtimeHubClient";
+import type { RuntimeDetail } from "../../../store/runtimeHubStore";
+import { buildOffloadPlanInput, keepAliveForRuntime } from "./RuntimeHubRuntimes";
 
 describe("runtime load keep-alive policy", () => {
   it("never sends keep_alive to managed llama.cpp", () => {
@@ -25,5 +33,174 @@ describe("runtime load keep-alive policy", () => {
       mode: "duration_ms",
       milliseconds: 86_400_000,
     });
+  });
+});
+
+const GIB = 1024 ** 3;
+
+function hardware(): HardwareSnapshot {
+  return {
+    captured_at_ms: 1,
+    total_ram_bytes: 32 * GIB,
+    available_ram_bytes: 20 * GIB,
+    logical_cpu_count: 8,
+    platform: {
+      os: "linux",
+      arch: "x86_64",
+      supported_runtimes: ["ollama", "llama_cpp"],
+      accelerators: [
+        { kind: "cpu", available: true, device_names: [], total_memory_bytes: null, available_memory_bytes: null },
+      ],
+    },
+  };
+}
+
+function installedModel(overrides: Partial<M3InstalledModel> = {}): M3InstalledModel {
+  return {
+    assetId: "ollama:target:q4",
+    modelId: "target",
+    displayName: "Target model",
+    runtime: "ollama",
+    variantId: "q4",
+    capabilities: { chat: true, embeddings: false, toolCalling: false, vision: false, structuredOutput: false },
+    estimatedRamBytes: 5 * GIB,
+    estimatedVramBytes: 0,
+    requiredAccelerator: null,
+    activeVersionKey: "a".repeat(64),
+    versions: [
+      {
+        versionKey: "a".repeat(64),
+        revision: "1",
+        sha256: "b".repeat(64),
+        sizeBytes: 4 * GIB,
+        artifactPath: "/models/target",
+        installedAtMs: 1,
+        active: true,
+        license: {
+          name: "MIT",
+          spdxId: "MIT",
+          sourceUrl: "https://example.com/license",
+          revision: "1",
+          retrievedAtMs: 1,
+          rawDeclaration: "MIT",
+        },
+        sourceId: "test-source",
+        template: null,
+        projector: null,
+        catalogRetrievedAtMs: null,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function runtimeCapability(runtimeId: string, kind: M3RuntimeCapability["descriptor"]["kind"]): M3RuntimeCapability {
+  return {
+    descriptor: {
+      runtimeId,
+      kind,
+      label: runtimeId,
+      managed: false,
+      apiBackend: kind === "mlx" ? "mlx" : kind === "ollama" ? "ollama" : "managed_local",
+    },
+    canLoad: true,
+    canUnload: true,
+    canLogs: false,
+    canMetrics: true,
+    canInfer: true,
+    settings: [],
+  };
+}
+
+function runtimeStatus(runtimeId: string, kind: "ollama" | "llama_cpp"): RuntimeStatus {
+  return {
+    runtime: {
+      schema_version: 1,
+      runtime_id: runtimeId,
+      kind,
+      label: runtimeId,
+      endpoint: null,
+      managed: false,
+    },
+    state: "ready",
+    version: null,
+    process: null,
+    message: null,
+    checked_at_ms: 1,
+  };
+}
+
+function resident(modelId: string, memoryBytes: number, vramBytes: number): RunningModel {
+  return {
+    runtime_id: "other",
+    model_id: modelId,
+    size_bytes: memoryBytes,
+    memory_bytes: memoryBytes,
+    vram_bytes: vramBytes,
+    digest: null,
+    expires_at: null,
+    ownership: "app_managed",
+  };
+}
+
+describe("buildOffloadPlanInput", () => {
+  it("uses the active installed version's exact size as weights and reports no residents", () => {
+    const model = installedModel();
+    const input = buildOffloadPlanInput(hardware(), model, [], {});
+
+    expect(input.model.weights_bytes).toBe(4 * GIB);
+    expect(input.model.estimated_ram_bytes).toBe(5 * GIB);
+    expect(input.model.estimated_vram_bytes).toBe(0);
+    expect(input.model.required_accelerator).toBeNull();
+    expect(input.model.has_vision_projector).toBe(false);
+    expect(input.reserved).toEqual({ ram_bytes: 0, vram_bytes: 0 });
+    expect(input.other_resident_count).toBe(0);
+    expect(input.requested_context_tokens).toBeNull();
+  });
+
+  it("sums memory from every other resident model across runtimes but excludes the target model itself", () => {
+    const model = installedModel();
+    const runtimeA = runtimeCapability("ollama-main", "ollama");
+    const runtimeB = runtimeCapability("managed-llama", "llama_cpp");
+    const runtimeDetails: Record<string, RuntimeDetail> = {
+      "ollama-main": {
+        status: {
+          runtimeType: "adapter",
+          status: runtimeStatus("ollama-main", "ollama"),
+          running_models: [resident("target", 4 * GIB, 0), resident("other-model", 2 * GIB, 1 * GIB)],
+        },
+      },
+      "managed-llama": {
+        status: {
+          runtimeType: "adapter",
+          status: runtimeStatus("managed-llama", "llama_cpp"),
+          running_models: [resident("third-model", 1 * GIB, 0)],
+        },
+      },
+    };
+
+    const input = buildOffloadPlanInput(hardware(), model, [runtimeA, runtimeB], runtimeDetails);
+
+    // "target" is already resident under the same model id (e.g. re-loading
+    // with a fresh setting); it must not count against itself as a reserve.
+    expect(input.other_resident_count).toBe(2);
+    expect(input.reserved).toEqual({ ram_bytes: 3 * GIB, vram_bytes: 1 * GIB });
+  });
+
+  it("falls back to the estimated RAM figure when no active version is recorded", () => {
+    const model = installedModel({ versions: [] });
+    const input = buildOffloadPlanInput(hardware(), model, [], {});
+    expect(input.model.weights_bytes).toBe(5 * GIB);
+  });
+
+  it("forwards vision capability and requested context tokens", () => {
+    const model = installedModel({
+      capabilities: { chat: true, embeddings: false, toolCalling: false, vision: true, structuredOutput: false },
+      requiredAccelerator: "cuda",
+    });
+    const input = buildOffloadPlanInput(hardware(), model, [], {}, 16_384);
+    expect(input.model.has_vision_projector).toBe(true);
+    expect(input.model.required_accelerator).toBe("cuda");
+    expect(input.requested_context_tokens).toBe(16_384);
   });
 });

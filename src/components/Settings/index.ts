@@ -7,3 +7,4 @@ export * from "./CompanionPanel";
 export * from "./NativeSkillsManager";
 export * from "./SecurityDoctorPanel";
 export * from "./AppearancePanel";
+export * from "./DesktopControlPanel";
