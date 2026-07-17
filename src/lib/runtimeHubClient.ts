@@ -810,6 +810,40 @@ export interface ConversionReport {
   eval: QuantizationEvalResult;
 }
 
+// --- Runtime PR Watcher and Capability Feed (ROADMAP.md Phase 8) ---
+
+export type PrTopic =
+  | "gguf_quantization"
+  | "chat_template_tool_calling"
+  | "api_routes"
+  | "hardware_gpu_backends"
+  | "kv_cache_context"
+  | "model_manifest_registry";
+
+export interface RelevantPrEntry {
+  number: number;
+  title: string;
+  url: string;
+  merged: boolean;
+  topic: PrTopic;
+  suggestedAction: string;
+}
+
+export interface RuntimePrWatcherState {
+  schemaVersion: number;
+  sourceRepo: string;
+  lastCheckedAtMs: number | null;
+  lastCheckError: string | null;
+  lastSeenPrNumber: number | null;
+  relevantPrs: RelevantPrEntry[];
+}
+
+export interface RuntimePrWatcherCheckResult {
+  state: RuntimePrWatcherState;
+  newlyRelevant: RelevantPrEntry[];
+  scannedCount: number;
+}
+
 export interface OperationArgs extends Record<string, unknown> {
   operationId: string;
   timeoutMs?: number | null;
@@ -926,4 +960,7 @@ export const runtimeHubClient = {
   componentActivateVersion: (
     args: OperationArgs & { request: { componentId: string; versionKey: string } },
   ) => invoke<M3InstalledComponent>("m3_component_activate_version", args),
+  runtimePrWatcherState: () => invoke<RuntimePrWatcherState>("runtime_pr_watcher_state"),
+  runtimePrWatcherCheckNow: () =>
+    invoke<RuntimePrWatcherCheckResult>("runtime_pr_watcher_check_now"),
 };

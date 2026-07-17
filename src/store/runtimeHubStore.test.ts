@@ -52,6 +52,8 @@ const mocks = vi.hoisted(() => ({
     quantizationQuantTypes: vi.fn(),
     quantizationConvertPath: vi.fn(),
     quantizationConvertInstalledModel: vi.fn(),
+    runtimePrWatcherState: vi.fn(),
+    runtimePrWatcherCheckNow: vi.fn(),
   },
 }));
 
@@ -157,6 +159,8 @@ beforeEach(() => {
     quantizationBackends: [],
     quantizationQuantTypes: [],
     quantizationReports: [],
+    prWatcherState: null,
+    prWatcherLastResult: null,
     loaded: false,
   });
 });
@@ -387,5 +391,61 @@ describe("runtimeHubStore", () => {
       useRuntimeHubStore.getState().convertInstalledModelQuantization("ollama:qwen:q4", null, "Q6_K", true),
     ).rejects.toThrow("no backend");
     expect(useRuntimeHubStore.getState().errors["quantization-convert"]).toContain("no backend");
+  });
+
+  it("loads the persisted runtime PR watcher state without triggering a network check", async () => {
+    const state = {
+      schemaVersion: 1,
+      sourceRepo: "ollama/ollama",
+      lastCheckedAtMs: 1_000,
+      lastCheckError: null,
+      lastSeenPrNumber: 20,
+      relevantPrs: [],
+    };
+    mocks.client.runtimePrWatcherState.mockResolvedValue(state);
+
+    await useRuntimeHubStore.getState().refreshPrWatcher();
+
+    expect(useRuntimeHubStore.getState().prWatcherState).toEqual(state);
+    expect(mocks.client.runtimePrWatcherCheckNow).not.toHaveBeenCalled();
+  });
+
+  it("checks now and stores both the updated state and the latest result", async () => {
+    const entry = {
+      number: 22,
+      title: "add /api/embed endpoint",
+      url: "https://github.com/ollama/ollama/pull/22",
+      merged: true,
+      topic: "api_routes",
+      suggestedAction: "Review whether Little Monkey's API compatibility harness still matches this route.",
+    };
+    const result = {
+      state: {
+        schemaVersion: 1,
+        sourceRepo: "ollama/ollama",
+        lastCheckedAtMs: 2_000,
+        lastCheckError: null,
+        lastSeenPrNumber: 22,
+        relevantPrs: [entry],
+      },
+      newlyRelevant: [entry],
+      scannedCount: 30,
+    };
+    mocks.client.runtimePrWatcherCheckNow.mockResolvedValue(result);
+
+    await useRuntimeHubStore.getState().checkPrWatcherNow();
+
+    expect(useRuntimeHubStore.getState().prWatcherState).toEqual(result.state);
+    expect(useRuntimeHubStore.getState().prWatcherLastResult).toEqual(result);
+  });
+
+  it("surfaces a check-now failure (e.g. GitHub rate limiting) as an error without crashing", async () => {
+    mocks.client.runtimePrWatcherCheckNow.mockRejectedValueOnce(
+      new Error("GitHub's public API rate limit was hit while checking for upstream changes. Wait a while and try again."),
+    );
+
+    await expect(useRuntimeHubStore.getState().checkPrWatcherNow()).rejects.toThrow("rate limit");
+
+    expect(useRuntimeHubStore.getState().errors["pr-watcher-check"]).toContain("rate limit");
   });
 });

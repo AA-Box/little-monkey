@@ -1,5 +1,5 @@
 import { useEffect, type KeyboardEvent } from "react";
-import { Activity, BookOpen, Boxes, Cpu, FlaskConical, Network, PackageCheck, RefreshCw, ServerCog, type LucideIcon } from "lucide-react";
+import { Activity, BookOpen, Boxes, Cpu, FlaskConical, GitPullRequestArrow, Network, PackageCheck, RefreshCw, ServerCog, type LucideIcon } from "lucide-react";
 import { useRuntimeHubStore, type RuntimeHubSection } from "../../store/runtimeHubStore";
 import { BusyButton, ErrorNotice } from "./runtimeHub/RuntimeHubShared";
 import { RuntimeHubOverview } from "./runtimeHub/RuntimeHubOverview";
@@ -10,6 +10,7 @@ import { RuntimeHubRuntimes } from "./runtimeHub/RuntimeHubRuntimes";
 import { RuntimeHubApi } from "./runtimeHub/RuntimeHubApi";
 import { RuntimeHubLan } from "./runtimeHub/RuntimeHubLan";
 import { RuntimeHubQuantization } from "./runtimeHub/RuntimeHubQuantization";
+import { RuntimeHubUpstreamWatcher } from "./runtimeHub/RuntimeHubUpstreamWatcher";
 
 const SECTIONS: Array<{ id: RuntimeHubSection; label: string; icon: LucideIcon }> = [
   { id: "overview", label: "Overview", icon: Activity },
@@ -20,6 +21,7 @@ const SECTIONS: Array<{ id: RuntimeHubSection; label: string; icon: LucideIcon }
   { id: "quantization", label: "Quantization", icon: FlaskConical },
   { id: "api", label: "API", icon: ServerCog },
   { id: "lan", label: "LAN", icon: Network },
+  { id: "upstream-watcher", label: "Upstream Watcher", icon: GitPullRequestArrow },
 ];
 
 export function RuntimeHubPanel() {
@@ -66,7 +68,7 @@ export function RuntimeHubPanel() {
       <div
         role="tablist"
         aria-label="Runtime Hub sections"
-        className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-surface p-1 sm:grid-cols-3 xl:grid-cols-7"
+        className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-surface p-1 sm:grid-cols-3 xl:grid-cols-9"
       >
         {SECTIONS.map((entry, index) => {
           const Icon = entry.icon;
@@ -108,6 +110,7 @@ export function RuntimeHubPanel() {
           {section === "quantization" && <RuntimeHubQuantization />}
           {section === "api" && <RuntimeHubApi />}
           {section === "lan" && <RuntimeHubLan />}
+          {section === "upstream-watcher" && <RuntimeHubUpstreamWatcher />}
         </>
       )}
     </div>

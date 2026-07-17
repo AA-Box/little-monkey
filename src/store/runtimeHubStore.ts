@@ -42,12 +42,23 @@ import {
   type QuantTypeDescriptor,
   type RuntimeInventory,
   type RuntimeLogTail,
+  type RuntimePrWatcherCheckResult,
+  type RuntimePrWatcherState,
   type ScopedToken,
   type SecurityAuditEvent,
   type SettingValue,
 } from "../lib/runtimeHubClient";
 
-export type RuntimeHubSection = "overview" | "models" | "components" | "catalogs" | "runtimes" | "api" | "lan" | "quantization";
+export type RuntimeHubSection =
+  | "overview"
+  | "models"
+  | "components"
+  | "catalogs"
+  | "runtimes"
+  | "api"
+  | "lan"
+  | "quantization"
+  | "upstream-watcher";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -105,6 +116,13 @@ interface RuntimeHubStoreState {
    * `TemplateFamily::detect`), not something the frontend re-implements. */
   chatTemplateLabReports: Record<string, ChatTemplateLabReport>;
   offloadPlans: Record<string, OffloadPlan>;
+  /** The persisted Runtime PR Watcher report — `null` until
+   * `refreshPrWatcher`/`checkPrWatcherNow` has loaded it at least once. */
+  prWatcherState: RuntimePrWatcherState | null;
+  /** The most recent `checkPrWatcherNow` result, kept separately from
+   * `prWatcherState.relevantPrs` (which accumulates across every check) so
+   * the UI can show "N new since last check" for just this run. */
+  prWatcherLastResult: RuntimePrWatcherCheckResult | null;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -156,6 +174,8 @@ interface RuntimeHubStoreState {
     quantChoice: string,
     allowRequantize: boolean,
   ) => Promise<void>;
+  refreshPrWatcher: () => Promise<void>;
+  checkPrWatcherNow: () => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -318,6 +338,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     quantizationReports: [],
     chatTemplateLabReports: {},
     offloadPlans: {},
+    prWatcherState: null,
+    prWatcherLastResult: null,
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -990,6 +1012,34 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           allowRequantize,
         });
         set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    refreshPrWatcher: async () => {
+      const key = "pr-watcher-refresh";
+      begin(key);
+      try {
+        const prWatcherState = await runtimeHubClient.runtimePrWatcherState();
+        set({ prWatcherState });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    checkPrWatcherNow: async () => {
+      const key = "pr-watcher-check";
+      begin(key);
+      try {
+        const result = await runtimeHubClient.runtimePrWatcherCheckNow();
+        set({ prWatcherState: result.state, prWatcherLastResult: result });
       } catch (error) {
         fail(key, error);
         throw error;
