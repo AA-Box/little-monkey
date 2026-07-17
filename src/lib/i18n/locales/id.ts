@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
@@ -19,6 +20,50 @@ export const id: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...diagnosticsLocale,
+  // Real Indonesian translations for the Self-Healing Diagnostics feature,
+  // overriding diagnosticsLocale's English defaults above.
+  "SettingsModal.tabDiagnostics": "Diagnostik",
+  "DiagnosticsPanel.title": "Diagnostik penyembuhan mandiri",
+  "DiagnosticsPanel.description": "Periksa apakah layanan yang dikelola sendiri oleh Little Monkey benar-benar dapat dijangkau — model lokal, server API lokal, server MCP, keychain OS, indeks pengetahuan, dan otomatisasi latar belakang. Pemeriksaan bersifat hanya-baca; perbaikan selalu merupakan langkah terpisah dan eksplisit.",
+  "DiagnosticsPanel.runDiagnosis": "Jalankan diagnosis",
+  "DiagnosticsPanel.rerun": "Jalankan lagi",
+  "DiagnosticsPanel.exportBundle": "Ekspor paket dukungan",
+  "DiagnosticsPanel.applyFix": "Terapkan perbaikan aman",
+  "DiagnosticsPanel.fixableBadge": "Perbaikan aman tersedia",
+  "DiagnosticsPanel.emptyTitle": "Jalankan diagnosis untuk melihat status saat ini",
+  "DiagnosticsPanel.emptyBody": "Belum ada yang diperiksa dalam sesi ini.",
+  "DiagnosticsPanel.generatedAt": "Diperiksa {{time}}",
+  "DiagnosticsPanel.healthyStatus": "Tidak ada peringatan atau temuan kritis yang tertunda",
+  "DiagnosticsPanel.unhealthyStatus": "{{critical}} kritis dan {{warnings}} temuan peringatan",
+  "DiagnosticsPanel.summaryPassed": "Lulus",
+  "DiagnosticsPanel.summaryWarnings": "Peringatan",
+  "DiagnosticsPanel.summaryCritical": "Kritis",
+  "DiagnosticsPanel.summaryFixed": "Diperbaiki",
+  "DiagnosticsPanel.summaryInfo": "Info",
+  "DiagnosticsPanel.summaryNotConfigured": "Tidak tersedia",
+  "DiagnosticsPanel.statusPass": "lulus",
+  "DiagnosticsPanel.statusInfo": "info",
+  "DiagnosticsPanel.statusWarning": "peringatan",
+  "DiagnosticsPanel.statusCritical": "kritis",
+  "DiagnosticsPanel.statusFixed": "diperbaiki",
+  "DiagnosticsPanel.statusNotConfigured": "tidak tersedia",
+  "DiagnosticsPanel.remediationLabel": "Langkah berikutnya",
+  "DiagnosticsPanel.dismiss": "Abaikan",
+  "DiagnosticsPanel.bundleTitle": "Paket dukungan",
+  "DiagnosticsPanel.bundleDescription": "Cuplikan yang telah disamarkan dari diagnosis ini beserta versi aplikasi dan platform Anda — tanpa prompt, obrolan, atau rahasia. Salin ke permintaan dukungan.",
+  "DiagnosticsPanel.bundleCopy": "Salin ke clipboard",
+  "DiagnosticsPanel.bundleCopied": "Disalin",
+  "DiagnosticsPanel.subsystemOllama": "Ollama",
+  "DiagnosticsPanel.subsystemLlama": "Model obrolan lokal",
+  "DiagnosticsPanel.subsystemEmbedLlama": "Model embedding lokal",
+  "DiagnosticsPanel.subsystemApiServer": "Server API lokal",
+  "DiagnosticsPanel.subsystemMcp": "Server MCP",
+  "DiagnosticsPanel.subsystemKnowledgeIndex": "Indeks pengetahuan",
+  "DiagnosticsPanel.subsystemAutomationDaemon": "Otomatisasi latar belakang",
+  "DiagnosticsPanel.subsystemKeychain": "Keychain OS",
+  "DiagnosticsPanel.subsystemConnectors": "Konektor",
+  "DiagnosticsPanel.subsystemRemotePairing": "Pemasangan jarak jauh / seluler",
   ...teamModeLocale,
   // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
   "SettingsModal.tabTeamMode": "Tim",

@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
@@ -19,6 +20,50 @@ export const esES: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...diagnosticsLocale,
+  // Real Peninsular Spanish translations for the Self-Healing Diagnostics
+  // feature, overriding diagnosticsLocale's English defaults above.
+  "SettingsModal.tabDiagnostics": "Diagnósticos",
+  "DiagnosticsPanel.title": "Diagnósticos autorreparables",
+  "DiagnosticsPanel.description": "Comprueba si los servicios que Little Monkey gestiona por sí mismo son realmente accesibles: modelos locales, el servidor API local, los servidores MCP, el llavero del sistema, los índices de conocimiento y la automatización en segundo plano. Las comprobaciones son de solo lectura; las reparaciones siempre son un paso aparte y explícito.",
+  "DiagnosticsPanel.runDiagnosis": "Ejecutar diagnóstico",
+  "DiagnosticsPanel.rerun": "Volver a ejecutar",
+  "DiagnosticsPanel.exportBundle": "Exportar paquete de soporte",
+  "DiagnosticsPanel.applyFix": "Aplicar reparación segura",
+  "DiagnosticsPanel.fixableBadge": "Reparación segura disponible",
+  "DiagnosticsPanel.emptyTitle": "Ejecuta un diagnóstico para ver el estado actual",
+  "DiagnosticsPanel.emptyBody": "Todavía no se ha comprobado nada en esta sesión.",
+  "DiagnosticsPanel.generatedAt": "Comprobado {{time}}",
+  "DiagnosticsPanel.healthyStatus": "Sin advertencias ni resultados críticos pendientes",
+  "DiagnosticsPanel.unhealthyStatus": "{{critical}} crítico(s) y {{warnings}} advertencia(s)",
+  "DiagnosticsPanel.summaryPassed": "Correcto",
+  "DiagnosticsPanel.summaryWarnings": "Advertencias",
+  "DiagnosticsPanel.summaryCritical": "Crítico",
+  "DiagnosticsPanel.summaryFixed": "Reparado",
+  "DiagnosticsPanel.summaryInfo": "Información",
+  "DiagnosticsPanel.summaryNotConfigured": "No disponible",
+  "DiagnosticsPanel.statusPass": "correcto",
+  "DiagnosticsPanel.statusInfo": "información",
+  "DiagnosticsPanel.statusWarning": "advertencia",
+  "DiagnosticsPanel.statusCritical": "crítico",
+  "DiagnosticsPanel.statusFixed": "reparado",
+  "DiagnosticsPanel.statusNotConfigured": "no disponible",
+  "DiagnosticsPanel.remediationLabel": "Siguiente paso",
+  "DiagnosticsPanel.dismiss": "Descartar",
+  "DiagnosticsPanel.bundleTitle": "Paquete de soporte",
+  "DiagnosticsPanel.bundleDescription": "Una instantánea redactada de este diagnóstico junto con la versión de la app y la plataforma; sin instrucciones, chats ni secretos. Cópiala en una solicitud de soporte.",
+  "DiagnosticsPanel.bundleCopy": "Copiar al portapapeles",
+  "DiagnosticsPanel.bundleCopied": "Copiado",
+  "DiagnosticsPanel.subsystemOllama": "Ollama",
+  "DiagnosticsPanel.subsystemLlama": "Modelo de chat local",
+  "DiagnosticsPanel.subsystemEmbedLlama": "Modelo de embeddings local",
+  "DiagnosticsPanel.subsystemApiServer": "Servidor API local",
+  "DiagnosticsPanel.subsystemMcp": "Servidores MCP",
+  "DiagnosticsPanel.subsystemKnowledgeIndex": "Índices de conocimiento",
+  "DiagnosticsPanel.subsystemAutomationDaemon": "Automatización en segundo plano",
+  "DiagnosticsPanel.subsystemKeychain": "Llavero del sistema",
+  "DiagnosticsPanel.subsystemConnectors": "Conectores",
+  "DiagnosticsPanel.subsystemRemotePairing": "Emparejamiento remoto / móvil",
   ...teamModeLocale,
   // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
   "SettingsModal.tabTeamMode": "Equipo",

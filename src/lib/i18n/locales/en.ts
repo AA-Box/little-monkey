@@ -11,6 +11,7 @@ import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
+import { diagnosticsLocale } from "./diagnostics";
 import { redTeamLabLocale } from "./redTeamLab";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
@@ -31,6 +32,7 @@ export const en: Record<string, string> = {
   ...mcpGeneratorLocale,
   ...specScorerLocale,
   ...inboxLocale,
+  ...diagnosticsLocale,
   ...redTeamLabLocale,
   ...teamModeLocale,
   ...knowledgeGraphExplorerLocale,

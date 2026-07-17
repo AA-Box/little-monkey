@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
@@ -19,6 +20,50 @@ export const ja: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...diagnosticsLocale,
+  // Real Japanese translations for the Self-Healing Diagnostics feature,
+  // overriding diagnosticsLocale's English defaults above.
+  "SettingsModal.tabDiagnostics": "診断",
+  "DiagnosticsPanel.title": "セルフヒーリング診断",
+  "DiagnosticsPanel.description": "Little Monkey自身が管理するサービスに実際に到達できるかを確認します — ローカルモデル、ローカルAPIサーバー、MCPサーバー、OSキーチェーン、ナレッジインデックス、バックグラウンド自動化。チェックは読み取り専用です。修正は常に別の明示的な手順です。",
+  "DiagnosticsPanel.runDiagnosis": "診断を実行",
+  "DiagnosticsPanel.rerun": "再実行",
+  "DiagnosticsPanel.exportBundle": "サポートバンドルをエクスポート",
+  "DiagnosticsPanel.applyFix": "安全な修正を適用",
+  "DiagnosticsPanel.fixableBadge": "安全な修正が利用可能",
+  "DiagnosticsPanel.emptyTitle": "現在の状態を確認するには診断を実行してください",
+  "DiagnosticsPanel.emptyBody": "このセッションではまだ何も確認されていません。",
+  "DiagnosticsPanel.generatedAt": "確認日時 {{time}}",
+  "DiagnosticsPanel.healthyStatus": "未解決の警告や重大な問題はありません",
+  "DiagnosticsPanel.unhealthyStatus": "重大な問題 {{critical}} 件、警告 {{warnings}} 件",
+  "DiagnosticsPanel.summaryPassed": "合格",
+  "DiagnosticsPanel.summaryWarnings": "警告",
+  "DiagnosticsPanel.summaryCritical": "重大",
+  "DiagnosticsPanel.summaryFixed": "修正済み",
+  "DiagnosticsPanel.summaryInfo": "情報",
+  "DiagnosticsPanel.summaryNotConfigured": "未対応",
+  "DiagnosticsPanel.statusPass": "合格",
+  "DiagnosticsPanel.statusInfo": "情報",
+  "DiagnosticsPanel.statusWarning": "警告",
+  "DiagnosticsPanel.statusCritical": "重大",
+  "DiagnosticsPanel.statusFixed": "修正済み",
+  "DiagnosticsPanel.statusNotConfigured": "未対応",
+  "DiagnosticsPanel.remediationLabel": "次のステップ",
+  "DiagnosticsPanel.dismiss": "閉じる",
+  "DiagnosticsPanel.bundleTitle": "サポートバンドル",
+  "DiagnosticsPanel.bundleDescription": "この診断結果に加え、アプリのバージョンとプラットフォームを含む編集済みのスナップショットです。プロンプト、チャット、秘密情報は含まれません。サポート依頼に貼り付けてください。",
+  "DiagnosticsPanel.bundleCopy": "クリップボードにコピー",
+  "DiagnosticsPanel.bundleCopied": "コピーしました",
+  "DiagnosticsPanel.subsystemOllama": "Ollama",
+  "DiagnosticsPanel.subsystemLlama": "ローカルチャットモデル",
+  "DiagnosticsPanel.subsystemEmbedLlama": "ローカル埋め込みモデル",
+  "DiagnosticsPanel.subsystemApiServer": "ローカルAPIサーバー",
+  "DiagnosticsPanel.subsystemMcp": "MCPサーバー",
+  "DiagnosticsPanel.subsystemKnowledgeIndex": "ナレッジインデックス",
+  "DiagnosticsPanel.subsystemAutomationDaemon": "バックグラウンド自動化",
+  "DiagnosticsPanel.subsystemKeychain": "OSキーチェーン",
+  "DiagnosticsPanel.subsystemConnectors": "コネクタ",
+  "DiagnosticsPanel.subsystemRemotePairing": "リモートペアリング / モバイル",
   ...teamModeLocale,
   // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
   "SettingsModal.tabTeamMode": "チーム",
