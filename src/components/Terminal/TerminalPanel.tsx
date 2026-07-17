@@ -49,9 +49,24 @@ function xtermTheme(): {
 interface TerminalPanelProps {
   chatSessionId: string;
   onClose: () => void;
+  /** Controlled fullscreen state — pass this (with `onFullscreenChange`) when
+   * an external control (App.tsx's right-sidebar fullscreen button, for the
+   * right-docked case) owns the toggle instead of the panel's own header
+   * button. Omitted for the bottom-docked usage, which keeps managing
+   * fullscreen internally exactly as before. */
+  fullscreen?: boolean;
+  onFullscreenChange?: (value: boolean) => void;
+  /** Hides the panel's own Maximize/Minimize button — set alongside the
+   * controlled props above so fullscreen isn't toggleable from two places
+   * at once when App.tsx's button already covers it. */
+  hideFullscreenButton?: boolean;
+  /** Renders as a fill-the-parent tab body (the right sidebar's Terminal
+   * tab): no own width/height, no fixed-position fullscreen, no resize
+   * handle — the hosting region owns all of those. */
+  embedded?: boolean;
 }
 
-export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
+export function TerminalPanel({ chatSessionId, onClose, fullscreen, onFullscreenChange, hideFullscreenButton, embedded }: TerminalPanelProps) {
   const { t } = useT();
   const roots = useWorkspaceStore((state) => state.roots);
   const sessions = useTerminalStore((state) => state.sessions);
@@ -78,7 +93,9 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   const [evidencePreview, setEvidencePreview] = useState<ReturnType<typeof buildTerminalEvidence> | null>(null);
   const [attachedNotice, setAttachedNotice] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  const [localExpanded, setLocalExpanded] = useState(false);
+  const expanded = fullscreen ?? localExpanded;
+  const setExpanded = onFullscreenChange ?? setLocalExpanded;
 
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -251,16 +268,18 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   return (
     <section
       className={`flex flex-col overflow-hidden border-border bg-background ${
-        expanded
-          ? "fixed inset-0 z-40 border"
-          : dock === "bottom"
-            ? "relative min-h-44 shrink-0 rounded-t-xl border shadow-sm"
-            : "relative h-full min-w-56 shrink-0 border-l"
+        embedded
+          ? "relative h-full min-h-0 w-full"
+          : expanded
+            ? "fixed inset-x-0 bottom-0 top-11 z-40 border"
+            : dock === "bottom"
+              ? "relative min-h-44 shrink-0 rounded-t-xl border shadow-sm"
+              : "relative h-full min-w-56 shrink-0 border-l"
       }`}
-      style={expanded ? undefined : dock === "bottom" ? { height: panelSize.bottom } : { width: panelSize.right }}
+      style={embedded || expanded ? undefined : dock === "bottom" ? { height: panelSize.bottom } : { width: panelSize.right }}
       aria-label={t("TerminalPanel.title")}
     >
-      {!expanded && (
+      {!expanded && !embedded && (
         <div
           role="separator"
           aria-orientation={dock === "bottom" ? "horizontal" : "vertical"}
@@ -331,15 +350,17 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
         >
           {dock === "bottom" ? <PanelRight size={14} /> : <PanelBottom size={14} />}
         </IconButton>
+        {!hideFullscreenButton && (
         <IconButton
           size="sm"
           variant="ghost"
-          onClick={() => setExpanded((value) => !value)}
+          onClick={() => setExpanded(!expanded)}
           aria-label={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
           title={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
         >
           {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
         </IconButton>
+        )}
         <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("TerminalPanel.closePanel")}>
           <X size={14} />
         </IconButton>

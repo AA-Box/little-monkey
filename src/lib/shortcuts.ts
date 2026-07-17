@@ -83,6 +83,57 @@ export const SHORTCUTS = [
     bindings: [{ key: "k", code: "KeyK", primary: true, shift: true }],
   },
   {
+    id: "openReview",
+    scope: "global",
+    labelKey: "App.rightPanelReview",
+    descriptionKey: "KeyboardShortcutsPanel.openReviewDescription",
+    // Deliberately `control` (not `primary`): the reference always shows
+    // Control here even on macOS, unlike every other binding in this table.
+    bindings: [{ key: "g", code: "KeyG", control: true, shift: true }],
+  },
+  {
+    id: "toggleRightSidebar",
+    scope: "global",
+    labelKey: "App.rightPanelMenuTitle",
+    descriptionKey: "KeyboardShortcutsPanel.toggleRightSidebarDescription",
+    bindings: [{ key: "b", code: "KeyB", primary: true, alt: true }],
+  },
+  {
+    id: "openTerminal",
+    scope: "global",
+    labelKey: "App.rightPanelTerminal",
+    descriptionKey: "KeyboardShortcutsPanel.openTerminalDescription",
+    // Ctrl+` everywhere, matching VSCode's terminal-toggle convention — mac
+    // deliberately gets `control` here instead of `primary` (which would be
+    // ⌘`) because Cmd+` is already a system-level "cycle windows of this
+    // app" binding; Ctrl+` sidesteps that collision the same way VSCode does.
+    bindings: [{ key: "`", code: "Backquote", primary: true }],
+    platformBindings: {
+      macos: [{ key: "`", code: "Backquote", control: true }],
+    },
+  },
+  {
+    id: "openBrowser",
+    scope: "global",
+    labelKey: "App.rightPanelBrowser",
+    descriptionKey: "KeyboardShortcutsPanel.openBrowserDescription",
+    bindings: [{ key: "t", code: "KeyT", primary: true }],
+  },
+  {
+    id: "openFiles",
+    scope: "global",
+    labelKey: "App.rightPanelWorkspace",
+    descriptionKey: "KeyboardShortcutsPanel.openFilesDescription",
+    bindings: [{ key: "p", code: "KeyP", primary: true }],
+  },
+  {
+    id: "openSideTasksPanel",
+    scope: "global",
+    labelKey: "App.rightPanelSideTasks",
+    descriptionKey: "KeyboardShortcutsPanel.openSideTasksDescription",
+    bindings: [{ key: "s", code: "KeyS", primary: true, alt: true }],
+  },
+  {
     id: "sendMessage",
     scope: "composer",
     labelKey: "KeyboardShortcutsPanel.sendMessage",

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FolderTree, ListTodo, PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
+import { FileDiff, FolderTree, Globe, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
@@ -32,7 +32,7 @@ import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore } from "./store/sideTaskStore";
-import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
+import { ArtifactPane, FileTree, DiffViewer, PermissionModal, ReviewPanel, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
@@ -49,6 +49,7 @@ import { startBackupScheduler } from "./lib/backupScheduler";
 import { useT } from "./lib/i18n";
 import {
   detectShortcutPlatform,
+  shortcutDisplayLabel,
   shortcutIdForEvent,
   shouldHandleGlobalShortcut,
   type ShortcutIdForScope,
@@ -75,6 +76,54 @@ function formatError(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/** The panels the right sidebar can host as tabs. */
+type RightTabKind = "review" | "terminal" | "files" | "sideTasks" | "browser";
+
+const RIGHT_TAB_KINDS: readonly RightTabKind[] = ["review", "terminal", "browser", "files", "sideTasks"];
+
+const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
+  review: "App.rightPanelReview",
+  terminal: "App.rightPanelTerminal",
+  browser: "App.rightPanelBrowser",
+  files: "App.rightPanelWorkspace",
+  sideTasks: "App.rightPanelSideTasks",
+};
+
+const RIGHT_TAB_SHORTCUT_IDS: Record<
+  RightTabKind,
+  "openReview" | "openTerminal" | "openBrowser" | "openFiles" | "openSideTasksPanel"
+> = {
+  review: "openReview",
+  terminal: "openTerminal",
+  browser: "openBrowser",
+  files: "openFiles",
+  sideTasks: "openSideTasksPanel",
+};
+
+function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
+  const className = "shrink-0 text-faint";
+  switch (kind) {
+    case "review":
+      return <FileDiff size={size} className={className} />;
+    case "terminal":
+      return <SquareTerminal size={size} className={className} />;
+    case "browser":
+      return <Globe size={size} className={className} />;
+    case "files":
+      return <FolderTree size={size} className={className} />;
+    default:
+      return <ListTodo size={size} className={className} />;
+  }
+}
+
+/** Clamps a user-dragged right-menu width to a sane range, capped relative
+ * to the viewport so a wide drag on a big display can't be dragged into an
+ * unreasonably narrow chat column. */
+function clampRightMenuWidth(value: number): number {
+  const viewportCap = Math.max(220, Math.floor((typeof window === "undefined" ? 1200 : window.innerWidth) * 0.6));
+  return Math.min(viewportCap, Math.max(220, Math.round(value)));
 }
 
 function App() {
@@ -111,7 +160,6 @@ function App() {
   const hasCompletedOnboarding = useOnboardingStore((s) => s.hasCompletedOnboarding);
   const restartOnboarding = useOnboardingStore((s) => s.restartOnboarding);
 
-  const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -135,11 +183,116 @@ function App() {
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const terminalDock = useTerminalStore((state) => state.dock);
-  /** The right sidebar region shows at most ONE thing at a time (Claude-
-   * Desktop-style): nothing (default), the picker menu, the workspace
-   * panel, or the side-tasks drawer. A right-docked terminal overrides
-   * whatever is selected here. */
-  const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks">("none");
+  /** The right sidebar hosts real TABS: several panels open at once, one
+   * active, the rest kept mounted-but-hidden so their state (a running
+   * terminal, review scroll position, a browser page) survives switching —
+   * choosing one never closes another. */
+  const [rightTabs, setRightTabs] = useState<RightTabKind[]>([]);
+  const [activeRightTab, setActiveRightTab] = useState<RightTabKind | null>(null);
+  /** Whether the region is visible at all; with no tabs open it shows the
+   * centered picker menu. */
+  const [rightOpen, setRightOpen] = useState(false);
+  const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+  /** Right-region fullscreen — covers the whole region (tab strip + active
+   * tab). Reset when the region closes so it can't linger stale. */
+  const [rightFullscreen, setRightFullscreen] = useState(false);
+  const rightRegionActive = rightOpen;
+  useEffect(() => {
+    if (!rightOpen) setRightFullscreen(false);
+  }, [rightOpen]);
+
+  const openRightTab = useCallback((kind: RightTabKind) => {
+    setRightOpen(true);
+    setPlusMenuOpen(false);
+    setRightTabs((tabs) => (tabs.includes(kind) ? tabs : [...tabs, kind]));
+    setActiveRightTab(kind);
+    if (kind === "terminal") {
+      useTerminalStore.getState().setDock("right");
+      setTerminalOpen(true);
+    }
+    if (kind === "sideTasks") {
+      useSideTaskStore.getState().openDrawer();
+    }
+  }, []);
+
+  const closeRightTab = useCallback((kind: RightTabKind) => {
+    setRightTabs((tabs) => {
+      const next = tabs.filter((tab) => tab !== kind);
+      setActiveRightTab((active) => (active === kind ? next[next.length - 1] ?? null : active));
+      return next;
+    });
+    if (kind === "terminal" && useTerminalStore.getState().dock === "right") {
+      setTerminalOpen(false);
+    }
+  }, []);
+
+  // Dock moves migrate the terminal between its two homes: re-docked to the
+  // bottom (via the panel's dock button) it leaves the tab strip; re-docked
+  // to the right (same button on the bottom panel) it must gain a sidebar
+  // tab, otherwise an open right-docked terminal would have nowhere to
+  // render at all.
+  useEffect(() => {
+    if (terminalDock === "bottom") {
+      setRightTabs((tabs) => {
+        if (!tabs.includes("terminal")) return tabs;
+        const next = tabs.filter((tab) => tab !== "terminal");
+        setActiveRightTab((active) => (active === "terminal" ? next[next.length - 1] ?? null : active));
+        return next;
+      });
+    } else if (terminalOpen) {
+      openRightTab("terminal");
+    }
+  }, [terminalDock, terminalOpen, openRightTab]);
+
+  // User-resizable width for the picker menu, persisted across restarts —
+  // mirrors the terminal's own drag-to-resize (TerminalPanel.tsx).
+  const RIGHT_MENU_WIDTH_KEY = "little-monkey-right-menu-width";
+  const [rightMenuWidth, setRightMenuWidthState] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem(RIGHT_MENU_WIDTH_KEY));
+      return Number.isFinite(stored) && stored > 0 ? clampRightMenuWidth(stored) : 288;
+    } catch {
+      return 288;
+    }
+  });
+  const setRightMenuWidth = useCallback((value: number) => {
+    const clamped = clampRightMenuWidth(value);
+    setRightMenuWidthState(clamped);
+    try {
+      localStorage.setItem(RIGHT_MENU_WIDTH_KEY, String(clamped));
+    } catch {
+      // Best-effort persistence only.
+    }
+  }, []);
+  const onMenuResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = rightMenuWidth;
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    // Live moves only update state; localStorage is written once on release
+    // — a synchronous storage write per pointermove makes the drag stutter.
+    let latest = startWidth;
+    const move = (moveEvent: PointerEvent) => {
+      latest = clampRightMenuWidth(startWidth + (startX - moveEvent.clientX));
+      setRightMenuWidthState(latest);
+    };
+    const up = () => {
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", up);
+      target.removeEventListener("pointercancel", up);
+      setRightMenuWidth(latest);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", up);
+    target.addEventListener("pointercancel", up);
+  }, [rightMenuWidth, setRightMenuWidth]);
+  const shortcutOverrides = useShortcutStore((s) => s.overrides);
+  const shortcutLabel = useCallback(
+    (id: "openReview" | "toggleRightSidebar" | "openTerminal" | "openBrowser" | "openFiles" | "openSideTasksPanel") =>
+      shortcutDisplayLabel(id, detectShortcutPlatform(), shortcutOverrides),
+    [shortcutOverrides],
+  );
   const [debateOpen, setDebateOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -260,8 +413,20 @@ function App() {
           setSettingsOpen(true);
         },
         openShortcuts: () => openSettingsTab("shortcuts"),
-        toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
+        toggleWorkspacePanel: () => openRightTab("files"),
         openCommandPalette: () => openCommandPalette(),
+        toggleRightSidebar: () => setRightOpen((open) => !open),
+        openTerminal: () => {
+          if (useTerminalStore.getState().dock === "right") {
+            openRightTab("terminal");
+          } else {
+            setTerminalOpen((open) => !open);
+          }
+        },
+        openBrowser: () => openRightTab("browser"),
+        openReview: () => openRightTab("review"),
+        openFiles: () => openRightTab("files"),
+        openSideTasksPanel: () => openRightTab("sideTasks"),
         sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
         sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
         sessionRename: () => activeSession && session.requestRename(activeSession.id),
@@ -386,10 +551,10 @@ function App() {
   }, [rootsVersion]);
 
   // Clicking "Preview" on a code fence should actually reveal the pane, even
-  // if the user had collapsed it — otherwise `artifactStore.open()` would
-  // silently do nothing visible.
+  // if the right region is closed or showing something else — otherwise
+  // `artifactStore.open()` would silently do nothing visible.
   useEffect(() => {
-    if (activeArtifact) setWorkspacePanelOpen(true);
+    if (activeArtifact) openRightTab("files");
   }, [activeArtifact]);
 
   const handleSelectFile = useCallback((path: string, content: string) => {
@@ -783,10 +948,7 @@ function App() {
             setVisualEditModeOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
-          onOpenSideTasks={() => {
-            useSideTaskStore.getState().openDrawer();
-            setRightPanel("sideTasks");
-          }}
+          onOpenSideTasks={() => openRightTab("sideTasks")}
           onOpenDebate={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -819,29 +981,14 @@ function App() {
         />
       </aside>
 
-      {/* Center: chat, with a drag-region strip standing in for the title bar */}
+      {/* Center: chat, with a drag-region strip standing in for the title bar.
+          The dock-toggle icons live in a viewport-anchored overlay just
+          below (not in this strip) — see the fixed-position block right
+          after this column closes — so their screen position never shifts
+          as the right sidebar's width animates open/closed; only the strip
+          itself (for window-dragging) stays here. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-end px-2">
-          <IconButton
-            size="sm"
-            variant={terminalOpen ? "secondary" : "ghost"}
-            onClick={() => setTerminalOpen((open) => !open)}
-            disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
-            aria-label={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
-            title={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
-          >
-            <SquareTerminal size={15} />
-          </IconButton>
-          <IconButton
-            size="sm"
-            variant={rightPanel !== "none" ? "secondary" : "ghost"}
-            onClick={() => setRightPanel((panel) => (panel === "none" ? "menu" : "none"))}
-            aria-label={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
-            title={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
-          >
-            <PanelRight size={15} />
-          </IconButton>
-        </div>
+        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center px-2" />
         <SessionGrantBanner />
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
@@ -935,6 +1082,7 @@ function App() {
               sessionId={activeSessionId}
               onManagePrompts={handleManagePrompts}
               onOpenSettingsTab={openSettingsTab}
+              topBarPortal
             />
           )}
         </ErrorBoundary>
@@ -972,120 +1120,241 @@ function App() {
         </div>
       )}
 
-      {/* Right region: hidden by default; shows exactly one of — the
-          right-docked terminal (overrides everything), the picker menu, the
-          side-tasks drawer, or the workspace panel. Claude-Desktop-style:
-          contents swap in place, they never stack beside each other. */}
-      {terminalOpen && terminalDock === "right" ? (
-        <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
-      ) : rightPanel === "sideTasks" ? (
-        <SideTaskDrawer sessionId={activeSessionId} />
-      ) : rightPanel === "menu" ? (
-        <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-surface">
-          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-              {t("App.rightPanelMenuTitle")}
-            </span>
-            <IconButton size="sm" onClick={() => setRightPanel("none")} aria-label={t("App.closeRightSidebar")} className="ml-auto">
-              <X size={16} />
-            </IconButton>
-          </div>
-          <div className="flex flex-col gap-1 p-3">
-            <button
-              type="button"
-              onClick={() => setRightPanel("workspace")}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-            >
-              <FolderTree size={16} className="shrink-0 text-faint" /> {t("App.rightPanelWorkspace")}
-            </button>
-            <button
-              type="button"
-              disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
-              onClick={() => {
-                useTerminalStore.getState().setDock("right");
-                setTerminalOpen(true);
-                setRightPanel("none");
-              }}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
-            >
-              <SquareTerminal size={16} className="shrink-0 text-faint" /> {t("App.rightPanelTerminal")}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                useSideTaskStore.getState().openDrawer();
-                setRightPanel("sideTasks");
-              }}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-            >
-              <ListTodo size={16} className="shrink-0 text-faint" /> {t("App.rightPanelSideTasks")}
-            </button>
-          </div>
-        </aside>
-      ) : rightPanel === "workspace" ? (
+      {/* Right region: a tabbed sidebar. The aside is always mounted so its
+          width can animate open/closed; with no tabs open it shows the
+          centered picker. Every open tab stays mounted (inactive ones
+          hidden) so a running terminal, a loaded review, or a browser page
+          survives switching tabs — opening one never closes another. */}
       <aside
-        className={`flex shrink-0 flex-col border-l border-border bg-surface transition-[width] duration-200 ${
-          workspacePanelOpen ? "w-96" : "w-12"
+        className={`relative flex h-full flex-col overflow-hidden border-border bg-surface ${
+          rightOpen
+            ? rightFullscreen
+              ? "fixed inset-x-0 bottom-0 top-11 z-40 w-full border"
+              : "shrink-0 border-l transition-[width] duration-200 ease-out"
+            : "w-0 shrink-0 border-l-0 transition-[width] duration-200 ease-out"
         }`}
+        style={rightOpen && !rightFullscreen ? { width: rightMenuWidth } : undefined}
       >
-        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
-          {workspacePanelOpen && (
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-              {t("App.workspacePanelTitle")}
-            </span>
-          )}
+        {rightOpen && !rightFullscreen && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            onPointerDown={onMenuResizeStart}
+            className="absolute inset-y-0 left-0 z-20 w-1.5 cursor-ew-resize bg-transparent transition-colors hover:bg-accent/40 active:bg-accent/60"
+          />
+        )}
+
+        {rightTabs.length === 0 ? (
+          <div className="flex flex-1 flex-col justify-center gap-1 p-3">
+            {RIGHT_TAB_KINDS.map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                disabled={kind === "terminal" && !primaryRoot(useWorkspaceStore.getState().roots)}
+                onClick={() => openRightTab(kind)}
+                className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+              >
+                <RightTabIcon kind={kind} size={16} />
+                <span className="min-w-0 flex-1 truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                <kbd className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-faint">
+                  {shortcutLabel(RIGHT_TAB_SHORTCUT_IDS[kind])}
+                </kbd>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <>
+            {/* Tab strip: one chip per open tab, "+" opens the rest. The
+                chips row scrolls horizontally in its own inner container —
+                the "+" dropdown must live OUTSIDE that scroll container,
+                because `overflow-x-auto` also clips absolutely-positioned
+                children to the 44px strip, which made the menu invisible. */}
+            <div className="relative shrink-0 border-b border-border">
+            <div data-tauri-drag-region className="flex h-11 items-center gap-1 overflow-x-auto px-3 [scrollbar-width:thin]">
+              {rightTabs.map((kind) => (
+                <div
+                  key={kind}
+                  className={`group inline-flex max-w-44 shrink-0 items-center rounded-lg text-sm transition-colors ${
+                    kind === activeRightTab ? "bg-surface-2 text-foreground" : "text-muted hover:bg-surface-2 hover:text-foreground"
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setActiveRightTab(kind)}
+                    className="inline-flex min-w-0 items-center gap-1.5 py-1.5 pl-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                  >
+                    <RightTabIcon kind={kind} size={15} />
+                    <span className="truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={t("App.closeRightTab")}
+                    onClick={() => closeRightTab(kind)}
+                    className="ml-0.5 mr-1 rounded-sm p-0.5 text-faint opacity-0 hover:text-danger focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent group-hover:opacity-100"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+              {RIGHT_TAB_KINDS.some((kind) => !rightTabs.includes(kind)) && (
+                <IconButton
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setPlusMenuOpen((open) => !open)}
+                  aria-label={t("App.openRightSidebar")}
+                >
+                  <Plus size={15} />
+                </IconButton>
+              )}
+            </div>
+            {plusMenuOpen && (
+              <>
+                <div className="fixed inset-0 z-30" onClick={() => setPlusMenuOpen(false)} />
+                <div className="absolute left-3 top-full z-40 mt-1 w-64 rounded-xl border border-border bg-background p-1.5 shadow-xl">
+                  {RIGHT_TAB_KINDS.filter((kind) => !rightTabs.includes(kind)).map((kind) => (
+                    <button
+                      key={kind}
+                      type="button"
+                      disabled={kind === "terminal" && !primaryRoot(useWorkspaceStore.getState().roots)}
+                      onClick={() => openRightTab(kind)}
+                      className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-foreground hover:bg-surface-2 disabled:opacity-50"
+                    >
+                      <RightTabIcon kind={kind} size={15} />
+                      <span className="min-w-0 flex-1 truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                      <kbd className="shrink-0 font-mono text-[11px] text-faint">{shortcutLabel(RIGHT_TAB_SHORTCUT_IDS[kind])}</kbd>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+            </div>
+
+            <div className="relative min-h-0 flex-1">
+              {rightTabs.map((kind) => (
+                <div key={kind} className={`absolute inset-0 ${kind === activeRightTab ? "flex flex-col" : "hidden"}`}>
+                  {kind === "review" ? (
+                    <ReviewPanel />
+                  ) : kind === "terminal" ? (
+                    <TerminalPanel
+                      chatSessionId={activeSessionId}
+                      onClose={() => closeRightTab("terminal")}
+                      hideFullscreenButton
+                      embedded
+                    />
+                  ) : kind === "browser" ? (
+                    <BrowserWorkbench
+                      taskId={activeSessionId}
+                      chatSessionId={activeSessionId}
+                      onClose={() => closeRightTab("browser")}
+                    />
+                  ) : kind === "sideTasks" ? (
+                    <SideTaskDrawer sessionId={activeSessionId} embedded />
+                  ) : activeArtifact ? (
+                    <ArtifactPane />
+                  ) : (
+                    <div className="flex min-h-0 flex-1 flex-col">
+                      <div className="min-h-0 flex-[3] border-b border-border">
+                        <FileTree key={rootsVersion} onSelectFile={handleSelectFile} />
+                      </div>
+                      <div className="flex min-h-0 flex-[2] flex-col">
+                        <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
+                            {t("App.diffPanelTitle")}
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => void handleRefreshDiff()}
+                            disabled={!selectedFile || diffLoading}
+                          >
+                            {diffLoading ? t("App.diffRefreshing") : t("App.diffRefresh")}
+                          </Button>
+                        </div>
+                        {diffError && <p className="px-3 pt-1.5 text-xs text-danger">{diffError}</p>}
+                        <div className="min-h-0 flex-1 overflow-auto p-2 [overscroll-behavior:contain]">
+                          {selectedFile ? (
+                            <DiffViewer
+                              fileName={selectedFile.path}
+                              oldValue={selectedFile.original}
+                              newValue={selectedFile.current}
+                              oldTitle={t("App.diffOldTitleOpened")}
+                              newTitle={t("App.diffNewTitleCurrent")}
+                            />
+                          ) : (
+                            <p className="p-3 text-sm text-faint">
+                              {t("App.diffEmptyStateHint")}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </aside>
+
+      {/* Dock-toggle icons: fixed to the viewport's top-right corner (z-50,
+          above the right sidebar's own z-40 fullscreen and the terminal's
+          z-40 fullscreen) rather than laid out inside the shrinking chat
+          column — their screen position must stay put as the sidebar
+          animates open/closed, and they must stay reachable/visible even
+          while a right-region panel is fullscreen, matching the reference
+          layout. */}
+      <div className="fixed right-3 top-2 z-50 flex items-center gap-1.5">
+        {/* Portal target for the primary ChatWindow's Compare/Crew pickers
+            (see ChatWindow's `topBarPortal` prop) — kept as the first child
+            so they land to the left of the dock-toggle icons below,
+            regardless of how many of those icons are currently shown. */}
+        <div id="chat-top-bar-slot" className="flex items-center gap-1.5" />
+        {/* Only present while the right region has something to fullscreen
+            — mirrors the reference layout, where this button appears
+            alongside the two persistent dock toggles the moment the side
+            panel opens, rather than occupying a slot all the time. */}
+        {rightRegionActive && (
           <IconButton
             size="sm"
-            onClick={() => setWorkspacePanelOpen((prev) => !prev)}
-            aria-label={workspacePanelOpen ? t("App.collapseWorkspacePanel") : t("App.expandWorkspacePanel")}
-            className="ml-auto"
+            variant="ghost"
+            onClick={() => setRightFullscreen((value) => !value)}
+            aria-label={rightFullscreen ? t("TerminalPanel.collapsePanel") : t("TerminalPanel.expandPanel")}
+            title={rightFullscreen ? t("TerminalPanel.collapsePanel") : t("TerminalPanel.expandPanel")}
           >
-            {workspacePanelOpen ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
+            {rightFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </IconButton>
-        </div>
-
-        {workspacePanelOpen && (activeArtifact ? (
-          <ArtifactPane />
-        ) : (
-          <div className="flex min-h-0 flex-1 flex-col">
-            <div className="min-h-0 flex-[3] border-b border-border">
-              <FileTree key={rootsVersion} onSelectFile={handleSelectFile} />
-            </div>
-            <div className="flex min-h-0 flex-[2] flex-col">
-              <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
-                <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-                  {t("App.diffPanelTitle")}
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => void handleRefreshDiff()}
-                  disabled={!selectedFile || diffLoading}
-                >
-                  {diffLoading ? t("App.diffRefreshing") : t("App.diffRefresh")}
-                </Button>
-              </div>
-              {diffError && <p className="px-3 pt-1.5 text-xs text-danger">{diffError}</p>}
-              <div className="min-h-0 flex-1 overflow-auto p-2 [overscroll-behavior:contain]">
-                {selectedFile ? (
-                  <DiffViewer
-                    fileName={selectedFile.path}
-                    oldValue={selectedFile.original}
-                    newValue={selectedFile.current}
-                    oldTitle={t("App.diffOldTitleOpened")}
-                    newTitle={t("App.diffNewTitleCurrent")}
-                  />
-                ) : (
-                  <p className="p-3 text-sm text-faint">
-                    {t("App.diffEmptyStateHint")}
-                  </p>
-                )}
-              </div>
-            </div>
-          </div>
-        ))}
-      </aside>
-      ) : null}
+        )}
+        {/* Always the BOTTOM terminal: this button opens/closes the bottom
+            strip regardless of where a terminal last lived — the sidebar's
+            Terminal tab is the (only) way into the right-docked one, and
+            the panel's own dock button moves it between the two. */}
+        <IconButton
+          size="sm"
+          variant={terminalOpen && terminalDock === "bottom" ? "secondary" : "ghost"}
+          onClick={() => {
+            if (terminalOpen && terminalDock === "bottom") {
+              setTerminalOpen(false);
+            } else {
+              useTerminalStore.getState().setDock("bottom");
+              setTerminalOpen(true);
+            }
+          }}
+          disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+          aria-label={terminalOpen && terminalDock === "bottom" ? t("App.closeTerminal") : t("App.openTerminal")}
+          title={`${terminalOpen && terminalDock === "bottom" ? t("App.closeTerminal") : t("App.openTerminal")} (${shortcutLabel("openTerminal")})`}
+        >
+          <SquareTerminal size={15} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          variant={rightOpen ? "secondary" : "ghost"}
+          onClick={() => setRightOpen((open) => !open)}
+          aria-label={rightOpen ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+          title={`${rightOpen ? t("App.closeRightSidebar") : t("App.openRightSidebar")} (${shortcutLabel("toggleRightSidebar")})`}
+        >
+          <PanelRight size={15} />
+        </IconButton>
+      </div>
 
       {commandPaletteOpen && (
         <CommandPalette

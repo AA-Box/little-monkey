@@ -27,6 +27,9 @@ export interface CompareTargetPickerProps {
   value: readonly ModelTargetSnapshot[];
   onChange: (next: ModelTargetSnapshot[]) => void;
   disabled?: boolean;
+  /** Which way the panel opens relative to the pill — "up" for the composer's
+   * bottom toolbar, "down" when rendered in a top bar. */
+  openDirection?: "up" | "down";
 }
 
 type CapabilityKind = "tools" | "vision";
@@ -92,7 +95,7 @@ function targetSearchText(target: ModelTargetSnapshot): string {
  * lives in a draft until Apply is pressed, and merely opening this control
  * never starts or switches a runtime.
  */
-export function CompareTargetPicker({ value, onChange, disabled = false }: CompareTargetPickerProps) {
+export function CompareTargetPicker({ value, onChange, disabled = false, openDirection = "up" }: CompareTargetPickerProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -295,7 +298,9 @@ export function CompareTargetPicker({ value, onChange, disabled = false }: Compa
           id={panelId}
           role="dialog"
           aria-labelledby={titleId}
-          className="absolute bottom-full right-0 z-30 mb-2 flex max-h-[min(36rem,75vh)] w-[23rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
+          className={`absolute right-0 z-30 flex max-h-[min(36rem,75vh)] w-[23rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl ${
+            openDirection === "down" ? "top-full mt-2" : "bottom-full mb-2"
+          }`}
         >
           <div className="border-b border-border px-3.5 pb-3 pt-3.5">
             <h2 id={titleId} className="text-sm font-semibold text-foreground">

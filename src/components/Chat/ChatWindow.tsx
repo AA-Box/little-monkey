@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CornerDownLeft, Square } from "lucide-react";
@@ -250,9 +251,14 @@ interface ChatWindowProps {
    * "Manage prompts…" row (see App.tsx's deep-link hook). */
   onManagePrompts: () => void;
   onOpenSettingsTab: (tab: SettingsTab) => void;
+  /** When true, the Compare/Crew pickers portal into App's top-right bar
+   * (element id "chat-top-bar-slot") instead of rendering in the bottom
+   * toolbar — only the primary pane sets this, so the split pane (which has
+   * no slot of its own) keeps them inline. */
+  topBarPortal?: boolean;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, topBarPortal = false }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -270,6 +276,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [compareTargets, setCompareTargets] = useState<ModelTargetSnapshot[]>([]);
   const [startingCrew, setStartingCrew] = useState(false);
   const [crewId, setCrewId] = useState<string | null>(null);
+  // Portal target for Compare/Crew when hoisted into App's top bar — queried
+  // after mount since the slot is a DOM sibling outside this component's own
+  // tree, not something a ref passed as a prop could reach.
+  const [topBarSlot, setTopBarSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!topBarPortal) return;
+    setTopBarSlot(document.getElementById("chat-top-bar-slot"));
+  }, [topBarPortal]);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
@@ -1210,8 +1224,38 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     if (event.key === "Enter") event.preventDefault();
   };
 
+  // Only actually portals once the slot is found (App always renders it, but
+  // it's a DOM sibling this component can't see until after mount) — until
+  // then, or when this isn't the primary pane, render inline like before so
+  // the controls are never just missing.
+  const portalsToTopBar = topBarPortal && topBarSlot !== null;
+  const compareCrewDisabled = sending || preparingTurn || startingComparison || startingCrew;
+  const compareCrewControls = (
+    <>
+      <CompareTargetPicker
+        value={compareTargets}
+        onChange={(targets) => {
+          setCompareTargets(targets);
+          if (targets.length > 0) setCrewId(null);
+        }}
+        disabled={compareCrewDisabled}
+        openDirection={portalsToTopBar ? "down" : "up"}
+      />
+      <CrewPicker
+        value={crewId}
+        onChange={(nextCrewId) => {
+          setCrewId(nextCrewId);
+          if (nextCrewId) setCompareTargets([]);
+        }}
+        disabled={compareCrewDisabled}
+        openDirection={portalsToTopBar ? "down" : "up"}
+      />
+    </>
+  );
+
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
+      {portalsToTopBar && topBarSlot && createPortal(compareCrewControls, topBarSlot)}
       <MessageList
         sessionId={sessionId}
         messages={messages}
@@ -1333,22 +1377,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             <ModeSelector />
             <PersonaSelector sessionId={sessionId} onManagePrompts={onManagePrompts} />
             <AttachMenu onAddFiles={() => void handleAddFiles()} onAddFolder={() => void handleAddFolder()} />
-            <CompareTargetPicker
-              value={compareTargets}
-              onChange={(targets) => {
-                setCompareTargets(targets);
-                if (targets.length > 0) setCrewId(null);
-              }}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
-            />
-            <CrewPicker
-              value={crewId}
-              onChange={(nextCrewId) => {
-                setCrewId(nextCrewId);
-                if (nextCrewId) setCompareTargets([]);
-              }}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
-            />
+            {!portalsToTopBar && compareCrewControls}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <ModelSwitcher />

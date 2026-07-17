@@ -275,6 +275,236 @@ pub fn git_commit(state: tauri::State<'_, AppState>, message: String) -> Result<
     Ok(summary_line.unwrap_or_else(|| "Committed successfully".to_string()))
 }
 
+/// One changed file in a [`ReviewPayload`]: full before/after content so the
+/// frontend can render unified or split diffs (and collapse unmodified
+/// hunks) without a second round-trip per file.
+#[derive(serde::Serialize)]
+pub struct ReviewFilePayload {
+    pub path: String,
+    pub old_content: String,
+    pub new_content: String,
+    pub added: u32,
+    pub deleted: u32,
+    /// Binary or oversized files carry no content — the UI shows a stub row.
+    pub binary: bool,
+}
+
+/// Snapshot backing the Review panel: every change between the review base
+/// and the working tree, plus branch/target labels and a compare URL.
+#[derive(serde::Serialize)]
+pub struct ReviewPayload {
+    pub is_repo: bool,
+    pub branch: Option<String>,
+    /// The upstream/default target this branch is compared against in
+    /// "branch" mode (e.g. `origin/develop`), when one can be resolved.
+    pub target: Option<String>,
+    pub total_added: u32,
+    pub total_deleted: u32,
+    pub files: Vec<ReviewFilePayload>,
+    /// A web URL for opening a compare/PR page for this branch, when the
+    /// `origin` remote is a recognizable GitHub/GitLab-style HTTPS/SSH URL.
+    pub pr_url: Option<String>,
+}
+
+/// Per-file content above this size is not shipped to the frontend — the
+/// row still appears with its numstat counts, flagged like a binary.
+const MAX_REVIEW_FILE_BYTES: usize = 1024 * 1024;
+/// Hard cap on files in one review payload, keeping the IPC message sane on
+/// pathological trees.
+const MAX_REVIEW_FILES: usize = 300;
+
+/// Resolves the branch's comparison target: its configured upstream if any,
+/// otherwise the remote's default branch (`origin/HEAD`), otherwise `None`.
+fn review_target(root: &Path) -> Option<String> {
+    let upstream = run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).ok()?;
+    if upstream.status.success() {
+        let name = String::from_utf8_lossy(&upstream.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    let origin_head = run_git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).ok()?;
+    if origin_head.status.success() {
+        let name = String::from_utf8_lossy(&origin_head.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Builds a GitHub-style compare URL from `origin`'s remote URL, tolerating
+/// both HTTPS and `git@host:owner/repo.git` SSH forms. Returns `None` for
+/// anything unrecognizable rather than guessing.
+fn compare_url(remote: &str, target: &str, branch: &str) -> Option<String> {
+    let remote = remote.trim();
+    let https = if let Some(rest) = remote.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("https://{host}/{path}")
+    } else if remote.starts_with("https://") || remote.starts_with("http://") {
+        remote.to_string()
+    } else {
+        return None;
+    };
+    let base = https.trim_end_matches('/').trim_end_matches(".git");
+    // Strip the remote name off the target ("origin/develop" -> "develop").
+    let target_branch = target.split_once('/').map_or(target, |(_, b)| b);
+    Some(format!("{base}/compare/{target_branch}...{branch}?expand=1"))
+}
+
+/// Full-content review snapshot. `mode` is `"branch"` (merge-base of the
+/// upstream target vs the working tree — the "what would this PR contain"
+/// view) or `"working"` (HEAD vs the working tree — uncommitted changes
+/// only). Like [`git_status`], a direct human-initiated UI read, not an
+/// agent tool — no permission gate.
+#[tauri::command]
+pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<ReviewPayload, String> {
+    let root = workspace_root(state.inner())?;
+
+    let empty = ReviewPayload {
+        is_repo: false,
+        branch: None,
+        target: None,
+        total_added: 0,
+        total_deleted: 0,
+        files: Vec::new(),
+        pr_url: None,
+    };
+
+    let is_repo_output = run_git(&root, &["rev-parse", "--is-inside-work-tree"])?;
+    if !is_repo_output.status.success()
+        || String::from_utf8_lossy(&is_repo_output.stdout).trim() != "true"
+    {
+        return Ok(empty);
+    }
+
+    let branch_output = run_git(&root, &["branch", "--show-current"])?;
+    let branch_name = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+    let branch = if branch_name.is_empty() { None } else { Some(branch_name.clone()) };
+
+    let target = review_target(&root);
+
+    const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let head_exists = run_git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?
+        .status
+        .success();
+
+    // The diff base: merge-base(target, HEAD) in branch mode (falling back
+    // to HEAD when there's no target), HEAD in working mode, and the empty
+    // tree for a repo with no commits yet in either mode.
+    let base = if !head_exists {
+        EMPTY_TREE_HASH.to_string()
+    } else if mode == "branch" {
+        match &target {
+            Some(target_ref) => {
+                let merge_base = run_git(&root, &["merge-base", target_ref, "HEAD"])?;
+                if merge_base.status.success() {
+                    String::from_utf8_lossy(&merge_base.stdout).trim().to_string()
+                } else {
+                    "HEAD".to_string()
+                }
+            }
+            None => "HEAD".to_string(),
+        }
+    } else {
+        "HEAD".to_string()
+    };
+
+    // Tracked changes (staged + unstaged) against the base, rename detection
+    // off so every entry is a plain single-path add/modify/delete.
+    let numstat = run_git(&root, &["diff", "--numstat", "--no-renames", "-z", &base])?;
+    if !numstat.status.success() {
+        return Err(String::from_utf8_lossy(&numstat.stderr).trim().to_string());
+    }
+
+    let mut files = Vec::new();
+    let mut total_added = 0u32;
+    let mut total_deleted = 0u32;
+
+    // `--numstat -z` records: "added\tdeleted\tpath\0" (binary = "-\t-\t").
+    for record in numstat.stdout.split(|&b| b == 0) {
+        if record.is_empty() || files.len() >= MAX_REVIEW_FILES {
+            continue;
+        }
+        let record = String::from_utf8_lossy(record);
+        let mut parts = record.splitn(3, '\t');
+        let (Some(added_raw), Some(deleted_raw), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let added = added_raw.parse::<u32>().unwrap_or(0);
+        let deleted = deleted_raw.parse::<u32>().unwrap_or(0);
+        let numstat_binary = added_raw == "-";
+        total_added += added;
+        total_deleted += deleted;
+
+        let old_output = run_git(&root, &["show", &format!("{base}:{path}")])?;
+        let old_bytes = if old_output.status.success() { old_output.stdout } else { Vec::new() };
+        let new_bytes = std::fs::read(root.join(path)).unwrap_or_default();
+
+        let binary = numstat_binary
+            || is_binary(&old_bytes)
+            || is_binary(&new_bytes)
+            || old_bytes.len() > MAX_REVIEW_FILE_BYTES
+            || new_bytes.len() > MAX_REVIEW_FILE_BYTES;
+
+        files.push(ReviewFilePayload {
+            path: path.to_string(),
+            old_content: if binary { String::new() } else { String::from_utf8_lossy(&old_bytes).to_string() },
+            new_content: if binary { String::new() } else { String::from_utf8_lossy(&new_bytes).to_string() },
+            added,
+            deleted,
+            binary,
+        });
+    }
+
+    // Untracked files: additions the tree diff can't see.
+    let untracked = run_git(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if untracked.status.success() {
+        for raw_path in untracked.stdout.split(|&b| b == 0) {
+            if raw_path.is_empty() || files.len() >= MAX_REVIEW_FILES {
+                continue;
+            }
+            let path = String::from_utf8_lossy(raw_path).to_string();
+            let bytes = std::fs::read(root.join(&path)).unwrap_or_default();
+            let binary = is_binary(&bytes) || bytes.len() > MAX_REVIEW_FILE_BYTES;
+            let added = if binary { 0 } else { count_lines(&bytes) };
+            total_added += added;
+            files.push(ReviewFilePayload {
+                path,
+                old_content: String::new(),
+                new_content: if binary { String::new() } else { String::from_utf8_lossy(&bytes).to_string() },
+                added,
+                deleted: 0,
+                binary,
+            });
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let pr_url = match (&target, &branch) {
+        (Some(target_ref), Some(branch_ref)) => {
+            let remote = run_git(&root, &["remote", "get-url", "origin"])?;
+            if remote.status.success() {
+                compare_url(&String::from_utf8_lossy(&remote.stdout), target_ref, branch_ref)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    Ok(ReviewPayload {
+        is_repo: true,
+        branch,
+        target,
+        total_added,
+        total_deleted,
+        files,
+        pr_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,6 +24,9 @@ export interface CrewPickerProps {
   value: string | null;
   onChange: (crewId: string | null) => void;
   disabled?: boolean;
+  /** Which way the panel opens relative to the pill — "up" for the composer's
+   * bottom toolbar, "down" when rendered in a top bar. */
+  openDirection?: "up" | "down";
 }
 
 interface EditorState {
@@ -57,7 +60,7 @@ function actorDraft(
   };
 }
 
-export function CrewPicker({ value, onChange, disabled = false }: CrewPickerProps) {
+export function CrewPicker({ value, onChange, disabled = false, openDirection = "up" }: CrewPickerProps) {
   const { t } = useT();
   const panelId = useId();
   const titleId = useId();
@@ -348,7 +351,9 @@ export function CrewPicker({ value, onChange, disabled = false }: CrewPickerProp
           id={panelId}
           role="dialog"
           aria-labelledby={titleId}
-          className="absolute bottom-full left-0 z-40 mb-2 flex max-h-[min(42rem,80vh)] w-[32rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
+          className={`absolute z-40 flex max-h-[min(42rem,80vh)] w-[32rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl ${
+            openDirection === "down" ? "right-0 top-full mt-2" : "left-0 bottom-full mb-2"
+          }`}
         >
           <header className="border-b border-border px-3.5 py-3">
             <h2 id={titleId} className="text-sm font-semibold text-foreground">{t("CrewPicker.title")}</h2>
