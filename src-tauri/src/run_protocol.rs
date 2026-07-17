@@ -270,6 +270,10 @@ pub enum RunKind {
     Browser,
     Acp,
     Background,
+    /// Evidence ledger for a remote desktop-control session: periodic and
+    /// start/stop screenshots recorded as `ArtifactAdded` events (see
+    /// `daemon/remote/desktop.rs`).
+    RemoteDesktopControl,
     /// A command executed inside a disposable copy of the workspace (see
     /// `sandbox.rs`). Distinct from `Background`: the workspace root grant
     /// for this kind is informational/read provenance only — the run itself
