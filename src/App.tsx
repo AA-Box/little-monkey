@@ -36,6 +36,7 @@ import { CrossRepoChangePlannerPanel } from "./components/CrossRepoChangePlanner
 import { VisualEditModePanel } from "./components/VisualEditMode";
 import { TerminalPanel } from "./components/Terminal";
 import { DebatePanel } from "./components/Debate";
+import { ApiContractDiffLabPanel } from "./components/ApiContractDiffLab";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
@@ -156,6 +157,7 @@ function App() {
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [debateOpen, setDebateOpen] = useState(false);
+  const [apiContractDiffLabOpen, setApiContractDiffLabOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -188,6 +190,7 @@ function App() {
     setGoldenDatasetBuilderOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
+    setApiContractDiffLabOpen(false);
     setDataNotebookOpen(false);
     setSyntheticMonitoringOpen(false);
     setCrossRepoIntelligenceOpen(false);
@@ -264,6 +267,7 @@ function App() {
           setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setApiContractDiffLabOpen(false);
           setDataNotebookOpen(false);
           setSyntheticMonitoringOpen(false);
           setCrossRepoIntelligenceOpen(false);
@@ -292,6 +296,7 @@ function App() {
           setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setApiContractDiffLabOpen(false);
           setDataNotebookOpen(false);
           setSyntheticMonitoringOpen(false);
           setCrossRepoIntelligenceOpen(false);
@@ -522,15 +527,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -553,15 +559,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -587,15 +594,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -619,15 +627,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -650,6 +659,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
@@ -686,6 +696,7 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setVisualEditModeOpen(false);
             setSecurityAutofixOpen(false);
             setSettingsInitialTab(undefined);
@@ -710,6 +721,7 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setVisualEditModeOpen(false);
@@ -769,8 +781,27 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
             setConnectorBuilderOpen(true);
+          }}
+          onOpenApiContractDiffLab={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setApiContractDiffLabOpen(true);
           }}
           onOpenAgentInbox={() => {
             setSettingsOpen(false);
@@ -788,6 +819,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
@@ -806,6 +838,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setConnectorBuilderOpen(false);
@@ -818,6 +851,7 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setRedTeamLabOpen(true);
@@ -858,6 +892,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
             setSpreadsheetCopilotOpen(true);
           }}
@@ -895,6 +930,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
             setGoldenDatasetBuilderOpen(true);
           }}
@@ -903,6 +939,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setConnectorBuilderOpen(false);
@@ -970,6 +1007,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setApiContractDiffLabOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
             setWorkCanvasOpen(false);
@@ -1191,6 +1229,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
             setWorkCanvasOpen(false);
@@ -1239,7 +1278,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : apiContractDiffLabOpen ? "api-contract-diff-lab" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -1273,11 +1312,13 @@ function App() {
               onClose={() => setDailyBriefOpen(false)}
               onOpenRunCenter={(runId) => {
                 setDailyBriefOpen(false);
+                setApiContractDiffLabOpen(false);
                 setRunCenterOpen(true);
                 void useRunStore.getState().selectRun(runId);
               }}
               onOpenAgentInbox={() => {
                 setDailyBriefOpen(false);
+                setApiContractDiffLabOpen(false);
                 setAgentInboxOpen(true);
               }}
               onOpenSettingsTab={openSettingsTab}
@@ -1357,6 +1398,8 @@ function App() {
                 void useRunStore.getState().selectRun(runId);
               }}
             />
+          ) : apiContractDiffLabOpen ? (
+            <ApiContractDiffLabPanel onClose={() => setApiContractDiffLabOpen(false)} />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
@@ -1385,7 +1428,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !apiContractDiffLabOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
