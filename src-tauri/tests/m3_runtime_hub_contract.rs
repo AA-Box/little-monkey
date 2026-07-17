@@ -111,6 +111,7 @@ struct DownloadState {
     bytes: Vec<u8>,
     etag: String,
     fail_once_at: Option<u64>,
+    corrupt_at: Option<u64>,
     offsets: Vec<u64>,
 }
 
@@ -125,6 +126,7 @@ impl MutableDownload {
                 bytes,
                 etag: etag.to_string(),
                 fail_once_at: None,
+                corrupt_at: None,
                 offsets: Vec::new(),
             }),
         }
@@ -139,6 +141,13 @@ impl MutableDownload {
 
     fn fail_once_at(&self, offset: u64) {
         self.state.lock().expect("download state").fail_once_at = Some(offset);
+    }
+
+    /// Returns a structurally valid chunk (correct offset/length/etag) at
+    /// `offset` but with a flipped bit, simulating silent transport-level
+    /// corruption that framing checks alone cannot catch.
+    fn corrupt_chunk_at(&self, offset: u64) {
+        self.state.lock().expect("download state").corrupt_at = Some(offset);
     }
 
     fn offsets(&self) -> Vec<u64> {
@@ -185,11 +194,18 @@ impl M3DownloadTransport for MutableDownload {
                 return Err(M3HubError::Transport("range starts past EOF".to_string()));
             }
             let end = start.saturating_add(max_bytes).min(state.bytes.len());
+            let mut bytes = state.bytes[start..end].to_vec();
+            if state.corrupt_at == Some(offset) {
+                state.corrupt_at = None;
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0xFF;
+                }
+            }
             Ok(M3DownloadChunk {
                 offset,
                 total_bytes: state.bytes.len() as u64,
                 etag: Some(state.etag.clone()),
-                bytes: state.bytes[start..end].to_vec(),
+                bytes,
             })
         })
     }
@@ -239,6 +255,9 @@ fn catalog_model(bytes: &[u8], revision: &str) -> M3CatalogModel {
             raw_declaration: "Apache License 2.0 test declaration".to_string(),
         },
         metadata: BTreeMap::from([("publisher".to_string(), "test".to_string())]),
+        template: None,
+        projector: None,
+        catalog_retrieved_at_ms: None,
     }
 }
 
@@ -1266,4 +1285,270 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
         hub.authorize_external_operation(&authorization),
         Err(M3HubError::Forbidden(_))
     ));
+}
+
+#[test]
+fn catalog_model_manifest_stays_backward_compatible_without_new_provenance_fields() {
+    let bytes = payload(4_096, 3);
+    let model = catalog_model(&bytes, "rev-compat");
+    let mut value = serde_json::to_value(&model).expect("serialize catalog model");
+    let object = value.as_object_mut().expect("catalog model is a JSON object");
+    // Simulate a manifest written before template/projector/provenance
+    // existed: the keys are entirely absent, not merely null.
+    assert!(object.remove("template").is_some());
+    assert!(object.remove("projector").is_some());
+    assert!(object.remove("catalogRetrievedAtMs").is_some());
+
+    let restored: M3CatalogModel = serde_json::from_value(value)
+        .expect("a legacy manifest without the new fields must still deserialize");
+    assert_eq!(restored.template, None);
+    assert_eq!(restored.projector, None);
+    assert_eq!(restored.catalog_retrieved_at_ms, None);
+    restored
+        .validate()
+        .expect("a legacy manifest without the new fields must still validate");
+}
+
+#[tokio::test]
+async fn search_stamps_provenance_and_installed_view_surfaces_template_projector_and_source() {
+    let bytes = payload(2_048, 11);
+    let mut model = catalog_model(&bytes, "rev-1");
+    model.template = Some("chatml".to_string());
+    model.projector = Some(M3ProjectorRef {
+        kind: "clip".to_string(),
+        sha256: sha256(b"projector-bytes"),
+        size_bytes: 4_096,
+    });
+    let directory = TestDirectory::new("provenance");
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-provenance"));
+    let hub = make_hub(
+        &directory.0,
+        download,
+        vec![Arc::new(StaticCatalog {
+            source_id: "test-catalog".to_string(),
+            entries: vec![model],
+        })],
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let matches = hub
+        .search_catalog("Local Model", 10, &context)
+        .await
+        .expect("search catalog");
+    assert_eq!(matches.len(), 1);
+    let retrieved_at = matches[0]
+        .model
+        .catalog_retrieved_at_ms
+        .expect("search stamps a local retrieval timestamp");
+    assert!(retrieved_at > 0);
+
+    let request = M3DownloadRequest {
+        accepted_license_sha256: matches[0].model.license.declaration_sha256(),
+        model: matches[0].model.clone(),
+    };
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("install stamped model");
+    let active = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version");
+    assert_eq!(active.source_id, "test-catalog");
+    assert_eq!(active.template.as_deref(), Some("chatml"));
+    assert_eq!(
+        active.projector.as_ref().map(|projector| projector.kind.as_str()),
+        Some("clip")
+    );
+    assert_eq!(active.catalog_retrieved_at_ms, Some(retrieved_at));
+}
+
+#[tokio::test]
+async fn identical_payload_across_assets_is_reused_without_a_network_transfer_and_survives_donor_deletion(
+) {
+    let directory = TestDirectory::new("dedup");
+    let shared_bytes = payload(120_000, 42);
+    let download = Arc::new(MutableDownload::new(shared_bytes.clone(), "etag-shared"));
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let donor = catalog_model(&shared_bytes, "rev-donor");
+    let donor_request = M3DownloadRequest {
+        accepted_license_sha256: donor.license.declaration_sha256(),
+        model: donor.clone(),
+    };
+    let installed_donor = hub
+        .download_model(&donor_request, &context)
+        .await
+        .expect("install donor over the network");
+    assert!(!download.offsets().is_empty());
+
+    // A different variant with byte-identical content must reuse the
+    // donor's verified payload instead of hitting the network again.
+    let before = download.offsets().len();
+    let mut reuser = donor.clone();
+    reuser.variant_id = "q5_k_m".to_string();
+    reuser.revision = "rev-reuser".to_string();
+    let reuser_request = M3DownloadRequest {
+        accepted_license_sha256: reuser.license.declaration_sha256(),
+        model: reuser.clone(),
+    };
+    let installed_reuser = hub
+        .download_model(&reuser_request, &context)
+        .await
+        .expect("reuse the donor's verified payload");
+    assert_eq!(
+        download.offsets().len(),
+        before,
+        "a byte-identical variant must not trigger any additional network range reads"
+    );
+    assert_ne!(installed_donor.asset_id, installed_reuser.asset_id);
+    let reuser_path = installed_reuser
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active reuser version")
+        .artifact_path
+        .clone();
+    assert_eq!(fs::read(&reuser_path).unwrap(), shared_bytes);
+
+    // Deleting the donor must not corrupt the reused survivor: the shared
+    // bytes must remain intact and independently owned on disk.
+    assert!(hub
+        .delete_model(
+            &M3DeleteModelRequest {
+                asset_id: donor.asset_id(),
+                confirmation: format!("DELETE {}", donor.asset_id()),
+            },
+            &context,
+        )
+        .await
+        .expect("delete donor"));
+    assert!(hub
+        .list_installed_models()
+        .unwrap()
+        .iter()
+        .any(|installed| installed.asset_id == reuser.asset_id()));
+    assert_eq!(fs::read(&reuser_path).unwrap(), shared_bytes);
+}
+
+#[tokio::test]
+async fn corrupted_local_candidate_is_never_reused_and_falls_back_to_a_real_download() {
+    let directory = TestDirectory::new("dedup-corrupt");
+    let shared_bytes = payload(80_000, 5);
+    let download = Arc::new(MutableDownload::new(shared_bytes.clone(), "etag-corrupt-guard"));
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let donor = catalog_model(&shared_bytes, "rev-donor");
+    let donor_request = M3DownloadRequest {
+        accepted_license_sha256: donor.license.declaration_sha256(),
+        model: donor.clone(),
+    };
+    let installed_donor = hub
+        .download_model(&donor_request, &context)
+        .await
+        .expect("install donor");
+    let donor_path = installed_donor
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active donor version")
+        .artifact_path
+        .clone();
+
+    // Corrupt the donor payload on disk without changing its length, e.g.
+    // simulating bit rot the hub did not itself cause.
+    let mut corrupted = shared_bytes.clone();
+    corrupted[0] ^= 0xFF;
+    fs::write(&donor_path, &corrupted).expect("corrupt donor payload in place");
+
+    let before = download.offsets().len();
+    let mut reuser = donor.clone();
+    reuser.variant_id = "q5_k_m".to_string();
+    reuser.revision = "rev-reuser".to_string();
+    let reuser_request = M3DownloadRequest {
+        accepted_license_sha256: reuser.license.declaration_sha256(),
+        model: reuser.clone(),
+    };
+    let installed_reuser = hub
+        .download_model(&reuser_request, &context)
+        .await
+        .expect("fall back to a genuine download");
+    assert!(
+        download.offsets().len() > before,
+        "a corrupted local candidate must never be reused; a real download must occur instead"
+    );
+    let reuser_path = installed_reuser
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active reuser version")
+        .artifact_path
+        .clone();
+    assert_eq!(fs::read(&reuser_path).unwrap(), shared_bytes);
+}
+
+#[tokio::test]
+async fn transport_corruption_is_caught_by_the_final_digest_check_and_a_retry_recovers() {
+    let directory = TestDirectory::new("transport-corruption");
+    let bytes = payload(50_000, 9);
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-corrupt-guard"));
+    download.corrupt_chunk_at(0);
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let model = catalog_model(&bytes, "rev-1");
+    let context = M3OperationContext::new(10_000);
+    let request = M3DownloadRequest {
+        accepted_license_sha256: model.license.declaration_sha256(),
+        model: model.clone(),
+    };
+
+    // A structurally valid but bit-flipped chunk must survive framing
+    // checks yet still be caught by the whole-file digest verification, and
+    // must never be silently accepted or partially published.
+    assert!(matches!(
+        hub.download_model(&request, &context).await,
+        Err(M3HubError::Integrity { .. })
+    ));
+    assert!(hub.list_installed_models().unwrap().is_empty());
+
+    // A retry must not resume the corrupted bytes; it must restart cleanly
+    // and succeed once the transport stops corrupting the stream.
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("retry recovers with clean bytes");
+    let active_path = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version")
+        .artifact_path
+        .clone();
+    assert_eq!(fs::read(&active_path).unwrap(), bytes);
 }

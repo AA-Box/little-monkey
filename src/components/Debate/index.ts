@@ -1,0 +1,1 @@
+export { DebatePanel } from "./DebatePanel";

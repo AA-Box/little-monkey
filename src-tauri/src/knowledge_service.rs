@@ -7,7 +7,7 @@
 //! or any connector/extractor/provider failure therefore leaves the previous
 //! generation usable.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -17,15 +17,19 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use futures_util::StreamExt;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+use crate::connectors;
 use crate::knowledge_adapters::{
     media_type_for_path, source_object_from_bytes, HtmlPdfExtractor, OfficeOpenXmlExtractor,
     TesseractOcrProvider,
@@ -275,7 +279,91 @@ pub enum ConnectorConfig {
         credential_ref: String,
         allow_loopback: bool,
     },
+    /// A GitHub repository, read via the already-authenticated `gh` CLI
+    /// bridge (`m5_delivery::github`'s process boundary, through the
+    /// generic `gh_api_json` helper) — no pasted token, ever.
+    /// `connector_account_id` names a Connector Catalog GitHub account (see
+    /// `connectors.rs`) purely for UI/identity purposes; the actual API
+    /// calls always go through the single machine-wide `gh` session, same as
+    /// `connectors_add_github`. Cursor = the last-seen commit SHA for
+    /// `git_ref` (or the repo's default branch, if unset) — real incremental
+    /// sync via `repos/{owner}/{repo}/compare/{cursor}...{ref}`, not just
+    /// content-hash re-diffing.
+    GitHubRepo {
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+        path_prefix: Option<String>,
+        connector_account_id: String,
+    },
+    /// An S3 (or S3-compatible: R2, MinIO, ...) bucket, listed and fetched
+    /// with hand-rolled SigV4-signed requests (`connectors::sigv4_authorization`)
+    /// — no AWS SDK dependency. `connector_account_id` supplies the access
+    /// key/secret key (Connector Catalog `ConnectorProvider::S3`); the
+    /// endpoint/bucket/region/prefix here are independent of what the
+    /// account was originally verified against, so one credential can back
+    /// several sources scoped to different prefixes or even buckets it can
+    /// reach. Cursor = a per-object-key ETag map — only keys whose ETag
+    /// changed are re-fetched.
+    S3Bucket {
+        endpoint: String,
+        bucket: String,
+        prefix: Option<String>,
+        region: String,
+        connector_account_id: String,
+    },
+    /// Exactly like `LocalFolder`, except a `notify`-backed filesystem
+    /// watcher (`sync_watched_folder_watchers`) triggers an automatic
+    /// debounced refresh on change, instead of requiring a manual refresh
+    /// click.
+    WatchedFolder {
+        path: String,
+        debounce_ms: u64,
+    },
+    /// A Notion workspace subtree, read via the Notion API's
+    /// search/blocks-children endpoints with a catalog-stored integration
+    /// token. `root_id` is the root page/database Notion id this source
+    /// walks from. Cursor = the maximum `last_edited_time` observed across
+    /// visited pages — real incremental sync via Notion's own search
+    /// `sort.timestamp = "last_edited_time"`, not just content-hash
+    /// re-diffing.
+    NotionPages {
+        connector_account_id: String,
+        root_id: String,
+    },
+    /// A fixed set of Slack channels, read via `conversations.history` with
+    /// a catalog-stored bot token. Cursor = a per-channel map of Slack's own
+    /// `oldest`-style message timestamp cursor.
+    SlackChannels {
+        connector_account_id: String,
+        channel_ids: Vec<String>,
+    },
+    /// A Jira project, read via the REST `/search` (JQL) endpoint with a
+    /// catalog-stored API token + account email. Cursor = a JQL
+    /// `updated >= <cursor>` bound (the maximum `updated` timestamp
+    /// observed).
+    JiraProject {
+        connector_account_id: String,
+        project_key: String,
+    },
 }
+
+// --- Non-goals (see the ROADMAP "External Knowledge Sync Pipelines" entry
+// and this build's own Non-Goals convention) ---------------------------------
+//
+// SharePoint and Google Drive connectors are NOT implemented here, and never
+// will be through this token-based catalog: both only expose their
+// documents through Microsoft Graph / Google Workspace APIs that require a
+// **registered OAuth application** (a real client id/secret and an approved
+// redirect URI with the respective platform), which is explicitly out of
+// scope for this build (see this build's constraints). There is no
+// token/PAT-based fallback that reaches a user's actual SharePoint/Drive
+// document set, so faking either with, say, a WebDAV-style endpoint would
+// misrepresent what's actually connected. GitLab is a stretch, same-shaped
+// as `GitHubRepo` (a `glab`-CLI or PAT bridge) — not implemented in this
+// pass either; unlike SharePoint/Drive it needs no OAuth app and could be
+// added later without an architecture change, so it is a plain scheduling
+// non-goal rather than an OAuth-blocked one.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectorObjectState {
@@ -853,6 +941,193 @@ fn validate_connector(connector: &ConnectorConfig) -> Result<(), String> {
             }
             validate_id("credential ref", credential_ref)?;
         }
+        ConnectorConfig::GitHubRepo {
+            owner,
+            repo,
+            git_ref,
+            path_prefix,
+            connector_account_id,
+        } => {
+            validate_repo_segment("GitHub owner", owner)?;
+            validate_repo_segment("GitHub repo", repo)?;
+            if let Some(git_ref) = git_ref {
+                validate_git_ref(git_ref)?;
+            }
+            if let Some(prefix) = path_prefix {
+                validate_relative_prefix("GitHub path prefix", prefix)?;
+            }
+            let account = connectors::account_by_id(connector_account_id)?;
+            if account.provider != connectors::ConnectorProvider::Github {
+                return Err("The selected connector account is not a GitHub account".to_string());
+            }
+        }
+        ConnectorConfig::S3Bucket {
+            endpoint,
+            bucket,
+            prefix,
+            region,
+            connector_account_id,
+        } => {
+            let parsed =
+                Url::parse(endpoint).map_err(|error| format!("Invalid S3 endpoint: {error}"))?;
+            if !matches!(parsed.scheme(), "https" | "http") || parsed.host_str().is_none() {
+                return Err("S3 endpoint must be an absolute HTTP(S) URL".to_string());
+            }
+            validate_s3_bucket_name(bucket)?;
+            validate_s3_region_name(region)?;
+            if let Some(prefix) = prefix {
+                validate_relative_prefix("S3 prefix", prefix)?;
+            }
+            let account = connectors::account_by_id(connector_account_id)?;
+            if account.provider != connectors::ConnectorProvider::S3 {
+                return Err("The selected connector account is not an S3 account".to_string());
+            }
+        }
+        ConnectorConfig::WatchedFolder { path, debounce_ms } => {
+            let path = Path::new(path);
+            if !path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err("Watched folder path must be absolute and unambiguous".to_string());
+            }
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("Watched folder must be a real directory, not a symlink".to_string());
+            }
+            if !(200..=600_000).contains(debounce_ms) {
+                return Err("Watched folder debounce must be between 200ms and 10 minutes".to_string());
+            }
+        }
+        ConnectorConfig::NotionPages {
+            connector_account_id,
+            root_id,
+        } => {
+            validate_notion_id(root_id)?;
+            let account = connectors::account_by_id(connector_account_id)?;
+            if account.provider != connectors::ConnectorProvider::Notion {
+                return Err("The selected connector account is not a Notion account".to_string());
+            }
+        }
+        ConnectorConfig::SlackChannels {
+            connector_account_id,
+            channel_ids,
+        } => {
+            if channel_ids.is_empty() || channel_ids.len() > 50 {
+                return Err("Select between one and 50 Slack channels".to_string());
+            }
+            for channel_id in channel_ids {
+                validate_slack_channel_id(channel_id)?;
+            }
+            let account = connectors::account_by_id(connector_account_id)?;
+            if account.provider != connectors::ConnectorProvider::Slack {
+                return Err("The selected connector account is not a Slack account".to_string());
+            }
+        }
+        ConnectorConfig::JiraProject {
+            connector_account_id,
+            project_key,
+        } => {
+            validate_jira_project_key(project_key)?;
+            let account = connectors::account_by_id(connector_account_id)?;
+            if account.provider != connectors::ConnectorProvider::Jira {
+                return Err("The selected connector account is not a Jira account".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_repo_segment(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 100
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(format!(
+            "{label} must use only letters, digits, '-', '_', or '.'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_ref(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 250
+        || value.starts_with('/')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        return Err("Invalid git ref".to_string());
+    }
+    Ok(())
+}
+
+fn validate_relative_prefix(label: &str, value: &str) -> Result<(), String> {
+    if value.len() > 500
+        || value.starts_with('/')
+        || value.contains("..")
+        || value.contains('\0')
+    {
+        return Err(format!("{label} must be a relative path with no '..' segments"));
+    }
+    Ok(())
+}
+
+fn validate_s3_bucket_name(bucket: &str) -> Result<(), String> {
+    let valid = (3..=63).contains(&bucket.len())
+        && bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err("Invalid S3 bucket name".to_string())
+    }
+}
+
+fn validate_s3_region_name(region: &str) -> Result<(), String> {
+    let valid = !region.is_empty()
+        && region.len() <= 40
+        && region.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err("Invalid S3 region".to_string())
+    }
+}
+
+fn validate_notion_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 100
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("Invalid Notion page/database id".to_string());
+    }
+    Ok(())
+}
+
+fn validate_slack_channel_id(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 32 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("Invalid Slack channel id".to_string());
+    }
+    Ok(())
+}
+
+fn validate_jira_project_key(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 40
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("Invalid Jira project key".to_string());
     }
     Ok(())
 }
@@ -953,6 +1228,7 @@ pub fn knowledge_v2_add_source(
     };
     catalog.sources.push(source.clone());
     save_catalog(&root, &catalog)?;
+    sync_watched_folder_watchers(&app);
     Ok(source)
 }
 
@@ -996,9 +1272,11 @@ pub fn knowledge_v2_update_source(
         source.cursor = None;
         source.checkpoint = None;
         source.last_error = None;
+        let _ = fs::remove_dir_all(root.join("connector-cache").join(&source_id));
     }
     let result = source.clone();
     save_catalog(&root, &catalog)?;
+    sync_watched_folder_watchers(&app);
     Ok(result)
 }
 
@@ -1032,6 +1310,8 @@ pub fn knowledge_v2_remove_source(app: AppHandle, source_id: String) -> Result<(
     let _lease = acquire_refresh_lease(&app_data, &removed.stack_id)?;
     remove_source_generation(&app_data, &root, &removed.stack_id, &source_id)?;
     save_catalog(&root, &catalog)?;
+    let _ = fs::remove_dir_all(root.join("connector-cache").join(&source_id));
+    sync_watched_folder_watchers(&app);
     if let KnowledgeSource {
         connector: ConnectorConfig::WebDav { credential_ref, .. },
         ..
@@ -1584,6 +1864,14 @@ async fn refresh_inner_at(
     );
     let limits = PipelineLimits::default();
     let mut collected = Vec::<(KnowledgeSource, Vec<SourceObject>)>::new();
+    // Some connectors (GitHub/S3/Notion/Slack/Jira) resolve a REAL upstream
+    // incremental cursor (a commit SHA, an ETag map, a high-water timestamp,
+    // ...) during collection rather than relying solely on the generic
+    // content-hash cursor computed below — see `collect_source_objects`'s doc
+    // comment. Collected here, keyed by source id, and preferred over the
+    // generic cursor in the catalog-write block near the end of this
+    // function.
+    let mut explicit_cursors = HashMap::<String, String>::new();
     for source in sources {
         if cancel.is_cancelled() {
             return Err(PipelineError::Cancelled.to_string());
@@ -1600,7 +1888,11 @@ async fn refresh_inner_at(
                 reused_chunks: 0,
             },
         );
-        let objects = collect_source_objects(app_data, &source, &limits, cancel).await?;
+        let (objects, explicit_cursor) =
+            collect_source_objects(app_data, &source, &limits, cancel).await?;
+        if let Some(cursor) = explicit_cursor {
+            explicit_cursors.insert(source.id.clone(), cursor);
+        }
         collected.push((source, objects));
     }
     let object_total = collected
@@ -1875,13 +2167,19 @@ async fn refresh_inner_at(
             .filter(|source| source.stack_id == stack_id)
         {
             if let Some(objects) = source_states.remove(&source.id) {
-                let cursor_payload = objects
-                    .iter()
-                    .map(|object| (&object.object_id, &object.content_sha256))
-                    .collect::<Vec<_>>();
-                source.cursor = Some(sha256(
-                    &serde_json::to_vec(&cursor_payload).map_err(|error| error.to_string())?,
-                ));
+                source.cursor = match explicit_cursors.remove(&source.id) {
+                    Some(cursor) => Some(cursor),
+                    None => {
+                        let cursor_payload = objects
+                            .iter()
+                            .map(|object| (&object.object_id, &object.content_sha256))
+                            .collect::<Vec<_>>();
+                        Some(sha256(
+                            &serde_json::to_vec(&cursor_payload)
+                                .map_err(|error| error.to_string())?,
+                        ))
+                    }
+                };
                 source.checkpoint = Some(generation_id.clone());
                 source.last_refresh_at_ms = Some(completed_at);
                 source.last_error = None;
@@ -1943,16 +2241,106 @@ fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
     }
 }
 
+/// Collects `source`'s current object set. Returns `(objects, explicit_cursor)`:
+/// `explicit_cursor`, when `Some`, is a REAL upstream incremental cursor the
+/// connector itself resolved (a commit SHA, an ETag map, a high-water
+/// timestamp, ...) and takes priority over `refresh_inner_at`'s generic
+/// content-hash cursor (see that function's doc comment on
+/// `explicit_cursors`). `None` means "no such cursor — fall back to the
+/// generic one", which is every pre-existing connector kind's behavior
+/// unchanged.
 async fn collect_source_objects(
     app_data: &Path,
     source: &KnowledgeSource,
     limits: &PipelineLimits,
     cancel: &CancellationToken,
-) -> Result<Vec<SourceObject>, String> {
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
     match &source.connector {
-        ConnectorConfig::LocalFile { path } => collect_local_file(source, Path::new(path), limits),
+        ConnectorConfig::LocalFile { path } => {
+            collect_local_file(source, Path::new(path), limits).map(|objects| (objects, None))
+        }
         ConnectorConfig::LocalFolder { path } | ConnectorConfig::Project { path } => {
             collect_local_folder(source, Path::new(path), limits, cancel)
+                .map(|objects| (objects, None))
+        }
+        ConnectorConfig::WatchedFolder { path, .. } => {
+            collect_local_folder(source, Path::new(path), limits, cancel)
+                .map(|objects| (objects, None))
+        }
+        ConnectorConfig::GitHubRepo {
+            owner,
+            repo,
+            git_ref,
+            path_prefix,
+            connector_account_id,
+        } => {
+            collect_github_repo(
+                app_data,
+                source,
+                owner,
+                repo,
+                git_ref.as_deref(),
+                path_prefix.as_deref(),
+                connector_account_id,
+                limits,
+                cancel,
+            )
+            .await
+        }
+        ConnectorConfig::S3Bucket {
+            endpoint,
+            bucket,
+            prefix,
+            region,
+            connector_account_id,
+        } => {
+            collect_s3_bucket(
+                app_data,
+                source,
+                endpoint,
+                bucket,
+                prefix.as_deref(),
+                region,
+                connector_account_id,
+                limits,
+                cancel,
+            )
+            .await
+        }
+        ConnectorConfig::NotionPages {
+            connector_account_id,
+            root_id,
+        } => {
+            collect_notion_pages(app_data, source, connector_account_id, root_id, limits, cancel)
+                .await
+        }
+        ConnectorConfig::SlackChannels {
+            connector_account_id,
+            channel_ids,
+        } => {
+            collect_slack_channels(
+                app_data,
+                source,
+                connector_account_id,
+                channel_ids,
+                limits,
+                cancel,
+            )
+            .await
+        }
+        ConnectorConfig::JiraProject {
+            connector_account_id,
+            project_key,
+        } => {
+            collect_jira_project(
+                app_data,
+                source,
+                connector_account_id,
+                project_key,
+                limits,
+                cancel,
+            )
+            .await
         }
         ConnectorConfig::Url {
             url,
@@ -1975,6 +2363,7 @@ async fn collect_source_objects(
                 cancel,
             )
             .await
+            .map(|objects| (objects, None))
         }
         ConnectorConfig::Sitemap {
             url,
@@ -1994,9 +2383,10 @@ async fn collect_source_objects(
                 cancel,
             )
             .await
+            .map(|objects| (objects, None))
         }
         ConnectorConfig::SelectedChats { session_ids } => {
-            collect_selected_chats(app_data, source, session_ids, limits)
+            collect_selected_chats(app_data, source, session_ids, limits).map(|objects| (objects, None))
         }
         ConnectorConfig::WebDav {
             url,
@@ -2020,8 +2410,1343 @@ async fn collect_source_objects(
                 cancel,
             )
             .await?;
-            Ok(vec![object])
+            Ok((vec![object], None))
         }
+    }
+}
+
+// =============================================================================
+// External Knowledge Sync connectors (ROADMAP "External Knowledge Sync
+// Pipelines"): GitHubRepo, S3Bucket, WatchedFolder, NotionPages,
+// SlackChannels, JiraProject.
+//
+// Non-goals — see `ConnectorConfig`'s doc comment above for the full
+// rationale: SharePoint and Google Drive are not implemented (both require a
+// registered OAuth app, out of scope for this build); GitLab is a stretch
+// left for later, not implemented in this pass.
+// =============================================================================
+
+// --- shared: local object-content cache --------------------------------------
+//
+// GitHubRepo/S3Bucket/NotionPages/SlackChannels/JiraProject each resolve a
+// REAL upstream incremental cursor (a commit SHA, an ETag map, a
+// last-edited-time high-water mark, ...) and use it to skip re-fetching
+// objects their own cursor says are unchanged. Skipping the fetch still
+// needs to produce a `SourceObject` with the right bytes for the extraction/
+// chunking pipeline below, so unchanged objects are read back from this
+// on-disk cache (written on every successful fetch) instead of the network —
+// never used for secrets, only the same object content the pipeline would
+// otherwise download and chunk anyway.
+fn connector_cache_dir(app_data: &Path, source_id: &str) -> Result<PathBuf, String> {
+    validate_id("source id", source_id)?;
+    let dir = data_root_at(app_data)?
+        .join("connector-cache")
+        .join(source_id);
+    fs::create_dir_all(&dir).map_err(|error| format!("Failed to create {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+fn connector_cache_path(cache_dir: &Path, object_id: &str) -> PathBuf {
+    cache_dir.join(format!("{}.bin", sha256(object_id.as_bytes())))
+}
+
+fn connector_cache_read(cache_dir: &Path, object_id: &str) -> Option<Vec<u8>> {
+    fs::read(connector_cache_path(cache_dir, object_id)).ok()
+}
+
+fn connector_cache_write(cache_dir: &Path, object_id: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = connector_cache_path(cache_dir, object_id);
+    let temporary = cache_dir.join(format!(".{}.tmp", Uuid::new_v4().simple()));
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("Failed to write connector cache entry: {error}"))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("Failed to publish connector cache entry: {error}"))?;
+    Ok(())
+}
+
+// --- shared: SSRF-hardened authenticated fetch -------------------------------
+
+/// Like `fetch_http`, but for the network-incremental connectors below:
+/// generic bearer/basic-auth-style headers instead of just basic auth, no
+/// redirect following (none of GitHub/S3/Notion/Slack/Jira's read endpoints
+/// legitimately redirect — same posture as `connectors.rs::verified_call`),
+/// and it returns the response headers too (S3's `GetObject` doesn't need
+/// them, but callers that do — none yet — can). DNS is resolved once and
+/// pinned to the exact socket used, non-public/loopback addresses are always
+/// rejected (mirrors `connectors.rs`'s stance: these are trusted, either
+/// fixed well-known API hosts or a user-supplied S3 endpoint/Jira site
+/// pinned to its own origin), and the response is capped and streamed the
+/// same way `fetch_http` is. `allow_loopback` exists only so this file's own
+/// tests can point it at a local fixture server — every production call site
+/// below passes `false`, exactly like `connectors.rs::verified_call`.
+async fn fetch_connector_bytes(
+    method: reqwest::Method,
+    url: &str,
+    allowed_origin: &str,
+    allow_loopback: bool,
+    headers: &[(&'static str, String)],
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<u8>, reqwest::header::HeaderMap), String> {
+    let policy = UrlSourcePolicy::new([allowed_origin], allow_loopback, false)
+        .map_err(|error| error.to_string())?;
+    let parsed = Url::parse(url).map_err(|error| error.to_string())?;
+    let addresses = resolve_url(&parsed).await?;
+    policy
+        .validate(url, &addresses, limits)
+        .map_err(|error| error.to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no port".to_string())?;
+    let socket = SocketAddr::new(addresses[0], port);
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HTTP_TIMEOUT)
+        .resolve(host, socket)
+        .build()
+        .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
+    let mut request = client.request(method, parsed.clone());
+    for (key, value) in headers {
+        request = request.header(*key, value.as_str());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Connector request failed: {error}"))?;
+    if response.status().is_redirection() {
+        return Err("Connector response was a redirect — refusing to follow".to_string());
+    }
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Connector request failed with HTTP {status}: {}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    let response_headers = response.headers().clone();
+    if let Some(length) = response.content_length() {
+        if length > limits.max_file_bytes.min(MAX_HTTP_BYTES as u64) {
+            return Err("Connector response exceeds the byte limit".to_string());
+        }
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let chunk = chunk.map_err(|error| format!("Connector response stream failed: {error}"))?;
+        if bytes.len().saturating_add(chunk.len())
+            > limits.max_file_bytes.min(MAX_HTTP_BYTES as u64) as usize
+        {
+            return Err("Connector response exceeds the byte limit".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, response_headers))
+}
+
+/// `application/x-www-form-urlencoded`-style percent-encoding for one query
+/// parameter *value* (Notion's `start_cursor`, Slack's `oldest`/`cursor`,
+/// Jira's `jql`) — distinct from `connectors::sigv4_uri_encode`, which is
+/// RFC 3986 encoding for SigV4's stricter canonical-request rules.
+fn percent_encode_query(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+/// Parses both Notion's `...Z` (Zulu) and Jira's `...+0000` (no-colon
+/// offset) ISO-8601 timestamp flavors into Unix milliseconds — `rfc3339`
+/// handles the former, the explicit format string handles the latter (which
+/// `parse_from_rfc3339` rejects outright).
+fn parse_iso8601_ms(value: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .or_else(|| chrono::DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.3f%z").ok())
+        .and_then(|datetime| u64::try_from(datetime.timestamp_millis()).ok())
+}
+
+// --- GitHubRepo ---------------------------------------------------------------
+
+async fn gh_api_json_call(path: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || crate::m5_delivery::m5_github_api_get(&path))
+        .await
+        .map_err(|error| format!("GitHub CLI task failed: {error}"))?
+}
+
+fn github_path_allowed(path: &str, prefix: Option<&str>) -> bool {
+    let prefix_ok = match prefix {
+        Some(prefix) if !prefix.is_empty() => path.starts_with(prefix.trim_end_matches('/')),
+        _ => true,
+    };
+    prefix_ok && media_type_for_path(Path::new(path)).is_some()
+}
+
+/// What [`collect_github_repo`] learned about this refresh's commit range,
+/// already reduced to plain JSON so [`github_plan_paths`] (the pure
+/// dedup/incremental-diff decision below) never touches the network/`gh`
+/// process itself and is directly unit-testable with fixture JSON.
+enum GithubCursorState {
+    /// `source.cursor` already equals the current commit sha — nothing to
+    /// diff, replay the previous path set verbatim.
+    Unchanged,
+    /// `repos/{owner}/{repo}/compare/{cursor}...{current}`'s `files` array.
+    Compare(Vec<Value>),
+    /// `repos/{owner}/{repo}/git/trees/{current}?recursive=1`'s `tree` array
+    /// — used on this source's first-ever refresh, or whenever the previous
+    /// path set is empty (e.g. after a `git_ref` change invalidated it).
+    FullTree(Vec<Value>),
+}
+
+/// Pure dedup/incremental-diff planner for [`collect_github_repo`]: given the
+/// previous refresh's known paths and this refresh's already-fetched cursor
+/// state, returns `(all_current_paths, changed_paths)` — `changed_paths` is
+/// the subset that actually needs a fresh `GetObject`/contents fetch;
+/// everything else in `all_current_paths` is expected to already be sitting
+/// in the local connector cache from a previous refresh.
+fn github_plan_paths(
+    previous_paths: BTreeSet<String>,
+    state: GithubCursorState,
+    path_prefix: Option<&str>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut changed_paths = BTreeSet::<String>::new();
+    let all_paths = match state {
+        GithubCursorState::Unchanged => previous_paths,
+        GithubCursorState::Compare(files) => {
+            let mut paths = previous_paths;
+            for file in &files {
+                let Some(filename) = file.get("filename").and_then(Value::as_str) else {
+                    continue;
+                };
+                let status = file.get("status").and_then(Value::as_str).unwrap_or_default();
+                if let Some(previous_name) = file.get("previous_filename").and_then(Value::as_str) {
+                    paths.remove(previous_name);
+                }
+                match status {
+                    "removed" => {
+                        paths.remove(filename);
+                    }
+                    _ if github_path_allowed(filename, path_prefix) => {
+                        paths.insert(filename.to_string());
+                        changed_paths.insert(filename.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            paths
+        }
+        GithubCursorState::FullTree(entries) => {
+            let mut paths = BTreeSet::new();
+            for entry in &entries {
+                if entry.get("type").and_then(Value::as_str) != Some("blob") {
+                    continue;
+                }
+                let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !github_path_allowed(path, path_prefix) {
+                    continue;
+                }
+                paths.insert(path.to_string());
+                changed_paths.insert(path.to_string());
+            }
+            paths
+        }
+    };
+    (all_paths, changed_paths)
+}
+
+/// Result of a single GitHub Contents-API fetch: GitHub only inlines
+/// base64 `content` for blobs under ~1MB — larger files omit `content`
+/// entirely (returning `git_url`/`size` instead), which must be treated as
+/// "skip this file" rather than a hard error, or a single oversized file
+/// anywhere in the tree would abort the refresh of every source in the stack.
+enum GhFileContent {
+    Inline(Vec<u8>),
+    TooLargeForContentsApi,
+}
+
+async fn gh_fetch_file_bytes(
+    owner: &str,
+    repo: &str,
+    path: &str,
+    at_ref: &str,
+) -> Result<GhFileContent, String> {
+    let encoded_path = connectors::sigv4_uri_encode(path, false);
+    let json =
+        gh_api_json_call(format!("repos/{owner}/{repo}/contents/{encoded_path}?ref={at_ref}")).await?;
+    let Some(encoded) = json.get("content").and_then(Value::as_str) else {
+        return Ok(GhFileContent::TooLargeForContentsApi);
+    };
+    let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map(GhFileContent::Inline)
+        .map_err(|error| format!("Failed to decode GitHub file content for {path}: {error}"))
+}
+
+/// Real incremental GitHub sync: `source.cursor` is the last-seen commit SHA
+/// for `git_ref` (or the repo's default branch, resolved as `HEAD`, if
+/// unset). On a repeat refresh whose ref has moved, only the files GitHub's
+/// own `compare` API reports as changed since that SHA are re-fetched;
+/// everything else is replayed from `connector_cache_read` — a full
+/// `git/trees` listing only ever runs once, on this source's first refresh
+/// (or after a ref change invalidates the previous path set).
+#[allow(clippy::too_many_arguments)]
+async fn collect_github_repo(
+    app_data: &Path,
+    source: &KnowledgeSource,
+    owner: &str,
+    repo: &str,
+    git_ref: Option<&str>,
+    path_prefix: Option<&str>,
+    connector_account_id: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let account = connectors::account_by_id(connector_account_id)?;
+    if account.provider != connectors::ConnectorProvider::Github {
+        return Err("The selected connector account is not a GitHub account".to_string());
+    }
+    let git_ref_display = git_ref.unwrap_or("HEAD").to_string();
+    let commit = gh_api_json_call(format!("repos/{owner}/{repo}/commits/{git_ref_display}")).await?;
+    let current_sha = commit
+        .get("sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "GitHub commit lookup returned no sha".to_string())?
+        .to_string();
+    if cancel.is_cancelled() {
+        return Err(PipelineError::Cancelled.to_string());
+    }
+
+    let uri_prefix = format!("https://github.com/{owner}/{repo}/blob/{git_ref_display}/");
+    let previous_paths: BTreeSet<String> = source
+        .objects
+        .iter()
+        .filter_map(|object| object.canonical_uri.strip_prefix(uri_prefix.as_str()).map(str::to_string))
+        .collect();
+
+    let cursor_state = match source.cursor.as_deref() {
+        Some(prev_sha) if prev_sha == current_sha => GithubCursorState::Unchanged,
+        Some(prev_sha) if !previous_paths.is_empty() => {
+            let compare =
+                gh_api_json_call(format!("repos/{owner}/{repo}/compare/{prev_sha}...{current_sha}"))
+                    .await?;
+            GithubCursorState::Compare(
+                compare
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        }
+        _ => {
+            let tree = gh_api_json_call(format!(
+                "repos/{owner}/{repo}/git/trees/{current_sha}?recursive=1"
+            ))
+            .await?;
+            GithubCursorState::FullTree(
+                tree.get("tree").and_then(Value::as_array).cloned().unwrap_or_default(),
+            )
+        }
+    };
+    let (all_paths, changed_paths) = github_plan_paths(previous_paths, cursor_state, path_prefix);
+
+    if all_paths.len() > limits.max_objects_per_source {
+        return Err(
+            "GitHub repository has more indexable files than the configured object limit"
+                .to_string(),
+        );
+    }
+
+    let cache_dir = connector_cache_dir(app_data, &source.id)?;
+    let mut objects = Vec::new();
+    for path in &all_paths {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let Some(media_type) = media_type_for_path(Path::new(path)) else {
+            continue;
+        };
+        let object_id = format!("gh-{}", &sha256(format!("{owner}/{repo}/{path}").as_bytes())[..32]);
+        let canonical_uri = format!("{uri_prefix}{path}");
+        let bytes = if changed_paths.contains(path) {
+            None
+        } else {
+            connector_cache_read(&cache_dir, &object_id)
+        };
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => match gh_fetch_file_bytes(owner, repo, path, &current_sha).await? {
+                GhFileContent::TooLargeForContentsApi => continue,
+                GhFileContent::Inline(fetched) => {
+                    if fetched.len() as u64 > limits.max_file_bytes {
+                        continue;
+                    }
+                    connector_cache_write(&cache_dir, &object_id, &fetched)?;
+                    fetched
+                }
+            },
+        };
+        objects.push(source_object_from_bytes(
+            &source.id,
+            &object_id,
+            canonical_uri,
+            media_type.to_string(),
+            bytes,
+            None,
+            None,
+        ));
+    }
+    Ok((objects, Some(current_sha)))
+}
+
+// --- S3Bucket -----------------------------------------------------------------
+
+struct S3ListPage {
+    entries: Vec<(String, String, u64)>,
+    is_truncated: bool,
+    next_token: Option<String>,
+}
+
+/// Minimal `ListObjectsV2` XML response parser — enough of AWS/R2/MinIO's
+/// standard shape (`Contents/{Key,ETag,Size}`, `IsTruncated`,
+/// `NextContinuationToken`) to drive pagination and per-key ETag tracking,
+/// without a full XML-schema/namespace-aware parser.
+fn parse_list_objects_v2(bytes: &[u8]) -> Result<S3ListPage, String> {
+    let mut reader = quick_xml::Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut entries = Vec::new();
+    let mut is_truncated = false;
+    let mut next_token = None;
+    let mut in_contents = false;
+    let mut current_key: Option<String> = None;
+    let mut current_etag: Option<String> = None;
+    let mut current_size: Option<u64> = None;
+    let mut current_tag = String::new();
+    loop {
+        match reader.read_event().map_err(|error| error.to_string())? {
+            quick_xml::events::Event::Start(start) => {
+                let name = String::from_utf8_lossy(start.name().as_ref()).to_string();
+                if name == "Contents" {
+                    in_contents = true;
+                    current_key = None;
+                    current_etag = None;
+                    current_size = None;
+                }
+                current_tag = name;
+            }
+            quick_xml::events::Event::Text(text) => {
+                let value = text.decode().map_err(|error| error.to_string())?.to_string();
+                if in_contents {
+                    match current_tag.as_str() {
+                        "Key" => current_key = Some(value),
+                        "ETag" => current_etag = Some(value.trim_matches('"').to_string()),
+                        "Size" => current_size = value.parse::<u64>().ok(),
+                        _ => {}
+                    }
+                } else {
+                    match current_tag.as_str() {
+                        "IsTruncated" => is_truncated = value == "true",
+                        "NextContinuationToken" => next_token = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+            quick_xml::events::Event::End(end) => {
+                let name = String::from_utf8_lossy(end.name().as_ref()).to_string();
+                if name == "Contents" {
+                    if let (Some(key), Some(etag)) = (current_key.take(), current_etag.take()) {
+                        entries.push((key, etag, current_size.take().unwrap_or(0)));
+                    }
+                    in_contents = false;
+                }
+            }
+            quick_xml::events::Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(S3ListPage {
+        entries,
+        is_truncated,
+        next_token,
+    })
+}
+
+/// Pure incremental-diff planner for [`collect_s3_bucket`]: given the
+/// previous refresh's per-key ETag map and this refresh's freshly listed
+/// `(key, etag, size)` entries, returns `(current_etags, changed_keys)` —
+/// `changed_keys` is the subset whose ETag differs from last time (or is
+/// new) and therefore needs a fresh `GetObject`; every other listed key is
+/// expected to already be sitting in the local connector cache.
+fn s3_plan_changed_keys(
+    previous_etags: &HashMap<String, String>,
+    listed: &[(String, String, u64)],
+    max_file_bytes: u64,
+) -> (HashMap<String, String>, BTreeSet<String>) {
+    let mut current = HashMap::new();
+    let mut changed = BTreeSet::new();
+    for (key, etag, size) in listed {
+        if *size > max_file_bytes || media_type_for_path(Path::new(key)).is_none() {
+            continue;
+        }
+        current.insert(key.clone(), etag.clone());
+        if previous_etags.get(key) != Some(etag) {
+            changed.insert(key.clone());
+        }
+    }
+    (current, changed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn s3_signed_get(
+    endpoint_url: &Url,
+    canonical_uri: &str,
+    query_pairs: &[(&str, &str)],
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    allow_loopback: bool,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, String> {
+    let host_header = connectors::host_header_value(endpoint_url)?;
+    let canonical_query = connectors::sigv4_canonical_query(query_pairs);
+    let headers = connectors::sigv4_signed_headers(
+        "GET",
+        &host_header,
+        canonical_uri,
+        &canonical_query,
+        access_key,
+        secret_key,
+        region,
+    );
+    let mut full_url = format!("{}://{host_header}{canonical_uri}", endpoint_url.scheme());
+    if !canonical_query.is_empty() {
+        full_url.push('?');
+        full_url.push_str(&canonical_query);
+    }
+    let origin = origin_of(endpoint_url)?;
+    let (bytes, _headers) = fetch_connector_bytes(
+        reqwest::Method::GET,
+        &full_url,
+        &origin,
+        allow_loopback,
+        &headers,
+        limits,
+        cancel,
+    )
+    .await?;
+    Ok(bytes)
+}
+
+/// Real incremental S3/R2/MinIO sync: `source.cursor` is a JSON
+/// `{ key: etag }` map. Every refresh still lists the bucket/prefix (S3 has
+/// no "changed since" listing API), but only keys whose ETag differs from
+/// last time are actually fetched with `GetObject` — everything else is
+/// replayed from `connector_cache_read`.
+#[allow(clippy::too_many_arguments)]
+async fn collect_s3_bucket(
+    app_data: &Path,
+    source: &KnowledgeSource,
+    endpoint: &str,
+    bucket: &str,
+    prefix: Option<&str>,
+    region: &str,
+    connector_account_id: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let account = connectors::account_by_id(connector_account_id)?;
+    if account.provider != connectors::ConnectorProvider::S3 {
+        return Err("The selected connector account is not an S3 account".to_string());
+    }
+    let secret_key = connectors::credential_for_account(&account)?;
+    let (_, _, _, access_key) = connectors::s3_connection(&account)?;
+    let endpoint_url = Url::parse(endpoint).map_err(|error| format!("Invalid S3 endpoint: {error}"))?;
+    let prefix = prefix.unwrap_or("").to_string();
+
+    let previous_etags: HashMap<String, String> = source
+        .cursor
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+
+    let cache_dir = connector_cache_dir(app_data, &source.id)?;
+    let mut listed = Vec::<(String, String, u64)>::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let mut query_pairs: Vec<(&str, &str)> = vec![("list-type", "2"), ("max-keys", "1000")];
+        if !prefix.is_empty() {
+            query_pairs.push(("prefix", &prefix));
+        }
+        if let Some(token) = continuation.as_deref() {
+            query_pairs.push(("continuation-token", token));
+        }
+        let canonical_uri = format!("/{bucket}");
+        let bytes = s3_signed_get(
+            &endpoint_url,
+            &canonical_uri,
+            &query_pairs,
+            &access_key,
+            &secret_key,
+            region,
+            false,
+            limits,
+            cancel,
+        )
+        .await?;
+        let page = parse_list_objects_v2(&bytes)?;
+        listed.extend(page.entries);
+        if listed.len() > limits.max_objects_per_source {
+            return Err("S3 bucket/prefix has more objects than the configured limit".to_string());
+        }
+        if page.is_truncated {
+            match page.next_token {
+                Some(token) => continuation = Some(token),
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+
+    let (current_etags, changed_keys) = s3_plan_changed_keys(&previous_etags, &listed, limits.max_file_bytes);
+    let mut objects = Vec::new();
+    for (key, _etag, _size) in &listed {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let Some(etag) = current_etags.get(key).cloned() else {
+            continue;
+        };
+        let Some(media_type) = media_type_for_path(Path::new(key)) else {
+            continue;
+        };
+        let object_id = format!("s3-{}", &sha256(format!("{bucket}/{key}").as_bytes())[..32]);
+        let canonical_uri = format!("s3://{bucket}/{key}");
+        let cached = if changed_keys.contains(key) {
+            None
+        } else {
+            connector_cache_read(&cache_dir, &object_id)
+        };
+        let bytes = match cached {
+            Some(bytes) => bytes,
+            None => {
+                let canonical_key_uri =
+                    format!("/{bucket}/{}", connectors::sigv4_uri_encode(key, false));
+                let fetched = s3_signed_get(
+                    &endpoint_url,
+                    &canonical_key_uri,
+                    &[],
+                    &access_key,
+                    &secret_key,
+                    region,
+                    false,
+                    limits,
+                    cancel,
+                )
+                .await?;
+                if fetched.len() as u64 > limits.max_file_bytes {
+                    continue;
+                }
+                connector_cache_write(&cache_dir, &object_id, &fetched)?;
+                fetched
+            }
+        };
+        objects.push(source_object_from_bytes(
+            &source.id,
+            &object_id,
+            canonical_uri,
+            media_type.to_string(),
+            bytes,
+            Some(etag),
+            None,
+        ));
+    }
+    let cursor = serde_json::to_string(&current_etags).map_err(|error| error.to_string())?;
+    Ok((objects, Some(cursor)))
+}
+
+// --- NotionPages ----------------------------------------------------------------
+
+async fn notion_get_children(
+    block_id: &str,
+    token: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<Vec<Value>, String> {
+    let mut results = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let mut url = format!("https://api.notion.com/v1/blocks/{block_id}/children?page_size=100");
+        if let Some(token) = &cursor {
+            url.push_str(&format!("&start_cursor={}", percent_encode_query(token)));
+        }
+        let headers = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("notion-version", "2022-06-28".to_string()),
+        ];
+        let (bytes, _headers) =
+            fetch_connector_bytes(reqwest::Method::GET, &url, "https://api.notion.com", false, &headers, limits, cancel)
+                .await?;
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Notion returned invalid JSON: {error}"))?;
+        if let Some(error) = json.get("message").and_then(Value::as_str) {
+            if json.get("object").and_then(Value::as_str) == Some("error") {
+                return Err(format!("Notion rejected the request: {error}"));
+            }
+        }
+        if let Some(array) = json.get("results").and_then(Value::as_array) {
+            results.extend(array.iter().cloned());
+        }
+        if json.get("has_more").and_then(Value::as_bool) == Some(true) {
+            cursor = json.get("next_cursor").and_then(Value::as_str).map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+        if results.len() > limits.max_objects_per_source.saturating_mul(5) {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+fn notion_block_plain_text(block: &Value) -> Option<String> {
+    let block_type = block.get("type").and_then(Value::as_str)?;
+    let payload = block.get(block_type)?;
+    let rich_text = payload.get("rich_text").and_then(Value::as_array)?;
+    let combined = rich_text
+        .iter()
+        .filter_map(|segment| segment.get("plain_text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    if combined.trim().is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+/// BFS from `root_id` collecting every descendant `child_page` block —
+/// Notion has no "list pages under this page" endpoint, so this walks
+/// `blocks/{id}/children` (paginated) and stops descending once it hits a
+/// `child_page` (that page's own content is fetched separately, only if it
+/// actually changed — see [`collect_notion_pages`]).
+async fn notion_discover_child_pages(
+    root_id: &str,
+    token: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<Vec<(String, String, u64)>, String> {
+    let mut found = Vec::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((root_id.to_string(), 0usize));
+    let mut visited = BTreeSet::new();
+    while let Some((block_id, depth)) = queue.pop_front() {
+        if !visited.insert(block_id.clone()) {
+            continue;
+        }
+        if depth > 6 || found.len() >= limits.max_objects_per_source {
+            continue;
+        }
+        let children = notion_get_children(&block_id, token, limits, cancel).await?;
+        for child in children {
+            let Some(child_id) = child.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let block_type = child.get("type").and_then(Value::as_str).unwrap_or_default();
+            let last_edited = child
+                .get("last_edited_time")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601_ms)
+                .unwrap_or(0);
+            if block_type == "child_page" {
+                let title = child
+                    .get("child_page")
+                    .and_then(|page| page.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled")
+                    .to_string();
+                found.push((child_id.to_string(), title, last_edited));
+            } else if child.get("has_children").and_then(Value::as_bool) == Some(true) {
+                queue.push_back((child_id.to_string(), depth + 1));
+            }
+        }
+    }
+    Ok(found)
+}
+
+async fn notion_extract_page_text(
+    page_id: &str,
+    title: &str,
+    token: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let mut text = format!("# {title}\n\n");
+    let mut queue = VecDeque::new();
+    queue.push_back((page_id.to_string(), 0usize));
+    let mut visited = BTreeSet::new();
+    let mut node_budget = 4_000usize;
+    while let Some((block_id, depth)) = queue.pop_front() {
+        if !visited.insert(block_id.clone()) {
+            continue;
+        }
+        if depth > 8 || node_budget == 0 {
+            continue;
+        }
+        let children = notion_get_children(&block_id, token, limits, cancel).await?;
+        for child in children {
+            node_budget = node_budget.saturating_sub(1);
+            if let Some(line) = notion_block_plain_text(&child) {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            let child_type = child.get("type").and_then(Value::as_str).unwrap_or_default();
+            if child_type != "child_page" && child.get("has_children").and_then(Value::as_bool) == Some(true) {
+                if let Some(id) = child.get("id").and_then(Value::as_str) {
+                    queue.push_back((id.to_string(), depth + 1));
+                }
+            }
+        }
+    }
+    Ok(text)
+}
+
+/// Pure incremental-diff planner for [`collect_notion_pages`]: given the
+/// previous refresh's per-page `last_edited_time` (as Unix ms, keyed by this
+/// source's stable `notion-<id>` object id) and this refresh's freshly
+/// discovered `(page_id, title, last_edited_ms)` triples, returns the set of
+/// object ids whose `last_edited_time` has moved (or are new) — every other
+/// discovered page is expected to already be sitting in the local connector
+/// cache.
+fn notion_plan_changed_pages(
+    previous_by_id: &HashMap<String, u64>,
+    discovered: &[(String, String, u64)],
+) -> BTreeSet<String> {
+    discovered
+        .iter()
+        .map(|(page_id, _title, last_edited_ms)| {
+            let object_id = format!("notion-{}", page_id.replace('-', ""));
+            (object_id, *last_edited_ms)
+        })
+        .filter(|(object_id, last_edited_ms)| previous_by_id.get(object_id) != Some(last_edited_ms))
+        .map(|(object_id, _)| object_id)
+        .collect()
+}
+
+/// Real incremental Notion sync: `source.cursor` is the maximum
+/// `last_edited_time` (as Unix ms) observed across every discovered page.
+/// Notion's Block Children API has no "changed since" filter, so discovery
+/// (`notion_discover_child_pages`) always walks the whole subtree, but each
+/// page's own `last_edited_time` (returned inline by that same walk, no
+/// extra call) is compared against what this source recorded for it last
+/// time (`ConnectorObjectState.modified_unix_ms`) — a page whose timestamp
+/// hasn't moved is replayed from `connector_cache_read` instead of walking
+/// its blocks again.
+async fn collect_notion_pages(
+    app_data: &Path,
+    source: &KnowledgeSource,
+    connector_account_id: &str,
+    root_id: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let account = connectors::account_by_id(connector_account_id)?;
+    if account.provider != connectors::ConnectorProvider::Notion {
+        return Err("The selected connector account is not a Notion account".to_string());
+    }
+    let token = connectors::credential_for_account(&account)?;
+    let cache_dir = connector_cache_dir(app_data, &source.id)?;
+    let previous_by_id: HashMap<String, u64> = source
+        .objects
+        .iter()
+        .filter_map(|object| object.modified_unix_ms.map(|ms| (object.object_id.clone(), ms)))
+        .collect();
+
+    let pages = notion_discover_child_pages(root_id, &token, limits, cancel).await?;
+    let changed_ids = notion_plan_changed_pages(&previous_by_id, &pages);
+    let mut objects = Vec::new();
+    let mut max_edited: u64 = 0;
+    for (page_id, title, last_edited_ms) in pages {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        max_edited = max_edited.max(last_edited_ms);
+        let object_id = format!("notion-{}", page_id.replace('-', ""));
+        let canonical_uri = format!("https://notion.so/{}", page_id.replace('-', ""));
+        let cached = if changed_ids.contains(&object_id) {
+            None
+        } else {
+            connector_cache_read(&cache_dir, &object_id)
+        };
+        let bytes = match cached {
+            Some(bytes) => bytes,
+            None => {
+                let text = notion_extract_page_text(&page_id, &title, &token, limits, cancel).await?;
+                let bytes = text.into_bytes();
+                if bytes.len() as u64 > limits.max_file_bytes {
+                    continue;
+                }
+                connector_cache_write(&cache_dir, &object_id, &bytes)?;
+                bytes
+            }
+        };
+        objects.push(source_object_from_bytes(
+            &source.id,
+            &object_id,
+            canonical_uri,
+            "text/plain".to_string(),
+            bytes,
+            None,
+            Some(last_edited_ms),
+        ));
+    }
+    Ok((objects, Some(max_edited.to_string())))
+}
+
+// --- SlackChannels --------------------------------------------------------------
+
+/// Pure per-page transcript builder for [`slack_fetch_new_messages`]: given
+/// one `conversations.history` page's raw `messages` array (Slack returns
+/// newest-first — reversed here so appended lines stay chronological) and
+/// the `oldest` boundary this refresh started from, returns the new
+/// transcript lines plus the latest message timestamp seen. The message
+/// exactly at the `oldest` boundary is dropped (Slack's `oldest` is
+/// inclusive, and that message was already appended on a previous refresh).
+fn slack_parse_messages_page(messages: &[Value], oldest: Option<&str>) -> (Vec<String>, Option<String>) {
+    let mut lines = Vec::new();
+    let mut latest_ts: Option<String> = None;
+    for message in messages.iter().rev() {
+        let Some(ts) = message.get("ts").and_then(Value::as_str) else {
+            continue;
+        };
+        if oldest == Some(ts) {
+            continue;
+        }
+        let text = message.get("text").and_then(Value::as_str).unwrap_or("");
+        let user = message.get("user").and_then(Value::as_str).unwrap_or("unknown");
+        lines.push(format!("[{ts}] {user}: {text}"));
+        latest_ts = Some(match latest_ts {
+            Some(previous) if previous.as_str() > ts => previous,
+            _ => ts.to_string(),
+        });
+    }
+    (lines, latest_ts)
+}
+
+/// One page of `conversations.history`, oldest-first within the page
+/// (Slack returns newest-first; reversed here so appends stay chronological)
+/// and with the message exactly at the `oldest` boundary dropped (Slack's
+/// `oldest` is inclusive, and that message was already appended last time).
+async fn slack_fetch_new_messages(
+    channel_id: &str,
+    oldest: Option<&str>,
+    token: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let mut lines = Vec::new();
+    let mut latest_ts: Option<String> = None;
+    let mut cursor: Option<String> = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let mut url = format!(
+            "https://slack.com/api/conversations.history?channel={}&limit=200",
+            percent_encode_query(channel_id)
+        );
+        if let Some(oldest) = oldest {
+            url.push_str(&format!("&oldest={}", percent_encode_query(oldest)));
+        }
+        if let Some(token) = &cursor {
+            url.push_str(&format!("&cursor={}", percent_encode_query(token)));
+        }
+        let headers = vec![("authorization", format!("Bearer {token}"))];
+        let (bytes, _headers) =
+            fetch_connector_bytes(reqwest::Method::GET, &url, "https://slack.com", false, &headers, limits, cancel)
+                .await?;
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Slack returned invalid JSON: {error}"))?;
+        if json.get("ok").and_then(Value::as_bool) != Some(true) {
+            let error = json.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
+            return Err(format!("Slack rejected the request: {error}"));
+        }
+        let messages = json
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (page_lines, page_latest) = slack_parse_messages_page(&messages, oldest);
+        lines.extend(page_lines);
+        latest_ts = match (latest_ts, page_latest) {
+            (Some(previous), Some(candidate)) if previous.as_str() >= candidate.as_str() => {
+                Some(previous)
+            }
+            (_, Some(candidate)) => Some(candidate),
+            (previous, None) => previous,
+        };
+        if json.get("has_more").and_then(Value::as_bool) == Some(true) {
+            let next = json
+                .get("response_metadata")
+                .and_then(|metadata| metadata.get("next_cursor"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        } else {
+            break;
+        }
+        if lines.len() > limits.max_objects_per_source.saturating_mul(20) {
+            break;
+        }
+    }
+    Ok((lines, latest_ts))
+}
+
+/// Real incremental Slack sync: `source.cursor` is a JSON
+/// `{ channel_id: last_ts }` map — each refresh asks `conversations.history`
+/// for messages strictly after that channel's own last-seen timestamp
+/// (Slack's own `oldest` cursor semantics), appending only the new messages
+/// to this source's cached transcript instead of re-fetching channel
+/// history from the beginning every time.
+async fn collect_slack_channels(
+    app_data: &Path,
+    source: &KnowledgeSource,
+    connector_account_id: &str,
+    channel_ids: &[String],
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let account = connectors::account_by_id(connector_account_id)?;
+    if account.provider != connectors::ConnectorProvider::Slack {
+        return Err("The selected connector account is not a Slack account".to_string());
+    }
+    let token = connectors::credential_for_account(&account)?;
+    let cache_dir = connector_cache_dir(app_data, &source.id)?;
+    let previous_cursors: HashMap<String, String> = source
+        .cursor
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let mut next_cursors = previous_cursors.clone();
+    let mut objects = Vec::new();
+    for channel_id in channel_ids {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let object_id = format!("slack-{}", channel_id.to_ascii_lowercase());
+        let oldest = previous_cursors.get(channel_id).cloned();
+        let mut transcript = connector_cache_read(&cache_dir, &object_id)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let (new_lines, latest_ts) =
+            slack_fetch_new_messages(channel_id, oldest.as_deref(), &token, limits, cancel).await?;
+        if !new_lines.is_empty() {
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            transcript.push_str(&new_lines.join("\n"));
+            if transcript.len() as u64 > limits.max_file_bytes {
+                let keep_from = transcript.len() - limits.max_file_bytes as usize;
+                let mut boundary = keep_from;
+                while boundary < transcript.len() && !transcript.is_char_boundary(boundary) {
+                    boundary += 1;
+                }
+                transcript = transcript[boundary..].to_string();
+            }
+            connector_cache_write(&cache_dir, &object_id, transcript.as_bytes())?;
+        }
+        if let Some(ts) = latest_ts {
+            next_cursors.insert(channel_id.clone(), ts);
+        }
+        if transcript.is_empty() {
+            continue;
+        }
+        let canonical_uri = format!("https://slack.com/archives/{channel_id}");
+        objects.push(source_object_from_bytes(
+            &source.id,
+            &object_id,
+            canonical_uri,
+            "text/plain".to_string(),
+            transcript.into_bytes(),
+            None,
+            None,
+        ));
+    }
+    let cursor = serde_json::to_string(&next_cursors).map_err(|error| error.to_string())?;
+    Ok((objects, Some(cursor)))
+}
+
+// --- JiraProject ----------------------------------------------------------------
+
+fn jira_adf_collect(node: &Value, out: &mut String) {
+    if let Some(text) = node.get("text").and_then(Value::as_str) {
+        out.push_str(text);
+    }
+    if let Some(content) = node.get("content").and_then(Value::as_array) {
+        for child in content {
+            jira_adf_collect(child, out);
+            out.push(' ');
+        }
+    }
+}
+
+/// Flattens a Jira Cloud v3 Atlassian Document Format `description` field
+/// into plain text — good enough for indexing/search, not a full ADF
+/// renderer.
+fn jira_adf_plain_text(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let mut out = String::new();
+    jira_adf_collect(value, &mut out);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `yyyy-MM-ddTHH:mm:ss.SSS±ZZZZ` → `yyyy-MM-dd HH:mm`, the bound format
+/// Jira's JQL `updated >= "..."` clause accepts.
+fn jira_jql_timestamp(raw: &str) -> String {
+    raw.replacen('T', " ", 1).chars().take(16).collect()
+}
+
+/// Real incremental Jira sync: `source.cursor` is a JQL
+/// `updated >= "<cursor>"` bound (the maximum `updated` timestamp observed
+/// last time) — each refresh's JQL only asks for issues updated since then,
+/// so unchanged issues never come back down the wire at all. Every issue
+/// this source has ever seen (tracked via its cached object, keyed by issue
+/// key) that this sweep did NOT return is still included in the result by
+/// replaying its cache, so a stale/deleted-from-JQL issue's chunks aren't
+/// spuriously dropped just because it wasn't touched recently.
+async fn collect_jira_project(
+    app_data: &Path,
+    source: &KnowledgeSource,
+    connector_account_id: &str,
+    project_key: &str,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let account = connectors::account_by_id(connector_account_id)?;
+    if account.provider != connectors::ConnectorProvider::Jira {
+        return Err("The selected connector account is not a Jira account".to_string());
+    }
+    let token = connectors::credential_for_account(&account)?;
+    let (site_url, email) = connectors::jira_connection(&account)?;
+    let base = Url::parse(&site_url).map_err(|error| format!("Invalid Jira site URL: {error}"))?;
+    let origin = origin_of(&base)?;
+    let base_str = base.as_str().trim_end_matches('/').to_string();
+
+    let mut jql = format!("project = \"{}\"", project_key.replace('"', ""));
+    if let Some(cursor) = source.cursor.as_deref() {
+        jql.push_str(&format!(" AND updated >= \"{}\"", cursor.replace('"', "")));
+    }
+    jql.push_str(" ORDER BY updated ASC");
+
+    let cache_dir = connector_cache_dir(app_data, &source.id)?;
+    let credential = base64::engine::general_purpose::STANDARD.encode(format!("{email}:{token}"));
+    let mut objects = Vec::new();
+    let mut max_updated_display: Option<String> = None;
+    let mut start_at = 0u32;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let url = format!(
+            "{base_str}/rest/api/3/search?jql={}&fields=summary,description,updated,status&startAt={start_at}&maxResults=50",
+            percent_encode_query(&jql)
+        );
+        let headers = vec![
+            ("accept", "application/json".to_string()),
+            ("authorization", format!("Basic {credential}")),
+        ];
+        let (bytes, _headers) =
+            fetch_connector_bytes(reqwest::Method::GET, &url, &origin, false, &headers, limits, cancel).await?;
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Jira returned invalid JSON: {error}"))?;
+        if let Some(message) = json.get("errorMessages").and_then(Value::as_array) {
+            if let Some(first) = message.first().and_then(Value::as_str) {
+                return Err(format!("Jira rejected the request: {first}"));
+            }
+        }
+        let issues = json
+            .get("issues")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if issues.is_empty() {
+            break;
+        }
+        for issue in &issues {
+            let Some(key) = issue.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let fields = issue.get("fields").cloned().unwrap_or(Value::Null);
+            let summary = fields.get("summary").and_then(Value::as_str).unwrap_or("");
+            let updated_raw = fields.get("updated").and_then(Value::as_str).unwrap_or("");
+            let updated_ms = parse_iso8601_ms(updated_raw);
+            if updated_raw.len() >= 16 {
+                let candidate = jira_jql_timestamp(updated_raw);
+                max_updated_display = Some(match &max_updated_display {
+                    Some(previous) if previous.as_str() >= candidate.as_str() => previous.clone(),
+                    _ => candidate,
+                });
+            }
+            let description = jira_adf_plain_text(fields.get("description"));
+            let status = fields
+                .get("status")
+                .and_then(|status| status.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let text = format!("{key}: {summary}\nStatus: {status}\n\n{description}");
+            let object_id = format!("jira-{}", key.to_ascii_lowercase());
+            let canonical_uri = format!("{base_str}/browse/{key}");
+            let bytes = text.into_bytes();
+            if bytes.len() as u64 > limits.max_file_bytes {
+                continue;
+            }
+            connector_cache_write(&cache_dir, &object_id, &bytes)?;
+            objects.push(source_object_from_bytes(
+                &source.id,
+                &object_id,
+                canonical_uri,
+                "text/plain".to_string(),
+                bytes,
+                None,
+                updated_ms,
+            ));
+        }
+        start_at += issues.len() as u32;
+        let total = json.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
+        if start_at >= total || issues.len() < 50 || objects.len() > limits.max_objects_per_source {
+            break;
+        }
+    }
+
+    let refreshed_ids: BTreeSet<String> =
+        objects.iter().map(|object| object.metadata.object_id.clone()).collect();
+    for previous in &source.objects {
+        if refreshed_ids.contains(&previous.object_id) {
+            continue;
+        }
+        if let Some(bytes) = connector_cache_read(&cache_dir, &previous.object_id) {
+            objects.push(source_object_from_bytes(
+                &source.id,
+                &previous.object_id,
+                previous.canonical_uri.clone(),
+                "text/plain".to_string(),
+                bytes,
+                None,
+                previous.modified_unix_ms,
+            ));
+        }
+    }
+    let cursor = max_updated_display.or_else(|| source.cursor.clone());
+    Ok((objects, cursor))
+}
+
+// --- WatchedFolder: filesystem-watcher-driven automatic refresh -----------------
+
+struct WatchedFolderHandle {
+    path: PathBuf,
+    debounce_ms: u64,
+    _watcher: RecommendedWatcher,
+}
+
+static WATCHED_FOLDER_HANDLES: OnceLock<Mutex<HashMap<String, WatchedFolderHandle>>> = OnceLock::new();
+
+fn watched_folder_handles() -> &'static Mutex<HashMap<String, WatchedFolderHandle>> {
+    WATCHED_FOLDER_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reconciles the set of active filesystem watchers against every enabled
+/// `WatchedFolder` source in the catalog — called once at app startup and
+/// again after every catalog mutation (add/update/remove source), so a
+/// source's watcher starts/stops in lockstep with the source itself. Stale
+/// watchers (for a source that was removed, disabled, or changed connector
+/// kind) are dropped, which stops them (`notify`'s watcher unwatches on
+/// `Drop`); missing ones are started. Best-effort throughout: a watcher that
+/// fails to start (e.g. the path no longer exists) simply means that one
+/// source falls back to manual refresh, never a hard error surfaced to the
+/// caller — this runs on background/setup paths that have no UI to show one
+/// to anyway.
+pub fn sync_watched_folder_watchers(app: &AppHandle) {
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return;
+    };
+    let Ok(root) = data_root_at(&app_data) else {
+        return;
+    };
+    let Ok(catalog) = load_catalog(&root) else {
+        return;
+    };
+    let mut desired = HashMap::<String, (PathBuf, u64, String)>::new();
+    for source in &catalog.sources {
+        if !source.enabled {
+            continue;
+        }
+        if let ConnectorConfig::WatchedFolder { path, debounce_ms } = &source.connector {
+            desired.insert(source.id.clone(), (PathBuf::from(path), *debounce_ms, source.stack_id.clone()));
+        }
+    }
+    let Ok(mut handles) = watched_folder_handles().lock() else {
+        return;
+    };
+    // Retain a handle only if the source is still an enabled WatchedFolder
+    // *and* its watched path/debounce still match the catalog — otherwise an
+    // edited source keeps watching its stale, previous path indefinitely.
+    handles.retain(|source_id, handle| {
+        desired
+            .get(source_id)
+            .is_some_and(|(path, debounce_ms, _)| handle.path == *path && handle.debounce_ms == *debounce_ms)
+    });
+    for (source_id, (path, debounce_ms, stack_id)) in desired {
+        if handles.contains_key(&source_id) {
+            continue;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        let Ok(mut watcher) = watcher else {
+            continue;
+        };
+        if watcher.watch(&path, RecursiveMode::Recursive).is_err() {
+            continue;
+        }
+        let app_for_refresh = app.clone();
+        thread::spawn(move || {
+            while rx.recv().is_ok() {
+                while rx.recv_timeout(Duration::from_millis(debounce_ms)).is_ok() {}
+                let app = app_for_refresh.clone();
+                let stack_id = stack_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    let Ok(app_data) = app.path().app_data_dir() else {
+                        return;
+                    };
+                    let _ = knowledge_v2_refresh_headless(&app_data, &stack_id).await;
+                });
+            }
+        });
+        handles.insert(source_id, WatchedFolderHandle { path, debounce_ms, _watcher: watcher });
     }
 }
 
@@ -2965,6 +4690,7 @@ pub fn knowledge_ocr_set_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn temporary_root(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -3230,5 +4956,481 @@ mod tests {
             .findings
             .iter()
             .all(|finding| !finding.masked_preview.contains("supersecret")));
+    }
+
+    // =========================================================================
+    // External Knowledge Sync connectors — dedup/incremental-cursor planners.
+    // Every test below is pure/fixture-driven: no live network call, no `gh`
+    // process, matching `knowledge_pipeline.rs`'s
+    // `url_policy_enforces_origin_dns_and_ssrf_limits` style.
+    // =========================================================================
+
+    // --- GitHubRepo ----------------------------------------------------------
+
+    #[test]
+    fn github_plan_paths_does_a_full_tree_listing_on_first_refresh() {
+        let tree = vec![
+            json!({ "type": "blob", "path": "README.md" }),
+            json!({ "type": "blob", "path": "docs/guide.md" }),
+            json!({ "type": "tree", "path": "docs" }),
+            json!({ "type": "blob", "path": "docs/notes.bin" }),
+        ];
+        let (all_paths, changed_paths) =
+            github_plan_paths(BTreeSet::new(), GithubCursorState::FullTree(tree), None);
+        assert_eq!(
+            all_paths,
+            BTreeSet::from(["README.md".to_string(), "docs/guide.md".to_string()])
+        );
+        assert_eq!(all_paths, changed_paths, "every path is 'changed' on a first sync");
+    }
+
+    #[test]
+    fn github_plan_paths_only_marks_compare_reported_files_as_changed() {
+        let previous = BTreeSet::from([
+            "README.md".to_string(),
+            "docs/guide.md".to_string(),
+            "docs/old.md".to_string(),
+        ]);
+        let files = vec![
+            json!({ "filename": "docs/guide.md", "status": "modified" }),
+            json!({ "filename": "docs/old.md", "status": "removed" }),
+            json!({ "filename": "docs/new.md", "status": "added" }),
+        ];
+        let (all_paths, changed_paths) =
+            github_plan_paths(previous, GithubCursorState::Compare(files), None);
+        assert_eq!(
+            all_paths,
+            BTreeSet::from([
+                "README.md".to_string(),
+                "docs/guide.md".to_string(),
+                "docs/new.md".to_string(),
+            ]),
+            "old.md is dropped and new.md is added"
+        );
+        assert_eq!(
+            changed_paths,
+            BTreeSet::from(["docs/guide.md".to_string(), "docs/new.md".to_string()]),
+            "README.md never appears in the compare diff, so it must NOT be re-fetched"
+        );
+    }
+
+    #[test]
+    fn github_plan_paths_an_unchanged_cursor_re_fetches_nothing() {
+        let previous = BTreeSet::from(["README.md".to_string()]);
+        let (all_paths, changed_paths) =
+            github_plan_paths(previous.clone(), GithubCursorState::Unchanged, None);
+        assert_eq!(all_paths, previous);
+        assert!(changed_paths.is_empty());
+    }
+
+    #[test]
+    fn github_plan_paths_a_rename_drops_the_old_path_and_keeps_the_new_one_changed() {
+        let previous = BTreeSet::from(["old_name.md".to_string()]);
+        let files = vec![
+            json!({ "filename": "new_name.md", "status": "renamed", "previous_filename": "old_name.md" }),
+        ];
+        let (all_paths, changed_paths) =
+            github_plan_paths(previous, GithubCursorState::Compare(files), None);
+        assert_eq!(all_paths, BTreeSet::from(["new_name.md".to_string()]));
+        assert_eq!(changed_paths, BTreeSet::from(["new_name.md".to_string()]));
+    }
+
+    #[test]
+    fn github_plan_paths_respects_the_configured_path_prefix() {
+        let tree = vec![
+            json!({ "type": "blob", "path": "docs/guide.md" }),
+            json!({ "type": "blob", "path": "src/main.rs" }),
+        ];
+        let (all_paths, _) =
+            github_plan_paths(BTreeSet::new(), GithubCursorState::FullTree(tree), Some("docs"));
+        assert_eq!(all_paths, BTreeSet::from(["docs/guide.md".to_string()]));
+    }
+
+    // --- S3Bucket --------------------------------------------------------------
+
+    #[test]
+    fn s3_plan_changed_keys_only_re_fetches_keys_whose_etag_moved() {
+        let previous = HashMap::from([
+            ("reports/a.txt".to_string(), "etag-a".to_string()),
+            ("reports/b.txt".to_string(), "etag-b".to_string()),
+        ]);
+        let listed = vec![
+            ("reports/a.txt".to_string(), "etag-a".to_string(), 10),
+            ("reports/b.txt".to_string(), "etag-b2".to_string(), 20),
+            ("reports/c.txt".to_string(), "etag-c".to_string(), 30),
+        ];
+        let (current, changed) = s3_plan_changed_keys(&previous, &listed, 1_000_000);
+        assert_eq!(current.len(), 3);
+        assert_eq!(
+            changed,
+            BTreeSet::from(["reports/b.txt".to_string(), "reports/c.txt".to_string()]),
+            "only the moved ETag and the brand-new key should be marked changed"
+        );
+    }
+
+    #[test]
+    fn s3_plan_changed_keys_skips_oversized_and_unsupported_extension_objects() {
+        let previous = HashMap::new();
+        let listed = vec![
+            ("huge.txt".to_string(), "etag-1".to_string(), 1_000),
+            ("archive.tar.gz".to_string(), "etag-2".to_string(), 10),
+            ("notes.md".to_string(), "etag-3".to_string(), 10),
+        ];
+        let (current, changed) = s3_plan_changed_keys(&previous, &listed, 100);
+        assert_eq!(current.len(), 1, "only notes.md fits the size AND extension filter");
+        assert!(current.contains_key("notes.md"));
+        assert_eq!(changed, BTreeSet::from(["notes.md".to_string()]));
+    }
+
+    // --- NotionPages -------------------------------------------------------------
+
+    #[test]
+    fn notion_plan_changed_pages_only_flags_pages_whose_last_edited_time_moved() {
+        let previous = HashMap::from([
+            ("notion-aaa".to_string(), 1_000u64),
+            ("notion-bbb".to_string(), 2_000u64),
+        ]);
+        let discovered = vec![
+            ("aaa".to_string(), "Unchanged Page".to_string(), 1_000u64),
+            ("bbb".to_string(), "Edited Page".to_string(), 2_500u64),
+            ("ccc".to_string(), "New Page".to_string(), 3_000u64),
+        ];
+        let changed = notion_plan_changed_pages(&previous, &discovered);
+        assert_eq!(
+            changed,
+            BTreeSet::from(["notion-bbb".to_string(), "notion-ccc".to_string()]),
+            "aaa's last_edited_time is identical to last time, so it must be replayed from cache"
+        );
+    }
+
+    // --- SlackChannels -----------------------------------------------------------
+
+    #[test]
+    fn slack_parse_messages_page_reverses_to_chronological_order_and_drops_the_oldest_boundary() {
+        let messages = vec![
+            json!({ "ts": "3.0", "user": "u1", "text": "third" }),
+            json!({ "ts": "2.0", "user": "u1", "text": "second" }),
+            json!({ "ts": "1.0", "user": "u1", "text": "first (already synced)" }),
+        ];
+        let (lines, latest) = slack_parse_messages_page(&messages, Some("1.0"));
+        assert_eq!(lines, vec!["[2.0] u1: second".to_string(), "[3.0] u1: third".to_string()]);
+        assert_eq!(latest.as_deref(), Some("3.0"));
+    }
+
+    #[test]
+    fn slack_parse_messages_page_with_no_oldest_boundary_keeps_every_message() {
+        let messages = vec![json!({ "ts": "5.0", "user": "u2", "text": "hello" })];
+        let (lines, latest) = slack_parse_messages_page(&messages, None);
+        assert_eq!(lines, vec!["[5.0] u2: hello".to_string()]);
+        assert_eq!(latest.as_deref(), Some("5.0"));
+    }
+
+    // --- JiraProject ---------------------------------------------------------------
+
+    #[test]
+    fn jira_jql_timestamp_converts_the_iso8601_updated_field_to_the_jql_bound_format() {
+        assert_eq!(jira_jql_timestamp("2024-01-15T10:30:00.000+0000"), "2024-01-15 10:30");
+    }
+
+    #[test]
+    fn jira_adf_plain_text_flattens_nested_content_nodes() {
+        let adf = json!({
+            "type": "doc",
+            "content": [
+                { "type": "paragraph", "content": [
+                    { "type": "text", "text": "Steps to reproduce:" }
+                ] },
+                { "type": "bulletList", "content": [
+                    { "type": "listItem", "content": [
+                        { "type": "paragraph", "content": [ { "type": "text", "text": "Open the app" } ] }
+                    ] }
+                ] }
+            ]
+        });
+        let text = jira_adf_plain_text(Some(&adf));
+        assert!(text.contains("Steps to reproduce:"));
+        assert!(text.contains("Open the app"));
+    }
+
+    #[test]
+    fn jira_adf_plain_text_of_none_is_empty() {
+        assert_eq!(jira_adf_plain_text(None), "");
+    }
+
+    // --- shared authenticated fetch + S3 signing, against a fixture server ------
+
+    /// Same shape as `connectors.rs`'s `spawn_fixture` (status line/extra
+    /// headers/body in, local loopback address out), plus a channel that
+    /// hands back the raw request bytes the fixture received — so a test can
+    /// assert on the request (headers, query string, ...) from the main test
+    /// thread instead of panicking inside the accept thread, where a panic
+    /// wouldn't fail the test directly.
+    fn spawn_knowledge_fixture(
+        status_line: &str,
+        extra_headers: &str,
+        body: &'static str,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let _ = tx.send(request);
+                let response = format!(
+                    "{status_line}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn fetch_connector_bytes_sends_the_given_headers_and_returns_the_body() {
+        let (addr, rx) = spawn_knowledge_fixture("HTTP/1.1 200 OK", "", "{\"ok\":true}");
+        let origin = format!("http://{addr}");
+        let url = format!("http://{addr}/v1/users/me");
+        let (bytes, _headers) = fetch_connector_bytes(
+            reqwest::Method::GET,
+            &url,
+            &origin,
+            true,
+            &[("authorization", "Bearer fixture-token".to_string())],
+            &PipelineLimits::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"{\"ok\":true}");
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            request.to_lowercase().contains("authorization: bearer fixture-token"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_connector_bytes_blocks_loopback_by_default() {
+        let url = "http://127.0.0.1:9/v1/users/me";
+        let result = fetch_connector_bytes(
+            reqwest::Method::GET,
+            url,
+            "http://127.0.0.1:9",
+            false,
+            &[],
+            &PipelineLimits::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_connector_bytes_refuses_a_redirect() {
+        let (addr, _rx) = spawn_knowledge_fixture(
+            "HTTP/1.1 302 Found",
+            "Location: http://example.test/\r\n",
+            "",
+        );
+        let origin = format!("http://{addr}");
+        let url = format!("http://{addr}/");
+        let result = fetch_connector_bytes(
+            reqwest::Method::GET,
+            &url,
+            &origin,
+            true,
+            &[],
+            &PipelineLimits::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("expected the redirect to be refused"),
+            Err(message) => assert!(message.to_lowercase().contains("redirect"), "{message}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_signed_get_sends_a_sigv4_authorization_header_and_the_exact_canonical_query() {
+        let (addr, rx) = spawn_knowledge_fixture(
+            "HTTP/1.1 200 OK",
+            "",
+            "<ListBucketResult></ListBucketResult>",
+        );
+        let endpoint_url = Url::parse(&format!("http://{addr}")).unwrap();
+        let bytes = s3_signed_get(
+            &endpoint_url,
+            "/my-bucket",
+            &[("list-type", "2"), ("prefix", "notes/")],
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            true,
+            &PipelineLimits::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("ListBucketResult"));
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("list-type=2") && request_line.contains("prefix=notes%2F"),
+            "request line should carry the exact signed canonical query: {request_line}"
+        );
+        assert!(
+            request.to_lowercase().contains("authorization: aws4-hmac-sha256"),
+            "request should carry a SigV4 Authorization header: {request}"
+        );
+    }
+
+    // --- connector cache -----------------------------------------------------------
+
+    #[test]
+    fn connector_cache_round_trips_bytes_and_misses_cleanly_when_absent() {
+        let root = temporary_root("connector-cache");
+        let cache_dir = connector_cache_dir(&root, "source-1").unwrap();
+        assert!(connector_cache_read(&cache_dir, "object-1").is_none());
+        connector_cache_write(&cache_dir, "object-1", b"hello world").unwrap();
+        assert_eq!(
+            connector_cache_read(&cache_dir, "object-1").as_deref(),
+            Some(b"hello world".as_slice())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- validate_connector: new connector kinds -------------------------------
+
+    #[test]
+    fn validate_connector_rejects_a_watched_folder_debounce_outside_bounds() {
+        let root = temporary_root("watched-folder");
+        let error = validate_connector(&ConnectorConfig::WatchedFolder {
+            path: root.to_string_lossy().to_string(),
+            debounce_ms: 50,
+        })
+        .unwrap_err();
+        assert!(error.contains("debounce"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_connector_accepts_a_watched_folder_within_debounce_bounds() {
+        let root = temporary_root("watched-folder-ok");
+        validate_connector(&ConnectorConfig::WatchedFolder {
+            path: root.to_string_lossy().to_string(),
+            debounce_ms: 1_000,
+        })
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_connector_rejects_an_unknown_connector_account_id() {
+        let error = validate_connector(&ConnectorConfig::GitHubRepo {
+            owner: "acme".to_string(),
+            repo: "widgets".to_string(),
+            git_ref: None,
+            path_prefix: None,
+            connector_account_id: "does-not-exist".to_string(),
+        })
+        .unwrap_err();
+        assert!(error.contains("Unknown connector account"), "{error}");
+    }
+
+    #[test]
+    fn validate_repo_segment_rejects_path_traversal_style_input() {
+        assert!(validate_repo_segment("owner", "acme").is_ok());
+        assert!(validate_repo_segment("owner", "../etc").is_err());
+        assert!(validate_repo_segment("owner", "").is_err());
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_traversal_and_accepts_normal_branch_names() {
+        assert!(validate_git_ref("main").is_ok());
+        assert!(validate_git_ref("feature/add-thing").is_ok());
+        assert!(validate_git_ref("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_relative_prefix_rejects_absolute_and_traversal_paths() {
+        assert!(validate_relative_prefix("prefix", "docs/guides").is_ok());
+        assert!(validate_relative_prefix("prefix", "/etc").is_err());
+        assert!(validate_relative_prefix("prefix", "../secrets").is_err());
+    }
+
+    #[test]
+    fn connector_config_serde_tags_match_the_frontend_knowledge_connector_union() {
+        let cases: Vec<(ConnectorConfig, &str)> = vec![
+            (
+                ConnectorConfig::GitHubRepo {
+                    owner: "acme".into(),
+                    repo: "widgets".into(),
+                    git_ref: None,
+                    path_prefix: None,
+                    connector_account_id: "a".into(),
+                },
+                "git_hub_repo",
+            ),
+            (
+                ConnectorConfig::S3Bucket {
+                    endpoint: "https://s3.example.com".into(),
+                    bucket: "bucket".into(),
+                    prefix: None,
+                    region: "us-east-1".into(),
+                    connector_account_id: "a".into(),
+                },
+                "s3_bucket",
+            ),
+            (
+                ConnectorConfig::WatchedFolder { path: "/tmp".into(), debounce_ms: 1_000 },
+                "watched_folder",
+            ),
+            (
+                ConnectorConfig::NotionPages { connector_account_id: "a".into(), root_id: "r".into() },
+                "notion_pages",
+            ),
+            (
+                ConnectorConfig::SlackChannels {
+                    connector_account_id: "a".into(),
+                    channel_ids: vec!["C1".into()],
+                },
+                "slack_channels",
+            ),
+            (
+                ConnectorConfig::JiraProject {
+                    connector_account_id: "a".into(),
+                    project_key: "PROJ".into(),
+                },
+                "jira_project",
+            ),
+        ];
+        for (config, expected_tag) in cases {
+            let value = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                value.get("kind").and_then(Value::as_str),
+                Some(expected_tag),
+                "serde tag for {config:?} must match the frontend's KnowledgeConnector['kind']"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_notion_id_and_slack_channel_and_jira_key_reject_empty_and_odd_characters() {
+        assert!(validate_notion_id("abcd1234-ef56-7890").is_ok());
+        assert!(validate_notion_id("").is_err());
+        assert!(validate_notion_id("has spaces").is_err());
+        assert!(validate_slack_channel_id("C0123456789").is_ok());
+        assert!(validate_slack_channel_id("").is_err());
+        assert!(validate_jira_project_key("PROJ").is_ok());
+        assert!(validate_jira_project_key("").is_err());
     }
 }
