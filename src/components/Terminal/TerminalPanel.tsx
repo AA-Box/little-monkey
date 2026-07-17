@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
   Box,
+  Maximize2,
+  Minimize2,
   Paperclip,
   Plus,
   RefreshCw,
@@ -20,6 +23,20 @@ import type { PillTone } from "../ui";
 import { SandboxPanel } from "./SandboxPanel";
 
 const MAX_HIGHLIGHT_MATCHES = 500;
+
+/** Mirrors the Rust `GitStatusPayload` used by `WorkspaceBar` (see
+ * src-tauri/src/git.rs); only the branch is needed for the prompt line. */
+interface GitStatusPayload {
+  is_repo: boolean;
+  branch: string | null;
+}
+
+/** Shortens a workspace path to its last two segments for the prompt line,
+ * e.g. `/Users/ahmad/Documents/newApp` -> `Documents/newApp`. */
+function shortWorkspacePath(path: string): string {
+  const segments = path.split(/[\\/]/).filter(Boolean);
+  return segments.slice(-2).join("/") || path;
+}
 
 function statusTone(status: "running" | "exited" | "killed" | "error"): PillTone {
   if (status === "running") return "success";
@@ -76,6 +93,8 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   const close = useTerminalStore((state) => state.close);
   const resize = useTerminalStore((state) => state.resize);
   const loadHistory = useTerminalStore((state) => state.loadHistory);
+  const identity = useTerminalStore((state) => state.identity);
+  const loadIdentity = useTerminalStore((state) => state.loadIdentity);
   const queueEvidence = useTerminalStore((state) => state.queueEvidence);
   const clearError = useTerminalStore((state) => state.clearError);
 
@@ -87,6 +106,8 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   const [evidencePreview, setEvidencePreview] = useState<ReturnType<typeof buildTerminalEvidence> | null>(null);
   const [attachedNotice, setAttachedNotice] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
   const outputRef = useRef<HTMLPreElement>(null);
   const followOutputRef = useRef(true);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -98,7 +119,30 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
 
   useEffect(() => {
     void initialize();
-  }, [initialize]);
+    void loadIdentity();
+  }, [initialize, loadIdentity]);
+
+  // The prompt line's `(branch)` segment only applies to the primary
+  // workspace root — `git_status` always reads that root, not an arbitrary
+  // one, so a terminal on a secondary root shows no branch rather than a
+  // misleading one.
+  useEffect(() => {
+    if (!isTauri() || !active || active.workspace_id !== defaultRoot?.id) {
+      setGitBranch(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<GitStatusPayload>("git_status")
+      .then((status) => {
+        if (!cancelled) setGitBranch(status.is_repo ? status.branch : null);
+      })
+      .catch(() => {
+        if (!cancelled) setGitBranch(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active, defaultRoot?.id]);
 
   useEffect(() => {
     if (!selectedWorkspaceId && defaultRoot) setSelectedWorkspaceId(defaultRoot.id);
@@ -184,40 +228,53 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   return (
     <section
       ref={panelRef}
-      className="relative flex h-[min(42vh,24rem)] min-h-56 shrink-0 flex-col border-t border-border bg-surface"
+      className={`relative flex ${expanded ? "h-[70vh]" : "h-[min(42vh,24rem)]"} min-h-56 shrink-0 flex-col overflow-hidden rounded-t-xl border border-border bg-background shadow-sm transition-[height]`}
       aria-label={t("TerminalPanel.title")}
     >
-      <div className="flex min-h-10 shrink-0 items-center gap-1 border-b border-border px-2">
-        <TerminalSquare size={15} className="shrink-0 text-faint" />
-        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-1 [scrollbar-width:thin]">
-          {sessions.map((session, index) => (
-            <div
-              key={session.id}
-              className={`group inline-flex max-w-44 shrink-0 items-center rounded-md border transition-colors ${
-                session.id === activeSessionId
-                  ? "border-accent bg-accent-soft text-foreground"
-                  : "border-transparent text-muted hover:bg-surface-2 hover:text-foreground"
-              }`}
-            >
-              <button
-                type="button"
-                onClick={() => setActive(session.id)}
-                className="inline-flex min-w-0 items-center gap-1.5 py-1 pl-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+      <div className="flex min-h-10 shrink-0 items-center gap-1.5 bg-surface px-3 py-1.5">
+        <span className="text-sm font-medium text-foreground">{t("TerminalPanel.title")}</span>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          onClick={() => void startTerminal()}
+          disabled={!selectedWorkspaceId || busy}
+          aria-label={t("TerminalPanel.newTerminal")}
+          title={t("TerminalPanel.newTerminal")}
+        >
+          <Plus size={14} />
+        </IconButton>
+        {sessions.length > 1 && (
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-1 [scrollbar-width:thin]">
+            {sessions.map((session, index) => (
+              <div
+                key={session.id}
+                className={`group inline-flex max-w-44 shrink-0 items-center rounded-md border transition-colors ${
+                  session.id === activeSessionId
+                    ? "border-accent bg-accent-soft text-foreground"
+                    : "border-transparent text-muted hover:bg-surface-2 hover:text-foreground"
+                }`}
               >
-                <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${session.status === "running" ? "bg-success" : session.status === "error" ? "bg-danger" : "bg-faint"}`} />
-                <span className="truncate">{t("TerminalPanel.tabLabel", { count: index + 1 })}</span>
-              </button>
-              <button
-                type="button"
-                aria-label={t("TerminalPanel.closeTab")}
-                onClick={() => void close(session.id)}
-                className="mr-1 rounded-sm p-0.5 text-faint opacity-70 hover:bg-background hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-              >
-                <X size={11} />
-              </button>
-            </div>
-          ))}
-        </div>
+                <button
+                  type="button"
+                  onClick={() => setActive(session.id)}
+                  className="inline-flex min-w-0 items-center gap-1.5 py-1 pl-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                >
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${session.status === "running" ? "bg-success" : session.status === "error" ? "bg-danger" : "bg-faint"}`} />
+                  <span className="truncate">{t("TerminalPanel.tabLabel", { count: index + 1 })}</span>
+                </button>
+                <button
+                  type="button"
+                  aria-label={t("TerminalPanel.closeTab")}
+                  onClick={() => void close(session.id)}
+                  className="mr-1 rounded-sm p-0.5 text-faint opacity-70 hover:bg-background hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex-1" />
         {roots.length > 1 && (
           <select
             value={selectedWorkspaceId}
@@ -231,12 +288,11 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
         <IconButton
           size="sm"
           variant="ghost"
-          onClick={() => void startTerminal()}
-          disabled={!selectedWorkspaceId || busy}
-          aria-label={t("TerminalPanel.newTerminal")}
-          title={t("TerminalPanel.newTerminal")}
+          onClick={() => setExpanded((value) => !value)}
+          aria-label={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
+          title={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
         >
-          <Plus size={14} />
+          {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
         </IconButton>
         <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("TerminalPanel.closePanel")}>
           <X size={14} />
@@ -327,14 +383,23 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
               const node = event.currentTarget;
               followOutputRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
             }}
-            className="min-h-0 flex-1 select-text overflow-auto whitespace-pre-wrap break-words bg-[#0d1117] px-3 py-2 font-mono text-xs leading-5 text-[#d1d5db] outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent [overscroll-behavior:contain]"
+            className="min-h-0 flex-1 select-text overflow-auto whitespace-pre-wrap break-words bg-background px-3 py-2 font-mono text-xs leading-5 text-foreground outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent [overscroll-behavior:contain]"
             aria-label={t("TerminalPanel.outputLabel")}
           >
             {searchResult.content || t("TerminalPanel.awaitingOutput")}
           </pre>
 
-          <div className="flex shrink-0 items-center gap-2 border-t border-border bg-background px-2 py-2">
-            <span className="select-none font-mono text-sm text-success">$</span>
+          <div className="flex shrink-0 items-center gap-1.5 border-t border-border bg-background px-3 py-2">
+            <span className="select-none whitespace-nowrap font-mono text-sm">
+              {identity && (
+                <span className="font-semibold text-success">
+                  {identity.user}@{identity.host}{" "}
+                </span>
+              )}
+              <span className="font-semibold text-accent">{shortWorkspacePath(active.workspace_path)}</span>
+              {gitBranch && <span className="text-warning"> ({gitBranch})</span>}
+              <span className="text-faint"> {"»"}</span>
+            </span>
             <input
               value={command}
               onChange={(event) => setCommand(event.target.value)}
@@ -353,7 +418,7 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
               disabled={active.status !== "running" || busy}
               placeholder={active.status === "running" ? t("TerminalPanel.commandPlaceholder") : t("TerminalPanel.restartToContinue")}
               aria-label={t("TerminalPanel.commandLabel")}
-              className="min-w-0 flex-1 bg-transparent font-mono text-sm text-foreground outline-none placeholder:text-faint disabled:opacity-50"
+              className="min-w-0 flex-1 bg-transparent font-mono text-sm text-foreground caret-accent outline-none placeholder:text-faint disabled:opacity-50"
               autoComplete="off"
               spellCheck={false}
             />
@@ -387,7 +452,7 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
                 <AlertTriangle size={13} /> {t("TerminalPanel.evidenceTruncated")}
               </div>
             )}
-            <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-[#0d1117] p-3 font-mono text-xs leading-5 text-[#d1d5db]">
+            <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-surface-2 p-3 font-mono text-xs leading-5 text-foreground">
               {evidencePreview.content}
             </pre>
             <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-end">

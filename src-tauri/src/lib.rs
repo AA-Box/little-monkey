@@ -57,6 +57,11 @@ pub mod native_skills;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
+// Operational-health diagnostics (reachability/liveness of app-owned
+// services), sibling to `security_doctor` (which audits posture, not
+// health). Self-contained: engine + thin command layer live in one file,
+// same convention as `ollama`/`llama`/`server`/`mcp`/`stacks`.
+pub mod diagnostics;
 pub mod workflow_core;
 // Runtime/model hub service plus its thin desktop command layer. The hub
 // composes Ollama, managed llama.cpp, MLX, catalog/download, and API policy
@@ -93,6 +98,11 @@ mod git;
 // this module's Tauri-command surface stays desktop-app-only).
 pub mod llama;
 pub mod mcp;
+// Connector Catalog: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/S3
+// connections, verified live before saving, secrets in the OS keychain only.
+// AppHandle-free core (bar the `AppState` config lock), same *_impl split as
+// `mcp`/`providers` above.
+pub mod connectors;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -171,6 +181,15 @@ pub mod automations;
 // action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
 // every other execution surface above.
 pub mod sandbox;
+// Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
+// Phase 6): a named local profile switcher, capability-checked roles, and a
+// redacted audit export layered over `run_ledger`/`permissions`. See the
+// module doc for exactly what it is (and, just as importantly, is not).
+pub mod team_mode;
+// Issue-to-PR Agent Flow (ROADMAP.md Phase 3): orchestrates picking up a
+// GitHub issue and carrying it through a reviewable owned-branch/PR loop on
+// top of the `m5_delivery` GitHub/worktree primitives.
+pub mod issue_to_pr;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -247,6 +266,20 @@ pub struct AppState {
     /// `load_config_impl`/`save_config_impl` pair with no `.await` in
     /// between, so there's nothing async to ever hold it across.
     pub mcp_config_lock: std::sync::Mutex<()>,
+    /// Serializes `connectors.json` read-modify-write cycles (see
+    /// `connectors.rs`) — same reasoning as `mcp_config_lock` protects
+    /// `mcp_servers.json`: `connectors_add_github`/`connectors_remove` are
+    /// synchronous commands (Tauri can dispatch those onto genuinely
+    /// concurrent OS threads) and `connectors_add_token`/`connectors_add_s3`/
+    /// `connectors_reverify` are async commands (the tokio runtime can run
+    /// those in parallel too), so without a shared lock two concurrent
+    /// config-mutating calls could both load the same "before" catalog and
+    /// the later save silently clobbers the earlier one's change. A plain
+    /// `std::sync::Mutex`: every critical section this guards is a
+    /// synchronous `load_config_impl`/`save_config_impl` pair, acquired only
+    /// around that pair (never across the `.await`ed verification call
+    /// itself), so there's nothing async to ever hold it across.
+    pub connectors_config_lock: std::sync::Mutex<()>,
     /// Serializes the permission-granted mutation itself (checkpoint backup +
     /// the actual file write) in `tool_write_file`/`tool_edit_file` — same
     /// "two unsynchronized concurrent writers can silently clobber each
@@ -337,6 +370,13 @@ pub struct AppState {
     /// previews (see `sandbox.rs`'s module doc for why this is intentionally
     /// not persisted like `m5_delivery`'s SQLite-backed preview store).
     pub sandbox: sandbox::SandboxState,
+    /// Serializes `team_members.json` read-modify-write cycles (see
+    /// `team_mode.rs`) so two concurrent member-roster mutations (e.g. an add
+    /// racing a role change, or two removes racing each other) can never both
+    /// load the same "before" file and have the later save silently clobber
+    /// the earlier one's change — same reasoning as `connectors_config_lock`/
+    /// `memory_lock` above protect their own files.
+    pub team_members_lock: std::sync::Mutex<()>,
 }
 
 impl Default for AppState {
@@ -354,6 +394,7 @@ impl Default for AppState {
             tool_cancel: Default::default(),
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
+            connectors_config_lock: Default::default(),
             file_write_lock: Default::default(),
             mcp: Default::default(),
             web_settings_lock: Default::default(),
@@ -365,6 +406,7 @@ impl Default for AppState {
             stack_cache: Default::default(),
             index_cancels: Default::default(),
             sandbox: Default::default(),
+            team_members_lock: Default::default(),
         }
     }
 }
@@ -490,6 +532,13 @@ pub fn run() {
             // A persisted M3 policy represents an explicit user opt-in. Start
             // its separate, capability-scoped compatibility listener without
             // blocking app launch; failures remain visible in Runtime Hub.
+            // Reconciles every enabled `WatchedFolder` Knowledge Sync source
+            // against the live filesystem-watcher registry so a watcher
+            // started in a previous session resumes across app restarts —
+            // afterward, `knowledge_service`'s add/update/remove-source
+            // commands keep it in sync as the catalog changes.
+            knowledge_service::sync_watched_folder_watchers(app.handle());
+
             let m3_http_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let hub = m3_http_app
@@ -531,6 +580,13 @@ pub fn run() {
             ollama::ollama_import_model,
             ollama::ollama_remove_model,
             ollama::ollama_signin,
+            connectors::connectors_list,
+            connectors::connectors_add_github,
+            connectors::connectors_add_token,
+            connectors::connectors_add_s3,
+            connectors::connectors_remove,
+            connectors::connectors_reverify,
+            connectors::connectors_export_audit,
             providers::providers_list_presets,
             providers::providers_list_configured,
             providers::providers_add_custom,
@@ -551,6 +607,7 @@ pub fn run() {
             permissions::get_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,
+            terminal::terminal_identity,
             terminal::terminal_create,
             terminal::terminal_list,
             terminal::terminal_execute,
@@ -585,6 +642,11 @@ pub fn run() {
             memory::memory_delete,
             memory::memory_update,
             memory::memory_clear,
+            memory::memory_list_all,
+            memory::memory_studio_update,
+            memory::memory_studio_set_enabled,
+            memory::memory_studio_delete,
+            memory::memory_import,
             sessions::sessions_load,
             sessions::sessions_save,
             profile_commands::profile_migration_status,
@@ -693,6 +755,12 @@ pub fn run() {
             automations::cron_validate,
             automations::cron_next,
             automations::cron_previous,
+            team_mode::team_members_list,
+            team_mode::team_members_add,
+            team_mode::team_members_update_role,
+            team_mode::team_members_remove,
+            team_mode::team_members_set_active,
+            team_mode::team_audit_export,
             run_commands::run_protocol_version,
             run_commands::run_submit,
             run_commands::run_append_event,
@@ -774,6 +842,9 @@ pub fn run() {
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
             security_commands::security_audit,
+            diagnostics::diagnostics_run,
+            diagnostics::diagnostics_apply_fix,
+            diagnostics::diagnostics_export_bundle,
             m4_commands::m4_packages_preview,
             m4_commands::m4_packages_install,
             m4_commands::m4_packages_update,
@@ -782,6 +853,11 @@ pub fn run() {
             m4_commands::m4_packages_rollback,
             m4_commands::m4_packages_uninstall,
             m4_commands::m4_packages_export,
+            m4_commands::m4_packages_set_team_approved,
+            m4_commands::m4_registries_list,
+            m4_commands::m4_registries_add,
+            m4_commands::m4_registries_remove,
+            m4_commands::m4_registries_verify,
             m4_commands::m4_mcp_oauth_register,
             m4_commands::m4_mcp_oauth_servers,
             m4_commands::m4_mcp_oauth_begin,
@@ -863,6 +939,12 @@ pub fn run() {
             m5_delivery::m5_github_checks,
             m5_delivery::m5_review_pull_request,
             m5_delivery::m5_review_reports,
+            issue_to_pr::issue_to_pr_start,
+            issue_to_pr::issue_to_pr_status,
+            issue_to_pr::issue_to_pr_list,
+            issue_to_pr::issue_to_pr_cancel,
+            issue_to_pr::issue_to_pr_advance,
+            issue_to_pr::issue_to_pr_run_checks,
             m7_companion::m7_overlay_show,
             m7_companion::m7_overlay_hide,
             m7_companion::m7_overlay_submit,
