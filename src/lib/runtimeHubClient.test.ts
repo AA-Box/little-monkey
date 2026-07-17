@@ -36,6 +36,7 @@ describe("runtimeHubClient", () => {
 
     await runtimeHubClient.hardwareSnapshot();
     await runtimeHubClient.hardwareProfile();
+    await runtimeHubClient.hardwareCompatibilityReport();
     await runtimeHubClient.storageStatus();
     await runtimeHubClient.installedModels();
     await runtimeHubClient.catalogSources();
@@ -78,6 +79,7 @@ describe("runtimeHubClient", () => {
     expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
       "m3_hardware_snapshot",
       "m3_hardware_profile",
+      "m3_hardware_compatibility_report",
       "m3_storage_status",
       "m3_installed_models",
       "m3_catalog_sources",
