@@ -20,6 +20,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Wand2,
   Workflow,
   Swords,
 } from "lucide-react";
@@ -48,6 +49,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenVisualEditMode: () => void;
 }
 
 interface MenuRowProps {
@@ -94,6 +96,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenVisualEditMode,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -184,6 +187,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenBrowserWorkbench();
+            }}
+          />
+          <MenuRow
+            icon={<Wand2 size={14} className="text-faint" />}
+            label={t("AppMenu.visualEditMode")}
+            onClick={() => {
+              closeAll();
+              onOpenVisualEditMode();
             }}
           />
           <MenuRow
