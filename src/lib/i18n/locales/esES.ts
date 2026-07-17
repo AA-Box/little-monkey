@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
@@ -358,6 +359,46 @@ export const esES: Record<string, string> = {
   "McpGenerator.statusNotClean": "No está limpio según el simulador",
   "McpGenerator.statusNotSimulated": "No simulado",
   ...dailyBriefLocale,
+  ...workCanvasLocale,
+  // Infinite Work Canvas (ROADMAP.md Phase 7) — real Spain Spanish translations, overriding every workCanvasLocale key above.
+  "AppMenu.workCanvas": "Lienzo de trabajo",
+  "WorkCanvasPanel.title": "Lienzo de trabajo",
+  "WorkCanvasPanel.subtitle": "Una pizarra espacial para chats, archivos, tareas y notas: conéctalos en planes, pizarras de investigación y mapas de arquitectura.",
+  "WorkCanvasPanel.close": "Cerrar el lienzo de trabajo",
+  "WorkCanvasPanel.emptyTitle": "Aún no hay tableros",
+  "WorkCanvasPanel.emptyDescription": "Crea un tablero para empezar a organizar chats, archivos, tareas y notas en un solo sitio.",
+  "WorkCanvasPanel.newBoardPlaceholder": "Nombre del tablero",
+  "WorkCanvasPanel.createBoard": "Crear tablero",
+  "WorkCanvasPanel.boardSwitcher.newBoard": "Nuevo tablero",
+  "WorkCanvasPanel.boardSwitcher.delete": "Eliminar tablero",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmYes": "Eliminar",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmCancel": "Cancelar",
+  "WorkCanvasPanel.zoomIn": "Acercar",
+  "WorkCanvasPanel.zoomOut": "Alejar",
+  "WorkCanvasPanel.addNode": "Añadir al lienzo",
+  "WorkCanvasPanel.addNode.chat": "Sesión de chat",
+  "WorkCanvasPanel.addNode.file": "Archivo",
+  "WorkCanvasPanel.addNode.run": "Tarea / ejecución",
+  "WorkCanvasPanel.addNode.note": "Nota adhesiva",
+  "WorkCanvasPanel.addNode.back": "Atrás",
+  "WorkCanvasPanel.addNode.noSessions": "Aún no hay sesiones de chat.",
+  "WorkCanvasPanel.addNode.noRuns": "Aún no hay tareas o ejecuciones.",
+  "WorkCanvasPanel.addNode.filePathLabel": "Ruta relativa al espacio de trabajo",
+  "WorkCanvasPanel.addNode.filePathPlaceholder": "src/App.tsx",
+  "WorkCanvasPanel.addNode.filePathAdd": "Añadir archivo",
+  "WorkCanvasPanel.canvasEmptyTitle": "Este tablero está vacío",
+  "WorkCanvasPanel.canvasEmptyDescription": "Usa «Añadir al lienzo» para colocar tu primer chat, archivo, tarea o nota.",
+  "WorkCanvasPanel.node.open": "Abrir",
+  "WorkCanvasPanel.node.spawnTask": "Iniciar tarea",
+  "WorkCanvasPanel.node.spawnTaskSourceLabel": "Nodo del lienzo de trabajo",
+  "WorkCanvasPanel.node.remove": "Quitar del lienzo",
+  "WorkCanvasPanel.node.connect": "Arrastra para conectar con otro nodo",
+  "WorkCanvasPanel.node.notePlaceholder": "Escribe una nota…",
+  "WorkCanvasPanel.node.chatLabel": "Chat",
+  "WorkCanvasPanel.node.runLabel": "Tarea / ejecución",
+  "WorkCanvasPanel.node.noteLabel": "Nota",
+  "WorkCanvasPanel.edge.remove": "Haz clic para quitar esta conexión",
+  "WorkCanvasPanel.helpHint": "Arrastra el fondo para desplazarte, usa la rueda del ratón para hacer zoom, arrastra una tarjeta para moverla, arrastra desde el punto de una tarjeta hasta otra para conectarlas.",
   ...pmCopilotLocale,
   // Real Spain Spanish translations, overriding every pmCopilotLocale key above.
   "AppMenu.pmCopilot": "Copiloto de Product Manager",

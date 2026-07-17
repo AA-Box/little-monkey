@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
@@ -358,6 +359,46 @@ export const id: Record<string, string> = {
   "McpGenerator.statusNotClean": "Belum bersih menurut simulator",
   "McpGenerator.statusNotSimulated": "Belum disimulasikan",
   ...dailyBriefLocale,
+  ...workCanvasLocale,
+  // Infinite Work Canvas (ROADMAP.md Phase 7) — real Indonesian translations, overriding every workCanvasLocale key above.
+  "AppMenu.workCanvas": "Kanvas Kerja",
+  "WorkCanvasPanel.title": "Kanvas Kerja",
+  "WorkCanvasPanel.subtitle": "Papan spasial untuk obrolan, file, tugas, dan catatan — hubungkan menjadi rencana, papan riset, dan peta arsitektur.",
+  "WorkCanvasPanel.close": "Tutup Kanvas Kerja",
+  "WorkCanvasPanel.emptyTitle": "Belum ada papan",
+  "WorkCanvasPanel.emptyDescription": "Buat papan untuk mulai memetakan obrolan, file, tugas, dan catatan di satu tempat.",
+  "WorkCanvasPanel.newBoardPlaceholder": "Nama papan",
+  "WorkCanvasPanel.createBoard": "Buat papan",
+  "WorkCanvasPanel.boardSwitcher.newBoard": "Papan baru",
+  "WorkCanvasPanel.boardSwitcher.delete": "Hapus papan",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmYes": "Hapus",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmCancel": "Batal",
+  "WorkCanvasPanel.zoomIn": "Perbesar",
+  "WorkCanvasPanel.zoomOut": "Perkecil",
+  "WorkCanvasPanel.addNode": "Tambahkan ke kanvas",
+  "WorkCanvasPanel.addNode.chat": "Sesi obrolan",
+  "WorkCanvasPanel.addNode.file": "File",
+  "WorkCanvasPanel.addNode.run": "Tugas / run",
+  "WorkCanvasPanel.addNode.note": "Catatan tempel",
+  "WorkCanvasPanel.addNode.back": "Kembali",
+  "WorkCanvasPanel.addNode.noSessions": "Belum ada sesi obrolan.",
+  "WorkCanvasPanel.addNode.noRuns": "Belum ada tugas/run.",
+  "WorkCanvasPanel.addNode.filePathLabel": "Jalur relatif terhadap workspace",
+  "WorkCanvasPanel.addNode.filePathPlaceholder": "src/App.tsx",
+  "WorkCanvasPanel.addNode.filePathAdd": "Tambahkan file",
+  "WorkCanvasPanel.canvasEmptyTitle": "Papan ini masih kosong",
+  "WorkCanvasPanel.canvasEmptyDescription": "Gunakan \"Tambahkan ke kanvas\" untuk menempatkan obrolan, file, tugas, atau catatan pertama Anda.",
+  "WorkCanvasPanel.node.open": "Buka",
+  "WorkCanvasPanel.node.spawnTask": "Mulai tugas",
+  "WorkCanvasPanel.node.spawnTaskSourceLabel": "Node Kanvas Kerja",
+  "WorkCanvasPanel.node.remove": "Hapus dari kanvas",
+  "WorkCanvasPanel.node.connect": "Seret untuk menghubungkan ke node lain",
+  "WorkCanvasPanel.node.notePlaceholder": "Tulis catatan…",
+  "WorkCanvasPanel.node.chatLabel": "Obrolan",
+  "WorkCanvasPanel.node.runLabel": "Tugas / run",
+  "WorkCanvasPanel.node.noteLabel": "Catatan",
+  "WorkCanvasPanel.edge.remove": "Klik untuk menghapus koneksi ini",
+  "WorkCanvasPanel.helpHint": "Seret latar belakang untuk menggeser, gulir untuk memperbesar/memperkecil, seret kartu untuk memindahkannya, seret dari titik pada kartu ke kartu lain untuk menghubungkannya.",
   ...pmCopilotLocale,
   // Real Indonesian translations, overriding every pmCopilotLocale key above.
   "AppMenu.pmCopilot": "Copilot Product Manager",

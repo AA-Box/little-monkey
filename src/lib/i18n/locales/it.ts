@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
@@ -358,6 +359,46 @@ export const it: Record<string, string> = {
   "McpGenerator.statusNotClean": "Non pulito secondo il simulatore",
   "McpGenerator.statusNotSimulated": "Non simulato",
   ...dailyBriefLocale,
+  ...workCanvasLocale,
+  // Infinite Work Canvas (ROADMAP.md Phase 7) — real Italian translations, overriding every workCanvasLocale key above.
+  "AppMenu.workCanvas": "Tela di lavoro",
+  "WorkCanvasPanel.title": "Tela di lavoro",
+  "WorkCanvasPanel.subtitle": "Una lavagna spaziale per chat, file, attività e note — collegali in piani, bacheche di ricerca e mappe di architettura.",
+  "WorkCanvasPanel.close": "Chiudi tela di lavoro",
+  "WorkCanvasPanel.emptyTitle": "Ancora nessuna lavagna",
+  "WorkCanvasPanel.emptyDescription": "Crea una lavagna per iniziare a mappare chat, file, attività e note in un unico posto.",
+  "WorkCanvasPanel.newBoardPlaceholder": "Nome lavagna",
+  "WorkCanvasPanel.createBoard": "Crea lavagna",
+  "WorkCanvasPanel.boardSwitcher.newBoard": "Nuova lavagna",
+  "WorkCanvasPanel.boardSwitcher.delete": "Elimina lavagna",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmYes": "Elimina",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmCancel": "Annulla",
+  "WorkCanvasPanel.zoomIn": "Aumenta zoom",
+  "WorkCanvasPanel.zoomOut": "Riduci zoom",
+  "WorkCanvasPanel.addNode": "Aggiungi alla tela",
+  "WorkCanvasPanel.addNode.chat": "Sessione di chat",
+  "WorkCanvasPanel.addNode.file": "File",
+  "WorkCanvasPanel.addNode.run": "Attività / run",
+  "WorkCanvasPanel.addNode.note": "Nota adesiva",
+  "WorkCanvasPanel.addNode.back": "Indietro",
+  "WorkCanvasPanel.addNode.noSessions": "Ancora nessuna sessione di chat.",
+  "WorkCanvasPanel.addNode.noRuns": "Ancora nessuna attività/run.",
+  "WorkCanvasPanel.addNode.filePathLabel": "Percorso relativo al workspace",
+  "WorkCanvasPanel.addNode.filePathPlaceholder": "src/App.tsx",
+  "WorkCanvasPanel.addNode.filePathAdd": "Aggiungi file",
+  "WorkCanvasPanel.canvasEmptyTitle": "Questa lavagna è vuota",
+  "WorkCanvasPanel.canvasEmptyDescription": "Usa \"Aggiungi alla tela\" per posizionare la tua prima chat, file, attività o nota.",
+  "WorkCanvasPanel.node.open": "Apri",
+  "WorkCanvasPanel.node.spawnTask": "Avvia attività",
+  "WorkCanvasPanel.node.spawnTaskSourceLabel": "Nodo della tela di lavoro",
+  "WorkCanvasPanel.node.remove": "Rimuovi dalla tela",
+  "WorkCanvasPanel.node.connect": "Trascina per collegare a un altro nodo",
+  "WorkCanvasPanel.node.notePlaceholder": "Scrivi una nota…",
+  "WorkCanvasPanel.node.chatLabel": "Chat",
+  "WorkCanvasPanel.node.runLabel": "Attività / run",
+  "WorkCanvasPanel.node.noteLabel": "Nota",
+  "WorkCanvasPanel.edge.remove": "Fai clic per rimuovere questa connessione",
+  "WorkCanvasPanel.helpHint": "Trascina lo sfondo per scorrere, usa la rotellina per lo zoom, trascina una scheda per spostarla, trascina dal punto di una scheda a un'altra per collegarle.",
   ...pmCopilotLocale,
   // Real Italian translations, overriding every pmCopilotLocale key above.
   "AppMenu.pmCopilot": "Copilota Product Manager",
