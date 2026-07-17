@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
@@ -24,6 +25,7 @@ export const en: Record<string, string> = {
   ...ecosystemLocale,
   ...developerLocale,
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...specScorerLocale,
