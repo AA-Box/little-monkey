@@ -49,6 +49,39 @@ export interface HardwareProfile {
   preferred_accelerator: AcceleratorKind;
 }
 
+/** Hardware Compatibility Matrix / "Driver Doctor" status for one backend. */
+export type M3AcceleratorStatus =
+  | "available"
+  | "not_detected"
+  | "driver_too_old"
+  | "tool_missing"
+  | "unsupported";
+
+export interface M3AcceleratorCompatibility {
+  kind: AcceleratorKind;
+  status: M3AcceleratorStatus;
+  summary: string;
+  deviceNames: string[];
+  driverVersion: string | null;
+  computeCapability: string | null;
+  confirmed: boolean;
+}
+
+export interface M3JetsonInfo {
+  detected: boolean;
+  model: string | null;
+}
+
+export interface M3HardwareCompatibilityReport {
+  capturedAtMs: number;
+  os: string;
+  arch: string;
+  accelerators: M3AcceleratorCompatibility[];
+  jetson: M3JetsonInfo;
+  hybridGraphicsDetected: boolean;
+  notes: string[];
+}
+
 export interface M3StorageStatus {
   root: string;
   quotaBytes: number;
@@ -75,6 +108,12 @@ export interface M3ModelLicense {
   rawDeclaration: string;
 }
 
+export interface M3ProjectorRef {
+  kind: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
 export interface M3CatalogModel {
   schemaVersion: number;
   sourceId: string;
@@ -95,6 +134,9 @@ export interface M3CatalogModel {
   capabilities: M3ModelCapabilities;
   license: M3ModelLicense;
   metadata: Record<string, string>;
+  template: string | null;
+  projector: M3ProjectorRef | null;
+  catalogRetrievedAtMs: number | null;
 }
 
 export interface M3HardwareFit {
@@ -120,6 +162,10 @@ export interface M3InstalledVersion {
   installedAtMs: number;
   active: boolean;
   license: M3ModelLicense;
+  sourceId: string;
+  template: string | null;
+  projector: M3ProjectorRef | null;
+  catalogRetrievedAtMs: number | null;
 }
 
 export interface M3InstalledModel {
@@ -269,6 +315,46 @@ export interface M3SchedulingPlan {
     }>;
   }>;
   preserved_residency: M3SchedulingInput["residents"];
+}
+
+export interface OffloadModelProfile {
+  weights_bytes: number;
+  estimated_ram_bytes: number;
+  estimated_vram_bytes: number;
+  required_accelerator: AcceleratorKind | null;
+  has_vision_projector: boolean;
+}
+
+export interface OffloadPlanInput {
+  hardware: HardwareSnapshot;
+  model: OffloadModelProfile;
+  reserved: { ram_bytes: number; vram_bytes: number };
+  other_resident_count: number;
+  requested_context_tokens: number | null;
+}
+
+export type ProjectorPlacement = "gpu" | "cpu" | "not_applicable";
+
+export interface OffloadRationale {
+  field: string;
+  explanation: string;
+}
+
+export interface OffloadPlan {
+  schema_version: number;
+  accelerator: AcceleratorKind;
+  context_tokens: number;
+  requested_context_tokens: number;
+  batch_size: number;
+  gpu_layers: number;
+  estimated_total_layers: number;
+  cpu_spill_layers: number;
+  projector_placement: ProjectorPlacement;
+  parallel_sequences: number;
+  available_ram_bytes: number;
+  available_vram_bytes: number;
+  rationale: OffloadRationale[];
+  improvement_suggestions: string[];
 }
 
 export type SettingValue =
@@ -542,6 +628,8 @@ export async function sha256Text(value: string): Promise<string> {
 export const runtimeHubClient = {
   hardwareSnapshot: () => invoke<HardwareSnapshot>("m3_hardware_snapshot"),
   hardwareProfile: () => invoke<HardwareProfile>("m3_hardware_profile"),
+  hardwareCompatibilityReport: () =>
+    invoke<M3HardwareCompatibilityReport>("m3_hardware_compatibility_report"),
   storageStatus: () => invoke<M3StorageStatus>("m3_storage_status"),
   installedModels: () => invoke<M3InstalledModel[]>("m3_installed_models"),
   catalogSources: () => invoke<M3CatalogSourceConfig[]>("m3_catalog_sources"),
@@ -552,6 +640,7 @@ export const runtimeHubClient = {
     invoke<M3RuntimeCapability[]>("m3_refresh_runtimes", args),
   schedulePlan: (input: M3SchedulingInput) =>
     invoke<M3SchedulingPlan>("m3_schedule_plan", { input }),
+  offloadPlan: (input: OffloadPlanInput) => invoke<OffloadPlan>("m3_offload_plan", { input }),
   catalogSearch: (args: OperationArgs & { query: string; limit: number }) =>
     invoke<M3CatalogMatch[]>("m3_catalog_search", args),
   modelDownload: (args: OperationArgs & { request: { model: M3CatalogModel; acceptedLicenseSha256: string } }) =>

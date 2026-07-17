@@ -16,6 +16,7 @@ import {
   type M3ComponentUpdateCheck,
   type M3InstalledComponent,
   type M3InstalledModel,
+  type M3HardwareCompatibilityReport,
   type M3HttpServerStatus,
   type M3LoadModelRequest,
   type M3RuntimeCapability,
@@ -25,6 +26,8 @@ import {
   type M3SchedulingPlan,
   type M3StorageStatus,
   type M3UnloadModelRequest,
+  type OffloadPlan,
+  type OffloadPlanInput,
   type PairedToken,
   type PairingChallenge,
   type PairingRequest,
@@ -59,6 +62,7 @@ interface RuntimeHubStoreState {
   section: RuntimeHubSection;
   hardware: HardwareSnapshot | null;
   profile: HardwareProfile | null;
+  compatibilityReport: M3HardwareCompatibilityReport | null;
   storage: M3StorageStatus | null;
   installedModels: M3InstalledModel[];
   installedComponents: M3InstalledComponent[];
@@ -82,6 +86,7 @@ interface RuntimeHubStoreState {
   downloadProgress: Record<string, M3DownloadProgress>;
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
+  offloadPlans: Record<string, OffloadPlan>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -90,6 +95,7 @@ interface RuntimeHubStoreState {
   dismissPairedToken: () => void;
   refresh: () => Promise<void>;
   refreshOverview: () => Promise<void>;
+  refreshCompatibilityReport: () => Promise<void>;
   searchCatalog: (query?: string) => Promise<void>;
   downloadModel: (match: M3CatalogMatch) => Promise<void>;
   updateModel: (assetId: string, match: M3CatalogMatch) => Promise<void>;
@@ -103,6 +109,7 @@ interface RuntimeHubStoreState {
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
+  previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
@@ -253,6 +260,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     section: "overview",
     hardware: null,
     profile: null,
+    compatibilityReport: null,
     storage: null,
     installedModels: [],
     installedComponents: [],
@@ -276,6 +284,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    offloadPlans: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -304,6 +313,24 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       } catch (error) {
         fail(key, error);
         throw error;
+      } finally {
+        finish(key);
+      }
+      // Kept out of the Promise.all above and never rethrown: the Hardware
+      // Compatibility Matrix / Driver Doctor report is diagnostic, additive
+      // information, so a failure here must never block the rest of the
+      // Runtime Hub (hardware/profile/storage/models/runtimes) from loading.
+      await get().refreshCompatibilityReport();
+    },
+
+    refreshCompatibilityReport: async () => {
+      const key = "compatibility";
+      begin(key);
+      try {
+        const compatibilityReport = await runtimeHubClient.hardwareCompatibilityReport();
+        set({ compatibilityReport });
+      } catch (error) {
+        fail(key, error);
       } finally {
         finish(key);
       }
@@ -511,6 +538,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set({ schedulingPlan });
       } catch (error) {
         set({ schedulingPlan: null });
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    previewOffloadPlan: async (runtimeId, input) => {
+      const key = `offload-plan:${runtimeId}`;
+      begin(key);
+      try {
+        const plan = await runtimeHubClient.offloadPlan(input);
+        set((state) => ({ offloadPlans: { ...state.offloadPlans, [runtimeId]: plan } }));
+      } catch (error) {
+        set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
         fail(key, error);
         throw error;
       } finally {

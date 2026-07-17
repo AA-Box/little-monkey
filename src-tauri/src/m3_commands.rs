@@ -14,14 +14,14 @@ use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
     M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
     M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck, M3DeleteModelRequest,
-    M3DownloadRequest, M3HubError, M3InstallComponentRequest, M3InstalledComponentView,
-    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
-    M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeMetricsView, M3RuntimeStatusView,
-    M3SetRuntimeConfigRequest, M3StorageStatus, M3UnloadModelRequest,
+    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
+    M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
+    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeMetricsView,
+    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus, M3UnloadModelRequest,
 };
 use crate::runtime_adapter::{
-    HardwareProfile, HardwareSnapshot, LocalRuntimeScheduler, RuntimeInventory, RuntimeLogTail,
-    SchedulingInput, SchedulingPlan,
+    HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
+    OffloadPlanInput, RuntimeInventory, RuntimeLogTail, SchedulingInput, SchedulingPlan,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -166,6 +166,19 @@ pub fn m3_hardware_profile(
     state.hub.hardware_profile().map_err(command_error)
 }
 
+/// Hardware Compatibility Matrix / "Driver Doctor" report. The frontend
+/// fetches this before starting a model download, model load, or runtime
+/// install so the user sees a concrete compatibility report first.
+#[tauri::command]
+pub fn m3_hardware_compatibility_report(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3HardwareCompatibilityReport, String> {
+    state
+        .hub
+        .hardware_compatibility_report()
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub fn m3_storage_status(
     state: tauri::State<'_, M3CommandState>,
@@ -217,6 +230,16 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Simulates fit and computes a per-load offload plan (context size, batch
+/// size, GPU layers, projector placement, CPU spill, and parallelism) before
+/// a model is actually loaded. Pure and read-only like `m3_schedule_plan`:
+/// the frontend supplies a live hardware snapshot and the selected model's
+/// profile, and this never touches a runtime process.
+#[tauri::command]
+pub fn m3_offload_plan(input: OffloadPlanInput) -> Result<OffloadPlan, String> {
+    LocalOffloadPlanner::plan(&input).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
