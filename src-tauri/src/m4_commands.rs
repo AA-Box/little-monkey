@@ -22,8 +22,8 @@ use crate::mcp_app_core::{
     SecretMaterial, ToolRoutingPolicy, UiBridgeRequest,
 };
 use crate::package_ecosystem::{
-    InstalledPackageState, PackageBundle, PermissionApproval, PortablePackageExport,
-    RegistrySnapshot, SemanticVersion,
+    AdditionalRegistryRecord, InstalledPackageState, PackageBundle, PermissionApproval,
+    PortablePackageExport, RegistrySnapshot, SemanticVersion,
 };
 use crate::workflow_core::{
     LegacyRecipeV1, NodeRunRecord, ReconciliationDecision, ReplayPlan, WorkflowDefinition,
@@ -432,6 +432,71 @@ pub fn m4_packages_export(
     package_id: String,
 ) -> Result<PortablePackageExport, String> {
     state.packages.export(&package_id).map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m4_packages_set_team_approved(
+    window: tauri::Window,
+    state: tauri::State<'_, M4CommandState>,
+    package_id: String,
+    team_approved: bool,
+) -> Result<InstalledPackageState, String> {
+    require_main_window(&window)?;
+    state
+        .packages
+        .set_team_approved(&package_id, team_approved)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m4_registries_list(
+    state: tauri::State<'_, M4CommandState>,
+) -> Result<Vec<AdditionalRegistryRecord>, String> {
+    state.packages.list_registry_sources().map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m4_registries_add(
+    window: tauri::Window,
+    state: tauri::State<'_, M4CommandState>,
+    source_id: String,
+    display_name: String,
+    location: String,
+    now_unix_ms: u64,
+) -> Result<AdditionalRegistryRecord, String> {
+    require_main_window(&window)?;
+    state
+        .packages
+        .add_registry_source(source_id, display_name, location, now_unix_ms)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m4_registries_remove(
+    window: tauri::Window,
+    state: tauri::State<'_, M4CommandState>,
+    source_id: String,
+) -> Result<bool, String> {
+    require_main_window(&window)?;
+    state
+        .packages
+        .remove_registry_source(&source_id)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m4_registries_verify(
+    window: tauri::Window,
+    state: tauri::State<'_, M4CommandState>,
+    source_id: String,
+    snapshot: RegistrySnapshot,
+    now_unix_ms: u64,
+) -> Result<AdditionalRegistryRecord, String> {
+    require_main_window(&window)?;
+    state
+        .packages
+        .verify_registry_source(&source_id, snapshot, now_unix_ms)
+        .map_err(command_error)
 }
 
 #[derive(Debug, Clone, Deserialize)]
