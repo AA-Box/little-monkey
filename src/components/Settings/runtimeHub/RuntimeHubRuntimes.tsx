@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, FileText, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
+import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
   AdvancedSettingCapability,
+  ContextCacheView,
+  EffectiveContextResolution,
   HardwareSnapshot,
   KeepAlive,
   M3InstalledModel,
@@ -167,6 +169,129 @@ function OffloadPlanPanel({
   );
 }
 
+/** One-line, honest summary of a runtime's configured context size: prefers
+ * a value the runtime itself confirmed live over one this app merely
+ * requested, and says so — never presents an estimate as a guaranteed fact. */
+export function contextCacheHeadline(view: ContextCacheView): string {
+  const tokens = view.reportedContextTokens ?? view.configured.tokens;
+  if (tokens == null) return "Context size unavailable for this runtime.";
+  const sourceLabel =
+    view.reportedContextTokens != null
+      ? "confirmed live by the runtime"
+      : view.configured.source === "runtime_configured"
+        ? "configured by this app"
+        : view.configured.source === "runtime_default"
+          ? "the runtime's default"
+          : "unavailable";
+  return `${tokens.toLocaleString()} tokens (${sourceLabel})`;
+}
+
+function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
+  if (!view) return null;
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+      <p className="text-xs font-semibold text-foreground">Context & cache</p>
+      <div className="mt-2 grid gap-2 text-xs text-muted sm:grid-cols-2">
+        <span>Context size: {contextCacheHeadline(view)}</span>
+        {view.contextTokensInUse != null && (
+          <span>Tokens in use: {view.contextTokensInUse.toLocaleString()}</span>
+        )}
+        {view.contextHeadroomTokens != null && (
+          <span>Headroom: {view.contextHeadroomTokens.toLocaleString()} tokens</span>
+        )}
+        {view.contextShiftDetected != null && (
+          <span>
+            Context shift: {view.contextShiftDetected ? "detected — earlier turns may have been dropped" : "not detected"}
+          </span>
+        )}
+        {view.totalSlots != null && <span>Server slots: {view.totalSlots}</span>}
+      </div>
+      {view.notes.length > 0 && (
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
+          {view.notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function EffectiveContextPanel({
+  runtime,
+  offloadPlan,
+}: {
+  runtime: M3RuntimeCapability;
+  offloadPlan: OffloadPlan | undefined;
+}) {
+  const resolveEffectiveContext = useRuntimeHubStore((state) => state.resolveEffectiveContext);
+  const contextSetting = runtime.settings.find((setting) => setting.key === "context_size" || setting.key === "num_ctx");
+  const schemaBounds = contextSetting?.schema.type === "integer" ? contextSetting.schema : undefined;
+  const [requested, setRequested] = useState(() => offloadPlan?.context_tokens ?? schemaBounds?.max ?? 4_096);
+  const [resolution, setResolution] = useState<EffectiveContextResolution | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+
+  if (!contextSetting || !offloadPlan) return null;
+
+  async function handleResolve() {
+    setBusy(true);
+    setError(undefined);
+    try {
+      const result = await resolveEffectiveContext({
+        requestedTokens: requested,
+        offloadPlanContextTokens: offloadPlan?.context_tokens ?? requested,
+        modelMetadataMaxContextTokens: null,
+        runtimeSettingMinTokens: schemaBounds?.min ?? null,
+        runtimeSettingMaxTokens: schemaBounds?.max ?? null,
+      });
+      setResolution(result);
+    } catch (thrown) {
+      setError(thrown instanceof Error ? thrown.message : String(thrown));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+      <p className="text-xs font-semibold text-foreground">Effective context size</p>
+      <p className="mt-1 text-xs text-muted">
+        Preview what a requested context size resolves to once bounded by the offload plan and this runtime&apos;s
+        configured limits, without loading anything.
+      </p>
+      <div className="mt-2 flex flex-wrap items-end gap-2">
+        <Field label="Requested tokens">
+          <input
+            type="number"
+            min={schemaBounds?.min}
+            max={schemaBounds?.max}
+            value={requested}
+            onChange={(event) => setRequested(Number(event.target.value))}
+            className={CONTROL_CLASS}
+          />
+        </Field>
+        <BusyButton type="button" busy={busy} onClick={() => void handleResolve()}>
+          Check
+        </BusyButton>
+      </div>
+      <ErrorNotice message={error} />
+      {resolution && (
+        <div className="mt-2 text-xs text-muted">
+          <p className="font-medium text-foreground">Effective: {resolution.effectiveTokens.toLocaleString()} tokens</p>
+          {resolution.rationale.length > 0 && (
+            <ul className="mt-1 list-disc space-y-1 pl-5 leading-5">
+              {resolution.rationale.map((entry) => (
+                <li key={entry}>{entry}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SettingControl({
   capability,
   value,
@@ -279,6 +404,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const [showLogs, setShowLogs] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showContextCache, setShowContextCache] = useState(false);
   const [settings, setSettings] = useState<Record<string, SettingValue>>(() =>
     Object.fromEntries(runtime.settings.map((setting) => [setting.key, setting.default_value])),
   );
@@ -451,6 +577,16 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             <Wrench size={15} aria-hidden="true" /> {showSettings ? "Hide advanced settings" : "Advanced settings"}
           </Button>
         )}
+        {detail?.contextCache && (
+          <Button
+            type="button"
+            className="min-h-11"
+            aria-expanded={showContextCache}
+            onClick={() => setShowContextCache((value) => !value)}
+          >
+            <Gauge size={15} aria-hidden="true" /> {showContextCache ? "Hide context & cache" : "Context & cache"}
+          </Button>
+        )}
       </div>
 
       {showLogs && detail?.logs && (
@@ -460,6 +596,12 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
         </div>
       )}
       {showMetrics && detail?.metrics && <div className="mt-4"><JsonView label="Live runtime metrics" value={detail.metrics} /></div>}
+      {showContextCache && detail?.contextCache && (
+        <div className="mt-4">
+          <ContextCachePanel view={detail.contextCache} />
+          <EffectiveContextPanel runtime={runtime} offloadPlan={offloadPlan} />
+        </div>
+      )}
 
       {showSettings && runtime.settings.length > 0 && (
         <section className="mt-4 rounded-lg border border-border bg-surface p-4" aria-label={`Advanced settings for ${runtime.descriptor.label}`}>
