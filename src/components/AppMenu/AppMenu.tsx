@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  BookOpenText,
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardList,
   GitBranch,
   Command,
   ClipboardCheck,
@@ -21,6 +23,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Telescope,
   Wand2,
   Workflow,
   Swords,
@@ -50,6 +53,9 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenPmCopilot: () => void;
+  onOpenDeepResearch: () => void;
+  onOpenBriefStudio: () => void;
   onOpenCrossRepoChangePlanner: () => void;
   onOpenVisualEditMode: () => void;
 }
@@ -98,6 +104,9 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenPmCopilot,
+  onOpenDeepResearch,
+  onOpenBriefStudio,
   onOpenCrossRepoChangePlanner,
   onOpenVisualEditMode,
 }: AppMenuProps) {
@@ -238,6 +247,30 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardList size={14} className="text-faint" />}
+            label={t("AppMenu.pmCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenPmCopilot();
+            }}
+          />
+          <MenuRow
+            icon={<Telescope size={14} className="text-faint" />}
+            label={t("AppMenu.deepResearch")}
+            onClick={() => {
+              closeAll();
+              onOpenDeepResearch();
+            }}
+          />
+          <MenuRow
+            icon={<BookOpenText size={14} className="text-faint" />}
+            label={t("AppMenu.briefStudio")}
+            onClick={() => {
+              closeAll();
+              onOpenBriefStudio();
             }}
           />
           <MenuRow
