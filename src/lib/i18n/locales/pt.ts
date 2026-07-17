@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
   "EcosystemDiscover.cancel": "Cancelar",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Portuguese translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "Estúdio de Resumos",
+  "BriefStudio.title": "Estúdio de Resumos Baseados em Fontes",
+  "BriefStudio.subtitle": "Transforme um documento, uma conversa ou uma pilha de conhecimento em um resumo executivo com citações, um esboço de slides, um quiz, flashcards ou um guia de estudo.",
+  "BriefStudio.close": "Fechar Estúdio de Resumos",
+  "BriefStudio.sourceHeading": "Material de origem",
+  "BriefStudio.sourceKind.pasted": "Documento colado",
+  "BriefStudio.sourceKind.session": "Sessão de chat",
+  "BriefStudio.sourceKind.knowledge_stack": "Pilha de conhecimento",
+  "BriefStudio.pastedLabelLabel": "Título do documento",
+  "BriefStudio.pastedLabelPlaceholder": "ex.: notas de planejamento do T3",
+  "BriefStudio.pastedTextLabel": "Cole o texto de origem",
+  "BriefStudio.pastedTextPlaceholder": "Cole o documento, as anotações ou a transcrição a partir dos quais gerar…",
+  "BriefStudio.sessionLabel": "Sessão de chat",
+  "BriefStudio.sessionPlaceholder": "Escolha uma sessão…",
+  "BriefStudio.noSessionsNote": "Ainda não há sessões de chat.",
+  "BriefStudio.stackLabel": "Pilha de conhecimento",
+  "BriefStudio.stackPlaceholder": "Escolha uma pilha…",
+  "BriefStudio.noStacksNote": "Ainda não há pilhas de conhecimento — crie uma em Configurações e depois a indexe.",
+  "BriefStudio.focusQueryLabel": "Tópico de foco",
+  "BriefStudio.focusQueryPlaceholder": "Em que o resumo deve focar?",
+  "BriefStudio.localOnlyLabel": "Executar totalmente local",
+  "BriefStudio.localOnlyHint": "Recusa gerar se o modelo ativo for um provedor de nuvem — nada sai desta máquina.",
+  "BriefStudio.assetHeading": "Tipo de recurso",
+  "BriefStudio.asset.brief": "Resumo executivo",
+  "BriefStudio.asset.slide_outline": "Esboço de slides",
+  "BriefStudio.asset.quiz": "Quiz",
+  "BriefStudio.asset.flashcards": "Flashcards",
+  "BriefStudio.asset.study_guide": "Guia de estudo",
+  "BriefStudio.asset.audio_overview": "Resumo em áudio",
+  "BriefStudio.asset.video_outline": "Esboço em vídeo",
+  "BriefStudio.unsupportedNote": "Resumos em áudio e esboços em vídeo ainda não são gerados — este app não tem um pipeline local de texto para voz ou de vídeo. Registrado como trabalho futuro, não simulado aqui.",
+  "BriefStudio.generateButton": "Gerar",
+  "BriefStudio.generatingLabel": "Gerando…",
+  "BriefStudio.emptyState": "Escolha uma fonte e um tipo de recurso, depois gere para ver o resultado aqui.",
+  "BriefStudio.errorHeading": "Não foi possível gerar",
+  "BriefStudio.groundedIn": "Baseado em {{label}}",
+  "BriefStudio.generatedAt": "Gerado em {{time}}",
+  "BriefStudio.ranLocallyBadge": "Executado totalmente local",
+  "BriefStudio.ranCloudBadge": "Executado via provedor de nuvem",
+  "BriefStudio.citationsHeading": "Citações",
+  "BriefStudio.citationsEmpty": "O modelo não citou nenhum trecho da fonte.",
+  "BriefStudio.citationVerified": "Verificada",
+  "BriefStudio.citationUnverified": "Não verificada — não encontrada literalmente na fonte",
+  "BriefStudio.unverifiedWarning": "{{count}} citação(ões) não puderam ser verificadas em relação ao texto de origem — revise antes de confiar nelas.",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Portuguese
   // translations, overriding the searchLocale keys above.
   "GlobalSearch.source.session": "Conversa",

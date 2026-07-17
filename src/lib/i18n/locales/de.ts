@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
   "EcosystemDiscover.cancel": "Abbrechen",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real German translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "Kurzbericht-Studio",
+  "BriefStudio.title": "Quellenbasiertes Kurzbericht-Studio",
+  "BriefStudio.subtitle": "Verwandeln Sie ein Dokument, einen Chat oder einen Wissensstapel in einen belegten Kurzbericht, eine Foliengliederung, ein Quiz, Lernkarten oder einen Studienleitfaden.",
+  "BriefStudio.close": "Kurzbericht-Studio schließen",
+  "BriefStudio.sourceHeading": "Quellenmaterial",
+  "BriefStudio.sourceKind.pasted": "Eingefügtes Dokument",
+  "BriefStudio.sourceKind.session": "Chat-Sitzung",
+  "BriefStudio.sourceKind.knowledge_stack": "Wissensstapel",
+  "BriefStudio.pastedLabelLabel": "Dokumenttitel",
+  "BriefStudio.pastedLabelPlaceholder": "z. B. Planungsnotizen Q3",
+  "BriefStudio.pastedTextLabel": "Quelltext einfügen",
+  "BriefStudio.pastedTextPlaceholder": "Fügen Sie das Dokument, die Notizen oder das Transkript ein, aus dem generiert werden soll…",
+  "BriefStudio.sessionLabel": "Chat-Sitzung",
+  "BriefStudio.sessionPlaceholder": "Sitzung auswählen…",
+  "BriefStudio.noSessionsNote": "Noch keine Chat-Sitzungen.",
+  "BriefStudio.stackLabel": "Wissensstapel",
+  "BriefStudio.stackPlaceholder": "Stapel auswählen…",
+  "BriefStudio.noStacksNote": "Noch keine Wissensstapel — erstellen Sie einen in den Einstellungen und indizieren Sie ihn.",
+  "BriefStudio.focusQueryLabel": "Themenschwerpunkt",
+  "BriefStudio.focusQueryPlaceholder": "Worauf soll sich der Kurzbericht konzentrieren?",
+  "BriefStudio.localOnlyLabel": "Vollständig lokal ausführen",
+  "BriefStudio.localOnlyHint": "Verweigert die Generierung, wenn das aktive Modell ein Cloud-Anbieter ist — nichts verlässt dieses Gerät.",
+  "BriefStudio.assetHeading": "Asset-Typ",
+  "BriefStudio.asset.brief": "Kurzbericht",
+  "BriefStudio.asset.slide_outline": "Foliengliederung",
+  "BriefStudio.asset.quiz": "Quiz",
+  "BriefStudio.asset.flashcards": "Lernkarten",
+  "BriefStudio.asset.study_guide": "Studienleitfaden",
+  "BriefStudio.asset.audio_overview": "Audioüberblick",
+  "BriefStudio.asset.video_outline": "Videogliederung",
+  "BriefStudio.unsupportedNote": "Audioüberblicke und Videogliederungen werden noch nicht generiert — diese App hat keine lokale Sprachsynthese- oder Video-Pipeline. Als Folgearbeit vorgemerkt, hier nicht simuliert.",
+  "BriefStudio.generateButton": "Generieren",
+  "BriefStudio.generatingLabel": "Wird generiert…",
+  "BriefStudio.emptyState": "Wählen Sie eine Quelle und einen Asset-Typ, und generieren Sie, um das Ergebnis hier zu sehen.",
+  "BriefStudio.errorHeading": "Generierung fehlgeschlagen",
+  "BriefStudio.groundedIn": "Basierend auf {{label}}",
+  "BriefStudio.generatedAt": "Generiert am {{time}}",
+  "BriefStudio.ranLocallyBadge": "Vollständig lokal ausgeführt",
+  "BriefStudio.ranCloudBadge": "Über Cloud-Anbieter ausgeführt",
+  "BriefStudio.citationsHeading": "Zitate",
+  "BriefStudio.citationsEmpty": "Das Modell hat keine Quellenstellen zitiert.",
+  "BriefStudio.citationVerified": "Verifiziert",
+  "BriefStudio.citationUnverified": "Nicht verifiziert — im Original nicht wortgleich gefunden",
+  "BriefStudio.unverifiedWarning": "{{count}} Zitat(e) konnten nicht anhand des Quelltexts verifiziert werden — vor dem Vertrauen prüfen.",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real German
   // translations, overriding the searchLocale keys of the same name above.
   "GlobalSearch.source.session": "Chat",

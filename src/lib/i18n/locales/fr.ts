@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const fr: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Supprimer cette source de registre ?",
   "EcosystemDiscover.removeRegistry": "Supprimer",
   "EcosystemDiscover.cancel": "Annuler",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real French translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "Studio de synthèses",
+  "BriefStudio.title": "Studio de synthèses ancrées aux sources",
+  "BriefStudio.subtitle": "Transformez un document, une conversation ou une base de connaissances en synthèse exécutive citée, plan de diapositives, quiz, cartes mémo ou guide d'étude.",
+  "BriefStudio.close": "Fermer le Studio de synthèses",
+  "BriefStudio.sourceHeading": "Matériel source",
+  "BriefStudio.sourceKind.pasted": "Document collé",
+  "BriefStudio.sourceKind.session": "Conversation",
+  "BriefStudio.sourceKind.knowledge_stack": "Base de connaissances",
+  "BriefStudio.pastedLabelLabel": "Titre du document",
+  "BriefStudio.pastedLabelPlaceholder": "p. ex. notes de planification T3",
+  "BriefStudio.pastedTextLabel": "Collez le texte source",
+  "BriefStudio.pastedTextPlaceholder": "Collez le document, les notes ou la transcription à partir desquels générer…",
+  "BriefStudio.sessionLabel": "Conversation",
+  "BriefStudio.sessionPlaceholder": "Choisissez une conversation…",
+  "BriefStudio.noSessionsNote": "Aucune conversation pour le moment.",
+  "BriefStudio.stackLabel": "Base de connaissances",
+  "BriefStudio.stackPlaceholder": "Choisissez une base…",
+  "BriefStudio.noStacksNote": "Aucune base de connaissances pour le moment — créez-en une dans les Réglages, puis indexez-la.",
+  "BriefStudio.focusQueryLabel": "Sujet à approfondir",
+  "BriefStudio.focusQueryPlaceholder": "Sur quoi la synthèse doit-elle se concentrer ?",
+  "BriefStudio.localOnlyLabel": "Exécuter entièrement en local",
+  "BriefStudio.localOnlyHint": "Refuse de générer si le modèle actif est un fournisseur cloud — rien ne quitte cette machine.",
+  "BriefStudio.assetHeading": "Type d'élément",
+  "BriefStudio.asset.brief": "Synthèse exécutive",
+  "BriefStudio.asset.slide_outline": "Plan de diapositives",
+  "BriefStudio.asset.quiz": "Quiz",
+  "BriefStudio.asset.flashcards": "Cartes mémo",
+  "BriefStudio.asset.study_guide": "Guide d'étude",
+  "BriefStudio.asset.audio_overview": "Synthèse audio",
+  "BriefStudio.asset.video_outline": "Plan vidéo",
+  "BriefStudio.unsupportedNote": "Les synthèses audio et les plans vidéo ne sont pas encore générés — cette application n'a pas de pipeline local de synthèse vocale ou vidéo. Noté comme suite à donner, pas simulé ici.",
+  "BriefStudio.generateButton": "Générer",
+  "BriefStudio.generatingLabel": "Génération…",
+  "BriefStudio.emptyState": "Choisissez une source et un type d'élément, puis générez pour voir le résultat ici.",
+  "BriefStudio.errorHeading": "Échec de la génération",
+  "BriefStudio.groundedIn": "Fondé sur {{label}}",
+  "BriefStudio.generatedAt": "Généré {{time}}",
+  "BriefStudio.ranLocallyBadge": "Exécuté entièrement en local",
+  "BriefStudio.ranCloudBadge": "Exécuté via un fournisseur cloud",
+  "BriefStudio.citationsHeading": "Citations",
+  "BriefStudio.citationsEmpty": "Le modèle n'a cité aucun passage source.",
+  "BriefStudio.citationVerified": "Vérifiée",
+  "BriefStudio.citationUnverified": "Non vérifiée — introuvable telle quelle dans la source",
+  "BriefStudio.unverifiedWarning": "{{count}} citation(s) n'ont pas pu être vérifiées par rapport au texte source — à examiner avant de leur faire confiance.",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real French
   // translations, overriding the searchLocale keys above.
   "GlobalSearch.source.session": "Discussion",

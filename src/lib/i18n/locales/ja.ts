@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
   "EcosystemDiscover.cancel": "キャンセル",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Japanese translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "ブリーフスタジオ",
+  "BriefStudio.title": "ソース根拠ブリーフスタジオ",
+  "BriefStudio.subtitle": "ドキュメント、チャット、ナレッジスタックを、引用付きのエグゼクティブブリーフ、スライドアウトライン、クイズ、フラッシュカード、学習ガイドに変換します。",
+  "BriefStudio.close": "ブリーフスタジオを閉じる",
+  "BriefStudio.sourceHeading": "ソース素材",
+  "BriefStudio.sourceKind.pasted": "貼り付けたドキュメント",
+  "BriefStudio.sourceKind.session": "チャットセッション",
+  "BriefStudio.sourceKind.knowledge_stack": "ナレッジスタック",
+  "BriefStudio.pastedLabelLabel": "ドキュメントのタイトル",
+  "BriefStudio.pastedLabelPlaceholder": "例: Q3計画メモ",
+  "BriefStudio.pastedTextLabel": "ソーステキストを貼り付け",
+  "BriefStudio.pastedTextPlaceholder": "生成元にするドキュメント、メモ、または文字起こしを貼り付けてください…",
+  "BriefStudio.sessionLabel": "チャットセッション",
+  "BriefStudio.sessionPlaceholder": "セッションを選択…",
+  "BriefStudio.noSessionsNote": "チャットセッションはまだありません。",
+  "BriefStudio.stackLabel": "ナレッジスタック",
+  "BriefStudio.stackPlaceholder": "スタックを選択…",
+  "BriefStudio.noStacksNote": "ナレッジスタックがまだありません — 設定で作成してからインデックスしてください。",
+  "BriefStudio.focusQueryLabel": "焦点となるトピック",
+  "BriefStudio.focusQueryPlaceholder": "ブリーフは何に焦点を当てるべきですか?",
+  "BriefStudio.localOnlyLabel": "完全にローカルで実行",
+  "BriefStudio.localOnlyHint": "アクティブなモデルがクラウドプロバイダーの場合は生成を拒否します — 何もこのマシンの外に出ません。",
+  "BriefStudio.assetHeading": "アセットの種類",
+  "BriefStudio.asset.brief": "エグゼクティブブリーフ",
+  "BriefStudio.asset.slide_outline": "スライドアウトライン",
+  "BriefStudio.asset.quiz": "クイズ",
+  "BriefStudio.asset.flashcards": "フラッシュカード",
+  "BriefStudio.asset.study_guide": "学習ガイド",
+  "BriefStudio.asset.audio_overview": "オーディオ概要",
+  "BriefStudio.asset.video_outline": "動画アウトライン",
+  "BriefStudio.unsupportedNote": "オーディオ概要と動画アウトラインはまだ生成されません — このアプリにはローカルのテキスト読み上げや動画生成のパイプラインがありません。今後の対応として記録されており、ここで偽装はしていません。",
+  "BriefStudio.generateButton": "生成",
+  "BriefStudio.generatingLabel": "生成中…",
+  "BriefStudio.emptyState": "ソースとアセットの種類を選んでから生成すると、ここに結果が表示されます。",
+  "BriefStudio.errorHeading": "生成できませんでした",
+  "BriefStudio.groundedIn": "{{label}} に基づく",
+  "BriefStudio.generatedAt": "{{time}} に生成",
+  "BriefStudio.ranLocallyBadge": "完全にローカルで実行",
+  "BriefStudio.ranCloudBadge": "クラウドプロバイダー経由で実行",
+  "BriefStudio.citationsHeading": "引用",
+  "BriefStudio.citationsEmpty": "モデルはソースの一節を引用しませんでした。",
+  "BriefStudio.citationVerified": "検証済み",
+  "BriefStudio.citationUnverified": "未検証 — ソース内に一致するテキストが見つかりません",
+  "BriefStudio.unverifiedWarning": "{{count}} 件の引用がソーステキストと照合できませんでした — 信頼する前に確認してください。",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Japanese
   // translations, overriding the searchLocale keys above.
   "GlobalSearch.source.session": "チャット",

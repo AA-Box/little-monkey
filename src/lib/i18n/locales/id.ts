@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
   "EcosystemDiscover.cancel": "Batal",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Indonesian translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "Studio Ringkasan",
+  "BriefStudio.title": "Studio Ringkasan Berbasis Sumber",
+  "BriefStudio.subtitle": "Ubah dokumen, obrolan, atau stack pengetahuan menjadi ringkasan eksekutif bersitasi, kerangka slide, kuis, kartu belajar, atau panduan belajar.",
+  "BriefStudio.close": "Tutup Studio Ringkasan",
+  "BriefStudio.sourceHeading": "Materi sumber",
+  "BriefStudio.sourceKind.pasted": "Dokumen tempel",
+  "BriefStudio.sourceKind.session": "Sesi obrolan",
+  "BriefStudio.sourceKind.knowledge_stack": "Stack pengetahuan",
+  "BriefStudio.pastedLabelLabel": "Judul dokumen",
+  "BriefStudio.pastedLabelPlaceholder": "misalnya catatan perencanaan Q3",
+  "BriefStudio.pastedTextLabel": "Tempel teks sumber",
+  "BriefStudio.pastedTextPlaceholder": "Tempel dokumen, catatan, atau transkrip yang ingin dijadikan sumber…",
+  "BriefStudio.sessionLabel": "Sesi obrolan",
+  "BriefStudio.sessionPlaceholder": "Pilih sesi…",
+  "BriefStudio.noSessionsNote": "Belum ada sesi obrolan.",
+  "BriefStudio.stackLabel": "Stack pengetahuan",
+  "BriefStudio.stackPlaceholder": "Pilih stack…",
+  "BriefStudio.noStacksNote": "Belum ada stack pengetahuan — buat satu di Pengaturan, lalu indeks.",
+  "BriefStudio.focusQueryLabel": "Topik fokus",
+  "BriefStudio.focusQueryPlaceholder": "Ringkasan ini harus berfokus pada apa?",
+  "BriefStudio.localOnlyLabel": "Jalankan sepenuhnya lokal",
+  "BriefStudio.localOnlyHint": "Menolak untuk membuat jika model aktif adalah penyedia cloud — tidak ada yang meninggalkan mesin ini.",
+  "BriefStudio.assetHeading": "Jenis aset",
+  "BriefStudio.asset.brief": "Ringkasan eksekutif",
+  "BriefStudio.asset.slide_outline": "Kerangka slide",
+  "BriefStudio.asset.quiz": "Kuis",
+  "BriefStudio.asset.flashcards": "Kartu belajar",
+  "BriefStudio.asset.study_guide": "Panduan belajar",
+  "BriefStudio.asset.audio_overview": "Ringkasan audio",
+  "BriefStudio.asset.video_outline": "Kerangka video",
+  "BriefStudio.unsupportedNote": "Ringkasan audio dan kerangka video belum bisa dibuat — aplikasi ini tidak punya pipeline text-to-speech atau video lokal. Dicatat sebagai tindak lanjut, bukan disimulasikan di sini.",
+  "BriefStudio.generateButton": "Buat",
+  "BriefStudio.generatingLabel": "Membuat…",
+  "BriefStudio.emptyState": "Pilih sumber dan jenis aset, lalu buat untuk melihat hasilnya di sini.",
+  "BriefStudio.errorHeading": "Gagal membuat",
+  "BriefStudio.groundedIn": "Berdasarkan {{label}}",
+  "BriefStudio.generatedAt": "Dibuat {{time}}",
+  "BriefStudio.ranLocallyBadge": "Berjalan sepenuhnya lokal",
+  "BriefStudio.ranCloudBadge": "Berjalan lewat penyedia cloud",
+  "BriefStudio.citationsHeading": "Sitasi",
+  "BriefStudio.citationsEmpty": "Model tidak mengutip bagian sumber mana pun.",
+  "BriefStudio.citationVerified": "Terverifikasi",
+  "BriefStudio.citationUnverified": "Tidak terverifikasi — tidak ditemukan persis di sumber",
+  "BriefStudio.unverifiedWarning": "{{count}} sitasi tidak dapat diverifikasi terhadap teks sumber — tinjau sebelum mempercayainya.",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Indonesian
   // translations, overriding the searchLocale keys above.
   "GlobalSearch.source.session": "Obrolan",

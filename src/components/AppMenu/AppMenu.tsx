@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  BookOpenText,
   Check,
   ChevronRight,
   ChevronsUpDown,
@@ -50,6 +51,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenBriefStudio: () => void;
   onOpenCrossRepoChangePlanner: () => void;
   onOpenVisualEditMode: () => void;
 }
@@ -98,6 +100,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenBriefStudio,
   onOpenCrossRepoChangePlanner,
   onOpenVisualEditMode,
 }: AppMenuProps) {
@@ -238,6 +241,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<BookOpenText size={14} className="text-faint" />}
+            label={t("AppMenu.briefStudio")}
+            onClick={() => {
+              closeAll();
+              onOpenBriefStudio();
             }}
           />
           <MenuRow
