@@ -855,7 +855,7 @@ export const id: Record<string, string> = {
   "TerminalPanel.dismiss": "Tutup",
   "TerminalPanel.loading": "Memuat sesi terminal…",
   "TerminalPanel.emptyTitle": "Tidak ada sesi terminal",
-  "TerminalPanel.emptyDescription": "Mulai shell sungguhan yang terbatas pada ruang kerja. Membukanya dan setiap perintah yang dikirim mengikuti kebijakan persetujuan yang sama dengan alat shell.",
+  "TerminalPanel.emptyDescription": "Mulai shell sungguhan yang terbatas pada ruang kerja. Terbuka seketika — perintah yang Anda ketik di sini berjalan sebagai pengguna Anda, tanpa permintaan persetujuan.",
   "TerminalPanel.startTerminal": "Mulai terminal",
   "TerminalPanel.status.running": "Berjalan",
   "TerminalPanel.status.exited": "Selesai",

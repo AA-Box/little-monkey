@@ -854,7 +854,7 @@ export const ja: Record<string, string> = {
   "TerminalPanel.dismiss": "閉じる",
   "TerminalPanel.loading": "ターミナルセッションを読み込んでいます…",
   "TerminalPanel.emptyTitle": "ターミナルセッションがありません",
-  "TerminalPanel.emptyDescription": "ワークスペースに限定された実際のシェルを起動します。起動も送信される各コマンドも、シェルツールと同じ承認ポリシーに従います。",
+  "TerminalPanel.emptyDescription": "ワークスペースに限定された実際のシェルを起動します。すぐに開き、ここで入力したコマンドは承認プロンプトなしであなたのユーザーとして実行されます。",
   "TerminalPanel.startTerminal": "ターミナルを起動",
   "TerminalPanel.status.running": "実行中",
   "TerminalPanel.status.exited": "終了",
