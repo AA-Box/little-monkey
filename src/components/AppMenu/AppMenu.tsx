@@ -5,6 +5,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardList,
   GitBranch,
   Command,
   ClipboardCheck,
@@ -52,6 +53,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenPmCopilot: () => void;
   onOpenDeepResearch: () => void;
   onOpenBriefStudio: () => void;
   onOpenCrossRepoChangePlanner: () => void;
@@ -102,6 +104,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenPmCopilot,
   onOpenDeepResearch,
   onOpenBriefStudio,
   onOpenCrossRepoChangePlanner,
@@ -244,6 +247,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardList size={14} className="text-faint" />}
+            label={t("AppMenu.pmCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenPmCopilot();
             }}
           />
           <MenuRow
