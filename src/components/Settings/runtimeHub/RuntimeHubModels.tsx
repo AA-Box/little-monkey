@@ -1,19 +1,24 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { ArchiveRestore, Download, Eraser, ExternalLink, GitCompareArrows, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
-import type {
-  AcceleratorKind,
-  HardwareProfile,
-  HardwareSnapshot,
-  M3CatalogMatch,
-  M3InstalledModel,
-  M3RuntimeCapability,
-  M3SchedulingInput,
-  SchedulerRuntimeKind,
+import {
+  gateCapabilities,
+  type AcceleratorKind,
+  type CapabilityArea,
+  type HardwareProfile,
+  type HardwareSnapshot,
+  type M3CatalogMatch,
+  type M3InstalledModel,
+  type M3ModelCapabilities,
+  type M3RuntimeCapability,
+  type M3SchedulingInput,
+  type SchedulerRuntimeKind,
+  type TemplateFamily,
 } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
 import {
   BusyButton,
+  CompatibilityWarningBanner,
   CONTROL_CLASS,
   ErrorNotice,
   Field,
@@ -37,15 +42,54 @@ function FitPill({ match }: { match: M3CatalogMatch }) {
   return <StatusPill tone={tone}>{labelize(match.fit.rating)}</StatusPill>;
 }
 
-function CapabilityList({ capabilities }: { capabilities: M3CatalogMatch["model"]["capabilities"] }) {
-  const entries = Object.entries(capabilities).filter(([, enabled]) => enabled);
+/** Fetches (and caches, keyed by the raw template string) this model's Chat
+ * Template Compatibility Lab report — see `chat_template_lab.rs`. Returns
+ * `undefined` until the first fetch resolves, in which case callers should
+ * treat capabilities as still-declared (not yet gated) rather than block on
+ * a loading state for every card. */
+function useChatTemplateLabReport(template: string | null) {
+  const cacheKey = template ?? "";
+  const report = useRuntimeHubStore((state) => state.chatTemplateLabReports[cacheKey]);
+  const fetchReport = useRuntimeHubStore((state) => state.fetchChatTemplateLabReport);
+  useEffect(() => {
+    if (!report) void fetchReport(template).catch(() => {});
+    // Only re-runs when the requested template string actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey]);
+  return report;
+}
+
+/**
+ * Renders only the capabilities that are both declared by the catalog/
+ * installed model AND, when a lab report is available for this model's
+ * template, verified by the Chat Template Compatibility Lab (see
+ * `gateCapabilities`). A declared capability the lab has flagged is listed
+ * separately below, muted, so users can see it's a *known, explained* gap
+ * rather than data silently disappearing — see the "Chat template
+ * compatibility lab" section for the full fixture detail.
+ */
+function CapabilityList({ capabilities, template }: { capabilities: M3ModelCapabilities; template: string | null }) {
+  const report = useChatTemplateLabReport(template);
+  const gated = gateCapabilities(capabilities, report);
+  const ready = Object.entries(gated).filter(([, enabled]) => enabled);
+  const flagged = report
+    ? Object.entries(capabilities).filter(([key, enabled]) => enabled && !gated[key as keyof M3ModelCapabilities])
+    : [];
   return (
-    <div className="flex flex-wrap gap-1.5" aria-label="Model capabilities">
-      {entries.map(([capability]) => (
-        <span key={capability} className="rounded-md bg-surface-2 px-2 py-1 text-xs text-muted">
-          {labelize(capability)}
-        </span>
-      ))}
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap gap-1.5" aria-label="Model capabilities">
+        {ready.map(([capability]) => (
+          <span key={capability} className="rounded-md bg-surface-2 px-2 py-1 text-xs text-muted">
+            {labelize(capability)}
+          </span>
+        ))}
+      </div>
+      {flagged.length > 0 && (
+        <p className="text-[11px] leading-4 text-muted">
+          Not yet renderer-verified: {flagged.map(([capability]) => labelize(capability)).join(", ")} — see the
+          chat template compatibility lab below.
+        </p>
+      )}
     </div>
   );
 }
@@ -108,7 +152,7 @@ function CatalogCard({ match }: { match: M3CatalogMatch }) {
         <span>RAM: {formatBytes(match.fit.requiredRamBytes)} required / {formatBytes(match.fit.availableRamBytes)} schedulable</span>
         <span>VRAM: {formatBytes(match.fit.requiredVramBytes)} required / {formatBytes(match.fit.availableVramBytes)} available</span>
       </div>
-      <div className="mt-3"><CapabilityList capabilities={match.model.capabilities} /></div>
+      <div className="mt-3"><CapabilityList capabilities={match.model.capabilities} template={match.model.template} /></div>
 
       {match.fit.reasons.length > 0 && (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
@@ -320,6 +364,9 @@ function InstalledCard({ model }: { model: M3InstalledModel }) {
         <span>{formatBytes(active?.sizeBytes)} active</span>
         <span>Revision {active?.revision ?? "unknown"}</span>
         <span>{active?.license.name ?? "License unavailable"}</span>
+      </div>
+      <div className="mt-3">
+        <CapabilityList capabilities={model.capabilities} template={active?.template ?? null} />
       </div>
       <div className="mt-4 flex flex-col gap-2" aria-label={`Installed versions of ${model.displayName}`}>
         {model.versions
@@ -556,6 +603,90 @@ function InterruptedStorageCleanup() {
   );
 }
 
+const KNOWN_TEMPLATE_FAMILIES: Array<{ value: string; label: string; family: TemplateFamily }> = [
+  { value: "chatml", label: "ChatML (Qwen and similar)", family: "chatml" },
+  { value: "llama3", label: "Llama 3", family: "llama3" },
+  { value: "mistral", label: "Mistral", family: "mistral" },
+  { value: "gemma", label: "Gemma", family: "gemma" },
+  { value: "generic", label: "Generic / unrecognized template", family: "generic" },
+];
+
+const CAPABILITY_AREA_HINT: Record<CapabilityArea, string> = {
+  tool_calling: "Gates the tool_calling capability.",
+  system_prompt: "Gates the chat capability.",
+  stop_token: "Gates the chat capability.",
+  structured_output: "Gates the structured_output capability.",
+  vision: "Gates the vision capability.",
+  thinking: "Informational only — no M3ModelCapabilities flag represents thinking mode yet.",
+};
+
+/**
+ * Chat Template and Renderer Compatibility Lab (ROADMAP Phase 8 item 8):
+ * lets a user pick one of the five coarse template families
+ * `chat_template_lab.rs` understands and see exactly which fixtures pass or
+ * fail against Little Monkey's real renderer/parser code for that family —
+ * the same report `CapabilityList` above uses to gate what's shown as
+ * chat/tool/vision-ready on each model card.
+ */
+function ChatTemplateLabSection() {
+  const [selected, setSelected] = useState("chatml");
+  const template = selected === "generic" ? null : selected;
+  const cacheKey = template ?? "";
+  const fetchReport = useRuntimeHubStore((state) => state.fetchChatTemplateLabReport);
+  const report = useRuntimeHubStore((state) => state.chatTemplateLabReports[cacheKey]);
+  const busy = useRuntimeHubStore((state) => state.busy[`chat-template-lab:${cacheKey}`]);
+  const error = useRuntimeHubStore((state) => state.errors[`chat-template-lab:${cacheKey}`]);
+
+  useEffect(() => {
+    void fetchReport(template).catch(() => {});
+    // Only re-runs when the selected family actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey]);
+
+  return (
+    <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="chat-template-lab-heading">
+      <SectionHeading
+        title="Chat template compatibility lab"
+        description="Runs tool-call, system-prompt, stop-token, structured-output, image-block, and reasoning fixtures against Little Monkey's own renderer/parser code (not a live model) for a coarse template family. A model's capability badges above are only ever shown as ready once its fixture actually passes for that model's template family."
+      />
+      <label className="mt-3 flex min-h-11 w-fit items-center gap-2 text-sm text-foreground">
+        <span className="text-xs font-medium text-muted">Template family</span>
+        <select
+          id="chat-template-lab-heading"
+          value={selected}
+          onChange={(event) => setSelected(event.target.value)}
+          className={`${CONTROL_CLASS} w-auto`}
+        >
+          {KNOWN_TEMPLATE_FAMILIES.map((family) => (
+            <option key={family.value} value={family.value}>{family.label}</option>
+          ))}
+        </select>
+      </label>
+      <ErrorNotice message={error} />
+      {busy && !report && <p className="mt-3 text-xs text-muted">Running fixtures…</p>}
+      {report && (
+        <ul className="mt-3 flex flex-col gap-2" aria-live="polite">
+          {report.results.map((result) => (
+            <li
+              key={result.area}
+              className={`rounded-md border p-3 text-xs leading-5 ${
+                result.passed ? "border-success/30 bg-success-soft" : "border-warning/30 bg-warning-soft"
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-medium text-foreground">{labelize(result.area)}</span>
+                <StatusPill tone={result.passed ? "success" : "warning"}>{result.passed ? "Pass" : "Not verified"}</StatusPill>
+              </div>
+              <p className="mt-1 text-muted">{result.detail}</p>
+              <p className="mt-1 text-[11px] italic text-faint">{CAPABILITY_AREA_HINT[result.area]}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export function RuntimeHubModels() {
   const query = useRuntimeHubStore((state) => state.catalogQuery);
   const setQuery = useRuntimeHubStore((state) => state.setCatalogQuery);
@@ -564,6 +695,7 @@ export function RuntimeHubModels() {
   const searchCatalog = useRuntimeHubStore((state) => state.searchCatalog);
   const searching = useRuntimeHubStore((state) => state.busy.catalog);
   const error = useRuntimeHubStore((state) => state.errors.catalog);
+  const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -587,6 +719,7 @@ export function RuntimeHubModels() {
       </section>
 
       <CapacityPlanner />
+      <ChatTemplateLabSection />
       <InterruptedStorageCleanup />
 
       <section className="flex flex-col gap-3" aria-labelledby="model-catalog-heading">
@@ -594,6 +727,7 @@ export function RuntimeHubModels() {
           title="Model catalog"
           description="Results include exact revision, license provenance, and a live fit rating for this computer."
         />
+        <CompatibilityWarningBanner report={compatibilityReport} />
         <form onSubmit={submit} className="flex flex-col gap-2 sm:flex-row">
           <label className="relative min-w-0 flex-1">
             <span className="sr-only">Search model catalog</span>
