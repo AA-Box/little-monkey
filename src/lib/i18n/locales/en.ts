@@ -10,6 +10,7 @@ import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
+import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
 
@@ -26,6 +27,7 @@ export const en: Record<string, string> = {
   ...mcpGeneratorLocale,
   ...specScorerLocale,
   ...inboxLocale,
+  ...knowledgeGraphExplorerLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
   "ComparePicker.toolsBadge": "Tools",
