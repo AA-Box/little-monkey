@@ -1032,15 +1032,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Device-specific profiles explain supported models, expected speed, and required runtime components.
 
-### 17. Sampler, Batching, and Speculative Decoding Controls
-
-**Status:** Research
-
-- Expose supported sampler options, batching, speculative decoding, flash attention, mixed precision, and model-family tuning.
-- Gate advanced controls behind model/runtime support checks.
-
-**Acceptance:** Advanced performance controls cannot be enabled when the selected model/runtime cannot honor them.
-
 ### 18. Runtime PR Watcher and Capability Feed
 
 **Status:** Planned

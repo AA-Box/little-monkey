@@ -22,8 +22,8 @@ use crate::m3_runtime_hub::{
     M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
     M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
     M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind,
-    M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus,
-    M3UnloadModelRequest,
+    M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
+    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -243,6 +243,25 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Sampler/Batching/Speculative Decoding Controls (ROADMAP Phase 8 item 17):
+/// narrows `runtime_id`'s declared advanced settings down to what the
+/// current hardware and (if `asset_id` is given) selected model can
+/// actually honor — see `m3_runtime_hub.rs`'s `gate_advanced_settings` for
+/// the gating rules. `asset_id: None` still resolves the hardware-only
+/// gates (flash attention, mixed precision); only the speculative-decoding
+/// draft-model gate needs a target model.
+#[tauri::command]
+pub fn m3_resolve_setting_capabilities(
+    state: tauri::State<'_, M3CommandState>,
+    runtime_id: String,
+    asset_id: Option<String>,
+) -> Result<M3SettingCapabilitiesView, String> {
+    state
+        .hub
+        .resolve_setting_capabilities(&runtime_id, asset_id.as_deref())
+        .map_err(command_error)
 }
 
 /// Chat Template and Renderer Compatibility Lab report for one coarse

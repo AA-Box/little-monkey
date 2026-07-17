@@ -715,6 +715,8 @@ mod tests {
             schema: SettingValueSchema::Integer { min, max, step: 1 },
             default_value: SettingValue::Integer { value: default },
             restart_required: false,
+            supported: true,
+            unsupported_reason: None,
         }
     }
 
