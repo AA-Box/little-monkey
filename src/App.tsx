@@ -3,20 +3,31 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
-import { ChatSessionList, ChatWindow, CompareView, CrewView } from "./components/Chat";
+import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
 import { IssueToPrPanel } from "./components/IssueToPr";
+import { TrustScorecardsPanel } from "./components/TrustScorecards";
+import { SopCompilerPanel } from "./components/SopCompiler";
+import { McpGeneratorPanel } from "./components/McpGenerator";
 import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
+import { CommandPalette } from "./components/Palette";
 import { AgentInbox } from "./components/Inbox";
+import { RedTeamLabPanel } from "./components/RedTeamLab";
+import { KnowledgeGraphExplorerPanel } from "./components/KnowledgeGraphExplorer";
+import { EvidenceBoardPanel } from "./components/EvidenceBoard";
 import { DailyBriefPanel } from "./components/DailyBrief";
 import { BriefStudioPanel } from "./components/BriefStudio";
+import { CrossRepoChangePlannerPanel } from "./components/CrossRepoChangePlanner";
+import { VisualEditModePanel } from "./components/VisualEditMode";
 import { TerminalPanel } from "./components/Terminal";
+import { DebatePanel } from "./components/Debate";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
+import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore } from "./store/sideTaskStore";
 import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
@@ -30,6 +41,7 @@ import { usePermissionStore } from "./store/permissionStore";
 import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
 import { hydrateAutomations } from "./store/automationsStore";
+import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
 import { useT } from "./lib/i18n";
@@ -42,6 +54,7 @@ import {
 import { onRunCancellationRequested } from "./lib/runProtocol";
 import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
+import { paletteClient } from "./lib/paletteClient";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
  * (captured the moment it was opened) so edits made by the agent afterwards
@@ -93,6 +106,8 @@ function App() {
   const connectMcp = useMcpStore((s) => s.connect);
   const activeArtifact = useArtifactStore((s) => s.active);
   const permissionPending = usePermissionStore((s) => s.pending !== null);
+  const hasCompletedOnboarding = useOnboardingStore((s) => s.hasCompletedOnboarding);
+  const restartOnboarding = useOnboardingStore((s) => s.restartOnboarding);
 
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(true);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
@@ -102,11 +117,21 @@ function App() {
   const [runCenterOpen, setRunCenterOpen] = useState(false);
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [issueToPrOpen, setIssueToPrOpen] = useState(false);
+  const [trustScorecardsOpen, setTrustScorecardsOpen] = useState(false);
+  const [sopCompilerOpen, setSopCompilerOpen] = useState(false);
+  const [mcpGeneratorOpen, setMcpGeneratorOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
+  const [redTeamLabOpen, setRedTeamLabOpen] = useState(false);
+  const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
+  const [evidenceBoardOpen, setEvidenceBoardOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
   const [briefStudioOpen, setBriefStudioOpen] = useState(false);
+  const [crossRepoPlannerOpen, setCrossRepoPlannerOpen] = useState(false);
+  const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const [debateOpen, setDebateOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -123,10 +148,20 @@ function App() {
     setRunCenterOpen(false);
     setBrowserWorkbenchOpen(false);
     setIssueToPrOpen(false);
+    setTrustScorecardsOpen(false);
+    setSopCompilerOpen(false);
+    setMcpGeneratorOpen(false);
     setGlobalSearchOpen(false);
+    setCommandPaletteOpen(false);
     setAgentInboxOpen(false);
+    setRedTeamLabOpen(false);
+    setKnowledgeGraphOpen(false);
+    setEvidenceBoardOpen(false);
+    setDebateOpen(false);
     setDailyBriefOpen(false);
     setBriefStudioOpen(false);
+    setCrossRepoPlannerOpen(false);
+    setVisualEditModeOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
@@ -135,6 +170,20 @@ function App() {
   const handleManagePrompts = useCallback(() => {
     openSettingsTab("prompts");
   }, [openSettingsTab]);
+
+  // Opens the Global Command Palette over whatever's currently shown —
+  // triggered by the in-window shortcut below (Cmd/Ctrl+Shift+K, only while
+  // focused) and by the OS-level global shortcut (works even unfocused; see
+  // `src-tauri/src/command_palette.rs`, which shows/focuses this window and
+  // emits `palette://open` for the listener further down).
+  const openCommandPalette = useCallback(() => {
+    setSettingsOpen(false);
+    setRunCenterOpen(false);
+    setBrowserWorkbenchOpen(false);
+    setGlobalSearchOpen(false);
+    setSettingsInitialTab(undefined);
+    setCommandPaletteOpen(true);
+  }, []);
 
   // App-wide accelerators. The same definitions are rendered by the
   // Keyboard Shortcuts Settings panel, so a displayed binding always has a
@@ -170,8 +219,14 @@ function App() {
           setBrowserWorkbenchOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
+          setRedTeamLabOpen(false);
+          setKnowledgeGraphOpen(false);
+          setEvidenceBoardOpen(false);
+          setDebateOpen(false);
           setDailyBriefOpen(false);
           setBriefStudioOpen(false);
+          setCrossRepoPlannerOpen(false);
+          setVisualEditModeOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
           newSession();
@@ -181,13 +236,20 @@ function App() {
           setBrowserWorkbenchOpen(false);
           setGlobalSearchOpen(false);
           setAgentInboxOpen(false);
+          setRedTeamLabOpen(false);
+          setKnowledgeGraphOpen(false);
+          setEvidenceBoardOpen(false);
+          setDebateOpen(false);
           setDailyBriefOpen(false);
           setBriefStudioOpen(false);
+          setCrossRepoPlannerOpen(false);
+          setVisualEditModeOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
         },
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
+        openCommandPalette: () => openCommandPalette(),
         sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
         sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
         sessionRename: () => activeSession && session.requestRename(activeSession.id),
@@ -216,7 +278,23 @@ function App() {
     // that stop bubbling for their own local Enter/Escape handling.
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [newSession, openSettingsTab, permissionPending]);
+  }, [newSession, openCommandPalette, openSettingsTab, permissionPending]);
+
+  // The OS-level global shortcut (works even when Little Monkey isn't the
+  // focused app) is registered in Rust and, on press, shows/focuses this
+  // window and emits this event — see `command_palette::show_palette`.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void paletteClient.onOpen(openCommandPalette).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [openCommandPalette]);
 
   useEffect(() => {
     void refreshRoots();
@@ -320,6 +398,17 @@ function App() {
     }
   }, [selectedFile]);
 
+  // First-run onboarding (ROADMAP.md Phase 6): a Tauri-only, full-screen
+  // wizard that replaces the entire shell below until it's finished or
+  // explicitly skipped. Plain-browser dev (`vite` without the Tauri shell)
+  // never shows it — same `isTauri()` guard every other Tauri-only boot
+  // effect above already uses — so it can't block local frontend-only
+  // development. Placed after every hook above so hook call order never
+  // depends on this condition.
+  if (isTauri() && !hasCompletedOnboarding) {
+    return <OnboardingWizard />;
+  }
+
   return (
     <div className="flex h-screen w-screen bg-background text-foreground">
       {/* Left sidebar: chat session list, extending to the very top of the
@@ -337,20 +426,40 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
             setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
             setSettingsOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
             setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -358,10 +467,20 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setCommandPaletteOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
             setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -369,43 +488,191 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
             setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
+          onOpenCommandPalette={openCommandPalette}
           onOpenIssueToPr={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
             setBriefStudioOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
+          }}
+          onOpenTrustScorecards={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setTrustScorecardsOpen(true);
+          }}
+          onOpenSopCompiler={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setTrustScorecardsOpen(false);
+            setMcpGeneratorOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setSopCompilerOpen(true);
+          }}
+          onOpenMcpGenerator={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setSopCompilerOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setMcpGeneratorOpen(true);
           }}
           onOpenAgentInbox={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
             setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
+          }}
+          onOpenRedTeamLab={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setRedTeamLabOpen(true);
+          }}
+          onOpenKnowledgeGraph={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setKnowledgeGraphOpen(true);
+          }}
+          onOpenEvidenceBoard={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setEvidenceBoardOpen(true);
           }}
           onOpenDailyBrief={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
           }}
@@ -414,14 +681,95 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setBriefStudioOpen(true);
           }}
+          onOpenCrossRepoChangePlanner={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setBriefStudioOpen(false);
+            setSettingsInitialTab(undefined);
+            setCrossRepoPlannerOpen(true);
+          }}
+          onOpenVisualEditMode={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setBriefStudioOpen(false);
+            setSettingsInitialTab(undefined);
+            setVisualEditModeOpen(true);
+          }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
+          onOpenDebate={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setDebateOpen(true);
+          }}
+          onRestartOnboarding={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setDebateOpen(false);
+            setTerminalOpen(false);
+            restartOnboarding();
+          }}
         />
       </aside>
 
@@ -443,7 +791,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : dailyBriefOpen ? "daily-brief" : briefStudioOpen ? "brief-studio" : runCenterOpen ? "run-center" : issueToPrOpen ? "issue-to-pr" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -462,6 +810,12 @@ function App() {
                 void useRunStore.getState().selectRun(runId);
               }}
             />
+          ) : redTeamLabOpen ? (
+            <RedTeamLabPanel onClose={() => setRedTeamLabOpen(false)} />
+          ) : knowledgeGraphOpen ? (
+            <KnowledgeGraphExplorerPanel onClose={() => setKnowledgeGraphOpen(false)} />
+          ) : evidenceBoardOpen ? (
+            <EvidenceBoardPanel sessionId={activeSessionId} onClose={() => setEvidenceBoardOpen(false)} />
           ) : dailyBriefOpen ? (
             <DailyBriefPanel
               onClose={() => setDailyBriefOpen(false)}
@@ -478,8 +832,15 @@ function App() {
             />
           ) : briefStudioOpen ? (
             <BriefStudioPanel onClose={() => setBriefStudioOpen(false)} />
+          ) : crossRepoPlannerOpen ? (
+            <CrossRepoChangePlannerPanel onClose={() => setCrossRepoPlannerOpen(false)} />
+          ) : visualEditModeOpen ? (
+            <VisualEditModePanel onClose={() => setVisualEditModeOpen(false)} />
+
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
+          ) : debateOpen ? (
+            <DebatePanel onClose={() => setDebateOpen(false)} />
           ) : issueToPrOpen ? (
             <IssueToPrPanel
               onClose={() => setIssueToPrOpen(false)}
@@ -489,6 +850,18 @@ function App() {
                 void useRunStore.getState().selectRun(runId);
               }}
             />
+          ) : trustScorecardsOpen ? (
+            <TrustScorecardsPanel onClose={() => setTrustScorecardsOpen(false)} />
+          ) : sopCompilerOpen ? (
+            <SopCompilerPanel
+              onClose={() => setSopCompilerOpen(false)}
+              onOpenSkillProposals={() => {
+                setSopCompilerOpen(false);
+                openSettingsTab("prompts");
+              }}
+            />
+          ) : mcpGeneratorOpen ? (
+            <McpGeneratorPanel onClose={() => setMcpGeneratorOpen(false)} />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
@@ -517,7 +890,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !dailyBriefOpen && !briefStudioOpen && !runCenterOpen && !issueToPrOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !briefStudioOpen && !crossRepoPlannerOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
@@ -614,7 +987,14 @@ function App() {
         ))}
       </aside>
 
+      {commandPaletteOpen && (
+        <CommandPalette
+          onClose={() => setCommandPaletteOpen(false)}
+          onOpenSettingsTab={openSettingsTab}
+        />
+      )}
       <PermissionModal />
+      <PrivacyFirewallGate />
       <SettingsModal
         open={settingsOpen}
         onClose={() => {
