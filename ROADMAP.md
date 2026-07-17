@@ -942,24 +942,6 @@ These are deliberately separate from the earlier phases: they are the next 30 ga
 
 This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 2026: 4,931 closed PRs fetched through the GitHub API, with 3,430 merged PRs used as the main signal. The goal is not to clone Ollama, but to learn from the runtime, model, GPU, registry, API, and diagnostics work that made Ollama dependable.
 
-### 1. Hardware Compatibility Matrix and Driver Doctor
-
-**Status:** Planned
-
-- Detect CUDA, ROCm, Vulkan, Metal, MLX, iGPU/dGPU, hybrid graphics, Jetson, driver versions, compute capability, and unsupported runtime combinations.
-- Explain what will work, what will fall back to CPU, and what needs a driver/runtime update.
-
-**Acceptance:** User sees a concrete compatibility report before model download, model load, or runtime install.
-
-### 2. Adaptive Runtime Scheduler and Offload Planner
-
-**Status:** Planned
-
-- Plan context size, batch size, GPU layers, projector offload, CPU spill, and parallelism from live memory/VRAM state.
-- Simulate fit before loading a model and explain tradeoffs.
-
-**Acceptance:** A model load shows why a runtime/context/offload plan was selected and how to improve it.
-
 ### 3. Multi-GPU and Heterogeneous Runtime Orchestration
 
 **Status:** Research
@@ -968,15 +950,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Track per-device memory, load, thermal pressure, and failure fallback.
 
 **Acceptance:** Multi-device execution never silently degrades correctness and always reports actual placement.
-
-### 4. Runtime Component Update Channels
-
-**Status:** Planned
-
-- Manage versioned `llama.cpp`, MLX, Metal, CUDA, ROCm, Vulkan, tokenizer, converter, and projector components.
-- Provide stable, beta, and pinned channels with rollback.
-
-**Acceptance:** Runtime updates can be installed, verified, rolled back, and tied to compatibility notes.
 
 ### 6. Modelfile Studio and Import Hardening
 
