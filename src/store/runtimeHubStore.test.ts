@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   client: {
     hardwareSnapshot: vi.fn(),
     hardwareProfile: vi.fn(),
+    hardwareCompatibilityReport: vi.fn(),
     storageStatus: vi.fn(),
     installedModels: vi.fn(),
     catalogSources: vi.fn(),
@@ -79,6 +80,25 @@ const storage = {
   availableForModelsBytes: 890,
   pendingDownloadBytes: 0,
 };
+const compatibilityReport = {
+  capturedAtMs: 1,
+  os: "macos",
+  arch: "aarch64",
+  accelerators: [
+    {
+      kind: "metal",
+      status: "available",
+      summary: "Metal is available.",
+      deviceNames: ["Apple Silicon unified GPU"],
+      driverVersion: null,
+      computeCapability: null,
+      confirmed: true,
+    },
+  ],
+  jetson: { detected: false, model: null },
+  hybridGraphicsDetected: false,
+  notes: [],
+};
 const capability = {
   descriptor: { runtimeId: "ollama", kind: "ollama", label: "Ollama", managed: false, apiBackend: "ollama" },
   canLoad: true,
@@ -109,6 +129,7 @@ beforeEach(() => {
     section: "overview",
     hardware: null,
     profile: null,
+    compatibilityReport: null,
     storage: null,
     installedModels: [],
     catalogSources: [],
@@ -140,6 +161,7 @@ describe("runtimeHubStore", () => {
   it("loads hardware, profile, storage, installed models, runtimes, and disabled LAN state", async () => {
     mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
     mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.hardwareCompatibilityReport.mockResolvedValue(compatibilityReport);
     mocks.client.storageStatus.mockResolvedValue(storage);
     mocks.client.installedModels.mockResolvedValue([]);
     mocks.client.refreshRuntimes.mockResolvedValue([capability]);
@@ -154,9 +176,28 @@ describe("runtimeHubStore", () => {
     expect(state.profile).toEqual(profile);
     expect(state.storage).toEqual(storage);
     expect(state.runtimes).toEqual([capability]);
+    expect(state.compatibilityReport).toEqual(compatibilityReport);
     expect(state.loaded).toBe(true);
     expect(mocks.client.lanTokens).not.toHaveBeenCalled();
     expect(state.busy).toEqual({});
+  });
+
+  it("does not block the rest of the overview refresh when the compatibility report fails", async () => {
+    mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
+    mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.hardwareCompatibilityReport.mockRejectedValue(new Error("driver doctor offline"));
+    mocks.client.storageStatus.mockResolvedValue(storage);
+    mocks.client.installedModels.mockResolvedValue([]);
+    mocks.client.refreshRuntimes.mockResolvedValue([capability]);
+    mocks.client.catalogSources.mockResolvedValue([]);
+
+    await useRuntimeHubStore.getState().refreshOverview();
+
+    const state = useRuntimeHubStore.getState();
+    expect(state.hardware).toEqual(hardware);
+    expect(state.loaded).toBe(true);
+    expect(state.compatibilityReport).toBeNull();
+    expect(state.errors.compatibility).toContain("driver doctor offline");
   });
 
   it("tracks a cancellable catalog operation and stores exact results", async () => {

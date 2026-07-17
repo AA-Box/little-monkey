@@ -19,8 +19,8 @@ use crate::mlx_runtime::{
     MlxRuntimeAdapter, MlxRuntimeStatus, MlxStreamEvent, MlxStreamSink, MlxToolDefinition,
 };
 use crate::runtime_adapter::{
-    validate_setting_values, AdvancedSettingCapability, HardwareProfile, HardwareSnapshot,
-    KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
+    validate_setting_values, AcceleratorKind, AdvancedSettingCapability, HardwareProfile,
+    HardwareSnapshot, KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
     RuntimeCapabilities, RuntimeInventory, RuntimeLogRequest, RuntimeLogTail,
     RuntimeOperationContext, RuntimeOperationLimits, RuntimeStatus, SettingValue, UnloadPolicy,
 };
@@ -525,8 +525,159 @@ pub struct M3CatalogMatch {
     pub fit: M3HardwareFit,
 }
 
+/// Hardware Compatibility Matrix / "Driver Doctor" status for a single
+/// accelerator backend. Every backend is queried defensively: a missing tool,
+/// an absent device, or an unsupported OS/arch combination is a normal,
+/// expected outcome and must never surface as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3AcceleratorStatus {
+    /// The backend was queried directly and at least one usable device was
+    /// found.
+    Available,
+    /// The backend's tooling ran successfully but reported no device.
+    NotDetected,
+    /// A device was found, but its driver/compute capability is below the
+    /// minimum this app requires for that backend.
+    DriverTooOld,
+    /// The backend's detection tool (e.g. `nvidia-smi`, `rocm-smi`,
+    /// `vulkaninfo`) is not installed or not on `PATH`, so the backend could
+    /// not be queried at all.
+    ToolMissing,
+    /// The backend cannot run on this OS/architecture combination.
+    Unsupported,
+}
+
+/// One row of the hardware compatibility report: a single accelerator
+/// backend, what was found, and a human-readable explanation a user can act
+/// on (install a driver, update a runtime, or expect a CPU fallback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3AcceleratorCompatibility {
+    pub kind: AcceleratorKind,
+    pub status: M3AcceleratorStatus,
+    /// Short, human-readable explanation of the status (what works, what
+    /// falls back to CPU, or what needs a driver/runtime update).
+    pub summary: String,
+    pub device_names: Vec<String>,
+    pub driver_version: Option<String>,
+    pub compute_capability: Option<String>,
+    /// False when this status was inferred or assumed rather than obtained
+    /// from a direct hardware/driver query, so `status: Available` should be
+    /// read as "likely" rather than confirmed. Used for Windows DirectML
+    /// (only a display adapter's presence is confirmed, not the DirectML
+    /// runtime path itself) and for the Metal OS/arch fallback used when
+    /// `system_profiler` is unavailable.
+    pub confirmed: bool,
+}
+
+/// NVIDIA Jetson (Tegra) detection result. Jetson devices share CUDA
+/// tooling with desktop NVIDIA GPUs but have their own driver/runtime
+/// implications, so they are reported separately from the CUDA row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3JetsonInfo {
+    pub detected: bool,
+    pub model: Option<String>,
+}
+
+/// Full hardware compatibility report shown to the user before a model
+/// download, model load, or runtime install: for every accelerator backend,
+/// what will work, what falls back to CPU, and what needs a driver/runtime
+/// update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3HardwareCompatibilityReport {
+    pub captured_at_ms: u64,
+    pub os: String,
+    pub arch: String,
+    pub accelerators: Vec<M3AcceleratorCompatibility>,
+    pub jetson: M3JetsonInfo,
+    /// True when more than one GPU-capable backend/device was detected
+    /// (e.g. an integrated and a discrete adapter, or two backends both
+    /// reporting `Available`) so the UI never silently picks one.
+    pub hybrid_graphics_detected: bool,
+    /// Free-form notes: unsupported runtime combinations, mixed-vendor GPU
+    /// warnings, and other callouts that do not fit a single backend row.
+    pub notes: Vec<String>,
+}
+
+/// Derives a best-effort compatibility report purely from a [`HardwareSnapshot`]'s
+/// accelerator list. This is the default used by any [`M3HardwareProbe`] that
+/// does not override [`M3HardwareProbe::compatibility_report`]; production
+/// probes override it to add driver versions, compute capability, Jetson
+/// detection, and the `ToolMissing`/`DriverTooOld` distinctions a plain
+/// accelerator list cannot express.
+pub fn compatibility_report_from_snapshot(
+    snapshot: &HardwareSnapshot,
+) -> M3HardwareCompatibilityReport {
+    let backends = [
+        AcceleratorKind::Metal,
+        AcceleratorKind::Cuda,
+        AcceleratorKind::Rocm,
+        AcceleratorKind::Vulkan,
+        AcceleratorKind::DirectMl,
+    ];
+    let mut accelerators = Vec::with_capacity(backends.len());
+    for kind in backends {
+        let found = snapshot
+            .platform
+            .accelerators
+            .iter()
+            .find(|capability| capability.kind == kind);
+        let (status, summary, device_names) = match found {
+            Some(capability) if capability.available => (
+                M3AcceleratorStatus::Available,
+                format!("{kind:?} reported available by the hardware snapshot."),
+                capability.device_names.clone(),
+            ),
+            _ => (
+                M3AcceleratorStatus::NotDetected,
+                format!("{kind:?} was not detected on this platform; falls back to CPU."),
+                Vec::new(),
+            ),
+        };
+        accelerators.push(M3AcceleratorCompatibility {
+            kind,
+            status,
+            summary,
+            device_names,
+            driver_version: None,
+            compute_capability: None,
+            confirmed: true,
+        });
+    }
+    let available_backends = accelerators
+        .iter()
+        .filter(|entry| entry.status == M3AcceleratorStatus::Available)
+        .count();
+    M3HardwareCompatibilityReport {
+        captured_at_ms: snapshot.captured_at_ms,
+        os: snapshot.platform.os.clone(),
+        arch: snapshot.platform.arch.clone(),
+        accelerators,
+        jetson: M3JetsonInfo {
+            detected: false,
+            model: None,
+        },
+        hybrid_graphics_detected: available_backends > 1,
+        notes: Vec::new(),
+    }
+}
+
 pub trait M3HardwareProbe: Send + Sync {
     fn snapshot(&self) -> M3HubResult<HardwareSnapshot>;
+
+    /// Hardware Compatibility Matrix / "Driver Doctor" report shown to the
+    /// user before a model download, model load, or runtime install. The
+    /// default implementation derives a coarse report from [`Self::snapshot`];
+    /// production probes should override this to add real driver-version and
+    /// compute-capability detection. Implementations must never panic or
+    /// return an error merely because a GPU tool/driver is absent — that is
+    /// the normal `NotDetected`/`ToolMissing` case.
+    fn compatibility_report(&self) -> M3HubResult<M3HardwareCompatibilityReport> {
+        Ok(compatibility_report_from_snapshot(&self.snapshot()?))
+    }
 }
 
 pub trait M3CatalogSource: Send + Sync {
@@ -1808,6 +1959,13 @@ impl M3RuntimeHub {
 
     pub fn hardware_profile(&self) -> M3HubResult<HardwareProfile> {
         self.hardware_snapshot()?.profile().map_err(runtime_error)
+    }
+
+    /// Hardware Compatibility Matrix / "Driver Doctor" report. Must be safe
+    /// to call before any model download, model load, or runtime install so
+    /// the UI can show a concrete compatibility report first.
+    pub fn hardware_compatibility_report(&self) -> M3HubResult<M3HardwareCompatibilityReport> {
+        self.hardware.compatibility_report()
     }
 
     pub fn storage_status(&self) -> M3HubResult<M3StorageStatus> {

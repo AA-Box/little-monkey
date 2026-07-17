@@ -14,6 +14,7 @@ import type {
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
 import {
   BusyButton,
+  CompatibilityWarningBanner,
   CONTROL_CLASS,
   ErrorNotice,
   Field,
@@ -564,6 +565,7 @@ export function RuntimeHubModels() {
   const searchCatalog = useRuntimeHubStore((state) => state.searchCatalog);
   const searching = useRuntimeHubStore((state) => state.busy.catalog);
   const error = useRuntimeHubStore((state) => state.errors.catalog);
+  const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -594,6 +596,7 @@ export function RuntimeHubModels() {
           title="Model catalog"
           description="Results include exact revision, license provenance, and a live fit rating for this computer."
         />
+        <CompatibilityWarningBanner report={compatibilityReport} />
         <form onSubmit={submit} className="flex flex-col gap-2 sm:flex-row">
           <label className="relative min-w-0 flex-1">
             <span className="sr-only">Search model catalog</span>

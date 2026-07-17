@@ -13,9 +13,10 @@ use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
     M3ActivateModelVersionRequest, M3ApiDispatchRequest, M3ApiDispatchResponse,
     M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport, M3DeleteModelRequest,
-    M3DownloadRequest, M3HubError, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
-    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeMetricsView,
-    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus, M3UnloadModelRequest,
+    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstalledModelView,
+    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
+    M3RuntimeHub, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
+    M3StorageStatus, M3UnloadModelRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -160,6 +161,19 @@ pub fn m3_hardware_profile(
     state: tauri::State<'_, M3CommandState>,
 ) -> Result<HardwareProfile, String> {
     state.hub.hardware_profile().map_err(command_error)
+}
+
+/// Hardware Compatibility Matrix / "Driver Doctor" report. The frontend
+/// fetches this before starting a model download, model load, or runtime
+/// install so the user sees a concrete compatibility report first.
+#[tauri::command]
+pub fn m3_hardware_compatibility_report(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3HardwareCompatibilityReport, String> {
+    state
+        .hub
+        .hardware_compatibility_report()
+        .map_err(command_error)
 }
 
 #[tauri::command]
