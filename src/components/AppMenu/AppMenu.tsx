@@ -16,6 +16,7 @@ import {
   Search,
   ServerCog,
   Settings as SettingsIcon,
+  ShieldAlert,
   ShieldCheck,
   SquareTerminal,
   Workflow,
@@ -40,6 +41,7 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
   onOpenTerminal: () => void;
+  onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
@@ -84,6 +86,7 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
   onOpenTerminal,
+  onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
   onRestartOnboarding,
@@ -234,6 +237,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldAlert size={14} className="text-faint" />}
+            label={t("AppMenu.redTeamLab")}
+            onClick={() => {
+              closeAll();
+              onOpenRedTeamLab();
             }}
           />
           <MenuRow
