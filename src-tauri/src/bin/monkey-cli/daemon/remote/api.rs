@@ -11,10 +11,12 @@ use crate::daemon::ledger::SharedLedger;
 use crate::daemon::store::{DaemonPaths, DaemonStore};
 use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
 
+use super::desktop::DesktopControlRuntime;
 use super::protocol::{
-    canonical_request, sha256_hex, ApprovalRequestBody, CancelRequestBody, PairAcceptRequest,
-    RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary, SignedRequestHeaders,
-    MAX_REMOTE_BODY_BYTES, REMOTE_PROTOCOL_VERSION,
+    canonical_request, sha256_hex, ApprovalRequestBody, CancelRequestBody,
+    DesktopControlActionRequest, DesktopControlStartRequest, DesktopControlStopRequest,
+    PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
+    SignedRequestHeaders, MAX_REMOTE_BODY_BYTES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{CommandReservation, KeyringRemoteSecrets, RemoteSecretStore, RemoteStore};
 
@@ -62,6 +64,10 @@ pub struct RemoteApi {
     host: RemoteHostConfig,
     store: Arc<Mutex<RemoteStore>>,
     secrets: Arc<dyn RemoteSecretStore>,
+    /// Shared with the resident serve loop so revoke / kill-switch / escape
+    /// hatch can force-stop the same live sessions this API creates. `None`
+    /// only in desktop-agnostic unit tests.
+    desktop: Option<Arc<DesktopControlRuntime>>,
 }
 
 impl Clone for RemoteApi {
@@ -71,18 +77,24 @@ impl Clone for RemoteApi {
             host: self.host.clone(),
             store: Arc::clone(&self.store),
             secrets: Arc::clone(&self.secrets),
+            desktop: self.desktop.clone(),
         }
     }
 }
 
 impl RemoteApi {
-    pub fn production(paths: DaemonPaths, host: RemoteHostConfig) -> Result<Self, String> {
+    pub fn production(
+        paths: DaemonPaths,
+        host: RemoteHostConfig,
+        desktop: Arc<DesktopControlRuntime>,
+    ) -> Result<Self, String> {
         let store = RemoteStore::open(&paths.root)?;
         Ok(Self {
             paths,
             host,
             store: Arc::new(Mutex::new(store)),
             secrets: Arc::new(KeyringRemoteSecrets),
+            desktop: Some(desktop),
         })
     }
 
@@ -98,6 +110,7 @@ impl RemoteApi {
             host,
             store: Arc::new(Mutex::new(store)),
             secrets,
+            desktop: None,
         }
     }
 
@@ -312,6 +325,18 @@ impl RemoteApi {
             }
             ("POST", ["v1", "remote", "kill"]) => require_action(scopes, RemoteAction::Kill)
                 .and_then(|_| self.kill(device_id, now_ms)),
+            ("POST", ["v1", "remote", "desktop-control", "start"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_start(&request.body, device_id))
+            }
+            ("POST", ["v1", "remote", "desktop-control", "action"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_action(&request.body, device_id))
+            }
+            ("POST", ["v1", "remote", "desktop-control", "stop"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_stop(&request.body, device_id))
+            }
             _ => Err((404, "Unknown remote runner endpoint".to_string())),
         };
         let (response, outcome, target) = match result {
@@ -607,15 +632,103 @@ impl RemoteApi {
         let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
         store.set_kill_switch(true).map_err(internal)?;
         let cancelled = store.request_cancel_all(now_ms).map_err(internal)?;
+        // Engaging the kill switch must also force-stop any live desktop
+        // control session right away, in-process, rather than waiting for the
+        // serve loop's next enforcement tick.
+        let desktop_sessions_stopped = self
+            .desktop
+            .as_ref()
+            .map(|runtime| runtime.emergency_stop_all())
+            .unwrap_or(0);
         Ok((
             202,
             serde_json::json!({
                 "status":"kill_switch_engaged",
                 "requested_by":device_id,
                 "cancelled_runs":cancelled,
+                "desktop_sessions_stopped":desktop_sessions_stopped,
             }),
             None,
         ))
+    }
+
+    fn desktop_control_start(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlStartRequest =
+            serde_json::from_slice(body).map_err(|error| {
+                (
+                    400,
+                    format!("Invalid desktop-control start request: {error}"),
+                )
+            })?;
+        // The consent prompt runs inside `runtime.start` before any session is
+        // created — the human-visible gate on the runner itself.
+        let value = runtime.start(
+            device_id,
+            &self.device_label(device_id),
+            request.allowlist,
+            request.batch_mode,
+        )?;
+        Ok((201, value, Some(device_id.to_string())))
+    }
+
+    fn desktop_control_action(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlActionRequest =
+            serde_json::from_slice(body).map_err(|error| {
+                (
+                    400,
+                    format!("Invalid desktop-control action request: {error}"),
+                )
+            })?;
+        let target = request.session_id.clone();
+        let value = runtime.action(device_id, &self.device_label(device_id), request)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn desktop_control_stop(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlStopRequest = serde_json::from_slice(body).map_err(|error| {
+            (
+                400,
+                format!("Invalid desktop-control stop request: {error}"),
+            )
+        })?;
+        let target = request.session_id.clone();
+        let value = runtime.stop(device_id, &request.session_id)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn require_desktop(&self) -> Result<&Arc<DesktopControlRuntime>, (u16, String)> {
+        self.desktop.as_ref().ok_or_else(|| {
+            (
+                503,
+                "Desktop control is not available on this runner".to_string(),
+            )
+        })
+    }
+
+    /// The paired device's human label, used in the local consent dialog.
+    /// Falls back to the opaque id if the record is unreadable.
+    fn device_label(&self, device_id: &str) -> String {
+        self.store
+            .lock()
+            .ok()
+            .and_then(|store| store.device(device_id).ok().flatten())
+            .map(|device| device.device_name)
+            .unwrap_or_else(|| device_id.to_string())
     }
 
     fn authorized_run(

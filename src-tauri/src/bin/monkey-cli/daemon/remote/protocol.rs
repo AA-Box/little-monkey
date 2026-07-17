@@ -22,6 +22,12 @@ pub enum RemoteAction {
     Approve,
     Cancel,
     Kill,
+    /// Drive the runner's real keyboard/mouse through the gated
+    /// `little_monkey_lib::desktop_control` core. Distinct from every other
+    /// action: it never touches a run, it always requires local visible
+    /// consent on the runner before a session is created, and it can be
+    /// force-stopped instantly by revoke or the kill switch.
+    ControlDesktop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +301,38 @@ pub struct CancelRequestBody {
     pub reason: Option<String>,
 }
 
+/// Body of `POST /v1/remote/desktop-control/start`. The `batch_mode` flag is
+/// only ever a *request* — it is honoured solely when the runner's own local
+/// consent prompt was answered "Allow (batch)"; the remote side asking for it
+/// is never sufficient on its own (see `api::desktop_control_start`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopControlStartRequest {
+    pub allowlist: Vec<String>,
+    #[serde(default)]
+    pub batch_mode: bool,
+}
+
+/// Body of `POST /v1/remote/desktop-control/action`. Reuses the desktop-control
+/// core's own [`little_monkey_lib::desktop_control::ControlAction`] as the
+/// payload rather than defining a parallel wire type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopControlActionRequest {
+    pub session_id: String,
+    /// Which allowlisted application/window this action is aimed at — the
+    /// desktop-control core enforces this against the session allowlist.
+    pub target_application_id: String,
+    pub action: little_monkey_lib::desktop_control::ControlAction,
+}
+
+/// Body of `POST /v1/remote/desktop-control/stop`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopControlStopRequest {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEntry {
@@ -387,7 +425,10 @@ pub fn random_token_id(bytes: usize) -> Result<String, String> {
             .as_bytes()
             .first()
             .is_some_and(u8::is_ascii_alphanumeric)
-            && token.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric);
+            && token
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric);
         if boundary_safe {
             return Ok(token);
         }

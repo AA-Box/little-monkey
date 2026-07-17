@@ -26,6 +26,7 @@ import {
   validateRemotePairRequest,
 } from "../../lib/daemonClient";
 import { useRecipeStore } from "../../store/recipeStore";
+import { useRunStore } from "../../store/runStore";
 import { Button, Tabs } from "../ui";
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : String(error); }
@@ -38,6 +39,17 @@ export function BackgroundAgentsPanel() {
   const [notice, setNotice] = useState<string | null>(null);
   const recipes = useRecipeStore((state) => state.recipes);
   const refreshRecipes = useRecipeStore((state) => state.refresh);
+  // Reuse the shared durable-run store (same source the Runs view uses) rather
+  // than a bespoke listing mechanism; filter it down to control sessions.
+  const runs = useRunStore((state) => state.runs);
+  const eventsByRun = useRunStore((state) => state.eventsByRun);
+  const selectedRunId = useRunStore((state) => state.selectedRunId);
+  const refreshRuns = useRunStore((state) => state.refresh);
+  const selectRun = useRunStore((state) => state.selectRun);
+  const controlSessions = useMemo(
+    () => runs.filter((run) => run.spec.kind === "remote_desktop_control").slice(0, 25),
+    [runs],
+  );
   const [install, setInstall] = useState({ concurrency: 2, maxQueue: 100, retentionDays: 30, webhookPort: "", notifications: true });
   const [queue, setQueue] = useState<DaemonQueueRequest>({ recipe: "", runKey: null, priority: 0, maxAttempts: 1, maxRuntimeSeconds: 3600, maxMemoryMb: null, ownedWorktree: false, repository: null, branchPrefix: "codex/background/", allowedRemotes: ["origin"], allowCommit: true, allowPush: false, allowCreatePullRequest: false, allowReviewComment: false });
   const [triggers, setTriggers] = useState<unknown>(null);
@@ -64,6 +76,7 @@ export function BackgroundAgentsPanel() {
   }
 
   useEffect(() => { void refresh(); void refreshRecipes(); }, [refreshRecipes]);
+  useEffect(() => { if (tab === "remote") void refreshRuns(); }, [tab, refreshRuns]);
   useEffect(() => {
     if (!status?.serviceRunning) return;
     const timer = window.setInterval(() => void refresh(), 2_000);
@@ -82,7 +95,7 @@ export function BackgroundAgentsPanel() {
     if (typeof path === "string") setRemote((value) => ({ ...value, [kind === "certificate" ? "tlsCertificate" : "tlsPrivateKey"]: path }));
   }
 
-  const enabledActions = ["view-runs", "view-events", "read-artifacts", "approve", "cancel", "kill"];
+  const enabledActions = ["view-runs", "view-events", "read-artifacts", "approve", "cancel", "kill", "control-desktop"];
   const controller = typeof remoteStatus?.advertise_url === "string" ? `${remoteStatus.advertise_url.replace(/\/$/, "")}/remote` : null;
 
   return (
@@ -134,6 +147,28 @@ export function BackgroundAgentsPanel() {
           <Button className="mt-3" disabled={pairWarnings.length > 0 || busy !== null} onClick={async () => { const output = await save({ defaultPath: "little-monkey-pairing.json", filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("pair invitation", () => remotePairCreate({ ...pairRequest, output })); }}><KeyRound size={14} /> Create invitation…</Button>
         </div>
         <div className="rounded-lg border border-border bg-surface p-3"><div className="flex flex-wrap gap-2"><Button size="sm" onClick={() => void act("devices", remotePairList, (value) => setDevices(String(value)))}>List devices</Button><input placeholder="Device ID" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} className="rounded-md border border-border bg-background px-2 text-xs" /><Button size="sm" variant="danger" disabled={!deviceId} onClick={() => { if (window.confirm(`Revoke ${deviceId} immediately?`)) void act("revoke", () => remotePairRevoke(deviceId, "revoked from desktop")); }}><Ban size={12} /> Revoke</Button><Button size="sm" disabled={!deviceId} onClick={async () => { const output = await save({ defaultPath: `${deviceId}-rotation.json`, filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("rotate", () => remotePairRotate(deviceId, output)); }}><RotateCw size={12} /> Rotate key</Button><Button size="sm" onClick={() => void act("audit", () => remoteAudit(100), setAudit)}>Audit</Button></div>{devices && <pre className="mt-2 whitespace-pre-wrap rounded-md bg-background p-2 text-[10px] text-muted">{devices}</pre>}{audit !== null && <pre className="mt-2 max-h-52 overflow-auto rounded-md bg-background p-2 text-[10px] text-muted">{JSON.stringify(audit, null, 2)}</pre>}</div>
+        <div className="rounded-lg border border-border bg-surface p-3">
+          <div className="flex items-center justify-between"><h4 className="text-xs font-semibold text-foreground">Remote desktop-control sessions</h4><Button size="sm" onClick={() => void refreshRuns()}><RefreshCw size={12} /> Refresh</Button></div>
+          <p className="mt-1 text-[11px] leading-4 text-muted">Every remote desktop-control session is recorded here with start, periodic, and stop screenshots as tamper-evident evidence. Control requires local on-screen consent on this runner, and can be stopped instantly with <code>monkey daemon desktop-control emergency-stop</code>, the kill switch, or revoking the device.</p>
+          {controlSessions.length === 0 ? <p className="mt-2 text-[11px] text-faint">No remote desktop-control sessions recorded yet.</p> : <ul className="mt-2 space-y-1">
+            {controlSessions.map((run) => {
+              const screenshots = (eventsByRun[run.spec.run_id] ?? []).filter((envelope) => envelope.event.type === "artifact_added");
+              const expanded = selectedRunId === run.spec.run_id;
+              return <li key={run.spec.run_id} className="rounded-md border border-border bg-background">
+                <button type="button" className="flex w-full flex-wrap items-center justify-between gap-2 p-2 text-left text-[11px]" onClick={() => void selectRun(run.spec.run_id)}>
+                  <span className="truncate font-mono text-foreground" title={run.spec.run_id}>{run.spec.run_id}</span>
+                  <span className="text-muted">{run.status}</span>
+                  <span className="text-faint">{new Date(run.spec.created_at_ms).toLocaleString()}</span>
+                </button>
+                {expanded && <div className="border-t border-border p-2">
+                  {screenshots.length === 0 ? <p className="text-[11px] text-faint">No screenshots recorded for this session yet.</p> : <ol className="space-y-1">
+                    {screenshots.map((envelope) => envelope.event.type === "artifact_added" ? <li key={envelope.event_id} className="flex items-center justify-between gap-2 text-[11px] text-muted"><span className="truncate" title={envelope.event.payload.content_sha256}>{envelope.event.payload.name}</span><span className="text-faint">{new Date(envelope.occurred_at_ms).toLocaleTimeString()} · {(envelope.event.payload.size_bytes / 1024).toFixed(0)} KiB</span></li> : null)}
+                  </ol>}
+                </div>}
+              </li>;
+            })}
+          </ul>}
+        </div>
       </>}
 
       {busy && <p role="status" className="flex items-center gap-2 text-xs text-muted"><Loader2 size={13} className="animate-spin" /> {busy}…</p>}

@@ -1,9 +1,12 @@
 mod api;
 mod client;
+mod desktop;
 mod protocol;
 mod server;
 mod store;
 mod web;
+
+pub use desktop::DesktopControlRuntime;
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -146,6 +149,7 @@ pub enum PairAction {
     Approve,
     Cancel,
     Kill,
+    ControlDesktop,
 }
 
 impl From<PairAction> for RemoteAction {
@@ -157,6 +161,7 @@ impl From<PairAction> for RemoteAction {
             PairAction::Approve => Self::Approve,
             PairAction::Cancel => Self::Cancel,
             PairAction::Kill => Self::Kill,
+            PairAction::ControlDesktop => Self::ControlDesktop,
         }
     }
 }
@@ -232,12 +237,18 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             server::save_host_config(&paths, &config)?;
             println!("Remote runner disabled; restart the daemon to close existing sockets.");
         }
-        RemoteCmd::HostServe => server::serve(paths).await?,
+        RemoteCmd::HostServe => {
+            let desktop = DesktopControlRuntime::production(&paths);
+            server::serve(paths, desktop).await?
+        }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
         RemoteCmd::PairRevoke { device_id, reason } => {
             let mut store = RemoteStore::open(&paths.root)?;
-            if !store.revoke_device(device_id, reason, now_ms()?, &KeyringRemoteSecrets)? {
+            // The one-shot CLI process holds no live sessions; the resident
+            // daemon force-stops any live session for this device on its next
+            // enforcement tick (see `DesktopControlRuntime::enforce`).
+            if !store.revoke_device(device_id, reason, now_ms()?, &KeyringRemoteSecrets, None)? {
                 return Err(format!("Unknown or already revoked device '{device_id}'"));
             }
             println!("Revoked {device_id}; its current key is invalid immediately.");
@@ -396,8 +407,11 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn spawn_if_configured(paths: DaemonPaths) -> Result<bool, String> {
-    server::spawn_if_configured(paths).await
+pub async fn spawn_if_configured(
+    paths: DaemonPaths,
+    desktop: std::sync::Arc<DesktopControlRuntime>,
+) -> Result<bool, String> {
+    server::spawn_if_configured(paths, desktop).await
 }
 
 fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), String> {

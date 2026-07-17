@@ -76,6 +76,18 @@ pub trait RemoteSecretStore: Send + Sync {
     fn delete(&self, slot: &str) -> Result<(), String>;
 }
 
+/// Seam that lets `revoke_device` immediately force-stop any live desktop
+/// control session owned by the revoked device, rather than merely blocking
+/// its future signed requests. Implemented by
+/// `super::desktop::DesktopControlRuntime`; `None` is passed from control
+/// planes that hold no live sessions (e.g. the one-shot `pair-revoke` CLI
+/// process). Kept as a trait — mirroring `desktop_control.rs`'s own
+/// `DesktopInputBackend` seam — so the revoke path is unit-testable without a
+/// real runtime. Returns how many sessions were force-stopped.
+pub trait DesktopSessionKiller: Send + Sync {
+    fn force_stop_device(&self, device_id: &str) -> usize;
+}
+
 pub struct KeyringRemoteSecrets;
 
 impl KeyringRemoteSecrets {
@@ -333,6 +345,7 @@ impl RemoteStore {
         reason: &str,
         now_ms: u64,
         secrets: &dyn RemoteSecretStore,
+        desktop: Option<&dyn DesktopSessionKiller>,
     ) -> Result<bool, String> {
         let Some(device) = self.device(device_id)? else {
             return Ok(false);
@@ -358,6 +371,23 @@ impl RemoteStore {
                 "allowed",
                 None,
             )?;
+            // Blocking future signed requests is not enough: a live desktop
+            // control session (especially an approved-batch one) must be
+            // force-stopped the instant its device is revoked, not left
+            // driving the cursor until it expires.
+            if let Some(killer) = desktop {
+                let stopped = killer.force_stop_device(device_id);
+                if stopped > 0 {
+                    self.audit(
+                        now_ms,
+                        Some(device_id),
+                        "desktop_control_force_stop",
+                        Some(device_id),
+                        "revoked",
+                        None,
+                    )?;
+                }
+            }
         }
         Ok(changed == 1)
     }
@@ -974,6 +1004,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[derive(Default)]
+    struct RecordingKiller(Mutex<Vec<String>>);
+    impl DesktopSessionKiller for RecordingKiller {
+        fn force_stop_device(&self, device_id: &str) -> usize {
+            self.0.lock().unwrap().push(device_id.to_string());
+            // Pretend one live session was force-stopped so the revoke path
+            // records its audit entry.
+            1
+        }
+    }
+
+    #[test]
+    fn revoke_force_stops_the_revoked_devices_desktop_sessions() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let invitation = store.create_invitation(&scopes, 1_000, 2_000).unwrap();
+        let accepted = store
+            .accept_invitation(
+                &invitation.pairing_id,
+                &invitation.token,
+                "phone",
+                "runner-one",
+                1_100,
+                &secrets,
+            )
+            .unwrap();
+        let killer = RecordingKiller::default();
+        assert!(store
+            .revoke_device(&accepted.device_id, "lost", 1_300, &secrets, Some(&killer))
+            .unwrap());
+        assert_eq!(
+            killer.0.lock().unwrap().as_slice(),
+            &[accepted.device_id.clone()],
+            "revoke must force-stop the revoked device's live sessions immediately"
+        );
+        // A second revoke is a no-op (already revoked) and must not re-fire the
+        // killer.
+        assert!(!store
+            .revoke_device(&accepted.device_id, "again", 1_400, &secrets, Some(&killer))
+            .unwrap());
+        assert_eq!(killer.0.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn revoke_and_rotation_stop_old_authority_immediately() {
         let (root, mut store, secrets, scopes) = fixture();
@@ -1014,7 +1087,7 @@ mod tests {
             )
             .is_err());
         assert!(store
-            .revoke_device(&accepted.device_id, "lost", 1_300, &secrets)
+            .revoke_device(&accepted.device_id, "lost", 1_300, &secrets, None)
             .unwrap());
         assert!(store
             .reserve_command(
