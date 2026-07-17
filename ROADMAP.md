@@ -978,15 +978,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Runtime updates can be installed, verified, rolled back, and tied to compatibility notes.
 
-### 6. Modelfile Studio and Import Hardening
-
-**Status:** Planned
-
-- Provide a UI for Modelfile editing, parsing, validation, dry-run creation, `requires`, parameters, templates, licenses, adapters, and short names.
-- Harden GGUF and safetensors import with clear errors and source metadata.
-
-**Acceptance:** User can preview and validate a custom model package before it enters the model library.
-
 ### 7. Model Conversion and Quantization Workbench
 
 **Status:** Planned

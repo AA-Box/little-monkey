@@ -54,6 +54,11 @@ pub mod m4_services;
 pub mod mcp_app_core;
 mod native_skill_commands;
 pub mod native_skills;
+// Tauri-free Modelfile parser/validator/format-sniffer backing "Modelfile
+// Studio" (Phase 8): real Ollama Modelfile grammar, short-name hardening,
+// and GGUF/safetensors header sanity checks, independent of `ollama.rs`'s
+// own `ollama create -f` invocation (which stays in `ollama.rs`, unchanged).
+pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
@@ -547,8 +552,12 @@ pub fn run() {
             ollama::ollama_example_cloud_tags,
             ollama::ollama_pull_model,
             ollama::ollama_import_model,
+            ollama::ollama_create_from_modelfile,
             ollama::ollama_remove_model,
             ollama::ollama_signin,
+            modelfile::modelfile_parse,
+            modelfile::modelfile_dry_run,
+            modelfile::modelfile_read_text_file,
             connectors::connectors_list,
             connectors::connectors_add_github,
             connectors::connectors_add_token,
