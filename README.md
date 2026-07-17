@@ -47,6 +47,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
 - Store private keys and provider credentials in the OS keychain; persisted configuration contains references rather than plaintext key material.
+- Generate ready-to-use local configuration for external agent tools/editors (Continue.dev, aider, or a generic OpenAI-SDK-compatible `.env`) from **Settings → Runtime Hub → Agents**, pointed at the app's real endpoint, a currently installed model, and a real paired token; check a previously generated or hand-edited config for a stale model, a moved endpoint, a missing auth header, an oversized context length, or a telemetry default worth revisiting.
 
 ### Skills, plugins, MCP Apps, and workflows
 
