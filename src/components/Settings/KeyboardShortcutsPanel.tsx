@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Monitor, Pencil, Plus, RotateCcw, Search, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Command, Monitor, Pencil, Plus, RotateCcw, Save, Search, Trash2 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
+import { DEFAULT_PALETTE_SHORTCUT, paletteClient } from "../../lib/paletteClient";
 import { usePermissionStore } from "../../store/permissionStore";
 import {
   defaultShortcutBindings,
@@ -44,6 +45,83 @@ function ShortcutKeys({ binding, platform }: { binding: ShortcutBinding; platfor
         </kbd>
       ))}
     </span>
+  );
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Editor for the Global Command Palette's OS-level shortcut
+ * (`src-tauri/src/command_palette.rs`) — separate from the recorder-based
+ * table below because it isn't one of this app's own in-window
+ * `shortcuts.ts` bindings: it's registered with the OS (works even while
+ * Little Monkey isn't the focused app), so its accelerator-string format
+ * ("CommandOrControl+Shift+K") and validation are entirely different.
+ * Mirrors `CompanionPanel.tsx`'s identical overlay-shortcut editor.
+ */
+function GlobalCommandPaletteShortcutCard() {
+  const { t } = useT();
+  const [shortcut, setShortcut] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const config = await paletteClient.config();
+    setShortcut(config.shortcut);
+    setDraft(config.shortcut);
+  }, []);
+
+  useEffect(() => {
+    void load().catch((reason) => setError(errorText(reason)));
+  }, [load]);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const config = await paletteClient.saveConfig({ schemaVersion: 1, shortcut: draft.trim() });
+      setShortcut(config.shortcut);
+      setDraft(config.shortcut);
+      setStatus(t("KeyboardShortcutsPanel.paletteShortcutSaved"));
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-border bg-surface-2 p-3">
+      <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+        <Command size={14} aria-hidden="true" />
+        {t("KeyboardShortcutsPanel.paletteShortcutTitle")}
+      </div>
+      <p className="mt-1 text-xs text-muted">{t("KeyboardShortcutsPanel.paletteShortcutDescription")}</p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <input
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          placeholder={DEFAULT_PALETTE_SHORTCUT}
+          className="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-1.5 font-mono text-xs text-foreground outline-none focus:ring-1 focus:ring-accent"
+        />
+        <Button
+          type="button"
+          size="sm"
+          disabled={busy || !draft.trim() || draft.trim() === shortcut}
+          onClick={() => void save()}
+        >
+          <Save size={13} aria-hidden="true" />
+          {t("KeyboardShortcutsPanel.paletteShortcutSaveButton")}
+        </Button>
+      </div>
+      {status && <p className="mt-1.5 text-xs text-success">{status}</p>}
+      {error && <p className="mt-1.5 text-xs text-danger">{error}</p>}
+    </div>
   );
 }
 
@@ -389,6 +467,8 @@ export function KeyboardShortcutsPanel() {
           </div>
         </div>
       )}
+
+      <GlobalCommandPaletteShortcutCard />
 
       <div className="relative">
         <Search

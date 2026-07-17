@@ -70,6 +70,19 @@ export const SHORTCUTS = [
     bindings: [{ key: "e", code: "KeyE", primary: true, shift: true }],
   },
   {
+    id: "openCommandPalette",
+    scope: "global",
+    labelKey: "CommandPalette.title",
+    descriptionKey: "KeyboardShortcutsPanel.openCommandPaletteDescription",
+    // Matches the OS-level global shortcut's own default
+    // (`command_palette::DEFAULT_SHORTCUT`, "CommandOrControl+Shift+K") so
+    // the in-window and "from anywhere" chords are the same muscle memory —
+    // this in-window binding only fires while the app window has focus; the
+    // OS-level one (registered in Rust, see `src-tauri/src/lib.rs::run`)
+    // works even when it doesn't.
+    bindings: [{ key: "k", code: "KeyK", primary: true, shift: true }],
+  },
+  {
     id: "sendMessage",
     scope: "composer",
     labelKey: "KeyboardShortcutsPanel.sendMessage",
