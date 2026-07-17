@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
   "EcosystemDiscover.cancel": "रद्द करें",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Hindi translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "ब्रीफ़ स्टूडियो",
+  "BriefStudio.title": "स्रोत-आधारित ब्रीफ़ स्टूडियो",
+  "BriefStudio.subtitle": "किसी दस्तावेज़, चैट या नॉलेज स्टैक को उद्धरण-सहित एक्ज़ीक्यूटिव ब्रीफ़, स्लाइड आउटलाइन, क्विज़, फ़्लैशकार्ड या स्टडी गाइड में बदलें।",
+  "BriefStudio.close": "ब्रीफ़ स्टूडियो बंद करें",
+  "BriefStudio.sourceHeading": "स्रोत सामग्री",
+  "BriefStudio.sourceKind.pasted": "पेस्ट किया गया दस्तावेज़",
+  "BriefStudio.sourceKind.session": "चैट सत्र",
+  "BriefStudio.sourceKind.knowledge_stack": "नॉलेज स्टैक",
+  "BriefStudio.pastedLabelLabel": "दस्तावेज़ शीर्षक",
+  "BriefStudio.pastedLabelPlaceholder": "जैसे, Q3 योजना नोट्स",
+  "BriefStudio.pastedTextLabel": "स्रोत टेक्स्ट पेस्ट करें",
+  "BriefStudio.pastedTextPlaceholder": "जिस दस्तावेज़, नोट्स या ट्रांसक्रिप्ट से जनरेट करना है उसे पेस्ट करें…",
+  "BriefStudio.sessionLabel": "चैट सत्र",
+  "BriefStudio.sessionPlaceholder": "एक सत्र चुनें…",
+  "BriefStudio.noSessionsNote": "अभी तक कोई चैट सत्र नहीं है।",
+  "BriefStudio.stackLabel": "नॉलेज स्टैक",
+  "BriefStudio.stackPlaceholder": "एक स्टैक चुनें…",
+  "BriefStudio.noStacksNote": "अभी तक कोई नॉलेज स्टैक नहीं है — सेटिंग्स में एक बनाएँ, फिर उसे इंडेक्स करें।",
+  "BriefStudio.focusQueryLabel": "फ़ोकस विषय",
+  "BriefStudio.focusQueryPlaceholder": "ब्रीफ़ का फ़ोकस किस पर होना चाहिए?",
+  "BriefStudio.localOnlyLabel": "पूरी तरह लोकल चलाएँ",
+  "BriefStudio.localOnlyHint": "यदि सक्रिय मॉडल क्लाउड प्रोवाइडर है तो जनरेट करने से मना कर देता है — कुछ भी इस मशीन से बाहर नहीं जाता।",
+  "BriefStudio.assetHeading": "एसेट प्रकार",
+  "BriefStudio.asset.brief": "एक्ज़ीक्यूटिव ब्रीफ़",
+  "BriefStudio.asset.slide_outline": "स्लाइड आउटलाइन",
+  "BriefStudio.asset.quiz": "क्विज़",
+  "BriefStudio.asset.flashcards": "फ़्लैशकार्ड",
+  "BriefStudio.asset.study_guide": "स्टडी गाइड",
+  "BriefStudio.asset.audio_overview": "ऑडियो ओवरव्यू",
+  "BriefStudio.asset.video_outline": "वीडियो आउटलाइन",
+  "BriefStudio.unsupportedNote": "ऑडियो ओवरव्यू और वीडियो आउटलाइन अभी जनरेट नहीं होते — इस ऐप में लोकल टेक्स्ट-टू-स्पीच या वीडियो पाइपलाइन नहीं है। इसे भविष्य के काम के रूप में दर्ज किया गया है, यहाँ नक़ली नहीं बनाया गया।",
+  "BriefStudio.generateButton": "जनरेट करें",
+  "BriefStudio.generatingLabel": "जनरेट हो रहा है…",
+  "BriefStudio.emptyState": "एक स्रोत और एसेट प्रकार चुनें, फिर परिणाम यहाँ देखने के लिए जनरेट करें।",
+  "BriefStudio.errorHeading": "जनरेट नहीं हो सका",
+  "BriefStudio.groundedIn": "{{label}} पर आधारित",
+  "BriefStudio.generatedAt": "{{time}} को जनरेट किया गया",
+  "BriefStudio.ranLocallyBadge": "पूरी तरह लोकल चला",
+  "BriefStudio.ranCloudBadge": "क्लाउड प्रोवाइडर के ज़रिए चला",
+  "BriefStudio.citationsHeading": "उद्धरण",
+  "BriefStudio.citationsEmpty": "मॉडल ने कोई स्रोत अंश उद्धृत नहीं किया।",
+  "BriefStudio.citationVerified": "सत्यापित",
+  "BriefStudio.citationUnverified": "असत्यापित — स्रोत में शब्दशः नहीं मिला",
+  "BriefStudio.unverifiedWarning": "{{count}} उद्धरण स्रोत टेक्स्ट के विरुद्ध सत्यापित नहीं हो सके — भरोसा करने से पहले इनकी समीक्षा करें।",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Hindi
   // translations, overriding the searchLocale keys above.
   "GlobalSearch.source.session": "चैट",

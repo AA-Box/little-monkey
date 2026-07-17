@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -1458,6 +1459,52 @@ export const ko: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "이 레지스트리 소스를 제거하시겠습니까?",
   "EcosystemDiscover.removeRegistry": "제거",
   "EcosystemDiscover.cancel": "취소",
+  ...briefStudioLocale,
+  // Source-Grounded Brief Studio (ROADMAP.md Phase 7, item 7) — real Korean translations overriding the English `briefStudioLocale` defaults spread above.
+  "AppMenu.briefStudio": "브리프 스튜디오",
+  "BriefStudio.title": "출처 기반 브리프 스튜디오",
+  "BriefStudio.subtitle": "문서, 채팅, 지식 스택을 출처가 표시된 경영진 브리프, 슬라이드 개요, 퀴즈, 플래시카드, 학습 가이드로 변환하세요.",
+  "BriefStudio.close": "브리프 스튜디오 닫기",
+  "BriefStudio.sourceHeading": "소스 자료",
+  "BriefStudio.sourceKind.pasted": "붙여넣은 문서",
+  "BriefStudio.sourceKind.session": "채팅 세션",
+  "BriefStudio.sourceKind.knowledge_stack": "지식 스택",
+  "BriefStudio.pastedLabelLabel": "문서 제목",
+  "BriefStudio.pastedLabelPlaceholder": "예: 3분기 계획 메모",
+  "BriefStudio.pastedTextLabel": "소스 텍스트 붙여넣기",
+  "BriefStudio.pastedTextPlaceholder": "생성할 문서, 메모 또는 대화 기록을 붙여넣으세요…",
+  "BriefStudio.sessionLabel": "채팅 세션",
+  "BriefStudio.sessionPlaceholder": "세션 선택…",
+  "BriefStudio.noSessionsNote": "아직 채팅 세션이 없습니다.",
+  "BriefStudio.stackLabel": "지식 스택",
+  "BriefStudio.stackPlaceholder": "스택 선택…",
+  "BriefStudio.noStacksNote": "아직 지식 스택이 없습니다 — 설정에서 하나를 만들고 색인하세요.",
+  "BriefStudio.focusQueryLabel": "초점 주제",
+  "BriefStudio.focusQueryPlaceholder": "브리프가 무엇에 초점을 맞춰야 하나요?",
+  "BriefStudio.localOnlyLabel": "완전히 로컬에서 실행",
+  "BriefStudio.localOnlyHint": "활성 모델이 클라우드 제공업체인 경우 생성을 거부합니다 — 아무것도 이 기기를 벗어나지 않습니다.",
+  "BriefStudio.assetHeading": "자산 유형",
+  "BriefStudio.asset.brief": "경영진 브리프",
+  "BriefStudio.asset.slide_outline": "슬라이드 개요",
+  "BriefStudio.asset.quiz": "퀴즈",
+  "BriefStudio.asset.flashcards": "플래시카드",
+  "BriefStudio.asset.study_guide": "학습 가이드",
+  "BriefStudio.asset.audio_overview": "오디오 개요",
+  "BriefStudio.asset.video_outline": "비디오 개요",
+  "BriefStudio.unsupportedNote": "오디오 개요와 비디오 개요는 아직 생성되지 않습니다 — 이 앱에는 로컬 텍스트 음성 변환이나 비디오 파이프라인이 없습니다. 후속 작업으로 기록되었으며, 여기서 가짜로 만들지 않습니다.",
+  "BriefStudio.generateButton": "생성",
+  "BriefStudio.generatingLabel": "생성 중…",
+  "BriefStudio.emptyState": "소스와 자산 유형을 선택한 다음 생성하면 결과가 여기에 표시됩니다.",
+  "BriefStudio.errorHeading": "생성하지 못했습니다",
+  "BriefStudio.groundedIn": "{{label}} 기반",
+  "BriefStudio.generatedAt": "{{time}}에 생성됨",
+  "BriefStudio.ranLocallyBadge": "완전히 로컬에서 실행됨",
+  "BriefStudio.ranCloudBadge": "클라우드 제공업체를 통해 실행됨",
+  "BriefStudio.citationsHeading": "인용",
+  "BriefStudio.citationsEmpty": "모델이 어떤 소스 구절도 인용하지 않았습니다.",
+  "BriefStudio.citationVerified": "검증됨",
+  "BriefStudio.citationUnverified": "검증되지 않음 — 소스에서 그대로 찾을 수 없음",
+  "BriefStudio.unverifiedWarning": "{{count}}개의 인용을 소스 텍스트와 대조하여 검증할 수 없었습니다 — 신뢰하기 전에 검토하세요.",
   // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Korean
   // translations, overriding the searchLocale keys above.
   "GlobalSearch.source.session": "채팅",

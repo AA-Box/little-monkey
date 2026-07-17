@@ -20,6 +20,7 @@ import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
@@ -46,6 +47,7 @@ export const en: Record<string, string> = {
   ...knowledgeGraphExplorerLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
+  ...briefStudioLocale,
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   "ComparePicker.toolsBadge": "Tools",
