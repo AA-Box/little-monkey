@@ -37,6 +37,36 @@ pub enum TerminalStatus {
     Error,
 }
 
+/// Local OS identity shown in the prompt line (`user@host`). Never carries
+/// workspace or secret data — purely cosmetic, read once per app launch.
+#[derive(Clone, Debug, Serialize)]
+pub struct TerminalIdentity {
+    pub user: String,
+    pub host: String,
+}
+
+#[tauri::command]
+pub fn terminal_identity() -> TerminalIdentity {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    let host = std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+    TerminalIdentity { user, host }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TerminalSessionView {
     pub id: String,
@@ -768,6 +798,13 @@ mod tests {
                 label: "terminal-test".to_string(),
             });
         state
+    }
+
+    #[test]
+    fn terminal_identity_never_returns_empty_fields() {
+        let identity = terminal_identity();
+        assert!(!identity.user.is_empty());
+        assert!(!identity.host.is_empty());
     }
 
     #[test]
