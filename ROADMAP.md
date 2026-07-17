@@ -942,15 +942,6 @@ These are deliberately separate from the earlier phases: they are the next 30 ga
 
 This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 2026: 4,931 closed PRs fetched through the GitHub API, with 3,430 merged PRs used as the main signal. The goal is not to clone Ollama, but to learn from the runtime, model, GPU, registry, API, and diagnostics work that made Ollama dependable.
 
-### 1. Hardware Compatibility Matrix and Driver Doctor
-
-**Status:** Planned
-
-- Detect CUDA, ROCm, Vulkan, Metal, MLX, iGPU/dGPU, hybrid graphics, Jetson, driver versions, compute capability, and unsupported runtime combinations.
-- Explain what will work, what will fall back to CPU, and what needs a driver/runtime update.
-
-**Acceptance:** User sees a concrete compatibility report before model download, model load, or runtime install.
-
 ### 3. Multi-GPU and Heterogeneous Runtime Orchestration
 
 **Status:** Research
@@ -968,15 +959,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Provide stable, beta, and pinned channels with rollback.
 
 **Acceptance:** Runtime updates can be installed, verified, rolled back, and tied to compatibility notes.
-
-### 5. Model Manifest, Blob, and Digest Store
-
-**Status:** Planned
-
-- Add content-addressed model storage with manifests, blobs, layer reuse, digest checks, resumable transfers, and garbage collection.
-- Track source registry, license, quant, template, projector, and provenance.
-
-**Acceptance:** Model files are deduplicated, verifiable, resumable, and safely pruned.
 
 ### 6. Modelfile Studio and Import Hardening
 

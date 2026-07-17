@@ -39,6 +39,8 @@ The current working tree includes the shipped foundations described below. Some 
 ### Runtime and API Hub
 
 - Inspect CPU/memory and runtime inventory, estimate model fit, search configured catalogs, resume verified downloads, activate/roll back model versions, prune old versions, clean owned orphan data, and load/unload supported runtimes.
+- Show a Hardware Compatibility Matrix ("Driver Doctor") before any model download, model load, or runtime install: real detection of Metal, CUDA, ROCm, Vulkan, and (best-effort) DirectML, plus driver version, compute capability, Jetson, and hybrid/multi-GPU detection, with an honest `available`/`not_detected`/`driver_too_old`/`tool_missing`/`unsupported` status per backend that never fails just because a GPU tool or device is absent.
+- Track each installed model's source registry, license, quantization, chat template, and multimodal projector in a content-addressed, digest-verified manifest; reuse an already-verified payload across asset variants/versions instead of re-downloading identical bytes, and never trust a corrupt local copy for reuse.
 - Manage Ollama, `llama.cpp`, and MLX through one runtime contract with capability preflight, owned-process shutdown, logs, metrics, cancellation, and resource-aware scheduling.
 - Before a model loads, simulate a per-load offload plan from the live hardware snapshot: recommended context size, batch size, GPU layers offloaded vs. CPU spill, projector placement, and parallelism, each with a plain-language rationale and concrete suggestions for raising the budget.
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.

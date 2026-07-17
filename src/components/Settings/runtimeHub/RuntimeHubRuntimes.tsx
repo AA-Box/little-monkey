@@ -16,6 +16,7 @@ import type {
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
 import {
   BusyButton,
+  CompatibilityWarningBanner,
   CONTROL_CLASS,
   ErrorNotice,
   Field,
@@ -267,6 +268,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const previewOffloadPlan = useRuntimeHubStore((state) => state.previewOffloadPlan);
   const offloadBusy = busy[`offload-plan:${runtimeId}`];
   const offloadError = errors[`offload-plan:${runtimeId}`];
+  const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
 
   const compatibleModels = installedModels.filter((model) => model.runtime === runtime.descriptor.kind);
   const [assetId, setAssetId] = useState(compatibleModels[0]?.assetId ?? "");
@@ -359,6 +361,9 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
       {runtime.canLoad && (
         <section className="mt-5 border-t border-border pt-4" aria-label={`Load a model in ${runtime.descriptor.label}`}>
           <SectionHeading title="Load model" description="Only verified models compatible with this runtime are listed." />
+          <div className="mt-3">
+            <CompatibilityWarningBanner report={compatibilityReport} />
+          </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Field label="Installed model">
               <select value={assetId} onChange={(event) => setAssetId(event.target.value)} className={CONTROL_CLASS} disabled={!compatibleModels.length}>

@@ -19,8 +19,8 @@ use crate::mlx_runtime::{
     MlxRuntimeAdapter, MlxRuntimeStatus, MlxStreamEvent, MlxStreamSink, MlxToolDefinition,
 };
 use crate::runtime_adapter::{
-    validate_setting_values, AdvancedSettingCapability, HardwareProfile, HardwareSnapshot,
-    KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
+    validate_setting_values, AcceleratorKind, AdvancedSettingCapability, HardwareProfile,
+    HardwareSnapshot, KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
     RuntimeCapabilities, RuntimeInventory, RuntimeLogRequest, RuntimeLogTail,
     RuntimeOperationContext, RuntimeOperationLimits, RuntimeStatus, SettingValue, UnloadPolicy,
 };
@@ -350,6 +350,18 @@ pub struct M3ModelCapabilities {
     pub structured_output: bool,
 }
 
+/// A minimal reference to a multimodal projector asset associated with a
+/// model (e.g. a CLIP/SigLIP vision tower or an audio encoder). This only
+/// tracks provenance/identity for the manifest; the projector/vision model
+/// manager itself (download, placement, sizing) is separate Phase 8 scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3ProjectorRef {
+    pub kind: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct M3CatalogModel {
@@ -372,6 +384,19 @@ pub struct M3CatalogModel {
     pub capabilities: M3ModelCapabilities,
     pub license: M3ModelLicense,
     pub metadata: BTreeMap<String, String>,
+    /// Chat template family/name identifying how this model expects prompts
+    /// to be rendered (e.g. "chatml", "llama-3"). Absent for older manifests
+    /// and for models whose runtime handles templating internally.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// The multimodal projector associated with this model, if any.
+    #[serde(default)]
+    pub projector: Option<M3ProjectorRef>,
+    /// When this catalog entry was locally retrieved from its source,
+    /// stamped by the hub at search time (never trusted from the remote
+    /// payload). Absent for manifests installed before this field existed.
+    #[serde(default)]
+    pub catalog_retrieved_at_ms: Option<u64>,
 }
 
 impl M3CatalogModel {
@@ -453,6 +478,22 @@ impl M3CatalogModel {
             validate_identifier(key, "catalog.metadata.key")?;
             validate_text(value, "catalog.metadata.value", 64 * 1024)?;
         }
+        if let Some(template) = &self.template {
+            validate_identifier(template, "catalog.template")?;
+        }
+        if let Some(projector) = &self.projector {
+            validate_identifier(&projector.kind, "catalog.projector.kind")?;
+            validate_sha256(&projector.sha256, "catalog.projector.sha256")?;
+            if projector.size_bytes == 0 || projector.size_bytes > MAX_DOWNLOAD_BYTES {
+                return Err(invalid(
+                    "catalog.projector.sizeBytes",
+                    format!("must be between 1 and {MAX_DOWNLOAD_BYTES}"),
+                ));
+            }
+        }
+        if let Some(retrieved_at_ms) = self.catalog_retrieved_at_ms {
+            validate_timestamp(retrieved_at_ms, "catalog.catalogRetrievedAtMs")?;
+        }
         Ok(())
     }
 }
@@ -484,8 +525,159 @@ pub struct M3CatalogMatch {
     pub fit: M3HardwareFit,
 }
 
+/// Hardware Compatibility Matrix / "Driver Doctor" status for a single
+/// accelerator backend. Every backend is queried defensively: a missing tool,
+/// an absent device, or an unsupported OS/arch combination is a normal,
+/// expected outcome and must never surface as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3AcceleratorStatus {
+    /// The backend was queried directly and at least one usable device was
+    /// found.
+    Available,
+    /// The backend's tooling ran successfully but reported no device.
+    NotDetected,
+    /// A device was found, but its driver/compute capability is below the
+    /// minimum this app requires for that backend.
+    DriverTooOld,
+    /// The backend's detection tool (e.g. `nvidia-smi`, `rocm-smi`,
+    /// `vulkaninfo`) is not installed or not on `PATH`, so the backend could
+    /// not be queried at all.
+    ToolMissing,
+    /// The backend cannot run on this OS/architecture combination.
+    Unsupported,
+}
+
+/// One row of the hardware compatibility report: a single accelerator
+/// backend, what was found, and a human-readable explanation a user can act
+/// on (install a driver, update a runtime, or expect a CPU fallback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3AcceleratorCompatibility {
+    pub kind: AcceleratorKind,
+    pub status: M3AcceleratorStatus,
+    /// Short, human-readable explanation of the status (what works, what
+    /// falls back to CPU, or what needs a driver/runtime update).
+    pub summary: String,
+    pub device_names: Vec<String>,
+    pub driver_version: Option<String>,
+    pub compute_capability: Option<String>,
+    /// False when this status was inferred or assumed rather than obtained
+    /// from a direct hardware/driver query, so `status: Available` should be
+    /// read as "likely" rather than confirmed. Used for Windows DirectML
+    /// (only a display adapter's presence is confirmed, not the DirectML
+    /// runtime path itself) and for the Metal OS/arch fallback used when
+    /// `system_profiler` is unavailable.
+    pub confirmed: bool,
+}
+
+/// NVIDIA Jetson (Tegra) detection result. Jetson devices share CUDA
+/// tooling with desktop NVIDIA GPUs but have their own driver/runtime
+/// implications, so they are reported separately from the CUDA row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3JetsonInfo {
+    pub detected: bool,
+    pub model: Option<String>,
+}
+
+/// Full hardware compatibility report shown to the user before a model
+/// download, model load, or runtime install: for every accelerator backend,
+/// what will work, what falls back to CPU, and what needs a driver/runtime
+/// update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3HardwareCompatibilityReport {
+    pub captured_at_ms: u64,
+    pub os: String,
+    pub arch: String,
+    pub accelerators: Vec<M3AcceleratorCompatibility>,
+    pub jetson: M3JetsonInfo,
+    /// True when more than one GPU-capable backend/device was detected
+    /// (e.g. an integrated and a discrete adapter, or two backends both
+    /// reporting `Available`) so the UI never silently picks one.
+    pub hybrid_graphics_detected: bool,
+    /// Free-form notes: unsupported runtime combinations, mixed-vendor GPU
+    /// warnings, and other callouts that do not fit a single backend row.
+    pub notes: Vec<String>,
+}
+
+/// Derives a best-effort compatibility report purely from a [`HardwareSnapshot`]'s
+/// accelerator list. This is the default used by any [`M3HardwareProbe`] that
+/// does not override [`M3HardwareProbe::compatibility_report`]; production
+/// probes override it to add driver versions, compute capability, Jetson
+/// detection, and the `ToolMissing`/`DriverTooOld` distinctions a plain
+/// accelerator list cannot express.
+pub fn compatibility_report_from_snapshot(
+    snapshot: &HardwareSnapshot,
+) -> M3HardwareCompatibilityReport {
+    let backends = [
+        AcceleratorKind::Metal,
+        AcceleratorKind::Cuda,
+        AcceleratorKind::Rocm,
+        AcceleratorKind::Vulkan,
+        AcceleratorKind::DirectMl,
+    ];
+    let mut accelerators = Vec::with_capacity(backends.len());
+    for kind in backends {
+        let found = snapshot
+            .platform
+            .accelerators
+            .iter()
+            .find(|capability| capability.kind == kind);
+        let (status, summary, device_names) = match found {
+            Some(capability) if capability.available => (
+                M3AcceleratorStatus::Available,
+                format!("{kind:?} reported available by the hardware snapshot."),
+                capability.device_names.clone(),
+            ),
+            _ => (
+                M3AcceleratorStatus::NotDetected,
+                format!("{kind:?} was not detected on this platform; falls back to CPU."),
+                Vec::new(),
+            ),
+        };
+        accelerators.push(M3AcceleratorCompatibility {
+            kind,
+            status,
+            summary,
+            device_names,
+            driver_version: None,
+            compute_capability: None,
+            confirmed: true,
+        });
+    }
+    let available_backends = accelerators
+        .iter()
+        .filter(|entry| entry.status == M3AcceleratorStatus::Available)
+        .count();
+    M3HardwareCompatibilityReport {
+        captured_at_ms: snapshot.captured_at_ms,
+        os: snapshot.platform.os.clone(),
+        arch: snapshot.platform.arch.clone(),
+        accelerators,
+        jetson: M3JetsonInfo {
+            detected: false,
+            model: None,
+        },
+        hybrid_graphics_detected: available_backends > 1,
+        notes: Vec::new(),
+    }
+}
+
 pub trait M3HardwareProbe: Send + Sync {
     fn snapshot(&self) -> M3HubResult<HardwareSnapshot>;
+
+    /// Hardware Compatibility Matrix / "Driver Doctor" report shown to the
+    /// user before a model download, model load, or runtime install. The
+    /// default implementation derives a coarse report from [`Self::snapshot`];
+    /// production probes should override this to add real driver-version and
+    /// compute-capability detection. Implementations must never panic or
+    /// return an error merely because a GPU tool/driver is absent — that is
+    /// the normal `NotDetected`/`ToolMissing` case.
+    fn compatibility_report(&self) -> M3HubResult<M3HardwareCompatibilityReport> {
+        Ok(compatibility_report_from_snapshot(&self.snapshot()?))
+    }
 }
 
 pub trait M3CatalogSource: Send + Sync {
@@ -834,6 +1026,15 @@ pub struct M3InstalledVersionView {
     pub installed_at_ms: u64,
     pub active: bool,
     pub license: M3ModelLicense,
+    /// Which configured catalog source this version originated from.
+    pub source_id: String,
+    /// Chat template family/name declared by the catalog entry, if any.
+    pub template: Option<String>,
+    /// The multimodal projector associated with this version, if any.
+    pub projector: Option<M3ProjectorRef>,
+    /// When the catalog entry for this version was locally retrieved, if the
+    /// installing manifest recorded it.
+    pub catalog_retrieved_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1760,6 +1961,13 @@ impl M3RuntimeHub {
         self.hardware_snapshot()?.profile().map_err(runtime_error)
     }
 
+    /// Hardware Compatibility Matrix / "Driver Doctor" report. Must be safe
+    /// to call before any model download, model load, or runtime install so
+    /// the UI can show a concrete compatibility report first.
+    pub fn hardware_compatibility_report(&self) -> M3HubResult<M3HardwareCompatibilityReport> {
+        self.hardware.compatibility_report()
+    }
+
     pub fn storage_status(&self) -> M3HubResult<M3StorageStatus> {
         let model_bytes = directory_size(&self.models_root)?;
         let pending_download_bytes = directory_size(&self.downloads_root)?;
@@ -1901,7 +2109,7 @@ impl M3RuntimeHub {
                     "source returned more entries than requested",
                 ));
             }
-            for entry in entries {
+            for mut entry in entries {
                 entry.validate()?;
                 if entry.source_id != source.source_id() {
                     return Err(invalid(
@@ -1914,6 +2122,9 @@ impl M3RuntimeHub {
                     entry.source_id, entry.model_id, entry.variant_id, entry.revision
                 );
                 if dedupe.insert(key) {
+                    // Provenance is stamped locally at retrieval time; a
+                    // remote source's own claim about this is never trusted.
+                    entry.catalog_retrieved_at_ms = Some(self.clock.now_ms()?);
                     matches.push(M3CatalogMatch {
                         fit: evaluate_hardware_fit(&entry, &hardware)?,
                         model: entry,
@@ -1975,87 +2186,120 @@ impl M3RuntimeHub {
             }
         }
 
-        let probe = run_bounded(
-            context,
-            "probe model download",
-            self.download.probe(&request.model.download_url, context),
-        )
-        .await?;
-        if probe.total_bytes != request.model.size_bytes {
-            return Err(invalid(
-                "download.contentLength",
-                format!(
-                    "catalog declares {} bytes but server declares {}",
-                    request.model.size_bytes, probe.total_bytes
-                ),
-            ));
-        }
         let partial_path = self
             .downloads_root
             .join(format!("{asset_key}{DOWNLOAD_SUFFIX}"));
         let resume_path = self
             .downloads_root
             .join(format!("{asset_key}{RESUME_SUFFIX}"));
-        let expected_resume = M3ResumeState {
-            schema_version: M3_HUB_SCHEMA_VERSION,
-            asset_key: asset_key.clone(),
-            version_key: version_key.clone(),
-            url: request.model.download_url.clone(),
-            expected_sha256: request.model.sha256.clone(),
-            total_bytes: request.model.size_bytes,
-            etag: probe.etag.clone(),
-        };
-        prepare_resume_files(&partial_path, &resume_path, &expected_resume, &probe)?;
-        atomic_write_private(&resume_path, &canonical_json(&expected_resume)?)?;
-        let mut offset = regular_file_len_or_zero(&partial_path)?;
-        if offset > 0 && !probe.accepts_ranges {
-            remove_owned_file(&partial_path)?;
-            offset = 0;
-        }
-        let remaining = request.model.size_bytes.saturating_sub(offset);
-        let available = self.storage_status()?.available_for_models_bytes;
-        if remaining > available {
-            return Err(M3HubError::Storage {
-                required: remaining,
-                available,
-            });
-        }
 
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut partial = options
-            .open(&partial_path)
-            .map_err(|source| io_at("open partial model", &partial_path, source))?;
-        while offset < request.model.size_bytes {
-            context.preflight("download model")?;
-            let requested = usize::try_from(
-                (request.model.size_bytes - offset).min(self.config.download_chunk_bytes as u64),
-            )
-            .map_err(|_| invalid("download.range", "size conversion overflow"))?;
-            let chunk = run_bounded(
+        // Layer reuse: if a byte-identical, independently re-verified payload
+        // is already installed under a different asset/version, materialize
+        // it locally without a network transfer instead of re-downloading
+        // content we already have. A mismatched or corrupt candidate is
+        // never trusted here (see `find_reusable_payload`), so this always
+        // falls back to a real download when reuse cannot be proven safe.
+        let reusable_payload = {
+            let _guard = lock(&self.state_lock)?;
+            let state = load_hub_state(&self.state_root, &self.models_root)?;
+            find_reusable_payload(
+                &state,
+                &self.models_root,
+                &request.model.sha256,
+                request.model.size_bytes,
+            )?
+        };
+
+        if let Some(existing_payload) = reusable_payload {
+            context.preflight("reuse verified model payload")?;
+            let available = self.storage_status()?.available_for_models_bytes;
+            if request.model.size_bytes > available {
+                return Err(M3HubError::Storage {
+                    required: request.model.size_bytes,
+                    available,
+                });
+            }
+            remove_owned_file(&partial_path)?;
+            remove_owned_file(&resume_path)?;
+            link_or_copy_owned(&existing_payload, &partial_path)?;
+        } else {
+            let probe = run_bounded(
                 context,
-                "download model range",
-                self.download.read_range(
-                    &request.model.download_url,
-                    offset,
-                    requested,
-                    probe.etag.as_deref(),
-                    context,
-                ),
+                "probe model download",
+                self.download.probe(&request.model.download_url, context),
             )
             .await?;
-            validate_download_chunk(&chunk, &probe, offset, requested)?;
-            partial
-                .write_all(&chunk.bytes)
-                .and_then(|_| partial.sync_data())
-                .map_err(|source| io_at("append partial model", &partial_path, source))?;
-            offset = offset
-                .checked_add(chunk.bytes.len() as u64)
-                .ok_or_else(|| invalid("download.offset", "overflow"))?;
+            if probe.total_bytes != request.model.size_bytes {
+                return Err(invalid(
+                    "download.contentLength",
+                    format!(
+                        "catalog declares {} bytes but server declares {}",
+                        request.model.size_bytes, probe.total_bytes
+                    ),
+                ));
+            }
+            let expected_resume = M3ResumeState {
+                schema_version: M3_HUB_SCHEMA_VERSION,
+                asset_key: asset_key.clone(),
+                version_key: version_key.clone(),
+                url: request.model.download_url.clone(),
+                expected_sha256: request.model.sha256.clone(),
+                total_bytes: request.model.size_bytes,
+                etag: probe.etag.clone(),
+            };
+            prepare_resume_files(&partial_path, &resume_path, &expected_resume, &probe)?;
+            atomic_write_private(&resume_path, &canonical_json(&expected_resume)?)?;
+            let mut offset = regular_file_len_or_zero(&partial_path)?;
+            if offset > 0 && !probe.accepts_ranges {
+                remove_owned_file(&partial_path)?;
+                offset = 0;
+            }
+            let remaining = request.model.size_bytes.saturating_sub(offset);
+            let available = self.storage_status()?.available_for_models_bytes;
+            if remaining > available {
+                return Err(M3HubError::Storage {
+                    required: remaining,
+                    available,
+                });
+            }
+
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut partial = options
+                .open(&partial_path)
+                .map_err(|source| io_at("open partial model", &partial_path, source))?;
+            while offset < request.model.size_bytes {
+                context.preflight("download model")?;
+                let requested = usize::try_from(
+                    (request.model.size_bytes - offset)
+                        .min(self.config.download_chunk_bytes as u64),
+                )
+                .map_err(|_| invalid("download.range", "size conversion overflow"))?;
+                let chunk = run_bounded(
+                    context,
+                    "download model range",
+                    self.download.read_range(
+                        &request.model.download_url,
+                        offset,
+                        requested,
+                        probe.etag.as_deref(),
+                        context,
+                    ),
+                )
+                .await?;
+                validate_download_chunk(&chunk, &probe, offset, requested)?;
+                partial
+                    .write_all(&chunk.bytes)
+                    .and_then(|_| partial.sync_data())
+                    .map_err(|source| io_at("append partial model", &partial_path, source))?;
+                offset = offset
+                    .checked_add(chunk.bytes.len() as u64)
+                    .ok_or_else(|| invalid("download.offset", "overflow"))?;
+            }
+            drop(partial);
         }
-        drop(partial);
         let actual_digest = sha256_file(&partial_path, request.model.size_bytes)?;
         if !constant_time_eq(actual_digest.as_bytes(), request.model.sha256.as_bytes()) {
             remove_owned_file(&partial_path)?;
@@ -3340,6 +3584,10 @@ fn stored_model_view(
                 installed_at_ms: version.installed_at_ms,
                 active: version.version_key == stored.active_version_key,
                 license: version.model.license.clone(),
+                source_id: version.model.source_id.clone(),
+                template: version.model.template.clone(),
+                projector: version.model.projector.clone(),
+                catalog_retrieved_at_ms: version.model.catalog_retrieved_at_ms,
             })
         })
         .collect::<M3HubResult<Vec<_>>>()?;
@@ -3874,6 +4122,50 @@ fn validate_download_chunk(
         }
     }
     Ok(())
+}
+
+/// Finds an already-installed payload (under any asset or version) whose
+/// digest and size match the requested download, re-hashing the on-disk
+/// candidate before trusting it. A candidate whose bytes no longer match its
+/// own manifest (e.g. bit rot) is silently skipped rather than reused, so a
+/// corrupt local copy can never poison a new install; the caller falls back
+/// to a real network download in that case.
+fn find_reusable_payload(
+    state: &M3HubState,
+    models_root: &Path,
+    sha256: &str,
+    size_bytes: u64,
+) -> M3HubResult<Option<PathBuf>> {
+    for stored in &state.models {
+        for version in &stored.versions {
+            if version.model.sha256 != sha256 || version.model.size_bytes != size_bytes {
+                continue;
+            }
+            let candidate = models_root.join(&version.artifact_relative_path);
+            let Ok(true) = inspect_optional_regular(&candidate) else {
+                continue;
+            };
+            match sha256_file(&candidate, size_bytes) {
+                Ok(digest) if constant_time_eq(digest.as_bytes(), sha256.as_bytes()) => {
+                    return Ok(Some(candidate));
+                }
+                _ => continue,
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Places verified bytes at `destination` by hard-linking `source` when
+/// possible (sharing disk space with the existing copy) and falling back to
+/// a full copy if linking is unavailable (e.g. across filesystems).
+fn link_or_copy_owned(source: &Path, destination: &Path) -> M3HubResult<()> {
+    if fs::hard_link(source, destination).is_ok() {
+        return Ok(());
+    }
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| io_at("reuse verified model payload", destination, error))
 }
 
 fn verify_stored_model(stored: &M3StoredModel, models_root: &Path) -> M3HubResult<()> {
