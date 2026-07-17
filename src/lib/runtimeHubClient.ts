@@ -251,6 +251,46 @@ export interface M3SchedulingPlan {
   preserved_residency: M3SchedulingInput["residents"];
 }
 
+export interface OffloadModelProfile {
+  weights_bytes: number;
+  estimated_ram_bytes: number;
+  estimated_vram_bytes: number;
+  required_accelerator: AcceleratorKind | null;
+  has_vision_projector: boolean;
+}
+
+export interface OffloadPlanInput {
+  hardware: HardwareSnapshot;
+  model: OffloadModelProfile;
+  reserved: { ram_bytes: number; vram_bytes: number };
+  other_resident_count: number;
+  requested_context_tokens: number | null;
+}
+
+export type ProjectorPlacement = "gpu" | "cpu" | "not_applicable";
+
+export interface OffloadRationale {
+  field: string;
+  explanation: string;
+}
+
+export interface OffloadPlan {
+  schema_version: number;
+  accelerator: AcceleratorKind;
+  context_tokens: number;
+  requested_context_tokens: number;
+  batch_size: number;
+  gpu_layers: number;
+  estimated_total_layers: number;
+  cpu_spill_layers: number;
+  projector_placement: ProjectorPlacement;
+  parallel_sequences: number;
+  available_ram_bytes: number;
+  available_vram_bytes: number;
+  rationale: OffloadRationale[];
+  improvement_suggestions: string[];
+}
+
 export type SettingValue =
   | { type: "boolean"; value: boolean }
   | { type: "integer"; value: number }
@@ -534,6 +574,7 @@ export const runtimeHubClient = {
     invoke<M3RuntimeCapability[]>("m3_refresh_runtimes", args),
   schedulePlan: (input: M3SchedulingInput) =>
     invoke<M3SchedulingPlan>("m3_schedule_plan", { input }),
+  offloadPlan: (input: OffloadPlanInput) => invoke<OffloadPlan>("m3_offload_plan", { input }),
   catalogSearch: (args: OperationArgs & { query: string; limit: number }) =>
     invoke<M3CatalogMatch[]>("m3_catalog_search", args),
   modelDownload: (args: OperationArgs & { request: { model: M3CatalogModel; acceptedLicenseSha256: string } }) =>

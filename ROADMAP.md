@@ -942,15 +942,6 @@ These are deliberately separate from the earlier phases: they are the next 30 ga
 
 This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 2026: 4,931 closed PRs fetched through the GitHub API, with 3,430 merged PRs used as the main signal. The goal is not to clone Ollama, but to learn from the runtime, model, GPU, registry, API, and diagnostics work that made Ollama dependable.
 
-### 2. Adaptive Runtime Scheduler and Offload Planner
-
-**Status:** Planned
-
-- Plan context size, batch size, GPU layers, projector offload, CPU spill, and parallelism from live memory/VRAM state.
-- Simulate fit before loading a model and explain tradeoffs.
-
-**Acceptance:** A model load shows why a runtime/context/offload plan was selected and how to improve it.
-
 ### 3. Multi-GPU and Heterogeneous Runtime Orchestration
 
 **Status:** Research
