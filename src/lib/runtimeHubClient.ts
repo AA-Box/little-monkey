@@ -192,6 +192,72 @@ export interface M3CleanupReport {
   reclaimedBytes: number;
 }
 
+// Runtime Component Update Channels: versioned `llama.cpp`/MLX/tokenizer/
+// converter/projector/accelerator-support components, distinct from models
+// above. See `M3ComponentHub` in `src-tauri/src/m3_runtime_hub.rs`.
+export type M3ComponentKind =
+  | "llama_cpp_server"
+  | "mlx_runtime"
+  | "tokenizer"
+  | "converter"
+  | "projector_runtime"
+  | "metal_support"
+  | "cuda_support"
+  | "rocm_support"
+  | "vulkan_support";
+
+export type M3ComponentChannel = "stable" | "beta" | "pinned";
+
+export interface M3ComponentCatalogEntry {
+  schemaVersion: number;
+  sourceId: string;
+  componentId: string;
+  kind: M3ComponentKind;
+  displayName: string;
+  accelerator: AcceleratorKind | null;
+  version: string;
+  channel: M3ComponentChannel;
+  downloadUrl: string;
+  sha256: string;
+  sizeBytes: number;
+  publishedAtMs: number;
+  compatibilityNote: string | null;
+  metadata: Record<string, string>;
+}
+
+export interface M3InstalledComponentVersion {
+  versionKey: string;
+  version: string;
+  channel: M3ComponentChannel;
+  sha256: string;
+  sizeBytes: number;
+  sourceUrl: string;
+  artifactPath: string;
+  installedAtMs: number;
+  publishedAtMs: number;
+  active: boolean;
+  compatibilityNote: string | null;
+}
+
+export interface M3InstalledComponent {
+  componentId: string;
+  kind: M3ComponentKind;
+  displayName: string;
+  accelerator: AcceleratorKind | null;
+  channel: M3ComponentChannel;
+  activeVersionKey: string;
+  versions: M3InstalledComponentVersion[];
+}
+
+export interface M3ComponentUpdateCheck {
+  componentId: string;
+  channel: M3ComponentChannel;
+  installedVersion: string;
+  installedPublishedAtMs: number;
+  latestAvailable: M3ComponentCatalogEntry | null;
+  updateAvailable: boolean;
+}
+
 export type SchedulerRuntimeKind = "ollama" | "llama_cpp";
 export interface M3SchedulingInput {
   platform: PlatformCapabilities;
@@ -628,4 +694,18 @@ export const runtimeHubClient = {
   httpServerStatus: () => invoke<M3HttpServerStatus>("m3_http_server_status"),
   httpServerStoreTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) =>
     invoke<string>("m3_http_server_store_tls_identity", { reference, certificatePem, privateKeyPem }),
+  componentStorageStatus: () => invoke<M3StorageStatus>("m3_component_storage_status"),
+  componentInstalled: () => invoke<M3InstalledComponent[]>("m3_component_installed"),
+  componentRegistryEntries: () => invoke<M3ComponentCatalogEntry[]>("m3_component_registry_entries"),
+  componentReplaceRegistryEntries: (entries: M3ComponentCatalogEntry[]) =>
+    invoke<M3ComponentCatalogEntry[]>("m3_component_replace_registry_entries", { entries }),
+  componentListRegistry: (args: OperationArgs) =>
+    invoke<M3ComponentCatalogEntry[]>("m3_component_list_registry", args),
+  componentCheckUpdates: (args: OperationArgs) =>
+    invoke<M3ComponentUpdateCheck[]>("m3_component_check_updates", args),
+  componentInstall: (args: OperationArgs & { request: { entry: M3ComponentCatalogEntry } }) =>
+    invoke<M3InstalledComponent>("m3_component_install", args),
+  componentActivateVersion: (
+    args: OperationArgs & { request: { componentId: string; versionKey: string } },
+  ) => invoke<M3InstalledComponent>("m3_component_activate_version", args),
 };

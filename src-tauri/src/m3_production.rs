@@ -11,11 +11,12 @@ use crate::compatibility_hub::{
 use crate::m3_commands::{M3CommandState, M3OwnedProcessShutdown};
 use crate::m3_runtime_hub::{
     DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility, M3AcceleratorStatus,
-    M3CanonicalStreamSink, M3CatalogSource, M3Clock, M3HardwareCompatibilityReport, M3HardwareProbe,
+    M3CanonicalStreamSink, M3CatalogSource, M3Clock, M3ComponentCatalogEntry, M3ComponentHub,
+    M3ComponentHubDependencies, M3ComponentSource, M3HardwareCompatibilityReport, M3HardwareProbe,
     M3HubConfig, M3HubError, M3HubFuture, M3HubResult, M3InferenceEngine, M3InstalledModelView,
     M3JetsonInfo, M3ModelCapabilities, M3OperationContext, M3RuntimeDriver, M3RuntimeHub,
     M3RuntimeHubDependencies, M3RuntimeKind, M3RuntimeReconciler, M3RuntimeStatusView, MlxM3Driver,
-    ReqwestM3DownloadTransport, RuntimeAdapterM3Driver, SystemM3Clock,
+    ReqwestM3DownloadTransport, RuntimeAdapterM3Driver, StaticM3ComponentSource, SystemM3Clock,
 };
 use crate::mlx_runtime::{
     CurrentHostMlxProbe, MlxError, MlxFuture, MlxGenerationRequest, MlxGenerationSummary,
@@ -56,9 +57,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 const M3_DIRECTORY: &str = "m3";
+const M3_COMPONENTS_DIRECTORY: &str = "m3-components";
 const CATALOG_CONFIG_FILE: &str = "catalog-sources.json";
 const CATALOG_CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CATALOG_CONFIG_BYTES: u64 = 256 * 1024;
+const COMPONENT_REGISTRY_FILE: &str = "component-registry.json";
+const COMPONENT_REGISTRY_SCHEMA_VERSION: u32 = 1;
+const COMPONENT_REGISTRY_SOURCE_ID: &str = "local";
+const MAX_COMPONENT_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const OLLAMA_RUNTIME_ID: &str = "ollama";
 const LLAMA_RUNTIME_ID: &str = "managed-llama";
 const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
@@ -1095,6 +1101,151 @@ pub fn replace_catalog_source_configs(
         })?;
     hub.replace_catalog_sources(sources)?;
     Ok(configs)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProductionComponentRegistry {
+    schema_version: u32,
+    entries: Vec<M3ComponentCatalogEntry>,
+}
+
+/// Loads the app's local, operator-editable registry of known runtime
+/// component versions (llama.cpp/MLX/tokenizer/converter/projector/
+/// accelerator-support builds).
+///
+/// There is no real upstream binary registry/CDN this app can verify and
+/// hit today for these artifacts, so — mirroring the pluggable
+/// `M3CatalogSource` pattern used for model catalogs — this reads a local
+/// JSON file an operator populates with entries they have independently
+/// vetted (a real source URL plus the sha256 they verified against it),
+/// rather than hardcoding a call to a registry this environment cannot
+/// confirm works. A missing file means an empty registry (no components
+/// advertised as installable yet), which is the honest default until an
+/// operator supplies real, verified entries.
+pub fn component_registry_entries(root: &Path) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    let path = root.join(COMPONENT_REGISTRY_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(M3HubError::Io {
+                operation: "inspect M3 component registry",
+                path,
+                source: error,
+            })
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_COMPONENT_REGISTRY_BYTES {
+        return Err(M3HubError::State(
+            "M3 component registry must be a bounded regular file".to_string(),
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|source| M3HubError::Io {
+        operation: "read M3 component registry",
+        path: path.clone(),
+        source,
+    })?;
+    let registry: ProductionComponentRegistry = serde_json::from_slice(&bytes)?;
+    if registry.schema_version != COMPONENT_REGISTRY_SCHEMA_VERSION {
+        return Err(M3HubError::State(
+            "M3 component registry version is unsupported".to_string(),
+        ));
+    }
+    // Constructing the source is the canonical validation for every entry.
+    StaticM3ComponentSource::new(COMPONENT_REGISTRY_SOURCE_ID, registry.entries.clone())?;
+    Ok(registry.entries)
+}
+
+fn component_sources_from_entries(
+    entries: &[M3ComponentCatalogEntry],
+) -> M3HubResult<Vec<Arc<dyn M3ComponentSource>>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![Arc::new(StaticM3ComponentSource::new(
+        COMPONENT_REGISTRY_SOURCE_ID,
+        entries.to_vec(),
+    )?)])
+}
+
+fn load_component_sources(root: &Path) -> M3HubResult<Vec<Arc<dyn M3ComponentSource>>> {
+    component_sources_from_entries(&component_registry_entries(root)?)
+}
+
+/// Replaces the local component registry file and the hub's in-memory
+/// sources together, mirroring `replace_catalog_source_configs`'s
+/// validate-then-atomically-publish shape.
+pub fn replace_component_registry_entries(
+    hub: &M3ComponentHub,
+    entries: Vec<M3ComponentCatalogEntry>,
+) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    let sources = component_sources_from_entries(&entries)?;
+    let document = ProductionComponentRegistry {
+        schema_version: COMPONENT_REGISTRY_SCHEMA_VERSION,
+        entries: entries.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    if bytes.len() as u64 > MAX_COMPONENT_REGISTRY_BYTES {
+        return Err(M3HubError::State(
+            "M3 component registry exceeds its byte limit".to_string(),
+        ));
+    }
+    let root = hub.root();
+    ensure_private_directory(root)?;
+    let path = root.join(COMPONENT_REGISTRY_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(M3HubError::State(
+                "M3 component registry target is not a regular file".to_string(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(M3HubError::Io {
+                operation: "inspect M3 component registry target",
+                path,
+                source,
+            })
+        }
+    }
+    let temporary = root.join(format!(".component-registry-{}.tmp", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(|source| M3HubError::Io {
+        operation: "create staged M3 component registry",
+        path: temporary.clone(),
+        source,
+    })?;
+    if let Err(source) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(M3HubError::Io {
+            operation: "write staged M3 component registry",
+            path: temporary,
+            source,
+        });
+    }
+    if let Err(source) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(M3HubError::Io {
+            operation: "publish M3 component registry",
+            path,
+            source,
+        });
+    }
+    #[cfg(unix)]
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| M3HubError::Io {
+            operation: "sync M3 component registry directory",
+            path: root.to_path_buf(),
+            source,
+        })?;
+    hub.replace_sources(sources)?;
+    Ok(entries)
 }
 
 /// Canonical inference implementation for Ollama and llama.cpp's local
@@ -3230,6 +3381,34 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
     let reconciler = Arc::new(ProductionRuntimeReconciler::new(
         factory, &installed, &runtimes,
     ));
+    // Runtime components (the llama.cpp/MLX/tokenizer/converter/projector
+    // binaries and accelerator-support packages the app itself depends on)
+    // are a distinct system from installed models, so they get their own
+    // storage root, config, and hub instance rather than sharing the model
+    // hub's state.
+    let component_root = app_data_dir.join(M3_COMPONENTS_DIRECTORY);
+    ensure_private_directory(&component_root)?;
+    let component_sources = load_component_sources(&component_root)?;
+    let component_config = M3HubConfig {
+        schema_version: config.schema_version,
+        // Components are small binaries/libraries, not multi-gigabyte model
+        // weights, so a much smaller quota is enough headroom.
+        storage_quota_bytes: 16 * 1024 * 1024 * 1024,
+        storage_reserve_bytes: 256 * 1024 * 1024,
+        download_chunk_bytes: config.download_chunk_bytes,
+        operation_timeout_ms: config.operation_timeout_ms,
+        max_catalog_results: config.max_catalog_results,
+    };
+    let component_hub = M3ComponentHub::new(
+        &component_root,
+        component_config,
+        M3ComponentHubDependencies {
+            clock: clock.clone(),
+            download: download.clone(),
+            sources: component_sources,
+        },
+    )?;
+
     let hub = M3RuntimeHub::new(
         root,
         config,
@@ -3243,7 +3422,11 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
             lan_factory: Some(lan_factory),
         },
     )?;
-    Ok(M3CommandState::with_owned_processes(Arc::new(hub), process))
+    Ok(M3CommandState::with_owned_processes(
+        Arc::new(hub),
+        Arc::new(component_hub),
+        process,
+    ))
 }
 
 #[cfg(test)]
