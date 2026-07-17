@@ -1,23 +1,33 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  BookOpenText,
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardList,
+  GitBranch,
+  Command,
   ClipboardCheck,
   Compass,
+  Database,
   GitPullRequest,
   Globe,
   HelpCircle,
+  LayoutDashboard,
   ListTodo,
   Inbox,
   Network,
-  GitBranch,
   Newspaper,
+  Radar,
   Search,
   ServerCog,
   Settings as SettingsIcon,
+  ShieldAlert,
+  ShieldCheck,
   SquareTerminal,
+  Telescope,
+  Wand2,
   Workflow,
   Swords,
 } from "lucide-react";
@@ -32,7 +42,10 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenCommandPalette: () => void;
   onOpenIssueToPr: () => void;
+  onOpenSecurityAutofix: () => void;
+  onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
   onOpenMigrationAgent: () => void;
@@ -40,10 +53,20 @@ interface AppMenuProps {
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
   onOpenTerminal: () => void;
+  onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenDataNotebook: () => void;
+  onOpenSyntheticMonitoring: () => void;
+  onOpenCrossRepoIntelligence: () => void;
+  onOpenWorkCanvas: () => void;
+  onOpenPmCopilot: () => void;
+  onOpenDeepResearch: () => void;
+  onOpenBriefStudio: () => void;
+  onOpenCrossRepoChangePlanner: () => void;
+  onOpenVisualEditMode: () => void;
 }
 
 interface MenuRowProps {
@@ -76,7 +99,10 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenCommandPalette,
   onOpenIssueToPr,
+  onOpenSecurityAutofix,
+  onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
   onOpenMigrationAgent,
@@ -84,10 +110,20 @@ export function AppMenu({
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
   onOpenTerminal,
+  onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenDataNotebook,
+  onOpenSyntheticMonitoring,
+  onOpenCrossRepoIntelligence,
+  onOpenWorkCanvas,
+  onOpenPmCopilot,
+  onOpenDeepResearch,
+  onOpenBriefStudio,
+  onOpenCrossRepoChangePlanner,
+  onOpenVisualEditMode,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -141,6 +177,14 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Command size={14} className="text-faint" />}
+            label={t("AppMenu.commandPalette")}
+            onClick={() => {
+              closeAll();
+              onOpenCommandPalette();
+            }}
+          />
+          <MenuRow
             icon={<Newspaper size={14} className="text-faint" />}
             label={t("AppMenu.dailyBrief")}
             onClick={() => {
@@ -173,11 +217,51 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Wand2 size={14} className="text-faint" />}
+            label={t("AppMenu.visualEditMode")}
+            onClick={() => {
+              closeAll();
+              onOpenVisualEditMode();
+            }}
+          />
+          <MenuRow
             icon={<GitPullRequest size={14} className="text-faint" />}
             label={t("AppMenu.issueToPr")}
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldAlert size={14} className="text-faint" />}
+            label={t("AppMenu.securityAutofix")}
+            onClick={() => {
+              closeAll();
+              onOpenSecurityAutofix();
+            }}
+          />
+          <MenuRow
+            icon={<Radar size={14} className="text-faint" />}
+            label={t("AppMenu.syntheticMonitoring")}
+            onClick={() => {
+              closeAll();
+              onOpenSyntheticMonitoring();
+            }}
+          />
+          <MenuRow
+            icon={<LayoutDashboard size={14} className="text-faint" />}
+            label={t("AppMenu.workCanvas")}
+            onClick={() => {
+              closeAll();
+              onOpenWorkCanvas();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldCheck size={14} className="text-faint" />}
+            label={t("AppMenu.trustScorecards")}
+            onClick={() => {
+              closeAll();
+              onOpenTrustScorecards();
             }}
           />
           <MenuRow
@@ -214,6 +298,38 @@ export function AppMenu({
           />
           <MenuRow
             icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoIntelligence")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoIntelligence();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardList size={14} className="text-faint" />}
+            label={t("AppMenu.pmCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenPmCopilot();
+            }}
+          />
+          <MenuRow
+            icon={<Telescope size={14} className="text-faint" />}
+            label={t("AppMenu.deepResearch")}
+            onClick={() => {
+              closeAll();
+              onOpenDeepResearch();
+            }}
+          />
+          <MenuRow
+            icon={<BookOpenText size={14} className="text-faint" />}
+            label={t("AppMenu.briefStudio")}
+            onClick={() => {
+              closeAll();
+              onOpenBriefStudio();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
             label={t("AppMenu.knowledgeGraphExplorer")}
             onClick={() => {
               closeAll();
@@ -229,11 +345,35 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dataNotebook")}
+            onClick={() => {
+              closeAll();
+              onOpenDataNotebook();
+            }}
+          />
+          <MenuRow
             icon={<SquareTerminal size={14} className="text-faint" />}
             label={t("AppMenu.integratedTerminal")}
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<GitBranch size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoChangePlanner")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoChangePlanner();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldAlert size={14} className="text-faint" />}
+            label={t("AppMenu.redTeamLab")}
+            onClick={() => {
+              closeAll();
+              onOpenRedTeamLab();
             }}
           />
           <MenuRow

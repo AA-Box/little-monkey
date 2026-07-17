@@ -1,0 +1,1 @@
+export { CrossRepoIntelligencePanel } from "./CrossRepoIntelligencePanel";
