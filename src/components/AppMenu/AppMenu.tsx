@@ -4,16 +4,23 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardCheck,
   Compass,
   GitPullRequest,
   Globe,
   HelpCircle,
   ListTodo,
   Inbox,
+  Network,
   Newspaper,
   Search,
+  ServerCog,
   Settings as SettingsIcon,
+  ShieldAlert,
+  ShieldCheck,
   SquareTerminal,
+  Workflow,
+  Swords,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -27,9 +34,16 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenTrustScorecards: () => void;
+  onOpenSopCompiler: () => void;
+  onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
+  onOpenKnowledgeGraph: () => void;
   onOpenTerminal: () => void;
+  onOpenRedTeamLab: () => void;
+  onOpenEvidenceBoard: () => void;
+  onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
 }
@@ -65,9 +79,16 @@ export function AppMenu({
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
   onOpenIssueToPr,
+  onOpenTrustScorecards,
+  onOpenSopCompiler,
+  onOpenMcpGenerator,
   onOpenSideTasks,
   onOpenAgentInbox,
+  onOpenKnowledgeGraph,
   onOpenTerminal,
+  onOpenRedTeamLab,
+  onOpenEvidenceBoard,
+  onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
 }: AppMenuProps) {
@@ -163,6 +184,30 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<ShieldCheck size={14} className="text-faint" />}
+            label={t("AppMenu.trustScorecards")}
+            onClick={() => {
+              closeAll();
+              onOpenTrustScorecards();
+            }}
+          />
+          <MenuRow
+            icon={<Workflow size={14} className="text-faint" />}
+            label={t("AppMenu.sopCompiler")}
+            onClick={() => {
+              closeAll();
+              onOpenSopCompiler();
+            }}
+          />
+          <MenuRow
+            icon={<ServerCog size={14} className="text-faint" />}
+            label={t("AppMenu.mcpGenerator")}
+            onClick={() => {
+              closeAll();
+              onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
             icon={<ListTodo size={14} className="text-faint" />}
             label={t("AppMenu.sideTasks")}
             onClick={() => {
@@ -171,11 +216,43 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.knowledgeGraphExplorer")}
+            onClick={() => {
+              closeAll();
+              onOpenKnowledgeGraph();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardCheck size={14} className="text-faint" />}
+            label={t("AppMenu.evidenceBoard")}
+            onClick={() => {
+              closeAll();
+              onOpenEvidenceBoard();
+            }}
+          />
+          <MenuRow
             icon={<SquareTerminal size={14} className="text-faint" />}
             label={t("AppMenu.integratedTerminal")}
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldAlert size={14} className="text-faint" />}
+            label={t("AppMenu.redTeamLab")}
+            onClick={() => {
+              closeAll();
+              onOpenRedTeamLab();
+            }}
+          />
+          <MenuRow
+            icon={<Swords size={14} className="text-faint" />}
+            label={t("AppMenu.debate")}
+            onClick={() => {
+              closeAll();
+              onOpenDebate();
             }}
           />
           <MenuRow

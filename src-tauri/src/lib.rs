@@ -62,6 +62,11 @@ pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
+// Operational-health diagnostics (reachability/liveness of app-owned
+// services), sibling to `security_doctor` (which audits posture, not
+// health). Self-contained: engine + thin command layer live in one file,
+// same convention as `ollama`/`llama`/`server`/`mcp`/`stacks`.
+pub mod diagnostics;
 pub mod workflow_core;
 // Runtime/model hub service plus its thin desktop command layer. The hub
 // composes Ollama, managed llama.cpp, MLX, catalog/download, and API policy
@@ -173,6 +178,19 @@ mod run_commands;
 // subcommand exists yet (it emits a launchd/crontab line, no in-process
 // scheduling), but there's no reason to make this one module-private either.
 pub mod automations;
+// Disposable-workspace-copy command execution: risky commands/tests run
+// against `<app_data>/sandbox-runs/<run_id>/workspace` instead of the real
+// workspace, with a restricted env, a wall-clock timeout, and (on macOS) a
+// generated Seatbelt profile. Nothing reaches the real workspace except
+// through the module's own explicit prepare-digest/confirm-phrase promote
+// action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
+// every other execution surface above.
+pub mod sandbox;
+// Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
+// Phase 6): a named local profile switcher, capability-checked roles, and a
+// redacted audit export layered over `run_ledger`/`permissions`. See the
+// module doc for exactly what it is (and, just as importantly, is not).
+pub mod team_mode;
 // Issue-to-PR Agent Flow (ROADMAP.md Phase 3): orchestrates picking up a
 // GitHub issue and carrying it through a reviewable owned-branch/PR loop on
 // top of the `m5_delivery` GitHub/worktree primitives.
@@ -353,6 +371,17 @@ pub struct AppState {
     pub index_cancels: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
     >,
+    /// In-memory registry of prepared-but-unconfirmed sandbox promote
+    /// previews (see `sandbox.rs`'s module doc for why this is intentionally
+    /// not persisted like `m5_delivery`'s SQLite-backed preview store).
+    pub sandbox: sandbox::SandboxState,
+    /// Serializes `team_members.json` read-modify-write cycles (see
+    /// `team_mode.rs`) so two concurrent member-roster mutations (e.g. an add
+    /// racing a role change, or two removes racing each other) can never both
+    /// load the same "before" file and have the later save silently clobber
+    /// the earlier one's change — same reasoning as `connectors_config_lock`/
+    /// `memory_lock` above protect their own files.
+    pub team_members_lock: std::sync::Mutex<()>,
 }
 
 impl Default for AppState {
@@ -381,6 +410,8 @@ impl Default for AppState {
             run_ledger: Default::default(),
             stack_cache: Default::default(),
             index_cancels: Default::default(),
+            sandbox: Default::default(),
+            team_members_lock: Default::default(),
         }
     }
 }
@@ -733,6 +764,12 @@ pub fn run() {
             automations::cron_validate,
             automations::cron_next,
             automations::cron_previous,
+            team_mode::team_members_list,
+            team_mode::team_members_add,
+            team_mode::team_members_update_role,
+            team_mode::team_members_remove,
+            team_mode::team_members_set_active,
+            team_mode::team_audit_export,
             run_commands::run_protocol_version,
             run_commands::run_submit,
             run_commands::run_append_event,
@@ -744,6 +781,12 @@ pub fn run() {
             run_commands::run_unarchive,
             run_commands::run_events,
             run_commands::run_integrity_check,
+            sandbox::sandbox_run,
+            sandbox::sandbox_list,
+            sandbox::sandbox_diff,
+            sandbox::sandbox_prepare_promote,
+            sandbox::sandbox_execute_promote,
+            sandbox::sandbox_discard,
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
             m3_commands::m3_storage_status,
@@ -808,6 +851,9 @@ pub fn run() {
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
             security_commands::security_audit,
+            diagnostics::diagnostics_run,
+            diagnostics::diagnostics_apply_fix,
+            diagnostics::diagnostics_export_bundle,
             m4_commands::m4_packages_preview,
             m4_commands::m4_packages_install,
             m4_commands::m4_packages_update,
