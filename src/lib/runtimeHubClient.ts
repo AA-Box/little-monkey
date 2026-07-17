@@ -153,6 +153,15 @@ export interface M3CatalogMatch {
   fit: M3HardwareFit;
 }
 
+/** Real evidence for a version's projector — never trust `capabilities.vision`
+ * alone (ROADMAP Phase 8 item 12). Mirrors the Chat Template Compatibility
+ * Lab's "never advertise readiness without evidence" bar. */
+export type M3ProjectorVerificationState =
+  | "not_required"
+  | "missing_reference"
+  | "unverified"
+  | "verified";
+
 export interface M3InstalledVersion {
   versionKey: string;
   revision: string;
@@ -166,6 +175,10 @@ export interface M3InstalledVersion {
   template: string | null;
   projector: M3ProjectorRef | null;
   catalogRetrievedAtMs: number | null;
+  projectorVerification: M3ProjectorVerificationState;
+  projectorVerifiedAtMs: number | null;
+  estimatedProjectorMemoryBytes: number | null;
+  visionReady: boolean;
 }
 
 export interface M3InstalledModel {
@@ -323,6 +336,7 @@ export interface OffloadModelProfile {
   estimated_vram_bytes: number;
   required_accelerator: AcceleratorKind | null;
   has_vision_projector: boolean;
+  projector_memory_bytes: number;
 }
 
 export interface OffloadPlanInput {
@@ -650,6 +664,9 @@ export const runtimeHubClient = {
   ) => invoke<M3InstalledModel>("m3_model_update", args),
   modelActivateVersion: (args: OperationArgs & { request: { assetId: string; versionKey: string } }) =>
     invoke<M3InstalledModel>("m3_model_activate_version", args),
+  verifyProjector: (
+    args: OperationArgs & { request: { assetId: string; versionKey: string; candidatePath: string } },
+  ) => invoke<M3InstalledModel>("m3_verify_projector", args),
   modelPruneVersions: (args: OperationArgs & { request: { assetId: string; confirmation: string } }) =>
     invoke<M3InstalledModel>("m3_model_prune_versions", args),
   modelDelete: (args: OperationArgs & { request: { assetId: string; confirmation: string } }) =>

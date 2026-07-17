@@ -1600,6 +1600,12 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
     }
     let mut text = String::new();
     let mut calls = Vec::new();
+    // Image content blocks (ROADMAP Phase 8 item 12): collected as OpenAI
+    // vision-style `data:` URIs. Only populated when the message actually
+    // carries an image, so a plain text/tool message composes exactly as
+    // before (a bare string or `null` `content`), matching every existing
+    // wire fixture unchanged.
+    let mut images = Vec::new();
     for content in &message.content {
         match content {
             CanonicalContent::Text { text: value } => text.push_str(value),
@@ -1612,6 +1618,10 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
                     "function":{"name":name,"arguments":input.to_string()}
                 }));
             }
+            CanonicalContent::Image {
+                mime_type,
+                data_base64,
+            } => images.push(CanonicalContent::image_data_url(mime_type, data_base64)),
             CanonicalContent::ToolResult { .. } => {
                 return vec![Err(M3HubError::Runtime(
                     "tool results require a tool-role message".to_string(),
@@ -1628,7 +1638,16 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
     object.insert("role".to_string(), Value::String(role.to_string()));
     object.insert(
         "content".to_string(),
-        if text.is_empty() && !calls.is_empty() {
+        if !images.is_empty() {
+            let mut parts = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({"type":"text","text":text}));
+            }
+            for image in &images {
+                parts.push(json!({"type":"image_url","image_url":{"url":image}}));
+            }
+            Value::Array(parts)
+        } else if text.is_empty() && !calls.is_empty() {
             Value::Null
         } else {
             Value::String(text)
@@ -4140,5 +4159,67 @@ GPU1:
         let report = crate::m3_runtime_hub::M3HardwareProbe::compatibility_report(&probe)
             .expect("compatibility report");
         assert_eq!(report.accelerators.len(), 5);
+    }
+
+    /// ROADMAP Phase 8 item 12 (Multimodal Projector and Vision Model
+    /// Manager): a user message carrying an inline image now genuinely
+    /// composes onto the OpenAI-compatible wire body used by the Ollama and
+    /// managed llama.cpp drivers, as a proper `image_url` content-array
+    /// entry alongside its accompanying text — the same real-composition
+    /// bar the Chat Template Compatibility Lab's `fixture_tool_calling`
+    /// already applies to tool calls on this exact function. Before this
+    /// change, `CanonicalContent` had no image variant at all, so this
+    /// round trip was structurally impossible.
+    #[test]
+    fn openai_request_body_composes_inline_image_content_alongside_text() {
+        let mut fixture = request("req-vision", "vision-model", false);
+        fixture.messages[0].content.push(CanonicalContent::Image {
+            mime_type: "image/png".to_string(),
+            data_base64: "cGxhY2Vob2xkZXItYnl0ZXM=".to_string(),
+        });
+        let body = openai_request_body(&fixture, false).expect("compose vision request");
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content is an array once an image is present");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,cGxhY2Vob2xkZXItYnl0ZXM="
+        );
+
+        // A plain text-only message (no image) must keep composing exactly
+        // as it always has — a bare string, not an array — so every
+        // existing non-vision fixture/driver is unaffected.
+        let text_only = request("req-text", "text-model", false);
+        let text_body = openai_request_body(&text_only, false).expect("compose text request");
+        assert_eq!(text_body["messages"][0]["content"], Value::String("hello".to_string()));
+    }
+
+    /// The MLX driver's flattened wire message has no native text slot for
+    /// images either; `canonical_message_to_mlx` (m3_runtime_hub.rs) carries
+    /// them in a dedicated `images` list instead. Exercised here (rather
+    /// than only in m3_runtime_hub.rs) because this is the other real
+    /// composition path the roadmap's "at least one real backend" bar
+    /// applies to, alongside the OpenAI-compatible wire above.
+    #[test]
+    fn canonical_message_to_mlx_carries_inline_images_separately_from_text() {
+        let message = CanonicalMessage {
+            role: CanonicalRole::User,
+            content: vec![
+                CanonicalContent::Text {
+                    text: "what is this?".to_string(),
+                },
+                CanonicalContent::Image {
+                    mime_type: "image/jpeg".to_string(),
+                    data_base64: "Zm9v".to_string(),
+                },
+            ],
+        };
+        let mlx_message = crate::m3_runtime_hub::canonical_message_to_mlx(&message).expect("flatten");
+        assert_eq!(mlx_message.text, "what is this?");
+        assert_eq!(mlx_message.images, vec!["data:image/jpeg;base64,Zm9v".to_string()]);
     }
 }

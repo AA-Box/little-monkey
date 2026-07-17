@@ -8,7 +8,7 @@ import type {
   RuntimeStatus,
 } from "../../../lib/runtimeHubClient";
 import type { RuntimeDetail } from "../../../store/runtimeHubStore";
-import { buildOffloadPlanInput, keepAliveForRuntime } from "./RuntimeHubRuntimes";
+import { buildOffloadPlanInput, keepAliveForRuntime, missingProjectorWarning } from "./RuntimeHubRuntimes";
 
 describe("runtime load keep-alive policy", () => {
   it("never sends keep_alive to managed llama.cpp", () => {
@@ -88,6 +88,10 @@ function installedModel(overrides: Partial<M3InstalledModel> = {}): M3InstalledM
         template: null,
         projector: null,
         catalogRetrievedAtMs: null,
+        projectorVerification: "not_required",
+        projectorVerifiedAtMs: null,
+        estimatedProjectorMemoryBytes: null,
+        visionReady: false,
       },
     ],
     ...overrides,
@@ -193,14 +197,80 @@ describe("buildOffloadPlanInput", () => {
     expect(input.model.weights_bytes).toBe(5 * GIB);
   });
 
-  it("forwards vision capability and requested context tokens", () => {
+  it("forwards a real projector's memory estimate and requested context tokens", () => {
     const model = installedModel({
       capabilities: { chat: true, embeddings: false, toolCalling: false, vision: true, structuredOutput: false },
       requiredAccelerator: "cuda",
+      versions: [
+        {
+          ...installedModel().versions[0],
+          projector: { kind: "clip", sha256: "c".repeat(64), sizeBytes: 512 * 1024 * 1024 },
+          projectorVerification: "unverified",
+          estimatedProjectorMemoryBytes: 512 * 1024 * 1024,
+        },
+      ],
     });
     const input = buildOffloadPlanInput(hardware(), model, [], {}, 16_384);
     expect(input.model.has_vision_projector).toBe(true);
+    expect(input.model.projector_memory_bytes).toBe(512 * 1024 * 1024);
     expect(input.model.required_accelerator).toBe("cuda");
     expect(input.requested_context_tokens).toBe(16_384);
+  });
+
+  it("never reports a vision projector for the offload plan when no projector reference is attached, even if capabilities.vision is declared true", () => {
+    // ROADMAP Phase 8 item 12: a declared-vision model with no projector at
+    // all must not make the offload planner reserve/place a phantom
+    // component — the missing-projector warning near the load flow is what
+    // surfaces that gap instead.
+    const model = installedModel({
+      capabilities: { chat: true, embeddings: false, toolCalling: false, vision: true, structuredOutput: false },
+    });
+    const input = buildOffloadPlanInput(hardware(), model, [], {});
+    expect(input.model.has_vision_projector).toBe(false);
+    expect(input.model.projector_memory_bytes).toBe(0);
+  });
+});
+
+describe("missingProjectorWarning", () => {
+  it("returns null when the active version needs no projector", () => {
+    expect(missingProjectorWarning(installedModel())).toBeNull();
+  });
+
+  it("warns when vision is declared but no projector reference exists at all", () => {
+    const model = installedModel({
+      versions: [{ ...installedModel().versions[0], projectorVerification: "missing_reference" }],
+    });
+    expect(missingProjectorWarning(model)).toContain("no associated multimodal projector");
+  });
+
+  it("warns (differently) when a projector is declared but not yet verified", () => {
+    const model = installedModel({
+      versions: [
+        {
+          ...installedModel().versions[0],
+          projector: { kind: "clip", sha256: "c".repeat(64), sizeBytes: 1024 },
+          projectorVerification: "unverified",
+        },
+      ],
+    });
+    expect(missingProjectorWarning(model)).toContain("has not been verified locally yet");
+  });
+
+  it("returns null once the projector is verified", () => {
+    const model = installedModel({
+      versions: [
+        {
+          ...installedModel().versions[0],
+          projector: { kind: "clip", sha256: "c".repeat(64), sizeBytes: 1024 },
+          projectorVerification: "verified",
+          visionReady: true,
+        },
+      ],
+    });
+    expect(missingProjectorWarning(model)).toBeNull();
+  });
+
+  it("returns null when there is no active version at all", () => {
+    expect(missingProjectorWarning(installedModel({ versions: [] }))).toBeNull();
   });
 });

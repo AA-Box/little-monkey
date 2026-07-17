@@ -18,6 +18,7 @@ use crate::m3_runtime_hub::{
     M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
     M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeMetricsView,
     M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus, M3UnloadModelRequest,
+    M3VerifyProjectorRequest,
 };
 use crate::runtime_adapter::{
     HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
@@ -289,6 +290,23 @@ pub async fn m3_model_activate_version(
 ) -> Result<M3InstalledModelView, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.activate_model_version(&request, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+/// Verifies a candidate local file against an installed model version's
+/// declared projector reference, promoting its evidence from "declared" to
+/// genuinely `Verified` (ROADMAP Phase 8 item 12). See
+/// `M3RuntimeHub::verify_projector` for why this checks a user-supplied
+/// path rather than downloading anything itself.
+#[tauri::command]
+pub async fn m3_verify_projector(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3VerifyProjectorRequest,
+) -> Result<M3InstalledModelView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.hub.verify_projector(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
 
