@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { apiContractDiffLabLocale } from "./apiContractDiffLab";
 
 export const es419: Record<string, string> = {
   ...crewLocale,
@@ -1420,5 +1421,50 @@ export const es419: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Esto no es un JSON de instantánea de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "¿Eliminar esta fuente de registro?",
   "EcosystemDiscover.removeRegistry": "Eliminar",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  ...apiContractDiffLabLocale,
+  // API Contract Diff & Mock Lab (ROADMAP.md Phase 7, item 23) — real Latin American Spanish translations, overriding every apiContractDiffLabLocale key above.
+  "AppMenu.apiContractDiffLab": "Diff de contratos de API y laboratorio de mocks",
+  "ApiContractDiffLab.title": "Diff de contratos de API y laboratorio de mocks",
+  "ApiContractDiffLab.subtitle": "Compara dos versiones de una especificación OpenAPI, señala los cambios disruptivos y genera mocks, un esqueleto de prueba de contrato y notas de impacto para los clientes.",
+  "ApiContractDiffLab.close": "Cerrar Diff de contratos de API y laboratorio de mocks",
+  "ApiContractDiffLab.oldVersionLabel": "Versión anterior",
+  "ApiContractDiffLab.newVersionLabel": "Versión nueva",
+  "ApiContractDiffLab.noFileLoaded": "Ningún archivo cargado",
+  "ApiContractDiffLab.specSummary": "{{title}} v{{version}} · {{count}} operación(es)",
+  "ApiContractDiffLab.chooseFile": "Elegir archivo…",
+  "ApiContractDiffLab.loading": "Cargando…",
+  "ApiContractDiffLab.runDiff": "Ejecutar comparación",
+  "ApiContractDiffLab.startOver": "Empezar de nuevo",
+  "ApiContractDiffLab.noReportYet": "Aún no hay informe",
+  "ApiContractDiffLab.noReportYetHint": "Carga arriba una especificación OpenAPI anterior y una nueva (JSON o YAML), luego haz clic en \"Ejecutar comparación\".",
+  "ApiContractDiffLab.verdictReady": "Listo para lanzamiento: sí — 0 cambios disruptivos",
+  "ApiContractDiffLab.verdictNotReady": "Listo para lanzamiento: no — {{count}} cambio(s) disruptivo(s)",
+  "ApiContractDiffLab.breakingHeading": "Cambios disruptivos ({{count}})",
+  "ApiContractDiffLab.nonBreakingHeading": "Cambios no disruptivos ({{count}})",
+  "ApiContractDiffLab.noChanges": "Las dos versiones son estructuralmente idénticas — no se detectaron cambios.",
+  "ApiContractDiffLab.draftImpactNotes": "Redactar notas de impacto para clientes",
+  "ApiContractDiffLab.drafting": "Redactando…",
+  "ApiContractDiffLab.impactLabel": "Impacto",
+  "ApiContractDiffLab.migrationLabel": "Migración",
+  "ApiContractDiffLab.mocksHeading": "Respuestas simuladas generadas",
+  "ApiContractDiffLab.statusLabel": "estado {{status}}",
+  "ApiContractDiffLab.testStubHeading": "Esqueleto de prueba de contrato generado",
+  "ApiContractDiffLab.saveTestStub": "Guardar esqueleto de prueba…",
+  "ApiContractDiffLab.kind.endpoint-removed": "Endpoint eliminado",
+  "ApiContractDiffLab.kind.endpoint-added": "Endpoint agregado",
+  "ApiContractDiffLab.kind.param-removed": "Parámetro eliminado",
+  "ApiContractDiffLab.kind.param-added": "Parámetro agregado",
+  "ApiContractDiffLab.kind.param-now-required": "Parámetro ahora obligatorio",
+  "ApiContractDiffLab.kind.param-now-optional": "Parámetro ahora opcional",
+  "ApiContractDiffLab.kind.param-type-changed": "Tipo de parámetro cambiado",
+  "ApiContractDiffLab.kind.field-removed": "Campo eliminado",
+  "ApiContractDiffLab.kind.field-added": "Campo agregado",
+  "ApiContractDiffLab.kind.field-now-required": "Campo ahora obligatorio",
+  "ApiContractDiffLab.kind.field-now-optional": "Campo ahora opcional",
+  "ApiContractDiffLab.kind.field-type-changed": "Tipo de campo cambiado",
+  "ApiContractDiffLab.kind.response-removed": "Respuesta eliminada",
+  "ApiContractDiffLab.kind.response-added": "Respuesta agregada",
+  "ApiContractDiffLab.kind.enum-value-removed": "Valor de enum eliminado",
+  "ApiContractDiffLab.kind.enum-value-added": "Valor de enum agregado"
 };

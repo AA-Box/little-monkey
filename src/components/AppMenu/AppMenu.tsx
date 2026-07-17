@@ -6,6 +6,7 @@ import {
   ChevronsUpDown,
   ClipboardCheck,
   Compass,
+  FileDiff,
   GitPullRequest,
   Globe,
   HelpCircle,
@@ -46,6 +47,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenApiContractDiffLab: () => void;
 }
 
 interface MenuRowProps {
@@ -91,6 +93,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenApiContractDiffLab,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -205,6 +208,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
+            icon={<FileDiff size={14} className="text-faint" />}
+            label={t("AppMenu.apiContractDiffLab")}
+            onClick={() => {
+              closeAll();
+              onOpenApiContractDiffLab();
             }}
           />
           <MenuRow

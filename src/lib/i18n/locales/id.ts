@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { apiContractDiffLabLocale } from "./apiContractDiffLab";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -1420,5 +1421,50 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ini bukan JSON snapshot registri yang valid.",
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
-  "EcosystemDiscover.cancel": "Batal"
+  "EcosystemDiscover.cancel": "Batal",
+  ...apiContractDiffLabLocale,
+  // API Contract Diff & Mock Lab (ROADMAP.md Phase 7, item 23) — real Indonesian translations, overriding every apiContractDiffLabLocale key above.
+  "AppMenu.apiContractDiffLab": "Diff Kontrak API & Lab Mock",
+  "ApiContractDiffLab.title": "Diff Kontrak API & Lab Mock",
+  "ApiContractDiffLab.subtitle": "Membandingkan dua versi spesifikasi OpenAPI, menandai perubahan yang merusak, dan menghasilkan mock, kerangka uji kontrak, serta catatan dampak klien.",
+  "ApiContractDiffLab.close": "Tutup Diff Kontrak API & Lab Mock",
+  "ApiContractDiffLab.oldVersionLabel": "Versi lama",
+  "ApiContractDiffLab.newVersionLabel": "Versi baru",
+  "ApiContractDiffLab.noFileLoaded": "Tidak ada berkas yang dimuat",
+  "ApiContractDiffLab.specSummary": "{{title}} v{{version}} · {{count}} operasi",
+  "ApiContractDiffLab.chooseFile": "Pilih berkas…",
+  "ApiContractDiffLab.loading": "Memuat…",
+  "ApiContractDiffLab.runDiff": "Jalankan diff",
+  "ApiContractDiffLab.startOver": "Mulai lagi",
+  "ApiContractDiffLab.noReportYet": "Belum ada laporan",
+  "ApiContractDiffLab.noReportYetHint": "Muat spesifikasi OpenAPI lama dan baru (JSON atau YAML) di atas, lalu klik \"Jalankan diff\".",
+  "ApiContractDiffLab.verdictReady": "Siap rilis: ya — 0 perubahan yang merusak",
+  "ApiContractDiffLab.verdictNotReady": "Siap rilis: tidak — {{count}} perubahan yang merusak",
+  "ApiContractDiffLab.breakingHeading": "Perubahan yang merusak ({{count}})",
+  "ApiContractDiffLab.nonBreakingHeading": "Perubahan yang tidak merusak ({{count}})",
+  "ApiContractDiffLab.noChanges": "Kedua versi identik secara struktural — tidak ada perubahan yang terdeteksi.",
+  "ApiContractDiffLab.draftImpactNotes": "Susun catatan dampak klien",
+  "ApiContractDiffLab.drafting": "Menyusun…",
+  "ApiContractDiffLab.impactLabel": "Dampak",
+  "ApiContractDiffLab.migrationLabel": "Migrasi",
+  "ApiContractDiffLab.mocksHeading": "Respons mock yang dihasilkan",
+  "ApiContractDiffLab.statusLabel": "status {{status}}",
+  "ApiContractDiffLab.testStubHeading": "Kerangka uji kontrak yang dihasilkan",
+  "ApiContractDiffLab.saveTestStub": "Simpan kerangka uji…",
+  "ApiContractDiffLab.kind.endpoint-removed": "Endpoint dihapus",
+  "ApiContractDiffLab.kind.endpoint-added": "Endpoint ditambahkan",
+  "ApiContractDiffLab.kind.param-removed": "Parameter dihapus",
+  "ApiContractDiffLab.kind.param-added": "Parameter ditambahkan",
+  "ApiContractDiffLab.kind.param-now-required": "Parameter kini wajib",
+  "ApiContractDiffLab.kind.param-now-optional": "Parameter kini opsional",
+  "ApiContractDiffLab.kind.param-type-changed": "Tipe parameter berubah",
+  "ApiContractDiffLab.kind.field-removed": "Bidang dihapus",
+  "ApiContractDiffLab.kind.field-added": "Bidang ditambahkan",
+  "ApiContractDiffLab.kind.field-now-required": "Bidang kini wajib",
+  "ApiContractDiffLab.kind.field-now-optional": "Bidang kini opsional",
+  "ApiContractDiffLab.kind.field-type-changed": "Tipe bidang berubah",
+  "ApiContractDiffLab.kind.response-removed": "Respons dihapus",
+  "ApiContractDiffLab.kind.response-added": "Respons ditambahkan",
+  "ApiContractDiffLab.kind.enum-value-removed": "Nilai enum dihapus",
+  "ApiContractDiffLab.kind.enum-value-added": "Nilai enum ditambahkan"
 };

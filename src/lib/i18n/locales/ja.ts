@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { apiContractDiffLabLocale } from "./apiContractDiffLab";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -1420,5 +1421,50 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "有効なレジストリスナップショットのJSONではありません。",
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
-  "EcosystemDiscover.cancel": "キャンセル"
+  "EcosystemDiscover.cancel": "キャンセル",
+  ...apiContractDiffLabLocale,
+  // API Contract Diff & Mock Lab (ROADMAP.md Phase 7, item 23) — real Japanese translations, overriding every apiContractDiffLabLocale key above.
+  "AppMenu.apiContractDiffLab": "APIコントラクト差分＆モックラボ",
+  "ApiContractDiffLab.title": "APIコントラクト差分＆モックラボ",
+  "ApiContractDiffLab.subtitle": "2つのOpenAPI仕様バージョンを比較し、破壊的変更を検出して、モック、契約テストのひな形、クライアント影響ノートを生成します。",
+  "ApiContractDiffLab.close": "APIコントラクト差分＆モックラボを閉じる",
+  "ApiContractDiffLab.oldVersionLabel": "旧バージョン",
+  "ApiContractDiffLab.newVersionLabel": "新バージョン",
+  "ApiContractDiffLab.noFileLoaded": "ファイルが読み込まれていません",
+  "ApiContractDiffLab.specSummary": "{{title}} v{{version}} ・ {{count}}件の操作",
+  "ApiContractDiffLab.chooseFile": "ファイルを選択…",
+  "ApiContractDiffLab.loading": "読み込み中…",
+  "ApiContractDiffLab.runDiff": "差分を実行",
+  "ApiContractDiffLab.startOver": "最初からやり直す",
+  "ApiContractDiffLab.noReportYet": "まだレポートがありません",
+  "ApiContractDiffLab.noReportYetHint": "上で旧バージョンと新バージョンのOpenAPI仕様（JSONまたはYAML）を読み込み、「差分を実行」をクリックしてください。",
+  "ApiContractDiffLab.verdictReady": "リリース準備完了: はい — 破壊的変更 0件",
+  "ApiContractDiffLab.verdictNotReady": "リリース準備完了: いいえ — 破壊的変更 {{count}}件",
+  "ApiContractDiffLab.breakingHeading": "破壊的変更（{{count}}件）",
+  "ApiContractDiffLab.nonBreakingHeading": "非破壊的変更（{{count}}件）",
+  "ApiContractDiffLab.noChanges": "2つのバージョンは構造的に同一です — 変更は検出されませんでした。",
+  "ApiContractDiffLab.draftImpactNotes": "クライアント影響ノートを作成",
+  "ApiContractDiffLab.drafting": "作成中…",
+  "ApiContractDiffLab.impactLabel": "影響",
+  "ApiContractDiffLab.migrationLabel": "移行方法",
+  "ApiContractDiffLab.mocksHeading": "生成されたモックレスポンス",
+  "ApiContractDiffLab.statusLabel": "ステータス {{status}}",
+  "ApiContractDiffLab.testStubHeading": "生成された契約テストのひな形",
+  "ApiContractDiffLab.saveTestStub": "テストひな形を保存…",
+  "ApiContractDiffLab.kind.endpoint-removed": "エンドポイントが削除されました",
+  "ApiContractDiffLab.kind.endpoint-added": "エンドポイントが追加されました",
+  "ApiContractDiffLab.kind.param-removed": "パラメータが削除されました",
+  "ApiContractDiffLab.kind.param-added": "パラメータが追加されました",
+  "ApiContractDiffLab.kind.param-now-required": "パラメータが必須になりました",
+  "ApiContractDiffLab.kind.param-now-optional": "パラメータが任意になりました",
+  "ApiContractDiffLab.kind.param-type-changed": "パラメータの型が変更されました",
+  "ApiContractDiffLab.kind.field-removed": "フィールドが削除されました",
+  "ApiContractDiffLab.kind.field-added": "フィールドが追加されました",
+  "ApiContractDiffLab.kind.field-now-required": "フィールドが必須になりました",
+  "ApiContractDiffLab.kind.field-now-optional": "フィールドが任意になりました",
+  "ApiContractDiffLab.kind.field-type-changed": "フィールドの型が変更されました",
+  "ApiContractDiffLab.kind.response-removed": "レスポンスが削除されました",
+  "ApiContractDiffLab.kind.response-added": "レスポンスが追加されました",
+  "ApiContractDiffLab.kind.enum-value-removed": "enum値が削除されました",
+  "ApiContractDiffLab.kind.enum-value-added": "enum値が追加されました"
 };
