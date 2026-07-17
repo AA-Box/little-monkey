@@ -20,6 +20,7 @@ import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
@@ -48,6 +49,7 @@ export const en: Record<string, string> = {
   ...knowledgeGraphExplorerLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
+  ...pmCopilotLocale,
   ...deepResearchLocale,
   ...briefStudioLocale,
   ...crossRepoChangePlannerLocale,
