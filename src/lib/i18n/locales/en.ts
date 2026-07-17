@@ -20,6 +20,7 @@ import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
@@ -29,6 +30,7 @@ import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const en: Record<string, string> = {
+  ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
   ...searchLocale,

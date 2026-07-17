@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
@@ -22,6 +23,7 @@ import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const hi: Record<string, string> = {
+  ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
   ...searchLocale,
@@ -1557,6 +1559,63 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
   "EcosystemDiscover.cancel": "रद्द करें",
+
+  // Synthetic Monitoring Agent (ROADMAP.md Phase 7, item 17) — real translations overriding the English `syntheticMonitoringLocale` defaults spread above.
+  "AppMenu.syntheticMonitoring": "सिंथेटिक मॉनिटरिंग",
+  "SyntheticMonitoring.title": "सिंथेटिक मॉनिटरिंग एजेंट",
+  "SyntheticMonitoring.subtitle": "स्थानीय और सार्वजनिक URL पर ब्राउज़र यात्राएँ शेड्यूल करें, स्क्रीनशॉट/कंसोल/नेटवर्क साक्ष्य कैप्चर करें, और किसी के विफल होते ही एक प्रस्तावित निदान प्राप्त करें।",
+  "SyntheticMonitoring.close": "सिंथेटिक मॉनिटरिंग बंद करें",
+  "SyntheticMonitoring.addMonitorHeading": "मॉनिटर जोड़ें",
+  "SyntheticMonitoring.editMonitorHeading": "मॉनिटर संपादित करें",
+  "SyntheticMonitoring.nameLabel": "नाम",
+  "SyntheticMonitoring.namePlaceholder": "जैसे मार्केटिंग होमपेज",
+  "SyntheticMonitoring.urlLabel": "URL",
+  "SyntheticMonitoring.urlPlaceholder": "https://example.com/ या http://localhost:5173/",
+  "SyntheticMonitoring.targetEnvLabel": "लक्ष्य",
+  "SyntheticMonitoring.targetEnvLocal": "स्थानीय",
+  "SyntheticMonitoring.targetEnvStaging": "स्टेजिंग",
+  "SyntheticMonitoring.targetEnvProduction": "प्रोडक्शन",
+  "SyntheticMonitoring.intervalLabel": "हर (मिनट)",
+  "SyntheticMonitoring.waitForLabel": "प्रतीक्षा करें",
+  "SyntheticMonitoring.waitForNone": "कुछ नहीं",
+  "SyntheticMonitoring.waitForSelectorOption": "एक सिलेक्टर",
+  "SyntheticMonitoring.waitForTextOption": "कुछ टेक्स्ट",
+  "SyntheticMonitoring.waitForValuePlaceholder": "#app-ready या \"वापसी पर स्वागत है\"",
+  "SyntheticMonitoring.waitTimeoutLabel": "प्रतीक्षा समय-सीमा (सेकंड)",
+  "SyntheticMonitoring.clickSelectorLabel": "क्लिक करें (वैकल्पिक)",
+  "SyntheticMonitoring.clickSelectorPlaceholder": "#accept-cookies",
+  "SyntheticMonitoring.assertionLabel": "जाँचें",
+  "SyntheticMonitoring.assertionSelectorPresent": "सिलेक्टर मौजूद है",
+  "SyntheticMonitoring.assertionTextPresent": "टेक्स्ट मौजूद है",
+  "SyntheticMonitoring.assertionUrlPrefix": "अंतिम URL इससे शुरू होता है",
+  "SyntheticMonitoring.assertionValuePlaceholder": "#dashboard, \"स्वागत है\", या https://example.com/dashboard",
+  "SyntheticMonitoring.cancelEditButton": "रद्द करें",
+  "SyntheticMonitoring.updateButton": "मॉनिटर अपडेट करें",
+  "SyntheticMonitoring.saveButton": "मॉनिटर जोड़ें",
+  "SyntheticMonitoring.monitorsHeading": "मॉनिटर",
+  "SyntheticMonitoring.emptyMonitors": "अभी तक कोई मॉनिटर नहीं है। रन शेड्यूल करना शुरू करने के लिए ऊपर एक जोड़ें।",
+  "SyntheticMonitoring.statusPass": "पास",
+  "SyntheticMonitoring.statusFail": "विफल",
+  "SyntheticMonitoring.statusError": "त्रुटि",
+  "SyntheticMonitoring.lastRunLabel": "अंतिम रन {{time}}",
+  "SyntheticMonitoring.neverRunLabel": "अभी तक नहीं चला",
+  "SyntheticMonitoring.everyIntervalLabel": "हर {{minutes}} मिनट",
+  "SyntheticMonitoring.runNowButton": "अभी चलाएं",
+  "SyntheticMonitoring.runningButton": "चल रहा है…",
+  "SyntheticMonitoring.enableToggleOn": "सक्षम",
+  "SyntheticMonitoring.enableToggleOff": "अक्षम",
+  "SyntheticMonitoring.editButton": "संपादित करें",
+  "SyntheticMonitoring.deleteButton": "हटाएं",
+  "SyntheticMonitoring.noSelectionState": "रन इतिहास और साक्ष्य देखने के लिए एक मॉनिटर चुनें।",
+  "SyntheticMonitoring.runHistoryHeading": "रन इतिहास",
+  "SyntheticMonitoring.emptyRunHistory": "अभी तक कोई रन नहीं है। \"अभी चलाएं\" का उपयोग करें या अगले शेड्यूल किए गए समय की प्रतीक्षा करें।",
+  "SyntheticMonitoring.latencyLabel": "{{ms}} मि.से.",
+  "SyntheticMonitoring.evidenceHeading": "स्क्रीनशॉट",
+  "SyntheticMonitoring.evidenceScreenshotAlt": "मॉनिटर रन के अंत में लिया गया स्क्रीनशॉट",
+  "SyntheticMonitoring.evidenceNoneState": "इस रन के लिए कोई स्क्रीनशॉट कैप्चर नहीं किया गया।",
+  "SyntheticMonitoring.failureReasonHeading": "विफलता का कारण",
+  "SyntheticMonitoring.diagnosisHeading": "प्रस्तावित निदान",
+  "SyntheticMonitoring.diagnosisNoneState": "इस रन के लिए कोई निदान नहीं बनाया गया (कोई मॉडल उपलब्ध नहीं था, या कॉल का समय समाप्त हो गया)।",
   // Real Hindi translations, overriding every crossRepoIntelligenceLocale key above.
   "AppMenu.crossRepoIntelligence": "क्रॉस-रीपो इंटेलिजेंस",
   "CrossRepoIntelligencePanel.title": "क्रॉस-रीपो कोड इंटेलिजेंस",

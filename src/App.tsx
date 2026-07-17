@@ -20,6 +20,7 @@ import { RedTeamLabPanel } from "./components/RedTeamLab";
 import { KnowledgeGraphExplorerPanel } from "./components/KnowledgeGraphExplorer";
 import { EvidenceBoardPanel } from "./components/EvidenceBoard";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { SyntheticMonitoringPanel } from "./components/SyntheticMonitoring";
 import { CrossRepoIntelligencePanel } from "./components/CrossRepoIntelligence";
 import { WorkCanvasPanel } from "./components/WorkCanvas";
 import { PmCopilotPanel } from "./components/PmCopilot";
@@ -48,6 +49,7 @@ import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
+import { startSyntheticMonitoringScheduler } from "./store/syntheticMonitoringStore";
 import { useT } from "./lib/i18n";
 import {
   detectShortcutPlatform,
@@ -132,6 +134,7 @@ function App() {
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const [evidenceBoardOpen, setEvidenceBoardOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [syntheticMonitoringOpen, setSyntheticMonitoringOpen] = useState(false);
   const [crossRepoIntelligenceOpen, setCrossRepoIntelligenceOpen] = useState(false);
   const [workCanvasOpen, setWorkCanvasOpen] = useState(false);
   const [pmCopilotOpen, setPmCopilotOpen] = useState(false);
@@ -168,6 +171,7 @@ function App() {
     setEvidenceBoardOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
+    setSyntheticMonitoringOpen(false);
     setCrossRepoIntelligenceOpen(false);
     setWorkCanvasOpen(false);
     setPmCopilotOpen(false);
@@ -237,6 +241,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setSyntheticMonitoringOpen(false);
           setCrossRepoIntelligenceOpen(false);
           setWorkCanvasOpen(false);
           setPmCopilotOpen(false);
@@ -258,6 +263,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setSyntheticMonitoringOpen(false);
           setCrossRepoIntelligenceOpen(false);
           setWorkCanvasOpen(false);
           setPmCopilotOpen(false);
@@ -343,7 +349,12 @@ function App() {
     void hydrateAutomations();
     if (isTauri() && getCurrentWindow().label === "main") {
       startScheduler();
-      return startBackupScheduler();
+      const stopBackupScheduler = startBackupScheduler();
+      const stopSyntheticMonitoringScheduler = startSyntheticMonitoringScheduler();
+      return () => {
+        stopBackupScheduler();
+        stopSyntheticMonitoringScheduler();
+      };
     }
     return undefined;
   }, []);
@@ -476,6 +487,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setWorkCanvasOpen(false);
             setPmCopilotOpen(false);
@@ -500,6 +512,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setWorkCanvasOpen(false);
             setPmCopilotOpen(false);
@@ -525,6 +538,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setWorkCanvasOpen(false);
             setPmCopilotOpen(false);
@@ -550,6 +564,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setWorkCanvasOpen(false);
             setPmCopilotOpen(false);
@@ -576,6 +591,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setWorkCanvasOpen(false);
             setBriefStudioOpen(false);
@@ -655,6 +671,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setWorkCanvasOpen(false);
             setPmCopilotOpen(false);
@@ -729,6 +746,7 @@ function App() {
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setSyntheticMonitoringOpen(false);
             setWorkCanvasOpen(false);
             setPmCopilotOpen(false);
             setDeepResearchOpen(false);
@@ -742,6 +760,32 @@ function App() {
             setCrossRepoIntelligenceOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenSyntheticMonitoring={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setWorkCanvasOpen(false);
+            setPmCopilotOpen(false);
+            setDeepResearchOpen(false);
+            setBriefStudioOpen(false);
+            setCrossRepoPlannerOpen(false);
+            setVisualEditModeOpen(false);
+            setCrossRepoIntelligenceOpen(false);
+            setSettingsInitialTab(undefined);
+            setSyntheticMonitoringOpen(true);
           }}
           onOpenCrossRepoIntelligence={() => {
             setSettingsOpen(false);
@@ -765,6 +809,7 @@ function App() {
             setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setWorkCanvasOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setCrossRepoIntelligenceOpen(true);
           }}
@@ -790,6 +835,7 @@ function App() {
             setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setCrossRepoIntelligenceOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setWorkCanvasOpen(true);
           }}
@@ -815,6 +861,7 @@ function App() {
             setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setCrossRepoIntelligenceOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setPmCopilotOpen(true);
           }}
@@ -840,6 +887,7 @@ function App() {
             setPmCopilotOpen(false);
             setWorkCanvasOpen(false);
             setCrossRepoIntelligenceOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setDeepResearchOpen(true);
           }}
@@ -865,6 +913,7 @@ function App() {
             setPmCopilotOpen(false);
             setWorkCanvasOpen(false);
             setCrossRepoIntelligenceOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setBriefStudioOpen(true);
           }}
@@ -890,6 +939,7 @@ function App() {
             setPmCopilotOpen(false);
             setWorkCanvasOpen(false);
             setCrossRepoIntelligenceOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setCrossRepoPlannerOpen(true);
           }}
@@ -915,6 +965,7 @@ function App() {
             setPmCopilotOpen(false);
             setWorkCanvasOpen(false);
             setCrossRepoIntelligenceOpen(false);
+            setSyntheticMonitoringOpen(false);
             setSettingsInitialTab(undefined);
             setVisualEditModeOpen(true);
           }}
@@ -951,6 +1002,7 @@ function App() {
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
+            setSyntheticMonitoringOpen(false);
             setDebateOpen(false);
             setTerminalOpen(false);
             restartOnboarding();
@@ -976,7 +1028,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -1015,6 +1067,8 @@ function App() {
               }}
               onOpenSettingsTab={openSettingsTab}
             />
+          ) : syntheticMonitoringOpen ? (
+            <SyntheticMonitoringPanel onClose={() => setSyntheticMonitoringOpen(false)} />
           ) : workCanvasOpen ? (
             <WorkCanvasPanel
               onClose={() => setWorkCanvasOpen(false)}
@@ -1095,7 +1149,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
