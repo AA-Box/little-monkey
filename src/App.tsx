@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
+import { FolderTree, ListTodo, PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
@@ -25,6 +25,7 @@ import { BriefStudioPanel } from "./components/BriefStudio";
 import { CrossRepoChangePlannerPanel } from "./components/CrossRepoChangePlanner";
 import { VisualEditModePanel } from "./components/VisualEditMode";
 import { TerminalPanel } from "./components/Terminal";
+import { useTerminalStore } from "./store/terminalStore";
 import { DebatePanel } from "./components/Debate";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
@@ -133,6 +134,12 @@ function App() {
   const [crossRepoPlannerOpen, setCrossRepoPlannerOpen] = useState(false);
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const terminalDock = useTerminalStore((state) => state.dock);
+  /** The right sidebar region shows at most ONE thing at a time (Claude-
+   * Desktop-style): nothing (default), the picker menu, the workspace
+   * panel, or the side-tasks drawer. A right-docked terminal overrides
+   * whatever is selected here. */
+  const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks">("none");
   const [debateOpen, setDebateOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -776,7 +783,10 @@ function App() {
             setVisualEditModeOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
-          onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
+          onOpenSideTasks={() => {
+            useSideTaskStore.getState().openDrawer();
+            setRightPanel("sideTasks");
+          }}
           onOpenDebate={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -821,6 +831,15 @@ function App() {
             title={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
           >
             <SquareTerminal size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant={rightPanel !== "none" ? "secondary" : "ghost"}
+            onClick={() => setRightPanel((panel) => (panel === "none" ? "menu" : "none"))}
+            aria-label={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+            title={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+          >
+            <PanelRight size={15} />
           </IconButton>
         </div>
         <SessionGrantBanner />
@@ -919,10 +938,11 @@ function App() {
             />
           )}
         </ErrorBoundary>
-        {terminalOpen && (
+        {terminalOpen && terminalDock === "bottom" && (
           <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
         )}
       </div>
+
 
       {/* Split pane: a second, fully independent chat opened via the session
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
@@ -952,16 +972,57 @@ function App() {
         </div>
       )}
 
-      {/* Side Tasks: a collapsible panel that coexists with whatever the
-          main pane is showing (unlike RunCenter/BrowserWorkbench, which
-          replace it) — ROADMAP.md's "Side Tasks" item asks for parallel work
-          that stays visible next to the main chat, not a full-screen swap.
-          Keyed by the active session so a manually-started ("+ New") task is
-          attributed to whichever chat is actually on screen. */}
-      <SideTaskDrawer sessionId={activeSessionId} />
-
-      {/* Right: collapsible workspace panel (file tree + diff preview),
-          also extending to the top of the window */}
+      {/* Right region: hidden by default; shows exactly one of — the
+          right-docked terminal (overrides everything), the picker menu, the
+          side-tasks drawer, or the workspace panel. Claude-Desktop-style:
+          contents swap in place, they never stack beside each other. */}
+      {terminalOpen && terminalDock === "right" ? (
+        <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
+      ) : rightPanel === "sideTasks" ? (
+        <SideTaskDrawer sessionId={activeSessionId} />
+      ) : rightPanel === "menu" ? (
+        <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-surface">
+          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
+              {t("App.rightPanelMenuTitle")}
+            </span>
+            <IconButton size="sm" onClick={() => setRightPanel("none")} aria-label={t("App.closeRightSidebar")} className="ml-auto">
+              <X size={16} />
+            </IconButton>
+          </div>
+          <div className="flex flex-col gap-1 p-3">
+            <button
+              type="button"
+              onClick={() => setRightPanel("workspace")}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <FolderTree size={16} className="shrink-0 text-faint" /> {t("App.rightPanelWorkspace")}
+            </button>
+            <button
+              type="button"
+              disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+              onClick={() => {
+                useTerminalStore.getState().setDock("right");
+                setTerminalOpen(true);
+                setRightPanel("none");
+              }}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+            >
+              <SquareTerminal size={16} className="shrink-0 text-faint" /> {t("App.rightPanelTerminal")}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                useSideTaskStore.getState().openDrawer();
+                setRightPanel("sideTasks");
+              }}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <ListTodo size={16} className="shrink-0 text-faint" /> {t("App.rightPanelSideTasks")}
+            </button>
+          </div>
+        </aside>
+      ) : rightPanel === "workspace" ? (
       <aside
         className={`flex shrink-0 flex-col border-l border-border bg-surface transition-[width] duration-200 ${
           workspacePanelOpen ? "w-96" : "w-12"
@@ -1024,6 +1085,7 @@ function App() {
           </div>
         ))}
       </aside>
+      ) : null}
 
       {commandPaletteOpen && (
         <CommandPalette

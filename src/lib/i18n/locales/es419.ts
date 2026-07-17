@@ -609,7 +609,7 @@ export const es419: Record<string, string> = {
   "TerminalPanel.dismiss": "Descartar",
   "TerminalPanel.loading": "Cargando sesiones de terminal…",
   "TerminalPanel.emptyTitle": "Sin sesión de terminal",
-  "TerminalPanel.emptyDescription": "Inicia un shell real limitado al espacio de trabajo. Abrirlo y cada comando enviado usan la misma política de aprobación que las herramientas de shell.",
+  "TerminalPanel.emptyDescription": "Inicia un shell real limitado al espacio de trabajo. Se abre al instante: los comandos que escribas aquí se ejecutan como tu usuario, sin solicitudes de aprobación.",
   "TerminalPanel.startTerminal": "Iniciar terminal",
   "TerminalPanel.status.running": "En ejecución",
   "TerminalPanel.status.exited": "Finalizado",

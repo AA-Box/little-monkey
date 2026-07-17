@@ -609,7 +609,7 @@ export const ko: Record<string, string> = {
   "TerminalPanel.dismiss": "닫기",
   "TerminalPanel.loading": "터미널 세션을 불러오는 중…",
   "TerminalPanel.emptyTitle": "터미널 세션 없음",
-  "TerminalPanel.emptyDescription": "워크스페이스로 범위가 제한된 실제 셸을 시작합니다. 셸을 여는 것과 제출되는 모든 명령은 셸 도구와 동일한 승인 정책을 따릅니다.",
+  "TerminalPanel.emptyDescription": "워크스페이스로 범위가 제한된 실제 셸을 시작합니다. 즉시 열리며, 여기에 입력한 명령은 승인 프롬프트 없이 사용자 권한으로 실행됩니다.",
   "TerminalPanel.startTerminal": "터미널 시작",
   "TerminalPanel.status.running": "실행 중",
   "TerminalPanel.status.exited": "종료됨",

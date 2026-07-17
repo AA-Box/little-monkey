@@ -609,7 +609,7 @@ export const de: Record<string, string> = {
   "TerminalPanel.dismiss": "Ausblenden",
   "TerminalPanel.loading": "Terminal-Sitzungen werden geladen…",
   "TerminalPanel.emptyTitle": "Keine Terminal-Sitzung",
-  "TerminalPanel.emptyDescription": "Starten Sie eine echte, auf den Arbeitsbereich beschränkte Shell. Das Öffnen und jeder abgeschickte Befehl unterliegen derselben Genehmigungsrichtlinie wie Shell-Tools.",
+  "TerminalPanel.emptyDescription": "Starten Sie eine echte, auf den Arbeitsbereich beschränkte Shell. Sie öffnet sich sofort — hier eingegebene Befehle laufen ohne Genehmigungsabfragen unter Ihrem Benutzer.",
   "TerminalPanel.startTerminal": "Terminal starten",
   "TerminalPanel.status.running": "Läuft",
   "TerminalPanel.status.exited": "Beendet",

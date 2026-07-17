@@ -697,6 +697,7 @@ pub fn run() {
             terminal::terminal_create,
             terminal::terminal_list,
             terminal::terminal_execute,
+            terminal::terminal_write,
             terminal::terminal_interrupt,
             terminal::terminal_resize,
             terminal::terminal_kill,
