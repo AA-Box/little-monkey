@@ -351,12 +351,22 @@ pub fn set_primary_workspace_root(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<WorkspaceRootInfo, String> {
-    let (_, info) = set_primary_workspace_root_impl(state.inner(), path)?;
+    let (changed, info) = set_primary_workspace_root_impl(state.inner(), path)?;
+    if changed {
+        // A PTY remains an unrestricted OS process after it starts. Kill it
+        // before a workspace switch can leave a now-detached shell running
+        // behind the new workspace's permission boundary.
+        state.terminal.kill_all(Some(&app));
+    }
     record_recent(&app, Path::new(&info.path), &info.label);
     Ok(info)
 }
 
-fn add_secondary_workspace_root_impl(
+/// `pub(crate)` (rather than private) so `issue_to_pr.rs` can attach an
+/// owned worktree as a secondary root directly from `&AppState` — the same
+/// "core logic factored out for reuse" reasoning as every other
+/// `*_impl` function in this file, just needed by another module for once.
+pub(crate) fn add_secondary_workspace_root_impl(
     state: &AppState,
     path: String,
 ) -> Result<WorkspaceRootInfo, String> {
@@ -413,10 +423,13 @@ fn remove_secondary_workspace_root_impl(state: &AppState, id: String) -> Result<
 /// use [`set_primary_workspace_root`] to change that instead.
 #[tauri::command]
 pub fn remove_secondary_workspace_root(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    remove_secondary_workspace_root_impl(state.inner(), id)
+    remove_secondary_workspace_root_impl(state.inner(), id.clone())?;
+    state.terminal.kill_workspace(&id, Some(&app));
+    Ok(())
 }
 
 /// Every currently attached folder, primary first.

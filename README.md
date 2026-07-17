@@ -2,7 +2,7 @@
 
 Little Monkey is a local-first Tauri desktop workspace for agentic AI. It can run against managed `llama.cpp`, Ollama, MLX on supported Apple Silicon, or OpenAI-compatible providers that you configure. The React UI and Rust backend share workspace, permission, run, model, package, browser, Git, and background-service contracts instead of treating each surface as a separate product.
 
-The current working tree includes functional M1–M7 implementations. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations) and tracked precisely in [ROADMAP.md](ROADMAP.md).
+The current working tree includes the shipped foundations described below. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations). Future product proposals and their acceptance boundaries live in [ROADMAP.md](ROADMAP.md).
 
 ## Features
 
@@ -22,6 +22,7 @@ The current working tree includes functional M1–M7 implementations. Some relea
 - Use workspace-scoped file read/list, glob, grep, edit/write, shell, memory, web fetch/search, knowledge search, MCP, subagent, plan, and verification tools.
 - Choose `manual`, `plan`, `acceptEdits`, `smart`, `auto`, or `bypass` permission modes. Sensitive paths have a deterministic risk floor, shell execution is kept behind the stronger policy, and unattended recipes cannot use `bypass`.
 - Checkpoint every mutating turn, then revert or re-apply file changes, rewind the conversation, or do both from the timeline.
+- Preview a checkpoint's per-file diff, artifacts, screenshots, and verification state before restoring it, compare any two checkpoints read-only, and run a rollback simulation that shows exactly what will change — with file, artifact, conversation, and external (shell/network/MCP) state distinguished, and effects that can't be safely undone marked `needs_reconciliation` rather than silently skipped.
 - Configure post-edit lint/build/test commands. Failures can return to the model for a bounded repair loop and are recorded as verification events.
 - Treat retrieved pages, RAG chunks, MCP results, subprocess output, GitHub content, browser evidence, subagent reports, and other model output as untrusted data before it re-enters a model prompt.
 - Inspect local posture in **Settings → Security Doctor**, or run `monkey security audit`. It checks app-data permissions, API/webhook listeners, remote TLS posture, MCP origins, installed skill integrity, and active browser/companion grants without contacting a model. `--fix` is limited to private app-owned modes and disabling clearly unsafe listeners; it does not delete user data or rotate credentials.
@@ -38,6 +39,8 @@ The current working tree includes functional M1–M7 implementations. Some relea
 ### Runtime and API Hub
 
 - Inspect CPU/memory and runtime inventory, estimate model fit, search configured catalogs, resume verified downloads, activate/roll back model versions, prune old versions, clean owned orphan data, and load/unload supported runtimes.
+- Show a Hardware Compatibility Matrix ("Driver Doctor") before any model download, model load, or runtime install: real detection of Metal, CUDA, ROCm, Vulkan, and (best-effort) DirectML, plus driver version, compute capability, Jetson, and hybrid/multi-GPU detection, with an honest `available`/`not_detected`/`driver_too_old`/`tool_missing`/`unsupported` status per backend that never fails just because a GPU tool or device is absent.
+- Track each installed model's source registry, license, quantization, chat template, and multimodal projector in a content-addressed, digest-verified manifest; reuse an already-verified payload across asset variants/versions instead of re-downloading identical bytes, and never trust a corrupt local copy for reuse.
 - Manage Ollama, `llama.cpp`, and MLX through one runtime contract with capability preflight, owned-process shutdown, logs, metrics, cancellation, and resource-aware scheduling.
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
@@ -301,7 +304,7 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - GitHub delivery needs local `git` plus authenticated `gh`; hosted Actions need user-supplied provider credentials, while Ollama review needs a user-owned self-hosted runner.
 - The local OCR, speech, meeting, and image paths require configured binaries/models/endpoints. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no Little Monkey relay, account service, RBAC/SSO plane, or hosted GPU.
-- M8 release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim.
+- Release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim.
 
 ## Project layout
 
@@ -312,5 +315,5 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - `.github/actions/little-monkey-review/` — reusable PR-review action implementation and contract test.
 - `src-tauri/fixtures/` — deterministic browser and knowledge acceptance fixtures.
 - `graphify-out/` — generated architecture graph and wiki; run `graphify update .` after code changes.
-- [ROADMAP.md](ROADMAP.md) — milestone design, dependency order, implementation status, acceptance gates, and remaining external evidence.
+- [ROADMAP.md](ROADMAP.md) — future product phases, scoped acceptance boundaries, research items, and explicit non-goals.
 - [roadmap_audit_report.md](roadmap_audit_report.md) — preserved historical audit followed by a current working-tree closeout.

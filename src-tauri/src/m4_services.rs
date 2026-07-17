@@ -25,11 +25,12 @@ use crate::mcp_app_core::{
 };
 use crate::package_ecosystem::{
     install_preview, signed_first_party_catalog, verify_package, verify_registry_snapshot,
-    ConnectorAuthKind, ContentKind, InstallEnvironment, InstallPreview, InstallTrustPolicy,
-    InstalledPackageState, McpRequirementKind, PackageBundle, PackageError, PackageKind,
-    PackageLimits, PackageManifest, PackagePermission, PackageStore, PermissionApproval,
-    PortablePackageExport, RegistrySnapshot, SemanticVersion, SignatureVerifier, TrustEvidence,
-    TrustStore, VerifiedPackage, VerifiedRegistryState,
+    AdditionalRegistryRecord, AdditionalRegistrySource, ConnectorAuthKind, ContentKind,
+    InstallEnvironment, InstallPreview, InstallTrustPolicy, InstalledPackageState,
+    McpRequirementKind, PackageBundle, PackageError, PackageKind, PackageLimits, PackageManifest,
+    PackagePermission, PackageStore, PermissionApproval, PortablePackageExport, RegistrySnapshot,
+    SemanticVersion, SignatureVerifier, TrustEvidence, TrustStore, VerifiedPackage,
+    VerifiedRegistryState,
 };
 use crate::workflow_core::{
     adapt_legacy_recipe, compile_workflow, plan_replay, reconcile_node, DaemonCapability,
@@ -528,6 +529,19 @@ impl PackageRegistryService {
         Ok(self.store.set_enabled(package_id, enabled)?)
     }
 
+    /// Sets the local "team approved" flag on an installed package. This is
+    /// deliberately not gated behind any role/permission check here — it is
+    /// a plain, locally-observed toggle intended for `PackageKind::Collection`
+    /// packages so a separate Team Mode feature, present or not, never has a
+    /// hard dependency on this field.
+    pub fn set_team_approved(
+        &self,
+        package_id: &str,
+        team_approved: bool,
+    ) -> Result<InstalledPackageState, M4ServiceError> {
+        Ok(self.store.set_team_approved(package_id, team_approved)?)
+    }
+
     pub fn pin(
         &self,
         package_id: &str,
@@ -548,8 +562,80 @@ impl PackageRegistryService {
         Ok(self.store.export_active(package_id)?)
     }
 
+    /// Lists every user-added registry source (the roadmap's "private/team
+    /// catalog"), including ones that have never successfully verified.
+    pub fn list_registry_sources(&self) -> Result<Vec<AdditionalRegistryRecord>, M4ServiceError> {
+        Ok(self.store.list_registry_sources()?)
+    }
+
+    pub fn add_registry_source(
+        &self,
+        source_id: String,
+        display_name: String,
+        location: String,
+        now_unix_ms: u64,
+    ) -> Result<AdditionalRegistryRecord, M4ServiceError> {
+        Ok(self.store.add_registry_source(AdditionalRegistrySource {
+            source_id,
+            display_name,
+            location,
+            added_unix_ms: now_unix_ms,
+        })?)
+    }
+
+    pub fn remove_registry_source(&self, source_id: &str) -> Result<bool, M4ServiceError> {
+        Ok(self.store.remove_registry_source(source_id)?)
+    }
+
+    /// Verifies a caller-supplied registry snapshot for one added source
+    /// through the exact same Ed25519 trust chain
+    /// ([`verify_registry_snapshot`]) as the built-in first-party registry —
+    /// never a bypass. Packages from this source only become visible once
+    /// this call succeeds; a failed verification is persisted as an error
+    /// (returned in `last_verification_error` on the record below, not as a
+    /// service error) and never marks the source trusted, but a previously
+    /// verified snapshot is retained rather than discarded.
+    pub fn verify_registry_source(
+        &self,
+        source_id: &str,
+        snapshot: RegistrySnapshot,
+        now_unix_ms: u64,
+    ) -> Result<AdditionalRegistryRecord, M4ServiceError> {
+        let previous = self
+            .store
+            .list_registry_sources()?
+            .into_iter()
+            .find(|record| record.source.source_id == source_id)
+            .ok_or_else(|| {
+                M4ServiceError::NotFound(format!("registry source {source_id} is not registered"))
+            })?
+            .verified;
+        match verify_registry_snapshot(
+            &snapshot,
+            &self.trust_store,
+            previous.as_ref(),
+            self.verifier.as_ref(),
+            now_unix_ms,
+        ) {
+            Ok(verified) => Ok(self
+                .store
+                .record_registry_verification(source_id, Some(verified), None)?),
+            Err(error) => Ok(self.store.record_registry_verification(
+                source_id,
+                None,
+                Some(error.to_string()),
+            )?),
+        }
+    }
+
+    /// Lists installed package states, excluding tombstoned (uninstalled) entries.
     pub fn installed(&self) -> Result<Vec<InstalledPackageState>, M4ServiceError> {
-        Ok(self.store.list_installed()?)
+        Ok(self
+            .store
+            .list_installed()?
+            .into_iter()
+            .filter(|state| !state.tombstoned)
+            .collect())
     }
 
     /// Produces one consolidated runtime/health view across all installed
@@ -563,17 +649,24 @@ impl PackageRegistryService {
         oauth_origins: &BTreeSet<String>,
         activated_workflow_ids: &BTreeSet<String>,
     ) -> Result<Vec<PluginRuntimeDescriptor>, M4ServiceError> {
-        let states = self.store.list_installed()?;
+        // Tombstones are durable reinstall/audit metadata, not installed
+        // plugins. Exposing them here created a ghost blocked runtime card:
+        // export_active correctly returned NotInstalled, but the UI still
+        // rendered the historical package as corrupt. Building on installed()
+        // keeps this view aligned with the Settings installed list, so a
+        // non-tombstoned state without an active version still surfaces as a
+        // blocked runtime instead of silently disappearing.
+        let states = self.installed()?;
         let enabled_packages = states
             .iter()
-            .filter(|state| state.enabled && !state.revoked && !state.tombstoned)
+            .filter(|state| state.enabled && !state.revoked)
             .map(|state| state.package_id.clone())
             .collect::<BTreeSet<_>>();
         let mut plugins = Vec::with_capacity(states.len());
 
         for state in states {
             let active = state.active_version;
-            let blocked = state.revoked || state.tombstoned || active.is_none();
+            let blocked = state.revoked || active.is_none();
             let rollback_target = state
                 .activation_history
                 .iter()
@@ -2388,7 +2481,133 @@ mod tests {
                 .unwrap()
                 .tombstoned
         );
+        assert!(service.installed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uninstall_removes_plugin_from_installed_and_runtime_views() {
+        let directory = TempDirectory::new("plugin-runtime-uninstall");
+        let service = package_service(&directory.0);
+        let now = FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS;
+        let package = service
+            .seed_first_party(now)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.manifest.package_id == "com.littlemonkey.skill.review")
+            .unwrap();
+        let preview = service
+            .preview(&package.manifest.package_id, package.manifest.version, now)
+            .unwrap();
+        service
+            .install(
+                &PackageInstallAuthorization {
+                    package_id: package.manifest.package_id.clone(),
+                    version: package.manifest.version,
+                    approval_digest: preview.approval_digest,
+                    approved: true,
+                },
+                now,
+            )
+            .unwrap();
         assert_eq!(service.installed().unwrap().len(), 1);
+        assert_eq!(
+            service
+                .plugin_runtime(
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        service.uninstall(&package.manifest.package_id).unwrap();
+
+        assert!(service.installed().unwrap().is_empty());
+        assert!(service
+            .plugin_runtime(
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap()
+            .is_empty());
+
+        // Tombstone metadata still exists internally so reinstall sequencing
+        // and audit history remain intact; it is simply no longer a runtime.
+        assert!(service
+            .store
+            .installed(&package.manifest.package_id)
+            .unwrap()
+            .is_some_and(|state| state.tombstoned));
+    }
+
+    #[test]
+    fn plugin_runtime_reports_blocked_package_without_active_version() {
+        let directory = TempDirectory::new("plugin-runtime-active-none");
+        let service = package_service(&directory.0);
+        let now = FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS;
+        let package = service
+            .seed_first_party(now)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.manifest.package_id == "com.littlemonkey.skill.review")
+            .unwrap();
+        let preview = service
+            .preview(&package.manifest.package_id, package.manifest.version, now)
+            .unwrap();
+        service
+            .install(
+                &PackageInstallAuthorization {
+                    package_id: package.manifest.package_id.clone(),
+                    version: package.manifest.version,
+                    approval_digest: preview.approval_digest,
+                    approved: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Simulate a state written by an older schema or foreign tool: not
+        // tombstoned, yet without an active version. validate() accepts it,
+        // so both views must agree on how it is reported.
+        let mut state = service
+            .store
+            .installed(&package.manifest.package_id)
+            .unwrap()
+            .unwrap();
+        state.active_version = None;
+        state.sequence += 1;
+        let state_directory = fs::read_dir(directory.0.join("state"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap();
+        fs::write(
+            state_directory.join(format!("state-{:020}-manual.json", state.sequence)),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let installed = service.installed().unwrap();
+        assert_eq!(installed.len(), 1);
+        assert!(installed[0].active_version.is_none());
+
+        let plugins = service
+            .plugin_runtime(
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].health, PluginRuntimeHealth::Blocked);
+        assert!(plugins[0].version.is_none());
+        assert!(!plugins[0].issues.is_empty());
     }
 
     #[test]

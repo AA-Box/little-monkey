@@ -55,7 +55,7 @@ import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPromp
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
-import { getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -65,6 +65,7 @@ import { usePermissionStore, type PermissionMode } from '../store/permissionStor
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
@@ -122,6 +123,16 @@ export const MENTION_NOTE_PREFIX = '[Mentions]';
 
 export function isMentionNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MENTION_NOTE_PREFIX);
+}
+
+/** Prefix identifying a synthetic Privacy Firewall notice (ROADMAP.md Phase
+ * 5) — redaction, block, or local-only-fallback switch — inserted into the
+ * transcript by the pre-turn gate in `runAgentTurnBody`. Same rendering
+ * convention as `SWITCH_NOTE_PREFIX`/`MENTION_NOTE_PREFIX` above. */
+export const PRIVACY_NOTE_PREFIX = '[Privacy firewall]';
+
+export function isPrivacyNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PRIVACY_NOTE_PREFIX);
 }
 
 /**
@@ -989,8 +1000,20 @@ async function resolveBaseUrl(): Promise<string> {
  * (its API key lives in the OS keychain, never here); local llama.cpp and
  * the unauthenticated local Ollama daemon both use the direct-`fetch`
  * `streamChat` path.
+ *
+ * Exported so `sideTaskRunner.ts` can default a newly-started side task onto
+ * whatever model the main chat is currently using, without re-implementing
+ * this resolution logic (or the local-runtime `resolveBaseUrl` lookup a
+ * from-scratch version would need) a second time — a side task's own loop is
+ * deliberately independent of the parent turn (see that module's doc
+ * comment), but "which model is active right now" is still a single, shared
+ * piece of app state both should read the same way.
  */
-async function resolveTarget(): Promise<ResolvedTarget> {
+/** Exported (in addition to the module's own uses above) so
+ * `issueToPrRunner.ts` can resolve the exact same active-target rules for
+ * its own headless, panel-driven agent turn — see that module's doc comment
+ * for why it reuses this rather than re-deriving target resolution. */
+export async function resolveTarget(): Promise<ResolvedTarget> {
   const target = getActiveChatTarget();
 
   if (target.kind === 'provider') {
@@ -1042,7 +1065,7 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
         ],
         [],
         undefined,
-        useModelStore.getState().effort,
+        effortForTarget(target),
         sessionId,
       );
       if (summary.streamError) throw new Error(summary.streamError);
@@ -1061,7 +1084,10 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
  * contains its endpoint/model/capability evidence. The inventory is built
  * once at run start; later global model changes cannot rewrite the ledger
  * snapshot. */
-function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+/** Exported so `issueToPrRunner.ts` can build the `target` field
+ * `beginDurableRun` needs for its own headless run, the same reuse reasoning
+ * as `resolveTarget` above. */
+export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
   const state = useModelStore.getState();
   const inventory = buildModelTargetInventory({
     installed: state.installed,
@@ -1071,7 +1097,7 @@ function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot 
     ollamaReachable: state.ollamaReachable,
     providers: state.providers,
     providerModels: state.providerModels,
-    effort: state.effort,
+    effortByTarget: state.effortByTarget,
   });
   if (target.kind === 'local') {
     return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
@@ -1208,6 +1234,27 @@ function buildFailoverChain(requireVision: boolean): ResolvedTarget[] {
   return chain;
 }
 
+/**
+ * The Privacy Firewall's (ROADMAP.md Phase 5) "switch to local" fallback —
+ * the currently selected Ollama model if one is configured, otherwise its
+ * first cached model. Deliberately never managed llama.cpp: starting that
+ * requires an explicit, already-downloaded model and an `llama_start` call
+ * (see `modelStore.ts::start`) this gate has no basis to make unattended,
+ * the same reasoning `buildFailoverChain`'s doc comment gives for why local
+ * llama.cpp never appears in *that* automatic switch chain either. Returns
+ * `null` when no Ollama model is configured at all, in which case the
+ * caller cancels the turn rather than guessing at a target.
+ */
+function findLocalOnlyTarget(): ResolvedTarget | null {
+  const state = useModelStore.getState();
+  const preferred =
+    state.activeOllamaModel && state.ollamaModels.some((model) => model.name === state.activeOllamaModel)
+      ? state.activeOllamaModel
+      : state.ollamaModels[0]?.name;
+  if (!preferred) return null;
+  return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: preferred };
+}
+
 /** Searches every configured target (cloud providers first, then Ollama) for one that can see images, for the pre-turn vision auto-switch. Returns `null` if nothing qualifies. */
 function findVisionCandidate(): ResolvedTarget | null {
   const chain = buildFailoverChain(true);
@@ -1224,9 +1271,14 @@ export interface AttachmentRef {
   path: string;
   isDir: boolean;
   /** Set at pick-time in `ChatWindow.tsx` for image files — its presence (alongside `dataUrl`) is what routes this attachment to the vision content-part path instead of the text-inlining path below. */
-  kind?: 'image';
+  kind?: 'image' | 'inline_text';
   /** The already-base64-encoded `data:` URL for an image attachment, read once at pick-time (see `imageAttachment.ts`) so this module never re-reads the file. */
   dataUrl?: string;
+  /** Bounded, user-approved inline text. Currently used by terminal evidence
+   * so it never needs to masquerade as a readable workspace path. */
+  content?: string;
+  /** Optional chip label for virtual attachments such as terminal evidence. */
+  label?: string;
 }
 
 /** A single resolved image attachment, ready to become a `ChatContentPart`. */
@@ -1254,10 +1306,24 @@ export async function resolveReferences(
 ): Promise<{ textRefs: ResolvedTextReference[]; images: ResolvedImage[]; unresolved: string[] }> {
   const images: ResolvedImage[] = [];
   const textAttachments: AttachmentRef[] = [];
+  const textRefs: ResolvedTextReference[] = [];
+  const inlinePaths = new Set<string>();
 
   for (const attachment of attachments) {
     if (attachment.kind === 'image') {
       if (attachment.dataUrl) images.push({ path: attachment.path, dataUrl: attachment.dataUrl });
+      continue;
+    }
+    if (attachment.kind === 'inline_text') {
+      if (attachment.content && !inlinePaths.has(attachment.path)) {
+        inlinePaths.add(attachment.path);
+        textRefs.push({
+          path: attachment.path,
+          isDir: false,
+          content: attachment.content,
+          source: 'terminal',
+        });
+      }
       continue;
     }
     textAttachments.push(attachment);
@@ -1271,7 +1337,6 @@ export async function resolveReferences(
     merged.set(attachment.path, attachment.isDir);
   }
 
-  const textRefs: ResolvedTextReference[] = [];
   const unresolved: string[] = [];
 
   for (const [path, isDir] of merged) {
@@ -1580,7 +1645,7 @@ async function runDaemonAgentTurn(
     verifyEnabled: settings.verifyEnabled,
     verifyMaxRounds: settings.verifyMaxRounds,
     subagentsEnabled: settings.subagentsEnabled,
-    effort: useModelStore.getState().effort,
+    effort: effortForTarget(resolvedTarget) ?? null,
     mcpServers: useMcpStore.getState().servers,
     attachedStackIds,
     attachedStackNames: attachedStacks.map((stack) => stack.name),
@@ -1829,7 +1894,7 @@ async function runAgentTurnBody(
   }
 
   const composedText = composeReferencedText(userText, textRefs);
-  const wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
+  let wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
@@ -1860,7 +1925,7 @@ async function runAgentTurnBody(
   // once per turn and only advanced (never rebuilt) on a pre-first-token
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
-  const primaryTarget = await resolveTarget();
+  let primaryTarget = await resolveTarget();
 
   // Distinct from the block above: that one is about a NEW image attached
   // THIS turn; this one is an OLDER image already sitting in history from a
@@ -1878,6 +1943,59 @@ async function runAgentTurnBody(
     });
   }
 
+  // Privacy Firewall (ROADMAP.md Phase 5): a visible data boundary before
+  // this turn's content — `composedText`, i.e. the typed message plus every
+  // "@"-mention/attachment it expanded into above, so a secret hiding in a
+  // referenced FILE is caught exactly like one typed directly — leaves the
+  // machine for a CLOUD model. Local llama.cpp and Ollama targets never
+  // leave the machine, so the gate is skipped entirely for those. Run after
+  // the vision-switch checks above so their notices describe the model the
+  // user actually picked, not one this gate might still redirect away from.
+  //
+  // OUT OF SCOPE this pass (see `privacy_firewall.rs`'s own module doc):
+  // every other outbound path — connector writes, MCP tool results, a
+  // paired device (Phase 4, unshipped) — is not gated here. The scanner and
+  // policy engine are destination-agnostic specifically so those call sites
+  // are additive later, not a redesign of this one.
+  if (primaryTarget.kind === 'provider') {
+    const workspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
+    const gate = await usePrivacyFirewallStore
+      .getState()
+      .gateOutbound(composedText, 'cloud_model', workspaceId);
+
+    if (gate.action === 'cancelled') {
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} This turn was blocked from being sent to ${targetLabel(primaryTarget)} and was cancelled.`,
+      });
+      return;
+    }
+
+    if (gate.action === 'switch_local') {
+      const local = findLocalOnlyTarget();
+      if (!local) {
+        addMessage({
+          role: 'system',
+          content: `${PRIVACY_NOTE_PREFIX} This turn was blocked from being sent to ${targetLabel(primaryTarget)}, and no local-only model is configured to switch to — the turn was cancelled. Configure an Ollama model to enable the local-only fallback.`,
+        });
+        return;
+      }
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Switched to ${targetLabel(local)} — this turn's content was blocked from leaving the machine.`,
+      });
+      primaryTarget = local;
+      applyTargetSwitch(local);
+    } else if (gate.content !== composedText) {
+      const redactedCount = gate.report.findings.filter((finding) => finding.action !== 'allow').length;
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
+      });
+      wireContent = toMessageContent(gate.content, images);
+    }
+  }
+
   const sequence: ResolvedTarget[] =
     settings.autoFailoverEnabled && primaryTarget.kind === 'provider'
       ? [primaryTarget, ...buildFailoverChain(requireVision).filter((c) => !(c.kind === 'provider' && c.providerId === primaryTarget.providerId && c.model === primaryTarget.model))]
@@ -1885,9 +2003,11 @@ async function runAgentTurnBody(
   let sequenceIndex = 0;
   let target = sequence[0];
 
-  const effort = useModelStore.getState().effort;
+  // Per-model, so it must track the target: re-resolved below whenever a
+  // failover switch changes `target` mid-turn.
+  let effort = effortForTarget(primaryTarget);
 
-  // Read once per turn, like `effort` above — not re-derived on every
+  // Read once per turn — not re-derived on every
   // tool-calling round trip, so a mode switch mid-turn (possible via the
   // split pane's shared global mode, or the user clicking Approve on a plan
   // card mid-turn) never changes what's offered partway through this turn's
@@ -2236,6 +2356,7 @@ async function runAgentTurnBody(
         .catch((error) => console.error('Failed to close failed-over durable run', error));
       sequenceIndex += 1;
       target = sequence[sequenceIndex];
+      effort = effortForTarget(target);
       durable.recorder = await startDurableRecorder(
         target,
         `${turnId}-failover-${sequenceIndex}`,
