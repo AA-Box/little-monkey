@@ -13,6 +13,7 @@ import {
   Inbox,
   Network,
   Newspaper,
+  Plug,
   Search,
   ServerCog,
   Settings as SettingsIcon,
@@ -34,6 +35,7 @@ interface AppMenuProps {
   onOpenIssueToPr: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
+  onOpenConnectorBuilder: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
@@ -77,6 +79,7 @@ export function AppMenu({
   onOpenIssueToPr,
   onOpenSopCompiler,
   onOpenMcpGenerator,
+  onOpenConnectorBuilder,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
@@ -191,6 +194,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
+            icon={<Plug size={14} className="text-faint" />}
+            label={t("AppMenu.connectorBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenConnectorBuilder();
             }}
           />
           <MenuRow

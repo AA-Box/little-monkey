@@ -8,6 +8,7 @@ import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
@@ -65,6 +66,7 @@ export const ja: Record<string, string> = {
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...onboardingLocale,
   // オンボーディングウィザードの実際の日本語訳。上でスプレッドした英語の
   // フォールバックを上書きする。
@@ -1283,5 +1285,52 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "有効なレジストリスナップショットのJSONではありません。",
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
-  "EcosystemDiscover.cancel": "キャンセル"
+  "EcosystemDiscover.cancel": "キャンセル",
+  // Connector Builder Studio (ROADMAP.md Phase 7) — real translations overriding the English `connectorBuilderLocale` defaults spread above.
+  "AppMenu.connectorBuilder": "コネクタビルダー",
+  "ConnectorBuilder.title": "コネクタビルダースタジオ",
+  "ConnectorBuilder.subtitle": "OpenAPI仕様からコネクタを生成し、その認証設定、スキーマ、レート制限のヒントを確認したうえで、エージェントに提供される前に敵対的な呼び出しをシミュレートします。",
+  "ConnectorBuilder.close": "コネクタビルダーを閉じる",
+  "ConnectorBuilder.specHeading": "OpenAPI仕様",
+  "ConnectorBuilder.importButton": "ファイルをインポート",
+  "ConnectorBuilder.loadedFile": "{{name}} を読み込みました",
+  "ConnectorBuilder.specPlaceholder": "OpenAPI 3.xまたはSwagger 2.0のドキュメント（JSONまたはYAML）を貼り付けるか、ディスクからインポートしてください。",
+  "ConnectorBuilder.resetButton": "リセット",
+  "ConnectorBuilder.generateButton": "コネクタを生成",
+  "ConnectorBuilder.draftingSummary": "要約を作成中…",
+  "ConnectorBuilder.authLabel": "認証",
+  "ConnectorBuilder.rateLimitLabel": "レート制限",
+  "ConnectorBuilder.rateLimitValue": "{{count}} 回/分",
+  "ConnectorBuilder.toolCountLabel": "ツール",
+  "ConnectorBuilder.authType.none": "なし",
+  "ConnectorBuilder.authType.apiKey": "APIキー",
+  "ConnectorBuilder.authType.httpBearer": "ベアラートークン",
+  "ConnectorBuilder.authType.httpBasic": "HTTP Basic",
+  "ConnectorBuilder.authType.oauth2": "OAuth2",
+  "ConnectorBuilder.noSelectionHint": "OpenAPI仕様を読み込むか貼り付けてコネクタを生成すると、ツールとシミュレーターレポートをプレビューできます。",
+  "ConnectorBuilder.runSimulatorButton": "シミュレーターを実行",
+  "ConnectorBuilder.registerButton": "MCPに登録",
+  "ConnectorBuilder.registerBlockedHint": "このコネクタは、登録されてエージェントに利用可能になる前にシミュレーターに合格する必要があります。",
+  "ConnectorBuilder.registeredAs": "MCPに「{{id}}」として登録しました。使用を開始するには設定から接続してください。",
+  "ConnectorBuilder.notSimulatorCleanWarning": "シミュレーターがクリーンではありません：1つ以上のフィクスチャが失敗しました。すべてのフィクスチャが合格するまで、このコネクタは登録できません。",
+  "ConnectorBuilder.notSimulatedYetWarning": "まだシミュレートされていません。このコネクタを登録する前にシミュレーターを実行してください。",
+  "ConnectorBuilder.toolsHeading": "生成されたツール",
+  "ConnectorBuilder.tableTool": "ツール",
+  "ConnectorBuilder.tableMethod": "メソッド",
+  "ConnectorBuilder.tableRisk": "リスク",
+  "ConnectorBuilder.tableParams": "パラメータ",
+  "ConnectorBuilder.noParams": "（なし）",
+  "ConnectorBuilder.risk.low": "低",
+  "ConnectorBuilder.risk.medium": "中",
+  "ConnectorBuilder.risk.high": "高",
+  "ConnectorBuilder.simulationHeading": "シミュレーターレポート：{{passed}}/{{total}} フィクスチャが合格",
+  "ConnectorBuilder.tableFixture": "フィクスチャ",
+  "ConnectorBuilder.tableOutcome": "結果",
+  "ConnectorBuilder.tableReason": "理由",
+  "ConnectorBuilder.pass": "合格",
+  "ConnectorBuilder.fail": "失敗",
+  "ConnectorBuilder.injectionDetectedHint": "このフィクスチャの入力でプロンプトインジェクションのパターンが検出されました",
+  "ConnectorBuilder.statusReady": "登録準備完了",
+  "ConnectorBuilder.statusNotClean": "シミュレーターがクリーンではありません",
+  "ConnectorBuilder.statusNotSimulated": "シミュレートされていません",
 };

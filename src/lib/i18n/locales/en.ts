@@ -8,6 +8,7 @@ import { developerLocale } from "./developer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
 import { teamModeLocale } from "./teamMode";
@@ -26,6 +27,7 @@ export const en: Record<string, string> = {
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...specScorerLocale,
   ...inboxLocale,
   ...teamModeLocale,

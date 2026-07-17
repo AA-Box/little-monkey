@@ -8,6 +8,7 @@ import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
@@ -65,6 +66,7 @@ export const pt: Record<string, string> = {
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...onboardingLocale,
   // Real Brazilian Portuguese translations of the onboarding wizard,
   // overriding the English fallback spread in just above.
@@ -1283,5 +1285,52 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Isso não é um JSON de snapshot de registro válido.",
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
-  "EcosystemDiscover.cancel": "Cancelar"
+  "EcosystemDiscover.cancel": "Cancelar",
+  // Connector Builder Studio (ROADMAP.md Phase 7) — real translations overriding the English `connectorBuilderLocale` defaults spread above.
+  "AppMenu.connectorBuilder": "Construtor de conectores",
+  "ConnectorBuilder.title": "Estúdio do construtor de conectores",
+  "ConnectorBuilder.subtitle": "Gera um conector a partir de uma especificação OpenAPI, revisa sua configuração de autenticação, esquemas e dicas de limite de taxa, e então simula chamadas adversárias contra ele antes de ficar disponível para os agentes.",
+  "ConnectorBuilder.close": "Fechar o construtor de conectores",
+  "ConnectorBuilder.specHeading": "Especificação OpenAPI",
+  "ConnectorBuilder.importButton": "Importar arquivo",
+  "ConnectorBuilder.loadedFile": "{{name}} carregado",
+  "ConnectorBuilder.specPlaceholder": "Cole um documento OpenAPI 3.x ou Swagger 2.0 (JSON ou YAML), ou importe um do disco.",
+  "ConnectorBuilder.resetButton": "Redefinir",
+  "ConnectorBuilder.generateButton": "Gerar conector",
+  "ConnectorBuilder.draftingSummary": "Redigindo um resumo…",
+  "ConnectorBuilder.authLabel": "Autenticação",
+  "ConnectorBuilder.rateLimitLabel": "Limite de taxa",
+  "ConnectorBuilder.rateLimitValue": "{{count}} req/min",
+  "ConnectorBuilder.toolCountLabel": "Ferramentas",
+  "ConnectorBuilder.authType.none": "Nenhuma",
+  "ConnectorBuilder.authType.apiKey": "Chave de API",
+  "ConnectorBuilder.authType.httpBearer": "Token bearer",
+  "ConnectorBuilder.authType.httpBasic": "HTTP Basic",
+  "ConnectorBuilder.authType.oauth2": "OAuth2",
+  "ConnectorBuilder.noSelectionHint": "Carregue ou cole uma especificação OpenAPI e gere um conector para pré-visualizar suas ferramentas e o relatório do simulador.",
+  "ConnectorBuilder.runSimulatorButton": "Executar simulador",
+  "ConnectorBuilder.registerButton": "Registrar no MCP",
+  "ConnectorBuilder.registerBlockedHint": "Este conector precisa passar no simulador antes de poder ser registrado e disponibilizado aos agentes.",
+  "ConnectorBuilder.registeredAs": "Registrado no MCP como \"{{id}}\". Conecte-o em Configurações para começar a usá-lo.",
+  "ConnectorBuilder.notSimulatorCleanWarning": "Não está limpo no simulador: um ou mais testes falharam. Este conector não pode ser registrado até que todos os testes passem.",
+  "ConnectorBuilder.notSimulatedYetWarning": "Ainda não simulado. Execute o simulador antes que este conector possa ser registrado.",
+  "ConnectorBuilder.toolsHeading": "Ferramentas geradas",
+  "ConnectorBuilder.tableTool": "Ferramenta",
+  "ConnectorBuilder.tableMethod": "Método",
+  "ConnectorBuilder.tableRisk": "Risco",
+  "ConnectorBuilder.tableParams": "Parâmetros",
+  "ConnectorBuilder.noParams": "(nenhum)",
+  "ConnectorBuilder.risk.low": "Baixo",
+  "ConnectorBuilder.risk.medium": "Médio",
+  "ConnectorBuilder.risk.high": "Alto",
+  "ConnectorBuilder.simulationHeading": "Relatório do simulador: {{passed}}/{{total}} testes aprovados",
+  "ConnectorBuilder.tableFixture": "Teste",
+  "ConnectorBuilder.tableOutcome": "Resultado",
+  "ConnectorBuilder.tableReason": "Motivo",
+  "ConnectorBuilder.pass": "Aprovado",
+  "ConnectorBuilder.fail": "Reprovado",
+  "ConnectorBuilder.injectionDetectedHint": "Padrão de prompt injection detectado na entrada deste teste",
+  "ConnectorBuilder.statusReady": "Pronto para registrar",
+  "ConnectorBuilder.statusNotClean": "Não está limpo no simulador",
+  "ConnectorBuilder.statusNotSimulated": "Não simulado",
 };

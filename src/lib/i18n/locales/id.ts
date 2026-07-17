@@ -8,6 +8,7 @@ import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
@@ -65,6 +66,7 @@ export const id: Record<string, string> = {
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...onboardingLocale,
   // Real Indonesian translations of the onboarding wizard, overriding the
   // English fallback spread in just above.
@@ -1283,5 +1285,52 @@ export const id: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Ini bukan JSON snapshot registri yang valid.",
   "EcosystemDiscover.confirmRemoveRegistry": "Hapus sumber registri ini?",
   "EcosystemDiscover.removeRegistry": "Hapus",
-  "EcosystemDiscover.cancel": "Batal"
+  "EcosystemDiscover.cancel": "Batal",
+  // Connector Builder Studio (ROADMAP.md Phase 7) — real translations overriding the English `connectorBuilderLocale` defaults spread above.
+  "AppMenu.connectorBuilder": "Pembuat Konektor",
+  "ConnectorBuilder.title": "Studio Pembuat Konektor",
+  "ConnectorBuilder.subtitle": "Menghasilkan konektor dari spesifikasi OpenAPI, meninjau pengaturan autentikasi, skema, dan petunjuk batas laju, lalu mensimulasikan panggilan adversarial terhadapnya sebelum tersedia untuk agen.",
+  "ConnectorBuilder.close": "Tutup Pembuat Konektor",
+  "ConnectorBuilder.specHeading": "Spesifikasi OpenAPI",
+  "ConnectorBuilder.importButton": "Impor berkas",
+  "ConnectorBuilder.loadedFile": "{{name}} dimuat",
+  "ConnectorBuilder.specPlaceholder": "Tempel dokumen OpenAPI 3.x atau Swagger 2.0 (JSON atau YAML), atau impor dari disk.",
+  "ConnectorBuilder.resetButton": "Atur ulang",
+  "ConnectorBuilder.generateButton": "Buat konektor",
+  "ConnectorBuilder.draftingSummary": "Menyusun ringkasan…",
+  "ConnectorBuilder.authLabel": "Autentikasi",
+  "ConnectorBuilder.rateLimitLabel": "Batas laju",
+  "ConnectorBuilder.rateLimitValue": "{{count}} permintaan/menit",
+  "ConnectorBuilder.toolCountLabel": "Alat",
+  "ConnectorBuilder.authType.none": "Tidak ada",
+  "ConnectorBuilder.authType.apiKey": "Kunci API",
+  "ConnectorBuilder.authType.httpBearer": "Token pembawa",
+  "ConnectorBuilder.authType.httpBasic": "HTTP Basic",
+  "ConnectorBuilder.authType.oauth2": "OAuth2",
+  "ConnectorBuilder.noSelectionHint": "Muat atau tempel spesifikasi OpenAPI dan buat konektor untuk melihat pratinjau alat dan laporan simulatornya.",
+  "ConnectorBuilder.runSimulatorButton": "Jalankan simulator",
+  "ConnectorBuilder.registerButton": "Daftarkan ke MCP",
+  "ConnectorBuilder.registerBlockedHint": "Konektor ini harus lulus simulator sebelum dapat didaftarkan dan tersedia untuk agen.",
+  "ConnectorBuilder.registeredAs": "Terdaftar di MCP sebagai \"{{id}}\". Hubungkan dari Pengaturan untuk mulai menggunakannya.",
+  "ConnectorBuilder.notSimulatorCleanWarning": "Belum bersih di simulator: satu atau beberapa fixture gagal. Konektor ini tidak dapat didaftarkan sampai semua fixture lulus.",
+  "ConnectorBuilder.notSimulatedYetWarning": "Belum disimulasikan. Jalankan simulator sebelum konektor ini dapat didaftarkan.",
+  "ConnectorBuilder.toolsHeading": "Alat yang dihasilkan",
+  "ConnectorBuilder.tableTool": "Alat",
+  "ConnectorBuilder.tableMethod": "Metode",
+  "ConnectorBuilder.tableRisk": "Risiko",
+  "ConnectorBuilder.tableParams": "Parameter",
+  "ConnectorBuilder.noParams": "(tidak ada)",
+  "ConnectorBuilder.risk.low": "Rendah",
+  "ConnectorBuilder.risk.medium": "Sedang",
+  "ConnectorBuilder.risk.high": "Tinggi",
+  "ConnectorBuilder.simulationHeading": "Laporan simulator: {{passed}}/{{total}} fixture lulus",
+  "ConnectorBuilder.tableFixture": "Fixture",
+  "ConnectorBuilder.tableOutcome": "Hasil",
+  "ConnectorBuilder.tableReason": "Alasan",
+  "ConnectorBuilder.pass": "Lulus",
+  "ConnectorBuilder.fail": "Gagal",
+  "ConnectorBuilder.injectionDetectedHint": "Pola prompt-injection terdeteksi pada input fixture ini",
+  "ConnectorBuilder.statusReady": "Siap didaftarkan",
+  "ConnectorBuilder.statusNotClean": "Belum bersih di simulator",
+  "ConnectorBuilder.statusNotSimulated": "Belum disimulasikan",
 };

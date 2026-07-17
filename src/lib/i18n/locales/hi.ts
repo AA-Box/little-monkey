@@ -8,6 +8,7 @@ import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
@@ -65,6 +66,7 @@ export const hi: Record<string, string> = {
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...onboardingLocale,
   // ऑनबोर्डिंग विज़ार्ड के वास्तविक हिंदी अनुवाद, ऊपर स्प्रेड किए गए अंग्रेज़ी
   // फ़ॉलबैक को ओवरराइड करते हुए।
@@ -1283,5 +1285,52 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "यह एक मान्य रजिस्ट्री स्नैपशॉट JSON नहीं है।",
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
-  "EcosystemDiscover.cancel": "रद्द करें"
+  "EcosystemDiscover.cancel": "रद्द करें",
+  // Connector Builder Studio (ROADMAP.md Phase 7) — real translations overriding the English `connectorBuilderLocale` defaults spread above.
+  "AppMenu.connectorBuilder": "कनेक्टर बिल्डर",
+  "ConnectorBuilder.title": "कनेक्टर बिल्डर स्टूडियो",
+  "ConnectorBuilder.subtitle": "OpenAPI स्पेक से एक कनेक्टर जनरेट करें, उसकी ऑथ सेटअप, स्कीमा और रेट-लिमिट संकेतों की समीक्षा करें, फिर एजेंटों के लिए उपलब्ध होने से पहले उसके विरुद्ध adversarial कॉल्स सिम्युलेट करें।",
+  "ConnectorBuilder.close": "कनेक्टर बिल्डर बंद करें",
+  "ConnectorBuilder.specHeading": "OpenAPI स्पेक",
+  "ConnectorBuilder.importButton": "फ़ाइल आयात करें",
+  "ConnectorBuilder.loadedFile": "{{name}} लोड हुई",
+  "ConnectorBuilder.specPlaceholder": "एक OpenAPI 3.x या Swagger 2.0 दस्तावेज़ (JSON या YAML) पेस्ट करें, या डिस्क से आयात करें।",
+  "ConnectorBuilder.resetButton": "रीसेट करें",
+  "ConnectorBuilder.generateButton": "कनेक्टर जनरेट करें",
+  "ConnectorBuilder.draftingSummary": "सारांश तैयार किया जा रहा है…",
+  "ConnectorBuilder.authLabel": "ऑथ",
+  "ConnectorBuilder.rateLimitLabel": "रेट लिमिट",
+  "ConnectorBuilder.rateLimitValue": "{{count}} अनुरोध/मिनट",
+  "ConnectorBuilder.toolCountLabel": "टूल्स",
+  "ConnectorBuilder.authType.none": "कोई नहीं",
+  "ConnectorBuilder.authType.apiKey": "API कुंजी",
+  "ConnectorBuilder.authType.httpBearer": "बियरर टोकन",
+  "ConnectorBuilder.authType.httpBasic": "HTTP बेसिक",
+  "ConnectorBuilder.authType.oauth2": "OAuth2",
+  "ConnectorBuilder.noSelectionHint": "टूल्स और सिम्युलेटर रिपोर्ट का पूर्वावलोकन करने के लिए एक OpenAPI स्पेक लोड या पेस्ट करें और एक कनेक्टर जनरेट करें।",
+  "ConnectorBuilder.runSimulatorButton": "सिम्युलेटर चलाएँ",
+  "ConnectorBuilder.registerButton": "MCP के साथ रजिस्टर करें",
+  "ConnectorBuilder.registerBlockedHint": "रजिस्टर होने और एजेंटों के लिए उपलब्ध होने से पहले इस कनेक्टर को सिम्युलेटर पास करना होगा।",
+  "ConnectorBuilder.registeredAs": "MCP के साथ \"{{id}}\" के रूप में रजिस्टर किया गया। इसे उपयोग करने के लिए सेटिंग्स से कनेक्ट करें।",
+  "ConnectorBuilder.notSimulatorCleanWarning": "सिम्युलेटर-क्लीन नहीं: एक या अधिक फिक्स्चर विफल रहे। जब तक सभी फिक्स्चर पास नहीं होते, यह कनेक्टर रजिस्टर नहीं किया जा सकता।",
+  "ConnectorBuilder.notSimulatedYetWarning": "अभी तक सिम्युलेट नहीं किया गया। इस कनेक्टर को रजिस्टर करने से पहले सिम्युलेटर चलाएँ।",
+  "ConnectorBuilder.toolsHeading": "जनरेट किए गए टूल्स",
+  "ConnectorBuilder.tableTool": "टूल",
+  "ConnectorBuilder.tableMethod": "मेथड",
+  "ConnectorBuilder.tableRisk": "जोखिम",
+  "ConnectorBuilder.tableParams": "पैरामीटर",
+  "ConnectorBuilder.noParams": "(कोई नहीं)",
+  "ConnectorBuilder.risk.low": "कम",
+  "ConnectorBuilder.risk.medium": "मध्यम",
+  "ConnectorBuilder.risk.high": "उच्च",
+  "ConnectorBuilder.simulationHeading": "सिम्युलेटर रिपोर्ट: {{passed}}/{{total}} फिक्स्चर पास हुए",
+  "ConnectorBuilder.tableFixture": "फिक्स्चर",
+  "ConnectorBuilder.tableOutcome": "परिणाम",
+  "ConnectorBuilder.tableReason": "कारण",
+  "ConnectorBuilder.pass": "पास",
+  "ConnectorBuilder.fail": "फ़ेल",
+  "ConnectorBuilder.injectionDetectedHint": "इस फिक्स्चर के इनपुट में प्रॉम्प्ट-इंजेक्शन पैटर्न मिला",
+  "ConnectorBuilder.statusReady": "रजिस्टर के लिए तैयार",
+  "ConnectorBuilder.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
+  "ConnectorBuilder.statusNotSimulated": "सिम्युलेट नहीं किया गया",
 };

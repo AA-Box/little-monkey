@@ -8,6 +8,7 @@ import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
@@ -65,6 +66,7 @@ export const de: Record<string, string> = {
   ...issueToPrLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...onboardingLocale,
   // Real German translations of the onboarding wizard, overriding the
   // English fallback spread in just above.
@@ -1283,5 +1285,52 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Das ist kein gültiges Registry-Snapshot-JSON.",
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
-  "EcosystemDiscover.cancel": "Abbrechen"
+  "EcosystemDiscover.cancel": "Abbrechen",
+  // Connector Builder Studio (ROADMAP.md Phase 7) — real translations overriding the English `connectorBuilderLocale` defaults spread above.
+  "AppMenu.connectorBuilder": "Connector-Builder",
+  "ConnectorBuilder.title": "Connector-Builder-Studio",
+  "ConnectorBuilder.subtitle": "Erzeugt einen Connector aus einer OpenAPI-Spezifikation, prüft dessen Auth-Einrichtung, Schemas und Rate-Limit-Hinweise und simuliert dann feindselige Aufrufe dagegen, bevor er für Agenten verfügbar wird.",
+  "ConnectorBuilder.close": "Connector-Builder schließen",
+  "ConnectorBuilder.specHeading": "OpenAPI-Spezifikation",
+  "ConnectorBuilder.importButton": "Datei importieren",
+  "ConnectorBuilder.loadedFile": "{{name}} geladen",
+  "ConnectorBuilder.specPlaceholder": "Ein OpenAPI-3.x- oder Swagger-2.0-Dokument (JSON oder YAML) einfügen oder von der Festplatte importieren.",
+  "ConnectorBuilder.resetButton": "Zurücksetzen",
+  "ConnectorBuilder.generateButton": "Connector generieren",
+  "ConnectorBuilder.draftingSummary": "Zusammenfassung wird entworfen…",
+  "ConnectorBuilder.authLabel": "Auth",
+  "ConnectorBuilder.rateLimitLabel": "Rate-Limit",
+  "ConnectorBuilder.rateLimitValue": "{{count}} Anfragen/Min",
+  "ConnectorBuilder.toolCountLabel": "Tools",
+  "ConnectorBuilder.authType.none": "Keine",
+  "ConnectorBuilder.authType.apiKey": "API-Schlüssel",
+  "ConnectorBuilder.authType.httpBearer": "Bearer-Token",
+  "ConnectorBuilder.authType.httpBasic": "HTTP Basic",
+  "ConnectorBuilder.authType.oauth2": "OAuth2",
+  "ConnectorBuilder.noSelectionHint": "Laden oder fügen Sie eine OpenAPI-Spezifikation ein und generieren Sie einen Connector, um dessen Tools und den Simulatorbericht in der Vorschau zu sehen.",
+  "ConnectorBuilder.runSimulatorButton": "Simulator ausführen",
+  "ConnectorBuilder.registerButton": "Mit MCP registrieren",
+  "ConnectorBuilder.registerBlockedHint": "Dieser Connector muss den Simulator bestehen, bevor er registriert und für Agenten verfügbar gemacht werden kann.",
+  "ConnectorBuilder.registeredAs": "Mit MCP als „{{id}}“ registriert. Verbinden Sie ihn in den Einstellungen, um ihn zu verwenden.",
+  "ConnectorBuilder.notSimulatorCleanWarning": "Nicht simulator-sauber: ein oder mehrere Testfälle sind fehlgeschlagen. Dieser Connector kann erst registriert werden, wenn alle Testfälle bestehen.",
+  "ConnectorBuilder.notSimulatedYetWarning": "Noch nicht simuliert. Führen Sie den Simulator aus, bevor dieser Connector registriert werden kann.",
+  "ConnectorBuilder.toolsHeading": "Generierte Tools",
+  "ConnectorBuilder.tableTool": "Tool",
+  "ConnectorBuilder.tableMethod": "Methode",
+  "ConnectorBuilder.tableRisk": "Risiko",
+  "ConnectorBuilder.tableParams": "Parameter",
+  "ConnectorBuilder.noParams": "(keine)",
+  "ConnectorBuilder.risk.low": "Niedrig",
+  "ConnectorBuilder.risk.medium": "Mittel",
+  "ConnectorBuilder.risk.high": "Hoch",
+  "ConnectorBuilder.simulationHeading": "Simulatorbericht: {{passed}}/{{total}} Testfälle bestanden",
+  "ConnectorBuilder.tableFixture": "Testfall",
+  "ConnectorBuilder.tableOutcome": "Ergebnis",
+  "ConnectorBuilder.tableReason": "Grund",
+  "ConnectorBuilder.pass": "Bestanden",
+  "ConnectorBuilder.fail": "Fehlgeschlagen",
+  "ConnectorBuilder.injectionDetectedHint": "Prompt-Injection-Muster in der Eingabe dieses Testfalls erkannt",
+  "ConnectorBuilder.statusReady": "Bereit zur Registrierung",
+  "ConnectorBuilder.statusNotClean": "Nicht simulator-sauber",
+  "ConnectorBuilder.statusNotSimulated": "Nicht simuliert",
 };
