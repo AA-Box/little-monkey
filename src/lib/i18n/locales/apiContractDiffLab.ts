@@ -1,0 +1,52 @@
+/**
+ * API Contract Diff and Mock Lab (ROADMAP.md Phase 7, item 23) — English
+ * source strings, spread into every locale's dictionary below with a REAL
+ * translation per locale (see `de.ts`/`fr.ts`/etc.), matching this app's
+ * normal per-locale i18n convention (`sopCompiler.ts` is the reference this
+ * mirrors).
+ */
+export const apiContractDiffLabLocale: Record<string, string> = {
+  "AppMenu.apiContractDiffLab": "API Contract Diff & Mock Lab",
+  "ApiContractDiffLab.title": "API Contract Diff & Mock Lab",
+  "ApiContractDiffLab.subtitle": "Compare two OpenAPI spec versions, flag breaking changes, and generate mocks, a contract-test stub, and client-impact notes.",
+  "ApiContractDiffLab.close": "Close API Contract Diff & Mock Lab",
+  "ApiContractDiffLab.oldVersionLabel": "Old version",
+  "ApiContractDiffLab.newVersionLabel": "New version",
+  "ApiContractDiffLab.noFileLoaded": "No file loaded",
+  "ApiContractDiffLab.specSummary": "{{title}} v{{version}} · {{count}} operation(s)",
+  "ApiContractDiffLab.chooseFile": "Choose file…",
+  "ApiContractDiffLab.loading": "Loading…",
+  "ApiContractDiffLab.runDiff": "Run diff",
+  "ApiContractDiffLab.startOver": "Start over",
+  "ApiContractDiffLab.noReportYet": "No report yet",
+  "ApiContractDiffLab.noReportYetHint": "Load an old and a new OpenAPI spec (JSON or YAML) above, then click \"Run diff\".",
+  "ApiContractDiffLab.verdictReady": "Release-ready: yes — 0 breaking changes",
+  "ApiContractDiffLab.verdictNotReady": "Release-ready: no — {{count}} breaking change(s)",
+  "ApiContractDiffLab.breakingHeading": "Breaking changes ({{count}})",
+  "ApiContractDiffLab.nonBreakingHeading": "Non-breaking changes ({{count}})",
+  "ApiContractDiffLab.noChanges": "The two versions are structurally identical — no changes detected.",
+  "ApiContractDiffLab.draftImpactNotes": "Draft client-impact notes",
+  "ApiContractDiffLab.drafting": "Drafting…",
+  "ApiContractDiffLab.impactLabel": "Impact",
+  "ApiContractDiffLab.migrationLabel": "Migration",
+  "ApiContractDiffLab.mocksHeading": "Generated mock responses",
+  "ApiContractDiffLab.statusLabel": "status {{status}}",
+  "ApiContractDiffLab.testStubHeading": "Generated contract-test stub",
+  "ApiContractDiffLab.saveTestStub": "Save test stub…",
+  "ApiContractDiffLab.kind.endpoint-removed": "Endpoint removed",
+  "ApiContractDiffLab.kind.endpoint-added": "Endpoint added",
+  "ApiContractDiffLab.kind.param-removed": "Parameter removed",
+  "ApiContractDiffLab.kind.param-added": "Parameter added",
+  "ApiContractDiffLab.kind.param-now-required": "Parameter now required",
+  "ApiContractDiffLab.kind.param-now-optional": "Parameter now optional",
+  "ApiContractDiffLab.kind.param-type-changed": "Parameter type changed",
+  "ApiContractDiffLab.kind.field-removed": "Field removed",
+  "ApiContractDiffLab.kind.field-added": "Field added",
+  "ApiContractDiffLab.kind.field-now-required": "Field now required",
+  "ApiContractDiffLab.kind.field-now-optional": "Field now optional",
+  "ApiContractDiffLab.kind.field-type-changed": "Field type changed",
+  "ApiContractDiffLab.kind.response-removed": "Response removed",
+  "ApiContractDiffLab.kind.response-added": "Response added",
+  "ApiContractDiffLab.kind.enum-value-removed": "Enum value removed",
+  "ApiContractDiffLab.kind.enum-value-added": "Enum value added",
+};

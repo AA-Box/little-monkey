@@ -10,6 +10,7 @@ import {
   Command,
   ClipboardCheck,
   Compass,
+  FileDiff,
   Database,
   GitPullRequest,
   Globe,
@@ -62,6 +63,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenApiContractDiffLab: () => void;
   onOpenGoldenDatasetBuilder: () => void;
   onOpenDataNotebook: () => void;
   onOpenSyntheticMonitoring: () => void;
@@ -122,6 +124,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenApiContractDiffLab,
   onOpenGoldenDatasetBuilder,
   onOpenDataNotebook,
   onOpenSyntheticMonitoring,
@@ -286,6 +289,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
+            icon={<FileDiff size={14} className="text-faint" />}
+            label={t("AppMenu.apiContractDiffLab")}
+            onClick={() => {
+              closeAll();
+              onOpenApiContractDiffLab();
             }}
           />
           <MenuRow
