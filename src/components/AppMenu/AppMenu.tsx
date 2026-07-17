@@ -54,6 +54,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenCrossRepoIntelligence: () => void;
   onOpenWorkCanvas: () => void;
   onOpenPmCopilot: () => void;
   onOpenDeepResearch: () => void;
@@ -106,6 +107,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenCrossRepoIntelligence,
   onOpenWorkCanvas,
   onOpenPmCopilot,
   onOpenDeepResearch,
@@ -258,6 +260,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoIntelligence")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoIntelligence();
             }}
           />
           <MenuRow

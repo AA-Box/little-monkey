@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
@@ -359,6 +360,7 @@ export const pt: Record<string, string> = {
   "McpGenerator.statusNotClean": "Não está limpo pelo simulador",
   "McpGenerator.statusNotSimulated": "Não simulado",
   ...dailyBriefLocale,
+  ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Portuguese translations, overriding every workCanvasLocale key above.
   "AppMenu.workCanvas": "Quadro de Trabalho",
@@ -1555,6 +1557,45 @@ export const pt: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Remover esta fonte de registro?",
   "EcosystemDiscover.removeRegistry": "Remover",
   "EcosystemDiscover.cancel": "Cancelar",
+  // Real Portuguese translations, overriding every crossRepoIntelligenceLocale key above.
+  "AppMenu.crossRepoIntelligence": "Inteligência entre repositórios",
+  "CrossRepoIntelligencePanel.title": "Inteligência de código entre repositórios",
+  "CrossRepoIntelligencePanel.subtitle": "Pesquise símbolos em todos os repositórios conectados e rastreie o impacto — arquivos afetados, responsáveis, testes e etapas de migração.",
+  "CrossRepoIntelligencePanel.close": "Fechar Inteligência entre repositórios",
+  "CrossRepoIntelligencePanel.rebuild": "Reconstruir índice",
+  "CrossRepoIntelligencePanel.rebuilding": "Indexando…",
+  "CrossRepoIntelligencePanel.builtAt": "Indexado {{time}} · {{symbolCount}} símbolos em {{fileCount}} arquivos",
+  "CrossRepoIntelligencePanel.notBuiltYet": "Crie o índice para pesquisar símbolos nos seus repositórios conectados.",
+  "CrossRepoIntelligencePanel.noWorkspace": "Abra uma pasta de espaço de trabalho primeiro.",
+  "CrossRepoIntelligencePanel.buildError": "Não foi possível criar o índice: {{error}}",
+  "CrossRepoIntelligencePanel.searchLabel": "Pesquisar símbolos",
+  "CrossRepoIntelligencePanel.searchPlaceholder": "Nome do símbolo (função, classe, tipo…)",
+  "CrossRepoIntelligencePanel.noMatches": "Nenhum símbolo corresponde a \"{{query}}\".",
+  "CrossRepoIntelligencePanel.matchesHint": "{{count}} símbolo(s) correspondente(s)",
+  "CrossRepoIntelligencePanel.kind.function": "função",
+  "CrossRepoIntelligencePanel.kind.method": "método",
+  "CrossRepoIntelligencePanel.kind.class": "classe",
+  "CrossRepoIntelligencePanel.kind.interface": "interface",
+  "CrossRepoIntelligencePanel.kind.type": "tipo",
+  "CrossRepoIntelligencePanel.kind.const": "constante",
+  "CrossRepoIntelligencePanel.kind.enum": "enum",
+  "CrossRepoIntelligencePanel.kind.struct": "struct",
+  "CrossRepoIntelligencePanel.kind.trait": "trait",
+  "CrossRepoIntelligencePanel.impact.title": "Impacto de \"{{symbol}}\"",
+  "CrossRepoIntelligencePanel.impact.loading": "Rastreando impacto…",
+  "CrossRepoIntelligencePanel.impact.error": "Não foi possível rastrear o impacto: {{error}}",
+  "CrossRepoIntelligencePanel.impact.affectedRepos": "Repositórios afetados",
+  "CrossRepoIntelligencePanel.impact.affectedFiles": "Arquivos afetados",
+  "CrossRepoIntelligencePanel.impact.definitions": "Definições",
+  "CrossRepoIntelligencePanel.impact.references": "Referências",
+  "CrossRepoIntelligencePanel.impact.noReferences": "Nenhuma referência encontrada.",
+  "CrossRepoIntelligencePanel.impact.tests": "Testes prováveis",
+  "CrossRepoIntelligencePanel.impact.noTests": "Nenhum arquivo de teste correspondente encontrado pela convenção de nomenclatura.",
+  "CrossRepoIntelligencePanel.impact.owners": "Responsáveis",
+  "CrossRepoIntelligencePanel.impact.unassigned": "Não atribuído",
+  "CrossRepoIntelligencePanel.impact.migrationSteps": "Prováveis etapas de migração",
+  "CrossRepoIntelligencePanel.impact.clear": "Limpar",
+  "CrossRepoIntelligencePanel.footnote": "Escopo do MVP: indexa as raízes do workspace conectadas (primária + secundárias) usando extração de símbolos baseada em regras e busca de texto — não é um AST/grafo de chamadas multilíngue completo.",
   // Real translations for Deep Research Workspace (ROADMAP Phase 7),
   // overriding the English deepResearchLocale spread above.
   "AppMenu.deepResearch": "Pesquisa Aprofundada",
