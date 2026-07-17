@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
@@ -358,6 +359,46 @@ export const hi: Record<string, string> = {
   "McpGenerator.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
   "McpGenerator.statusNotSimulated": "सिम्युलेट नहीं हुआ",
   ...dailyBriefLocale,
+  ...workCanvasLocale,
+  // Infinite Work Canvas (ROADMAP.md Phase 7) — real Hindi translations, overriding every workCanvasLocale key above.
+  "AppMenu.workCanvas": "वर्क कैनवस",
+  "WorkCanvasPanel.title": "वर्क कैनवस",
+  "WorkCanvasPanel.subtitle": "चैट, फ़ाइलों, कार्यों और नोट्स के लिए एक स्थानिक बोर्ड — इन्हें योजनाओं, शोध बोर्ड और आर्किटेक्चर मैप में जोड़ें।",
+  "WorkCanvasPanel.close": "वर्क कैनवस बंद करें",
+  "WorkCanvasPanel.emptyTitle": "अभी तक कोई बोर्ड नहीं",
+  "WorkCanvasPanel.emptyDescription": "चैट, फ़ाइलों, कार्यों और नोट्स को एक ही जगह मैप करना शुरू करने के लिए एक बोर्ड बनाएं।",
+  "WorkCanvasPanel.newBoardPlaceholder": "बोर्ड का नाम",
+  "WorkCanvasPanel.createBoard": "बोर्ड बनाएं",
+  "WorkCanvasPanel.boardSwitcher.newBoard": "नया बोर्ड",
+  "WorkCanvasPanel.boardSwitcher.delete": "बोर्ड हटाएं",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmYes": "हटाएं",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmCancel": "रद्द करें",
+  "WorkCanvasPanel.zoomIn": "ज़ूम इन करें",
+  "WorkCanvasPanel.zoomOut": "ज़ूम आउट करें",
+  "WorkCanvasPanel.addNode": "कैनवस में जोड़ें",
+  "WorkCanvasPanel.addNode.chat": "चैट सत्र",
+  "WorkCanvasPanel.addNode.file": "फ़ाइल",
+  "WorkCanvasPanel.addNode.run": "कार्य / रन",
+  "WorkCanvasPanel.addNode.note": "स्टिकी नोट",
+  "WorkCanvasPanel.addNode.back": "वापस",
+  "WorkCanvasPanel.addNode.noSessions": "अभी तक कोई चैट सत्र नहीं है।",
+  "WorkCanvasPanel.addNode.noRuns": "अभी तक कोई कार्य/रन नहीं है।",
+  "WorkCanvasPanel.addNode.filePathLabel": "वर्कस्पेस-सापेक्ष पथ",
+  "WorkCanvasPanel.addNode.filePathPlaceholder": "src/App.tsx",
+  "WorkCanvasPanel.addNode.filePathAdd": "फ़ाइल जोड़ें",
+  "WorkCanvasPanel.canvasEmptyTitle": "यह बोर्ड खाली है",
+  "WorkCanvasPanel.canvasEmptyDescription": "अपनी पहली चैट, फ़ाइल, कार्य या नोट रखने के लिए \"कैनवस में जोड़ें\" का उपयोग करें।",
+  "WorkCanvasPanel.node.open": "खोलें",
+  "WorkCanvasPanel.node.spawnTask": "कार्य शुरू करें",
+  "WorkCanvasPanel.node.spawnTaskSourceLabel": "वर्क कैनवस नोड",
+  "WorkCanvasPanel.node.remove": "कैनवस से हटाएं",
+  "WorkCanvasPanel.node.connect": "किसी अन्य नोड से जोड़ने के लिए खींचें",
+  "WorkCanvasPanel.node.notePlaceholder": "एक नोट लिखें…",
+  "WorkCanvasPanel.node.chatLabel": "चैट",
+  "WorkCanvasPanel.node.runLabel": "कार्य / रन",
+  "WorkCanvasPanel.node.noteLabel": "नोट",
+  "WorkCanvasPanel.edge.remove": "इस कनेक्शन को हटाने के लिए क्लिक करें",
+  "WorkCanvasPanel.helpHint": "स्थानांतरित करने के लिए पृष्ठभूमि को खींचें, ज़ूम करने के लिए स्क्रॉल करें, किसी कार्ड को हिलाने के लिए उसे खींचें, कार्ड के बिंदु से किसी अन्य पर खींचकर उन्हें जोड़ें।",
   ...pmCopilotLocale,
   // Real Hindi translations, overriding every pmCopilotLocale key above.
   "AppMenu.pmCopilot": "प्रोडक्ट मैनेजर कोपायलट",

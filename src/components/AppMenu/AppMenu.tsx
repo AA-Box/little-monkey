@@ -13,6 +13,7 @@ import {
   GitPullRequest,
   Globe,
   HelpCircle,
+  LayoutDashboard,
   ListTodo,
   Inbox,
   Network,
@@ -53,6 +54,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenWorkCanvas: () => void;
   onOpenPmCopilot: () => void;
   onOpenDeepResearch: () => void;
   onOpenBriefStudio: () => void;
@@ -104,6 +106,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenWorkCanvas,
   onOpenPmCopilot,
   onOpenDeepResearch,
   onOpenBriefStudio,
@@ -215,6 +218,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<LayoutDashboard size={14} className="text-faint" />}
+            label={t("AppMenu.workCanvas")}
+            onClick={() => {
+              closeAll();
+              onOpenWorkCanvas();
             }}
           />
           <MenuRow

@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
 import { deepResearchLocale } from "./deepResearch";
 import { briefStudioLocale } from "./briefStudio";
@@ -358,6 +359,46 @@ export const ja: Record<string, string> = {
   "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
   "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
+  ...workCanvasLocale,
+  // Infinite Work Canvas (ROADMAP.md Phase 7) — real Japanese translations, overriding every workCanvasLocale key above.
+  "AppMenu.workCanvas": "ワークキャンバス",
+  "WorkCanvasPanel.title": "ワークキャンバス",
+  "WorkCanvasPanel.subtitle": "チャット、ファイル、タスク、メモのための空間ボード――計画、リサーチボード、アーキテクチャ図としてつなげられます。",
+  "WorkCanvasPanel.close": "ワークキャンバスを閉じる",
+  "WorkCanvasPanel.emptyTitle": "ボードはまだありません",
+  "WorkCanvasPanel.emptyDescription": "ボードを作成して、チャット、ファイル、タスク、メモを一箇所にまとめましょう。",
+  "WorkCanvasPanel.newBoardPlaceholder": "ボード名",
+  "WorkCanvasPanel.createBoard": "ボードを作成",
+  "WorkCanvasPanel.boardSwitcher.newBoard": "新しいボード",
+  "WorkCanvasPanel.boardSwitcher.delete": "ボードを削除",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmYes": "削除",
+  "WorkCanvasPanel.boardSwitcher.deleteConfirmCancel": "キャンセル",
+  "WorkCanvasPanel.zoomIn": "ズームイン",
+  "WorkCanvasPanel.zoomOut": "ズームアウト",
+  "WorkCanvasPanel.addNode": "キャンバスに追加",
+  "WorkCanvasPanel.addNode.chat": "チャットセッション",
+  "WorkCanvasPanel.addNode.file": "ファイル",
+  "WorkCanvasPanel.addNode.run": "タスク／実行",
+  "WorkCanvasPanel.addNode.note": "付箋",
+  "WorkCanvasPanel.addNode.back": "戻る",
+  "WorkCanvasPanel.addNode.noSessions": "チャットセッションはまだありません。",
+  "WorkCanvasPanel.addNode.noRuns": "タスク/実行はまだありません。",
+  "WorkCanvasPanel.addNode.filePathLabel": "ワークスペースからの相対パス",
+  "WorkCanvasPanel.addNode.filePathPlaceholder": "src/App.tsx",
+  "WorkCanvasPanel.addNode.filePathAdd": "ファイルを追加",
+  "WorkCanvasPanel.canvasEmptyTitle": "このボードは空です",
+  "WorkCanvasPanel.canvasEmptyDescription": "「キャンバスに追加」から最初のチャット、ファイル、タスク、メモを配置しましょう。",
+  "WorkCanvasPanel.node.open": "開く",
+  "WorkCanvasPanel.node.spawnTask": "タスクを開始",
+  "WorkCanvasPanel.node.spawnTaskSourceLabel": "ワークキャンバスのノード",
+  "WorkCanvasPanel.node.remove": "キャンバスから削除",
+  "WorkCanvasPanel.node.connect": "ドラッグして別のノードに接続",
+  "WorkCanvasPanel.node.notePlaceholder": "メモを入力…",
+  "WorkCanvasPanel.node.chatLabel": "チャット",
+  "WorkCanvasPanel.node.runLabel": "タスク／実行",
+  "WorkCanvasPanel.node.noteLabel": "メモ",
+  "WorkCanvasPanel.edge.remove": "クリックしてこの接続を削除",
+  "WorkCanvasPanel.helpHint": "背景をドラッグして移動、スクロールしてズーム、カードをドラッグして移動、カードの点から別のカードへドラッグして接続します。",
   ...pmCopilotLocale,
   // Real Japanese translations, overriding every pmCopilotLocale key above.
   "AppMenu.pmCopilot": "プロダクトマネージャーコパイロット",
