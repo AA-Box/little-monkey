@@ -95,6 +95,7 @@ pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
 mod artifact_commands;
+pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
 // `pub` only for the doc-comment convention every sibling module below
@@ -893,6 +894,7 @@ pub fn run() {
             m3_commands::m3_runtimes,
             m3_commands::m3_refresh_runtimes,
             m3_commands::m3_schedule_plan,
+            m3_commands::m3_chat_template_lab_report,
             m3_commands::m3_offload_plan,
             m3_commands::m3_catalog_search,
             m3_commands::m3_model_download,

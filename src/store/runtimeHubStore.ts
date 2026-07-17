@@ -3,6 +3,7 @@ import {
   createM3OperationId,
   runtimeHubClient,
   sha256Text,
+  type ChatTemplateLabReport,
   type HardwareProfile,
   type HardwareSnapshot,
   type LanServerPolicy,
@@ -86,6 +87,11 @@ interface RuntimeHubStoreState {
   downloadProgress: Record<string, M3DownloadProgress>;
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
+  /** Keyed by the raw `template` string a model declares (an empty string
+   * stands in for "no template"/`null`) — not by `TemplateFamily`, since
+   * family detection is the Rust command's job (`chat_template_lab.rs`'s
+   * `TemplateFamily::detect`), not something the frontend re-implements. */
+  chatTemplateLabReports: Record<string, ChatTemplateLabReport>;
   offloadPlans: Record<string, OffloadPlan>;
   loaded: boolean;
 
@@ -109,6 +115,7 @@ interface RuntimeHubStoreState {
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
+  fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
@@ -284,6 +291,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    chatTemplateLabReports: {},
     offloadPlans: {},
     loaded: false,
 
@@ -538,6 +546,23 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set({ schedulingPlan });
       } catch (error) {
         set({ schedulingPlan: null });
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    fetchChatTemplateLabReport: async (template) => {
+      const cacheKey = template ?? "";
+      const key = `chat-template-lab:${cacheKey}`;
+      begin(key);
+      try {
+        const report = await runtimeHubClient.chatTemplateLabReport(template);
+        set((state) => ({
+          chatTemplateLabReports: { ...state.chatTemplateLabReports, [cacheKey]: report },
+        }));
+      } catch (error) {
         fail(key, error);
         throw error;
       } finally {

@@ -99,6 +99,53 @@ export interface M3ModelCapabilities {
   structuredOutput: boolean;
 }
 
+/** Coarse chat-template family the Chat Template Compatibility Lab groups
+ * fixtures by — see `chat_template_lab.rs`'s module doc comment for why
+ * detection is deliberately this coarse. */
+export type TemplateFamily = "chatml" | "llama3" | "mistral" | "gemma" | "generic";
+
+/** One fixture area from the ROADMAP wording ("tool rendering, image
+ * blocks, thinking modes, system prompts, and stop tokens"), plus
+ * structured output. */
+export type CapabilityArea =
+  | "tool_calling"
+  | "system_prompt"
+  | "stop_token"
+  | "structured_output"
+  | "vision"
+  | "thinking";
+
+export interface ChatTemplateLabResult {
+  area: CapabilityArea;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ChatTemplateLabReport {
+  templateFamily: TemplateFamily;
+  results: ChatTemplateLabResult[];
+}
+
+/** Mirrors `chat_template_lab.rs`'s `gate_capabilities`: a capability can
+ * only stay `true` if it was already declared true AND the lab actually
+ * verified it for this template family. `embeddings` has no chat-template
+ * fixture and passes through unchanged. */
+export function gateCapabilities(
+  capabilities: M3ModelCapabilities,
+  report: ChatTemplateLabReport | undefined,
+): M3ModelCapabilities {
+  if (!report) return capabilities;
+  const passed = (area: CapabilityArea) =>
+    report.results.some((result) => result.area === area && result.passed);
+  return {
+    chat: capabilities.chat && passed("system_prompt") && passed("stop_token"),
+    embeddings: capabilities.embeddings,
+    toolCalling: capabilities.toolCalling && passed("tool_calling"),
+    vision: capabilities.vision && passed("vision"),
+    structuredOutput: capabilities.structuredOutput && passed("structured_output"),
+  };
+}
+
 export interface M3ModelLicense {
   name: string;
   spdxId: string | null;
@@ -640,6 +687,8 @@ export const runtimeHubClient = {
     invoke<M3RuntimeCapability[]>("m3_refresh_runtimes", args),
   schedulePlan: (input: M3SchedulingInput) =>
     invoke<M3SchedulingPlan>("m3_schedule_plan", { input }),
+  chatTemplateLabReport: (template: string | null) =>
+    invoke<ChatTemplateLabReport>("m3_chat_template_lab_report", { template }),
   offloadPlan: (input: OffloadPlanInput) => invoke<OffloadPlan>("m3_offload_plan", { input }),
   catalogSearch: (args: OperationArgs & { query: string; limit: number }) =>
     invoke<M3CatalogMatch[]>("m3_catalog_search", args),
