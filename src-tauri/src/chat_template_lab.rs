@@ -310,7 +310,12 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
             role: CanonicalRole::User,
             content: vec![CanonicalContent::Text { text: "go".to_string() }],
         }],
-        Vec::new(),
+        vec![CanonicalToolDefinition {
+            name: "read_file".to_string(),
+            description: "Reads a file from the workspace".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        }],
         None,
     );
     let mut sink = RecordingSink::default();
