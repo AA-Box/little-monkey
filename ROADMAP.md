@@ -1023,15 +1023,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** User can connect external tools to Little Monkey's local endpoint without hand-editing fragile config files.
 
-### 14. Model Retirement and Compatibility Warnings
-
-**Status:** Planned
-
-- Warn about retired cloud models, outdated local models, unsupported model families, and old agent model defaults.
-- Suggest replacements based on hardware, workflow, and privacy policy.
-
-**Acceptance:** Deprecated or unsafe model choices show a clear migration path before a run starts.
-
 ### 15. Runtime Telemetry and Memory Trace Viewer
 
 **Status:** Planned

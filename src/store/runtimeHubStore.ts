@@ -19,6 +19,7 @@ import {
   type M3HardwareCompatibilityReport,
   type M3HttpServerStatus,
   type M3LoadModelRequest,
+  type M3LocalModelStalenessWarning,
   type M3RuntimeCapability,
   type M3RuntimeMetricsView,
   type M3RuntimeStatusView,
@@ -87,6 +88,10 @@ interface RuntimeHubStoreState {
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
   offloadPlans: Record<string, OffloadPlan>;
+  /** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+   * 14): keyed by assetId. `null` means "checked, currently up to date";
+   * absent means "not checked yet". */
+  modelStalenessWarnings: Record<string, M3LocalModelStalenessWarning | null>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -112,6 +117,7 @@ interface RuntimeHubStoreState {
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
+  checkModelStaleness: (assetId: string) => Promise<void>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
   unloadModel: (request: M3UnloadModelRequest) => Promise<void>;
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
@@ -285,6 +291,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     cleanupReport: null,
     schedulingPlan: null,
     offloadPlans: {},
+    modelStalenessWarnings: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -555,6 +562,25 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
         fail(key, error);
         throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    checkModelStaleness: async (assetId) => {
+      // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8,
+      // item 14): diagnostic, additive information like the Hardware
+      // Compatibility Matrix report above — a staleness-check hiccup must
+      // never block the "Load model" flow itself, so failures are captured
+      // for display but never rethrown.
+      const key = `model-staleness:${assetId}`;
+      begin(key);
+      try {
+        const operationId = createM3OperationId("model-staleness-check");
+        const warning = await runtimeHubClient.modelStalenessCheck({ operationId, timeoutMs: 30_000, assetId });
+        set((state) => ({ modelStalenessWarnings: { ...state.modelStalenessWarnings, [assetId]: warning } }));
+      } catch (error) {
+        fail(key, error);
       } finally {
         finish(key);
       }

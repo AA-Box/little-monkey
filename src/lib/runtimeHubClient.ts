@@ -187,6 +187,19 @@ export interface M3CatalogSourceConfig {
   endpoint: string;
 }
 
+// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+// an installed model flagged as outdated — a different catalog revision is
+// available *and* the install has gone unrefreshed for a long time. See
+// `model_retirement.rs`'s `check_local_model_staleness`.
+export interface M3LocalModelStalenessWarning {
+  assetId: string;
+  installedRevision: string;
+  latestRevision: string;
+  installedAtMs: number;
+  ageMs: number;
+  suggestedReplacementDisplayName: string;
+}
+
 export interface M3CleanupReport {
   removedPaths: number;
   reclaimedBytes: number;
@@ -643,6 +656,8 @@ export const runtimeHubClient = {
   offloadPlan: (input: OffloadPlanInput) => invoke<OffloadPlan>("m3_offload_plan", { input }),
   catalogSearch: (args: OperationArgs & { query: string; limit: number }) =>
     invoke<M3CatalogMatch[]>("m3_catalog_search", args),
+  modelStalenessCheck: (args: OperationArgs & { assetId: string }) =>
+    invoke<M3LocalModelStalenessWarning | null>("m3_model_staleness_check", args),
   modelDownload: (args: OperationArgs & { request: { model: M3CatalogModel; acceptedLicenseSha256: string } }) =>
     invoke<M3InstalledModel>("m3_model_download", args),
   modelUpdate: (

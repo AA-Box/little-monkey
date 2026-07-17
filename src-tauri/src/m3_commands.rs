@@ -255,6 +255,22 @@ pub async fn m3_catalog_search(
     finish(&state, &operation_id, result).await
 }
 
+/// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+/// 14): the frontend calls this before a local model actually loads (see
+/// `RuntimeHubRuntimes.tsx`'s "Load model" section) so an outdated installed
+/// model shows a concrete "update to this" migration path first.
+#[tauri::command]
+pub async fn m3_model_staleness_check(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    asset_id: String,
+) -> Result<Option<crate::model_retirement::LocalModelStalenessWarning>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.hub.model_staleness_check(&asset_id, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
 #[tauri::command]
 pub async fn m3_model_download(
     state: tauri::State<'_, M3CommandState>,

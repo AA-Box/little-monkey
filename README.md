@@ -47,6 +47,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
 - Store private keys and provider credentials in the OS keychain; persisted configuration contains references rather than plaintext key material.
+- Warn about model retirement and compatibility before a run starts, on both surfaces: a cloud provider model (Settings → AI Providers, or the chat model switcher) known-retired against a maintained, versioned local list gets a reason and a concrete replacement suggested from that provider's own live model list; an installed local Runtime Hub model with a different catalog revision available and no refresh in a long time gets flagged the same way before its "Load model" step runs. Neither check is a live-verified upstream source — both are honest, updatable local signals, not a guarantee.
 
 ### Skills, plugins, MCP Apps, and workflows
 
