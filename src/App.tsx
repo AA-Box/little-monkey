@@ -27,6 +27,7 @@ import { useArtifactStore } from "./store/artifactStore";
 import { usePermissionStore } from "./store/permissionStore";
 import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
+import { subscribeToLocalAppsChanges, subscribeToLocalAppRunRequests } from "./store/localAppsStore";
 import { hydrateAutomations } from "./store/automationsStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
@@ -262,6 +263,20 @@ function App() {
   useEffect(() => {
     if (isTauri() && getCurrentWindow().label === "main") {
       recoverDaemonDesktopTurns();
+    }
+  }, []);
+
+  // Local App Builder (ROADMAP.md, Phase 3): a published app's static page
+  // triggers a run over HTTP, but only the desktop app's own frontend loop
+  // can actually execute a recipe (`recipeRunner.ts`'s `runRecipeNow`) — see
+  // `local_apps.rs`'s module doc. Main-window-only, same reasoning as the
+  // scheduler and daemon-recovery effects above: every window shares the
+  // same local API server, so running this in a secondary window too would
+  // race to handle the same run request twice.
+  useEffect(() => {
+    void subscribeToLocalAppsChanges();
+    if (isTauri() && getCurrentWindow().label === "main") {
+      void subscribeToLocalAppRunRequests();
     }
   }, []);
 

@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const id: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const id: Record<string, string> = {
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Alur Agen Issue-to-PR",
@@ -298,6 +300,7 @@ export const id: Record<string, string> = {
   "MessageList.verifyNoOutput": "Tidak ada output",
   "MessageList.verifyRunning": "Menjalankan {{label}}…",
   "MessageList.sourcesHeading": "{{count}} sumber",
+  "MessageList.recipeStartedFromLocalApp": "Dimulai dari resep: {{name}} · melalui Local App \"{{appName}}\"",
   "SubagentRow.profileExplore": "eksplorasi",
   "SubagentRow.profileCode": "kode",
   "SubagentRow.statusRunning": "Berjalan",
@@ -988,4 +991,32 @@ export const id: Record<string, string> = {
   "ApprovalChainModal.timeRemaining": "Waktu tersisa: {{time}}",
   "ApprovalChainModal.denyButton": "Tolak",
   "ApprovalChainModal.approveButton": "Setujui",
+
+  // Local App Builder (ROADMAP.md Phase 3) — real translations overriding the English `localAppsLocale` defaults spread above.
+  "SettingsModal.tabLocalApps": "Aplikasi Lokal",
+  "LocalAppsPanel.description": "Publikasikan Recipe tersimpan sebagai halaman lokal kecil — token terbatas memungkinkannya menjalankan hanya recipe itu saja, tidak ada yang lain di workspace Anda.",
+  "LocalAppsPanel.publishedHeading": "Aplikasi yang dipublikasikan",
+  "LocalAppsPanel.publishButton": "Publikasikan Aplikasi Lokal",
+  "LocalAppsPanel.noRecipesHint": "Simpan recipe terlebih dahulu di Pengaturan → Tugas.",
+  "LocalAppsPanel.emptyState": "Belum ada Aplikasi Lokal yang dipublikasikan.",
+  "LocalAppsPanel.recipeAndTemplate": "Recipe: {{recipe}} · {{template}}",
+  "LocalAppsPanel.statusPublished": "Dipublikasikan",
+  "LocalAppsPanel.statusDisabled": "Dibatalkan publikasinya",
+  "LocalAppsPanel.openButton": "Buka",
+  "LocalAppsPanel.copyLinkButton": "Salin tautan",
+  "LocalAppsPanel.copiedButton": "Disalin",
+  "LocalAppsPanel.unpublishButton": "Batalkan publikasi",
+  "LocalAppsPanel.confirmUnpublishButton": "Konfirmasi pembatalan publikasi",
+  "LocalAppsPanel.cancelButton": "Batal",
+  "LocalAppsPanel.wizardHeading": "Publikasikan Aplikasi Lokal",
+  "LocalAppsPanel.wizardRecipeLabel": "Recipe",
+  "LocalAppsPanel.wizardTemplateLabel": "Templat",
+  "LocalAppsPanel.wizardParamsLabel": "Label parameter",
+  "LocalAppsPanel.publishingButton": "Mempublikasikan…",
+  "LocalAppsPanel.confirmPublishButton": "Publikasikan",
+  "LocalAppsPanel.template.form": "Formulir",
+  "LocalAppsPanel.template.dashboard": "Dasbor",
+  "LocalAppsPanel.template.approval_page": "Halaman persetujuan",
+  "LocalAppsPanel.template.report_generator": "Generator laporan",
+  "LocalAppsPanel.template.chat_widget": "Widget obrolan",
 };

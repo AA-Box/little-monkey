@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const ko: Record<string, string> = {
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "이슈-투-PR",
   "IssueToPr.title": "이슈-투-PR 에이전트 흐름",
@@ -298,6 +300,7 @@ export const ko: Record<string, string> = {
   "MessageList.verifyNoOutput": "출력 없음",
   "MessageList.verifyRunning": "{{label}} 실행 중…",
   "MessageList.sourcesHeading": "출처 {{count}}개",
+  "MessageList.recipeStartedFromLocalApp": "레시피에서 시작됨: {{name}} · 로컬 앱 \"{{appName}}\" 경유",
   "SubagentRow.profileExplore": "탐색",
   "SubagentRow.profileCode": "코드",
   "SubagentRow.statusRunning": "실행 중",
@@ -988,4 +991,32 @@ export const ko: Record<string, string> = {
   "ApprovalChainModal.timeRemaining": "남은 시간: {{time}}",
   "ApprovalChainModal.denyButton": "거부",
   "ApprovalChainModal.approveButton": "승인",
+
+  // Local App Builder (ROADMAP.md Phase 3) — real translations overriding the English `localAppsLocale` defaults spread above.
+  "SettingsModal.tabLocalApps": "로컬 앱",
+  "LocalAppsPanel.description": "저장된 레시피를 작은 로컬 페이지로 게시합니다 — 범위가 제한된 토큰을 통해 해당 레시피만 실행할 수 있으며, 워크스페이스의 다른 어떤 것도 실행할 수 없습니다.",
+  "LocalAppsPanel.publishedHeading": "게시된 앱",
+  "LocalAppsPanel.publishButton": "로컬 앱 게시",
+  "LocalAppsPanel.noRecipesHint": "먼저 설정 → 작업에서 레시피를 저장하세요.",
+  "LocalAppsPanel.emptyState": "아직 게시된 로컬 앱이 없습니다.",
+  "LocalAppsPanel.recipeAndTemplate": "레시피: {{recipe}} · {{template}}",
+  "LocalAppsPanel.statusPublished": "게시됨",
+  "LocalAppsPanel.statusDisabled": "게시 취소됨",
+  "LocalAppsPanel.openButton": "열기",
+  "LocalAppsPanel.copyLinkButton": "링크 복사",
+  "LocalAppsPanel.copiedButton": "복사됨",
+  "LocalAppsPanel.unpublishButton": "게시 취소",
+  "LocalAppsPanel.confirmUnpublishButton": "게시 취소 확인",
+  "LocalAppsPanel.cancelButton": "취소",
+  "LocalAppsPanel.wizardHeading": "로컬 앱 게시",
+  "LocalAppsPanel.wizardRecipeLabel": "레시피",
+  "LocalAppsPanel.wizardTemplateLabel": "템플릿",
+  "LocalAppsPanel.wizardParamsLabel": "매개변수 레이블",
+  "LocalAppsPanel.publishingButton": "게시 중…",
+  "LocalAppsPanel.confirmPublishButton": "게시",
+  "LocalAppsPanel.template.form": "양식",
+  "LocalAppsPanel.template.dashboard": "대시보드",
+  "LocalAppsPanel.template.approval_page": "승인 페이지",
+  "LocalAppsPanel.template.report_generator": "보고서 생성기",
+  "LocalAppsPanel.template.chat_widget": "채팅 위젯",
 };

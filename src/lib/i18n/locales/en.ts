@@ -9,6 +9,7 @@ import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { inboxLocale } from "./inbox";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const en: Record<string, string> = {
   ...crewLocale,
@@ -22,6 +23,7 @@ export const en: Record<string, string> = {
   ...triageLocale,
   ...inboxLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
@@ -318,6 +320,7 @@ export const en: Record<string, string> = {
   "MessageList.verifyRunning": "Running {{label}}…",
   "MessageList.sourcesHeading": "{{count}} source(s)",
   "MessageList.recipeStarted": "Started from recipe: {{name}}",
+  "MessageList.recipeStartedFromLocalApp": "Started from recipe: {{name}} · via Local App \"{{appName}}\"",
   "SubagentRow.profileExplore": "explore",
   "SubagentRow.profileCode": "code",
   "SubagentRow.statusRunning": "Running",

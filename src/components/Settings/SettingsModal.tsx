@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  AppWindow,
   BarChart3,
   BookOpen,
   Bot,
@@ -51,6 +52,7 @@ import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
 import { TriagePanel } from "../Triage/TriagePanel";
 import { ApprovalChainsPanel } from "./ApprovalChainsPanel";
+import { LocalAppsPanel } from "./LocalAppsPanel";
 import { CompanionPanel } from "./CompanionPanel";
 import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
 import { AppearancePanel } from "./AppearancePanel";
@@ -71,7 +73,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance" | "triage" | "approvalchains";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance" | "triage" | "approvalchains" | "localapps";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -98,12 +100,13 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   appearance: Palette,
   triage: Inbox,
   approvalchains: ListOrdered,
+  localapps: AppWindow,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "approvalchains", "companion", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
-  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks"] },
+  { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "tasks", "localapps"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "mcp", "connectors", "prompts", "apiserver"] },
 ];
 
@@ -132,6 +135,7 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   appearance: "SettingsModal.tabAppearance",
   triage: "SettingsModal.tabTriage",
   approvalchains: "SettingsModal.tabApprovalChains",
+  localapps: "SettingsModal.tabLocalApps",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -356,6 +360,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "shortcuts" && <KeyboardShortcutsPanel />}
               {tab === "usage" && <UsagePanel />}
               {tab === "tasks" && <ScheduledTasksPanel />}
+              {tab === "localapps" && <LocalAppsPanel />}
               {tab === "portability" && <PortabilityPanel />}
               {tab === "ecosystem" && <EcosystemPanel />}
               {tab === "runtimehub" && <RuntimeHubPanel />}

@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const hi: Record<string, string> = {
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "इशू-टू-पीआर",
   "IssueToPr.title": "इशू-टू-पीआर एजेंट फ़्लो",
@@ -298,6 +300,7 @@ export const hi: Record<string, string> = {
   "MessageList.verifyNoOutput": "कोई आउटपुट नहीं",
   "MessageList.verifyRunning": "{{label}} चल रहा है…",
   "MessageList.sourcesHeading": "{{count}} स्रोत",
+  "MessageList.recipeStartedFromLocalApp": "रेसिपी से शुरू किया गया: {{name}} · लोकल ऐप \"{{appName}}\" के ज़रिए",
   "SubagentRow.profileExplore": "अन्वेषण",
   "SubagentRow.profileCode": "कोड",
   "SubagentRow.statusRunning": "चल रहा है",
@@ -988,4 +991,32 @@ export const hi: Record<string, string> = {
   "ApprovalChainModal.timeRemaining": "शेष समय: {{time}}",
   "ApprovalChainModal.denyButton": "अस्वीकार करें",
   "ApprovalChainModal.approveButton": "स्वीकृत करें",
+
+  // Local App Builder (ROADMAP.md Phase 3) — real translations overriding the English `localAppsLocale` defaults spread above.
+  "SettingsModal.tabLocalApps": "स्थानीय ऐप्स",
+  "LocalAppsPanel.description": "किसी सहेजे गए रेसिपी को एक छोटे स्थानीय पेज के रूप में प्रकाशित करें — एक सीमित टोकन इसे केवल वही एक रेसिपी चलाने देता है, आपके वर्कस्पेस में और कुछ नहीं।",
+  "LocalAppsPanel.publishedHeading": "प्रकाशित ऐप्स",
+  "LocalAppsPanel.publishButton": "स्थानीय ऐप प्रकाशित करें",
+  "LocalAppsPanel.noRecipesHint": "पहले सेटिंग्स → कार्यों में एक रेसिपी सहेजें।",
+  "LocalAppsPanel.emptyState": "अभी तक कोई स्थानीय ऐप प्रकाशित नहीं हुआ।",
+  "LocalAppsPanel.recipeAndTemplate": "रेसिपी: {{recipe}} · {{template}}",
+  "LocalAppsPanel.statusPublished": "प्रकाशित",
+  "LocalAppsPanel.statusDisabled": "अप्रकाशित",
+  "LocalAppsPanel.openButton": "खोलें",
+  "LocalAppsPanel.copyLinkButton": "लिंक कॉपी करें",
+  "LocalAppsPanel.copiedButton": "कॉपी हो गया",
+  "LocalAppsPanel.unpublishButton": "अप्रकाशित करें",
+  "LocalAppsPanel.confirmUnpublishButton": "अप्रकाशित करने की पुष्टि करें",
+  "LocalAppsPanel.cancelButton": "रद्द करें",
+  "LocalAppsPanel.wizardHeading": "स्थानीय ऐप प्रकाशित करें",
+  "LocalAppsPanel.wizardRecipeLabel": "रेसिपी",
+  "LocalAppsPanel.wizardTemplateLabel": "टेम्पलेट",
+  "LocalAppsPanel.wizardParamsLabel": "पैरामीटर लेबल",
+  "LocalAppsPanel.publishingButton": "प्रकाशित हो रहा है…",
+  "LocalAppsPanel.confirmPublishButton": "प्रकाशित करें",
+  "LocalAppsPanel.template.form": "फ़ॉर्म",
+  "LocalAppsPanel.template.dashboard": "डैशबोर्ड",
+  "LocalAppsPanel.template.approval_page": "अनुमोदन पृष्ठ",
+  "LocalAppsPanel.template.report_generator": "रिपोर्ट जनरेटर",
+  "LocalAppsPanel.template.chat_widget": "चैट विजेट",
 };

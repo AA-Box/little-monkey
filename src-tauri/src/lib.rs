@@ -183,6 +183,7 @@ pub mod issue_to_pr;
 // independent state machine — see the module doc for why it isn't an
 // extension of `PermissionState`.
 pub mod approval_chains;
+pub mod local_apps;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -372,6 +373,9 @@ pub struct AppState {
     /// `approval_chains.rs`'s module doc. A separate state machine from
     /// `permissions` above, not an extension of it.
     pub approval_chains: approval_chains::ApprovalChainState,
+    /// Serializes `local_apps.json` read-modify-write cycles (publish/
+    /// unpublish) — same reasoning as `api_server_config_lock`.
+    pub local_apps_config_lock: std::sync::Mutex<()>,
 }
 
 impl Default for AppState {
@@ -402,6 +406,7 @@ impl Default for AppState {
             stack_cache: Default::default(),
             index_cancels: Default::default(),
             approval_chains: Default::default(),
+            local_apps_config_lock: Default::default(),
         }
     }
 }
@@ -925,6 +930,10 @@ pub fn run() {
             approval_chains::approval_chain_respond,
             approval_chains::approval_chains_get,
             approval_chains::approval_chains_history,
+            local_apps::local_apps_publish,
+            local_apps::local_apps_list,
+            local_apps::local_apps_unpublish,
+            local_apps::local_apps_open,
             m7_companion::m7_overlay_show,
             m7_companion::m7_overlay_hide,
             m7_companion::m7_overlay_submit,

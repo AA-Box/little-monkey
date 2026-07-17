@@ -644,6 +644,12 @@ export interface RecipeNotice {
   /** Absolute path the recipe was loaded from, if known — omitted for a
    * recipe resolved only by name (the common case; see `recipesStore.ts`). */
   path?: string;
+  /** Set only when this run was triggered through a published Local App's
+   * `run` route (see `localAppsStore.ts`'s run-request listener) rather than
+   * a direct "Run now"/scheduled invocation — the id of that Local App, so
+   * `MessageList`/Run Capsule viewers can show which published app started
+   * this run. */
+  localAppId?: string;
 }
 
 function isRecipePayload(value: unknown): value is RecipeNotice {

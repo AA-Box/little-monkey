@@ -314,6 +314,15 @@ pub enum Scope {
     WorkflowRun,
     /// Gates `GET /v1/artifacts/{id}` — see [`handle_artifact_read`].
     ArtifactRead,
+    /// Gates `POST /v1/local-apps/{id}/run` — see [`local_apps`] and
+    /// [`handle_local_app_run`]. Only ever minted by
+    /// [`mint_local_app_token`], never by [`mint_token`] (the generic
+    /// create-token flow rejects it outright) — a token carrying this scope
+    /// is meaningless without also matching [`TokenEntry::bound_local_app_id`],
+    /// which the generic flow never sets. `backends` is always empty on a
+    /// token carrying only this scope, so it can never route through
+    /// `chat`/`models`/`embeddings` either — see [`mint_local_app_token`].
+    LocalAppRun,
 }
 
 /// Which upstream a [`TokenEntry`] may be routed to. Mirrors [`ModelRoute`]
@@ -338,7 +347,7 @@ fn backend_label(backend: Backend) -> &'static str {
 /// secret that ever reaches disk — see [`mint_token`]. `#[serde(default)]`
 /// throughout for the same hand-edited-file leniency as `CustomProviderEntry`/
 /// `WebSettings`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
     #[serde(default)]
     pub id: String,
@@ -359,6 +368,12 @@ pub struct TokenEntry {
     /// preserved by `#[serde(default)]` for every token already on disk.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Set only by [`mint_local_app_token`] — the one Local App id this
+    /// token's [`Scope::LocalAppRun`] scope is allowed to run, checked by
+    /// [`authenticate_local_app_token`] against the id in the request path.
+    /// `None` for every ordinary token minted by [`mint_token`].
+    #[serde(default)]
+    pub bound_local_app_id: Option<String>,
 }
 
 /// Frontend-facing view of a [`TokenEntry`] with the digest stripped —
@@ -694,18 +709,20 @@ fn route_backend(route: &ModelRoute) -> Option<Backend> {
 /// A token that matched on the current request, stripped down to just what
 /// route handlers need to enforce scope/backend restrictions — returned by
 /// [`authenticate`].
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TokenAuth {
     id: String,
     scopes: Vec<Scope>,
     backends: Vec<Backend>,
+    /// See [`TokenEntry::bound_local_app_id`].
+    bound_local_app_id: Option<String>,
 }
 
 /// The subset of a [`TokenEntry`] needed to authenticate one request —
 /// deliberately not the full struct (no `label`/`created_at`), assembled
 /// fresh from `api_server.json` in [`build_deps`] on every request so a
 /// revoked token stops working immediately without a server restart.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct StoredToken {
     id: String,
     sha256: String,
@@ -713,6 +730,8 @@ struct StoredToken {
     backends: Vec<Backend>,
     /// See [`TokenEntry::expires_at`] — checked by [`authenticate`].
     expires_at: Option<u64>,
+    /// See [`TokenEntry::bound_local_app_id`].
+    bound_local_app_id: Option<String>,
 }
 
 /// Shared `403` gate for every route (the original five and the phase-5
@@ -748,11 +767,27 @@ enum ExtendedRoute {
     KnowledgeQuery,
     ArtifactRead(String),
     WorkflowRunStatus(String),
+    /// `POST /v1/local-apps/{id}/run` — see [`handle_local_app_run`].
+    LocalAppRun(String),
+    /// `GET /local-apps/{id}` or `GET /local-apps/{id}/{rel_path}` — see
+    /// [`handle_local_app_static`]. Unauthenticated: a published Local App's
+    /// static page must open in a plain browser tab with no bearer token.
+    LocalAppStatic { app_id: String, rel_path: String },
 }
 
 fn extended_route_for(method: &Method, path: &str) -> Option<ExtendedRoute> {
     if method == Method::POST && path == "/v1/knowledge/query" {
         return Some(ExtendedRoute::KnowledgeQuery);
+    }
+    if method == Method::POST {
+        if let Some(id) = path
+            .strip_prefix("/v1/local-apps/")
+            .and_then(|rest| rest.strip_suffix("/run"))
+        {
+            if !id.is_empty() && !id.contains('/') {
+                return Some(ExtendedRoute::LocalAppRun(id.to_string()));
+            }
+        }
     }
     if method == Method::GET {
         if let Some(id) = path.strip_prefix("/v1/artifacts/") {
@@ -763,6 +798,17 @@ fn extended_route_for(method: &Method, path: &str) -> Option<ExtendedRoute> {
         if let Some(run_id) = path.strip_prefix("/v1/workflows/runs/") {
             if !run_id.is_empty() {
                 return Some(ExtendedRoute::WorkflowRunStatus(run_id.to_string()));
+            }
+        }
+        if let Some(rest) = path.strip_prefix("/local-apps/") {
+            let mut parts = rest.splitn(2, '/');
+            let app_id = parts.next().unwrap_or("");
+            let rel_path = parts.next().unwrap_or("");
+            if !app_id.is_empty() {
+                return Some(ExtendedRoute::LocalAppStatic {
+                    app_id: app_id.to_string(),
+                    rel_path: rel_path.to_string(),
+                });
             }
         }
     }
@@ -967,6 +1013,7 @@ fn authenticate(
                 id: stored.id.clone(),
                 scopes: stored.scopes.clone(),
                 backends: stored.backends.clone(),
+                bound_local_app_id: stored.bound_local_app_id.clone(),
             }));
         }
     }
@@ -1495,6 +1542,218 @@ async fn handle_workflow_run_status(
     }
 }
 
+/// A published Local App's `run` route is a standing invitation for any
+/// local process to trigger a scoped recipe execution, so unlike every
+/// other route in this file it must always require its own valid, correctly
+/// -bound bearer token — regardless of the server's global `require_token`
+/// toggle, which exists only as an escape hatch for tools that can't set a
+/// custom header on the `chat`/`models`/`embeddings` routes it was designed
+/// for. Honoring that toggle here would mean "leave API auth off" also
+/// silently hands out unauthenticated recipe-execution triggers to anything
+/// on loopback. Returns the matched [`TokenAuth`] only when it both carries
+/// [`Scope::LocalAppRun`] *and* its [`TokenEntry::bound_local_app_id`]
+/// matches `app_id` from the request path — this pairing is what makes it
+/// structurally impossible for a Local App's token to run any recipe other
+/// than the one it was minted for.
+fn authenticate_local_app_token(
+    deps: &ServerDeps,
+    headers: &HeaderMap,
+    app_id: &str,
+) -> Result<TokenAuth, Response<ResponseBody>> {
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(token) = provided else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Missing bearer token for this Local App.",
+            "invalid_api_key",
+        ));
+    };
+    let digest = sha256_hex(token);
+    for stored in &deps.tokens {
+        if constant_time_eq(&digest, &stored.sha256) {
+            if let Some(expires_at) = stored.expires_at {
+                if now_ms() >= expires_at {
+                    break;
+                }
+            }
+            if !stored.scopes.contains(&Scope::LocalAppRun)
+                || stored.bound_local_app_id.as_deref() != Some(app_id)
+            {
+                return Err(forbidden_response(
+                    "This token isn't scoped to run this Local App.",
+                ));
+            }
+            return Ok(TokenAuth {
+                id: stored.id.clone(),
+                scopes: stored.scopes.clone(),
+                backends: stored.backends.clone(),
+                bound_local_app_id: stored.bound_local_app_id.clone(),
+            });
+        }
+    }
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        "Incorrect API key provided for this Local App.",
+        "invalid_api_key",
+    ))
+}
+
+/// `GET /local-apps/{id}` / `GET /local-apps/{id}/{rel_path}` — serves the
+/// static page `local_apps::publish_impl` generated, scoped strictly to that
+/// one app's own directory. Unauthenticated by design (see
+/// [`handle_extended_request`]'s doc comment): opening the link in a plain
+/// browser tab must work with no bearer token at all. Path-traversal safety
+/// is entirely `local_apps::read_static_file`'s job (canonicalize + verify
+/// prefix, the same convention `native_skills.rs` uses).
+async fn handle_local_app_static(
+    app: &AppHandle,
+    app_id: &str,
+    rel_path: &str,
+) -> Response<ResponseBody> {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve the app data directory",
+            "internal_error",
+        );
+    };
+    match crate::local_apps::read_static_file(&app_data_dir, app_id, rel_path) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(full_body(bytes))
+            .expect("building a static-file response from a fixed status + content-type never fails"),
+        Err(_) => not_found_response(),
+    }
+}
+
+/// `POST /v1/local-apps/{id}/run` — the one and only way a published Local
+/// App triggers its bound recipe. Deliberately never executes anything
+/// itself: it validates the request, requires a fresh human approval via
+/// [`permissions::request_permission`] (the same "Default deny" gate every
+/// other new external-write action in this codebase goes through — see
+/// `triage.rs`'s `triage_send_draft_impl` for the identical pattern), then
+/// emits [`crate::local_apps::LOCAL_APP_RUN_REQUESTED_EVENT`] for the
+/// desktop app's own frontend event loop to actually run the recipe
+/// (`recipeRunner.ts`'s `runRecipeNow`, tagged with this app's id) and
+/// produce its Run Capsule — mirroring how `run_submit` only ever records a
+/// ledger entry and leaves live tool execution to that same frontend loop
+/// (see this module's doc comment).
+async fn handle_local_app_run(
+    app: &AppHandle,
+    authed: &TokenAuth,
+    app_id: String,
+    body: Bytes,
+) -> Response<ResponseBody> {
+    if !crate::local_apps::is_valid_app_id(&app_id) || authed.bound_local_app_id.as_deref() != Some(app_id.as_str()) {
+        return not_found_response();
+    }
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve the app data directory",
+            "internal_error",
+        );
+    };
+    let config = match crate::local_apps::config_file_path(app)
+        .and_then(|path| crate::local_apps::load_config_impl(&path))
+    {
+        Ok(config) => config,
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error")
+        }
+    };
+    let Some(def) = config.apps.iter().find(|a| a.id == app_id) else {
+        return not_found_response();
+    };
+    if !def.enabled {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "This Local App has been unpublished.",
+            "app_disabled",
+        );
+    }
+
+    let state = app.state::<AppState>();
+    let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
+    let recipe = match crate::recipes::resolve_recipe_with_path(
+        &def.recipe_name,
+        workspace_root.as_deref(),
+        &app_data_dir,
+    ) {
+        Ok((recipe, _path)) => recipe,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &e, "recipe_unavailable");
+        }
+    };
+
+    let overrides: std::collections::HashMap<String, String> = if body.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid JSON body: {e}"),
+                    "invalid_request_error",
+                )
+            }
+        }
+    };
+    let values = match crate::recipes::resolve_param_values(&recipe, &overrides) {
+        Ok(values) => values,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e, "invalid_params"),
+    };
+
+    let mut param_summary: Vec<String> = values
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    param_summary.sort();
+    let detail = format!(
+        "Local App '{}' wants to run recipe '{}' with parameters: {}",
+        def.name,
+        def.recipe_name,
+        if param_summary.is_empty() {
+            "(none)".to_string()
+        } else {
+            param_summary.join(", ")
+        }
+    );
+    if let Err(e) = crate::permissions::request_permission(
+        app,
+        state.inner(),
+        "local_app_run",
+        detail,
+        None,
+        None,
+        None,
+        Some(&def.name),
+    )
+    .await
+    {
+        return forbidden_response(&e);
+    }
+
+    let _ = app.emit(
+        crate::local_apps::LOCAL_APP_RUN_REQUESTED_EVENT,
+        crate::local_apps::LocalAppRunRequestedPayload {
+            app_id: app_id.clone(),
+            recipe_name: def.recipe_name.clone(),
+            params: values,
+        },
+    );
+
+    json_response(
+        StatusCode::ACCEPTED,
+        json!({ "status": "accepted", "app_id": app_id }),
+    )
+}
+
 /// Dispatches the three phase-5 extended routes when `path`/`method` match
 /// one (see [`extended_route_for`]), applying the same [`authenticate`] gate
 /// [`handle_request`] uses before returning `None` so unmatched requests
@@ -1511,6 +1770,26 @@ async fn handle_extended_request(
 ) -> Option<(Response<ResponseBody>, Option<String>)> {
     let route = extended_route_for(method, path)?;
 
+    // These two routes intentionally never go through the generic
+    // `authenticate` gate below: `LocalAppStatic` must serve to a plain
+    // browser tab with no bearer token at all, and `LocalAppRun` must always
+    // require its own correctly-bound bearer token regardless of the
+    // server's global `require_token` toggle — see
+    // [`authenticate_local_app_token`]'s doc comment for why.
+    if let ExtendedRoute::LocalAppStatic { app_id, rel_path } = &route {
+        let response = handle_local_app_static(app, app_id, rel_path).await;
+        return Some((with_cors(response), None));
+    }
+    if let ExtendedRoute::LocalAppRun(app_id) = &route {
+        let authed = match authenticate_local_app_token(deps, headers, app_id) {
+            Ok(authed) => authed,
+            Err(response) => return Some((with_cors(response), None)),
+        };
+        let matched_token_id = Some(authed.id.clone());
+        let response = handle_local_app_run(app, &authed, app_id.clone(), body.clone()).await;
+        return Some((with_cors(response), matched_token_id));
+    }
+
     let authed = match authenticate(deps, headers) {
         Ok(authed) => authed,
         Err(response) => return Some((with_cors(response), None)),
@@ -1524,6 +1803,9 @@ async fn handle_extended_request(
         ExtendedRoute::ArtifactRead(id) => handle_artifact_read(app, authed.as_ref(), id).await,
         ExtendedRoute::WorkflowRunStatus(run_id) => {
             handle_workflow_run_status(app, authed.as_ref(), run_id).await
+        }
+        ExtendedRoute::LocalAppRun(_) | ExtendedRoute::LocalAppStatic { .. } => {
+            unreachable!("handled above")
         }
     };
     Some((with_cors(response), matched_token_id))
@@ -1640,6 +1922,7 @@ fn tokens_from_config(config: &ApiServerConfig) -> Vec<StoredToken> {
             scopes: t.scopes.clone(),
             backends: t.backends.clone(),
             expires_at: t.expires_at,
+            bound_local_app_id: t.bound_local_app_id.clone(),
         })
         .collect()
 }
@@ -2256,6 +2539,14 @@ fn mint_token(
     if scopes.is_empty() {
         return Err("Select at least one scope".to_string());
     }
+    // `LocalAppRun` is meaningless without `bound_local_app_id`, which this
+    // generic flow never sets — see `Scope::LocalAppRun`'s doc comment.
+    // Only `mint_local_app_token` may ever produce a token carrying it.
+    if scopes.contains(&Scope::LocalAppRun) {
+        return Err(
+            "Scope 'local_app_run' can only be granted by publishing a Local App".to_string(),
+        );
+    }
     if backends.is_empty() {
         return Err("Select at least one backend".to_string());
     }
@@ -2275,7 +2566,53 @@ fn mint_token(
         created_at: now_ms(),
         last_used_at: None,
         expires_at,
+        bound_local_app_id: None,
     };
+    Ok((token, entry))
+}
+
+/// Mints a token that can do exactly one thing: `POST` the `run` route for
+/// one specific published Local App — see [`Scope::LocalAppRun`]'s doc
+/// comment. `backends` is always empty: `Backend::{Local,Ollama,Providers}`
+/// only ever gate the model-proxying routes (`chat`/`models`/`embeddings`),
+/// and a Local App token must never be able to reach any of them — an empty
+/// list makes [`backend_visible`]'s check fail closed for every one of them,
+/// independent of `scopes`.
+pub fn mint_local_app_token(label: &str, bound_local_app_id: &str) -> (String, TokenEntry) {
+    let token = generate_token();
+    let entry = TokenEntry {
+        id: Uuid::new_v4().to_string(),
+        label: label.to_string(),
+        sha256: sha256_hex(&token),
+        scopes: vec![Scope::LocalAppRun],
+        backends: Vec::new(),
+        created_at: now_ms(),
+        last_used_at: None,
+        expires_at: None,
+        bound_local_app_id: Some(bound_local_app_id.to_string()),
+    };
+    (token, entry)
+}
+
+/// Locked read-modify-write persistence for [`mint_local_app_token`] — same
+/// shape as [`create_token_with_state_impl`], called from
+/// `local_apps::publish_impl` rather than a Tauri command directly (Local
+/// Apps have their own `local_apps_publish` command, which mints this token
+/// as one step of a larger operation).
+pub fn create_local_app_token_with_state(
+    state: &AppState,
+    path: &Path,
+    label: &str,
+    bound_local_app_id: &str,
+) -> Result<(String, TokenEntry), String> {
+    let (token, entry) = mint_local_app_token(label, bound_local_app_id);
+    let _guard = state
+        .api_server_config_lock
+        .lock()
+        .map_err(|_| "API server config lock poisoned".to_string())?;
+    let mut config = load_config_impl(path)?;
+    config.tokens.push(entry.clone());
+    save_config_impl(path, &config)?;
     Ok((token, entry))
 }
 
@@ -2303,7 +2640,11 @@ fn create_token_with_state_impl(
 /// pre-revocation snapshot to `config.revoked` (the audit trail that
 /// survives — see [`RevokedTokenEntry`]) in the same locked read-modify-write
 /// cycle, so the two never drift apart.
-fn revoke_token_with_state_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
+pub(crate) fn revoke_token_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    id: &str,
+) -> Result<(), String> {
     let _guard = state
         .api_server_config_lock
         .lock()
@@ -2417,6 +2758,7 @@ mod tests {
             scopes,
             backends,
             expires_at: None,
+            bound_local_app_id: None,
         }
     }
 
@@ -3255,7 +3597,9 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
-        };
+        
+            ..Default::default()
+};
         let view = TokenEntryView::from(&entry);
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("sha256"));
@@ -3289,6 +3633,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
+            ..Default::default()
         });
 
         save_config_impl(&path, &config).unwrap();
@@ -3406,6 +3751,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
+            ..Default::default()
         });
         config.tokens.push(TokenEntry {
             id: "b".to_string(),
@@ -3416,6 +3762,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
+            ..Default::default()
         });
         save_config_impl(&path, &config).unwrap();
 
@@ -3541,6 +3888,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
+            ..Default::default()
         });
 
         let tokens = tokens_from_config(&config);
@@ -3742,6 +4090,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
+            ..Default::default()
         });
         config.revoked.push(RevokedTokenEntry {
             id: "revoked-1".to_string(),
@@ -3781,6 +4130,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: Some(now_ms() - 1_000),
+            ..Default::default()
         });
         config.tokens.push(TokenEntry {
             id: "active-2".to_string(),
@@ -3791,6 +4141,7 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             expires_at: None,
+            ..Default::default()
         });
 
         let audit = export_audit_impl(&config);
@@ -3809,6 +4160,7 @@ mod tests {
             id: "tok-chat-only".to_string(),
             scopes: vec![Scope::Chat],
             backends: vec![Backend::Local],
+            ..Default::default()
         };
         assert!(require_scope(Some(&chat_only), Scope::Knowledge, "knowledge").is_err());
         assert!(require_scope(Some(&chat_only), Scope::WorkflowRun, "workflow_run").is_err());
@@ -3823,6 +4175,7 @@ mod tests {
             id: "tok-full".to_string(),
             scopes: vec![Scope::Knowledge, Scope::WorkflowRun, Scope::ArtifactRead],
             backends: vec![Backend::Local],
+            ..Default::default()
         };
         assert!(require_scope(Some(&full), Scope::Knowledge, "knowledge").is_ok());
         assert!(require_scope(Some(&full), Scope::WorkflowRun, "workflow_run").is_ok());
@@ -3861,6 +4214,139 @@ mod tests {
         assert_eq!(extended_route_for(&Method::GET, "/v1/models"), None);
     }
 
+    #[test]
+    fn extended_route_for_matches_the_local_app_run_and_static_routes() {
+        assert_eq!(
+            extended_route_for(&Method::POST, "/v1/local-apps/app-1/run"),
+            Some(ExtendedRoute::LocalAppRun("app-1".to_string()))
+        );
+        assert_eq!(
+            extended_route_for(&Method::GET, "/local-apps/app-1"),
+            Some(ExtendedRoute::LocalAppStatic {
+                app_id: "app-1".to_string(),
+                rel_path: String::new()
+            })
+        );
+        assert_eq!(
+            extended_route_for(&Method::GET, "/local-apps/app-1/index.html"),
+            Some(ExtendedRoute::LocalAppStatic {
+                app_id: "app-1".to_string(),
+                rel_path: "index.html".to_string()
+            })
+        );
+        // Wrong method, a blank id, and a run path with an extra segment
+        // must all fall through instead of matching.
+        assert_eq!(extended_route_for(&Method::GET, "/v1/local-apps/app-1/run"), None);
+        assert_eq!(extended_route_for(&Method::POST, "/v1/local-apps//run"), None);
+        assert_eq!(extended_route_for(&Method::GET, "/local-apps/"), None);
+    }
+
+    // -------------------------------------------------------------
+    // Local App Builder (ROADMAP.md, Phase 3): scoped-token enforcement
+    // -------------------------------------------------------------
+
+    fn local_app_stored_token(id: &str, plaintext: &str, bound_local_app_id: &str) -> StoredToken {
+        StoredToken {
+            id: id.to_string(),
+            sha256: sha256_hex(plaintext),
+            scopes: vec![Scope::LocalAppRun],
+            backends: Vec::new(),
+            expires_at: None,
+            bound_local_app_id: Some(bound_local_app_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn mint_local_app_token_produces_a_scope_and_binding_that_cannot_reach_anything_else() {
+        let (_token, entry) = mint_local_app_token("Local App: nightly-audit", "app-1");
+        assert_eq!(entry.scopes, vec![Scope::LocalAppRun]);
+        assert!(entry.backends.is_empty());
+        assert_eq!(entry.bound_local_app_id.as_deref(), Some("app-1"));
+    }
+
+    #[test]
+    fn mint_token_rejects_the_local_app_run_scope_from_the_generic_create_token_flow() {
+        let result = mint_token(
+            "Manually crafted",
+            vec![Scope::LocalAppRun],
+            vec![Backend::Local],
+            None,
+        );
+        assert!(result.unwrap_err().contains("local_app_run"));
+    }
+
+    #[test]
+    fn authenticate_local_app_token_accepts_only_the_exact_bound_app_id() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
+
+        let headers = with_bearer(get_request("/"), "lmk-app1").headers;
+        assert!(authenticate_local_app_token(&deps, &headers, "app-1").is_ok());
+
+        // The exact same token must be rejected for a different app id —
+        // this is the core "impossible to do anything beyond running that
+        // one recipe" guarantee.
+        let rejection = authenticate_local_app_token(&deps, &headers, "app-2");
+        assert!(rejection.is_err());
+    }
+
+    #[test]
+    fn authenticate_local_app_token_rejects_a_token_with_no_local_app_run_scope() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.tokens = vec![stored_token("tok-chat", "lmk-chat-only", vec![Scope::Chat], vec![Backend::Local])];
+        let headers = with_bearer(get_request("/"), "lmk-chat-only").headers;
+        assert!(authenticate_local_app_token(&deps, &headers, "app-1").is_err());
+    }
+
+    #[test]
+    fn authenticate_local_app_token_rejects_missing_or_wrong_bearer_and_ignores_require_token_toggle() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = false; // must not matter for this route
+        deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
+
+        let no_bearer = HeaderMap::new();
+        assert!(authenticate_local_app_token(&deps, &no_bearer, "app-1").is_err());
+
+        let wrong_bearer = with_bearer(get_request("/"), "lmk-never-existed").headers;
+        assert!(authenticate_local_app_token(&deps, &wrong_bearer, "app-1").is_err());
+    }
+
+    #[test]
+    fn a_local_app_token_cannot_reach_chat_models_or_embeddings_through_the_ordinary_routes() {
+        // Exercises the real dispatcher, not just the scope-membership check:
+        // a token minted with only `Scope::LocalAppRun` and empty `backends`
+        // must be turned away by every one of `handle_request`'s five
+        // ordinary routes — this is what makes it structurally impossible
+        // for a published Local App's token to do anything beyond running
+        // its one bound recipe.
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
+
+        for path in ["/v1/models", "/v1/chat/completions", "/v1/embeddings"] {
+            let req = if path == "/v1/models" {
+                with_bearer(get_request(path), "lmk-app1")
+            } else {
+                with_bearer(post_request(path, "{}"), "lmk-app1")
+            };
+            let (resp, matched) = tokio_test_block_on(handle_request(&deps, req));
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "path {path} must reject a Local-App-scoped token"
+            );
+            assert_eq!(matched.as_deref(), Some("tok-app1"));
+        }
+    }
+
+    fn tokio_test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
     // -------------------------------------------------------------
     // Review-finding regressions
     // -------------------------------------------------------------
@@ -3878,6 +4364,7 @@ mod tests {
             id: "t".to_string(),
             scopes: vec![Scope::Models],
             backends: vec![Backend::Local],
+            ..Default::default()
         };
         assert!(backend_visible(Some(&auth), Backend::Local));
         assert!(!backend_visible(Some(&auth), Backend::Ollama));

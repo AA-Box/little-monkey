@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const ja: Record<string, string> = {
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Issue-to-PR エージェントフロー",
@@ -298,6 +300,7 @@ export const ja: Record<string, string> = {
   "MessageList.verifyNoOutput": "出力なし",
   "MessageList.verifyRunning": "{{label}} を実行中…",
   "MessageList.sourcesHeading": "{{count}} 件のソース",
+  "MessageList.recipeStartedFromLocalApp": "レシピから開始: {{name}} · ローカルアプリ「{{appName}}」経由",
   "SubagentRow.profileExplore": "探索",
   "SubagentRow.profileCode": "コード",
   "SubagentRow.statusRunning": "実行中",
@@ -988,4 +991,32 @@ export const ja: Record<string, string> = {
   "ApprovalChainModal.timeRemaining": "残り時間: {{time}}",
   "ApprovalChainModal.denyButton": "拒否",
   "ApprovalChainModal.approveButton": "承認",
+
+  // Local App Builder (ROADMAP.md Phase 3) — real translations overriding the English `localAppsLocale` defaults spread above.
+  "SettingsModal.tabLocalApps": "ローカルアプリ",
+  "LocalAppsPanel.description": "保存したレシピを小さなローカルページとして公開します。スコープ付きトークンにより、そのレシピのみを実行でき、ワークスペースの他の部分には一切アクセスできません。",
+  "LocalAppsPanel.publishedHeading": "公開済みアプリ",
+  "LocalAppsPanel.publishButton": "ローカルアプリを公開",
+  "LocalAppsPanel.noRecipesHint": "まず設定→タスクでレシピを保存してください。",
+  "LocalAppsPanel.emptyState": "公開済みのローカルアプリはまだありません。",
+  "LocalAppsPanel.recipeAndTemplate": "レシピ: {{recipe}} ・ {{template}}",
+  "LocalAppsPanel.statusPublished": "公開中",
+  "LocalAppsPanel.statusDisabled": "公開停止",
+  "LocalAppsPanel.openButton": "開く",
+  "LocalAppsPanel.copyLinkButton": "リンクをコピー",
+  "LocalAppsPanel.copiedButton": "コピーしました",
+  "LocalAppsPanel.unpublishButton": "公開を停止",
+  "LocalAppsPanel.confirmUnpublishButton": "公開停止を確定",
+  "LocalAppsPanel.cancelButton": "キャンセル",
+  "LocalAppsPanel.wizardHeading": "ローカルアプリを公開",
+  "LocalAppsPanel.wizardRecipeLabel": "レシピ",
+  "LocalAppsPanel.wizardTemplateLabel": "テンプレート",
+  "LocalAppsPanel.wizardParamsLabel": "パラメータのラベル",
+  "LocalAppsPanel.publishingButton": "公開中…",
+  "LocalAppsPanel.confirmPublishButton": "公開",
+  "LocalAppsPanel.template.form": "フォーム",
+  "LocalAppsPanel.template.dashboard": "ダッシュボード",
+  "LocalAppsPanel.template.approval_page": "承認ページ",
+  "LocalAppsPanel.template.report_generator": "レポート生成",
+  "LocalAppsPanel.template.chat_widget": "チャットウィジェット",
 };

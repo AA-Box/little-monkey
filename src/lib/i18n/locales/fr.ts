@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const fr: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const fr: Record<string, string> = {
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flux d'agent Issue-to-PR",
@@ -298,6 +300,7 @@ export const fr: Record<string, string> = {
   "MessageList.verifyNoOutput": "Aucune sortie",
   "MessageList.verifyRunning": "Exécution de {{label}}…",
   "MessageList.sourcesHeading": "{{count}} source(s)",
+  "MessageList.recipeStartedFromLocalApp": "Démarré à partir de la recette : {{name}} · via l'application locale « {{appName}} »",
   "SubagentRow.profileExplore": "exploration",
   "SubagentRow.profileCode": "code",
   "SubagentRow.statusRunning": "En cours",
@@ -988,4 +991,32 @@ export const fr: Record<string, string> = {
   "ApprovalChainModal.timeRemaining": "Temps restant : {{time}}",
   "ApprovalChainModal.denyButton": "Refuser",
   "ApprovalChainModal.approveButton": "Approuver",
+
+  // Local App Builder (ROADMAP.md Phase 3) — real translations overriding the English `localAppsLocale` defaults spread above.
+  "SettingsModal.tabLocalApps": "Applications locales",
+  "LocalAppsPanel.description": "Publiez une recette enregistrée sous forme de petite page locale — un jeton limité lui permet d'exécuter uniquement cette recette, jamais autre chose dans votre espace de travail.",
+  "LocalAppsPanel.publishedHeading": "Applications publiées",
+  "LocalAppsPanel.publishButton": "Publier une application locale",
+  "LocalAppsPanel.noRecipesHint": "Enregistrez d'abord une recette dans Paramètres → Tâches.",
+  "LocalAppsPanel.emptyState": "Aucune application locale publiée pour l'instant.",
+  "LocalAppsPanel.recipeAndTemplate": "Recette : {{recipe}} · {{template}}",
+  "LocalAppsPanel.statusPublished": "Publiée",
+  "LocalAppsPanel.statusDisabled": "Dépubliée",
+  "LocalAppsPanel.openButton": "Ouvrir",
+  "LocalAppsPanel.copyLinkButton": "Copier le lien",
+  "LocalAppsPanel.copiedButton": "Copié",
+  "LocalAppsPanel.unpublishButton": "Dépublier",
+  "LocalAppsPanel.confirmUnpublishButton": "Confirmer la dépublication",
+  "LocalAppsPanel.cancelButton": "Annuler",
+  "LocalAppsPanel.wizardHeading": "Publier une application locale",
+  "LocalAppsPanel.wizardRecipeLabel": "Recette",
+  "LocalAppsPanel.wizardTemplateLabel": "Modèle",
+  "LocalAppsPanel.wizardParamsLabel": "Libellés des paramètres",
+  "LocalAppsPanel.publishingButton": "Publication…",
+  "LocalAppsPanel.confirmPublishButton": "Publier",
+  "LocalAppsPanel.template.form": "Formulaire",
+  "LocalAppsPanel.template.dashboard": "Tableau de bord",
+  "LocalAppsPanel.template.approval_page": "Page d'approbation",
+  "LocalAppsPanel.template.report_generator": "Générateur de rapport",
+  "LocalAppsPanel.template.chat_widget": "Widget de discussion",
 };

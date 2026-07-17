@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
+import { localAppsLocale } from "./localApps";
 
 export const it: Record<string, string> = {
   ...crewLocale,
@@ -16,6 +17,7 @@ export const it: Record<string, string> = {
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
+  ...localAppsLocale,
   // Issue-to-PR Agent Flow (ROADMAP.md Phase 3) — real translations overriding the English `issueToPrLocale` defaults spread above.
   "AppMenu.issueToPr": "Issue-to-PR",
   "IssueToPr.title": "Flusso agente Issue-to-PR",
@@ -298,6 +300,7 @@ export const it: Record<string, string> = {
   "MessageList.verifyNoOutput": "Nessun output",
   "MessageList.verifyRunning": "Esecuzione di {{label}} in corso…",
   "MessageList.sourcesHeading": "{{count}} fonte/i",
+  "MessageList.recipeStartedFromLocalApp": "Avviato dalla ricetta: {{name}} · tramite Local App \"{{appName}}\"",
   "SubagentRow.profileExplore": "esplorazione",
   "SubagentRow.profileCode": "codice",
   "SubagentRow.statusRunning": "In corso",
@@ -988,4 +991,32 @@ export const it: Record<string, string> = {
   "ApprovalChainModal.timeRemaining": "Tempo rimanente: {{time}}",
   "ApprovalChainModal.denyButton": "Rifiuta",
   "ApprovalChainModal.approveButton": "Approva",
+
+  // Local App Builder (ROADMAP.md Phase 3) — real translations overriding the English `localAppsLocale` defaults spread above.
+  "SettingsModal.tabLocalApps": "App locali",
+  "LocalAppsPanel.description": "Pubblica una ricetta salvata come piccola pagina locale — un token limitato le permette di eseguire solo quella ricetta, mai altro nel tuo spazio di lavoro.",
+  "LocalAppsPanel.publishedHeading": "App pubblicate",
+  "LocalAppsPanel.publishButton": "Pubblica un'app locale",
+  "LocalAppsPanel.noRecipesHint": "Salva prima una ricetta in Impostazioni → Attività.",
+  "LocalAppsPanel.emptyState": "Nessuna app locale pubblicata finora.",
+  "LocalAppsPanel.recipeAndTemplate": "Ricetta: {{recipe}} · {{template}}",
+  "LocalAppsPanel.statusPublished": "Pubblicata",
+  "LocalAppsPanel.statusDisabled": "Non pubblicata",
+  "LocalAppsPanel.openButton": "Apri",
+  "LocalAppsPanel.copyLinkButton": "Copia link",
+  "LocalAppsPanel.copiedButton": "Copiato",
+  "LocalAppsPanel.unpublishButton": "Annulla pubblicazione",
+  "LocalAppsPanel.confirmUnpublishButton": "Conferma annullamento",
+  "LocalAppsPanel.cancelButton": "Annulla",
+  "LocalAppsPanel.wizardHeading": "Pubblica un'app locale",
+  "LocalAppsPanel.wizardRecipeLabel": "Ricetta",
+  "LocalAppsPanel.wizardTemplateLabel": "Modello",
+  "LocalAppsPanel.wizardParamsLabel": "Etichette dei parametri",
+  "LocalAppsPanel.publishingButton": "Pubblicazione…",
+  "LocalAppsPanel.confirmPublishButton": "Pubblica",
+  "LocalAppsPanel.template.form": "Modulo",
+  "LocalAppsPanel.template.dashboard": "Dashboard",
+  "LocalAppsPanel.template.approval_page": "Pagina di approvazione",
+  "LocalAppsPanel.template.report_generator": "Generatore di report",
+  "LocalAppsPanel.template.chat_widget": "Widget chat",
 };
