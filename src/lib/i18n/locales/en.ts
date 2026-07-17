@@ -5,25 +5,40 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
-import { paletteLocale } from "./palette";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
+import { inboxLocale } from "./inbox";
+import { approvalChainsLocale } from "./approvalChains";
+import { securityAutofixLocale } from "./securityAutofix";
+import { paletteLocale } from "./palette";
 import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
+import { connectorBuilderLocale } from "./connectorBuilder";
 import { specScorerLocale } from "./specScorer";
-import { inboxLocale } from "./inbox";
 import { privacyFirewallLocale } from "./privacyFirewall";
 import { sandboxLocale } from "./sandbox";
 import { diagnosticsLocale } from "./diagnostics";
 import { redTeamLabLocale } from "./redTeamLab";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { apiContractDiffLabLocale } from "./apiContractDiffLab";
+import { migrationAgentLocale } from "./migrationAgent";
+import { dataNotebookLocale } from "./dataNotebook";
+import { syntheticMonitoringLocale } from "./syntheticMonitoring";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
+import { workCanvasLocale } from "./workCanvas";
+import { pmCopilotLocale } from "./pmCopilot";
+import { deepResearchLocale } from "./deepResearch";
+import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const en: Record<string, string> = {
+  ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
   ...searchLocale,
@@ -31,21 +46,34 @@ export const en: Record<string, string> = {
   ...portabilityLocale,
   ...ecosystemLocale,
   ...developerLocale,
-  ...paletteLocale,
   ...issueToPrLocale,
+  ...triageLocale,
+  ...inboxLocale,
+  ...approvalChainsLocale,
+  ...securityAutofixLocale,
+  ...paletteLocale,
   ...trustScorecardsLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
+  ...connectorBuilderLocale,
   ...specScorerLocale,
-  ...inboxLocale,
   ...privacyFirewallLocale,
   ...sandboxLocale,
   ...diagnosticsLocale,
   ...redTeamLabLocale,
   ...teamModeLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
+  ...apiContractDiffLabLocale,
+  ...migrationAgentLocale,
+  ...dataNotebookLocale,
+  ...crossRepoIntelligenceLocale,
+  ...workCanvasLocale,
+  ...pmCopilotLocale,
+  ...deepResearchLocale,
+  ...briefStudioLocale,
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   "ComparePicker.toolsBadge": "Tools",
@@ -53,6 +81,7 @@ export const en: Record<string, string> = {
   "AppMenu.sideTasks": "Side Tasks",
   "AppMenu.integratedTerminal": "Integrated terminal",
   "AppMenu.evidenceBoard": "Evidence Board",
+  "AppMenu.goldenDatasetBuilder": "Golden Dataset Builder",
   "EvidenceBoard.title": "Evidence Board",
   "EvidenceBoard.subtitle": "Audit a report claim by claim, with grounded evidence, instead of trusting one summary",
   "EvidenceBoard.close": "Close Evidence Board",
@@ -1262,6 +1291,58 @@ export const en: Record<string, string> = {
   "UsagePanel.clearConfirmMessage": "Clear all recorded usage history? This can't be undone.",
   "UsagePanel.clearConfirmButton": "Clear",
   "UsagePanel.clearCancelButton": "Cancel",
+  "GoldenDatasetBuilder.title": "Golden Dataset Builder",
+  "GoldenDatasetBuilder.subtitle": "Generate labeled synthetic examples, mix in real ones through a privacy filter, and trace every example back to its source",
+  "GoldenDatasetBuilder.close": "Close Golden Dataset Builder",
+  "GoldenDatasetBuilder.selectDataset": "Select a dataset…",
+  "GoldenDatasetBuilder.newDataset": "New dataset",
+  "GoldenDatasetBuilder.deleteDataset": "Delete dataset",
+  "GoldenDatasetBuilder.datasetNamePlaceholder": "Dataset name (e.g. \"Support ticket triage\")",
+  "GoldenDatasetBuilder.seedPlaceholder": "Describe what this dataset should contain (e.g. \"20 example support tickets with a category label\")",
+  "GoldenDatasetBuilder.fieldsPlaceholder": "Schema fields, comma-separated (e.g. text, category)",
+  "GoldenDatasetBuilder.createDataset": "Create dataset",
+  "GoldenDatasetBuilder.cancel": "Cancel",
+  "GoldenDatasetBuilder.generationError": "Failed: {{error}}",
+  "GoldenDatasetBuilder.dismiss": "Dismiss",
+  "GoldenDatasetBuilder.noDatasets": "No dataset selected",
+  "GoldenDatasetBuilder.noDatasetsHint": "Create a dataset from a seed description and schema, then generate synthetic examples or import real ones.",
+  "GoldenDatasetBuilder.seedHeading": "Seed description",
+  "GoldenDatasetBuilder.noSeed": "No seed description set.",
+  "GoldenDatasetBuilder.schemaFields": "Schema fields: {{fields}}",
+  "GoldenDatasetBuilder.countLabel": "Count",
+  "GoldenDatasetBuilder.generating": "Generating…",
+  "GoldenDatasetBuilder.generate": "Generate examples",
+  "GoldenDatasetBuilder.importReal": "Import real examples",
+  "GoldenDatasetBuilder.runEval": "Run eval",
+  "GoldenDatasetBuilder.importHint": "Paste a JSON array of objects matching the schema fields, or one example per line with fields separated by \"|\" in schema order. The same privacy filter used for synthetic examples runs on every imported row — rows that fail are flagged and excluded, never silently included.",
+  "GoldenDatasetBuilder.importSourcePlaceholder": "Source label (e.g. \"support-export.csv\")",
+  "GoldenDatasetBuilder.importTextPlaceholder": "Paste real examples here…",
+  "GoldenDatasetBuilder.importButton": "Import",
+  "GoldenDatasetBuilder.importResult": "Imported {{imported}} example(s); {{skipped}} line(s) skipped (didn't match the schema).",
+  "GoldenDatasetBuilder.examplesCount": "{{count}} example(s)",
+  "GoldenDatasetBuilder.includedCount": "{{count}} included",
+  "GoldenDatasetBuilder.noExamplesYet": "No examples yet",
+  "GoldenDatasetBuilder.noExamplesHint": "Generate synthetic examples or import real ones to get started.",
+  "GoldenDatasetBuilder.versionHistory": "Version history",
+  "GoldenDatasetBuilder.versionEntry": "v{{version}} — {{note}}",
+  "GoldenDatasetBuilder.exampleCountLabel": "{{count}} example(s)",
+  "GoldenDatasetBuilder.evalHistory": "Eval results",
+  "GoldenDatasetBuilder.evalVersionLabel": "(v{{version}})",
+  "GoldenDatasetBuilder.provenanceSynthetic": "Synthetic",
+  "GoldenDatasetBuilder.provenanceImported": "Imported",
+  "GoldenDatasetBuilder.privacyPassed": "Privacy OK",
+  "GoldenDatasetBuilder.privacyFlagged": "Privacy flagged",
+  "GoldenDatasetBuilder.duplicateExact": "Exact duplicate",
+  "GoldenDatasetBuilder.duplicateNear": "Near duplicate",
+  "GoldenDatasetBuilder.excluded": "Excluded",
+  "GoldenDatasetBuilder.deleteExample": "Delete example",
+  "GoldenDatasetBuilder.generationPromptLabel": "Generation prompt: {{prompt}}",
+  "GoldenDatasetBuilder.sourceLabel": "Source: {{source}}",
+  "GoldenDatasetBuilder.versionLabel": "v{{version}}",
+  "GoldenDatasetBuilder.privacyFinding.email": "Email",
+  "GoldenDatasetBuilder.privacyFinding.phone": "Phone number",
+  "GoldenDatasetBuilder.privacyFinding.ssn": "SSN-like number",
+  "GoldenDatasetBuilder.privacyFinding.creditCard": "Credit-card-like number",
 
   "SettingsModal.tabDesktopControl": "Desktop Control",
 

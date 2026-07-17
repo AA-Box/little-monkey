@@ -1536,7 +1536,13 @@ impl M3InferenceEngine for CapabilityCheckedInferenceEngine {
     }
 }
 
-fn openai_request_body(request: &CanonicalInferenceRequest, stream: bool) -> M3HubResult<Value> {
+/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs`'s
+/// compose-direction fixtures, so the compatibility lab exercises the exact
+/// wire-body builder real inference traffic uses.
+pub(crate) fn openai_request_body(
+    request: &CanonicalInferenceRequest,
+    stream: bool,
+) -> M3HubResult<Value> {
     let messages = request
         .messages
         .iter()
@@ -1658,7 +1664,9 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
     vec![Ok(Value::Object(object))]
 }
 
-fn parse_openai_response(
+/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs`'s
+/// non-streaming parse-direction fixtures.
+pub(crate) fn parse_openai_response(
     value: &Value,
     request: &CanonicalInferenceRequest,
 ) -> M3HubResult<CanonicalInferenceResponse> {
@@ -1785,7 +1793,10 @@ async fn read_bounded_response(
     Ok(bytes)
 }
 
-struct OpenAiStreamState {
+/// `pub(crate)`: constructed via `Default` and driven through
+/// `ingest_sse_line`/`finish` directly by `chat_template_lab.rs`'s streaming
+/// fixtures — the same struct real SSE responses are parsed with.
+pub(crate) struct OpenAiStreamState {
     response_id: Option<String>,
     model: Option<String>,
     created: Option<u64>,
@@ -1975,7 +1986,7 @@ impl OpenAiStreamState {
         Ok(())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         mut self,
         request: &CanonicalInferenceRequest,
         sink: &mut dyn M3CanonicalStreamSink,
@@ -2053,7 +2064,11 @@ async fn parse_openai_sse(
     state.finish(request, sink)
 }
 
-fn ingest_sse_line(
+/// `pub(crate)`: drives a single synthetic SSE `data:` line through the same
+/// state machine a real streamed response uses; `chat_template_lab.rs` calls
+/// this directly (no live HTTP response required) to validate the streaming
+/// parse direction.
+pub(crate) fn ingest_sse_line(
     line: &str,
     request: &CanonicalInferenceRequest,
     sink: &mut dyn M3CanonicalStreamSink,

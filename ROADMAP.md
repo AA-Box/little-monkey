@@ -978,6 +978,15 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** A model cannot be advertised as chat/tool/vision-ready until renderer tests pass.
 
+### 9. Context and KV Cache Control Center
+
+**Status:** Planned
+
+- Inspect context window, prompt cache reuse, KV cache size, context shift, generation headroom, and cache invalidation.
+- Give users safe controls for long-context tradeoffs.
+
+**Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
+
 ### 10. Tool-Call and Structured-Output Parser Hardening
 
 **Status:** Planned
