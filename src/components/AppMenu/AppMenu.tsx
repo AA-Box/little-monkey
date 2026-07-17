@@ -4,14 +4,23 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardCheck,
+  Compass,
+  GitPullRequest,
   Globe,
   HelpCircle,
   ListTodo,
   Inbox,
+  Network,
+  Newspaper,
   Search,
+  ServerCog,
   Settings as SettingsIcon,
   ShieldAlert,
+  ShieldCheck,
   SquareTerminal,
+  Workflow,
+  Swords,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
@@ -24,10 +33,19 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenIssueToPr: () => void;
+  onOpenTrustScorecards: () => void;
+  onOpenSopCompiler: () => void;
+  onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
+  onOpenKnowledgeGraph: () => void;
   onOpenTerminal: () => void;
   onOpenRedTeamLab: () => void;
+  onOpenEvidenceBoard: () => void;
+  onOpenDebate: () => void;
+  onRestartOnboarding: () => void;
+  onOpenDailyBrief: () => void;
 }
 
 interface MenuRowProps {
@@ -60,10 +78,19 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenIssueToPr,
+  onOpenTrustScorecards,
+  onOpenSopCompiler,
+  onOpenMcpGenerator,
   onOpenSideTasks,
   onOpenAgentInbox,
+  onOpenKnowledgeGraph,
   onOpenTerminal,
   onOpenRedTeamLab,
+  onOpenEvidenceBoard,
+  onOpenDebate,
+  onRestartOnboarding,
+  onOpenDailyBrief,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -117,6 +144,14 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Newspaper size={14} className="text-faint" />}
+            label={t("AppMenu.dailyBrief")}
+            onClick={() => {
+              closeAll();
+              onOpenDailyBrief();
+            }}
+          />
+          <MenuRow
             icon={<Inbox size={14} className="text-faint" />}
             label={t("AppMenu.agentInbox")}
             onClick={() => {
@@ -141,11 +176,59 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<GitPullRequest size={14} className="text-faint" />}
+            label={t("AppMenu.issueToPr")}
+            onClick={() => {
+              closeAll();
+              onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldCheck size={14} className="text-faint" />}
+            label={t("AppMenu.trustScorecards")}
+            onClick={() => {
+              closeAll();
+              onOpenTrustScorecards();
+            }}
+          />
+          <MenuRow
+            icon={<Workflow size={14} className="text-faint" />}
+            label={t("AppMenu.sopCompiler")}
+            onClick={() => {
+              closeAll();
+              onOpenSopCompiler();
+            }}
+          />
+          <MenuRow
+            icon={<ServerCog size={14} className="text-faint" />}
+            label={t("AppMenu.mcpGenerator")}
+            onClick={() => {
+              closeAll();
+              onOpenMcpGenerator();
+            }}
+          />
+          <MenuRow
             icon={<ListTodo size={14} className="text-faint" />}
             label={t("AppMenu.sideTasks")}
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.knowledgeGraphExplorer")}
+            onClick={() => {
+              closeAll();
+              onOpenKnowledgeGraph();
+            }}
+          />
+          <MenuRow
+            icon={<ClipboardCheck size={14} className="text-faint" />}
+            label={t("AppMenu.evidenceBoard")}
+            onClick={() => {
+              closeAll();
+              onOpenEvidenceBoard();
             }}
           />
           <MenuRow
@@ -162,6 +245,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenRedTeamLab();
+            }}
+          />
+          <MenuRow
+            icon={<Swords size={14} className="text-faint" />}
+            label={t("AppMenu.debate")}
+            onClick={() => {
+              closeAll();
+              onOpenDebate();
             }}
           />
           <MenuRow
@@ -216,6 +307,14 @@ export function AppMenu({
             )}
           </div>
 
+          <MenuRow
+            icon={<Compass size={14} className="text-faint" />}
+            label={t("AppMenu.restartOnboarding")}
+            onClick={() => {
+              closeAll();
+              onRestartOnboarding();
+            }}
+          />
           <MenuRow
             icon={<HelpCircle size={14} className="text-faint" />}
             label={t("AppMenu.getHelp")}
