@@ -5,6 +5,7 @@
 //! HTTP/SSE uses `M3RuntimeHub::dispatch_api_stream` directly from the server;
 //! the IPC command intentionally handles only non-streaming requests.
 
+use crate::chat_template_lab::{run_chat_template_lab, ChatTemplateLabReport, TemplateFamily};
 use crate::compatibility_hub::{
     LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest, ScopedTokenView,
     SecurityAuditEvent,
@@ -221,6 +222,17 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Chat Template and Renderer Compatibility Lab report for one coarse
+/// template family (derived from `M3CatalogModel`/`M3InstalledVersion`'s
+/// `template` field). Pure and deterministic — no hub state needed, same as
+/// `m3_schedule_plan` above — so the frontend can call this directly for
+/// any model's declared `template` string, including `null`/unrecognized
+/// ones (which fall back to the `Generic` family).
+#[tauri::command]
+pub fn m3_chat_template_lab_report(template: Option<String>) -> Result<ChatTemplateLabReport, String> {
+    Ok(run_chat_template_lab(TemplateFamily::detect(template.as_deref())))
 }
 
 #[tauri::command]

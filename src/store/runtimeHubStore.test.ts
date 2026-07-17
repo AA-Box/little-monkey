@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     runtimes: vi.fn(),
     refreshRuntimes: vi.fn(),
     schedulePlan: vi.fn(),
+    chatTemplateLabReport: vi.fn(),
     catalogSearch: vi.fn(),
     modelDownload: vi.fn(),
     modelUpdate: vi.fn(),
@@ -211,6 +212,25 @@ describe("runtimeHubStore", () => {
     mocks.client.cancelOperation.mockResolvedValue(true);
     await expect(useRuntimeHubStore.getState().cancelOperation("catalog")).resolves.toBe(true);
     expect(mocks.client.cancelOperation).toHaveBeenCalledWith("catalog-live");
+  });
+
+  it("fetches and caches a chat template lab report keyed by the raw template string", async () => {
+    const gemmaReport = {
+      templateFamily: "gemma",
+      results: [{ area: "system_prompt", passed: false, detail: "gemma has no system role" }],
+    };
+    mocks.client.chatTemplateLabReport.mockResolvedValue(gemmaReport);
+
+    await useRuntimeHubStore.getState().fetchChatTemplateLabReport("gemma-2-9b-it");
+
+    expect(mocks.client.chatTemplateLabReport).toHaveBeenCalledWith("gemma-2-9b-it");
+    expect(useRuntimeHubStore.getState().chatTemplateLabReports["gemma-2-9b-it"]).toEqual(gemmaReport);
+
+    const genericReport = { templateFamily: "generic", results: [] };
+    mocks.client.chatTemplateLabReport.mockResolvedValue(genericReport);
+    await useRuntimeHubStore.getState().fetchChatTemplateLabReport(null);
+    expect(mocks.client.chatTemplateLabReport).toHaveBeenCalledWith(null);
+    expect(useRuntimeHubStore.getState().chatTemplateLabReports[""]).toEqual(genericReport);
   });
 
   it("collects status, inventory, logs, and metrics only through capability-backed runtime calls", async () => {

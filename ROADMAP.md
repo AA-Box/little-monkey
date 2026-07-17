@@ -987,15 +987,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** A conversion produces a reproducible report, output digest, license warning, and eval result.
 
-### 8. Chat Template and Renderer Compatibility Lab
-
-**Status:** Planned
-
-- Test model-specific chat templates, tool rendering, image blocks, thinking modes, system prompts, and stop tokens.
-- Compare native model templates against Little Monkey's renderer before a model is marked ready.
-
-**Acceptance:** A model cannot be advertised as chat/tool/vision-ready until renderer tests pass.
-
 ### 9. Context and KV Cache Control Center
 
 **Status:** Planned
