@@ -65,6 +65,7 @@ import { usePermissionStore, type PermissionMode } from '../store/permissionStor
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
@@ -122,6 +123,16 @@ export const MENTION_NOTE_PREFIX = '[Mentions]';
 
 export function isMentionNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MENTION_NOTE_PREFIX);
+}
+
+/** Prefix identifying a synthetic Privacy Firewall notice (ROADMAP.md Phase
+ * 5) — redaction, block, or local-only-fallback switch — inserted into the
+ * transcript by the pre-turn gate in `runAgentTurnBody`. Same rendering
+ * convention as `SWITCH_NOTE_PREFIX`/`MENTION_NOTE_PREFIX` above. */
+export const PRIVACY_NOTE_PREFIX = '[Privacy firewall]';
+
+export function isPrivacyNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PRIVACY_NOTE_PREFIX);
 }
 
 /**
@@ -998,6 +1009,10 @@ async function resolveBaseUrl(): Promise<string> {
  * comment), but "which model is active right now" is still a single, shared
  * piece of app state both should read the same way.
  */
+/** Exported (in addition to the module's own uses above) so
+ * `issueToPrRunner.ts` can resolve the exact same active-target rules for
+ * its own headless, panel-driven agent turn — see that module's doc comment
+ * for why it reuses this rather than re-deriving target resolution. */
 export async function resolveTarget(): Promise<ResolvedTarget> {
   const target = getActiveChatTarget();
 
@@ -1069,7 +1084,10 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
  * contains its endpoint/model/capability evidence. The inventory is built
  * once at run start; later global model changes cannot rewrite the ledger
  * snapshot. */
-function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+/** Exported so `issueToPrRunner.ts` can build the `target` field
+ * `beginDurableRun` needs for its own headless run, the same reuse reasoning
+ * as `resolveTarget` above. */
+export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
   const state = useModelStore.getState();
   const inventory = buildModelTargetInventory({
     installed: state.installed,
@@ -1214,6 +1232,27 @@ function buildFailoverChain(requireVision: boolean): ResolvedTarget[] {
   }
 
   return chain;
+}
+
+/**
+ * The Privacy Firewall's (ROADMAP.md Phase 5) "switch to local" fallback —
+ * the currently selected Ollama model if one is configured, otherwise its
+ * first cached model. Deliberately never managed llama.cpp: starting that
+ * requires an explicit, already-downloaded model and an `llama_start` call
+ * (see `modelStore.ts::start`) this gate has no basis to make unattended,
+ * the same reasoning `buildFailoverChain`'s doc comment gives for why local
+ * llama.cpp never appears in *that* automatic switch chain either. Returns
+ * `null` when no Ollama model is configured at all, in which case the
+ * caller cancels the turn rather than guessing at a target.
+ */
+function findLocalOnlyTarget(): ResolvedTarget | null {
+  const state = useModelStore.getState();
+  const preferred =
+    state.activeOllamaModel && state.ollamaModels.some((model) => model.name === state.activeOllamaModel)
+      ? state.activeOllamaModel
+      : state.ollamaModels[0]?.name;
+  if (!preferred) return null;
+  return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: preferred };
 }
 
 /** Searches every configured target (cloud providers first, then Ollama) for one that can see images, for the pre-turn vision auto-switch. Returns `null` if nothing qualifies. */
@@ -1855,7 +1894,7 @@ async function runAgentTurnBody(
   }
 
   const composedText = composeReferencedText(userText, textRefs);
-  const wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
+  let wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
@@ -1886,7 +1925,7 @@ async function runAgentTurnBody(
   // once per turn and only advanced (never rebuilt) on a pre-first-token
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
-  const primaryTarget = await resolveTarget();
+  let primaryTarget = await resolveTarget();
 
   // Distinct from the block above: that one is about a NEW image attached
   // THIS turn; this one is an OLDER image already sitting in history from a
@@ -1902,6 +1941,59 @@ async function runAgentTurnBody(
       role: 'system',
       content: `${SWITCH_NOTE_PREFIX} This conversation has an earlier image that ${targetLabel(primaryTarget)} can't see — this reply won't see it either. Switch to a vision-capable model if you need it referenced.`,
     });
+  }
+
+  // Privacy Firewall (ROADMAP.md Phase 5): a visible data boundary before
+  // this turn's content — `composedText`, i.e. the typed message plus every
+  // "@"-mention/attachment it expanded into above, so a secret hiding in a
+  // referenced FILE is caught exactly like one typed directly — leaves the
+  // machine for a CLOUD model. Local llama.cpp and Ollama targets never
+  // leave the machine, so the gate is skipped entirely for those. Run after
+  // the vision-switch checks above so their notices describe the model the
+  // user actually picked, not one this gate might still redirect away from.
+  //
+  // OUT OF SCOPE this pass (see `privacy_firewall.rs`'s own module doc):
+  // every other outbound path — connector writes, MCP tool results, a
+  // paired device (Phase 4, unshipped) — is not gated here. The scanner and
+  // policy engine are destination-agnostic specifically so those call sites
+  // are additive later, not a redesign of this one.
+  if (primaryTarget.kind === 'provider') {
+    const workspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
+    const gate = await usePrivacyFirewallStore
+      .getState()
+      .gateOutbound(composedText, 'cloud_model', workspaceId);
+
+    if (gate.action === 'cancelled') {
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} This turn was blocked from being sent to ${targetLabel(primaryTarget)} and was cancelled.`,
+      });
+      return;
+    }
+
+    if (gate.action === 'switch_local') {
+      const local = findLocalOnlyTarget();
+      if (!local) {
+        addMessage({
+          role: 'system',
+          content: `${PRIVACY_NOTE_PREFIX} This turn was blocked from being sent to ${targetLabel(primaryTarget)}, and no local-only model is configured to switch to — the turn was cancelled. Configure an Ollama model to enable the local-only fallback.`,
+        });
+        return;
+      }
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Switched to ${targetLabel(local)} — this turn's content was blocked from leaving the machine.`,
+      });
+      primaryTarget = local;
+      applyTargetSwitch(local);
+    } else if (gate.content !== composedText) {
+      const redactedCount = gate.report.findings.filter((finding) => finding.action !== 'allow').length;
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
+      });
+      wireContent = toMessageContent(gate.content, images);
+    }
   }
 
   const sequence: ResolvedTarget[] =

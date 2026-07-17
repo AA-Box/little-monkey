@@ -118,6 +118,15 @@ export interface SettingsState {
    * rather than a three-way target-kind picker for a minor v1 win (see the
    * design doc's "keep this genuinely optional... don't force a UI" note). */
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  /** Whether the Safe Desktop Control settings panel (see
+   * `src-tauri/src/desktop_control.rs` and `docs/safe-desktop-control-design.md`)
+   * is reachable at all. Default false — same "disabled = not offered"
+   * posture as `subagentsEnabled`/`skillAutoInvokeEnabled`: this is a
+   * research spike that can move the real mouse/keyboard on macOS, so it
+   * stays off until a user deliberately opts in, in addition to every
+   * backend-side gate (never-bypass, allowlist, per-action approval,
+   * emergency stop) already enforced regardless of this setting. */
+  desktopControlEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -145,6 +154,7 @@ export interface SettingsState {
   setMaxConcurrentSubagents: (value: number) => void;
   setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
   clearSubagentProfileModel: (profile: 'explore' | 'code') => void;
+  setDesktopControlEnabled: (value: boolean) => void;
   setThemePreference: (value: ThemePreference) => void;
   setAccentColor: (value: AccentColor) => void;
   setTextScale: (value: TextScale) => void;
@@ -218,6 +228,7 @@ interface PersistedShape {
   skillAutoInvokeEnabled: boolean;
   maxConcurrentSubagents: number;
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  desktopControlEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
@@ -245,6 +256,7 @@ function defaults(): PersistedShape {
     skillAutoInvokeEnabled: false,
     maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     subagentProfileModels: {},
+    desktopControlEnabled: false,
   };
 }
 
@@ -343,6 +355,8 @@ function hydrate(): PersistedShape {
           ? Math.round(parsed.maxConcurrentSubagents)
           : fallback.maxConcurrentSubagents,
       subagentProfileModels: sanitizeSubagentProfileModels(parsed.subagentProfileModels),
+      desktopControlEnabled:
+        typeof parsed.desktopControlEnabled === "boolean" ? parsed.desktopControlEnabled : fallback.desktopControlEnabled,
     };
   } catch {
     return fallback;
@@ -555,6 +569,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       const { [profile]: _discard, ...rest } = state.subagentProfileModels;
       return { subagentProfileModels: rest };
     });
+    persist({ ...get() });
+  },
+
+  setDesktopControlEnabled: (value) => {
+    set({ desktopControlEnabled: value });
     persist({ ...get() });
   },
 }));

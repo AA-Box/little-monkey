@@ -796,6 +796,13 @@ pub fn permission_respond(
     allow: bool,
     remember: bool,
 ) -> Result<(), String> {
+    // Team Mode (ROADMAP.md Phase 6) gate: responding to a pending
+    // permission request (allow or deny) requires the active team member to
+    // have Approver or Owner role. A complete no-op — see
+    // `team_mode::require_approver`'s doc comment — when no team members
+    // have ever been configured, so solo users see no behavior change.
+    crate::team_mode::require_approver(&app, state.inner())?;
+
     let pending = {
         let guard = state.permissions.pending.lock().unwrap();
         let pending = guard
