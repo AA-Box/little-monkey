@@ -1,14 +1,78 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Archive, CalendarDays, Filter, Loader2, Search, X } from "lucide-react";
+import {
+  Activity,
+  Archive,
+  BookOpen,
+  CalendarDays,
+  FileText,
+  Filter,
+  Globe,
+  ListChecks,
+  Loader2,
+  MessageCircle,
+  MessageSquare,
+  Plug,
+  Search,
+  ShieldCheck,
+  Users,
+  X,
+} from "lucide-react";
 
-import { globalProfileSearch, type GlobalSearchHit } from "../../lib/profileSearch";
+import { globalProfileSearch, type GlobalSearchHit, type SearchSourceKind } from "../../lib/profileSearch";
+import type { UniversalSearchSourceKind } from "../../lib/universalSearch";
 import { useT } from "../../lib/i18n";
 import { useSessionStore } from "../../store/sessionStore";
+import { useUniversalSearchStore } from "../../store/universalSearchStore";
 import { IconButton, StatusPill } from "../ui";
 
 interface GlobalSearchProps {
   onClose: () => void;
   onOpenRun: (runId: string) => void;
+}
+
+/** Every group `GlobalSearch` can render, in display order: the existing
+ * backend-indexed profile search kinds first, then the client-side
+ * universal-search fan-out's kinds (workspace files, run/task summaries,
+ * knowledge stacks, browser evidence, connected apps). */
+type CombinedSourceKind = SearchSourceKind | UniversalSearchSourceKind;
+
+const SOURCE_KIND_ORDER: CombinedSourceKind[] = [
+  "message",
+  "actor_transcript",
+  "run_event",
+  "session",
+  "task",
+  "workspace_file",
+  "knowledge",
+  "browser_evidence",
+  "connected_app",
+];
+
+const SOURCE_KIND_ICON: Record<CombinedSourceKind, typeof MessageCircle> = {
+  message: MessageCircle,
+  actor_transcript: Users,
+  run_event: Activity,
+  session: MessageSquare,
+  task: ListChecks,
+  workspace_file: FileText,
+  knowledge: BookOpen,
+  browser_evidence: Globe,
+  connected_app: Plug,
+};
+
+/** A row shape both the backend profile-search hits and the client-side
+ * universal-search hits normalize into, so the panel can render them in one
+ * grouped list without branching on origin at render time. */
+interface DisplayHit {
+  key: string;
+  sourceKind: CombinedSourceKind;
+  title: string;
+  snippet: string;
+  occurredAtMs: number;
+  modelKey: string | null;
+  workspacePath: string | null;
+  archived: boolean;
+  onOpen: (() => void) | null;
 }
 
 function optional(value: string): string | null {
@@ -28,6 +92,10 @@ function formatDate(value: number): string {
 export function GlobalSearch({ onClose, onOpenRun }: GlobalSearchProps) {
   const { t } = useT();
   const switchSession = useSessionStore((state) => state.switchSession);
+  const runUniversalSearch = useUniversalSearchStore((state) => state.run);
+  const universalHits = useUniversalSearchStore((state) => state.hits);
+  const universalExcludedCount = useUniversalSearchStore((state) => state.excludedCount);
+  const universalLoading = useUniversalSearchStore((state) => state.loading);
   const [query, setQuery] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -56,12 +124,13 @@ export function GlobalSearch({ onClose, onOpenRun }: GlobalSearchProps) {
         setResults([]);
         setLoading(false);
         setError(null);
+        useUniversalSearchStore.getState().clear();
         return;
       }
       setLoading(true);
       setError(null);
-      try {
-        const hits = await globalProfileSearch({
+      const [profileOutcome] = await Promise.allSettled([
+        globalProfileSearch({
           query,
           includeArchived,
           fromMs: dateBoundary(fromDate, false),
@@ -70,19 +139,21 @@ export function GlobalSearch({ onClose, onOpenRun }: GlobalSearchProps) {
           personaId: optional(personaId),
           workspacePath: optional(workspacePath),
           limit: 100,
-        });
-        if (sequence === requestSequence.current) setResults(hits);
-      } catch (caught) {
-        if (sequence === requestSequence.current) {
-          setResults([]);
-          setError(caught instanceof Error ? caught.message : String(caught));
-        }
-      } finally {
-        if (sequence === requestSequence.current) setLoading(false);
+        }),
+        runUniversalSearch(query, { includeArchived }),
+      ]);
+      if (sequence !== requestSequence.current) return;
+      if (profileOutcome.status === "fulfilled") {
+        setResults(profileOutcome.value);
+        setError(null);
+      } else {
+        setResults([]);
+        setError(errorText(profileOutcome.reason));
       }
+      setLoading(false);
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [fromDate, includeArchived, modelKey, personaId, query, toDate, workspacePath]);
+  }, [fromDate, includeArchived, modelKey, personaId, query, runUniversalSearch, toDate, workspacePath]);
 
   function openHit(hit: GlobalSearchHit) {
     if (hit.sessionId) {
@@ -92,6 +163,60 @@ export function GlobalSearch({ onClose, onOpenRun }: GlobalSearchProps) {
       onOpenRun(hit.runId);
     }
   }
+
+  const displayHits = useMemo<DisplayHit[]>(() => {
+    const fromProfile: DisplayHit[] = results.map((hit) => ({
+      key: `profile:${hit.documentId}`,
+      sourceKind: hit.sourceKind,
+      title: hit.title,
+      snippet: hit.snippet,
+      occurredAtMs: hit.occurredAtMs,
+      modelKey: hit.modelKey,
+      workspacePath: hit.workspacePath,
+      archived: hit.archived,
+      onOpen: hit.sessionId || hit.runId ? () => openHit(hit) : null,
+    }));
+    const fromUniversal: DisplayHit[] = universalHits.map((hit) => ({
+      key: `universal:${hit.id}`,
+      sourceKind: hit.sourceKind,
+      title: hit.title,
+      snippet: hit.snippet,
+      occurredAtMs: hit.occurredAtMs,
+      modelKey: null,
+      workspacePath: hit.workspacePath,
+      archived: hit.archived,
+      onOpen: hit.sessionId
+        ? () => {
+            switchSession(hit.sessionId as string);
+            onClose();
+          }
+        : hit.runId
+          ? () => onOpenRun(hit.runId as string)
+          : null,
+    }));
+    const combined = [...fromProfile, ...fromUniversal];
+    const rank = new Map(SOURCE_KIND_ORDER.map((kind, index) => [kind, index]));
+    return combined.sort((a, b) => {
+      const rankDiff = (rank.get(a.sourceKind) ?? 99) - (rank.get(b.sourceKind) ?? 99);
+      if (rankDiff !== 0) return rankDiff;
+      return b.occurredAtMs - a.occurredAtMs;
+    });
+  }, [results, universalHits, switchSession, onClose, onOpenRun]);
+
+  const groups = useMemo(() => {
+    const bySource = new Map<CombinedSourceKind, DisplayHit[]>();
+    for (const hit of displayHits) {
+      const list = bySource.get(hit.sourceKind) ?? [];
+      list.push(hit);
+      bySource.set(hit.sourceKind, list);
+    }
+    return SOURCE_KIND_ORDER.map((kind) => ({ kind, hits: bySource.get(kind) ?? [] })).filter(
+      (group) => group.hits.length > 0,
+    );
+  }, [displayHits]);
+
+  const isLoading = loading || universalLoading;
+  const hasAnyResults = displayHits.length > 0;
 
   return (
     <section className="flex min-h-0 flex-1 flex-col" aria-labelledby="global-search-title">
@@ -114,7 +239,7 @@ export function GlobalSearch({ onClose, onOpenRun }: GlobalSearchProps) {
               className="h-10 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-faint"
               placeholder={t("GlobalSearch.placeholder")}
             />
-            {loading && <Loader2 size={15} className="animate-spin text-faint" aria-label={t("GlobalSearch.loading")} />}
+            {isLoading && <Loader2 size={15} className="animate-spin text-faint" aria-label={t("GlobalSearch.loading")} />}
           </label>
           <button
             type="button"
@@ -136,23 +261,77 @@ export function GlobalSearch({ onClose, onOpenRun }: GlobalSearchProps) {
             <label className="flex items-end gap-2 pb-1.5 text-xs text-foreground"><input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} /><Archive size={13} />{t("GlobalSearch.includeArchived")}</label>
           </div>
         )}
+        {universalExcludedCount > 0 && (
+          <p className="mt-3 flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-xs text-muted">
+            <ShieldCheck size={13} className="shrink-0 text-faint" />
+            {t("GlobalSearch.accessFilteredNotice", { count: String(universalExcludedCount) })}
+          </p>
+        )}
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto [overscroll-behavior:contain]">
         {error ? <p role="alert" className="m-4 rounded-lg border border-danger/30 bg-danger-soft p-3 text-sm text-danger">{error}</p>
           : !query.trim() ? <p className="p-8 text-center text-sm text-faint">{t("GlobalSearch.startHint")}</p>
-            : !loading && results.length === 0 ? <p className="p-8 text-center text-sm text-faint">{t("GlobalSearch.noResults")}</p>
-              : <ul className="divide-y divide-border" aria-live="polite">{results.map((hit) => (
-                <li key={hit.documentId}>
-                  <button type="button" onClick={() => openHit(hit)} className="w-full px-4 py-3 text-left hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent">
-                    <div className="flex items-start justify-between gap-3"><span className="truncate text-sm font-medium text-foreground">{hit.title}</span><div className="flex shrink-0 items-center gap-2"><StatusPill tone="neutral">{t(`GlobalSearch.source.${hit.sourceKind}`)}</StatusPill>{hit.archived && <StatusPill tone="warning">{t("GlobalSearch.archived")}</StatusPill>}</div></div>
-                    <p className="mt-1 line-clamp-3 text-sm text-muted">{hit.snippet}</p>
-                    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-faint"><span>{hit.role}</span><time dateTime={new Date(hit.occurredAtMs).toISOString()}>{formatDate(hit.occurredAtMs)}</time>{hit.modelKey && <span>{hit.modelKey}</span>}{hit.workspacePath && <span className="truncate">{hit.workspacePath}</span>}</div>
-                  </button>
-                </li>
-              ))}</ul>}
+            : !isLoading && !hasAnyResults ? <p className="p-8 text-center text-sm text-faint">{t("GlobalSearch.noResults")}</p>
+              : <div aria-live="polite">
+                  {groups.map((group) => {
+                    const Icon = SOURCE_KIND_ICON[group.kind];
+                    return (
+                      <section key={group.kind}>
+                        <h2 className="sticky top-0 z-10 flex items-center gap-1.5 border-b border-border bg-background/95 px-4 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-faint backdrop-blur">
+                          <Icon size={12} /> {t(`GlobalSearch.source.${group.kind}`)} <span className="font-normal normal-case text-faint">({group.hits.length})</span>
+                        </h2>
+                        <ul className="divide-y divide-border">
+                          {group.hits.map((hit) => (
+                            <li key={hit.key}>
+                              {hit.onOpen ? (
+                                <button
+                                  type="button"
+                                  onClick={hit.onOpen}
+                                  className="w-full px-4 py-3 text-left hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+                                >
+                                  <HitBody hit={hit} t={t} />
+                                </button>
+                              ) : (
+                                <div className="px-4 py-3">
+                                  <HitBody hit={hit} t={t} />
+                                </div>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                    );
+                  })}
+                </div>}
       </div>
     </section>
   );
 }
 
+function HitBody({ hit, t }: { hit: DisplayHit; t: (key: string, vars?: Record<string, string>) => string }) {
+  return (
+    <>
+      <div className="flex items-start justify-between gap-3">
+        <span className="truncate text-sm font-medium text-foreground">{hit.title}</span>
+        {hit.archived && <StatusPill tone="warning">{t("GlobalSearch.archived")}</StatusPill>}
+      </div>
+      <p className="mt-1 line-clamp-3 text-sm text-muted">{hit.snippet}</p>
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-faint">
+        {hit.occurredAtMs > 0 && <time dateTime={new Date(hit.occurredAtMs).toISOString()}>{formatDate(hit.occurredAtMs)}</time>}
+        {hit.modelKey && <span>{hit.modelKey}</span>}
+        {hit.workspacePath && <span className="truncate">{hit.workspacePath}</span>}
+      </div>
+    </>
+  );
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}

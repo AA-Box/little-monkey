@@ -1458,6 +1458,15 @@ export const ko: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "이 레지스트리 소스를 제거하시겠습니까?",
   "EcosystemDiscover.removeRegistry": "제거",
   "EcosystemDiscover.cancel": "취소",
+  // Permission-Aware Universal Search (ROADMAP.md Phase 7) — real Korean
+  // translations, overriding the searchLocale keys above.
+  "GlobalSearch.source.session": "채팅",
+  "GlobalSearch.source.task": "작업",
+  "GlobalSearch.source.workspace_file": "파일",
+  "GlobalSearch.source.knowledge": "지식",
+  "GlobalSearch.source.browser_evidence": "브라우저 증거",
+  "GlobalSearch.source.connected_app": "연결된 앱",
+  "GlobalSearch.accessFilteredNotice": "현재 기기 또는 워크스페이스 접근 권한이 포함하지 않아 일부 결과가 제외되었습니다 ({{count}}개 숨김).",
   // Real Korean translations, overriding every visualEditModeLocale key above.
   "AppMenu.visualEditMode": "비주얼 디자인 편집 모드",
   "VisualEditModePanel.title": "비주얼 디자인 편집 모드",
