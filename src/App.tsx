@@ -37,6 +37,7 @@ import { VisualEditModePanel } from "./components/VisualEditMode";
 import { TerminalPanel } from "./components/Terminal";
 import { useTerminalStore } from "./store/terminalStore";
 import { DebatePanel } from "./components/Debate";
+import { DatabaseAdminGuardrailsPanel } from "./components/DatabaseAdminGuardrails";
 import { ApiContractDiffLabPanel } from "./components/ApiContractDiffLab";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
@@ -164,6 +165,7 @@ function App() {
    * whatever is selected here. */
   const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks">("none");
   const [debateOpen, setDebateOpen] = useState(false);
+  const [dbAdminGuardrailsOpen, setDbAdminGuardrailsOpen] = useState(false);
   const [apiContractDiffLabOpen, setApiContractDiffLabOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
@@ -196,6 +198,7 @@ function App() {
     setEvidenceBoardOpen(false);
     setGoldenDatasetBuilderOpen(false);
     setDebateOpen(false);
+    setDbAdminGuardrailsOpen(false);
     setDailyBriefOpen(false);
     setApiContractDiffLabOpen(false);
     setDataNotebookOpen(false);
@@ -273,6 +276,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
+          setDbAdminGuardrailsOpen(false);
           setDailyBriefOpen(false);
           setApiContractDiffLabOpen(false);
           setDataNotebookOpen(false);
@@ -302,6 +306,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
+          setDbAdminGuardrailsOpen(false);
           setDailyBriefOpen(false);
           setApiContractDiffLabOpen(false);
           setDataNotebookOpen(false);
@@ -533,6 +538,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
 setApiContractDiffLabOpen(false);
 setDataNotebookOpen(false);
@@ -565,6 +571,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
 setApiContractDiffLabOpen(false);
 setDataNotebookOpen(false);
@@ -600,6 +607,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
 setApiContractDiffLabOpen(false);
 setDataNotebookOpen(false);
@@ -633,6 +641,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
 setApiContractDiffLabOpen(false);
 setDataNotebookOpen(false);
@@ -665,6 +674,7 @@ setVisualEditModeOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
@@ -702,6 +712,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setApiContractDiffLabOpen(false);
             setVisualEditModeOpen(false);
@@ -727,6 +738,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
@@ -806,6 +818,7 @@ setVisualEditModeOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setSettingsInitialTab(undefined);
             setApiContractDiffLabOpen(true);
@@ -825,6 +838,7 @@ setVisualEditModeOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
@@ -857,6 +871,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setApiContractDiffLabOpen(false);
             setVisualEditModeOpen(false);
@@ -898,6 +913,7 @@ setVisualEditModeOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
@@ -918,6 +934,7 @@ setVisualEditModeOpen(false);
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
             setVisualEditModeOpen(false);
@@ -1014,6 +1031,7 @@ setVisualEditModeOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setApiContractDiffLabOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -1239,6 +1257,7 @@ setVisualEditModeOpen(false);
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDailyBriefOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
@@ -1253,6 +1272,24 @@ setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setDebateOpen(true);
           }}
+          onOpenDbAdminGuardrails={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDailyBriefOpen(false);
+            setDebateOpen(false);
+            setSettingsInitialTab(undefined);
+            setDbAdminGuardrailsOpen(true);
+          }}
           onRestartOnboarding={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -1263,6 +1300,7 @@ setVisualEditModeOpen(false);
             setAgentInboxOpen(false);
             setSyntheticMonitoringOpen(false);
             setDebateOpen(false);
+            setDbAdminGuardrailsOpen(false);
             setDataNotebookOpen(false);
             setTerminalOpen(false);
             restartOnboarding();
@@ -1297,7 +1335,7 @@ setVisualEditModeOpen(false);
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : apiContractDiffLabOpen ? "api-contract-diff-lab" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : dbAdminGuardrailsOpen ? "db-admin-guardrails" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : apiContractDiffLabOpen ? "api-contract-diff-lab" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -1376,6 +1414,8 @@ setVisualEditModeOpen(false);
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : debateOpen ? (
             <DebatePanel onClose={() => setDebateOpen(false)} />
+          ) : dbAdminGuardrailsOpen ? (
+            <DatabaseAdminGuardrailsPanel onClose={() => setDbAdminGuardrailsOpen(false)} />
           ) : issueToPrOpen ? (
             <IssueToPrPanel
               onClose={() => setIssueToPrOpen(false)}
@@ -1448,7 +1488,7 @@ setVisualEditModeOpen(false);
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !apiContractDiffLabOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !dbAdminGuardrailsOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !apiContractDiffLabOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
