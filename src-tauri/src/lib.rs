@@ -565,6 +565,7 @@ pub fn run() {
             server::api_server_create_token,
             server::api_server_revoke_token,
             server::api_server_list_tokens,
+            server::api_server_export_audit,
             ollama::ollama_status,
             ollama::ollama_start,
             ollama::ollama_list_models,
