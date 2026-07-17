@@ -12,16 +12,21 @@ import {
   Gauge,
   GitPullRequest,
   ListChecks,
+  Lock,
   MessageSquare,
   MonitorCheck,
+  MousePointerClick,
   Palette,
   Plug,
+  PlugZap,
   ScrollText,
   Search,
   Server,
   ShieldCheck,
   Sparkles,
+  Stethoscope,
   Terminal,
+  Users,
   X,
   Zap,
   type LucideIcon,
@@ -35,6 +40,7 @@ import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { MemoryStudioPanel } from "./MemoryStudioPanel";
 import { McpPanel } from "./McpPanel";
+import { ConnectorsPanel } from "./ConnectorsPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
 import { ApiServerPanel } from "./ApiServerPanel";
 import { KnowledgePanel } from "./KnowledgePanel";
@@ -49,7 +55,11 @@ import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { GitDeliveryPanel } from "./GitDeliveryPanel";
 import { CompanionPanel } from "./CompanionPanel";
 import { SecurityDoctorPanel } from "./SecurityDoctorPanel";
+import { PrivacyFirewallPanel } from "./PrivacyFirewallPanel";
+import { DesktopControlPanel } from "./DesktopControlPanel";
+import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { AppearancePanel } from "./AppearancePanel";
+import { TeamModePanel } from "./TeamModePanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -67,7 +77,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "appearance";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -78,6 +88,7 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   rules: ScrollText,
   memorystudio: Brain,
   mcp: Plug,
+  connectors: PlugZap,
   prompts: MessageSquare,
   apiserver: Terminal,
   shortcuts: Keyboard,
@@ -91,14 +102,18 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   background: Bot,
   companion: Sparkles,
   security: ShieldCheck,
+  privacy: Lock,
+  diagnostics: Stethoscope,
   appearance: Palette,
+  desktopcontrol: MousePointerClick,
+  team: Users,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
-  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "companion", "shortcuts", "usage", "portability"] },
+  { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "privacy", "diagnostics", "team", "companion", "desktopcontrol", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "background", "mcp", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "background", "mcp", "connectors", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
@@ -110,6 +125,7 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   rules: "SettingsModal.tabRules",
   memorystudio: "SettingsModal.tabMemoryStudio",
   mcp: "SettingsModal.tabMcp",
+  connectors: "SettingsModal.tabConnectors",
   prompts: "SettingsModal.tabPrompts",
   apiserver: "SettingsModal.tabApiServer",
   shortcuts: "SettingsModal.tabKeyboardShortcuts",
@@ -123,7 +139,11 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   background: "SettingsModal.tabBackgroundAgents",
   companion: "SettingsModal.tabCompanion",
   security: "SettingsModal.tabSecurityDoctor",
+  privacy: "SettingsModal.tabPrivacyFirewall",
+  diagnostics: "SettingsModal.tabDiagnostics",
   appearance: "SettingsModal.tabAppearance",
+  desktopcontrol: "SettingsModal.tabDesktopControl",
+  team: "SettingsModal.tabTeamMode",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -343,6 +363,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "rules" && <RulesMemoryPanel />}
               {tab === "memorystudio" && <MemoryStudioPanel />}
               {tab === "mcp" && <McpPanel />}
+              {tab === "connectors" && <ConnectorsPanel />}
               {tab === "prompts" && <PromptLibraryPanel />}
               {tab === "apiserver" && <ApiServerPanel />}
               {tab === "shortcuts" && <KeyboardShortcutsPanel />}
@@ -356,7 +377,11 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "background" && <BackgroundAgentsPanel />}
               {tab === "companion" && <CompanionPanel />}
               {tab === "security" && <SecurityDoctorPanel />}
+              {tab === "privacy" && <PrivacyFirewallPanel />}
+              {tab === "diagnostics" && <DiagnosticsPanel />}
               {tab === "appearance" && <AppearancePanel />}
+              {tab === "desktopcontrol" && <DesktopControlPanel />}
+              {tab === "team" && <TeamModePanel />}
             </div>
           </div>
         </div>
