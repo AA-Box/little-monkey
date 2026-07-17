@@ -23,6 +23,8 @@ import {
   type M3SchedulingPlan,
   type M3StorageStatus,
   type M3UnloadModelRequest,
+  type OffloadPlan,
+  type OffloadPlanInput,
   type PairedToken,
   type PairingChallenge,
   type PairingRequest,
@@ -78,6 +80,7 @@ interface RuntimeHubStoreState {
   downloadProgress: Record<string, M3DownloadProgress>;
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
+  offloadPlans: Record<string, OffloadPlan>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -96,6 +99,7 @@ interface RuntimeHubStoreState {
   cleanupOrphans: () => Promise<void>;
   replaceCatalogSources: (sources: M3CatalogSourceConfig[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
+  previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
@@ -267,6 +271,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    offloadPlans: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -441,6 +446,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set({ schedulingPlan });
       } catch (error) {
         set({ schedulingPlan: null });
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    previewOffloadPlan: async (runtimeId, input) => {
+      const key = `offload-plan:${runtimeId}`;
+      begin(key);
+      try {
+        const plan = await runtimeHubClient.offloadPlan(input);
+        set((state) => ({ offloadPlans: { ...state.offloadPlans, [runtimeId]: plan } }));
+      } catch (error) {
+        set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
         fail(key, error);
         throw error;
       } finally {

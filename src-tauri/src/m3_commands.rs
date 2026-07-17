@@ -19,8 +19,8 @@ use crate::m3_runtime_hub::{
     M3StorageStatus, M3UnloadModelRequest,
 };
 use crate::runtime_adapter::{
-    HardwareProfile, HardwareSnapshot, LocalRuntimeScheduler, RuntimeInventory, RuntimeLogTail,
-    SchedulingInput, SchedulingPlan,
+    HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
+    OffloadPlanInput, RuntimeInventory, RuntimeLogTail, SchedulingInput, SchedulingPlan,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -221,6 +221,16 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Simulates fit and computes a per-load offload plan (context size, batch
+/// size, GPU layers, projector placement, CPU spill, and parallelism) before
+/// a model is actually loaded. Pure and read-only like `m3_schedule_plan`:
+/// the frontend supplies a live hardware snapshot and the selected model's
+/// profile, and this never touches a runtime process.
+#[tauri::command]
+pub fn m3_offload_plan(input: OffloadPlanInput) -> Result<OffloadPlan, String> {
+    LocalOffloadPlanner::plan(&input).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
