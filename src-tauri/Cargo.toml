@@ -50,7 +50,20 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 rustyline = "17"
-rmcp = { version = "2.2.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# mcp_oauth.rs: implementing rmcp's `transport::auth::CredentialStore`/
+# `StateStore` traits (both `#[async_trait]`-defined) requires applying the
+# same macro to the `impl` block. Already an indirect dependency via rmcp
+# itself (whose `auth` feature needs it); made direct so this crate's own
+# code can name the macro. Version-matched to rmcp's own requirement so only
+# one copy resolves.
+async-trait = "0.1.89"
+# "auth" (+ its required "reqwest" feature, for the rustls-backed
+# `ReqwestClient`/TLS provider `oauth2`'s HTTP calls need) enables rmcp's
+# `transport::auth` module — generic MCP-spec OAuth 2.0 client support (RFC
+# 8414 discovery, RFC 7591 dynamic client registration, PKCE authorization
+# code flow, token refresh) used by `mcp_oauth.rs`. See that module's doc
+# comment for how it composes with the existing manual-bearer-token path.
+rmcp = { version = "2.2.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "reqwest"] }
 # Only needed by the `mcp_test_server` bin (src/bin/mcp_test_server.rs), a
 # trivial stdio MCP server used solely by mcp.rs's unit tests — its
 # `#[tool_router]`-annotated methods need `JsonSchema` derives, and that

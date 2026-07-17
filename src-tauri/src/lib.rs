@@ -93,6 +93,13 @@ mod git;
 // this module's Tauri-command surface stays desktop-app-only).
 pub mod llama;
 pub mod mcp;
+// Generic MCP-spec OAuth 2.0 (RFC 8414 discovery, RFC 7591 dynamic client
+// registration, PKCE authorization-code flow) for HTTP MCP servers — an
+// additional, alternative way to obtain `mcp.rs`'s `McpTransport::Http`
+// bearer token besides the manual `mcp_set_http_token` paste-a-token path.
+// Kept as its own module (rather than growing `mcp.rs` further) since it's
+// the one place a future `rmcp` OAuth API change would need editing.
+pub mod mcp_oauth;
 // Connector Catalog: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/S3
 // connections, verified live before saving, secrets in the OS keychain only.
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
@@ -310,6 +317,31 @@ pub struct AppState {
     /// the connection itself, so this lock is never held across a
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
+    /// Per-server cancellation signal for an in-flight `mcp_oauth_connect`
+    /// (see `mcp_oauth.rs`) — keyed by server id, mirroring `tool_cancel`'s
+    /// shape. `mcp_oauth_cancel` looks up the entry and calls
+    /// `notify_waiters()`; the connect command races its own flow against
+    /// `notified()` in a `tokio::select!` and removes its entry when done
+    /// (success, failure, or cancellation), so this map only ever holds
+    /// entries for genuinely in-flight connect attempts.
+    pub mcp_oauth_cancel:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// Per-server async lock serializing OAuth access-token retrieval/refresh
+    /// (see `mcp_oauth::get_access_token_if_connected`) — keyed by server id.
+    /// `connect_impl`'s `Http` branch calls that function on every
+    /// `mcp_connect`, and nothing else serializes concurrent connects for the
+    /// same server id; without this, two overlapping connects (e.g. a
+    /// double-click on Reconnect, or an auto-reconnect racing a manual one)
+    /// can both read the same still-current refresh token and POST it to the
+    /// token endpoint concurrently. For an authorization server that rotates
+    /// refresh tokens on use, the second request is rejected and that connect
+    /// fails with a misleading "authorization expired/revoked" error even
+    /// though the other attempt just saved valid, fresh credentials. A plain
+    /// `std::sync::Mutex` guarding the *map* (never held across an `.await`);
+    /// each server id's own `tokio::sync::Mutex` is what's actually held
+    /// across the refresh call.
+    pub mcp_oauth_refresh_locks:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Serializes `web_settings.json` writes (see `web.rs::web_set_settings`)
     /// — same reasoning as `mcp_config_lock` protects `mcp_servers.json`.
     /// `web_set_settings` is a synchronous command (Tauri can dispatch two
@@ -397,6 +429,8 @@ impl Default for AppState {
             triage_state_lock: Default::default(),
             file_write_lock: Default::default(),
             mcp: Default::default(),
+            mcp_oauth_cancel: Default::default(),
+            mcp_oauth_refresh_locks: Default::default(),
             web_settings_lock: Default::default(),
             api_server: Default::default(),
             api_server_config_lock: Default::default(),
@@ -707,6 +741,9 @@ pub fn run() {
             mcp::mcp_remove_http_token,
             mcp::mcp_list_tools,
             mcp::mcp_call_tool,
+            mcp_oauth::mcp_oauth_connect,
+            mcp_oauth::mcp_oauth_cancel,
+            mcp_oauth::mcp_oauth_disconnect,
             system::reveal_in_finder,
             system::open_in_terminal,
             system::open_in_editor,
