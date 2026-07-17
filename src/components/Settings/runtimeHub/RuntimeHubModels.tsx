@@ -92,6 +92,18 @@ function CatalogCard({ match }: { match: M3CatalogMatch }) {
         <span>{formatBytes(match.model.estimatedRamBytes)} estimated RAM</span>
         <span>{match.model.quantization ?? "Unquantized"}</span>
       </div>
+      {(match.model.template || match.model.projector) && (
+        <div className="mt-2 flex flex-wrap gap-1.5 text-xs text-muted">
+          {match.model.template && (
+            <span className="rounded-md bg-surface-2 px-2 py-1">Template {match.model.template}</span>
+          )}
+          {match.model.projector && (
+            <span className="rounded-md bg-surface-2 px-2 py-1">
+              Projector {match.model.projector.kind} ({formatBytes(match.model.projector.sizeBytes)})
+            </span>
+          )}
+        </div>
+      )}
       <div className="mt-3 grid gap-2 rounded-md border border-border bg-surface-2 p-3 text-xs text-muted sm:grid-cols-2">
         <span>RAM: {formatBytes(match.fit.requiredRamBytes)} required / {formatBytes(match.fit.availableRamBytes)} schedulable</span>
         <span>VRAM: {formatBytes(match.fit.requiredVramBytes)} required / {formatBytes(match.fit.availableVramBytes)} available</span>
@@ -322,6 +334,18 @@ function InstalledCard({ model }: { model: M3InstalledModel }) {
                 </div>
                 <p className="mt-1 break-all font-mono text-[11px] text-muted">
                   {version.versionKey.slice(0, 16)}… · {formatBytes(version.sizeBytes)} · {formatDate(version.installedAtMs)}
+                </p>
+                <p className="mt-1 break-all text-[11px] text-muted">
+                  {[
+                    `Source ${version.sourceId}`,
+                    version.template ? `Template ${version.template}` : null,
+                    version.projector
+                      ? `Projector ${version.projector.kind} (${formatBytes(version.projector.sizeBytes)})`
+                      : null,
+                    version.catalogRetrievedAtMs ? `Catalog retrieved ${formatDate(version.catalogRetrievedAtMs)}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </p>
               </div>
               {!version.active && (
