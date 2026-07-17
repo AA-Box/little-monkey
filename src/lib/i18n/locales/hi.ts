@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
@@ -63,6 +64,40 @@ export const hi: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceEmpty": "यहां पथ और उसके स्रोत प्रमाण देखने के लिए ऊपर एक संबंध प्रश्न पूछें।",
   "KnowledgeGraphExplorer.noEvidence": "इस पथ के लिए कोई प्रमाण अंश दर्ज नहीं किया गया।",
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
+  // Trust Scorecards (ROADMAP.md Phase 7) — real translations overriding the English `trustScorecardsLocale` defaults spread above.
+  "AppMenu.trustScorecards": "ट्रस्ट स्कोरकार्ड",
+  "TrustScorecards.title": "ट्रस्ट स्कोरकार्ड",
+  "TrustScorecards.subtitle": "हर मॉडल, कनेक्टर, MCP सर्वर, स्किल, वर्कफ़्लो और प्लगइन की गुणवत्ता, लागत, गोपनीयता, सुरक्षा, विश्वसनीयता और उद्गम की तुलना करें — साथ ही वह ठोस प्रमाण भी देखें जिससे हर स्कोर निकाला गया।",
+  "TrustScorecards.close": "ट्रस्ट स्कोरकार्ड बंद करें",
+  "TrustScorecards.refresh": "स्कोरकार्ड रीफ़्रेश करें",
+  "TrustScorecards.loading": "एंटिटी स्कोर की जा रही हैं…",
+  "TrustScorecards.empty": "अभी स्कोर करने के लिए कुछ नहीं है — पहले कोई मॉडल, कनेक्टर, MCP सर्वर, स्किल, वर्कफ़्लो या प्लगइन कनेक्ट करें।",
+  "TrustScorecards.filterAll": "सभी",
+  "TrustScorecards.searchPlaceholder": "नाम से खोजें…",
+  "TrustScorecards.columnName": "नाम",
+  "TrustScorecards.columnKind": "प्रकार",
+  "TrustScorecards.columnDimension": "आयाम",
+  "TrustScorecards.expandEvidence": "प्रमाण दिखाएँ",
+  "TrustScorecards.selectForCompare": "तुलना के लिए {{name}} चुनें",
+  "TrustScorecards.compareButton": "{{count}} की तुलना करें",
+  "TrustScorecards.compareTitle": "{{count}} ट्रस्ट प्रोफ़ाइलों की तुलना",
+  "TrustScorecards.kind.model": "मॉडल",
+  "TrustScorecards.kind.connector": "कनेक्टर",
+  "TrustScorecards.kind.mcp_server": "MCP सर्वर",
+  "TrustScorecards.kind.skill": "स्किल",
+  "TrustScorecards.kind.workflow": "वर्कफ़्लो",
+  "TrustScorecards.kind.plugin": "प्लगइन",
+  "TrustScorecards.dimension.quality": "गुणवत्ता",
+  "TrustScorecards.dimension.cost": "लागत",
+  "TrustScorecards.dimension.privacy": "गोपनीयता",
+  "TrustScorecards.dimension.security": "सुरक्षा",
+  "TrustScorecards.dimension.reliability": "विश्वसनीयता",
+  "TrustScorecards.dimension.provenance": "उद्गम",
+  "TrustScorecards.level.good": "अच्छा",
+  "TrustScorecards.level.fair": "औसत",
+  "TrustScorecards.level.poor": "कमज़ोर",
+  "TrustScorecards.level.unknown": "अपर्याप्त प्रमाण",
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,

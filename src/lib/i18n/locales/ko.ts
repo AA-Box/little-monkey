@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
@@ -63,6 +64,40 @@ export const ko: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceEmpty": "위에서 관계 질문을 하면 여기에 경로와 그 출처 증거가 표시됩니다.",
   "KnowledgeGraphExplorer.noEvidence": "이 경로에 대해 기록된 증거 구간이 없습니다.",
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
+  // Trust Scorecards (ROADMAP.md Phase 7) — real translations overriding the English `trustScorecardsLocale` defaults spread above.
+  "AppMenu.trustScorecards": "신뢰 스코어카드",
+  "TrustScorecards.title": "신뢰 스코어카드",
+  "TrustScorecards.subtitle": "모든 모델, 커넥터, MCP 서버, 스킬, 워크플로, 플러그인의 품질, 비용, 개인정보 보호, 보안, 안정성, 출처를 비교하고, 각 점수를 산출한 정확한 근거도 함께 확인하세요.",
+  "TrustScorecards.close": "신뢰 스코어카드 닫기",
+  "TrustScorecards.refresh": "스코어카드 새로고침",
+  "TrustScorecards.loading": "엔티티 평가 중…",
+  "TrustScorecards.empty": "아직 평가할 항목이 없습니다 — 먼저 모델, 커넥터, MCP 서버, 스킬, 워크플로 또는 플러그인을 연결하세요.",
+  "TrustScorecards.filterAll": "전체",
+  "TrustScorecards.searchPlaceholder": "이름으로 검색…",
+  "TrustScorecards.columnName": "이름",
+  "TrustScorecards.columnKind": "종류",
+  "TrustScorecards.columnDimension": "항목",
+  "TrustScorecards.expandEvidence": "근거 보기",
+  "TrustScorecards.selectForCompare": "{{name}}을(를) 비교 대상으로 선택",
+  "TrustScorecards.compareButton": "{{count}}개 비교",
+  "TrustScorecards.compareTitle": "{{count}}개의 신뢰 프로필 비교 중",
+  "TrustScorecards.kind.model": "모델",
+  "TrustScorecards.kind.connector": "커넥터",
+  "TrustScorecards.kind.mcp_server": "MCP 서버",
+  "TrustScorecards.kind.skill": "스킬",
+  "TrustScorecards.kind.workflow": "워크플로",
+  "TrustScorecards.kind.plugin": "플러그인",
+  "TrustScorecards.dimension.quality": "품질",
+  "TrustScorecards.dimension.cost": "비용",
+  "TrustScorecards.dimension.privacy": "개인정보 보호",
+  "TrustScorecards.dimension.security": "보안",
+  "TrustScorecards.dimension.reliability": "안정성",
+  "TrustScorecards.dimension.provenance": "출처",
+  "TrustScorecards.level.good": "좋음",
+  "TrustScorecards.level.fair": "보통",
+  "TrustScorecards.level.poor": "미흡",
+  "TrustScorecards.level.unknown": "근거 부족",
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,

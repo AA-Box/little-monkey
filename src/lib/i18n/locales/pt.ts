@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
@@ -63,6 +64,40 @@ export const pt: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceEmpty": "Faça uma pergunta de relação acima para ver aqui o caminho e suas evidências de origem.",
   "KnowledgeGraphExplorer.noEvidence": "Nenhum trecho de evidência foi registrado para este caminho.",
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
+  // Trust Scorecards (ROADMAP.md Phase 7) — real translations overriding the English `trustScorecardsLocale` defaults spread above.
+  "AppMenu.trustScorecards": "Scorecards de confiança",
+  "TrustScorecards.title": "Scorecards de confiança",
+  "TrustScorecards.subtitle": "Compare qualidade, custo, privacidade, segurança, confiabilidade e proveniência de cada modelo, conector, servidor MCP, skill, workflow e plugin — com a evidência exata usada para derivar cada pontuação.",
+  "TrustScorecards.close": "Fechar Scorecards de confiança",
+  "TrustScorecards.refresh": "Atualizar scorecards",
+  "TrustScorecards.loading": "Avaliando entidades…",
+  "TrustScorecards.empty": "Nada para avaliar ainda — conecte primeiro um modelo, conector, servidor MCP, skill, workflow ou plugin.",
+  "TrustScorecards.filterAll": "Todos",
+  "TrustScorecards.searchPlaceholder": "Buscar por nome…",
+  "TrustScorecards.columnName": "Nome",
+  "TrustScorecards.columnKind": "Tipo",
+  "TrustScorecards.columnDimension": "Dimensão",
+  "TrustScorecards.expandEvidence": "Mostrar evidência",
+  "TrustScorecards.selectForCompare": "Selecionar {{name}} para comparar",
+  "TrustScorecards.compareButton": "Comparar {{count}}",
+  "TrustScorecards.compareTitle": "Comparando {{count}} perfis de confiança",
+  "TrustScorecards.kind.model": "Modelo",
+  "TrustScorecards.kind.connector": "Conector",
+  "TrustScorecards.kind.mcp_server": "Servidor MCP",
+  "TrustScorecards.kind.skill": "Skill",
+  "TrustScorecards.kind.workflow": "Workflow",
+  "TrustScorecards.kind.plugin": "Plugin",
+  "TrustScorecards.dimension.quality": "Qualidade",
+  "TrustScorecards.dimension.cost": "Custo",
+  "TrustScorecards.dimension.privacy": "Privacidade",
+  "TrustScorecards.dimension.security": "Segurança",
+  "TrustScorecards.dimension.reliability": "Confiabilidade",
+  "TrustScorecards.dimension.provenance": "Proveniência",
+  "TrustScorecards.level.good": "Bom",
+  "TrustScorecards.level.fair": "Regular",
+  "TrustScorecards.level.poor": "Fraco",
+  "TrustScorecards.level.unknown": "Evidência insuficiente",
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,

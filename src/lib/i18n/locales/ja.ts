@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
@@ -63,6 +64,40 @@ export const ja: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceEmpty": "上で関係についての質問をすると、ここにパスとその根拠となるソースの証拠が表示されます。",
   "KnowledgeGraphExplorer.noEvidence": "このパスに記録された証拠スパンはありません。",
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
+  // Trust Scorecards (ROADMAP.md Phase 7) — real translations overriding the English `trustScorecardsLocale` defaults spread above.
+  "AppMenu.trustScorecards": "トラストスコアカード",
+  "TrustScorecards.title": "トラストスコアカード",
+  "TrustScorecards.subtitle": "すべてのモデル、コネクタ、MCPサーバー、スキル、ワークフロー、プラグインの品質・コスト・プライバシー・セキュリティ・信頼性・出所を、各スコアの根拠となった具体的な証拠とともに比較できます。",
+  "TrustScorecards.close": "トラストスコアカードを閉じる",
+  "TrustScorecards.refresh": "スコアカードを更新",
+  "TrustScorecards.loading": "エンティティを評価中…",
+  "TrustScorecards.empty": "まだ評価対象がありません。先にモデル、コネクタ、MCPサーバー、スキル、ワークフロー、プラグインのいずれかを接続してください。",
+  "TrustScorecards.filterAll": "すべて",
+  "TrustScorecards.searchPlaceholder": "名前で検索…",
+  "TrustScorecards.columnName": "名前",
+  "TrustScorecards.columnKind": "種類",
+  "TrustScorecards.columnDimension": "評価項目",
+  "TrustScorecards.expandEvidence": "根拠を表示",
+  "TrustScorecards.selectForCompare": "{{name}} を比較対象に選択",
+  "TrustScorecards.compareButton": "{{count}} 件を比較",
+  "TrustScorecards.compareTitle": "{{count}} 件のトラストプロファイルを比較中",
+  "TrustScorecards.kind.model": "モデル",
+  "TrustScorecards.kind.connector": "コネクタ",
+  "TrustScorecards.kind.mcp_server": "MCPサーバー",
+  "TrustScorecards.kind.skill": "スキル",
+  "TrustScorecards.kind.workflow": "ワークフロー",
+  "TrustScorecards.kind.plugin": "プラグイン",
+  "TrustScorecards.dimension.quality": "品質",
+  "TrustScorecards.dimension.cost": "コスト",
+  "TrustScorecards.dimension.privacy": "プライバシー",
+  "TrustScorecards.dimension.security": "セキュリティ",
+  "TrustScorecards.dimension.reliability": "信頼性",
+  "TrustScorecards.dimension.provenance": "出所",
+  "TrustScorecards.level.good": "良好",
+  "TrustScorecards.level.fair": "普通",
+  "TrustScorecards.level.poor": "弱い",
+  "TrustScorecards.level.unknown": "根拠不十分",
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,

@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
@@ -63,6 +64,40 @@ export const id: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceEmpty": "Ajukan pertanyaan hubungan di atas untuk melihat jalur dan bukti sumbernya di sini.",
   "KnowledgeGraphExplorer.noEvidence": "Tidak ada bagian bukti yang tercatat untuk jalur ini.",
   ...issueToPrLocale,
+  ...trustScorecardsLocale,
+  // Trust Scorecards (ROADMAP.md Phase 7) — real translations overriding the English `trustScorecardsLocale` defaults spread above.
+  "AppMenu.trustScorecards": "Trust Scorecard",
+  "TrustScorecards.title": "Trust Scorecard",
+  "TrustScorecards.subtitle": "Bandingkan kualitas, biaya, privasi, keamanan, keandalan, dan asal-usul setiap model, konektor, server MCP, skill, workflow, dan plugin — beserta bukti pasti yang menjadi dasar setiap skor.",
+  "TrustScorecards.close": "Tutup Trust Scorecard",
+  "TrustScorecards.refresh": "Segarkan scorecard",
+  "TrustScorecards.loading": "Menilai entitas…",
+  "TrustScorecards.empty": "Belum ada yang bisa dinilai — hubungkan dulu model, konektor, server MCP, skill, workflow, atau plugin.",
+  "TrustScorecards.filterAll": "Semua",
+  "TrustScorecards.searchPlaceholder": "Cari berdasarkan nama…",
+  "TrustScorecards.columnName": "Nama",
+  "TrustScorecards.columnKind": "Jenis",
+  "TrustScorecards.columnDimension": "Dimensi",
+  "TrustScorecards.expandEvidence": "Tampilkan bukti",
+  "TrustScorecards.selectForCompare": "Pilih {{name}} untuk dibandingkan",
+  "TrustScorecards.compareButton": "Bandingkan {{count}}",
+  "TrustScorecards.compareTitle": "Membandingkan {{count}} profil kepercayaan",
+  "TrustScorecards.kind.model": "Model",
+  "TrustScorecards.kind.connector": "Konektor",
+  "TrustScorecards.kind.mcp_server": "Server MCP",
+  "TrustScorecards.kind.skill": "Skill",
+  "TrustScorecards.kind.workflow": "Workflow",
+  "TrustScorecards.kind.plugin": "Plugin",
+  "TrustScorecards.dimension.quality": "Kualitas",
+  "TrustScorecards.dimension.cost": "Biaya",
+  "TrustScorecards.dimension.privacy": "Privasi",
+  "TrustScorecards.dimension.security": "Keamanan",
+  "TrustScorecards.dimension.reliability": "Keandalan",
+  "TrustScorecards.dimension.provenance": "Asal-usul",
+  "TrustScorecards.level.good": "Baik",
+  "TrustScorecards.level.fair": "Cukup",
+  "TrustScorecards.level.poor": "Buruk",
+  "TrustScorecards.level.unknown": "Bukti tidak memadai",
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...onboardingLocale,

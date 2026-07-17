@@ -9,6 +9,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
 import { BrowserWorkbench } from "./components/Browser";
 import { IssueToPrPanel } from "./components/IssueToPr";
+import { TrustScorecardsPanel } from "./components/TrustScorecards";
 import { SopCompilerPanel } from "./components/SopCompiler";
 import { McpGeneratorPanel } from "./components/McpGenerator";
 import { SideTaskDrawer } from "./components/SideTasks";
@@ -110,6 +111,7 @@ function App() {
   const [runCenterOpen, setRunCenterOpen] = useState(false);
   const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
   const [issueToPrOpen, setIssueToPrOpen] = useState(false);
+  const [trustScorecardsOpen, setTrustScorecardsOpen] = useState(false);
   const [sopCompilerOpen, setSopCompilerOpen] = useState(false);
   const [mcpGeneratorOpen, setMcpGeneratorOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
@@ -135,6 +137,7 @@ function App() {
     setRunCenterOpen(false);
     setBrowserWorkbenchOpen(false);
     setIssueToPrOpen(false);
+    setTrustScorecardsOpen(false);
     setSopCompilerOpen(false);
     setMcpGeneratorOpen(false);
     setGlobalSearchOpen(false);
@@ -368,6 +371,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
@@ -382,6 +386,7 @@ function App() {
             setSettingsOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
@@ -398,6 +403,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setAgentInboxOpen(false);
@@ -412,6 +418,7 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
@@ -427,6 +434,7 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
@@ -438,12 +446,29 @@ function App() {
             setSettingsInitialTab(undefined);
             setIssueToPrOpen(true);
           }}
+          onOpenTrustScorecards={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setGlobalSearchOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setAgentInboxOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setTrustScorecardsOpen(true);
+          }}
           onOpenSopCompiler={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
+            setTrustScorecardsOpen(false);
             setMcpGeneratorOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
@@ -537,6 +562,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setKnowledgeGraphOpen(false);
@@ -576,7 +602,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -626,6 +652,8 @@ function App() {
                 void useRunStore.getState().selectRun(runId);
               }}
             />
+          ) : trustScorecardsOpen ? (
+            <TrustScorecardsPanel onClose={() => setTrustScorecardsOpen(false)} />
           ) : sopCompilerOpen ? (
             <SopCompilerPanel
               onClose={() => setSopCompilerOpen(false)}
@@ -664,7 +692,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">

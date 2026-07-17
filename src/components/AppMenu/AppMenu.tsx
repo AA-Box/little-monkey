@@ -16,6 +16,7 @@ import {
   Search,
   ServerCog,
   Settings as SettingsIcon,
+  ShieldCheck,
   SquareTerminal,
   Workflow,
   Swords,
@@ -32,6 +33,7 @@ interface AppMenuProps {
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
   onOpenIssueToPr: () => void;
+  onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
   onOpenSideTasks: () => void;
@@ -75,6 +77,7 @@ export function AppMenu({
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
   onOpenIssueToPr,
+  onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
   onOpenSideTasks,
@@ -175,6 +178,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldCheck size={14} className="text-faint" />}
+            label={t("AppMenu.trustScorecards")}
+            onClick={() => {
+              closeAll();
+              onOpenTrustScorecards();
             }}
           />
           <MenuRow
