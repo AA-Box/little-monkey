@@ -969,15 +969,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Runtime updates can be installed, verified, rolled back, and tied to compatibility notes.
 
-### 5. Model Manifest, Blob, and Digest Store
-
-**Status:** Planned
-
-- Add content-addressed model storage with manifests, blobs, layer reuse, digest checks, resumable transfers, and garbage collection.
-- Track source registry, license, quant, template, projector, and provenance.
-
-**Acceptance:** Model files are deduplicated, verifiable, resumable, and safely pruned.
-
 ### 6. Modelfile Studio and Import Hardening
 
 **Status:** Planned

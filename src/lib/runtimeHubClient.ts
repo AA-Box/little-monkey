@@ -108,6 +108,12 @@ export interface M3ModelLicense {
   rawDeclaration: string;
 }
 
+export interface M3ProjectorRef {
+  kind: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
 export interface M3CatalogModel {
   schemaVersion: number;
   sourceId: string;
@@ -128,6 +134,9 @@ export interface M3CatalogModel {
   capabilities: M3ModelCapabilities;
   license: M3ModelLicense;
   metadata: Record<string, string>;
+  template: string | null;
+  projector: M3ProjectorRef | null;
+  catalogRetrievedAtMs: number | null;
 }
 
 export interface M3HardwareFit {
@@ -153,6 +162,10 @@ export interface M3InstalledVersion {
   installedAtMs: number;
   active: boolean;
   license: M3ModelLicense;
+  sourceId: string;
+  template: string | null;
+  projector: M3ProjectorRef | null;
+  catalogRetrievedAtMs: number | null;
 }
 
 export interface M3InstalledModel {
