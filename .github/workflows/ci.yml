@@ -8,7 +8,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  frontend:
+    # TS/JS checks are platform-independent — one OS is enough, no reason to
+    # triplicate tsc/vitest/i18n-lint across the Rust test matrix below.
     runs-on: ubuntu-22.04
 
     steps:
@@ -17,9 +19,54 @@ jobs:
       - name: Install Linux system deps
         run: |
           sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Frontend tests
+        run: pnpm test
+
+      - name: i18n key-lint
+        run: pnpm i18n:lint
+
+  rust-tests:
+    # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
+    # code — a single-OS CI job would silently never compile the arms that
+    # don't match its own target at all (cfg-gated blocks that don't match
+    # the runner's target are stripped before the compiler looks at them).
+    # Mirrors release.yml's platform set (minus the ARM runners, which only
+    # matter for release artifacts, not for compiling/testing).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring
 
       - name: Start a D-Bus Secret Service for keychain-backed tests
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
@@ -41,18 +88,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.os }}
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm exec tsc --noEmit
+      - name: Build test binaries only (Windows diagnostic pass)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          pnpm stage:cli:placeholder
+          cargo test --manifest-path src-tauri/Cargo.toml --no-run
 
-      - name: Frontend tests
-        run: pnpm test
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: startsWith(matrix.os, 'windows')
 
-      - name: i18n key-lint
-        run: pnpm i18n:lint
+      - name: Dump PE imports of the crashing test binary (Windows diagnostic pass)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri/target/debug/deps -Filter "little_monkey_lib-*.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Write-Host "Inspecting: $($exe.FullName)"
+          dumpbin /dependents $exe.FullName
+          dumpbin /imports $exe.FullName | Select-String -Pattern "\.dll|ordinal|ProcessPrng|bcrypt" -Context 0,2
 
       - name: Rust tests
         run: pnpm test:rust
