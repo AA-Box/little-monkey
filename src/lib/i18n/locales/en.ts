@@ -11,6 +11,7 @@ import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
 import { inboxLocale } from "./inbox";
+import { privacyFirewallLocale } from "./privacyFirewall";
 import { sandboxLocale } from "./sandbox";
 import { diagnosticsLocale } from "./diagnostics";
 import { redTeamLabLocale } from "./redTeamLab";
@@ -33,6 +34,7 @@ export const en: Record<string, string> = {
   ...mcpGeneratorLocale,
   ...specScorerLocale,
   ...inboxLocale,
+  ...privacyFirewallLocale,
   ...sandboxLocale,
   ...diagnosticsLocale,
   ...redTeamLabLocale,

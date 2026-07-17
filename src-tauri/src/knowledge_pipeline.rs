@@ -2024,7 +2024,14 @@ pub enum SensitiveDataKind {
 }
 
 impl SensitiveDataKind {
-    fn label(self) -> &'static str {
+    /// `pub(crate)` (not `pub`) so `privacy_firewall.rs` can build its own
+    /// `[REDACTED:KIND]` markers for a *selective* redaction (only findings a
+    /// workspace's policy actually flags get replaced, unlike this module's
+    /// own `preview`/`apply_policy`, which always redact every finding)
+    /// without duplicating this label text as a second regex-adjacent
+    /// constant that could drift from `SensitiveFinding`'s own masked
+    /// output. Not part of this crate's public API surface.
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PrivateKey => "PRIVATE_KEY",
             Self::ApiCredential => "API_CREDENTIAL",
