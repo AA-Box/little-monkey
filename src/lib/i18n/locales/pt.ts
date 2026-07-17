@@ -855,7 +855,7 @@ export const pt: Record<string, string> = {
   "TerminalPanel.dismiss": "Dispensar",
   "TerminalPanel.loading": "Carregando sessões do terminal…",
   "TerminalPanel.emptyTitle": "Nenhuma sessão de terminal",
-  "TerminalPanel.emptyDescription": "Inicie um shell real restrito ao espaço de trabalho. Abri-lo e cada comando enviado usam a mesma política de aprovação das ferramentas de shell.",
+  "TerminalPanel.emptyDescription": "Inicie um shell real restrito ao espaço de trabalho. Ele abre na hora — os comandos digitados aqui são executados como seu usuário, sem solicitações de aprovação.",
   "TerminalPanel.startTerminal": "Iniciar terminal",
   "TerminalPanel.status.running": "Em execução",
   "TerminalPanel.status.exited": "Encerrado",

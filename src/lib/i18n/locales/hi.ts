@@ -854,7 +854,7 @@ export const hi: Record<string, string> = {
   "TerminalPanel.dismiss": "खारिज करें",
   "TerminalPanel.loading": "टर्मिनल सत्र लोड हो रहे हैं…",
   "TerminalPanel.emptyTitle": "कोई टर्मिनल सत्र नहीं",
-  "TerminalPanel.emptyDescription": "वर्कस्पेस तक सीमित एक वास्तविक शेल शुरू करें। इसे खोलना और हर सबमिट किया गया कमांड शेल टूल्स जैसी ही अनुमोदन नीति का पालन करते हैं।",
+  "TerminalPanel.emptyDescription": "वर्कस्पेस तक सीमित एक वास्तविक शेल शुरू करें। यह तुरंत खुलता है — यहाँ टाइप किए गए कमांड बिना अनुमोदन संकेतों के आपके उपयोगकर्ता के रूप में चलते हैं।",
   "TerminalPanel.startTerminal": "टर्मिनल शुरू करें",
   "TerminalPanel.status.running": "चल रहा है",
   "TerminalPanel.status.exited": "समाप्त",
