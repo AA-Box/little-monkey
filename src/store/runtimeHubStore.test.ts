@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     runtimes: vi.fn(),
     refreshRuntimes: vi.fn(),
     schedulePlan: vi.fn(),
+    chatTemplateLabReport: vi.fn(),
     catalogSearch: vi.fn(),
     modelDownload: vi.fn(),
     modelUpdate: vi.fn(),
@@ -29,6 +30,9 @@ const mocks = vi.hoisted(() => ({
     runtimeMetrics: vi.fn(),
     runtimeSetConfig: vi.fn(),
     runtimeConfig: vi.fn(),
+    contextCacheState: vi.fn(),
+    contextEffectiveSize: vi.fn(),
+    classifyContextFailure: vi.fn(),
     apiDispatch: vi.fn(),
     apiCancelInference: vi.fn(),
     lanValidatePolicy: vi.fn(),
@@ -220,23 +224,71 @@ describe("runtimeHubStore", () => {
     expect(mocks.client.cancelOperation).toHaveBeenCalledWith("catalog-live");
   });
 
+  it("fetches and caches a chat template lab report keyed by the raw template string", async () => {
+    const gemmaReport = {
+      templateFamily: "gemma",
+      results: [{ area: "system_prompt", passed: false, detail: "gemma has no system role" }],
+    };
+    mocks.client.chatTemplateLabReport.mockResolvedValue(gemmaReport);
+
+    await useRuntimeHubStore.getState().fetchChatTemplateLabReport("gemma-2-9b-it");
+
+    expect(mocks.client.chatTemplateLabReport).toHaveBeenCalledWith("gemma-2-9b-it");
+    expect(useRuntimeHubStore.getState().chatTemplateLabReports["gemma-2-9b-it"]).toEqual(gemmaReport);
+
+    const genericReport = { templateFamily: "generic", results: [] };
+    mocks.client.chatTemplateLabReport.mockResolvedValue(genericReport);
+    await useRuntimeHubStore.getState().fetchChatTemplateLabReport(null);
+    expect(mocks.client.chatTemplateLabReport).toHaveBeenCalledWith(null);
+    expect(useRuntimeHubStore.getState().chatTemplateLabReports[""]).toEqual(genericReport);
+  });
+
   it("collects status, inventory, logs, and metrics only through capability-backed runtime calls", async () => {
     useRuntimeHubStore.setState({ runtimes: [capability] as never });
     const status = { runtimeType: "adapter", status: { state: "ready" }, running_models: [] };
     const inventory = { schema_version: 1, runtime_id: "ollama", models: [], captured_at_ms: 1 };
     const logs = { text: "ready", truncated: false };
     const metrics = { runtimeType: "adapter", status: { state: "ready" }, running_models: [] };
+    const contextCache = {
+      runtimeId: "ollama",
+      runtimeKind: "ollama",
+      configured: { tokens: 4_096, source: "runtime_default", settingKey: "num_ctx" },
+      reportedContextTokens: null,
+      contextTokensInUse: null,
+      contextHeadroomTokens: null,
+      contextShiftDetected: null,
+      totalSlots: null,
+      notes: [],
+      sampledAtMs: 1,
+    };
     mocks.client.runtimeStatus.mockResolvedValue(status);
     mocks.client.runtimeInventory.mockResolvedValue(inventory);
     mocks.client.runtimeLogs.mockResolvedValue(logs);
     mocks.client.runtimeMetrics.mockResolvedValue(metrics);
     mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue(contextCache);
 
     await useRuntimeHubStore.getState().refreshRuntime("ollama");
 
-    expect(useRuntimeHubStore.getState().runtimeDetails.ollama).toMatchObject({ status, inventory, logs, metrics });
+    expect(useRuntimeHubStore.getState().runtimeDetails.ollama).toMatchObject({ status, inventory, logs, metrics, contextCache });
     expect(mocks.client.runtimeStatus).toHaveBeenCalledWith(expect.objectContaining({ runtimeId: "ollama" }));
     expect(mocks.client.runtimeLogs).toHaveBeenCalledWith(expect.objectContaining({ maxBytes: 128 * 1024 }));
+    expect(mocks.client.contextCacheState).toHaveBeenCalledWith(expect.objectContaining({ runtimeId: "ollama" }));
+  });
+
+  it("does not let a context-cache-state failure block the rest of the runtime refresh", async () => {
+    useRuntimeHubStore.setState({ runtimes: [capability] as never });
+    mocks.client.runtimeStatus.mockResolvedValue({ runtimeType: "adapter", status: { state: "ready" }, running_models: [] });
+    mocks.client.runtimeInventory.mockResolvedValue({ schema_version: 1, runtime_id: "ollama", models: [], captured_at_ms: 1 });
+    mocks.client.runtimeLogs.mockResolvedValue({ text: "", truncated: false });
+    mocks.client.runtimeMetrics.mockResolvedValue({ runtimeType: "adapter", status: { state: "ready" }, running_models: [] });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockRejectedValue(new Error("context cache unavailable"));
+
+    await useRuntimeHubStore.getState().refreshRuntime("ollama");
+
+    expect(useRuntimeHubStore.getState().runtimeDetails.ollama.contextCache).toBeUndefined();
+    expect(useRuntimeHubStore.getState().errors["runtime:ollama"]).toBeUndefined();
   });
 
   it("validates and persists LAN policy before refreshing scoped tokens and audit events", async () => {

@@ -5,25 +5,33 @@
 //! HTTP/SSE uses `M3RuntimeHub::dispatch_api_stream` directly from the server;
 //! the IPC command intentionally handles only non-streaming requests.
 
+use crate::chat_template_lab::{run_chat_template_lab, ChatTemplateLabReport, TemplateFamily};
 use crate::compatibility_hub::{
     LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest, ScopedTokenView,
     SecurityAuditEvent,
 };
+use crate::context_cache::{
+    self, ContextCacheView, ContextFailureClassification, ContextFailureInput, ContextRuntimeKind,
+    EffectiveContextInput, EffectiveContextResolution,
+};
 use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
-    M3ActivateModelVersionRequest, M3ApiDispatchRequest, M3ApiDispatchResponse,
-    M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport, M3DeleteModelRequest,
-    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstalledModelView,
-    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
-    M3RuntimeHub, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
-    M3StorageStatus, M3UnloadModelRequest,
+    M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
+    M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
+    M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck, M3DeleteModelRequest,
+    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
+    M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
+    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind,
+    M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus,
+    M3UnloadModelRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
     QuantizationWorkbench,
 };
 use crate::runtime_adapter::{
-    HardwareProfile, HardwareSnapshot, LocalRuntimeScheduler, RuntimeInventory, RuntimeLogTail,
+    HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
+    OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState, RuntimeLogTail,
     SchedulingInput, SchedulingPlan,
 };
 use serde::Serialize;
@@ -39,15 +47,21 @@ pub trait M3OwnedProcessShutdown: Send + Sync {
 
 pub struct M3CommandState {
     pub hub: Arc<M3RuntimeHub>,
+    /// Runtime component (llama.cpp/MLX/tokenizer/converter/projector/
+    /// accelerator-support) version manager. Kept as a separate hub from
+    /// `hub` — see `m3_runtime_hub`'s "Runtime Component Update Channels"
+    /// module section for why.
+    pub component_hub: Arc<M3ComponentHub>,
     operations: Mutex<BTreeMap<String, CancellationToken>>,
     catalog_mutation: Mutex<()>,
     owned_processes: Option<Arc<dyn M3OwnedProcessShutdown>>,
 }
 
 impl M3CommandState {
-    pub fn new(hub: Arc<M3RuntimeHub>) -> Self {
+    pub fn new(hub: Arc<M3RuntimeHub>, component_hub: Arc<M3ComponentHub>) -> Self {
         Self {
             hub,
+            component_hub,
             operations: Mutex::new(BTreeMap::new()),
             catalog_mutation: Mutex::new(()),
             owned_processes: None,
@@ -56,10 +70,12 @@ impl M3CommandState {
 
     pub fn with_owned_processes(
         hub: Arc<M3RuntimeHub>,
+        component_hub: Arc<M3ComponentHub>,
         owned_processes: Arc<dyn M3OwnedProcessShutdown>,
     ) -> Self {
         Self {
             hub,
+            component_hub,
             operations: Mutex::new(BTreeMap::new()),
             catalog_mutation: Mutex::new(()),
             owned_processes: Some(owned_processes),
@@ -227,6 +243,27 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Chat Template and Renderer Compatibility Lab report for one coarse
+/// template family (derived from `M3CatalogModel`/`M3InstalledVersion`'s
+/// `template` field). Pure and deterministic — no hub state needed, same as
+/// `m3_schedule_plan` above — so the frontend can call this directly for
+/// any model's declared `template` string, including `null`/unrecognized
+/// ones (which fall back to the `Generic` family).
+#[tauri::command]
+pub fn m3_chat_template_lab_report(template: Option<String>) -> Result<ChatTemplateLabReport, String> {
+    Ok(run_chat_template_lab(TemplateFamily::detect(template.as_deref())))
+}
+
+/// Simulates fit and computes a per-load offload plan (context size, batch
+/// size, GPU layers, projector placement, CPU spill, and parallelism) before
+/// a model is actually loaded. Pure and read-only like `m3_schedule_plan`:
+/// the frontend supplies a live hardware snapshot and the selected model's
+/// profile, and this never touches a runtime process.
+#[tauri::command]
+pub fn m3_offload_plan(input: OffloadPlanInput) -> Result<OffloadPlan, String> {
+    LocalOffloadPlanner::plan(&input).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -397,6 +434,138 @@ pub async fn m3_runtime_metrics(
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.runtime_metrics(&runtime_id, &context).await;
     finish(&state, &operation_id, result).await
+}
+
+fn context_runtime_kind(kind: M3RuntimeKind) -> ContextRuntimeKind {
+    match kind {
+        M3RuntimeKind::Ollama => ContextRuntimeKind::Ollama,
+        M3RuntimeKind::LlamaCpp => ContextRuntimeKind::LlamaCpp,
+        M3RuntimeKind::Mlx => ContextRuntimeKind::Mlx,
+    }
+}
+
+fn context_cache_sampled_at_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Context window / KV-cache state for one runtime: the context size this
+/// app has configured (or will configure) for its next load, plus — for a
+/// managed, currently running llama.cpp process — whatever live state its
+/// `/props` and `/slots` endpoints actually report. Ollama and MLX honestly
+/// report only what this app itself knows (the requested setting), since
+/// neither backend's API surfaces live KV-cache/context occupancy today.
+async fn context_cache_state_impl(
+    state: &M3CommandState,
+    runtime_id: &str,
+    context: &M3OperationContext,
+) -> Result<ContextCacheView, M3HubError> {
+    let capability = state
+        .hub
+        .list_runtimes()?
+        .into_iter()
+        .find(|entry| entry.descriptor.runtime_id == runtime_id)
+        .ok_or_else(|| M3HubError::NotFound(format!("unknown runtime {runtime_id}")))?;
+    let kind = context_runtime_kind(capability.descriptor.kind);
+    let persisted = state.hub.runtime_config(runtime_id)?;
+    let configured = context_cache::resolve_configured_context(
+        &capability.settings,
+        persisted.as_ref(),
+        context_cache::configured_context_key_candidates(kind),
+    );
+
+    let mut live = None;
+    if kind == ContextRuntimeKind::LlamaCpp {
+        if let Ok(M3RuntimeStatusView::Adapter { status, .. }) =
+            state.hub.runtime_status(runtime_id, context).await
+        {
+            let reachable = matches!(status.state, RuntimeLifecycleState::Ready | RuntimeLifecycleState::Starting);
+            if reachable {
+                if let Ok(transport) = ReqwestHttpTransport::new() {
+                    let cancellation = CancellationToken::new();
+                    live = Some(
+                        context_cache::fetch_llama_cpp_live_context_state(
+                            &status.runtime.endpoint,
+                            &transport,
+                            &cancellation,
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+    }
+
+    let reported_context_tokens = live.as_ref().and_then(|live| live.reported_context_tokens);
+    let context_tokens_in_use = live
+        .as_ref()
+        .and_then(|live| live.slots.iter().filter_map(|slot| slot.tokens_in_use).max());
+    let context_shift_detected = live.as_ref().and_then(|live| {
+        if live.slots.is_empty() {
+            None
+        } else if live.slots.iter().any(|slot| slot.context_shifted == Some(true)) {
+            Some(true)
+        } else if live.slots.iter().all(|slot| slot.context_shifted == Some(false)) {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    let total_slots = live.as_ref().and_then(|live| live.total_slots);
+    let notes = context_cache::context_cache_notes(kind, live.as_ref());
+    let effective_context_tokens = reported_context_tokens.or(configured.tokens);
+
+    Ok(ContextCacheView {
+        runtime_id: runtime_id.to_string(),
+        runtime_kind: kind,
+        configured,
+        reported_context_tokens,
+        context_tokens_in_use,
+        context_headroom_tokens: context_cache::context_headroom(effective_context_tokens, context_tokens_in_use),
+        context_shift_detected,
+        total_slots,
+        notes,
+        sampled_at_ms: context_cache_sampled_at_ms(),
+    })
+}
+
+#[tauri::command]
+pub async fn m3_context_cache_state(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    runtime_id: String,
+) -> Result<ContextCacheView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = context_cache_state_impl(&state, &runtime_id, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+/// Resolves a safe, user-visible effective context size for a load: the
+/// frontend supplies its requested size plus the already-computed offload
+/// plan's memory-aware bound (see `m3_offload_plan`) and any known model
+/// metadata/runtime setting bounds; this only tightens those bounds further
+/// and explains every reduction, never bypasses them.
+#[tauri::command]
+pub fn m3_context_effective_size(
+    input: EffectiveContextInput,
+) -> Result<EffectiveContextResolution, String> {
+    Ok(context_cache::resolve_effective_context(&input))
+}
+
+/// Classifies a plausibly context/cache-related generation failure or
+/// degradation into one of five categories (prompt too long, cache
+/// exhausted/context shift, memory pressure, runtime limitation, model
+/// metadata limit) with a plain-language explanation, or returns `null` when
+/// the supplied evidence gives no reason to believe context/cache/memory was
+/// the cause.
+#[tauri::command]
+pub fn m3_classify_context_failure(
+    input: ContextFailureInput,
+) -> Result<Option<ContextFailureClassification>, String> {
+    Ok(context_cache::classify_context_failure(&input))
 }
 
 #[tauri::command]
@@ -649,4 +818,89 @@ pub async fn quantization_convert_installed_model(
     .await
     .map_err(|error| format!("quantization task join failed: {error}"))?
     .map_err(|error| error.to_string())
+}
+
+// -------------------------------------------------------------------------
+// Runtime Component Update Channels
+// -------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn m3_component_storage_status(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3StorageStatus, String> {
+    state.component_hub.storage_status().map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m3_component_installed(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<M3InstalledComponentView>, String> {
+    state.component_hub.list_installed().map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m3_component_registry_entries(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    crate::m3_production::component_registry_entries(state.component_hub.root())
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m3_component_replace_registry_entries(
+    state: tauri::State<'_, M3CommandState>,
+    entries: Vec<M3ComponentCatalogEntry>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let _guard = command_lock(&state.catalog_mutation)?;
+    crate::m3_production::replace_component_registry_entries(&state.component_hub, entries)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub async fn m3_component_list_registry(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.component_hub.list_registry(&context).await;
+    finish(&state, &operation_id, result).await
+}
+
+#[tauri::command]
+pub async fn m3_component_check_updates(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<M3ComponentUpdateCheck>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.component_hub.check_updates(&context).await;
+    finish(&state, &operation_id, result).await
+}
+
+#[tauri::command]
+pub async fn m3_component_install(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3InstallComponentRequest,
+) -> Result<M3InstalledComponentView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.component_hub.install_component(&request, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+#[tauri::command]
+pub async fn m3_component_activate_version(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3ActivateComponentVersionRequest,
+) -> Result<M3InstalledComponentView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state
+        .component_hub
+        .activate_component_version(&request, &context)
+        .await;
+    finish(&state, &operation_id, result).await
 }

@@ -54,6 +54,11 @@ pub mod m4_services;
 pub mod mcp_app_core;
 mod native_skill_commands;
 pub mod native_skills;
+// Tauri-free Modelfile parser/validator/format-sniffer backing "Modelfile
+// Studio" (Phase 8): real Ollama Modelfile grammar, short-name hardening,
+// and GGUF/safetensors header sanity checks, independent of `ollama.rs`'s
+// own `ollama create -f` invocation (which stays in `ollama.rs`, unchanged).
+pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
@@ -75,10 +80,21 @@ pub mod m3_runtime_hub;
 // quantization backends (a real `llama-quantize` shell-out plus an honest
 // no-op passthrough fallback), with thin command glue in `m3_commands.rs`.
 pub mod quantization;
+// Context window / KV-cache observability and long-context failure
+// classification (Phase 8, "Context and KV Cache Control Center"). Builds on
+// `runtime_adapter`'s settings/offload-planner types rather than duplicating
+// them.
+pub mod context_cache;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
 pub mod m7_companion;
+// Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
+// shortcut's persisted configuration and "bring the palette to the front"
+// action. The palette itself renders inside the main window and dispatches
+// every command through the exact same Tauri commands chat/recipes/
+// knowledge/permissions already expose — see the module doc for why.
+pub mod command_palette;
 // Safe Desktop Control — a design-validation research spike (ROADMAP.md
 // Phase 5, "Safe Desktop Control", Status: Research). Off by default,
 // never reachable from bypass mode, every action gated behind an explicit
@@ -94,6 +110,7 @@ pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
 mod artifact_commands;
+pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
 // `pub` only for the doc-comment convention every sibling module below
@@ -116,6 +133,11 @@ pub mod mcp;
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
 // `mcp`/`providers` above.
 pub mod connectors;
+// Inbox Triage Agents (ROADMAP.md, Phase 3): read-only ranking/summarization
+// of GitHub/Slack/Jira work queues built on the Connector Catalog above, plus
+// draft-only reply/comment/status-update generation. Every write goes through
+// `permissions::request_permission`, same as every other mutating tool.
+pub mod triage;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -299,6 +321,15 @@ pub struct AppState {
     /// around that pair (never across the `.await`ed verification call
     /// itself), so there's nothing async to ever hold it across.
     pub connectors_config_lock: std::sync::Mutex<()>,
+    /// Serializes `triage.json` read-modify-write cycles (see `triage.rs`) —
+    /// same reasoning as `connectors_config_lock` protects `connectors.json`:
+    /// `triage_refresh`/`triage_generate_draft`/`triage_send_draft` are all
+    /// async commands the tokio runtime can run concurrently, so without a
+    /// shared lock two concurrent config-mutating calls could both load the
+    /// same "before" queue and the later save silently clobbers the earlier
+    /// one's change. Acquired only around synchronous `load_config_impl`/
+    /// `save_config_impl` pairs, never across an awaited network call.
+    pub triage_state_lock: std::sync::Mutex<()>,
     /// Serializes the permission-granted mutation itself (checkpoint backup +
     /// the actual file write) in `tool_write_file`/`tool_edit_file` — same
     /// "two unsynchronized concurrent writers can silently clobber each
@@ -430,6 +461,7 @@ impl Default for AppState {
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
             connectors_config_lock: Default::default(),
+            triage_state_lock: Default::default(),
             file_write_lock: Default::default(),
             mcp: Default::default(),
             web_settings_lock: Default::default(),
@@ -468,7 +500,17 @@ pub fn run() {
     let configured_companion_shortcut = m7_state
         .overlay_shortcut()
         .expect("failed to load the configured companion shortcut");
-    let desktop_control_state = desktop_control::DesktopControlState::production();
+    let palette_state = command_palette::CommandPaletteState::production(&app_data_dir)
+        .expect("failed to initialize the command palette");
+    let configured_palette_shortcut = palette_state
+        .shortcut()
+        .expect("failed to load the configured command palette shortcut");
+    // Machine-wide lock at <app_data>/desktop_control.lock so the local app
+    // and the resident daemon (which constructs its own DesktopControlState)
+    // can never drive real OS input simultaneously.
+    let desktop_control_state = desktop_control::DesktopControlState::production_with_lock(
+        app_data_dir.join("desktop_control.lock"),
+    );
     // Fixed (not user-configurable, unlike the companion overlay shortcut
     // above) global emergency-stop hotkey — see ROADMAP.md's Safe Desktop
     // Control acceptance criteria ("Emergency stop hotkey") and the design
@@ -481,9 +523,24 @@ pub fn run() {
         DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
             .parse()
             .expect("the desktop control emergency-stop hotkey must be valid");
-    let companion_shortcut = tauri_plugin_global_shortcut::Builder::new()
+    // All three global OS-level shortcuts (the companion overlay's, the
+    // command palette's, and desktop control's fixed emergency stop) share
+    // one `tauri_plugin_global_shortcut` plugin registration — a Tauri app
+    // manages exactly one instance of each plugin — and one dispatching
+    // handler that tells them apart by comparing the fired `Shortcut`
+    // against each feature's configured, already-parsed value
+    // (`Shortcut`/`HotKey` derives `PartialEq`).
+    let companion_shortcut_parsed = configured_companion_shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .expect("the configured companion shortcut must be valid");
+    let palette_shortcut_parsed = configured_palette_shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .expect("the configured command palette shortcut must be valid");
+    let global_shortcuts = tauri_plugin_global_shortcut::Builder::new()
         .with_shortcut(configured_companion_shortcut.as_str())
         .expect("the configured companion shortcut must be valid")
+        .with_shortcut(configured_palette_shortcut.as_str())
+        .expect("the configured command palette shortcut must be valid")
         .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
         .expect("the desktop control emergency-stop hotkey must be valid")
         .with_handler(move |app, shortcut, event| {
@@ -496,8 +553,10 @@ pub fn run() {
                 if let Some(overlay) = app.get_webview_window("companion-overlay") {
                     let _ = overlay.hide();
                 }
-            } else {
+            } else if *shortcut == companion_shortcut_parsed {
                 let _ = m7_companion::show_overlay(app);
+            } else if *shortcut == palette_shortcut_parsed {
+                let _ = command_palette::show_palette(app);
             }
         })
         .build();
@@ -507,7 +566,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(companion_shortcut)
+        .plugin(global_shortcuts)
         .manage(AppState::default())
         .manage(m3_state)
         .manage(quantization_state)
@@ -516,6 +575,7 @@ pub fn run() {
         .manage(native_skills_state)
         .manage(browser_state)
         .manage(m7_state)
+        .manage(palette_state)
         .manage(desktop_control_state)
         // Tier-2 interactive-artifact protocol — serves a previously
         // `artifact_publish`-ed document by id with a strict per-document
@@ -643,8 +703,12 @@ pub fn run() {
             ollama::ollama_example_cloud_tags,
             ollama::ollama_pull_model,
             ollama::ollama_import_model,
+            ollama::ollama_create_from_modelfile,
             ollama::ollama_remove_model,
             ollama::ollama_signin,
+            modelfile::modelfile_parse,
+            modelfile::modelfile_dry_run,
+            modelfile::modelfile_read_text_file,
             connectors::connectors_list,
             connectors::connectors_add_github,
             connectors::connectors_add_token,
@@ -652,6 +716,10 @@ pub fn run() {
             connectors::connectors_remove,
             connectors::connectors_reverify,
             connectors::connectors_export_audit,
+            triage::triage_refresh,
+            triage::triage_list,
+            triage::triage_generate_draft,
+            triage::triage_send_draft,
             providers::providers_list_presets,
             providers::providers_list_configured,
             providers::providers_add_custom,
@@ -676,6 +744,7 @@ pub fn run() {
             terminal::terminal_create,
             terminal::terminal_list,
             terminal::terminal_execute,
+            terminal::terminal_write,
             terminal::terminal_interrupt,
             terminal::terminal_resize,
             terminal::terminal_kill,
@@ -853,6 +922,8 @@ pub fn run() {
             m3_commands::m3_runtimes,
             m3_commands::m3_refresh_runtimes,
             m3_commands::m3_schedule_plan,
+            m3_commands::m3_chat_template_lab_report,
+            m3_commands::m3_offload_plan,
             m3_commands::m3_catalog_search,
             m3_commands::m3_model_download,
             m3_commands::m3_model_update,
@@ -867,6 +938,9 @@ pub fn run() {
             m3_commands::m3_runtime_unload_model,
             m3_commands::m3_runtime_logs,
             m3_commands::m3_runtime_metrics,
+            m3_commands::m3_context_cache_state,
+            m3_commands::m3_context_effective_size,
+            m3_commands::m3_classify_context_failure,
             m3_commands::m3_runtime_set_config,
             m3_commands::m3_runtime_config,
             m3_commands::m3_api_dispatch,
@@ -884,6 +958,14 @@ pub fn run() {
             m3_commands::quantization_quant_types,
             m3_commands::quantization_convert_path,
             m3_commands::quantization_convert_installed_model,
+            m3_commands::m3_component_storage_status,
+            m3_commands::m3_component_installed,
+            m3_commands::m3_component_registry_entries,
+            m3_commands::m3_component_replace_registry_entries,
+            m3_commands::m3_component_list_registry,
+            m3_commands::m3_component_check_updates,
+            m3_commands::m3_component_install,
+            m3_commands::m3_component_activate_version,
             m3_http_server::m3_http_server_start,
             m3_http_server::m3_http_server_stop,
             m3_http_server::m3_http_server_status,
@@ -1035,6 +1117,9 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            command_palette::palette_show,
+            command_palette::palette_config_get,
+            command_palette::palette_config_save,
             privacy_firewall::privacy_firewall_get_policy,
             privacy_firewall::privacy_firewall_save_policy,
             privacy_firewall::privacy_firewall_preview,

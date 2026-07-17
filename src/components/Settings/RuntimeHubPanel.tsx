@@ -1,9 +1,10 @@
 import { useEffect, type KeyboardEvent } from "react";
-import { Activity, BookOpen, Boxes, Cpu, FlaskConical, Network, RefreshCw, ServerCog, type LucideIcon } from "lucide-react";
+import { Activity, BookOpen, Boxes, Cpu, FlaskConical, Network, PackageCheck, RefreshCw, ServerCog, type LucideIcon } from "lucide-react";
 import { useRuntimeHubStore, type RuntimeHubSection } from "../../store/runtimeHubStore";
 import { BusyButton, ErrorNotice } from "./runtimeHub/RuntimeHubShared";
 import { RuntimeHubOverview } from "./runtimeHub/RuntimeHubOverview";
 import { RuntimeHubModels } from "./runtimeHub/RuntimeHubModels";
+import { RuntimeHubComponents } from "./runtimeHub/RuntimeHubComponents";
 import { RuntimeHubCatalogs } from "./runtimeHub/RuntimeHubCatalogs";
 import { RuntimeHubRuntimes } from "./runtimeHub/RuntimeHubRuntimes";
 import { RuntimeHubApi } from "./runtimeHub/RuntimeHubApi";
@@ -13,6 +14,7 @@ import { RuntimeHubQuantization } from "./runtimeHub/RuntimeHubQuantization";
 const SECTIONS: Array<{ id: RuntimeHubSection; label: string; icon: LucideIcon }> = [
   { id: "overview", label: "Overview", icon: Activity },
   { id: "models", label: "Models", icon: Boxes },
+  { id: "components", label: "Components", icon: PackageCheck },
   { id: "catalogs", label: "Catalogs", icon: BookOpen },
   { id: "runtimes", label: "Runtimes", icon: Cpu },
   { id: "quantization", label: "Quantization", icon: FlaskConical },
@@ -100,6 +102,7 @@ export function RuntimeHubPanel() {
           {!loaded && <ErrorNotice message={overviewError} />}
           {section === "overview" && <RuntimeHubOverview />}
           {section === "models" && <RuntimeHubModels />}
+          {section === "components" && <RuntimeHubComponents />}
           {section === "catalogs" && <RuntimeHubCatalogs />}
           {section === "runtimes" && <RuntimeHubRuntimes />}
           {section === "quantization" && <RuntimeHubQuantization />}
