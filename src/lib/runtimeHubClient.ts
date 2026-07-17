@@ -724,6 +724,92 @@ export interface M3HttpServerStatus {
   lastError: string | null;
 }
 
+// --- Model Conversion and Quantization Workbench (ROADMAP.md Phase 8) ---
+
+export interface BackendDescriptor {
+  id: string;
+  available: boolean;
+}
+
+export interface QuantTypeDescriptor {
+  id: string;
+  cliName: string;
+  note: string;
+}
+
+export type SourceFormat = "gguf" | "safetensors";
+
+export interface GgufHeaderInfo {
+  version: number;
+  tensorCount: number;
+  metadataKvCount: number;
+  architecture: string | null;
+  name: string | null;
+  quantizationVersion: string | null;
+  declaredLicense: string | null;
+}
+
+export interface SafetensorsHeaderInfo {
+  headerSizeBytes: number;
+  tensorCount: number;
+  metadata: Record<string, string>;
+  declaredLicense: string | null;
+}
+
+export type SourceHeader = ({ kind: "gguf" } & GgufHeaderInfo) | ({ kind: "safetensors" } & SafetensorsHeaderInfo);
+
+export type LicenseSource = "installed_model_manifest" | "gguf_metadata" | "safetensors_metadata" | "none";
+export type LicenseRisk = "permissive" | "copyleft" | "restricted" | "unknown";
+
+export interface LicenseAssessment {
+  declaredName: string | null;
+  declaredSpdxId: string | null;
+  source: LicenseSource;
+  risk: LicenseRisk;
+  warning: string | null;
+}
+
+export interface QuantizationSourceInfo {
+  path: string;
+  format: SourceFormat;
+  sha256: string;
+  sizeBytes: number;
+  header: SourceHeader;
+}
+
+export interface QuantizationToolInfo {
+  backendId: string;
+  name: string;
+  version: string | null;
+  real: boolean;
+}
+
+export interface QuantizationOutputInfo {
+  path: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface QuantizationEvalResult {
+  method: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ConversionReport {
+  schemaVersion: number;
+  conversionId: string;
+  generatedAtMs: number;
+  source: QuantizationSourceInfo;
+  quantChoice: string;
+  allowRequantize: boolean;
+  tool: QuantizationToolInfo;
+  output: QuantizationOutputInfo;
+  tradeoffNote: string;
+  license: LicenseAssessment;
+  eval: QuantizationEvalResult;
+}
+
 export interface OperationArgs extends Record<string, unknown> {
   operationId: string;
   timeoutMs?: number | null;
@@ -816,6 +902,16 @@ export const runtimeHubClient = {
   httpServerStatus: () => invoke<M3HttpServerStatus>("m3_http_server_status"),
   httpServerStoreTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) =>
     invoke<string>("m3_http_server_store_tls_identity", { reference, certificatePem, privateKeyPem }),
+  quantizationBackends: () => invoke<BackendDescriptor[]>("quantization_backends"),
+  quantizationQuantTypes: () => invoke<QuantTypeDescriptor[]>("quantization_quant_types"),
+  quantizationConvertPath: (args: { sourcePath: string; quantChoice: string; allowRequantize: boolean }) =>
+    invoke<ConversionReport>("quantization_convert_path", args),
+  quantizationConvertInstalledModel: (args: {
+    assetId: string;
+    versionKey: string | null;
+    quantChoice: string;
+    allowRequantize: boolean;
+  }) => invoke<ConversionReport>("quantization_convert_installed_model", args),
   componentStorageStatus: () => invoke<M3StorageStatus>("m3_component_storage_status"),
   componentInstalled: () => invoke<M3InstalledComponent[]>("m3_component_installed"),
   componentRegistryEntries: () => invoke<M3ComponentCatalogEntry[]>("m3_component_registry_entries"),
