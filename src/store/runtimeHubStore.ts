@@ -3,6 +3,9 @@ import {
   createM3OperationId,
   runtimeHubClient,
   sha256Text,
+  type BackendDescriptor,
+  type ConversionReport,
+  type ChatTemplateLabReport,
   type HardwareProfile,
   type HardwareSnapshot,
   type LanServerPolicy,
@@ -24,13 +27,20 @@ import {
   type M3RuntimeStatusView,
   type M3SchedulingInput,
   type M3SchedulingPlan,
+  type M3SettingCapabilitiesView,
   type M3StorageStatus,
   type M3UnloadModelRequest,
+  type ContextCacheView,
+  type ContextFailureClassification,
+  type ContextFailureInput,
+  type EffectiveContextInput,
+  type EffectiveContextResolution,
   type OffloadPlan,
   type OffloadPlanInput,
   type PairedToken,
   type PairingChallenge,
   type PairingRequest,
+  type QuantTypeDescriptor,
   type RuntimeInventory,
   type RuntimeLogTail,
   type ScopedToken,
@@ -38,7 +48,7 @@ import {
   type SettingValue,
 } from "../lib/runtimeHubClient";
 
-export type RuntimeHubSection = "overview" | "models" | "components" | "catalogs" | "runtimes" | "api" | "lan";
+export type RuntimeHubSection = "overview" | "models" | "components" | "catalogs" | "runtimes" | "api" | "lan" | "quantization";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -46,6 +56,7 @@ export interface RuntimeDetail {
   logs?: RuntimeLogTail;
   metrics?: M3RuntimeMetricsView;
   config?: Record<string, SettingValue>;
+  contextCache?: ContextCacheView;
   refreshedAt?: number;
 }
 
@@ -86,7 +97,20 @@ interface RuntimeHubStoreState {
   downloadProgress: Record<string, M3DownloadProgress>;
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
+  quantizationBackends: BackendDescriptor[];
+  quantizationQuantTypes: QuantTypeDescriptor[];
+  quantizationReports: ConversionReport[];
+  /** Keyed by the raw `template` string a model declares (an empty string
+   * stands in for "no template"/`null`) — not by `TemplateFamily`, since
+   * family detection is the Rust command's job (`chat_template_lab.rs`'s
+   * `TemplateFamily::detect`), not something the frontend re-implements. */
+  chatTemplateLabReports: Record<string, ChatTemplateLabReport>;
   offloadPlans: Record<string, OffloadPlan>;
+  /** Keyed by runtimeId: the Sampler/Batching/Speculative Decoding gating
+   * result last resolved for that runtime (see `resolveSettingCapabilities`
+   * below). Absent until first resolved; the UI falls back to the
+   * runtime's raw, ungated `settings` list until then. */
+  settingCapabilities: Record<string, M3SettingCapabilitiesView>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -109,9 +133,13 @@ interface RuntimeHubStoreState {
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
+  fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
+  resolveSettingCapabilities: (runtimeId: string, assetId: string | null) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
+  resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
+  classifyContextFailure: (input: ContextFailureInput) => Promise<ContextFailureClassification | null>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
   unloadModel: (request: M3UnloadModelRequest) => Promise<void>;
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
@@ -127,6 +155,14 @@ interface RuntimeHubStoreState {
   startHttpServer: () => Promise<void>;
   stopHttpServer: () => Promise<void>;
   storeTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) => Promise<string>;
+  refreshQuantization: () => Promise<void>;
+  convertPathQuantization: (sourcePath: string, quantChoice: string, allowRequantize: boolean) => Promise<void>;
+  convertInstalledModelQuantization: (
+    assetId: string,
+    versionKey: string | null,
+    quantChoice: string,
+    allowRequantize: boolean,
+  ) => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -284,7 +320,12 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    quantizationBackends: [],
+    quantizationQuantTypes: [],
+    quantizationReports: [],
+    chatTemplateLabReports: {},
     offloadPlans: {},
+    settingCapabilities: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -545,6 +586,23 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    fetchChatTemplateLabReport: async (template) => {
+      const cacheKey = template ?? "";
+      const key = `chat-template-lab:${cacheKey}`;
+      begin(key);
+      try {
+        const report = await runtimeHubClient.chatTemplateLabReport(template);
+        set((state) => ({
+          chatTemplateLabReports: { ...state.chatTemplateLabReports, [cacheKey]: report },
+        }));
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
     previewOffloadPlan: async (runtimeId, input) => {
       const key = `offload-plan:${runtimeId}`;
       begin(key);
@@ -553,6 +611,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set((state) => ({ offloadPlans: { ...state.offloadPlans, [runtimeId]: plan } }));
       } catch (error) {
         set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    resolveSettingCapabilities: async (runtimeId, assetId) => {
+      const key = `settings-gate:${runtimeId}`;
+      begin(key);
+      try {
+        const resolved = await runtimeHubClient.resolveSettingCapabilities({ runtimeId, assetId });
+        set((state) => ({ settingCapabilities: { ...state.settingCapabilities, [runtimeId]: resolved } }));
+      } catch (error) {
+        set((state) => ({ settingCapabilities: omitKey(state.settingCapabilities, runtimeId) }));
         fail(key, error);
         throw error;
       } finally {
@@ -588,31 +661,41 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       try {
         const statusOperation = createM3OperationId("runtime-status");
         const inventoryOperation = createM3OperationId("runtime-inventory");
-        const [statusResult, inventoryResult, logsResult, metricsResult, configResult] = await Promise.allSettled([
-          runtimeHubClient.runtimeStatus({ operationId: statusOperation, timeoutMs: 15_000, runtimeId }),
-          runtimeHubClient.runtimeInventory({ operationId: inventoryOperation, timeoutMs: 20_000, runtimeId }),
-          capability?.canLogs
-            ? runtimeHubClient.runtimeLogs({
-                operationId: createM3OperationId("runtime-logs"),
-                timeoutMs: 10_000,
-                runtimeId,
-                maxBytes: 128 * 1024,
-              })
-            : Promise.resolve(undefined),
-          capability?.canMetrics
-            ? runtimeHubClient.runtimeMetrics({
-                operationId: createM3OperationId("runtime-metrics"),
-                timeoutMs: 10_000,
-                runtimeId,
-              })
-            : Promise.resolve(undefined),
-          runtimeHubClient.runtimeConfig(runtimeId),
-        ]);
+        const [statusResult, inventoryResult, logsResult, metricsResult, configResult, contextCacheResult] =
+          await Promise.allSettled([
+            runtimeHubClient.runtimeStatus({ operationId: statusOperation, timeoutMs: 15_000, runtimeId }),
+            runtimeHubClient.runtimeInventory({ operationId: inventoryOperation, timeoutMs: 20_000, runtimeId }),
+            capability?.canLogs
+              ? runtimeHubClient.runtimeLogs({
+                  operationId: createM3OperationId("runtime-logs"),
+                  timeoutMs: 10_000,
+                  runtimeId,
+                  maxBytes: 128 * 1024,
+                })
+              : Promise.resolve(undefined),
+            capability?.canMetrics
+              ? runtimeHubClient.runtimeMetrics({
+                  operationId: createM3OperationId("runtime-metrics"),
+                  timeoutMs: 10_000,
+                  runtimeId,
+                })
+              : Promise.resolve(undefined),
+            runtimeHubClient.runtimeConfig(runtimeId),
+            runtimeHubClient.contextCacheState({
+              operationId: createM3OperationId("context-cache-state"),
+              timeoutMs: 10_000,
+              runtimeId,
+            }),
+          ]);
         if (statusResult.status === "rejected") throw statusResult.reason;
         if (inventoryResult.status === "rejected") throw inventoryResult.reason;
         if (logsResult.status === "rejected") throw logsResult.reason;
         if (metricsResult.status === "rejected") throw metricsResult.reason;
         if (configResult.status === "rejected") throw configResult.reason;
+        // Context/cache state is diagnostic, additive information (like the
+        // Hardware Compatibility report): a failure here must never block
+        // the rest of the runtime card from refreshing.
+        const contextCache = contextCacheResult.status === "fulfilled" ? contextCacheResult.value : undefined;
         set((state) => ({
           runtimeDetails: {
             ...state.runtimeDetails,
@@ -623,6 +706,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
               logs: logsResult.value,
               metrics: metricsResult.value,
               config: configResult.value ?? undefined,
+              contextCache,
               refreshedAt: Date.now(),
             },
           },
@@ -634,6 +718,13 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         finish(key);
       }
     },
+
+    // Pure, read-only helpers with no shared state to track: like
+    // `previewOffloadPlan`'s underlying `m3_offload_plan` call, these never
+    // touch a runtime process, so callers can await the resolved value
+    // directly instead of reading it back out of the store.
+    resolveEffectiveContext: (input) => runtimeHubClient.contextEffectiveSize(input),
+    classifyContextFailure: (input) => runtimeHubClient.classifyContextFailure(input),
 
     loadModel: async (request) => {
       const key = `load:${request.runtimeId}`;
@@ -872,6 +963,56 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       begin(key);
       try {
         return await runtimeHubClient.httpServerStoreTlsIdentity(reference, certificatePem, privateKeyPem);
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    refreshQuantization: async () => {
+      const key = "quantization-refresh";
+      begin(key);
+      try {
+        const [quantizationBackends, quantizationQuantTypes] = await Promise.all([
+          runtimeHubClient.quantizationBackends(),
+          runtimeHubClient.quantizationQuantTypes(),
+        ]);
+        set({ quantizationBackends, quantizationQuantTypes });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    convertPathQuantization: async (sourcePath, quantChoice, allowRequantize) => {
+      const key = "quantization-convert";
+      begin(key);
+      try {
+        const report = await runtimeHubClient.quantizationConvertPath({ sourcePath, quantChoice, allowRequantize });
+        set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    convertInstalledModelQuantization: async (assetId, versionKey, quantChoice, allowRequantize) => {
+      const key = "quantization-convert";
+      begin(key);
+      try {
+        const report = await runtimeHubClient.quantizationConvertInstalledModel({
+          assetId,
+          versionKey,
+          quantChoice,
+          allowRequantize,
+        });
+        set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
       } catch (error) {
         fail(key, error);
         throw error;

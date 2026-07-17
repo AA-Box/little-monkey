@@ -737,6 +737,67 @@ pub async fn ollama_import_model(app: AppHandle, name: String, path: String) -> 
     result
 }
 
+/// Create a model from a full, user-authored Modelfile — the "Modelfile
+/// Studio" hardened counterpart to [`ollama_import_model`]'s throwaway
+/// one-line `FROM <path>` writer above. `modelfile_text` is expected to have
+/// already been previewed via `modelfile::modelfile_dry_run`, but this
+/// command re-parses and re-validates it from scratch regardless — a
+/// frontend claiming "already validated" is never trusted for a command that
+/// writes a file and shells out. `short_name` and every path-shaped
+/// instruction (`FROM`, `ADAPTER`) are validated/canonicalized before
+/// anything touches disk; the actual `ollama create -f` invocation and
+/// progress streaming are identical to `ollama_import_model`'s, and this
+/// still never installs anything until this command is explicitly called —
+/// the frontend only calls it after the user confirms a successful preview.
+#[tauri::command]
+pub async fn ollama_create_from_modelfile(
+    app: AppHandle,
+    short_name: String,
+    modelfile_text: String,
+) -> Result<(), String> {
+    let short_name = crate::modelfile::validate_short_name(&short_name).map_err(|e| e.to_string())?;
+    let parsed = crate::modelfile::parse_modelfile(&modelfile_text).map_err(|e| e.to_string())?;
+    crate::modelfile::validate_modelfile(&parsed).map_err(|e| e.to_string())?;
+    let resolved = parsed
+        .with_canonicalized_paths()
+        .map_err(|e| e.to_string())?;
+    let rendered = resolved.render();
+
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    std::fs::create_dir_all(&app_dir).map_err(|e| {
+        format!(
+            "Failed to create app data directory {}: {e}",
+            app_dir.display()
+        )
+    })?;
+    let modelfile_path = app_dir.join(format!("Modelfile.{}", uuid::Uuid::new_v4()));
+    std::fs::write(&modelfile_path, rendered)
+        .map_err(|e| format!("Failed to write Modelfile: {e}"))?;
+
+    let binary = find_ollama_binary().unwrap_or_else(|| "ollama".to_string());
+
+    let spawn_result = tokio::process::Command::new(&binary)
+        .arg("create")
+        .arg(&short_name)
+        .arg("-f")
+        .arg(&modelfile_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let result = match spawn_result {
+        Ok(child) => stream_ollama_progress(&app, child, &short_name).await,
+        Err(e) => Err(format!("Failed to spawn `ollama create {short_name}`: {e}")),
+    };
+
+    let _ = std::fs::remove_file(&modelfile_path);
+    result
+}
+
 /// Remove a locally-pulled model tag via Ollama's native `DELETE /api/delete`
 /// endpoint. Only forgets the tag from Ollama's own store — Little Monkey doesn't
 /// manage where Ollama keeps its blobs.
