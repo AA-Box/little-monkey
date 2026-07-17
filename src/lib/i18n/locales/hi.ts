@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const hi: Record<string, string> = {
   ...crewLocale,
@@ -353,6 +354,7 @@ export const hi: Record<string, string> = {
   "McpGenerator.statusNotClean": "सिम्युलेटर-क्लीन नहीं",
   "McpGenerator.statusNotSimulated": "सिम्युलेट नहीं हुआ",
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   // Real Hindi translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "डेली ब्रीफ",
   "DailyBriefPanel.title": "डेली ब्रीफ",
@@ -1420,5 +1422,36 @@ export const hi: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "यह एक मान्य रजिस्ट्री स्नैपशॉट JSON नहीं है।",
   "EcosystemDiscover.confirmRemoveRegistry": "इस रजिस्ट्री स्रोत को हटाएं?",
   "EcosystemDiscover.removeRegistry": "हटाएं",
-  "EcosystemDiscover.cancel": "रद्द करें"
+  "EcosystemDiscover.cancel": "रद्द करें",
+  // Real Hindi translations, overriding every visualEditModeLocale key above.
+  "AppMenu.visualEditMode": "विज़ुअल डिज़ाइन एडिट मोड",
+  "VisualEditModePanel.title": "विज़ुअल डिज़ाइन एडिट मोड",
+  "VisualEditModePanel.subtitle": "Browser Workbench में एक एलिमेंट चुनें, बदलाव बताएं, सोर्स पैच की समीक्षा करें",
+  "VisualEditModePanel.close": "विज़ुअल डिज़ाइन एडिट मोड बंद करें",
+  "VisualEditModePanel.pickElement.title": "1. एक एलिमेंट चुनें",
+  "VisualEditModePanel.pickElement.description": "पहले से खुले Browser Workbench सत्र का उपयोग करता है — साइडबार से एक शुरू करें, अपने पेज पर जाएं, फिर यहां उसे चुनें।",
+  "VisualEditModePanel.pickElement.session": "ब्राउज़र सत्र",
+  "VisualEditModePanel.pickElement.noSessions": "कोई खुला Browser Workbench सत्र नहीं",
+  "VisualEditModePanel.pickElement.refreshSessions": "सत्र रीफ़्रेश करें",
+  "VisualEditModePanel.pickElement.selector": "CSS सिलेक्टर",
+  "VisualEditModePanel.pickElement.selectorPlaceholder": "जैसे button.cta, #submit-button",
+  "VisualEditModePanel.pickElement.capture": "एलिमेंट कैप्चर करें",
+  "VisualEditModePanel.describeChange": "2. अपना बदलाव बताएं",
+  "VisualEditModePanel.describeChangePlaceholder": "जैसे \"इस बटन को बड़ा करें\" या \"इसे नीला करें\"",
+  "VisualEditModePanel.generate": "पैच बनाएं",
+  "VisualEditModePanel.generating": "सोर्स फ़ाइलें खोजी जा रही हैं और मॉडल से पैच मांगा जा रहा है…",
+  "VisualEditModePanel.empty": "अभी तक कोई विज़ुअल एडिट नहीं — शुरू करने के लिए ऊपर एक एलिमेंट कैप्चर करें और बदलाव बताएं।",
+  "VisualEditModePanel.before": "पहले",
+  "VisualEditModePanel.after": "बाद में",
+  "VisualEditModePanel.noScreenshot": "कोई स्क्रीनशॉट कैप्चर नहीं हुआ",
+  "VisualEditModePanel.accept": "स्वीकार करें",
+  "VisualEditModePanel.reject": "अस्वीकार करें",
+  "VisualEditModePanel.replay": "फिर से चलाएं",
+  "VisualEditModePanel.dismiss": "हटाएं",
+  "VisualEditModePanel.acceptedNote": "{{file}} में लिखा गया",
+  "VisualEditModePanel.status.generating": "बन रहा है",
+  "VisualEditModePanel.status.pending": "समीक्षा लंबित",
+  "VisualEditModePanel.status.accepted": "स्वीकृत",
+  "VisualEditModePanel.status.rejected": "अस्वीकृत",
+  "VisualEditModePanel.status.error": "त्रुटि"
 };

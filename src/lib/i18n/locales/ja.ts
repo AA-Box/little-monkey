@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const ja: Record<string, string> = {
   ...crewLocale,
@@ -353,6 +354,7 @@ export const ja: Record<string, string> = {
   "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
   "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   // Real Japanese translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "デイリーブリーフ",
   "DailyBriefPanel.title": "デイリーブリーフ",
@@ -1420,5 +1422,36 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "有効なレジストリスナップショットのJSONではありません。",
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
-  "EcosystemDiscover.cancel": "キャンセル"
+  "EcosystemDiscover.cancel": "キャンセル",
+  // Real Japanese translations, overriding every visualEditModeLocale key above.
+  "AppMenu.visualEditMode": "ビジュアルデザイン編集モード",
+  "VisualEditModePanel.title": "ビジュアルデザイン編集モード",
+  "VisualEditModePanel.subtitle": "Browser Workbenchで要素を選び、変更内容を説明し、ソースパッチを確認します",
+  "VisualEditModePanel.close": "ビジュアルデザイン編集モードを閉じる",
+  "VisualEditModePanel.pickElement.title": "1. 要素を選択",
+  "VisualEditModePanel.pickElement.description": "既に開いているBrowser Workbenchのセッションを使用します — まずサイドバーからセッションを開始し、ページに移動してから、ここで選択してください。",
+  "VisualEditModePanel.pickElement.session": "ブラウザセッション",
+  "VisualEditModePanel.pickElement.noSessions": "開いているBrowser Workbenchセッションがありません",
+  "VisualEditModePanel.pickElement.refreshSessions": "セッションを更新",
+  "VisualEditModePanel.pickElement.selector": "CSSセレクタ",
+  "VisualEditModePanel.pickElement.selectorPlaceholder": "例: button.cta, #submit-button",
+  "VisualEditModePanel.pickElement.capture": "要素をキャプチャ",
+  "VisualEditModePanel.describeChange": "2. 変更内容を説明",
+  "VisualEditModePanel.describeChangePlaceholder": "例:「このボタンを大きくして」「これを青にして」",
+  "VisualEditModePanel.generate": "パッチを生成",
+  "VisualEditModePanel.generating": "ソースファイルを検索し、モデルにパッチを依頼しています…",
+  "VisualEditModePanel.empty": "まだビジュアル編集はありません — 上で要素をキャプチャして変更内容を説明してください。",
+  "VisualEditModePanel.before": "変更前",
+  "VisualEditModePanel.after": "変更後",
+  "VisualEditModePanel.noScreenshot": "スクリーンショットは取得されていません",
+  "VisualEditModePanel.accept": "承認",
+  "VisualEditModePanel.reject": "却下",
+  "VisualEditModePanel.replay": "再実行",
+  "VisualEditModePanel.dismiss": "閉じる",
+  "VisualEditModePanel.acceptedNote": "{{file}} に書き込みました",
+  "VisualEditModePanel.status.generating": "生成中",
+  "VisualEditModePanel.status.pending": "レビュー待ち",
+  "VisualEditModePanel.status.accepted": "承認済み",
+  "VisualEditModePanel.status.rejected": "却下済み",
+  "VisualEditModePanel.status.error": "エラー"
 };

@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const de: Record<string, string> = {
   ...crewLocale,
@@ -353,6 +354,7 @@ export const de: Record<string, string> = {
   "McpGenerator.statusNotClean": "Nicht simulator-sauber",
   "McpGenerator.statusNotSimulated": "Nicht simuliert",
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   // Real German translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Tagesüberblick",
   "DailyBriefPanel.title": "Tagesüberblick",
@@ -1420,5 +1422,36 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "Das ist kein gültiges Registry-Snapshot-JSON.",
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
-  "EcosystemDiscover.cancel": "Abbrechen"
+  "EcosystemDiscover.cancel": "Abbrechen",
+  // Real German translations, overriding every visualEditModeLocale key above.
+  "AppMenu.visualEditMode": "Visueller Design-Bearbeitungsmodus",
+  "VisualEditModePanel.title": "Visueller Design-Bearbeitungsmodus",
+  "VisualEditModePanel.subtitle": "Element im Browser Workbench auswählen, Änderung beschreiben, Quellcode-Patch prüfen",
+  "VisualEditModePanel.close": "Visuellen Design-Bearbeitungsmodus schließen",
+  "VisualEditModePanel.pickElement.title": "1. Element auswählen",
+  "VisualEditModePanel.pickElement.description": "Nutzt eine bereits geöffnete Browser-Workbench-Sitzung – starte zuerst eine über die Seitenleiste, navigiere zu deiner Seite und wähle sie dann hier aus.",
+  "VisualEditModePanel.pickElement.session": "Browser-Sitzung",
+  "VisualEditModePanel.pickElement.noSessions": "Keine geöffneten Browser-Workbench-Sitzungen",
+  "VisualEditModePanel.pickElement.refreshSessions": "Sitzungen aktualisieren",
+  "VisualEditModePanel.pickElement.selector": "CSS-Selektor",
+  "VisualEditModePanel.pickElement.selectorPlaceholder": "z. B. button.cta, #submit-button",
+  "VisualEditModePanel.pickElement.capture": "Element erfassen",
+  "VisualEditModePanel.describeChange": "2. Änderung beschreiben",
+  "VisualEditModePanel.describeChangePlaceholder": "z. B. „diesen Button größer machen“ oder „dies blau färben“",
+  "VisualEditModePanel.generate": "Patch erzeugen",
+  "VisualEditModePanel.generating": "Durchsucht Quellcode-Dateien und fragt das Modell nach einem Patch …",
+  "VisualEditModePanel.empty": "Noch keine visuellen Änderungen – erfasse oben ein Element und beschreibe eine Änderung, um zu beginnen.",
+  "VisualEditModePanel.before": "Vorher",
+  "VisualEditModePanel.after": "Nachher",
+  "VisualEditModePanel.noScreenshot": "Kein Screenshot erfasst",
+  "VisualEditModePanel.accept": "Übernehmen",
+  "VisualEditModePanel.reject": "Ablehnen",
+  "VisualEditModePanel.replay": "Wiederholen",
+  "VisualEditModePanel.dismiss": "Verwerfen",
+  "VisualEditModePanel.acceptedNote": "Geschrieben in {{file}}",
+  "VisualEditModePanel.status.generating": "wird erzeugt",
+  "VisualEditModePanel.status.pending": "Prüfung ausstehend",
+  "VisualEditModePanel.status.accepted": "übernommen",
+  "VisualEditModePanel.status.rejected": "abgelehnt",
+  "VisualEditModePanel.status.error": "Fehler"
 };

@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const ko: Record<string, string> = {
   ...crewLocale,
@@ -353,6 +354,7 @@ export const ko: Record<string, string> = {
   "McpGenerator.statusNotClean": "시뮬레이터 기준 미통과",
   "McpGenerator.statusNotSimulated": "시뮬레이션되지 않음",
   ...dailyBriefLocale,
+  ...visualEditModeLocale,
   // Real Korean translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "데일리 브리핑",
   "DailyBriefPanel.title": "데일리 브리핑",
@@ -1420,5 +1422,36 @@ export const ko: Record<string, string> = {
   "EcosystemDiscover.invalidSnapshotJson": "유효한 레지스트리 스냅샷 JSON이 아닙니다.",
   "EcosystemDiscover.confirmRemoveRegistry": "이 레지스트리 소스를 제거하시겠습니까?",
   "EcosystemDiscover.removeRegistry": "제거",
-  "EcosystemDiscover.cancel": "취소"
+  "EcosystemDiscover.cancel": "취소",
+  // Real Korean translations, overriding every visualEditModeLocale key above.
+  "AppMenu.visualEditMode": "비주얼 디자인 편집 모드",
+  "VisualEditModePanel.title": "비주얼 디자인 편집 모드",
+  "VisualEditModePanel.subtitle": "Browser Workbench에서 요소를 선택하고, 변경 사항을 설명하고, 소스 패치를 검토하세요",
+  "VisualEditModePanel.close": "비주얼 디자인 편집 모드 닫기",
+  "VisualEditModePanel.pickElement.title": "1. 요소 선택",
+  "VisualEditModePanel.pickElement.description": "이미 열려 있는 Browser Workbench 세션을 사용합니다 — 먼저 사이드바에서 세션을 시작하고 페이지로 이동한 다음 여기에서 선택하세요.",
+  "VisualEditModePanel.pickElement.session": "브라우저 세션",
+  "VisualEditModePanel.pickElement.noSessions": "열려 있는 Browser Workbench 세션이 없습니다",
+  "VisualEditModePanel.pickElement.refreshSessions": "세션 새로고침",
+  "VisualEditModePanel.pickElement.selector": "CSS 선택자",
+  "VisualEditModePanel.pickElement.selectorPlaceholder": "예: button.cta, #submit-button",
+  "VisualEditModePanel.pickElement.capture": "요소 캡처",
+  "VisualEditModePanel.describeChange": "2. 변경 사항 설명",
+  "VisualEditModePanel.describeChangePlaceholder": "예: \"이 버튼을 더 크게 만들어줘\" 또는 \"이것을 파란색으로 바꿔줘\"",
+  "VisualEditModePanel.generate": "패치 생성",
+  "VisualEditModePanel.generating": "소스 파일을 검색하고 모델에 패치를 요청하는 중…",
+  "VisualEditModePanel.empty": "아직 비주얼 편집이 없습니다 — 위에서 요소를 캡처하고 변경 사항을 설명해 시작하세요.",
+  "VisualEditModePanel.before": "이전",
+  "VisualEditModePanel.after": "이후",
+  "VisualEditModePanel.noScreenshot": "캡처된 스크린샷이 없습니다",
+  "VisualEditModePanel.accept": "수락",
+  "VisualEditModePanel.reject": "거부",
+  "VisualEditModePanel.replay": "다시 실행",
+  "VisualEditModePanel.dismiss": "닫기",
+  "VisualEditModePanel.acceptedNote": "{{file}}에 기록됨",
+  "VisualEditModePanel.status.generating": "생성 중",
+  "VisualEditModePanel.status.pending": "검토 대기 중",
+  "VisualEditModePanel.status.accepted": "수락됨",
+  "VisualEditModePanel.status.rejected": "거부됨",
+  "VisualEditModePanel.status.error": "오류"
 };
