@@ -987,15 +987,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
 
-### 10. Tool-Call and Structured-Output Parser Hardening
-
-**Status:** Planned
-
-- Fuzz streaming tool calls, JSON mode, schema outputs, braces in strings, malformed chunks, and model-specific parsers.
-- Add regression fixtures per model family.
-
-**Acceptance:** Tool-call parsing failures produce safe errors, not accidental tool execution or corrupted arguments.
-
 ### 11. OpenAI and Ollama API Compatibility Harness
 
 **Status:** Planned

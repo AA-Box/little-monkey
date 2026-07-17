@@ -54,6 +54,11 @@ pub mod m4_services;
 pub mod mcp_app_core;
 mod native_skill_commands;
 pub mod native_skills;
+// Tauri-free Modelfile parser/validator/format-sniffer backing "Modelfile
+// Studio" (Phase 8): real Ollama Modelfile grammar, short-name hardening,
+// and GGUF/safetensors header sanity checks, independent of `ollama.rs`'s
+// own `ollama create -f` invocation (which stays in `ollama.rs`, unchanged).
+pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
@@ -70,6 +75,11 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+// Context window / KV-cache observability and long-context failure
+// classification (Phase 8, "Context and KV Cache Control Center"). Builds on
+// `runtime_adapter`'s settings/offload-planner types rather than duplicating
+// them.
+pub mod context_cache;
 // Runtime Telemetry and Memory Trace Viewer (Phase 8): bounded per-load/
 // per-request trace capture, redaction, and support-bundle assembly. Reuses
 // `runtime_adapter::OffloadPlan` and `m3_runtime_hub::M3RuntimeHub::runtime_logs`
@@ -101,6 +111,7 @@ pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
 mod artifact_commands;
+pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
 // `pub` only for the doc-comment convention every sibling module below
@@ -685,8 +696,12 @@ pub fn run() {
             ollama::ollama_example_cloud_tags,
             ollama::ollama_pull_model,
             ollama::ollama_import_model,
+            ollama::ollama_create_from_modelfile,
             ollama::ollama_remove_model,
             ollama::ollama_signin,
+            modelfile::modelfile_parse,
+            modelfile::modelfile_dry_run,
+            modelfile::modelfile_read_text_file,
             connectors::connectors_list,
             connectors::connectors_add_github,
             connectors::connectors_add_token,
@@ -722,6 +737,7 @@ pub fn run() {
             terminal::terminal_create,
             terminal::terminal_list,
             terminal::terminal_execute,
+            terminal::terminal_write,
             terminal::terminal_interrupt,
             terminal::terminal_resize,
             terminal::terminal_kill,
@@ -899,6 +915,7 @@ pub fn run() {
             m3_commands::m3_runtimes,
             m3_commands::m3_refresh_runtimes,
             m3_commands::m3_schedule_plan,
+            m3_commands::m3_chat_template_lab_report,
             m3_commands::m3_offload_plan,
             m3_commands::m3_catalog_search,
             m3_commands::m3_model_download,
@@ -914,6 +931,9 @@ pub fn run() {
             m3_commands::m3_runtime_unload_model,
             m3_commands::m3_runtime_logs,
             m3_commands::m3_runtime_metrics,
+            m3_commands::m3_context_cache_state,
+            m3_commands::m3_context_effective_size,
+            m3_commands::m3_classify_context_failure,
             m3_commands::m3_runtime_set_config,
             m3_commands::m3_runtime_config,
             m3_commands::m3_api_dispatch,

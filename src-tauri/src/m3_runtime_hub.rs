@@ -7,12 +7,13 @@
 //! without weakening the validation and persistence rules here.
 
 use crate::compatibility_hub::{
-    compatibility_conformance_manifest, encode_response, encode_stream_event, ApiBackend, ApiScope,
-    AuthorizationRequest, AuthorizedToken, CanonicalContent, CanonicalInferenceRequest,
-    CanonicalInferenceResponse, CanonicalMessage, CanonicalRole, CanonicalStreamEvent,
-    CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError, CompatibilityProtocol,
-    LanAccessController, LanEntropySource, LanServerPolicy, LanStateProtector, PairedToken,
-    PairingChallengeView, PairingRequest, ProtocolStreamFrame, ScopedTokenView, SecurityAuditEvent,
+    compatibility_conformance_manifest, encode_response, encode_stream_event, request_offers_tool,
+    ApiBackend, ApiScope, AuthorizationRequest, AuthorizedToken, CanonicalContent,
+    CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage, CanonicalRole,
+    CanonicalStreamEvent, CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError,
+    CompatibilityProtocol, LanAccessController, LanEntropySource, LanServerPolicy,
+    LanStateProtector, PairedToken, PairingChallengeView, PairingRequest, ProtocolStreamFrame,
+    ScopedTokenView, SecurityAuditEvent,
 };
 use crate::mlx_runtime::{
     MlxGenerationRequest, MlxGenerationSummary, MlxMessage, MlxOperationContext, MlxProcessMetrics,
@@ -3475,6 +3476,12 @@ impl CanonicalCollector {
                     "tool arguments must decode to an object".to_string(),
                 ));
             }
+            if !request_offers_tool(request, &tool.name) {
+                return Err(M3HubError::Runtime(format!(
+                    "stream called tool \"{}\" that was not offered in this request",
+                    tool.name
+                )));
+            }
             if ordered
                 .insert(
                     index,
@@ -3516,7 +3523,10 @@ impl CanonicalCollector {
     }
 }
 
-fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
+/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs` to
+/// validate the MLX driver's tool-call round-trip alongside the OpenAI-
+/// compatible Ollama/llama.cpp path.
+pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
     let role = match message.role {
         CanonicalRole::System => "system",
         CanonicalRole::User => "user",
@@ -5928,4 +5938,470 @@ fn validate_component_sources(sources: &[Arc<dyn M3ComponentSource>]) -> M3HubRe
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compatibility_hub::CanonicalToolDefinition;
+
+    // ------------------------------------------------------------------
+    // Phase 8 item 10: tool-call and structured-output parser hardening.
+    //
+    // This module previously had no test coverage at all, despite owning
+    // `CanonicalCollector` (which turns a `CanonicalStreamEvent` sequence
+    // into the final `CanonicalInferenceResponse` for both `.complete()`
+    // implementations) and `MlxCanonicalSink` (which translates the MLX
+    // runtime's own event protocol into canonical events). These fixtures
+    // exercise both directly against adversarial/malformed input, the same
+    // way the m3_production.rs OpenAI-compatible-engine fixtures do.
+    // ------------------------------------------------------------------
+
+    fn request_with_tools(tools: &[&str]) -> CanonicalInferenceRequest {
+        CanonicalInferenceRequest {
+            schema_version: crate::compatibility_hub::COMPATIBILITY_SCHEMA_VERSION,
+            protocol: CompatibilityProtocol::OpenAiChatCompletions,
+            request_id: "request-mlx".to_string(),
+            model: "local-model".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                content: vec![CanonicalContent::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
+            tools: tools
+                .iter()
+                .map(|name| CanonicalToolDefinition {
+                    name: name.to_string(),
+                    description: "test tool".to_string(),
+                    input_schema: json!({"type":"object","properties":{}}),
+                    strict: false,
+                })
+                .collect(),
+            max_output_tokens: 32,
+            temperature: None,
+            stream: true,
+            response_schema: None,
+            metadata: Value::Null,
+        }
+    }
+
+    fn started_collector(request: &CanonicalInferenceRequest) -> CanonicalCollector {
+        let mut collector = CanonicalCollector::default();
+        collector
+            .emit(CanonicalStreamEvent::ResponseStart {
+                response_id: "resp-1".to_string(),
+                model: request.model.clone(),
+                created_at_seconds: 0,
+            })
+            .expect("response start");
+        collector
+    }
+
+    fn complete_collector(
+        mut collector: CanonicalCollector,
+        request: &CanonicalInferenceRequest,
+    ) -> M3HubResult<CanonicalInferenceResponse> {
+        collector
+            .emit(CanonicalStreamEvent::ResponseCompleted {
+                response_id: "resp-1".to_string(),
+                finish_reason: "tool_calls".to_string(),
+                usage: CanonicalUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            })
+            .map_err(M3HubError::Runtime)?;
+        collector.into_response(request, 0)
+    }
+
+    /// Splits the JSON text for `value` into 3+ fragments, deliberately
+    /// cutting inside an embedded `{`/`}` pair and inside an escaped quote —
+    /// the two spots a naive brace-counting parser (instead of buffering
+    /// verbatim and parsing once complete) would get wrong. `value` must
+    /// contain a string field with a `{...}` substring and an escaped quote.
+    fn split_with_embedded_brace_and_escape(value: &Value) -> Vec<String> {
+        let text = value.to_string();
+        let mut braces = text.match_indices('{');
+        let _outer_open = braces.next().expect("outer open brace");
+        let (embedded_open, _) = braces.next().expect("embedded open brace");
+        let (embedded_close, _) = text
+            .match_indices('}')
+            .next()
+            .expect("embedded close brace");
+        let (escape_at, _) = text
+            .match_indices("\\\"")
+            .next()
+            .expect("escaped quote");
+        let mut cuts = vec![embedded_open + 1, embedded_close, escape_at + 1];
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut fragments = Vec::new();
+        let mut previous = 0;
+        for cut in cuts {
+            fragments.push(text[previous..cut].to_string());
+            previous = cut;
+        }
+        fragments.push(text[previous..].to_string());
+        fragments
+    }
+
+    /// Naive brace-counting to find where a streamed tool call's JSON ends
+    /// breaks the moment a string value contains braces. `CanonicalCollector`
+    /// never brace-counts: it concatenates every `ToolCallArgumentsDelta`
+    /// fragment verbatim and only asks `serde_json` to parse the result once
+    /// the call is over, so this must reconstruct exactly.
+    #[test]
+    fn collector_reconstructs_brace_in_string_arguments_across_fragments() {
+        let request = request_with_tools(&["search"]);
+        let arguments_value = json!({"note": "find {ignored} \"quoted\" value"});
+        let fragments = split_with_embedded_brace_and_escape(&arguments_value);
+        assert!(fragments.len() >= 3, "expected multiple fragments");
+
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("tool call start");
+        for fragment in &fragments {
+            collector
+                .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                    json_delta: fragment.clone(),
+                })
+                .expect("argument fragment");
+        }
+        collector
+            .emit(CanonicalStreamEvent::ToolCallEnd {
+                index: 0,
+                call_id: "call_1".to_string(),
+            })
+            .expect("tool call end");
+        let response = complete_collector(collector, &request).expect("response assembles");
+        assert_eq!(
+            response.content,
+            vec![CanonicalContent::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: arguments_value,
+            }]
+        );
+    }
+
+    #[test]
+    fn collector_rejects_duplicate_tool_block_index() {
+        let request = request_with_tools(&["search"]);
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("first start");
+        let result = collector.emit(CanonicalStreamEvent::ToolCallStart {
+            index: 0,
+            call_id: "call_2".to_string(),
+            name: "search".to_string(),
+        });
+        assert!(matches!(result, Err(ref message) if message.contains("duplicate")));
+    }
+
+    #[test]
+    fn collector_rejects_arguments_before_start_and_call_id_mismatch() {
+        let request = request_with_tools(&["search"]);
+        let mut collector = started_collector(&request);
+        assert!(collector
+            .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                call_id: "call_1".to_string(),
+                json_delta: "{}".to_string(),
+            })
+            .is_err());
+
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("start");
+        let mismatched = collector.emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+            index: 0,
+            call_id: "wrong-id".to_string(),
+            json_delta: "{}".to_string(),
+        });
+        assert!(matches!(mismatched, Err(ref message) if message.contains("mismatch")));
+
+        let end_mismatch = collector.emit(CanonicalStreamEvent::ToolCallEnd {
+            index: 0,
+            call_id: "wrong-id".to_string(),
+        });
+        assert!(matches!(end_mismatch, Err(ref message) if message.contains("mismatch")));
+    }
+
+    /// A tool call that started but never received `ToolCallEnd` (stream
+    /// truncated, connection dropped) must not silently resolve into a
+    /// completed response.
+    #[test]
+    fn collector_rejects_unfinished_tool_call_at_response_assembly() {
+        let request = request_with_tools(&["search"]);
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("start");
+        collector
+            .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                call_id: "call_1".to_string(),
+                json_delta: "{\"q\": \"incomplete".to_string(),
+            })
+            .expect("delta");
+        // No `ToolCallEnd`: the stream ends here.
+        let result = complete_collector(collector, &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("unfinished")),
+            "expected an unfinished-tool-call rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn collector_rejects_arguments_that_are_not_valid_json_or_not_an_object() {
+        let request = request_with_tools(&["search"]);
+        for arguments in ["{\"unterminated", "42", "[1,2,3]", ""] {
+            let mut collector = started_collector(&request);
+            collector
+                .emit(CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                })
+                .expect("start");
+            collector
+                .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                    json_delta: arguments.to_string(),
+                })
+                .expect("delta");
+            collector
+                .emit(CanonicalStreamEvent::ToolCallEnd {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                })
+                .expect("end");
+            let result = complete_collector(collector, &request);
+            assert!(
+                result.is_err(),
+                "arguments {arguments:?} should not assemble into a response"
+            );
+        }
+    }
+
+    /// The other half of the acceptance criterion: a tool call naming
+    /// something the request never offered must never reach a caller as a
+    /// materialized `ToolUse` — the collector is the shared choke point for
+    /// both the MLX and any future collector-backed engine, so it is the
+    /// right place to enforce this regardless of which runtime produced the
+    /// stream.
+    #[test]
+    fn collector_rejects_tool_call_naming_an_unoffered_tool() {
+        let request = request_with_tools(&["weather"]);
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "shell_exec".to_string(),
+            })
+            .expect("start");
+        collector
+            .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                call_id: "call_1".to_string(),
+                json_delta: "{\"cmd\":\"rm -rf /\"}".to_string(),
+            })
+            .expect("delta");
+        collector
+            .emit(CanonicalStreamEvent::ToolCallEnd {
+                index: 0,
+                call_id: "call_1".to_string(),
+            })
+            .expect("end");
+        let result = complete_collector(collector, &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
+            "expected an unoffered-tool rejection, got {result:?}"
+        );
+    }
+
+    /// Full MLX-runtime pipeline: raw `MlxStreamEvent`s (as the MLX sidecar
+    /// process would emit, one JSON object per line) run through
+    /// `MlxCanonicalSink` and land in a `CanonicalCollector`, mirroring what
+    /// `MlxRuntimeAdapter::stream`/`complete` do in production.
+    fn run_mlx_pipeline(
+        request: &CanonicalInferenceRequest,
+        events: Vec<MlxStreamEvent>,
+    ) -> M3HubResult<CanonicalInferenceResponse> {
+        let mut collector = started_collector(request);
+        {
+            let mut sink = MlxCanonicalSink::new(&mut collector, "resp-1".to_string());
+            for event in events {
+                sink.emit(event).map_err(M3HubError::Runtime)?;
+            }
+        }
+        collector.into_response(request, 0)
+    }
+
+    #[test]
+    fn mlx_pipeline_reconstructs_brace_in_string_arguments() {
+        let request = request_with_tools(&["search"]);
+        let arguments_value = json!({"note": "a {braced} \"quoted\" value"});
+        let fragments = split_with_embedded_brace_and_escape(&arguments_value);
+        assert!(fragments.len() >= 3, "expected multiple fragments");
+
+        let mut events = vec![MlxStreamEvent::ToolCallStart {
+            call_id: "call_1".to_string(),
+            name: "search".to_string(),
+        }];
+        events.extend(
+            fragments
+                .into_iter()
+                .map(|fragment| MlxStreamEvent::ToolCallArgumentsDelta {
+                    call_id: "call_1".to_string(),
+                    json: fragment,
+                }),
+        );
+        events.push(MlxStreamEvent::ToolCallEnd {
+            call_id: "call_1".to_string(),
+        });
+        events.push(MlxStreamEvent::Completed {
+            input_tokens: 3,
+            output_tokens: 5,
+        });
+        let response =
+            run_mlx_pipeline(&request, events).expect("mlx pipeline assembles a response");
+        assert_eq!(
+            response.content,
+            vec![CanonicalContent::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: arguments_value,
+            }]
+        );
+        assert_eq!(response.finish_reason, "tool_use");
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_duplicate_tool_call_id() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                },
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("duplicate")),
+            "expected a duplicate-id rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_arguments_before_start() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![MlxStreamEvent::ToolCallArgumentsDelta {
+                call_id: "call_1".to_string(),
+                json: "{}".to_string(),
+            }],
+        );
+        assert!(matches!(result, Err(M3HubError::Runtime(_))));
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_end_for_unknown_tool_call() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![MlxStreamEvent::ToolCallEnd {
+                call_id: "call_1".to_string(),
+            }],
+        );
+        assert!(matches!(result, Err(M3HubError::Runtime(_))));
+    }
+
+    /// The MLX sidecar process crashing or its stream being cut mid-call
+    /// (started, never ended) must not silently complete as if nothing
+    /// happened.
+    #[test]
+    fn mlx_pipeline_rejects_completed_with_unfinished_tool_call() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                },
+                MlxStreamEvent::ToolCallArgumentsDelta {
+                    call_id: "call_1".to_string(),
+                    json: "{\"q\":\"incomplete".to_string(),
+                },
+                MlxStreamEvent::Completed {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("unfinished")),
+            "expected an unfinished-tool-call rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_tool_call_naming_an_unoffered_tool() {
+        let request = request_with_tools(&["weather"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "shell_exec".to_string(),
+                },
+                MlxStreamEvent::ToolCallArgumentsDelta {
+                    call_id: "call_1".to_string(),
+                    json: "{\"cmd\":\"rm -rf /\"}".to_string(),
+                },
+                MlxStreamEvent::ToolCallEnd {
+                    call_id: "call_1".to_string(),
+                },
+                MlxStreamEvent::Completed {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
+            "expected an unoffered-tool rejection, got {result:?}"
+        );
+    }
 }

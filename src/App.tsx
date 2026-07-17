@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
+import { FolderTree, ListTodo, PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
@@ -35,7 +35,9 @@ import { BriefStudioPanel } from "./components/BriefStudio";
 import { CrossRepoChangePlannerPanel } from "./components/CrossRepoChangePlanner";
 import { VisualEditModePanel } from "./components/VisualEditMode";
 import { TerminalPanel } from "./components/Terminal";
+import { useTerminalStore } from "./store/terminalStore";
 import { DebatePanel } from "./components/Debate";
+import { ApiContractDiffLabPanel } from "./components/ApiContractDiffLab";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
@@ -155,7 +157,14 @@ function App() {
   const [crossRepoPlannerOpen, setCrossRepoPlannerOpen] = useState(false);
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const terminalDock = useTerminalStore((state) => state.dock);
+  /** The right sidebar region shows at most ONE thing at a time (Claude-
+   * Desktop-style): nothing (default), the picker menu, the workspace
+   * panel, or the side-tasks drawer. A right-docked terminal overrides
+   * whatever is selected here. */
+  const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks">("none");
   const [debateOpen, setDebateOpen] = useState(false);
+  const [apiContractDiffLabOpen, setApiContractDiffLabOpen] = useState(false);
   // Tab Settings should jump to the moment it opens — set alongside
   // `settingsOpen` by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
@@ -188,6 +197,7 @@ function App() {
     setGoldenDatasetBuilderOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
+    setApiContractDiffLabOpen(false);
     setDataNotebookOpen(false);
     setSyntheticMonitoringOpen(false);
     setCrossRepoIntelligenceOpen(false);
@@ -264,6 +274,7 @@ function App() {
           setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setApiContractDiffLabOpen(false);
           setDataNotebookOpen(false);
           setSyntheticMonitoringOpen(false);
           setCrossRepoIntelligenceOpen(false);
@@ -292,6 +303,7 @@ function App() {
           setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setApiContractDiffLabOpen(false);
           setDataNotebookOpen(false);
           setSyntheticMonitoringOpen(false);
           setCrossRepoIntelligenceOpen(false);
@@ -522,15 +534,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsOpen(true);
           }}
           onOpenRunCenter={() => {
@@ -553,15 +566,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
           }}
@@ -587,15 +601,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
           }}
@@ -619,15 +634,16 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
+setApiContractDiffLabOpen(false);
+setDataNotebookOpen(false);
+setSyntheticMonitoringOpen(false);
+setCrossRepoIntelligenceOpen(false);
+setWorkCanvasOpen(false);
+setPmCopilotOpen(false);
+setDeepResearchOpen(false);
+setBriefStudioOpen(false);
+setCrossRepoPlannerOpen(false);
+setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
@@ -650,6 +666,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
@@ -686,6 +703,7 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setVisualEditModeOpen(false);
             setSecurityAutofixOpen(false);
             setSettingsInitialTab(undefined);
@@ -710,6 +728,7 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setCrossRepoIntelligenceOpen(false);
             setVisualEditModeOpen(false);
@@ -769,8 +788,27 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
             setConnectorBuilderOpen(true);
+          }}
+          onOpenApiContractDiffLab={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setApiContractDiffLabOpen(true);
           }}
           onOpenAgentInbox={() => {
             setSettingsOpen(false);
@@ -788,6 +826,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
             setCrossRepoIntelligenceOpen(false);
@@ -806,6 +845,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setConnectorBuilderOpen(false);
@@ -818,6 +858,7 @@ function App() {
             setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setRedTeamLabOpen(true);
@@ -858,6 +899,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
             setSpreadsheetCopilotOpen(true);
           }}
@@ -895,6 +937,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setSettingsInitialTab(undefined);
             setGoldenDatasetBuilderOpen(true);
           }}
@@ -903,6 +946,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setConnectorBuilderOpen(false);
@@ -970,6 +1014,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
+            setApiContractDiffLabOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
             setWorkCanvasOpen(false);
@@ -1172,7 +1217,10 @@ function App() {
             setVisualEditModeOpen(true);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
-          onOpenSideTasks={() => useSideTaskStore.getState().openDrawer()}
+          onOpenSideTasks={() => {
+            useSideTaskStore.getState().openDrawer();
+            setRightPanel("sideTasks");
+          }}
           onOpenDebate={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -1191,6 +1239,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setGoldenDatasetBuilderOpen(false);
             setDailyBriefOpen(false);
+            setApiContractDiffLabOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
             setWorkCanvasOpen(false);
@@ -1234,12 +1283,21 @@ function App() {
           >
             <SquareTerminal size={15} />
           </IconButton>
+          <IconButton
+            size="sm"
+            variant={rightPanel !== "none" ? "secondary" : "ghost"}
+            onClick={() => setRightPanel((panel) => (panel === "none" ? "menu" : "none"))}
+            aria-label={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+            title={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+          >
+            <PanelRight size={15} />
+          </IconButton>
         </div>
         <SessionGrantBanner />
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : apiContractDiffLabOpen ? "api-contract-diff-lab" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -1273,11 +1331,13 @@ function App() {
               onClose={() => setDailyBriefOpen(false)}
               onOpenRunCenter={(runId) => {
                 setDailyBriefOpen(false);
+                setApiContractDiffLabOpen(false);
                 setRunCenterOpen(true);
                 void useRunStore.getState().selectRun(runId);
               }}
               onOpenAgentInbox={() => {
                 setDailyBriefOpen(false);
+                setApiContractDiffLabOpen(false);
                 setAgentInboxOpen(true);
               }}
               onOpenSettingsTab={openSettingsTab}
@@ -1357,6 +1417,8 @@ function App() {
                 void useRunStore.getState().selectRun(runId);
               }}
             />
+          ) : apiContractDiffLabOpen ? (
+            <ApiContractDiffLabPanel onClose={() => setApiContractDiffLabOpen(false)} />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
@@ -1376,16 +1438,17 @@ function App() {
             />
           )}
         </ErrorBoundary>
-        {terminalOpen && (
+        {terminalOpen && terminalDock === "bottom" && (
           <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
         )}
       </div>
+
 
       {/* Split pane: a second, fully independent chat opened via the session
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !apiContractDiffLabOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
@@ -1409,16 +1472,57 @@ function App() {
         </div>
       )}
 
-      {/* Side Tasks: a collapsible panel that coexists with whatever the
-          main pane is showing (unlike RunCenter/BrowserWorkbench, which
-          replace it) — ROADMAP.md's "Side Tasks" item asks for parallel work
-          that stays visible next to the main chat, not a full-screen swap.
-          Keyed by the active session so a manually-started ("+ New") task is
-          attributed to whichever chat is actually on screen. */}
-      <SideTaskDrawer sessionId={activeSessionId} />
-
-      {/* Right: collapsible workspace panel (file tree + diff preview),
-          also extending to the top of the window */}
+      {/* Right region: hidden by default; shows exactly one of — the
+          right-docked terminal (overrides everything), the picker menu, the
+          side-tasks drawer, or the workspace panel. Claude-Desktop-style:
+          contents swap in place, they never stack beside each other. */}
+      {terminalOpen && terminalDock === "right" ? (
+        <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
+      ) : rightPanel === "sideTasks" ? (
+        <SideTaskDrawer sessionId={activeSessionId} />
+      ) : rightPanel === "menu" ? (
+        <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-surface">
+          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
+              {t("App.rightPanelMenuTitle")}
+            </span>
+            <IconButton size="sm" onClick={() => setRightPanel("none")} aria-label={t("App.closeRightSidebar")} className="ml-auto">
+              <X size={16} />
+            </IconButton>
+          </div>
+          <div className="flex flex-col gap-1 p-3">
+            <button
+              type="button"
+              onClick={() => setRightPanel("workspace")}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <FolderTree size={16} className="shrink-0 text-faint" /> {t("App.rightPanelWorkspace")}
+            </button>
+            <button
+              type="button"
+              disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+              onClick={() => {
+                useTerminalStore.getState().setDock("right");
+                setTerminalOpen(true);
+                setRightPanel("none");
+              }}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+            >
+              <SquareTerminal size={16} className="shrink-0 text-faint" /> {t("App.rightPanelTerminal")}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                useSideTaskStore.getState().openDrawer();
+                setRightPanel("sideTasks");
+              }}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <ListTodo size={16} className="shrink-0 text-faint" /> {t("App.rightPanelSideTasks")}
+            </button>
+          </div>
+        </aside>
+      ) : rightPanel === "workspace" ? (
       <aside
         className={`flex shrink-0 flex-col border-l border-border bg-surface transition-[width] duration-200 ${
           workspacePanelOpen ? "w-96" : "w-12"
@@ -1481,6 +1585,7 @@ function App() {
           </div>
         ))}
       </aside>
+      ) : null}
 
       {commandPaletteOpen && (
         <CommandPalette
