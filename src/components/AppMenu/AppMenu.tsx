@@ -13,10 +13,12 @@ import {
   GitPullRequest,
   Globe,
   HelpCircle,
+  LayoutDashboard,
   ListTodo,
   Inbox,
   Network,
   Newspaper,
+  Radar,
   Search,
   ServerCog,
   Settings as SettingsIcon,
@@ -53,6 +55,9 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenSyntheticMonitoring: () => void;
+  onOpenCrossRepoIntelligence: () => void;
+  onOpenWorkCanvas: () => void;
   onOpenPmCopilot: () => void;
   onOpenDeepResearch: () => void;
   onOpenBriefStudio: () => void;
@@ -104,6 +109,9 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenSyntheticMonitoring,
+  onOpenCrossRepoIntelligence,
+  onOpenWorkCanvas,
   onOpenPmCopilot,
   onOpenDeepResearch,
   onOpenBriefStudio,
@@ -218,6 +226,22 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Radar size={14} className="text-faint" />}
+            label={t("AppMenu.syntheticMonitoring")}
+            onClick={() => {
+              closeAll();
+              onOpenSyntheticMonitoring();
+            }}
+          />
+          <MenuRow
+            icon={<LayoutDashboard size={14} className="text-faint" />}
+            label={t("AppMenu.workCanvas")}
+            onClick={() => {
+              closeAll();
+              onOpenWorkCanvas();
+            }}
+          />
+          <MenuRow
             icon={<ShieldCheck size={14} className="text-faint" />}
             label={t("AppMenu.trustScorecards")}
             onClick={() => {
@@ -247,6 +271,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenSideTasks();
+            }}
+          />
+          <MenuRow
+            icon={<Network size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoIntelligence")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoIntelligence();
             }}
           />
           <MenuRow
