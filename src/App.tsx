@@ -22,6 +22,7 @@ import { RedTeamLabPanel } from "./components/RedTeamLab";
 import { KnowledgeGraphExplorerPanel } from "./components/KnowledgeGraphExplorer";
 import { SpreadsheetCopilotPanel } from "./components/SpreadsheetCopilot";
 import { EvidenceBoardPanel } from "./components/EvidenceBoard";
+import { GoldenDatasetBuilderPanel } from "./components/GoldenDatasetBuilder";
 import { DailyBriefPanel } from "./components/DailyBrief";
 import { DataNotebookPanel } from "./components/DataNotebook";
 import { SyntheticMonitoringPanel } from "./components/SyntheticMonitoring";
@@ -140,6 +141,7 @@ function App() {
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const [spreadsheetCopilotOpen, setSpreadsheetCopilotOpen] = useState(false);
   const [evidenceBoardOpen, setEvidenceBoardOpen] = useState(false);
+  const [goldenDatasetBuilderOpen, setGoldenDatasetBuilderOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
   const [dataNotebookOpen, setDataNotebookOpen] = useState(false);
   const [syntheticMonitoringOpen, setSyntheticMonitoringOpen] = useState(false);
@@ -180,6 +182,7 @@ function App() {
     setKnowledgeGraphOpen(false);
     setSpreadsheetCopilotOpen(false);
     setEvidenceBoardOpen(false);
+    setGoldenDatasetBuilderOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
     setDataNotebookOpen(false);
@@ -255,6 +258,7 @@ function App() {
           setKnowledgeGraphOpen(false);
           setSpreadsheetCopilotOpen(false);
           setEvidenceBoardOpen(false);
+          setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
           setDataNotebookOpen(false);
@@ -282,6 +286,7 @@ function App() {
           setKnowledgeGraphOpen(false);
           setSpreadsheetCopilotOpen(false);
           setEvidenceBoardOpen(false);
+          setGoldenDatasetBuilderOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
           setDataNotebookOpen(false);
@@ -510,6 +515,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -539,6 +545,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -571,6 +578,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -601,6 +609,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -666,6 +675,7 @@ function App() {
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setVisualEditModeOpen(false);
@@ -688,6 +698,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -709,6 +720,7 @@ function App() {
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -776,6 +788,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setVisualEditModeOpen(false);
@@ -795,6 +808,7 @@ function App() {
             setSpreadsheetCopilotOpen(false);
             setRedTeamLabOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
@@ -812,6 +826,7 @@ function App() {
             setGlobalSearchOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
@@ -837,6 +852,22 @@ function App() {
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setEvidenceBoardOpen(true);
+          }}
+          onOpenGoldenDatasetBuilder={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setAgentInboxOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setSettingsInitialTab(undefined);
+            setGoldenDatasetBuilderOpen(true);
           }}
           onOpenDailyBrief={() => {
             setSettingsOpen(false);
@@ -880,6 +911,7 @@ function App() {
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
             setSyntheticMonitoringOpen(false);
@@ -1126,6 +1158,7 @@ function App() {
             setKnowledgeGraphOpen(false);
             setSpreadsheetCopilotOpen(false);
             setEvidenceBoardOpen(false);
+            setGoldenDatasetBuilderOpen(false);
             setDailyBriefOpen(false);
             setDataNotebookOpen(false);
             setSyntheticMonitoringOpen(false);
@@ -1175,7 +1208,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : migrationAgentOpen ? "migration-agent" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : migrationAgentOpen ? "migration-agent" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -1202,6 +1235,8 @@ function App() {
             <SpreadsheetCopilotPanel onClose={() => setSpreadsheetCopilotOpen(false)} />
           ) : evidenceBoardOpen ? (
             <EvidenceBoardPanel sessionId={activeSessionId} onClose={() => setEvidenceBoardOpen(false)} />
+          ) : goldenDatasetBuilderOpen ? (
+            <GoldenDatasetBuilderPanel onClose={() => setGoldenDatasetBuilderOpen(false)} />
           ) : dailyBriefOpen ? (
             <DailyBriefPanel
               onClose={() => setDailyBriefOpen(false)}
@@ -1317,7 +1352,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !migrationAgentOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !migrationAgentOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
