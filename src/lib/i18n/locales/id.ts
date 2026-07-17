@@ -893,6 +893,7 @@ export const id: Record<string, string> = {
   "ApiServerPanel.scope.knowledge": "Kueri pengetahuan",
   "ApiServerPanel.scope.workflow_run": "Status jalannya workflow",
   "ApiServerPanel.scope.artifact_read": "Baca artefak",
+  "ApiServerPanel.scope.local_app_run": "Jalankan Local App",
   "ApiServerPanel.backend.local": "Model lokal",
   "ApiServerPanel.backend.ollama": "Ollama",
   "ApiServerPanel.backend.providers": "Penyedia cloud",

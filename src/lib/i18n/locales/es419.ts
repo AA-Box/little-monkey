@@ -893,6 +893,7 @@ export const es419: Record<string, string> = {
   "ApiServerPanel.scope.knowledge": "Consulta de conocimiento",
   "ApiServerPanel.scope.workflow_run": "Estado de ejecución del workflow",
   "ApiServerPanel.scope.artifact_read": "Lectura de artefacto",
+  "ApiServerPanel.scope.local_app_run": "Ejecución de app local",
   "ApiServerPanel.backend.local": "Modelo local",
   "ApiServerPanel.backend.ollama": "Ollama",
   "ApiServerPanel.backend.providers": "Proveedores en la nube",

@@ -893,6 +893,7 @@ export const ko: Record<string, string> = {
   "ApiServerPanel.scope.knowledge": "지식 쿼리",
   "ApiServerPanel.scope.workflow_run": "워크플로 실행 상태",
   "ApiServerPanel.scope.artifact_read": "아티팩트 읽기",
+  "ApiServerPanel.scope.local_app_run": "로컬 앱 실행",
   "ApiServerPanel.backend.local": "로컬 모델",
   "ApiServerPanel.backend.ollama": "Ollama",
   "ApiServerPanel.backend.providers": "클라우드 제공업체",

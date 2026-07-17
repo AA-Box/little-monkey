@@ -893,6 +893,7 @@ export const pt: Record<string, string> = {
   "ApiServerPanel.scope.knowledge": "Consulta de conhecimento",
   "ApiServerPanel.scope.workflow_run": "Status de execução do workflow",
   "ApiServerPanel.scope.artifact_read": "Leitura de artefato",
+  "ApiServerPanel.scope.local_app_run": "Execução de app local",
   "ApiServerPanel.backend.local": "Modelo local",
   "ApiServerPanel.backend.ollama": "Ollama",
   "ApiServerPanel.backend.providers": "Provedores de nuvem",

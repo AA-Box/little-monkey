@@ -24,8 +24,13 @@ export interface ApiServerStatus {
  * `workflow_run`/`artifact_read` are the phase-5 scopes gating the three
  * extended routes in `handle_extended_request` (knowledge query, read-only
  * workflow-run status, artifact read) — see that module's doc comment for
- * why there's deliberately no route to *submit* a run over this API. */
-export type Scope = "chat" | "models" | "embeddings" | "knowledge" | "workflow_run" | "artifact_read";
+ * why there's deliberately no route to *submit* a run over this API.
+ * `local_app_run` (Local App Builder) is never user-selectable — it's only
+ * ever minted by `mint_local_app_token` and shows up read-only on a Local
+ * App's scoped token in the general token list, but still needs to be a
+ * valid `Scope` value so that token renders correctly instead of falling
+ * through to `t()`'s raw-key fallback. */
+export type Scope = "chat" | "models" | "embeddings" | "knowledge" | "workflow_run" | "artifact_read" | "local_app_run";
 export type Backend = "local" | "ollama" | "providers";
 
 /** Mirrors the Rust `TokenEntryView` struct — never the digest, which stays

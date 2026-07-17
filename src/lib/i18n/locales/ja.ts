@@ -893,6 +893,7 @@ export const ja: Record<string, string> = {
   "ApiServerPanel.scope.knowledge": "ナレッジ検索",
   "ApiServerPanel.scope.workflow_run": "ワークフロー実行状況",
   "ApiServerPanel.scope.artifact_read": "アーティファクト読み取り",
+  "ApiServerPanel.scope.local_app_run": "ローカルアプリ実行",
   "ApiServerPanel.backend.local": "ローカルモデル",
   "ApiServerPanel.backend.ollama": "Ollama",
   "ApiServerPanel.backend.providers": "クラウドプロバイダー",

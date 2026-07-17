@@ -893,6 +893,7 @@ export const hi: Record<string, string> = {
   "ApiServerPanel.scope.knowledge": "नॉलेज क्वेरी",
   "ApiServerPanel.scope.workflow_run": "वर्कफ़्लो रन स्थिति",
   "ApiServerPanel.scope.artifact_read": "आर्टिफ़ैक्ट रीड",
+  "ApiServerPanel.scope.local_app_run": "लोकल ऐप रन",
   "ApiServerPanel.backend.local": "लोकल मॉडल",
   "ApiServerPanel.backend.ollama": "Ollama",
   "ApiServerPanel.backend.providers": "क्लाउड प्रोवाइडर",
