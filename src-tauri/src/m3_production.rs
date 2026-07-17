@@ -3912,7 +3912,9 @@ GPU1:
             }
         }
         assert!(!report.jetson.detected);
-        assert_eq!(report.os, "macos");
+        // `os` mirrors `std::env::consts::OS` (see `PlatformCapabilities::current`),
+        // not a hardcoded platform — this test runs on Linux CI as well as macOS.
+        assert_eq!(report.os, std::env::consts::OS);
     }
 
     #[test]
