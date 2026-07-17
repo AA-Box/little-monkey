@@ -43,6 +43,7 @@ interface AppMenuProps {
   onOpenBrowserWorkbench: () => void;
   onOpenCommandPalette: () => void;
   onOpenIssueToPr: () => void;
+  onOpenSecurityAutofix: () => void;
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
@@ -97,6 +98,7 @@ export function AppMenu({
   onOpenBrowserWorkbench,
   onOpenCommandPalette,
   onOpenIssueToPr,
+  onOpenSecurityAutofix,
   onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
@@ -223,6 +225,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<ShieldAlert size={14} className="text-faint" />}
+            label={t("AppMenu.securityAutofix")}
+            onClick={() => {
+              closeAll();
+              onOpenSecurityAutofix();
             }}
           />
           <MenuRow

@@ -117,6 +117,11 @@ pub mod mcp;
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
 // `mcp`/`providers` above.
 pub mod connectors;
+// Inbox Triage Agents (ROADMAP.md, Phase 3): read-only ranking/summarization
+// of GitHub/Slack/Jira work queues built on the Connector Catalog above, plus
+// draft-only reply/comment/status-update generation. Every write goes through
+// `permissions::request_permission`, same as every other mutating tool.
+pub mod triage;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -300,6 +305,15 @@ pub struct AppState {
     /// around that pair (never across the `.await`ed verification call
     /// itself), so there's nothing async to ever hold it across.
     pub connectors_config_lock: std::sync::Mutex<()>,
+    /// Serializes `triage.json` read-modify-write cycles (see `triage.rs`) —
+    /// same reasoning as `connectors_config_lock` protects `connectors.json`:
+    /// `triage_refresh`/`triage_generate_draft`/`triage_send_draft` are all
+    /// async commands the tokio runtime can run concurrently, so without a
+    /// shared lock two concurrent config-mutating calls could both load the
+    /// same "before" queue and the later save silently clobbers the earlier
+    /// one's change. Acquired only around synchronous `load_config_impl`/
+    /// `save_config_impl` pairs, never across an awaited network call.
+    pub triage_state_lock: std::sync::Mutex<()>,
     /// Serializes the permission-granted mutation itself (checkpoint backup +
     /// the actual file write) in `tool_write_file`/`tool_edit_file` — same
     /// "two unsynchronized concurrent writers can silently clobber each
@@ -431,6 +445,7 @@ impl Default for AppState {
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
             connectors_config_lock: Default::default(),
+            triage_state_lock: Default::default(),
             file_write_lock: Default::default(),
             mcp: Default::default(),
             web_settings_lock: Default::default(),
@@ -673,6 +688,10 @@ pub fn run() {
             connectors::connectors_remove,
             connectors::connectors_reverify,
             connectors::connectors_export_audit,
+            triage::triage_refresh,
+            triage::triage_list,
+            triage::triage_generate_draft,
+            triage::triage_send_draft,
             providers::providers_list_presets,
             providers::providers_list_configured,
             providers::providers_add_custom,

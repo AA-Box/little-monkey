@@ -909,6 +909,23 @@ pub fn m5_github_api_get(path: &str) -> Result<Value, String> {
     github::gh_api_json(path)
 }
 
+/// Paginated counterpart to [`m5_github_api_get`] — Inbox Triage's GitHub
+/// source (`triage.rs::collect_github`) uses this so it isn't limited to a
+/// single `per_page` window when ranking by staleness.
+pub fn m5_github_api_get_paginated(path: &str, max_items: usize) -> Result<Vec<Value>, String> {
+    github::gh_api_paginated_json(path, max_items)
+}
+
+/// Non-worktree-scoped `gh api --method POST <path>` bridge — Inbox Triage's
+/// GitHub comment-posting action (`triage.rs::triage_send_draft`) uses this
+/// after its own `request_permission` gate has already been granted; nothing
+/// in this function or `github::gh_api_post_json` itself gates permission,
+/// matching `m5_github_api_get`'s read-side split (the gate lives at the
+/// `#[tauri::command]` layer, not the bridge layer).
+pub fn m5_github_api_post(path: &str, body: &Value) -> Result<Value, String> {
+    github::gh_api_post_json(path, body)
+}
+
 #[tauri::command]
 pub fn m5_github_issue(worktree_id: String, number: u32) -> Result<Value, String> {
     let store = open_store()?;

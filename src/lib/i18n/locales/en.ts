@@ -5,13 +5,16 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
-import { paletteLocale } from "./palette";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
+import { inboxLocale } from "./inbox";
+import { approvalChainsLocale } from "./approvalChains";
+import { securityAutofixLocale } from "./securityAutofix";
+import { paletteLocale } from "./palette";
 import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
-import { inboxLocale } from "./inbox";
 import { privacyFirewallLocale } from "./privacyFirewall";
 import { sandboxLocale } from "./sandbox";
 import { diagnosticsLocale } from "./diagnostics";
@@ -38,13 +41,16 @@ export const en: Record<string, string> = {
   ...portabilityLocale,
   ...ecosystemLocale,
   ...developerLocale,
-  ...paletteLocale,
   ...issueToPrLocale,
+  ...triageLocale,
+  ...inboxLocale,
+  ...approvalChainsLocale,
+  ...securityAutofixLocale,
+  ...paletteLocale,
   ...trustScorecardsLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...specScorerLocale,
-  ...inboxLocale,
   ...privacyFirewallLocale,
   ...sandboxLocale,
   ...diagnosticsLocale,
