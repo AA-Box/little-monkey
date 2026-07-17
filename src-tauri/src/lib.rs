@@ -908,6 +908,7 @@ pub fn run() {
             m3_commands::m3_catalog_replace_sources,
             m3_commands::m3_runtimes,
             m3_commands::m3_refresh_runtimes,
+            m3_commands::m3_resolve_setting_capabilities,
             m3_commands::m3_schedule_plan,
             m3_commands::m3_chat_template_lab_report,
             m3_commands::m3_offload_plan,

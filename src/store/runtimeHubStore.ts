@@ -25,6 +25,7 @@ import {
   type M3RuntimeStatusView,
   type M3SchedulingInput,
   type M3SchedulingPlan,
+  type M3SettingCapabilitiesView,
   type M3StorageStatus,
   type M3UnloadModelRequest,
   type ContextCacheView,
@@ -99,6 +100,11 @@ interface RuntimeHubStoreState {
    * `TemplateFamily::detect`), not something the frontend re-implements. */
   chatTemplateLabReports: Record<string, ChatTemplateLabReport>;
   offloadPlans: Record<string, OffloadPlan>;
+  /** Keyed by runtimeId: the Sampler/Batching/Speculative Decoding gating
+   * result last resolved for that runtime (see `resolveSettingCapabilities`
+   * below). Absent until first resolved; the UI falls back to the
+   * runtime's raw, ungated `settings` list until then. */
+  settingCapabilities: Record<string, M3SettingCapabilitiesView>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -123,6 +129,7 @@ interface RuntimeHubStoreState {
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
+  resolveSettingCapabilities: (runtimeId: string, assetId: string | null) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
   resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
@@ -301,6 +308,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     schedulingPlan: null,
     chatTemplateLabReports: {},
     offloadPlans: {},
+    settingCapabilities: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -586,6 +594,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set((state) => ({ offloadPlans: { ...state.offloadPlans, [runtimeId]: plan } }));
       } catch (error) {
         set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    resolveSettingCapabilities: async (runtimeId, assetId) => {
+      const key = `settings-gate:${runtimeId}`;
+      begin(key);
+      try {
+        const resolved = await runtimeHubClient.resolveSettingCapabilities({ runtimeId, assetId });
+        set((state) => ({ settingCapabilities: { ...state.settingCapabilities, [runtimeId]: resolved } }));
+      } catch (error) {
+        set((state) => ({ settingCapabilities: omitKey(state.settingCapabilities, runtimeId) }));
         fail(key, error);
         throw error;
       } finally {

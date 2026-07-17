@@ -427,6 +427,29 @@ export interface AdvancedSettingCapability {
   schema: SettingValueSchema;
   default_value: SettingValue;
   restart_required: boolean;
+  /** Whether this control can actually be enabled for the current
+   * runtime/model/hardware combination — see `runtime_adapter.rs`'s
+   * `AdvancedSettingCapability` doc comment. When `false`, disable the
+   * control in the UI and show `unsupported_reason`. */
+  supported: boolean;
+  unsupported_reason: string | null;
+}
+
+/** One installed model that could serve as a speculative-decoding draft
+ * model for the target model settings were resolved against. See
+ * `m3_runtime_hub.rs`'s `M3DraftModelCandidate`. */
+export interface M3DraftModelCandidate {
+  modelId: string;
+  displayName: string;
+}
+
+/** Result of `m3_resolve_setting_capabilities`: `runtime.settings` narrowed
+ * to what the current hardware/model can actually honor, plus (for
+ * speculative decoding) the installed models that are valid draft-model
+ * choices right now. See `m3_runtime_hub.rs`'s `gate_advanced_settings`. */
+export interface M3SettingCapabilitiesView {
+  settings: AdvancedSettingCapability[];
+  draftModelCandidates: M3DraftModelCandidate[];
 }
 
 export interface M3RuntimeDescriptor {
@@ -752,6 +775,8 @@ export const runtimeHubClient = {
   runtimes: () => invoke<M3RuntimeCapability[]>("m3_runtimes"),
   refreshRuntimes: (args: OperationArgs) =>
     invoke<M3RuntimeCapability[]>("m3_refresh_runtimes", args),
+  resolveSettingCapabilities: (args: { runtimeId: string; assetId: string | null }) =>
+    invoke<M3SettingCapabilitiesView>("m3_resolve_setting_capabilities", args),
   schedulePlan: (input: M3SchedulingInput) =>
     invoke<M3SchedulingPlan>("m3_schedule_plan", { input }),
   chatTemplateLabReport: (template: string | null) =>
