@@ -10,6 +10,7 @@ import {
   Command,
   ClipboardCheck,
   Compass,
+  Database,
   GitPullRequest,
   Globe,
   HelpCircle,
@@ -56,6 +57,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenDataNotebook: () => void;
   onOpenSyntheticMonitoring: () => void;
   onOpenCrossRepoIntelligence: () => void;
   onOpenWorkCanvas: () => void;
@@ -111,6 +113,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenDataNotebook,
   onOpenSyntheticMonitoring,
   onOpenCrossRepoIntelligence,
   onOpenWorkCanvas,
@@ -329,6 +332,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenEvidenceBoard();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dataNotebook")}
+            onClick={() => {
+              closeAll();
+              onOpenDataNotebook();
             }}
           />
           <MenuRow

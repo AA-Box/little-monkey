@@ -16,6 +16,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
@@ -421,6 +422,7 @@ export const ja: Record<string, string> = {
   "McpGenerator.statusNotClean": "シミュレーターでクリーンではない",
   "McpGenerator.statusNotSimulated": "未シミュレート",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Japanese translations, overriding every workCanvasLocale key above.
@@ -1677,6 +1679,49 @@ export const ja: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "このレジストリソースを削除しますか?",
   "EcosystemDiscover.removeRegistry": "削除",
   "EcosystemDiscover.cancel": "キャンセル",
+  // Real Japanese translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "データノートブック",
+  "DataNotebookPanel.title": "データノートブックとSQLラボ",
+  "DataNotebookPanel.subtitle": "ローカルのCSV/JSONデータセット上のSQLとMarkdownセル。保存済みのソースから再現可能",
+  "DataNotebookPanel.close": "データノートブックを閉じる",
+  "DataNotebookPanel.notebookListTitle": "ノートブック",
+  "DataNotebookPanel.newNotebook": "新しいノートブック",
+  "DataNotebookPanel.defaultNotebookName": "無題のノートブック",
+  "DataNotebookPanel.emptyState": "ノートブックがまだありません。作成して始めましょう。",
+  "DataNotebookPanel.deleteNotebook": "ノートブックを削除",
+  "DataNotebookPanel.renameNotebook": "ノートブック名",
+  "DataNotebookPanel.noActiveNotebook": "開始するにはノートブックを選択または作成してください。",
+  "DataNotebookPanel.persistError": "一部の変更が保存されていない可能性があります: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "データセット",
+  "DataNotebookPanel.datasetSection.none": "まだデータセットがインポートされていません。",
+  "DataNotebookPanel.datasetSection.import": "CSV/JSONをインポート…",
+  "DataNotebookPanel.datasetSection.clear": "データセットを削除",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}} 行 · テーブル `{{table}}`",
+  "DataNotebookPanel.importError": "インポートに失敗しました: {{error}}",
+  "DataNotebookPanel.addSqlCell": "SQLセルを追加",
+  "DataNotebookPanel.addMarkdownCell": "Markdownセルを追加",
+  "DataNotebookPanel.runAll": "すべて再実行",
+  "DataNotebookPanel.running": "実行中…",
+  "DataNotebookPanel.exportReport": "レポートをエクスポート",
+  "DataNotebookPanel.noCells": "セルがまだありません。SQLまたはMarkdownセルを追加して始めましょう。",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "Markdown",
+  "DataNotebookPanel.cell.run": "実行",
+  "DataNotebookPanel.cell.moveUp": "セルを上に移動",
+  "DataNotebookPanel.cell.moveDown": "セルを下に移動",
+  "DataNotebookPanel.cell.delete": "セルを削除",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "Markdownを書く…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "プレビュー",
+  "DataNotebookPanel.cell.markdownEditToggle": "編集",
+  "DataNotebookPanel.cell.notRun": "まだ実行されていません。",
+  "DataNotebookPanel.cell.error": "エラー: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}} 行が影響を受けました。",
+  "DataNotebookPanel.cell.noResults": "結果セットはありません。",
+  "DataNotebookPanel.cell.truncated": "{{total}} 件中最初の {{shown}} 行を表示しています。",
+  "DataNotebookPanel.reportModal.title": "再現可能なレポート",
+  "DataNotebookPanel.reportModal.copy": "クリップボードにコピー",
+  "DataNotebookPanel.reportModal.copied": "コピーしました！",
 
   // Synthetic Monitoring Agent (ROADMAP.md Phase 7, item 17) — real translations overriding the English `syntheticMonitoringLocale` defaults spread above.
   "AppMenu.syntheticMonitoring": "合成監視",

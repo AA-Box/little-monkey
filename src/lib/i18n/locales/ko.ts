@@ -16,6 +16,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { dataNotebookLocale } from "./dataNotebook";
 import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
@@ -421,6 +422,7 @@ export const ko: Record<string, string> = {
   "McpGenerator.statusNotClean": "시뮬레이터 기준 미통과",
   "McpGenerator.statusNotSimulated": "시뮬레이션되지 않음",
   ...dailyBriefLocale,
+  ...dataNotebookLocale,
   ...crossRepoIntelligenceLocale,
   ...workCanvasLocale,
   // Infinite Work Canvas (ROADMAP.md Phase 7) — real Korean translations, overriding every workCanvasLocale key above.
@@ -1677,6 +1679,49 @@ export const ko: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "이 레지스트리 소스를 제거하시겠습니까?",
   "EcosystemDiscover.removeRegistry": "제거",
   "EcosystemDiscover.cancel": "취소",
+  // Real Korean translations, overriding every dataNotebookLocale key above.
+  "AppMenu.dataNotebook": "데이터 노트북",
+  "DataNotebookPanel.title": "데이터 노트북 및 SQL 랩",
+  "DataNotebookPanel.subtitle": "로컬 CSV/JSON 데이터셋에 대한 SQL 및 마크다운 셀, 저장된 소스에서 재현 가능",
+  "DataNotebookPanel.close": "데이터 노트북 닫기",
+  "DataNotebookPanel.notebookListTitle": "노트북",
+  "DataNotebookPanel.newNotebook": "새 노트북",
+  "DataNotebookPanel.defaultNotebookName": "제목 없는 노트북",
+  "DataNotebookPanel.emptyState": "아직 노트북이 없습니다. 시작하려면 하나를 만드세요.",
+  "DataNotebookPanel.deleteNotebook": "노트북 삭제",
+  "DataNotebookPanel.renameNotebook": "노트북 이름",
+  "DataNotebookPanel.noActiveNotebook": "시작하려면 노트북을 선택하거나 만드세요.",
+  "DataNotebookPanel.persistError": "일부 변경 사항이 저장되지 않았을 수 있습니다: {{error}}",
+  "DataNotebookPanel.datasetSection.title": "데이터셋",
+  "DataNotebookPanel.datasetSection.none": "아직 가져온 데이터셋이 없습니다.",
+  "DataNotebookPanel.datasetSection.import": "CSV/JSON 가져오기…",
+  "DataNotebookPanel.datasetSection.clear": "데이터셋 제거",
+  "DataNotebookPanel.datasetSection.summary": "{{name}} · {{rows}}행 · 테이블 `{{table}}`",
+  "DataNotebookPanel.importError": "가져오기 실패: {{error}}",
+  "DataNotebookPanel.addSqlCell": "SQL 셀 추가",
+  "DataNotebookPanel.addMarkdownCell": "마크다운 셀 추가",
+  "DataNotebookPanel.runAll": "모두 다시 실행",
+  "DataNotebookPanel.running": "실행 중…",
+  "DataNotebookPanel.exportReport": "보고서 내보내기",
+  "DataNotebookPanel.noCells": "아직 셀이 없습니다. 시작하려면 SQL 또는 마크다운 셀을 추가하세요.",
+  "DataNotebookPanel.cell.sqlLabel": "SQL",
+  "DataNotebookPanel.cell.markdownLabel": "마크다운",
+  "DataNotebookPanel.cell.run": "실행",
+  "DataNotebookPanel.cell.moveUp": "셀을 위로 이동",
+  "DataNotebookPanel.cell.moveDown": "셀을 아래로 이동",
+  "DataNotebookPanel.cell.delete": "셀 삭제",
+  "DataNotebookPanel.cell.sqlPlaceholder": "SELECT * FROM ...",
+  "DataNotebookPanel.cell.markdownPlaceholder": "마크다운 작성…",
+  "DataNotebookPanel.cell.markdownPreviewToggle": "미리보기",
+  "DataNotebookPanel.cell.markdownEditToggle": "편집",
+  "DataNotebookPanel.cell.notRun": "아직 실행되지 않았습니다.",
+  "DataNotebookPanel.cell.error": "오류: {{error}}",
+  "DataNotebookPanel.cell.rowsAffected": "{{count}}행이 영향을 받았습니다.",
+  "DataNotebookPanel.cell.noResults": "결과 집합이 없습니다.",
+  "DataNotebookPanel.cell.truncated": "{{total}}개 중 처음 {{shown}}개 행을 표시합니다.",
+  "DataNotebookPanel.reportModal.title": "재현 가능한 보고서",
+  "DataNotebookPanel.reportModal.copy": "클립보드에 복사",
+  "DataNotebookPanel.reportModal.copied": "복사됨!",
 
   // Synthetic Monitoring Agent (ROADMAP.md Phase 7, item 17) — real translations overriding the English `syntheticMonitoringLocale` defaults spread above.
   "AppMenu.syntheticMonitoring": "합성 모니터링",
