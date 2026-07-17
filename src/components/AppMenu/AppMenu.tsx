@@ -18,6 +18,7 @@ import {
   Inbox,
   Network,
   Newspaper,
+  Radar,
   Search,
   ServerCog,
   Settings as SettingsIcon,
@@ -54,6 +55,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenSyntheticMonitoring: () => void;
   onOpenCrossRepoIntelligence: () => void;
   onOpenWorkCanvas: () => void;
   onOpenPmCopilot: () => void;
@@ -107,6 +109,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenSyntheticMonitoring,
   onOpenCrossRepoIntelligence,
   onOpenWorkCanvas,
   onOpenPmCopilot,
@@ -220,6 +223,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenIssueToPr();
+            }}
+          />
+          <MenuRow
+            icon={<Radar size={14} className="text-faint" />}
+            label={t("AppMenu.syntheticMonitoring")}
+            onClick={() => {
+              closeAll();
+              onOpenSyntheticMonitoring();
             }}
           />
           <MenuRow

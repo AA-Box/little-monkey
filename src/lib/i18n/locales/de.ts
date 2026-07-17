@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { syntheticMonitoringLocale } from "./syntheticMonitoring";
 import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
 import { workCanvasLocale } from "./workCanvas";
 import { pmCopilotLocale } from "./pmCopilot";
@@ -22,6 +23,7 @@ import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const de: Record<string, string> = {
+  ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
   ...searchLocale,
@@ -1557,6 +1559,63 @@ export const de: Record<string, string> = {
   "EcosystemDiscover.confirmRemoveRegistry": "Diese Registry-Quelle entfernen?",
   "EcosystemDiscover.removeRegistry": "Entfernen",
   "EcosystemDiscover.cancel": "Abbrechen",
+
+  // Synthetic Monitoring Agent (ROADMAP.md Phase 7, item 17) — real translations overriding the English `syntheticMonitoringLocale` defaults spread above.
+  "AppMenu.syntheticMonitoring": "Synthetisches Monitoring",
+  "SyntheticMonitoring.title": "Synthetic-Monitoring-Agent",
+  "SyntheticMonitoring.subtitle": "Plane Browser-Abläufe für lokale und öffentliche URLs, erfasse Screenshot-, Konsolen- und Netzwerk-Belege und erhalte sofort eine vorgeschlagene Diagnose, wenn einer fehlschlägt.",
+  "SyntheticMonitoring.close": "Synthetisches Monitoring schließen",
+  "SyntheticMonitoring.addMonitorHeading": "Monitor hinzufügen",
+  "SyntheticMonitoring.editMonitorHeading": "Monitor bearbeiten",
+  "SyntheticMonitoring.nameLabel": "Name",
+  "SyntheticMonitoring.namePlaceholder": "z. B. Marketing-Startseite",
+  "SyntheticMonitoring.urlLabel": "URL",
+  "SyntheticMonitoring.urlPlaceholder": "https://example.com/ oder http://localhost:5173/",
+  "SyntheticMonitoring.targetEnvLabel": "Ziel",
+  "SyntheticMonitoring.targetEnvLocal": "Lokal",
+  "SyntheticMonitoring.targetEnvStaging": "Staging",
+  "SyntheticMonitoring.targetEnvProduction": "Produktion",
+  "SyntheticMonitoring.intervalLabel": "Alle (Minuten)",
+  "SyntheticMonitoring.waitForLabel": "Warten auf",
+  "SyntheticMonitoring.waitForNone": "Nichts",
+  "SyntheticMonitoring.waitForSelectorOption": "Einen Selektor",
+  "SyntheticMonitoring.waitForTextOption": "Einen Text",
+  "SyntheticMonitoring.waitForValuePlaceholder": "#app-ready oder „Willkommen zurück“",
+  "SyntheticMonitoring.waitTimeoutLabel": "Wartezeit-Limit (Sekunden)",
+  "SyntheticMonitoring.clickSelectorLabel": "Klicken (optional)",
+  "SyntheticMonitoring.clickSelectorPlaceholder": "#accept-cookies",
+  "SyntheticMonitoring.assertionLabel": "Prüfen",
+  "SyntheticMonitoring.assertionSelectorPresent": "Selektor ist vorhanden",
+  "SyntheticMonitoring.assertionTextPresent": "Text ist vorhanden",
+  "SyntheticMonitoring.assertionUrlPrefix": "Ziel-URL beginnt mit",
+  "SyntheticMonitoring.assertionValuePlaceholder": "#dashboard, „Willkommen“ oder https://example.com/dashboard",
+  "SyntheticMonitoring.cancelEditButton": "Abbrechen",
+  "SyntheticMonitoring.updateButton": "Monitor aktualisieren",
+  "SyntheticMonitoring.saveButton": "Monitor hinzufügen",
+  "SyntheticMonitoring.monitorsHeading": "Monitore",
+  "SyntheticMonitoring.emptyMonitors": "Noch keine Monitore. Füge oben einen hinzu, um Läufe zu planen.",
+  "SyntheticMonitoring.statusPass": "Bestanden",
+  "SyntheticMonitoring.statusFail": "Fehlgeschlagen",
+  "SyntheticMonitoring.statusError": "Fehler",
+  "SyntheticMonitoring.lastRunLabel": "Letzter Lauf {{time}}",
+  "SyntheticMonitoring.neverRunLabel": "Noch nie gelaufen",
+  "SyntheticMonitoring.everyIntervalLabel": "alle {{minutes}} Min.",
+  "SyntheticMonitoring.runNowButton": "Jetzt ausführen",
+  "SyntheticMonitoring.runningButton": "Wird ausgeführt…",
+  "SyntheticMonitoring.enableToggleOn": "Aktiviert",
+  "SyntheticMonitoring.enableToggleOff": "Deaktiviert",
+  "SyntheticMonitoring.editButton": "Bearbeiten",
+  "SyntheticMonitoring.deleteButton": "Löschen",
+  "SyntheticMonitoring.noSelectionState": "Wähle einen Monitor, um Lauf-Verlauf und Belege zu sehen.",
+  "SyntheticMonitoring.runHistoryHeading": "Lauf-Verlauf",
+  "SyntheticMonitoring.emptyRunHistory": "Noch keine Läufe. Nutze „Jetzt ausführen“ oder warte auf den nächsten geplanten Zeitpunkt.",
+  "SyntheticMonitoring.latencyLabel": "{{ms}} ms",
+  "SyntheticMonitoring.evidenceHeading": "Screenshot",
+  "SyntheticMonitoring.evidenceScreenshotAlt": "Am Ende des Monitor-Laufs erfasster Screenshot",
+  "SyntheticMonitoring.evidenceNoneState": "Für diesen Lauf wurde kein Screenshot erfasst.",
+  "SyntheticMonitoring.failureReasonHeading": "Fehlerursache",
+  "SyntheticMonitoring.diagnosisHeading": "Vorgeschlagene Diagnose",
+  "SyntheticMonitoring.diagnosisNoneState": "Für diesen Lauf wurde keine Diagnose erstellt (kein Modell verfügbar oder der Aufruf ist abgelaufen).",
   // Real German translations, overriding every crossRepoIntelligenceLocale key above.
   "AppMenu.crossRepoIntelligence": "Repo-übergreifende Intelligenz",
   "CrossRepoIntelligencePanel.title": "Repo-übergreifende Code-Intelligenz",
