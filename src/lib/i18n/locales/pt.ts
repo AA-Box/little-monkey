@@ -3,6 +3,7 @@ import { runLocale } from "./runs";
 import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
+import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { issueToPrLocale } from "./issueToPr";
 import { sopCompilerLocale } from "./sopCompiler";
@@ -17,6 +18,32 @@ export const pt: Record<string, string> = {
   ...searchLocale,
   ...translationLocale,
   ...portabilityLocale,
+  ...teamModeLocale,
+  // Team, Family, and Organization Mode (ROADMAP.md Phase 6) — real translations overriding the English `teamModeLocale` defaults spread above.
+  "SettingsModal.tabTeamMode": "Equipe",
+  "TeamModePanel.membersHeading": "Membros da equipe",
+  "TeamModePanel.membersDescription": "Um seletor de perfil local com nome para indicar quem está usando esta máquina agora — não é um limite de autenticação. Qualquer pessoa com acesso local a este aplicativo já tem controle total sobre ele; isso só muda a atribuição de auditoria e quem pode responder às solicitações de permissão.",
+  "TeamModePanel.dismissError": "Dispensar",
+  "TeamModePanel.activeSwitcherLabel": "Membro ativo",
+  "TeamModePanel.activeSwitcherNone": "Nenhum selecionado",
+  "TeamModePanel.membersEmpty": "Nenhum membro da equipe configurado ainda — o aplicativo se comporta exatamente como para um usuário único até que você adicione um.",
+  "TeamModePanel.addNameLabel": "Nome de exibição",
+  "TeamModePanel.addNamePlaceholder": "ex.: Alex",
+  "TeamModePanel.addRoleLabel": "Função",
+  "TeamModePanel.addButton": "Adicionar membro",
+  "TeamModePanel.firstMemberIsOwnerHint": "O primeiro membro adicionado sempre se torna Proprietário, independentemente da função selecionada.",
+  "TeamModePanel.auditHeading": "Exportação de auditoria",
+  "TeamModePanel.auditDescription": "Um relatório redigido das execuções recentes e decisões de permissão — chaves de provedor, tokens ou outros segredos nunca são incluídos.",
+  "TeamModePanel.exportButton": "Exportar relatório de auditoria",
+  "TeamModePanel.roleOwner": "Proprietário",
+  "TeamModePanel.roleApprover": "Aprovador",
+  "TeamModePanel.roleOperator": "Operador",
+  "TeamModePanel.roleViewer": "Visualizador",
+  "TeamModePanel.activeBadge": "Ativo",
+  "TeamModePanel.lastActive": "Ativo pela última vez {{date}}",
+  "TeamModePanel.roleSelectAriaLabel": "Função de {{name}}",
+  "TeamModePanel.removeButton": "Remover {{name}}",
+  "TeamModePanel.removeConfirm": "Remover {{name}} desta equipe? Esta ação não pode ser desfeita.",
   ...knowledgeGraphExplorerLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "Explorador de Grafo de Conhecimento",
