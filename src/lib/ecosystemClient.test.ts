@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
-import { ecosystemClient, type McpUiManifest, type PortablePackageExport, type WorkflowDefinition, type WorkflowRunRequest } from "./ecosystemClient";
+import { ecosystemClient, type McpUiManifest, type PortablePackageExport, type RegistrySnapshot, type WorkflowDefinition, type WorkflowRunRequest } from "./ecosystemClient";
 
 const manifest: McpUiManifest = {
   contract_version: 1,
@@ -98,6 +98,37 @@ describe("ecosystemClient command contracts", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(5, "m4_plugins_deactivate_workflow", {
       packageId: "com.example.plugin",
       contentPath: "workflows/review.json",
+    });
+  });
+
+  it("forwards the local team-approved toggle without any role/permission argument", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await ecosystemClient.setPackageTeamApproved("com.example.collection", true);
+    expect(invokeMock).toHaveBeenCalledWith("m4_packages_set_team_approved", {
+      packageId: "com.example.collection",
+      teamApproved: true,
+    });
+  });
+
+  it("keeps the additional-registry-source lifecycle (list/add/remove/verify) explicit", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await ecosystemClient.listRegistrySources();
+    await ecosystemClient.addRegistrySource("team-catalog", "Team Catalog", "https://team.example.com/registry.json", 111);
+    await ecosystemClient.removeRegistrySource("team-catalog");
+    const snapshot = { registry_id: "team-catalog", sequence: 1 } as unknown as RegistrySnapshot;
+    await ecosystemClient.verifyRegistrySource("team-catalog", snapshot, 222);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "m4_registries_list");
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "m4_registries_add", {
+      sourceId: "team-catalog",
+      displayName: "Team Catalog",
+      location: "https://team.example.com/registry.json",
+      nowUnixMs: 111,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "m4_registries_remove", { sourceId: "team-catalog" });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "m4_registries_verify", {
+      sourceId: "team-catalog",
+      snapshot,
+      nowUnixMs: 222,
     });
   });
 });
