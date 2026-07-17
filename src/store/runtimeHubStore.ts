@@ -27,6 +27,11 @@ import {
   type M3SchedulingPlan,
   type M3StorageStatus,
   type M3UnloadModelRequest,
+  type ContextCacheView,
+  type ContextFailureClassification,
+  type ContextFailureInput,
+  type EffectiveContextInput,
+  type EffectiveContextResolution,
   type OffloadPlan,
   type OffloadPlanInput,
   type PairedToken,
@@ -47,6 +52,7 @@ export interface RuntimeDetail {
   logs?: RuntimeLogTail;
   metrics?: M3RuntimeMetricsView;
   config?: Record<string, SettingValue>;
+  contextCache?: ContextCacheView;
   refreshedAt?: number;
 }
 
@@ -119,6 +125,8 @@ interface RuntimeHubStoreState {
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
+  resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
+  classifyContextFailure: (input: ContextFailureInput) => Promise<ContextFailureClassification | null>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
   unloadModel: (request: M3UnloadModelRequest) => Promise<void>;
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
@@ -613,31 +621,41 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       try {
         const statusOperation = createM3OperationId("runtime-status");
         const inventoryOperation = createM3OperationId("runtime-inventory");
-        const [statusResult, inventoryResult, logsResult, metricsResult, configResult] = await Promise.allSettled([
-          runtimeHubClient.runtimeStatus({ operationId: statusOperation, timeoutMs: 15_000, runtimeId }),
-          runtimeHubClient.runtimeInventory({ operationId: inventoryOperation, timeoutMs: 20_000, runtimeId }),
-          capability?.canLogs
-            ? runtimeHubClient.runtimeLogs({
-                operationId: createM3OperationId("runtime-logs"),
-                timeoutMs: 10_000,
-                runtimeId,
-                maxBytes: 128 * 1024,
-              })
-            : Promise.resolve(undefined),
-          capability?.canMetrics
-            ? runtimeHubClient.runtimeMetrics({
-                operationId: createM3OperationId("runtime-metrics"),
-                timeoutMs: 10_000,
-                runtimeId,
-              })
-            : Promise.resolve(undefined),
-          runtimeHubClient.runtimeConfig(runtimeId),
-        ]);
+        const [statusResult, inventoryResult, logsResult, metricsResult, configResult, contextCacheResult] =
+          await Promise.allSettled([
+            runtimeHubClient.runtimeStatus({ operationId: statusOperation, timeoutMs: 15_000, runtimeId }),
+            runtimeHubClient.runtimeInventory({ operationId: inventoryOperation, timeoutMs: 20_000, runtimeId }),
+            capability?.canLogs
+              ? runtimeHubClient.runtimeLogs({
+                  operationId: createM3OperationId("runtime-logs"),
+                  timeoutMs: 10_000,
+                  runtimeId,
+                  maxBytes: 128 * 1024,
+                })
+              : Promise.resolve(undefined),
+            capability?.canMetrics
+              ? runtimeHubClient.runtimeMetrics({
+                  operationId: createM3OperationId("runtime-metrics"),
+                  timeoutMs: 10_000,
+                  runtimeId,
+                })
+              : Promise.resolve(undefined),
+            runtimeHubClient.runtimeConfig(runtimeId),
+            runtimeHubClient.contextCacheState({
+              operationId: createM3OperationId("context-cache-state"),
+              timeoutMs: 10_000,
+              runtimeId,
+            }),
+          ]);
         if (statusResult.status === "rejected") throw statusResult.reason;
         if (inventoryResult.status === "rejected") throw inventoryResult.reason;
         if (logsResult.status === "rejected") throw logsResult.reason;
         if (metricsResult.status === "rejected") throw metricsResult.reason;
         if (configResult.status === "rejected") throw configResult.reason;
+        // Context/cache state is diagnostic, additive information (like the
+        // Hardware Compatibility report): a failure here must never block
+        // the rest of the runtime card from refreshing.
+        const contextCache = contextCacheResult.status === "fulfilled" ? contextCacheResult.value : undefined;
         set((state) => ({
           runtimeDetails: {
             ...state.runtimeDetails,
@@ -648,6 +666,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
               logs: logsResult.value,
               metrics: metricsResult.value,
               config: configResult.value ?? undefined,
+              contextCache,
               refreshedAt: Date.now(),
             },
           },
@@ -659,6 +678,13 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         finish(key);
       }
     },
+
+    // Pure, read-only helpers with no shared state to track: like
+    // `previewOffloadPlan`'s underlying `m3_offload_plan` call, these never
+    // touch a runtime process, so callers can await the resolved value
+    // directly instead of reading it back out of the store.
+    resolveEffectiveContext: (input) => runtimeHubClient.contextEffectiveSize(input),
+    classifyContextFailure: (input) => runtimeHubClient.classifyContextFailure(input),
 
     loadModel: async (request) => {
       const key = `load:${request.runtimeId}`;

@@ -8,6 +8,7 @@ use crate::compatibility_hub::{
     CanonicalContent, CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage,
     CanonicalRole, CanonicalStreamEvent, CanonicalUsage, LanStateProtector, OsLanEntropy,
 };
+use crate::context_cache::{classify_context_failure, ContextFailureInput};
 use crate::m3_commands::{M3CommandState, M3OwnedProcessShutdown};
 use crate::m3_runtime_hub::{
     DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility, M3AcceleratorStatus,
@@ -1333,10 +1334,27 @@ impl OpenAiCompatibleM3InferenceEngine {
         if !response.status().is_success() {
             let status = response.status();
             let detail = read_bounded_response(response, 64 * 1024, cancellation, context).await?;
-            return Err(M3HubError::Runtime(format!(
-                "local inference returned HTTP {status}: {}",
-                String::from_utf8_lossy(&detail).trim()
-            )));
+            let detail_text = String::from_utf8_lossy(&detail).trim().to_string();
+            // A runtime's own error body is the most reliable place to spot a
+            // context/cache/memory-related failure (e.g. llama-server's
+            // "the request exceeds the available context size, try
+            // increasing it"), so classify it here and fold the explanation
+            // into the message the user actually sees — this is a best-effort
+            // text/status classification only; it never fabricates numeric
+            // context/memory figures this call site doesn't have.
+            let classification = classify_context_failure(&ContextFailureInput {
+                error_text: Some(detail_text.clone()),
+                http_status: Some(status.as_u16()),
+                ..Default::default()
+            });
+            return Err(M3HubError::Runtime(match classification {
+                Some(classification) => format!(
+                    "local inference returned HTTP {status} [context:{}] {} (raw: {detail_text})",
+                    classification.class.slug(),
+                    classification.explanation
+                ),
+                None => format!("local inference returned HTTP {status}: {detail_text}"),
+            }));
         }
         Ok(response)
     }

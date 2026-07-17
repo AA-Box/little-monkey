@@ -529,6 +529,73 @@ export interface RuntimeLogTail {
   truncated: boolean;
 }
 
+// -- Context and KV Cache Control Center (Phase 8) -------------------------
+
+export type ContextLimitSource = "runtime_configured" | "runtime_default" | "unavailable";
+
+export interface ConfiguredContext {
+  tokens: number | null;
+  source: ContextLimitSource;
+  settingKey: string | null;
+}
+
+export type ContextRuntimeKind = "ollama" | "llama_cpp" | "mlx";
+
+export interface ContextCacheView {
+  runtimeId: string;
+  runtimeKind: ContextRuntimeKind;
+  configured: ConfiguredContext;
+  reportedContextTokens: number | null;
+  contextTokensInUse: number | null;
+  contextHeadroomTokens: number | null;
+  contextShiftDetected: boolean | null;
+  totalSlots: number | null;
+  notes: string[];
+  sampledAtMs: number;
+}
+
+export interface EffectiveContextInput {
+  requestedTokens: number;
+  offloadPlanContextTokens: number;
+  modelMetadataMaxContextTokens: number | null;
+  runtimeSettingMinTokens: number | null;
+  runtimeSettingMaxTokens: number | null;
+}
+
+export interface EffectiveContextResolution {
+  effectiveTokens: number;
+  cappedBy: string[];
+  rationale: string[];
+}
+
+export type ContextFailureClass =
+  | "prompt_too_long"
+  | "cache_exhausted_context_shift"
+  | "memory_pressure"
+  | "runtime_limitation"
+  | "model_metadata_limit";
+
+export interface ContextFailureClassification {
+  class: ContextFailureClass;
+  explanation: string;
+  evidence: string[];
+}
+
+export interface ContextFailureInput {
+  errorText?: string | null;
+  httpStatus?: number | null;
+  configuredContextTokens?: number | null;
+  requestedContextTokens?: number | null;
+  modelMetadataMaxContextTokens?: number | null;
+  promptTokens?: number | null;
+  contextShiftSignal?: boolean | null;
+  availableRamBytes?: number | null;
+  requiredRamBytes?: number | null;
+  availableVramBytes?: number | null;
+  requiredVramBytes?: number | null;
+  runtimeSupportsContextControl?: boolean | null;
+}
+
 export type KeepAlive = { mode: "duration_ms"; milliseconds: number } | { mode: "forever" };
 
 export interface M3LoadModelRequest {
@@ -718,6 +785,12 @@ export const runtimeHubClient = {
     invoke<RuntimeLogTail>("m3_runtime_logs", args),
   runtimeMetrics: (args: OperationArgs & { runtimeId: string }) =>
     invoke<M3RuntimeMetricsView>("m3_runtime_metrics", args),
+  contextCacheState: (args: OperationArgs & { runtimeId: string }) =>
+    invoke<ContextCacheView>("m3_context_cache_state", args),
+  contextEffectiveSize: (input: EffectiveContextInput) =>
+    invoke<EffectiveContextResolution>("m3_context_effective_size", { input }),
+  classifyContextFailure: (input: ContextFailureInput) =>
+    invoke<ContextFailureClassification | null>("m3_classify_context_failure", { input }),
   runtimeSetConfig: (request: { runtimeId: string; values: Record<string, SettingValue> }) =>
     invoke<Record<string, SettingValue>>("m3_runtime_set_config", { request }),
   runtimeConfig: (runtimeId: string) =>

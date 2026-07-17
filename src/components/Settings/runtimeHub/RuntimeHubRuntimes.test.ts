@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type {
+  ContextCacheView,
   HardwareSnapshot,
   M3InstalledModel,
   M3RuntimeCapability,
@@ -8,7 +9,45 @@ import type {
   RuntimeStatus,
 } from "../../../lib/runtimeHubClient";
 import type { RuntimeDetail } from "../../../store/runtimeHubStore";
-import { buildOffloadPlanInput, keepAliveForRuntime } from "./RuntimeHubRuntimes";
+import { buildOffloadPlanInput, contextCacheHeadline, keepAliveForRuntime } from "./RuntimeHubRuntimes";
+
+function contextCacheView(overrides: Partial<ContextCacheView> = {}): ContextCacheView {
+  return {
+    runtimeId: "managed-llama",
+    runtimeKind: "llama_cpp",
+    configured: { tokens: 4_096, source: "runtime_default", settingKey: "context_size" },
+    reportedContextTokens: null,
+    contextTokensInUse: null,
+    contextHeadroomTokens: null,
+    contextShiftDetected: null,
+    totalSlots: null,
+    notes: [],
+    sampledAtMs: 1,
+    ...overrides,
+  };
+}
+
+describe("contextCacheHeadline", () => {
+  it("reports unavailable when neither a live nor configured figure is known", () => {
+    const view = contextCacheView({ configured: { tokens: null, source: "unavailable", settingKey: null } });
+    expect(contextCacheHeadline(view)).toBe("Context size unavailable for this runtime.");
+  });
+
+  it("prefers a live-confirmed figure over the merely configured one", () => {
+    const view = contextCacheView({ reportedContextTokens: 8_192, configured: { tokens: 4_096, source: "runtime_configured", settingKey: "context_size" } });
+    expect(contextCacheHeadline(view)).toBe("8,192 tokens (confirmed live by the runtime)");
+  });
+
+  it("labels a persisted setting as configured by this app", () => {
+    const view = contextCacheView({ configured: { tokens: 16_384, source: "runtime_configured", settingKey: "num_ctx" } });
+    expect(contextCacheHeadline(view)).toBe("16,384 tokens (configured by this app)");
+  });
+
+  it("labels an unset setting as the runtime's own default", () => {
+    const view = contextCacheView({ configured: { tokens: 4_096, source: "runtime_default", settingKey: "context_size" } });
+    expect(contextCacheHeadline(view)).toBe("4,096 tokens (the runtime's default)");
+  });
+});
 
 describe("runtime load keep-alive policy", () => {
   it("never sends keep_alive to managed llama.cpp", () => {
