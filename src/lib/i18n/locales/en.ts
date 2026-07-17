@@ -21,6 +21,7 @@ import { diagnosticsLocale } from "./diagnostics";
 import { redTeamLabLocale } from "./redTeamLab";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
 import { migrationAgentLocale } from "./migrationAgent";
@@ -59,6 +60,7 @@ export const en: Record<string, string> = {
   ...redTeamLabLocale,
   ...teamModeLocale,
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
   ...migrationAgentLocale,

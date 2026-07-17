@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
@@ -105,6 +106,7 @@ export const pt: Record<string, string> = {
   "TeamModePanel.removeButton": "Remover {{name}}",
   "TeamModePanel.removeConfirm": "Remover {{name}} desta equipe? Esta ação não pode ser desfeita.",
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "Explorador de Grafo de Conhecimento",
   "KnowledgeGraphExplorer.title": "Explorador de Grafo de Conhecimento",
@@ -122,6 +124,29 @@ export const pt: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "Evidências",
   "KnowledgeGraphExplorer.evidenceEmpty": "Faça uma pergunta de relação acima para ver aqui o caminho e suas evidências de origem.",
   "KnowledgeGraphExplorer.noEvidence": "Nenhum trecho de evidência foi registrado para este caminho.",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "Copiloto de Planilhas",
+  "SpreadsheetCopilot.title": "Copiloto de Planilhas",
+  "SpreadsheetCopilot.subtitle": "Carregue um CSV, descreva uma coluna calculada, uma etapa de limpeza ou um resumo, e revise as células exatas citadas antes de aprovar a gravação.",
+  "SpreadsheetCopilot.close": "Fechar Copiloto de Planilhas",
+  "SpreadsheetCopilot.loadButton": "Abrir CSV…",
+  "SpreadsheetCopilot.noFileHint": "Abra um arquivo CSV para começar.",
+  "SpreadsheetCopilot.requestLabel": "Descreva uma operação",
+  "SpreadsheetCopilot.requestPlaceholder": "ex.: Adicionar uma coluna que multiplica quantidade por preço",
+  "SpreadsheetCopilot.proposeButton": "Propor",
+  "SpreadsheetCopilot.noProposalHint": "Descreva uma operação e clique em Propor para ver aqui uma alteração comparável — nada é gravado no arquivo até que você aprove.",
+  "SpreadsheetCopilot.citedRangesHeading": "Células / intervalos citados",
+  "SpreadsheetCopilot.diffHeading": "Alterações de célula ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(nova célula)",
+  "SpreadsheetCopilot.diffBlank": "(em branco)",
+  "SpreadsheetCopilot.approveWarning": "Aprovar grava esta alteração no arquivo CSV no disco. Rejeite se as células ou valores citados parecerem incorretos.",
+  "SpreadsheetCopilot.rejectButton": "Rejeitar",
+  "SpreadsheetCopilot.approveButton": "Aprovar e gravar arquivo",
+  "SpreadsheetCopilot.emptyState": "Abra um arquivo CSV acima para carregá-lo na grade.",
+  "SpreadsheetCopilot.gridChangedCell": "Alterado pela proposta pendente",
+  "SpreadsheetCopilot.gridCitedCell": "Citado pela proposta pendente",
+  "SpreadsheetCopilot.gridEmptyHeader": "em branco",
+  "SpreadsheetCopilot.gridTruncated": "Mostrando as primeiras {{shown}} de {{total}} linhas.",
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,
