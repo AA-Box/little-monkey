@@ -4119,7 +4119,7 @@ fn relative_model_payload(asset_key: &str, version_key: &str) -> String {
     format!("{asset_key}/{version_key}/{MODEL_PAYLOAD_FILE}")
 }
 
-fn sha256_file(path: &Path, expected_size: u64) -> M3HubResult<String> {
+pub(crate) fn sha256_file(path: &Path, expected_size: u64) -> M3HubResult<String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| io_at("inspect checksum input", path, source))?;
     if !metadata.file_type().is_file() || metadata.len() != expected_size {

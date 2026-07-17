@@ -1,5 +1,5 @@
 import { useEffect, type KeyboardEvent } from "react";
-import { Activity, BookOpen, Boxes, Cpu, Network, RefreshCw, ServerCog, type LucideIcon } from "lucide-react";
+import { Activity, BookOpen, Boxes, Cpu, FlaskConical, Network, RefreshCw, ServerCog, type LucideIcon } from "lucide-react";
 import { useRuntimeHubStore, type RuntimeHubSection } from "../../store/runtimeHubStore";
 import { BusyButton, ErrorNotice } from "./runtimeHub/RuntimeHubShared";
 import { RuntimeHubOverview } from "./runtimeHub/RuntimeHubOverview";
@@ -8,12 +8,14 @@ import { RuntimeHubCatalogs } from "./runtimeHub/RuntimeHubCatalogs";
 import { RuntimeHubRuntimes } from "./runtimeHub/RuntimeHubRuntimes";
 import { RuntimeHubApi } from "./runtimeHub/RuntimeHubApi";
 import { RuntimeHubLan } from "./runtimeHub/RuntimeHubLan";
+import { RuntimeHubQuantization } from "./runtimeHub/RuntimeHubQuantization";
 
 const SECTIONS: Array<{ id: RuntimeHubSection; label: string; icon: LucideIcon }> = [
   { id: "overview", label: "Overview", icon: Activity },
   { id: "models", label: "Models", icon: Boxes },
   { id: "catalogs", label: "Catalogs", icon: BookOpen },
   { id: "runtimes", label: "Runtimes", icon: Cpu },
+  { id: "quantization", label: "Quantization", icon: FlaskConical },
   { id: "api", label: "API", icon: ServerCog },
   { id: "lan", label: "LAN", icon: Network },
 ];
@@ -62,7 +64,7 @@ export function RuntimeHubPanel() {
       <div
         role="tablist"
         aria-label="Runtime Hub sections"
-        className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-surface p-1 sm:grid-cols-3 xl:grid-cols-6"
+        className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-surface p-1 sm:grid-cols-3 xl:grid-cols-7"
       >
         {SECTIONS.map((entry, index) => {
           const Icon = entry.icon;
@@ -100,6 +102,7 @@ export function RuntimeHubPanel() {
           {section === "models" && <RuntimeHubModels />}
           {section === "catalogs" && <RuntimeHubCatalogs />}
           {section === "runtimes" && <RuntimeHubRuntimes />}
+          {section === "quantization" && <RuntimeHubQuantization />}
           {section === "api" && <RuntimeHubApi />}
           {section === "lan" && <RuntimeHubLan />}
         </>

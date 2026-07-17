@@ -987,15 +987,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** User can preview and validate a custom model package before it enters the model library.
 
-### 7. Model Conversion and Quantization Workbench
-
-**Status:** Planned
-
-- Convert compatible Hugging Face, safetensors, GGUF, LoRA, and adapter inputs into local model packages.
-- Offer quantization choices with benchmark, quality, size, and license checks.
-
-**Acceptance:** A conversion produces a reproducible report, output digest, license warning, and eval result.
-
 ### 8. Chat Template and Renderer Compatibility Lab
 
 **Status:** Planned

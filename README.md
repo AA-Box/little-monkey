@@ -44,6 +44,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
 - Store private keys and provider credentials in the OS keychain; persisted configuration contains references rather than plaintext key material.
+- Quantize an installed model or an arbitrary GGUF/safetensors path from the Quantization workbench: real GGUF/safetensors header sniffing, a heuristic license risk check, a static per-quant-level size/quality tradeoff reference, and a real `llama-quantize` backend when it's found on the machine (an honest copy-only passthrough otherwise) — every run produces a reproducible report with source/output digests and a real GGUF-parses eval check.
 
 ### Skills, plugins, MCP Apps, and workflows
 

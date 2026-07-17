@@ -3,6 +3,8 @@ import {
   createM3OperationId,
   runtimeHubClient,
   sha256Text,
+  type BackendDescriptor,
+  type ConversionReport,
   type HardwareProfile,
   type HardwareSnapshot,
   type LanServerPolicy,
@@ -25,6 +27,7 @@ import {
   type PairedToken,
   type PairingChallenge,
   type PairingRequest,
+  type QuantTypeDescriptor,
   type RuntimeInventory,
   type RuntimeLogTail,
   type ScopedToken,
@@ -32,7 +35,7 @@ import {
   type SettingValue,
 } from "../lib/runtimeHubClient";
 
-export type RuntimeHubSection = "overview" | "models" | "catalogs" | "runtimes" | "api" | "lan";
+export type RuntimeHubSection = "overview" | "models" | "catalogs" | "runtimes" | "api" | "lan" | "quantization";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -76,6 +79,9 @@ interface RuntimeHubStoreState {
   downloadProgress: Record<string, M3DownloadProgress>;
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
+  quantizationBackends: BackendDescriptor[];
+  quantizationQuantTypes: QuantTypeDescriptor[];
+  quantizationReports: ConversionReport[];
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -110,6 +116,14 @@ interface RuntimeHubStoreState {
   startHttpServer: () => Promise<void>;
   stopHttpServer: () => Promise<void>;
   storeTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) => Promise<string>;
+  refreshQuantization: () => Promise<void>;
+  convertPathQuantization: (sourcePath: string, quantChoice: string, allowRequantize: boolean) => Promise<void>;
+  convertInstalledModelQuantization: (
+    assetId: string,
+    versionKey: string | null,
+    quantChoice: string,
+    allowRequantize: boolean,
+  ) => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -263,6 +277,9 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    quantizationBackends: [],
+    quantizationQuantTypes: [],
+    quantizationReports: [],
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -738,6 +755,56 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       begin(key);
       try {
         return await runtimeHubClient.httpServerStoreTlsIdentity(reference, certificatePem, privateKeyPem);
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    refreshQuantization: async () => {
+      const key = "quantization-refresh";
+      begin(key);
+      try {
+        const [quantizationBackends, quantizationQuantTypes] = await Promise.all([
+          runtimeHubClient.quantizationBackends(),
+          runtimeHubClient.quantizationQuantTypes(),
+        ]);
+        set({ quantizationBackends, quantizationQuantTypes });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    convertPathQuantization: async (sourcePath, quantChoice, allowRequantize) => {
+      const key = "quantization-convert";
+      begin(key);
+      try {
+        const report = await runtimeHubClient.quantizationConvertPath({ sourcePath, quantChoice, allowRequantize });
+        set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    convertInstalledModelQuantization: async (assetId, versionKey, quantChoice, allowRequantize) => {
+      const key = "quantization-convert";
+      begin(key);
+      try {
+        const report = await runtimeHubClient.quantizationConvertInstalledModel({
+          assetId,
+          versionKey,
+          quantChoice,
+          allowRequantize,
+        });
+        set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
       } catch (error) {
         fail(key, error);
         throw error;
