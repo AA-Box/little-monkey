@@ -258,6 +258,8 @@ export interface ModelStore {
   pullOllamaModel: (tag: string) => Promise<void>;
   /** Import a local `.gguf` file or Safetensors model directory into Ollama under `name` (via `ollama create`), tracking progress/errors the same way as `pullOllamaModel`. */
   importOllamaModel: (name: string, path: string) => Promise<void>;
+  /** Create a model from a full, user-authored Modelfile via Modelfile Studio's hardened `ollama_create_from_modelfile` command — re-parses/re-validates `modelfileText` server-side regardless of any prior preview, then streams `ollama create` output the same way as `pullOllamaModel`/`importOllamaModel` (keyed by `shortName`). */
+  createModelfileModel: (shortName: string, modelfileText: string) => Promise<void>;
   /** Select an already-pulled Ollama tag as the active chat target. Instant, no backend call. */
   useOllamaModel: (tag: string) => void;
   /** Remove a locally-pulled Ollama tag, then refresh. */
@@ -464,6 +466,27 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [name]: message },
+      }));
+      throw err;
+    }
+  },
+
+  createModelfileModel: async (shortName, modelfileText) => {
+    set((state) => {
+      const { [shortName]: _discard, ...rest } = state.ollamaPullError;
+      return { ollamaPullError: rest };
+    });
+    try {
+      await invoke("ollama_create_from_modelfile", { shortName, modelfileText });
+      set((state) => {
+        const { [shortName]: _discard, ...rest } = state.ollamaPullProgress;
+        return { ollamaPullProgress: rest };
+      });
+      await get().refreshOllama();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        ollamaPullError: { ...state.ollamaPullError, [shortName]: message },
       }));
       throw err;
     }

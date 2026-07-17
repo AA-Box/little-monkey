@@ -97,6 +97,52 @@ describe("modelStore.start", () => {
   });
 });
 
+describe("modelStore.createModelfileModel", () => {
+  beforeEach(() => {
+    useModelStore.setState({ ollamaPullProgress: {}, ollamaPullError: {} });
+  });
+
+  it("invokes ollama_create_from_modelfile with {shortName, modelfileText} and refreshes on success", async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "ollama_create_from_modelfile") return Promise.resolve(undefined);
+      if (command === "ollama_status") {
+        return Promise.resolve({ reachable: true, version: "0.5.0", binary_found: true });
+      }
+      if (command === "ollama_list_models") return Promise.resolve([]);
+      if (command === "ollama_example_cloud_tags") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    await useModelStore
+      .getState()
+      .createModelfileModel("my-model", "FROM llama3.2:latest\nPARAMETER temperature 0.7\n");
+
+    expect(invokeMock).toHaveBeenCalledWith("ollama_create_from_modelfile", {
+      shortName: "my-model",
+      modelfileText: "FROM llama3.2:latest\nPARAMETER temperature 0.7\n",
+    });
+    expect(useModelStore.getState().ollamaReachable).toBe(true);
+    expect(useModelStore.getState().ollamaPullError).toEqual({});
+  });
+
+  it("records the failure keyed by shortName and rethrows, without clearing other tags' state", async () => {
+    useModelStore.setState({
+      ollamaPullProgress: { "other-tag": "pulling..." },
+      ollamaPullError: {},
+    });
+    invokeMock.mockRejectedValueOnce(new Error("line 1: FROM requires a value"));
+
+    await expect(
+      useModelStore.getState().createModelfileModel("my-model", "FROM \n"),
+    ).rejects.toThrow("line 1: FROM requires a value");
+
+    expect(useModelStore.getState().ollamaPullError).toEqual({
+      "my-model": "line 1: FROM requires a value",
+    });
+    expect(useModelStore.getState().ollamaPullProgress).toEqual({ "other-tag": "pulling..." });
+  });
+});
+
 const EFFORT_BY_TARGET_STORAGE_KEY = "little-monkey-effort-by-target";
 const LEGACY_EFFORT_STORAGE_KEY = "little-monkey-effort";
 
