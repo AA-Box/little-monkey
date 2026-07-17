@@ -6,17 +6,35 @@ import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
 import { issueToPrLocale } from "./issueToPr";
+import { triageLocale } from "./triage";
+import { inboxLocale } from "./inbox";
+import { approvalChainsLocale } from "./approvalChains";
+import { securityAutofixLocale } from "./securityAutofix";
+import { paletteLocale } from "./palette";
+import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { specScorerLocale } from "./specScorer";
-import { inboxLocale } from "./inbox";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { sandboxLocale } from "./sandbox";
+import { diagnosticsLocale } from "./diagnostics";
+import { redTeamLabLocale } from "./redTeamLab";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
 import { dataNotebookLocale } from "./dataNotebook";
+import { syntheticMonitoringLocale } from "./syntheticMonitoring";
+import { crossRepoIntelligenceLocale } from "./crossRepoIntelligence";
+import { workCanvasLocale } from "./workCanvas";
+import { pmCopilotLocale } from "./pmCopilot";
+import { deepResearchLocale } from "./deepResearch";
+import { briefStudioLocale } from "./briefStudio";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
+import { visualEditModeLocale } from "./visualEditMode";
 
 export const en: Record<string, string> = {
+  ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
   ...searchLocale,
@@ -25,15 +43,31 @@ export const en: Record<string, string> = {
   ...ecosystemLocale,
   ...developerLocale,
   ...issueToPrLocale,
+  ...triageLocale,
+  ...inboxLocale,
+  ...approvalChainsLocale,
+  ...securityAutofixLocale,
+  ...paletteLocale,
+  ...trustScorecardsLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
   ...specScorerLocale,
-  ...inboxLocale,
+  ...privacyFirewallLocale,
+  ...sandboxLocale,
+  ...diagnosticsLocale,
+  ...redTeamLabLocale,
   ...teamModeLocale,
   ...knowledgeGraphExplorerLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
   ...dataNotebookLocale,
+  ...crossRepoIntelligenceLocale,
+  ...workCanvasLocale,
+  ...pmCopilotLocale,
+  ...deepResearchLocale,
+  ...briefStudioLocale,
+  ...crossRepoChangePlannerLocale,
+  ...visualEditModeLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
@@ -1247,5 +1281,51 @@ export const en: Record<string, string> = {
   "UsagePanel.clearButton": "Clear usage history",
   "UsagePanel.clearConfirmMessage": "Clear all recorded usage history? This can't be undone.",
   "UsagePanel.clearConfirmButton": "Clear",
-  "UsagePanel.clearCancelButton": "Cancel"
+  "UsagePanel.clearCancelButton": "Cancel",
+
+  "SettingsModal.tabDesktopControl": "Desktop Control",
+
+  "DesktopControlPanel.title": "Safe Desktop Control (research spike)",
+  "DesktopControlPanel.disabledDescription": "Lets Little Monkey move the mouse and send keystrokes on macOS, only inside an explicit, allowlisted, per-action-approved session — never from the model's own initiative, never from an unattended run. Off by default. Read docs/safe-desktop-control-design.md before enabling.",
+  "DesktopControlPanel.enabledDescription": "A control session is a bounded window in which every mouse/keyboard action must be approved before it runs, unless the session was started in approved-batch mode. Emergency stop always works immediately.",
+  "DesktopControlPanel.enableLabel": "Enable Safe Desktop Control",
+  "DesktopControlPanel.enableDescription": "Research spike — off by default. Never reachable while permission mode is bypass, regardless of this setting.",
+  "DesktopControlPanel.emergencyStopButton": "Emergency stop",
+  "DesktopControlPanel.emergencyStopStatus": "Emergency stop: deactivated {{sessions}} session(s), cancelled {{actions}} pending action(s).",
+  "DesktopControlPanel.startSessionHeading": "Start a session",
+  "DesktopControlPanel.startSessionDescription": "Name every application or window this session may act within. Actions targeting anything else are rejected before they reach the input backend.",
+  "DesktopControlPanel.allowlistLabel": "Allowed applications/windows (comma-separated)",
+  "DesktopControlPanel.allowlistPlaceholder": "e.g. Notes, TextEdit",
+  "DesktopControlPanel.lifetimeLabel": "Session length (minutes, max 30)",
+  "DesktopControlPanel.approvedBatchLabel": "Approved batch mode (skip per-action approval for this session)",
+  "DesktopControlPanel.startSessionButton": "Start session",
+  "DesktopControlPanel.sessionStarted": "Session started. The companion overlay is now visible as the on-screen indicator.",
+  "DesktopControlPanel.sessionStopped": "Session stopped.",
+  "DesktopControlPanel.sessionsHeading": "Sessions",
+  "DesktopControlPanel.noSessions": "No sessions yet.",
+  "DesktopControlPanel.statusActive": "Active",
+  "DesktopControlPanel.statusInactive": "Stopped",
+  "DesktopControlPanel.approvedBatchBadge": "approved batch",
+  "DesktopControlPanel.stopSessionButton": "Stop",
+  "DesktopControlPanel.pendingActionsHeading": "Pending actions",
+  "DesktopControlPanel.pendingActionsDescription": "Every action from a non-batch session waits here until you approve or deny it.",
+  "DesktopControlPanel.noPendingActions": "Nothing is waiting for approval.",
+  "DesktopControlPanel.approveButton": "Approve",
+  "DesktopControlPanel.denyButton": "Deny",
+  "DesktopControlPanel.actionDescriptionMouseMove": "Move mouse to ({{x}}, {{y}})",
+  "DesktopControlPanel.actionDescriptionMouseClick": "Click the {{button}} mouse button",
+  "DesktopControlPanel.actionDescriptionKeyPress": "Press key \"{{key}}\"",
+  "DesktopControlPanel.testActionHeading": "Send a test action",
+  "DesktopControlPanel.testActionDescription": "Exercises the approval gate end to end against an active session — nothing here bypasses it.",
+  "DesktopControlPanel.noActiveSessions": "Start a session above to send a test action.",
+  "DesktopControlPanel.actionKindMouseMove": "Move mouse",
+  "DesktopControlPanel.actionKindMouseClick": "Click mouse button",
+  "DesktopControlPanel.actionKindKeyPress": "Press key",
+  "DesktopControlPanel.mouseButtonLeft": "Left",
+  "DesktopControlPanel.mouseButtonRight": "Right",
+  "DesktopControlPanel.mouseButtonMiddle": "Middle",
+  "DesktopControlPanel.keyPlaceholder": "e.g. a, enter, tab",
+  "DesktopControlPanel.sendActionButton": "Send action",
+  "DesktopControlPanel.actionExecuted": "Action executed.",
+  "DesktopControlPanel.actionNotExecuted": "Action did not execute."
 };

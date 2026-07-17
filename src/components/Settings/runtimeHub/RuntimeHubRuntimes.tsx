@@ -3,15 +3,20 @@ import { Activity, FileText, Play, RefreshCw, Save, Square, Wrench } from "lucid
 import { Button, StatusPill } from "../../ui";
 import type {
   AdvancedSettingCapability,
+  HardwareSnapshot,
   KeepAlive,
+  M3InstalledModel,
   M3RuntimeCapability,
   M3RuntimeKind,
+  OffloadPlan,
+  OffloadPlanInput,
   RunningModel,
   SettingValue,
 } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
 import {
   BusyButton,
+  CompatibilityWarningBanner,
   CONTROL_CLASS,
   ErrorNotice,
   Field,
@@ -67,6 +72,99 @@ export function keepAliveForRuntime(
     ? Math.min(1_440, Math.max(1, Math.round(minutes)))
     : 10;
   return { mode: "duration_ms", milliseconds: boundedMinutes * 60_000 };
+}
+
+/** Builds the pure input for `m3_offload_plan` from already-loaded Runtime
+ * Hub state: the live hardware snapshot, the model about to be loaded, and
+ * every other model currently resident on any runtime (so the plan reflects
+ * memory genuinely available right now, not just this runtime's own view). */
+export function buildOffloadPlanInput(
+  hardware: HardwareSnapshot,
+  model: M3InstalledModel,
+  runtimes: M3RuntimeCapability[],
+  runtimeDetails: Record<string, RuntimeDetail>,
+  requestedContextTokens?: number,
+): OffloadPlanInput {
+  const activeVersion = model.versions.find((version) => version.active);
+  const weightsBytes = activeVersion?.sizeBytes ?? model.estimatedRamBytes;
+  const others = runtimes
+    .flatMap((runtime) => runningModels(runtimeDetails[runtime.descriptor.runtimeId]))
+    .filter((resident) => resident.model_id !== model.modelId);
+  const reservedRamBytes = others.reduce((sum, resident) => sum + resident.memory_bytes, 0);
+  const reservedVramBytes = others.reduce((sum, resident) => sum + resident.vram_bytes, 0);
+  return {
+    hardware,
+    model: {
+      weights_bytes: weightsBytes,
+      estimated_ram_bytes: model.estimatedRamBytes,
+      estimated_vram_bytes: model.estimatedVramBytes,
+      required_accelerator: (model.requiredAccelerator as OffloadPlanInput["model"]["required_accelerator"]) ?? null,
+      has_vision_projector: model.capabilities.vision,
+    },
+    reserved: { ram_bytes: reservedRamBytes, vram_bytes: reservedVramBytes },
+    other_resident_count: others.length,
+    requested_context_tokens: requestedContextTokens ?? null,
+  };
+}
+
+const PROJECTOR_PLACEMENT_LABEL: Record<OffloadPlan["projector_placement"], string> = {
+  gpu: "GPU",
+  cpu: "CPU",
+  not_applicable: "N/A",
+};
+
+function OffloadPlanPanel({
+  plan,
+  busy,
+  error,
+}: {
+  plan: OffloadPlan | undefined;
+  busy: boolean | undefined;
+  error: string | undefined;
+}) {
+  if (!plan && !busy && !error) return null;
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3" aria-live="polite">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-foreground">Offload plan</p>
+        {busy && <StatusPill tone="neutral">Computing…</StatusPill>}
+      </div>
+      <ErrorNotice message={error} />
+      {plan && (
+        <>
+          <div className="mt-2 grid gap-2 text-xs text-muted sm:grid-cols-3">
+            <span>Accelerator: {labelize(plan.accelerator)}</span>
+            <span>
+              Context: {plan.context_tokens.toLocaleString()} tokens
+              {plan.context_tokens < plan.requested_context_tokens
+                ? ` (requested ${plan.requested_context_tokens.toLocaleString()})`
+                : ""}
+            </span>
+            <span>Batch size: {plan.batch_size}</span>
+            <span>GPU layers: {plan.gpu_layers} / {plan.estimated_total_layers}</span>
+            <span>CPU spill: {plan.cpu_spill_layers} layer{plan.cpu_spill_layers === 1 ? "" : "s"}</span>
+            <span>Parallel sequences: {plan.parallel_sequences}</span>
+            {plan.projector_placement !== "not_applicable" && (
+              <span>Projector: {PROJECTOR_PLACEMENT_LABEL[plan.projector_placement]}</span>
+            )}
+          </div>
+          {plan.rationale.length > 0 && (
+            <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
+              {plan.rationale.map((entry) => <li key={entry.field}>{entry.explanation}</li>)}
+            </ul>
+          )}
+          {plan.improvement_suggestions.length > 0 && (
+            <div className="mt-3 rounded-md border border-warning/30 bg-warning-soft p-2">
+              <p className="text-xs font-medium text-warning">How to improve this plan</p>
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-xs leading-5 text-warning">
+                {plan.improvement_suggestions.map((suggestion) => <li key={suggestion}>{suggestion}</li>)}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 function SettingControl({
@@ -163,6 +261,14 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const loadModel = useRuntimeHubStore((state) => state.loadModel);
   const unloadModel = useRuntimeHubStore((state) => state.unloadModel);
   const saveConfig = useRuntimeHubStore((state) => state.setRuntimeConfig);
+  const hardware = useRuntimeHubStore((state) => state.hardware);
+  const allRuntimes = useRuntimeHubStore((state) => state.runtimes);
+  const runtimeDetails = useRuntimeHubStore((state) => state.runtimeDetails);
+  const offloadPlan = useRuntimeHubStore((state) => state.offloadPlans[runtimeId]);
+  const previewOffloadPlan = useRuntimeHubStore((state) => state.previewOffloadPlan);
+  const offloadBusy = busy[`offload-plan:${runtimeId}`];
+  const offloadError = errors[`offload-plan:${runtimeId}`];
+  const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
 
   const compatibleModels = installedModels.filter((model) => model.runtime === runtime.descriptor.kind);
   const [assetId, setAssetId] = useState(compatibleModels[0]?.assetId ?? "");
@@ -184,6 +290,13 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   useEffect(() => {
     if (detail?.config) setSettings((current) => ({ ...current, ...detail.config }));
   }, [detail?.config]);
+
+  const selectedModel = compatibleModels.find((model) => model.assetId === assetId);
+  useEffect(() => {
+    if (!hardware || !selectedModel) return;
+    const input = buildOffloadPlanInput(hardware, selectedModel, allRuntimes, runtimeDetails);
+    void previewOffloadPlan(runtimeId, input).catch(() => {});
+  }, [hardware, selectedModel, allRuntimes, runtimeDetails, runtimeId, previewOffloadPlan]);
 
   const state = statusState(detail);
   const resident = runningModels(detail);
@@ -248,6 +361,9 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
       {runtime.canLoad && (
         <section className="mt-5 border-t border-border pt-4" aria-label={`Load a model in ${runtime.descriptor.label}`}>
           <SectionHeading title="Load model" description="Only verified models compatible with this runtime are listed." />
+          <div className="mt-3">
+            <CompatibilityWarningBanner report={compatibilityReport} />
+          </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Field label="Installed model">
               <select value={assetId} onChange={(event) => setAssetId(event.target.value)} className={CONTROL_CLASS} disabled={!compatibleModels.length}>
@@ -268,6 +384,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             )}
             <Toggle checked={replaceExisting} onChange={setReplaceExisting} label="Replace currently loaded model" description="Unload app-managed residents before loading this model." />
           </div>
+          <OffloadPlanPanel plan={offloadPlan} busy={offloadBusy} error={offloadError} />
           <ErrorNotice message={errors[`load:${runtimeId}`]} />
           <div className="mt-3 flex justify-end">
             <BusyButton type="button" variant="primary" busy={busy[`load:${runtimeId}`]} disabled={!assetId} onClick={handleLoad}>
