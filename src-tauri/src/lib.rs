@@ -74,6 +74,14 @@ pub mod m3_runtime_hub;
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
 pub mod m7_companion;
+// Safe Desktop Control — a design-validation research spike (ROADMAP.md
+// Phase 5, "Safe Desktop Control", Status: Research). Off by default,
+// never reachable from bypass mode, every action gated behind an explicit
+// per-action approval unless the session was started in "approved batch"
+// mode, and wired into the same app-exit emergency-stop path as
+// `m7_companion`. See `docs/safe-desktop-control-design.md` for the full
+// threat model and explicit non-goals.
+pub mod desktop_control;
 // Apple-Silicon-only MLX lifecycle adapter. The module reports explicit
 // unsupported capability on every other platform rather than implying a
 // portable backend.
@@ -429,11 +437,35 @@ pub fn run() {
     let configured_companion_shortcut = m7_state
         .overlay_shortcut()
         .expect("failed to load the configured companion shortcut");
+    let desktop_control_state = desktop_control::DesktopControlState::production();
+    // Fixed (not user-configurable, unlike the companion overlay shortcut
+    // above) global emergency-stop hotkey — see ROADMAP.md's Safe Desktop
+    // Control acceptance criteria ("Emergency stop hotkey") and the design
+    // doc's kill-switch requirement. Registered on the same shortcut manager
+    // as the companion overlay shortcut (one `tauri_plugin_global_shortcut`
+    // plugin instance per app), disambiguated in the shared handler below by
+    // comparing the fired `Shortcut` against this parsed constant.
+    const DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT: &str = "CommandOrControl+Shift+Escape";
+    let desktop_control_emergency_stop_shortcut: tauri_plugin_global_shortcut::Shortcut =
+        DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT
+            .parse()
+            .expect("the desktop control emergency-stop hotkey must be valid");
     let companion_shortcut = tauri_plugin_global_shortcut::Builder::new()
         .with_shortcut(configured_companion_shortcut.as_str())
         .expect("the configured companion shortcut must be valid")
-        .with_handler(|app, _shortcut, event| {
-            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+        .with_shortcut(DESKTOP_CONTROL_EMERGENCY_STOP_SHORTCUT)
+        .expect("the desktop control emergency-stop hotkey must be valid")
+        .with_handler(move |app, shortcut, event| {
+            if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                return;
+            }
+            if *shortcut == desktop_control_emergency_stop_shortcut {
+                let state = app.state::<desktop_control::DesktopControlState>();
+                let _ = state.emergency_stop();
+                if let Some(overlay) = app.get_webview_window("companion-overlay") {
+                    let _ = overlay.hide();
+                }
+            } else {
                 let _ = m7_companion::show_overlay(app);
             }
         })
@@ -452,6 +484,7 @@ pub fn run() {
         .manage(native_skills_state)
         .manage(browser_state)
         .manage(m7_state)
+        .manage(desktop_control_state)
         // Tier-2 interactive-artifact protocol — serves a previously
         // `artifact_publish`-ed document by id with a strict per-document
         // CSP (`connect-src 'none'`, no capability granted to this scheme —
@@ -965,6 +998,12 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            desktop_control::desktop_control_start_session,
+            desktop_control::desktop_control_stop_session,
+            desktop_control::desktop_control_sessions,
+            desktop_control::desktop_control_request_action,
+            desktop_control::desktop_control_respond_action,
+            desktop_control::desktop_control_emergency_stop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1001,6 +1040,9 @@ pub fn run() {
 
             let companion = app_handle.state::<m7_companion::M7CompanionState>();
             let _ = companion.emergency_stop();
+
+            let desktop_control = app_handle.state::<desktop_control::DesktopControlState>();
+            let _ = desktop_control.emergency_stop();
 
             let state = app_handle.state::<AppState>();
             state.terminal.kill_all(Some(app_handle));
