@@ -3516,7 +3516,10 @@ impl CanonicalCollector {
     }
 }
 
-fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
+/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs` to
+/// validate the MLX driver's tool-call round-trip alongside the OpenAI-
+/// compatible Ollama/llama.cpp path.
+pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
     let role = match message.role {
         CanonicalRole::System => "system",
         CanonicalRole::User => "user",

@@ -47,6 +47,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
 - Store private keys and provider credentials in the OS keychain; persisted configuration contains references rather than plaintext key material.
+- Run a Chat Template and Renderer Compatibility Lab that exercises real tool-call, system-prompt, stop-token, and structured-output fixtures against Little Monkey's own OpenAI-compatible request/response renderer and the MLX driver's message flattening, grouped by a coarse chat-template family (ChatML, Llama 3, Mistral, Gemma, or generic). A model's chat/tool/vision capability badges are only shown once the matching fixture(s) actually pass for its declared template — image blocks and reasoning ("thinking") content are not yet representable in the renderer, so vision is never advertised as ready and thinking-mode fixtures are informational only.
 
 ### Skills, plugins, MCP Apps, and workflows
 
