@@ -111,6 +111,7 @@ struct DownloadState {
     bytes: Vec<u8>,
     etag: String,
     fail_once_at: Option<u64>,
+    corrupt_at: Option<u64>,
     offsets: Vec<u64>,
 }
 
@@ -125,6 +126,7 @@ impl MutableDownload {
                 bytes,
                 etag: etag.to_string(),
                 fail_once_at: None,
+                corrupt_at: None,
                 offsets: Vec::new(),
             }),
         }
@@ -139,6 +141,13 @@ impl MutableDownload {
 
     fn fail_once_at(&self, offset: u64) {
         self.state.lock().expect("download state").fail_once_at = Some(offset);
+    }
+
+    /// Returns a structurally valid chunk (correct offset/length/etag) at
+    /// `offset` but with a flipped bit, simulating silent transport-level
+    /// corruption that framing checks alone cannot catch.
+    fn corrupt_chunk_at(&self, offset: u64) {
+        self.state.lock().expect("download state").corrupt_at = Some(offset);
     }
 
     fn offsets(&self) -> Vec<u64> {
@@ -185,11 +194,18 @@ impl M3DownloadTransport for MutableDownload {
                 return Err(M3HubError::Transport("range starts past EOF".to_string()));
             }
             let end = start.saturating_add(max_bytes).min(state.bytes.len());
+            let mut bytes = state.bytes[start..end].to_vec();
+            if state.corrupt_at == Some(offset) {
+                state.corrupt_at = None;
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0xFF;
+                }
+            }
             Ok(M3DownloadChunk {
                 offset,
                 total_bytes: state.bytes.len() as u64,
                 etag: Some(state.etag.clone()),
-                bytes: state.bytes[start..end].to_vec(),
+                bytes,
             })
         })
     }
@@ -239,6 +255,9 @@ fn catalog_model(bytes: &[u8], revision: &str) -> M3CatalogModel {
             raw_declaration: "Apache License 2.0 test declaration".to_string(),
         },
         metadata: BTreeMap::from([("publisher".to_string(), "test".to_string())]),
+        template: None,
+        projector: None,
+        catalog_retrieved_at_ms: None,
     }
 }
 
@@ -261,12 +280,37 @@ fn make_hub(
     runtime_reconciler: Option<Arc<dyn M3RuntimeReconciler>>,
     lan_factory: Option<Arc<dyn M3LanAccessFactory>>,
 ) -> M3RuntimeHub {
+    make_hub_with_hardware(
+        root,
+        download,
+        catalogs,
+        runtimes,
+        runtime_reconciler,
+        lan_factory,
+        hardware(),
+    )
+}
+
+/// Same as [`make_hub`] but with an explicit hardware snapshot — used to
+/// exercise the Sampler/Batching/Speculative Decoding Controls gating
+/// (ROADMAP Phase 8 item 17), which depends on whether the Hardware
+/// Compatibility report shows a real GPU backend.
+#[allow(clippy::too_many_arguments)]
+fn make_hub_with_hardware(
+    root: &Path,
+    download: Arc<dyn M3DownloadTransport>,
+    catalogs: Vec<Arc<dyn M3CatalogSource>>,
+    runtimes: Vec<Arc<dyn M3RuntimeDriver>>,
+    runtime_reconciler: Option<Arc<dyn M3RuntimeReconciler>>,
+    lan_factory: Option<Arc<dyn M3LanAccessFactory>>,
+    snapshot: HardwareSnapshot,
+) -> M3RuntimeHub {
     M3RuntimeHub::new(
         root,
         test_config(),
         M3RuntimeHubDependencies {
             clock: Arc::new(FixedClock::new(10_000)),
-            hardware: Arc::new(FixedHardware(hardware())),
+            hardware: Arc::new(FixedHardware(snapshot)),
             download,
             catalogs,
             runtimes,
@@ -275,6 +319,30 @@ fn make_hub(
         },
     )
     .expect("M3 hub")
+}
+
+/// A hardware snapshot reporting an available CUDA GPU — the counterpart to
+/// [`hardware`]'s CPU-only default, used to prove the flash-attention/
+/// mixed-precision gates actually flip to "supported" on real GPU hardware
+/// rather than always reporting unsupported.
+fn hardware_with_cuda() -> HardwareSnapshot {
+    HardwareSnapshot {
+        captured_at_ms: 1_000,
+        total_ram_bytes: 16 * 1024 * 1024 * 1024,
+        available_ram_bytes: 12 * 1024 * 1024 * 1024,
+        logical_cpu_count: 8,
+        platform: PlatformCapabilities::from_host(
+            "linux",
+            "x86_64",
+            vec![little_monkey_lib::runtime_adapter::AcceleratorCapability {
+                kind: little_monkey_lib::runtime_adapter::AcceleratorKind::Cuda,
+                available: true,
+                device_names: vec!["Test GPU".to_string()],
+                total_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+                available_memory_bytes: Some(20 * 1024 * 1024 * 1024),
+            }],
+        ),
+    }
 }
 
 #[tokio::test]
@@ -562,18 +630,70 @@ impl MockRuntimeDriver {
     }
 
     fn setting_capabilities() -> Vec<AdvancedSettingCapability> {
-        vec![AdvancedSettingCapability {
-            key: "threads".to_string(),
-            label: "Threads".to_string(),
-            description: "Worker thread count".to_string(),
-            schema: SettingValueSchema::Integer {
-                min: 1,
-                max: 64,
-                step: 1,
+        vec![
+            AdvancedSettingCapability {
+                key: "threads".to_string(),
+                label: "Threads".to_string(),
+                description: "Worker thread count".to_string(),
+                schema: SettingValueSchema::Integer {
+                    min: 1,
+                    max: 64,
+                    step: 1,
+                },
+                default_value: SettingValue::Integer { value: 4 },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
             },
-            default_value: SettingValue::Integer { value: 4 },
-            restart_required: true,
-        }]
+            // Mirrors `runtime_adapter.rs`'s real llama.cpp capability
+            // declarations closely enough to exercise the Runtime Hub's
+            // gating layer (ROADMAP Phase 8 item 17) against this mock
+            // driver: `M3RuntimeHub::set_runtime_config`/`load_model` gate
+            // these by key regardless of which concrete driver declared
+            // them.
+            AdvancedSettingCapability {
+                key: "flash_attention".to_string(),
+                label: "Flash attention".to_string(),
+                description: "Flash attention behavior".to_string(),
+                schema: SettingValueSchema::Choice {
+                    options: vec!["auto".to_string(), "on".to_string(), "off".to_string()],
+                },
+                default_value: SettingValue::Choice {
+                    value: "auto".to_string(),
+                },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "mixed_precision".to_string(),
+                label: "Mixed precision (KV cache)".to_string(),
+                description: "KV cache quantization".to_string(),
+                schema: SettingValueSchema::Choice {
+                    options: vec!["f16".to_string(), "q8_0".to_string(), "q4_0".to_string()],
+                },
+                default_value: SettingValue::Choice {
+                    value: "f16".to_string(),
+                },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "speculative_decoding_draft_model".to_string(),
+                label: "Speculative decoding draft model".to_string(),
+                description: "Draft model id for speculative decoding".to_string(),
+                schema: SettingValueSchema::Text { max_bytes: 256 },
+                default_value: SettingValue::Text {
+                    value: String::new(),
+                },
+                restart_required: true,
+                supported: false,
+                unsupported_reason: Some(
+                    "Select a model to check for a compatible installed draft model.".to_string(),
+                ),
+            },
+        ]
     }
 
     fn running_models(&self) -> M3HubResult<Vec<RunningModel>> {
@@ -985,6 +1105,392 @@ async fn reconciled_runtime_load_config_metrics_logs_unload_and_safe_delete_are_
         .expect("delete after unload"));
 }
 
+/// `catalog_model` with the model id, display name, and estimated RAM
+/// footprint overridden — used to build same/different-family and
+/// larger/smaller model pairs for the speculative-decoding draft-model gate
+/// tests below, without duplicating every other field `catalog_model`
+/// already sets up correctly.
+fn family_model(
+    bytes: &[u8],
+    revision: &str,
+    model_id: &str,
+    display_name: &str,
+    estimated_ram_bytes: u64,
+) -> M3CatalogModel {
+    let mut model = catalog_model(bytes, revision);
+    model.model_id = model_id.to_string();
+    model.display_name = display_name.to_string();
+    model.estimated_ram_bytes = estimated_ram_bytes;
+    model
+}
+
+// -- Sampler, Batching, and Speculative Decoding Controls (ROADMAP Phase 8
+// item 17) ---------------------------------------------------------------
+
+#[tokio::test]
+async fn set_runtime_config_gates_flash_attention_and_mixed_precision_on_hardware() {
+    let directory = TestDirectory::new("hardware-gate");
+    let bytes = payload(40_000, 11);
+    let download = Arc::new(MutableDownload::new(bytes, "etag-hardware-gate"));
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    let cpu_only_hub = make_hub(
+        &directory.0,
+        download,
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        None,
+        None,
+    );
+
+    // A safe default ("auto"/"f16") never needs a GPU and must always save.
+    cpu_only_hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([(
+                "flash_attention".to_string(),
+                SettingValue::Choice {
+                    value: "auto".to_string(),
+                },
+            )]),
+        })
+        .expect("auto flash attention never needs gating");
+    cpu_only_hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([(
+                "mixed_precision".to_string(),
+                SettingValue::Choice {
+                    value: "f16".to_string(),
+                },
+            )]),
+        })
+        .expect("f16 mixed precision never needs gating");
+
+    // "on"/non-f16 require a real GPU backend; this hub's hardware report is
+    // CPU-only, so both must be rejected with a clear reason, not silently
+    // accepted.
+    let flash_on_rejected = cpu_only_hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([(
+                "flash_attention".to_string(),
+                SettingValue::Choice {
+                    value: "on".to_string(),
+                },
+            )]),
+        })
+        .expect_err("flash attention cannot be forced on without a GPU backend");
+    assert!(matches!(flash_on_rejected, M3HubError::Unsupported(reason) if reason.contains("GPU backend")));
+    let mixed_precision_rejected = cpu_only_hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([(
+                "mixed_precision".to_string(),
+                SettingValue::Choice {
+                    value: "q8_0".to_string(),
+                },
+            )]),
+        })
+        .expect_err("quantized KV cache cannot be enabled without a GPU backend");
+    assert!(matches!(mixed_precision_rejected, M3HubError::Unsupported(reason) if reason.contains("GPU backend")));
+
+    // The same requests succeed once the Hardware Compatibility report shows
+    // a real GPU backend — proving this is a genuine hardware check, not a
+    // permanently-closed gate.
+    let gpu_directory = TestDirectory::new("hardware-gate-gpu");
+    let gpu_bytes = payload(40_000, 13);
+    let gpu_download = Arc::new(MutableDownload::new(gpu_bytes, "etag-hardware-gate-gpu"));
+    let gpu_runtime_state = Arc::new(MockRuntimeState::default());
+    let gpu_hub = make_hub_with_hardware(
+        &gpu_directory.0,
+        gpu_download,
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(gpu_runtime_state))],
+        None,
+        None,
+        hardware_with_cuda(),
+    );
+    gpu_hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([(
+                "flash_attention".to_string(),
+                SettingValue::Choice {
+                    value: "on".to_string(),
+                },
+            )]),
+        })
+        .expect("flash attention can be forced on with a CUDA backend available");
+    gpu_hub
+        .set_runtime_config(&M3SetRuntimeConfigRequest {
+            runtime_id: "managed-llama".to_string(),
+            values: BTreeMap::from([(
+                "mixed_precision".to_string(),
+                SettingValue::Choice {
+                    value: "q8_0".to_string(),
+                },
+            )]),
+        })
+        .expect("quantized KV cache can be enabled with a CUDA backend available");
+}
+
+#[tokio::test]
+async fn load_model_enforces_the_speculative_decoding_draft_model_gate() {
+    let directory = TestDirectory::new("draft-model-gate");
+    let download = Arc::new(MutableDownload::new(Vec::new(), "etag-draft"));
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        Some(Arc::new(MockReconciler {
+            state: runtime_state.clone(),
+        })),
+        None,
+    );
+    let context = M3OperationContext::default();
+
+    let target_bytes = payload(60_000, 21);
+    let target = family_model(
+        &target_bytes,
+        "rev-target",
+        "llama-3-8b-instruct",
+        "Llama 3 8B Instruct",
+        8_000_000_000,
+    );
+    download.set_payload(target_bytes, "etag-target");
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: target.license.declaration_sha256(),
+            model: target.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("download target model");
+
+    let mismatched_family_bytes = payload(30_000, 23);
+    let mismatched_family = family_model(
+        &mismatched_family_bytes,
+        "rev-mismatch",
+        "mistral-7b-instruct",
+        "Mistral 7B Instruct",
+        4_000_000_000,
+    );
+    download.set_payload(mismatched_family_bytes, "etag-mismatch");
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: mismatched_family.license.declaration_sha256(),
+            model: mismatched_family.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("download mismatched-family model");
+
+    // Neither the target itself nor a differently-family model is a valid
+    // draft: both must be rejected before the process ever launches.
+    hub.set_runtime_config(&M3SetRuntimeConfigRequest {
+        runtime_id: "managed-llama".to_string(),
+        values: BTreeMap::from([(
+            "speculative_decoding_draft_model".to_string(),
+            SettingValue::Text {
+                value: target.model_id.clone(),
+            },
+        )]),
+    })
+    .expect("persisting a not-yet-validated draft choice is allowed");
+    let self_as_draft = hub
+        .load_model(
+            &M3LoadModelRequest {
+                runtime_id: "managed-llama".to_string(),
+                asset_id: target.asset_id(),
+                keep_alive: None,
+                replace_existing: false,
+            },
+            &context,
+        )
+        .await
+        .expect_err("a model cannot be its own speculative-decoding draft");
+    assert!(matches!(self_as_draft, M3HubError::Unsupported(_)));
+
+    hub.set_runtime_config(&M3SetRuntimeConfigRequest {
+        runtime_id: "managed-llama".to_string(),
+        values: BTreeMap::from([(
+            "speculative_decoding_draft_model".to_string(),
+            SettingValue::Text {
+                value: mismatched_family.model_id.clone(),
+            },
+        )]),
+    })
+    .expect("persisting a not-yet-validated draft choice is allowed");
+    let wrong_family = hub
+        .load_model(
+            &M3LoadModelRequest {
+                runtime_id: "managed-llama".to_string(),
+                asset_id: target.asset_id(),
+                keep_alive: None,
+                replace_existing: false,
+            },
+            &context,
+        )
+        .await
+        .expect_err("a different-family model is not a compatible draft");
+    assert!(matches!(wrong_family, M3HubError::Unsupported(_)));
+
+    // A smaller, same-family model is a genuinely compatible draft.
+    let draft_bytes = payload(15_000, 27);
+    let draft = family_model(
+        &draft_bytes,
+        "rev-draft",
+        "llama-3-1b-instruct",
+        "Llama 3 1B Instruct",
+        1_000_000_000,
+    );
+    download.set_payload(draft_bytes, "etag-draft-model");
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: draft.license.declaration_sha256(),
+            model: draft.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("download compatible draft model");
+    hub.set_runtime_config(&M3SetRuntimeConfigRequest {
+        runtime_id: "managed-llama".to_string(),
+        values: BTreeMap::from([(
+            "speculative_decoding_draft_model".to_string(),
+            SettingValue::Text {
+                value: draft.model_id.clone(),
+            },
+        )]),
+    })
+    .expect("persist a genuinely compatible draft choice");
+    hub.load_model(
+        &M3LoadModelRequest {
+            runtime_id: "managed-llama".to_string(),
+            asset_id: target.asset_id(),
+            keep_alive: None,
+            replace_existing: false,
+        },
+        &context,
+    )
+    .await
+    .expect("load succeeds once the draft model is a smaller, same-family installed model");
+}
+
+#[tokio::test]
+async fn resolve_setting_capabilities_reports_gpu_gates_and_draft_model_candidates() {
+    let directory = TestDirectory::new("resolve-capabilities");
+    let download = Arc::new(MutableDownload::new(Vec::new(), "etag-resolve"));
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        Some(Arc::new(MockReconciler {
+            state: runtime_state.clone(),
+        })),
+        None,
+    );
+    let context = M3OperationContext::default();
+
+    // Before any model is selected, the hardware-only gates already resolve
+    // (this hub's hardware is CPU-only) and the model-relative gate reports
+    // "select a model" rather than guessing.
+    let unscoped = hub
+        .resolve_setting_capabilities("managed-llama", None)
+        .expect("resolve without a target model");
+    let flash_attention = unscoped
+        .settings
+        .iter()
+        .find(|setting| setting.key == "flash_attention")
+        .expect("flash_attention present");
+    assert!(!flash_attention.supported);
+    let draft_model_setting = unscoped
+        .settings
+        .iter()
+        .find(|setting| setting.key == "speculative_decoding_draft_model")
+        .expect("speculative_decoding_draft_model present");
+    assert!(!draft_model_setting.supported);
+    assert!(unscoped.draft_model_candidates.is_empty());
+
+    let target_bytes = payload(60_000, 31);
+    let target = family_model(
+        &target_bytes,
+        "rev-target",
+        "qwen2-7b-instruct",
+        "Qwen2 7B Instruct",
+        7_000_000_000,
+    );
+    download.set_payload(target_bytes, "etag-target");
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: target.license.declaration_sha256(),
+            model: target.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("download target model");
+
+    // No compatible draft installed yet: still unsupported, with a specific
+    // reason naming the target model.
+    let no_draft_yet = hub
+        .resolve_setting_capabilities("managed-llama", Some(&target.asset_id()))
+        .expect("resolve with a target but no draft installed");
+    let draft_model_setting = no_draft_yet
+        .settings
+        .iter()
+        .find(|setting| setting.key == "speculative_decoding_draft_model")
+        .expect("speculative_decoding_draft_model present");
+    assert!(!draft_model_setting.supported);
+    assert!(draft_model_setting
+        .unsupported_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains(&target.display_name)));
+    assert!(no_draft_yet.draft_model_candidates.is_empty());
+
+    let draft_bytes = payload(15_000, 33);
+    let draft = family_model(
+        &draft_bytes,
+        "rev-draft",
+        "qwen2-1.5b-instruct",
+        "Qwen2 1.5B Instruct",
+        1_500_000_000,
+    );
+    download.set_payload(draft_bytes, "etag-draft");
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: draft.license.declaration_sha256(),
+            model: draft.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("download compatible draft model");
+
+    let with_draft = hub
+        .resolve_setting_capabilities("managed-llama", Some(&target.asset_id()))
+        .expect("resolve with a compatible draft installed");
+    let draft_model_setting = with_draft
+        .settings
+        .iter()
+        .find(|setting| setting.key == "speculative_decoding_draft_model")
+        .expect("speculative_decoding_draft_model present");
+    assert!(draft_model_setting.supported);
+    assert!(draft_model_setting.unsupported_reason.is_none());
+    assert_eq!(with_draft.draft_model_candidates.len(), 1);
+    assert_eq!(with_draft.draft_model_candidates[0].model_id, draft.model_id);
+    assert_eq!(
+        with_draft.draft_model_candidates[0].display_name,
+        draft.display_name
+    );
+}
+
 struct DeterministicEntropy(Mutex<u8>);
 
 impl LanEntropySource for DeterministicEntropy {
@@ -1266,4 +1772,270 @@ async fn scoped_pairing_dispatch_stream_rate_limit_cancel_revoke_and_audit_are_w
         hub.authorize_external_operation(&authorization),
         Err(M3HubError::Forbidden(_))
     ));
+}
+
+#[test]
+fn catalog_model_manifest_stays_backward_compatible_without_new_provenance_fields() {
+    let bytes = payload(4_096, 3);
+    let model = catalog_model(&bytes, "rev-compat");
+    let mut value = serde_json::to_value(&model).expect("serialize catalog model");
+    let object = value.as_object_mut().expect("catalog model is a JSON object");
+    // Simulate a manifest written before template/projector/provenance
+    // existed: the keys are entirely absent, not merely null.
+    assert!(object.remove("template").is_some());
+    assert!(object.remove("projector").is_some());
+    assert!(object.remove("catalogRetrievedAtMs").is_some());
+
+    let restored: M3CatalogModel = serde_json::from_value(value)
+        .expect("a legacy manifest without the new fields must still deserialize");
+    assert_eq!(restored.template, None);
+    assert_eq!(restored.projector, None);
+    assert_eq!(restored.catalog_retrieved_at_ms, None);
+    restored
+        .validate()
+        .expect("a legacy manifest without the new fields must still validate");
+}
+
+#[tokio::test]
+async fn search_stamps_provenance_and_installed_view_surfaces_template_projector_and_source() {
+    let bytes = payload(2_048, 11);
+    let mut model = catalog_model(&bytes, "rev-1");
+    model.template = Some("chatml".to_string());
+    model.projector = Some(M3ProjectorRef {
+        kind: "clip".to_string(),
+        sha256: sha256(b"projector-bytes"),
+        size_bytes: 4_096,
+    });
+    let directory = TestDirectory::new("provenance");
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-provenance"));
+    let hub = make_hub(
+        &directory.0,
+        download,
+        vec![Arc::new(StaticCatalog {
+            source_id: "test-catalog".to_string(),
+            entries: vec![model],
+        })],
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let matches = hub
+        .search_catalog("Local Model", 10, &context)
+        .await
+        .expect("search catalog");
+    assert_eq!(matches.len(), 1);
+    let retrieved_at = matches[0]
+        .model
+        .catalog_retrieved_at_ms
+        .expect("search stamps a local retrieval timestamp");
+    assert!(retrieved_at > 0);
+
+    let request = M3DownloadRequest {
+        accepted_license_sha256: matches[0].model.license.declaration_sha256(),
+        model: matches[0].model.clone(),
+    };
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("install stamped model");
+    let active = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version");
+    assert_eq!(active.source_id, "test-catalog");
+    assert_eq!(active.template.as_deref(), Some("chatml"));
+    assert_eq!(
+        active.projector.as_ref().map(|projector| projector.kind.as_str()),
+        Some("clip")
+    );
+    assert_eq!(active.catalog_retrieved_at_ms, Some(retrieved_at));
+}
+
+#[tokio::test]
+async fn identical_payload_across_assets_is_reused_without_a_network_transfer_and_survives_donor_deletion(
+) {
+    let directory = TestDirectory::new("dedup");
+    let shared_bytes = payload(120_000, 42);
+    let download = Arc::new(MutableDownload::new(shared_bytes.clone(), "etag-shared"));
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let donor = catalog_model(&shared_bytes, "rev-donor");
+    let donor_request = M3DownloadRequest {
+        accepted_license_sha256: donor.license.declaration_sha256(),
+        model: donor.clone(),
+    };
+    let installed_donor = hub
+        .download_model(&donor_request, &context)
+        .await
+        .expect("install donor over the network");
+    assert!(!download.offsets().is_empty());
+
+    // A different variant with byte-identical content must reuse the
+    // donor's verified payload instead of hitting the network again.
+    let before = download.offsets().len();
+    let mut reuser = donor.clone();
+    reuser.variant_id = "q5_k_m".to_string();
+    reuser.revision = "rev-reuser".to_string();
+    let reuser_request = M3DownloadRequest {
+        accepted_license_sha256: reuser.license.declaration_sha256(),
+        model: reuser.clone(),
+    };
+    let installed_reuser = hub
+        .download_model(&reuser_request, &context)
+        .await
+        .expect("reuse the donor's verified payload");
+    assert_eq!(
+        download.offsets().len(),
+        before,
+        "a byte-identical variant must not trigger any additional network range reads"
+    );
+    assert_ne!(installed_donor.asset_id, installed_reuser.asset_id);
+    let reuser_path = installed_reuser
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active reuser version")
+        .artifact_path
+        .clone();
+    assert_eq!(fs::read(&reuser_path).unwrap(), shared_bytes);
+
+    // Deleting the donor must not corrupt the reused survivor: the shared
+    // bytes must remain intact and independently owned on disk.
+    assert!(hub
+        .delete_model(
+            &M3DeleteModelRequest {
+                asset_id: donor.asset_id(),
+                confirmation: format!("DELETE {}", donor.asset_id()),
+            },
+            &context,
+        )
+        .await
+        .expect("delete donor"));
+    assert!(hub
+        .list_installed_models()
+        .unwrap()
+        .iter()
+        .any(|installed| installed.asset_id == reuser.asset_id()));
+    assert_eq!(fs::read(&reuser_path).unwrap(), shared_bytes);
+}
+
+#[tokio::test]
+async fn corrupted_local_candidate_is_never_reused_and_falls_back_to_a_real_download() {
+    let directory = TestDirectory::new("dedup-corrupt");
+    let shared_bytes = payload(80_000, 5);
+    let download = Arc::new(MutableDownload::new(shared_bytes.clone(), "etag-corrupt-guard"));
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let donor = catalog_model(&shared_bytes, "rev-donor");
+    let donor_request = M3DownloadRequest {
+        accepted_license_sha256: donor.license.declaration_sha256(),
+        model: donor.clone(),
+    };
+    let installed_donor = hub
+        .download_model(&donor_request, &context)
+        .await
+        .expect("install donor");
+    let donor_path = installed_donor
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active donor version")
+        .artifact_path
+        .clone();
+
+    // Corrupt the donor payload on disk without changing its length, e.g.
+    // simulating bit rot the hub did not itself cause.
+    let mut corrupted = shared_bytes.clone();
+    corrupted[0] ^= 0xFF;
+    fs::write(&donor_path, &corrupted).expect("corrupt donor payload in place");
+
+    let before = download.offsets().len();
+    let mut reuser = donor.clone();
+    reuser.variant_id = "q5_k_m".to_string();
+    reuser.revision = "rev-reuser".to_string();
+    let reuser_request = M3DownloadRequest {
+        accepted_license_sha256: reuser.license.declaration_sha256(),
+        model: reuser.clone(),
+    };
+    let installed_reuser = hub
+        .download_model(&reuser_request, &context)
+        .await
+        .expect("fall back to a genuine download");
+    assert!(
+        download.offsets().len() > before,
+        "a corrupted local candidate must never be reused; a real download must occur instead"
+    );
+    let reuser_path = installed_reuser
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active reuser version")
+        .artifact_path
+        .clone();
+    assert_eq!(fs::read(&reuser_path).unwrap(), shared_bytes);
+}
+
+#[tokio::test]
+async fn transport_corruption_is_caught_by_the_final_digest_check_and_a_retry_recovers() {
+    let directory = TestDirectory::new("transport-corruption");
+    let bytes = payload(50_000, 9);
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-corrupt-guard"));
+    download.corrupt_chunk_at(0);
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let model = catalog_model(&bytes, "rev-1");
+    let context = M3OperationContext::new(10_000);
+    let request = M3DownloadRequest {
+        accepted_license_sha256: model.license.declaration_sha256(),
+        model: model.clone(),
+    };
+
+    // A structurally valid but bit-flipped chunk must survive framing
+    // checks yet still be caught by the whole-file digest verification, and
+    // must never be silently accepted or partially published.
+    assert!(matches!(
+        hub.download_model(&request, &context).await,
+        Err(M3HubError::Integrity { .. })
+    ));
+    assert!(hub.list_installed_models().unwrap().is_empty());
+
+    // A retry must not resume the corrupted bytes; it must restart cleanly
+    // and succeed once the transport stops corrupting the stream.
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("retry recovers with clean bytes");
+    let active_path = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version")
+        .artifact_path
+        .clone();
+    assert_eq!(fs::read(&active_path).unwrap(), bytes);
 }

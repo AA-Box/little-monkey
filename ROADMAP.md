@@ -942,24 +942,6 @@ These are deliberately separate from the earlier phases: they are the next 30 ga
 
 This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 2026: 4,931 closed PRs fetched through the GitHub API, with 3,430 merged PRs used as the main signal. The goal is not to clone Ollama, but to learn from the runtime, model, GPU, registry, API, and diagnostics work that made Ollama dependable.
 
-### 1. Hardware Compatibility Matrix and Driver Doctor
-
-**Status:** Planned
-
-- Detect CUDA, ROCm, Vulkan, Metal, MLX, iGPU/dGPU, hybrid graphics, Jetson, driver versions, compute capability, and unsupported runtime combinations.
-- Explain what will work, what will fall back to CPU, and what needs a driver/runtime update.
-
-**Acceptance:** User sees a concrete compatibility report before model download, model load, or runtime install.
-
-### 2. Adaptive Runtime Scheduler and Offload Planner
-
-**Status:** Planned
-
-- Plan context size, batch size, GPU layers, projector offload, CPU spill, and parallelism from live memory/VRAM state.
-- Simulate fit before loading a model and explain tradeoffs.
-
-**Acceptance:** A model load shows why a runtime/context/offload plan was selected and how to improve it.
-
 ### 3. Multi-GPU and Heterogeneous Runtime Orchestration
 
 **Status:** Research
@@ -969,24 +951,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Multi-device execution never silently degrades correctness and always reports actual placement.
 
-### 4. Runtime Component Update Channels
-
-**Status:** Planned
-
-- Manage versioned `llama.cpp`, MLX, Metal, CUDA, ROCm, Vulkan, tokenizer, converter, and projector components.
-- Provide stable, beta, and pinned channels with rollback.
-
-**Acceptance:** Runtime updates can be installed, verified, rolled back, and tied to compatibility notes.
-
-### 5. Model Manifest, Blob, and Digest Store
-
-**Status:** Planned
-
-- Add content-addressed model storage with manifests, blobs, layer reuse, digest checks, resumable transfers, and garbage collection.
-- Track source registry, license, quant, template, projector, and provenance.
-
-**Acceptance:** Model files are deduplicated, verifiable, resumable, and safely pruned.
-
 ### 6. Modelfile Studio and Import Hardening
 
 **Status:** Planned
@@ -995,15 +959,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Harden GGUF and safetensors import with clear errors and source metadata.
 
 **Acceptance:** User can preview and validate a custom model package before it enters the model library.
-
-### 7. Model Conversion and Quantization Workbench
-
-**Status:** Planned
-
-- Convert compatible Hugging Face, safetensors, GGUF, LoRA, and adapter inputs into local model packages.
-- Offer quantization choices with benchmark, quality, size, and license checks.
-
-**Acceptance:** A conversion produces a reproducible report, output digest, license warning, and eval result.
 
 ### 8. Chat Template and Renderer Compatibility Lab
 
@@ -1022,15 +977,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Give users safe controls for long-context tradeoffs.
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
-
-### 10. Tool-Call and Structured-Output Parser Hardening
-
-**Status:** Planned
-
-- Fuzz streaming tool calls, JSON mode, schema outputs, braces in strings, malformed chunks, and model-specific parsers.
-- Add regression fixtures per model family.
-
-**Acceptance:** Tool-call parsing failures produce safe errors, not accidental tool execution or corrupted arguments.
 
 ### 11. OpenAI and Ollama API Compatibility Harness
 
@@ -1085,15 +1031,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Prefer safe fallbacks over failed loads.
 
 **Acceptance:** Device-specific profiles explain supported models, expected speed, and required runtime components.
-
-### 17. Sampler, Batching, and Speculative Decoding Controls
-
-**Status:** Research
-
-- Expose supported sampler options, batching, speculative decoding, flash attention, mixed precision, and model-family tuning.
-- Gate advanced controls behind model/runtime support checks.
-
-**Acceptance:** Advanced performance controls cannot be enabled when the selected model/runtime cannot honor them.
 
 ### 18. Runtime PR Watcher and Capability Feed
 

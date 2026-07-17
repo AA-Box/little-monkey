@@ -35,6 +35,7 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isPlanNotice,
+  isPrivacyNotice,
   isRecipeNotice,
   isSourcesNotice,
   isSwitchNotice,
@@ -238,7 +239,13 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         if (notice) items.push({ kind: "command", key: `command-${index}`, notice });
         return;
       }
-      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg) || isVerifyFixNotice(msg)) {
+      if (
+        isCompactionMarker(msg) ||
+        isSwitchNotice(msg) ||
+        isMentionNotice(msg) ||
+        isVerifyFixNotice(msg) ||
+        isPrivacyNotice(msg)
+      ) {
         items.push({ kind: "notice", key: `notice-${index}`, text: textContent(msg.content) });
       }
     }
