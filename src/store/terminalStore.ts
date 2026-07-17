@@ -27,6 +27,13 @@ interface TerminalStatusEvent {
   session: TerminalSession;
 }
 
+/** Mirrors Rust `TerminalIdentity` — local `user`/`host` shown in the prompt
+ * line. Purely cosmetic; never carries workspace or secret data. */
+export interface TerminalIdentity {
+  user: string;
+  host: string;
+}
+
 export interface TerminalEvidence {
   id: string;
   terminalSessionId: string;
@@ -83,6 +90,7 @@ interface TerminalStore {
   activeSessionId: string | null;
   historyByWorkspace: Record<string, string[]>;
   pendingEvidenceByChat: Record<string, TerminalEvidence[]>;
+  identity: TerminalIdentity | null;
   initialized: boolean;
   busy: boolean;
   error: string | null;
@@ -96,6 +104,7 @@ interface TerminalStore {
   close: (sessionId: string) => Promise<void>;
   resize: (sessionId: string, rows: number, cols: number) => Promise<void>;
   loadHistory: (workspaceId: string) => Promise<string[]>;
+  loadIdentity: () => Promise<void>;
   queueEvidence: (chatSessionId: string, evidence: TerminalEvidence) => void;
   consumeEvidence: (chatSessionId: string) => TerminalEvidence[];
   clearError: () => void;
@@ -144,6 +153,7 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
   activeSessionId: null,
   historyByWorkspace: {},
   pendingEvidenceByChat: {},
+  identity: null,
   initialized: false,
   busy: false,
   error: null,
@@ -272,6 +282,17 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
     } catch (error) {
       set({ error: String(error) });
       return [];
+    }
+  },
+
+  loadIdentity: async () => {
+    if (get().identity || !isTauri()) return;
+    try {
+      const identity = await invoke<TerminalIdentity>("terminal_identity");
+      set({ identity });
+    } catch {
+      // Cosmetic prompt-line detail only — the panel falls back to the
+      // workspace path alone when identity can't be resolved.
     }
   },
 

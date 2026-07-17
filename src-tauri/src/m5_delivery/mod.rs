@@ -900,6 +900,15 @@ pub fn m5_github_auth_status() -> Result<github::GitHubAuthStatus, String> {
     github::auth_status()
 }
 
+/// Non-worktree-scoped `gh api <path>` bridge for other in-process Rust
+/// callers — Knowledge Sync's `GitHubRepo` connector (`knowledge_service.rs`)
+/// uses this for repo metadata/commit/compare/tree/blob reads. Deliberately
+/// not a `#[tauri::command]`: nothing outside the Rust backend calls it
+/// directly, unlike every other function in this file.
+pub fn m5_github_api_get(path: &str) -> Result<Value, String> {
+    github::gh_api_json(path)
+}
+
 #[tauri::command]
 pub fn m5_github_issue(worktree_id: String, number: u32) -> Result<Value, String> {
     let store = open_store()?;

@@ -18,8 +18,10 @@ import {
   Trash2,
 } from "lucide-react";
 import { useSessionStore } from "../../store/sessionStore";
+import { useConnectorsStore, type ConnectorProvider } from "../../store/connectorsStore";
 import {
   DEFAULT_HYBRID_CONFIG,
+  connectorUsesAccountReference,
   useKnowledgeV2Store,
   type HybridSearchConfig,
   type KnowledgeConnector,
@@ -30,11 +32,31 @@ import {
   type PiiPreview,
 } from "../../store/knowledgeV2Store";
 import type { KnowledgeStack } from "../../store/stackStore";
+import { useT } from "../../lib/i18n";
 import { Button, IconButton, StatusPill } from "../ui";
 
 type ConnectorKind = KnowledgeConnector["kind"];
 
-const CONNECTOR_LABELS: Record<ConnectorKind, string> = {
+/** Which Connector Catalog provider (`connectorsStore.ts`) backs each
+ * account-reference connector kind — used to filter the picker's option
+ * list down to accounts of the right provider. */
+const CONNECTOR_KIND_PROVIDER: Record<
+  "git_hub_repo" | "s3_bucket" | "notion_pages" | "slack_channels" | "jira_project",
+  ConnectorProvider
+> = {
+  git_hub_repo: "github",
+  s3_bucket: "s3",
+  notion_pages: "notion",
+  slack_channels: "slack",
+  jira_project: "jira",
+};
+
+// English fallback/legacy labels for the connector kinds this panel already
+// supported before i18n coverage was added (see this file's top-level
+// pre-existing-gap note) — left as-is rather than retrofitted. The six new
+// External Knowledge Sync connector kinds are labeled through `t()` instead,
+// inside the component (see `connectorLabels` below).
+const LEGACY_CONNECTOR_LABELS = {
   local_file: "Local file",
   local_folder: "Local folder",
   project: "Project",
@@ -42,7 +64,7 @@ const CONNECTOR_LABELS: Record<ConnectorKind, string> = {
   sitemap: "Sitemap",
   selected_chats: "Selected conversations",
   web_dav: "WebDAV file",
-};
+} as const satisfies Partial<Record<ConnectorKind, string>>;
 
 function toOrigin(value: string): string {
   try {
@@ -68,6 +90,24 @@ function sourceDescription(source: KnowledgeSourceV2): string {
       return source.connector.url;
     case "selected_chats":
       return `${source.connector.session_ids.length} conversation${source.connector.session_ids.length === 1 ? "" : "s"}`;
+    case "git_hub_repo": {
+      const { owner, repo, git_ref, path_prefix } = source.connector;
+      const ref = git_ref ? `@${git_ref}` : "";
+      const prefix = path_prefix ? `/${path_prefix}` : "";
+      return `${owner}/${repo}${ref}${prefix}`;
+    }
+    case "s3_bucket": {
+      const { bucket, prefix } = source.connector;
+      return `s3://${bucket}${prefix ? `/${prefix}` : ""}`;
+    }
+    case "watched_folder":
+      return source.connector.path;
+    case "notion_pages":
+      return source.connector.root_id;
+    case "slack_channels":
+      return source.connector.channel_ids.join(", ");
+    case "jira_project":
+      return source.connector.project_key;
   }
 }
 
@@ -94,6 +134,9 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
   const installOcr = useKnowledgeV2Store((state) => state.installOcr);
   const setOcrEnabled = useKnowledgeV2Store((state) => state.setOcrEnabled);
   const sessions = useSessionStore((state) => state.sessions);
+  const connectorAccounts = useConnectorsStore((state) => state.accounts);
+  const refreshConnectorAccounts = useConnectorsStore((state) => state.refresh);
+  const { t } = useT();
 
   const [stackId, setStackId] = useState("");
   const [adding, setAdding] = useState(false);
@@ -114,6 +157,46 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
   const [expandedSource, setExpandedSource] = useState<string | null>(null);
   const [backgroundInterval, setBackgroundInterval] = useState(60);
   const [backgroundAllStacks, setBackgroundAllStacks] = useState(true);
+
+  // --- External Knowledge Sync connector form state ---------------------
+  const [connectorAccountId, setConnectorAccountId] = useState("");
+  const [githubOwner, setGithubOwner] = useState("");
+  const [githubRepo, setGithubRepo] = useState("");
+  const [githubRef, setGithubRef] = useState("");
+  const [githubPathPrefix, setGithubPathPrefix] = useState("");
+  const [s3Endpoint, setS3Endpoint] = useState("");
+  const [s3Bucket, setS3Bucket] = useState("");
+  const [s3Prefix, setS3Prefix] = useState("");
+  const [s3Region, setS3Region] = useState("us-east-1");
+  const [debounceMs, setDebounceMs] = useState(2_000);
+  const [notionRootId, setNotionRootId] = useState("");
+  const [slackChannelIds, setSlackChannelIds] = useState("");
+  const [jiraProjectKey, setJiraProjectKey] = useState("");
+
+  const connectorLabels: Record<ConnectorKind, string> = {
+    ...LEGACY_CONNECTOR_LABELS,
+    git_hub_repo: t("KnowledgeV2Panel.connectorGitHubRepo"),
+    s3_bucket: t("KnowledgeV2Panel.connectorS3Bucket"),
+    watched_folder: t("KnowledgeV2Panel.connectorWatchedFolder"),
+    notion_pages: t("KnowledgeV2Panel.connectorNotionPages"),
+    slack_channels: t("KnowledgeV2Panel.connectorSlackChannels"),
+    jira_project: t("KnowledgeV2Panel.connectorJiraProject"),
+  };
+
+  const accountsForKind = connectorUsesAccountReference(kind)
+    ? connectorAccounts.filter((account) => account.provider === CONNECTOR_KIND_PROVIDER[kind])
+    : [];
+
+  useEffect(() => {
+    void refreshConnectorAccounts();
+  }, [refreshConnectorAccounts]);
+
+  useEffect(() => {
+    if (connectorUsesAccountReference(kind) && !accountsForKind.some((account) => account.id === connectorAccountId)) {
+      setConnectorAccountId(accountsForKind[0]?.id ?? "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, connectorAccounts]);
 
   useEffect(() => {
     void refreshSources();
@@ -155,15 +238,26 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
     setSelectedChats([]);
     setWebdavUsername("");
     setWebdavPassword("");
+    setGithubOwner("");
+    setGithubRepo("");
+    setGithubRef("");
+    setGithubPathPrefix("");
+    setS3Endpoint("");
+    setS3Bucket("");
+    setS3Prefix("");
+    setDebounceMs(2_000);
+    setNotionRootId("");
+    setSlackChannelIds("");
+    setJiraProjectKey("");
     setFormError(null);
   };
 
   const choosePath = async () => {
-    const directory = kind === "local_folder" || kind === "project";
+    const directory = kind === "local_folder" || kind === "project" || kind === "watched_folder";
     const selected = await open({ directory, multiple: false });
     if (typeof selected === "string") {
       setPath(selected);
-      if (!label) setLabel(selected.split(/[\\/]/).filter(Boolean).pop() ?? CONNECTOR_LABELS[kind]);
+      if (!label) setLabel(selected.split(/[\\/]/).filter(Boolean).pop() ?? connectorLabels[kind]);
     }
   };
 
@@ -171,6 +265,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
     if (kind === "local_file") return { kind, path: path.trim() };
     if (kind === "local_folder") return { kind, path: path.trim() };
     if (kind === "project") return { kind, path: path.trim() };
+    if (kind === "watched_folder") return { kind, path: path.trim(), debounce_ms: debounceMs };
     if (kind === "selected_chats") return { kind, session_ids: selectedChats };
     if (kind === "web_dav") {
       return {
@@ -191,6 +286,42 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
         allow_loopback: allowLoopback,
       };
     }
+    if (kind === "git_hub_repo") {
+      return {
+        kind,
+        owner: githubOwner.trim(),
+        repo: githubRepo.trim(),
+        git_ref: githubRef.trim() || null,
+        path_prefix: githubPathPrefix.trim() || null,
+        connector_account_id: connectorAccountId,
+      };
+    }
+    if (kind === "s3_bucket") {
+      return {
+        kind,
+        endpoint: s3Endpoint.trim(),
+        bucket: s3Bucket.trim(),
+        prefix: s3Prefix.trim() || null,
+        region: s3Region.trim(),
+        connector_account_id: connectorAccountId,
+      };
+    }
+    if (kind === "notion_pages") {
+      return { kind, connector_account_id: connectorAccountId, root_id: notionRootId.trim() };
+    }
+    if (kind === "slack_channels") {
+      return {
+        kind,
+        connector_account_id: connectorAccountId,
+        channel_ids: slackChannelIds
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+      };
+    }
+    if (kind === "jira_project") {
+      return { kind, connector_account_id: connectorAccountId, project_key: jiraProjectKey.trim() };
+    }
     return {
       kind: "url",
       url: url.trim(),
@@ -210,7 +341,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
       const connector = connectorFromForm();
       await addSource(
         stackId,
-        label.trim() || CONNECTOR_LABELS[kind],
+        label.trim() || connectorLabels[kind],
         connector,
         kind === "web_dav" ? webdavPassword : undefined,
       );
@@ -355,6 +486,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
 
           {adding && (
             <div className="mt-3 rounded-lg border border-accent/30 bg-surface p-3">
+              <p className="mb-2 text-[11px] text-faint">{t("KnowledgeV2Panel.connectorNonGoalsNote")}</p>
               <div className="grid gap-2 sm:grid-cols-2">
                 <label className="text-xs text-muted">
                   Source type
@@ -363,7 +495,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
                     onChange={(event) => setKind(event.target.value as ConnectorKind)}
                     className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-xs text-foreground"
                   >
-                    {Object.entries(CONNECTOR_LABELS).map(([value, text]) => (
+                    {Object.entries(connectorLabels).map(([value, text]) => (
                       <option key={value} value={value}>
                         {text}
                       </option>
@@ -376,12 +508,166 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
                     value={label}
                     onChange={(event) => setLabel(event.target.value)}
                     className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-xs text-foreground"
-                    placeholder={CONNECTOR_LABELS[kind]}
+                    placeholder={connectorLabels[kind]}
                   />
                 </label>
               </div>
 
-              {(kind === "local_file" || kind === "local_folder" || kind === "project") && (
+              {connectorUsesAccountReference(kind) && (
+                <label className="mt-2 block text-xs text-muted">
+                  {t("KnowledgeV2Panel.connectorAccountLabel")}
+                  <select
+                    value={connectorAccountId}
+                    onChange={(event) => setConnectorAccountId(event.target.value)}
+                    className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                  >
+                    {accountsForKind.length === 0 && (
+                      <option value="">{t("KnowledgeV2Panel.connectorAccountNoneOption")}</option>
+                    )}
+                    {accountsForKind.map((account) => (
+                      <option key={account.id} value={account.id}>
+                        {account.label}
+                      </option>
+                    ))}
+                  </select>
+                  {accountsForKind.length === 0 && (
+                    <span className="mt-1 block text-[11px] text-warning">
+                      {t("KnowledgeV2Panel.connectorAccountMissingHint")}
+                    </span>
+                  )}
+                </label>
+              )}
+
+              {kind === "git_hub_repo" && (
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <label className="text-xs text-muted">
+                    {t("KnowledgeV2Panel.githubOwnerLabel")}
+                    <input
+                      value={githubOwner}
+                      onChange={(event) => setGithubOwner(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                      placeholder="acme"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    {t("KnowledgeV2Panel.githubRepoLabel")}
+                    <input
+                      value={githubRepo}
+                      onChange={(event) => setGithubRepo(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                      placeholder="widgets"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    {t("KnowledgeV2Panel.githubRefLabel")}
+                    <input
+                      value={githubRef}
+                      onChange={(event) => setGithubRef(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                      placeholder="main"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    {t("KnowledgeV2Panel.githubPathPrefixLabel")}
+                    <input
+                      value={githubPathPrefix}
+                      onChange={(event) => setGithubPathPrefix(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                      placeholder="docs/"
+                    />
+                  </label>
+                </div>
+              )}
+
+              {kind === "s3_bucket" && (
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <label className="text-xs text-muted sm:col-span-2">
+                    {t("KnowledgeV2Panel.s3EndpointLabel")}
+                    <input
+                      value={s3Endpoint}
+                      onChange={(event) => setS3Endpoint(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                      placeholder="https://s3.amazonaws.com"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    {t("KnowledgeV2Panel.s3BucketLabel")}
+                    <input
+                      value={s3Bucket}
+                      onChange={(event) => setS3Bucket(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    {t("KnowledgeV2Panel.s3RegionLabel")}
+                    <input
+                      value={s3Region}
+                      onChange={(event) => setS3Region(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                    />
+                  </label>
+                  <label className="text-xs text-muted sm:col-span-2">
+                    {t("KnowledgeV2Panel.s3PrefixLabel")}
+                    <input
+                      value={s3Prefix}
+                      onChange={(event) => setS3Prefix(event.target.value)}
+                      className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                      placeholder="reports/2024/"
+                    />
+                  </label>
+                </div>
+              )}
+
+              {kind === "watched_folder" && (
+                <label className="mt-2 block text-xs text-muted">
+                  {t("KnowledgeV2Panel.debounceLabel")}
+                  <input
+                    type="number"
+                    min={200}
+                    max={600_000}
+                    value={debounceMs}
+                    onChange={(event) => setDebounceMs(Number(event.target.value))}
+                    className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                  />
+                </label>
+              )}
+
+              {kind === "notion_pages" && (
+                <label className="mt-2 block text-xs text-muted">
+                  {t("KnowledgeV2Panel.notionRootIdLabel")}
+                  <input
+                    value={notionRootId}
+                    onChange={(event) => setNotionRootId(event.target.value)}
+                    className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                  />
+                </label>
+              )}
+
+              {kind === "slack_channels" && (
+                <label className="mt-2 block text-xs text-muted">
+                  {t("KnowledgeV2Panel.slackChannelIdsLabel")}
+                  <input
+                    value={slackChannelIds}
+                    onChange={(event) => setSlackChannelIds(event.target.value)}
+                    className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                    placeholder="C0123456789, C9876543210"
+                  />
+                </label>
+              )}
+
+              {kind === "jira_project" && (
+                <label className="mt-2 block text-xs text-muted">
+                  {t("KnowledgeV2Panel.jiraProjectKeyLabel")}
+                  <input
+                    value={jiraProjectKey}
+                    onChange={(event) => setJiraProjectKey(event.target.value)}
+                    className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-xs text-foreground"
+                    placeholder="PROJ"
+                  />
+                </label>
+              )}
+
+              {(kind === "local_file" || kind === "local_folder" || kind === "project" || kind === "watched_folder") && (
                 <div className="mt-2 flex gap-2">
                   <input
                     value={path}
