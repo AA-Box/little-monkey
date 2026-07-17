@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  GitBranch,
   Command,
   ClipboardCheck,
   Compass,
@@ -49,6 +50,7 @@ interface AppMenuProps {
   onOpenDebate: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenCrossRepoChangePlanner: () => void;
   onOpenVisualEditMode: () => void;
 }
 
@@ -96,6 +98,7 @@ export function AppMenu({
   onOpenDebate,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenCrossRepoChangePlanner,
   onOpenVisualEditMode,
 }: AppMenuProps) {
   const { t } = useT();
@@ -259,6 +262,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenTerminal();
+            }}
+          />
+          <MenuRow
+            icon={<GitBranch size={14} className="text-faint" />}
+            label={t("AppMenu.crossRepoChangePlanner")}
+            onClick={() => {
+              closeAll();
+              onOpenCrossRepoChangePlanner();
             }}
           />
           <MenuRow

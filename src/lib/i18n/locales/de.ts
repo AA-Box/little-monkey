@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const de: Record<string, string> = {
@@ -354,6 +355,7 @@ export const de: Record<string, string> = {
   "McpGenerator.statusNotClean": "Nicht simulator-sauber",
   "McpGenerator.statusNotSimulated": "Nicht simuliert",
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real German translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Tagesüberblick",
@@ -399,6 +401,39 @@ export const de: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "{{used}} von {{quota}} Modellspeicher belegt",
   "DailyBriefPanel.runtime.open": "In Einstellungen › Runtime Hub öffnen",
   "DailyBriefPanel.runtime.error": "Aktualisierung der Runtime-Hub-Übersicht fehlgeschlagen: {{error}}",
+  // Real German translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "Repo-übergreifende Änderungsplanung",
+  "CrossRepoChangePlanner.title": "Repo-übergreifende Änderungsplanung",
+  "CrossRepoChangePlanner.subtitle": "Beschreibe eine koordinierte Änderung einmal. Prüfe einen geordneten Plan pro Ordner mit Risiko- und Rollback-Hinweisen und genehmige ihn, bevor irgendein Repository angefasst wird.",
+  "CrossRepoChangePlanner.close": "Änderungsplanung schließen",
+  "CrossRepoChangePlanner.noRootsWarning": "Es sind keine Arbeitsbereichsordner angehängt. Öffne zuerst einen primären Ordner (und hänge optional weitere an), bevor du eine repo-übergreifende Änderung planst.",
+  "CrossRepoChangePlanner.descriptionLabel": "Beschreibe die koordinierte Änderung",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "z. B. Benenne das Feld `widgetId` in `widgetKey` um – in der API, im Web-Client und in der Dokumentation.",
+  "CrossRepoChangePlanner.generateButton": "Plan erstellen",
+  "CrossRepoChangePlanner.statusDraft": "Entwurf – noch nicht genehmigt",
+  "CrossRepoChangePlanner.statusApproved": "Genehmigt",
+  "CrossRepoChangePlanner.approveButton": "Plan genehmigen",
+  "CrossRepoChangePlanner.approveGateNote": "Kein Repository wird angefasst, bevor du diesen Plan genehmigst. Bearbeite bei Bedarf zuerst Text oder Reihenfolge der Schritte.",
+  "CrossRepoChangePlanner.startOverButton": "Neu beginnen",
+  "CrossRepoChangePlanner.moveUp": "Schritt nach oben verschieben",
+  "CrossRepoChangePlanner.moveDown": "Schritt nach unten verschieben",
+  "CrossRepoChangePlanner.dependsOn": "Abhängig von: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "Zusammenfassung",
+  "CrossRepoChangePlanner.changesLabel": "Was sich ändert",
+  "CrossRepoChangePlanner.risksLabel": "Was schiefgehen könnte",
+  "CrossRepoChangePlanner.rollbackLabel": "Rückabwicklung",
+  "CrossRepoChangePlanner.branchSectionHeading": "Branch-Erstellung",
+  "CrossRepoChangePlanner.branchCreated": "Branch erstellt: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "GitHub-Repository",
+  "CrossRepoChangePlanner.baseRefLabel": "Basis-Ref",
+  "CrossRepoChangePlanner.branchPrefixLabel": "Präfix für eigenen Branch",
+  "CrossRepoChangePlanner.labelLabel": "Aufgabenbezeichnung",
+  "CrossRepoChangePlanner.createBranchButton": "Branch erstellen",
+  "CrossRepoChangePlanner.approveFirstHint": "Genehmige den Plan, bevor du für diesen Schritt einen Branch erstellst.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "Gib {{phrase}} ein, um zu bestätigen",
+  "CrossRepoChangePlanner.confirmCancel": "Abbrechen",
+  "CrossRepoChangePlanner.confirmExecute": "Bestätigen",
+  "CrossRepoChangePlanner.pushFollowUpNote": "Dies erstellt nur lokale, app-eigene Branches. Das Pushen eines Branches und das Öffnen eines Entwurfs-PR bleibt eine manuelle Folgeaktion in Einstellungen → Git-Übermittlung, mit demselben Bestätigen-und-Phrase-eingeben-Schritt wie beim Issue-to-PR-Ablauf.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

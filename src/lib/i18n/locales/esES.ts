@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const esES: Record<string, string> = {
@@ -354,6 +355,7 @@ export const esES: Record<string, string> = {
   "McpGenerator.statusNotClean": "No está limpio según el simulador",
   "McpGenerator.statusNotSimulated": "No simulado",
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Spain Spanish translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Resumen diario",
@@ -399,6 +401,39 @@ export const esES: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "{{used}} utilizados de {{quota}} de almacenamiento de modelos",
   "DailyBriefPanel.runtime.open": "Abrir en Ajustes › Runtime Hub",
   "DailyBriefPanel.runtime.error": "No se ha podido actualizar el resumen del Runtime Hub: {{error}}",
+  // Real Spain Spanish translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "Planificador de cambios entre repositorios",
+  "CrossRepoChangePlanner.title": "Planificador de cambios entre repositorios",
+  "CrossRepoChangePlanner.subtitle": "Describe un cambio coordinado una vez. Revisa un plan ordenado por carpeta con notas de riesgo y reversión, y apruébalo antes de que se toque ningún repositorio.",
+  "CrossRepoChangePlanner.close": "Cerrar el planificador de cambios entre repositorios",
+  "CrossRepoChangePlanner.noRootsWarning": "No hay carpetas del espacio de trabajo adjuntas. Abre una carpeta principal (y, opcionalmente, adjunta carpetas secundarias) antes de planificar un cambio entre repositorios.",
+  "CrossRepoChangePlanner.descriptionLabel": "Describe el cambio coordinado",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "p. ej. Renombra el campo `widgetId` a `widgetKey` en la API, el cliente web y la documentación.",
+  "CrossRepoChangePlanner.generateButton": "Generar plan",
+  "CrossRepoChangePlanner.statusDraft": "Borrador — aún no aprobado",
+  "CrossRepoChangePlanner.statusApproved": "Aprobado",
+  "CrossRepoChangePlanner.approveButton": "Aprobar plan",
+  "CrossRepoChangePlanner.approveGateNote": "Ningún repositorio se modifica hasta que apruebes este plan. Edita antes el texto o el orden de los pasos si hace falta.",
+  "CrossRepoChangePlanner.startOverButton": "Volver a empezar",
+  "CrossRepoChangePlanner.moveUp": "Mover paso hacia arriba",
+  "CrossRepoChangePlanner.moveDown": "Mover paso hacia abajo",
+  "CrossRepoChangePlanner.dependsOn": "Depende de: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "Resumen",
+  "CrossRepoChangePlanner.changesLabel": "Qué cambia",
+  "CrossRepoChangePlanner.risksLabel": "Qué podría fallar",
+  "CrossRepoChangePlanner.rollbackLabel": "Reversión",
+  "CrossRepoChangePlanner.branchSectionHeading": "Creación de rama",
+  "CrossRepoChangePlanner.branchCreated": "Rama creada: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "Repositorio de GitHub",
+  "CrossRepoChangePlanner.baseRefLabel": "Ref base",
+  "CrossRepoChangePlanner.branchPrefixLabel": "Prefijo de la rama propia",
+  "CrossRepoChangePlanner.labelLabel": "Etiqueta de la tarea",
+  "CrossRepoChangePlanner.createBranchButton": "Crear rama",
+  "CrossRepoChangePlanner.approveFirstHint": "Aprueba el plan antes de crear una rama para este paso.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "Escribe {{phrase}} para confirmar",
+  "CrossRepoChangePlanner.confirmCancel": "Cancelar",
+  "CrossRepoChangePlanner.confirmExecute": "Confirmar",
+  "CrossRepoChangePlanner.pushFollowUpNote": "Esto solo crea ramas locales propias de la aplicación. Subir una rama y abrir un PR en borrador sigue siendo una acción manual posterior en Ajustes → Entrega de Git, con el mismo paso de confirmación escribiendo la frase, igual que en el flujo de Issue-to-PR.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

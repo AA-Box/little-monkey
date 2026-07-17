@@ -13,6 +13,7 @@ import { mcpGeneratorLocale } from "./mcpGenerator";
 import { onboardingLocale } from "./onboarding";
 import { specScorerLocale } from "./specScorer";
 import { dailyBriefLocale } from "./dailyBrief";
+import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 
 export const it: Record<string, string> = {
@@ -354,6 +355,7 @@ export const it: Record<string, string> = {
   "McpGenerator.statusNotClean": "Non pulito secondo il simulatore",
   "McpGenerator.statusNotSimulated": "Non simulato",
   ...dailyBriefLocale,
+  ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   // Real Italian translations, overriding every dailyBriefLocale key above.
   "AppMenu.dailyBrief": "Riepilogo giornaliero",
@@ -399,6 +401,39 @@ export const it: Record<string, string> = {
   "DailyBriefPanel.runtime.storage": "{{used}} utilizzati su {{quota}} di spazio modelli",
   "DailyBriefPanel.runtime.open": "Apri in Impostazioni › Runtime Hub",
   "DailyBriefPanel.runtime.error": "Aggiornamento della panoramica di Runtime Hub non riuscito: {{error}}",
+  // Real Italian translations, overriding every crossRepoChangePlannerLocale key above.
+  "AppMenu.crossRepoChangePlanner": "Pianificatore di modifiche cross-repo",
+  "CrossRepoChangePlanner.title": "Pianificatore di modifiche cross-repo",
+  "CrossRepoChangePlanner.subtitle": "Descrivi una volta una modifica coordinata. Rivedi un piano ordinato per cartella root con note su rischi e rollback, quindi approvalo prima che qualsiasi repository venga toccato.",
+  "CrossRepoChangePlanner.close": "Chiudi il pianificatore di modifiche cross-repo",
+  "CrossRepoChangePlanner.noRootsWarning": "Nessuna cartella dell'area di lavoro è collegata. Apri una cartella primaria (e facoltativamente collega cartelle secondarie) prima di pianificare una modifica cross-repo.",
+  "CrossRepoChangePlanner.descriptionLabel": "Descrivi la modifica coordinata",
+  "CrossRepoChangePlanner.descriptionPlaceholder": "es. Rinomina il campo `widgetId` in `widgetKey` in API, client web e documentazione.",
+  "CrossRepoChangePlanner.generateButton": "Genera piano",
+  "CrossRepoChangePlanner.statusDraft": "Bozza — non ancora approvata",
+  "CrossRepoChangePlanner.statusApproved": "Approvata",
+  "CrossRepoChangePlanner.approveButton": "Approva piano",
+  "CrossRepoChangePlanner.approveGateNote": "Nessun repository viene toccato finché non approvi questo piano. Modifica prima il testo o l'ordine dei passaggi, se necessario.",
+  "CrossRepoChangePlanner.startOverButton": "Ricomincia",
+  "CrossRepoChangePlanner.moveUp": "Sposta il passaggio in su",
+  "CrossRepoChangePlanner.moveDown": "Sposta il passaggio in giù",
+  "CrossRepoChangePlanner.dependsOn": "Dipende da: {{roots}}",
+  "CrossRepoChangePlanner.summaryLabel": "Riepilogo",
+  "CrossRepoChangePlanner.changesLabel": "Cosa cambia",
+  "CrossRepoChangePlanner.risksLabel": "Cosa potrebbe rompersi",
+  "CrossRepoChangePlanner.rollbackLabel": "Rollback",
+  "CrossRepoChangePlanner.branchSectionHeading": "Creazione branch",
+  "CrossRepoChangePlanner.branchCreated": "Branch creato: {{branch}}",
+  "CrossRepoChangePlanner.repositorySlugLabel": "Repository GitHub",
+  "CrossRepoChangePlanner.baseRefLabel": "Ref di base",
+  "CrossRepoChangePlanner.branchPrefixLabel": "Prefisso del branch di proprietà",
+  "CrossRepoChangePlanner.labelLabel": "Etichetta attività",
+  "CrossRepoChangePlanner.createBranchButton": "Crea branch",
+  "CrossRepoChangePlanner.approveFirstHint": "Approva il piano prima di creare un branch per questo passaggio.",
+  "CrossRepoChangePlanner.confirmTypePhrase": "Digita {{phrase}} per confermare",
+  "CrossRepoChangePlanner.confirmCancel": "Annulla",
+  "CrossRepoChangePlanner.confirmExecute": "Conferma",
+  "CrossRepoChangePlanner.pushFollowUpNote": "Questo crea solo branch locali di proprietà dell'app. Eseguire il push di un branch e aprire una PR in bozza resta un'azione manuale successiva in Impostazioni → Consegna Git, con lo stesso passaggio di conferma tramite digitazione della frase, esattamente come il flusso Issue-to-PR.",
   "ComparePicker.toolsBadge": "Tools",
   "ComparePicker.visionBadge": "Vision",
   "ComparePicker.capabilitySupported": "supported",

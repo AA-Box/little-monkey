@@ -20,6 +20,7 @@ import { RedTeamLabPanel } from "./components/RedTeamLab";
 import { KnowledgeGraphExplorerPanel } from "./components/KnowledgeGraphExplorer";
 import { EvidenceBoardPanel } from "./components/EvidenceBoard";
 import { DailyBriefPanel } from "./components/DailyBrief";
+import { CrossRepoChangePlannerPanel } from "./components/CrossRepoChangePlanner";
 import { VisualEditModePanel } from "./components/VisualEditMode";
 import { TerminalPanel } from "./components/Terminal";
 import { DebatePanel } from "./components/Debate";
@@ -125,6 +126,7 @@ function App() {
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const [evidenceBoardOpen, setEvidenceBoardOpen] = useState(false);
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
+  const [crossRepoPlannerOpen, setCrossRepoPlannerOpen] = useState(false);
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [debateOpen, setDebateOpen] = useState(false);
@@ -155,6 +157,7 @@ function App() {
     setEvidenceBoardOpen(false);
     setDebateOpen(false);
     setDailyBriefOpen(false);
+    setCrossRepoPlannerOpen(false);
     setVisualEditModeOpen(false);
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
@@ -218,6 +221,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setCrossRepoPlannerOpen(false);
           setVisualEditModeOpen(false);
           setSettingsOpen(false);
           setSettingsInitialTab(undefined);
@@ -233,6 +237,7 @@ function App() {
           setEvidenceBoardOpen(false);
           setDebateOpen(false);
           setDailyBriefOpen(false);
+          setCrossRepoPlannerOpen(false);
           setVisualEditModeOpen(false);
           setSettingsInitialTab(undefined);
           setSettingsOpen(true);
@@ -427,6 +432,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setSettingsOpen(true);
           }}
@@ -445,6 +451,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setRunCenterOpen(true);
@@ -464,6 +471,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setGlobalSearchOpen(true);
@@ -483,6 +491,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
@@ -577,6 +586,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setSettingsInitialTab(undefined);
             setAgentInboxOpen(true);
@@ -645,6 +655,7 @@ function App() {
             setGlobalSearchOpen(false);
             setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
+            setCrossRepoPlannerOpen(false);
             setVisualEditModeOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -652,6 +663,26 @@ function App() {
             setDebateOpen(false);
             setSettingsInitialTab(undefined);
             setDailyBriefOpen(true);
+          }}
+          onOpenCrossRepoChangePlanner={() => {
+            setSettingsOpen(false);
+            setRunCenterOpen(false);
+            setBrowserWorkbenchOpen(false);
+            setIssueToPrOpen(false);
+            setTrustScorecardsOpen(false);
+            setSopCompilerOpen(false);
+            setMcpGeneratorOpen(false);
+            setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
+            setAgentInboxOpen(false);
+            setRedTeamLabOpen(false);
+            setKnowledgeGraphOpen(false);
+            setEvidenceBoardOpen(false);
+            setDebateOpen(false);
+            setDailyBriefOpen(false);
+            setVisualEditModeOpen(false);
+            setSettingsInitialTab(undefined);
+            setCrossRepoPlannerOpen(true);
           }}
           onOpenVisualEditMode={() => {
             setSettingsOpen(false);
@@ -669,6 +700,7 @@ function App() {
             setEvidenceBoardOpen(false);
             setDebateOpen(false);
             setDailyBriefOpen(false);
+            setCrossRepoPlannerOpen(false);
             setSettingsInitialTab(undefined);
             setVisualEditModeOpen(true);
           }}
@@ -724,7 +756,7 @@ function App() {
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : evidenceBoardOpen ? "evidence-board" : dailyBriefOpen ? "daily-brief" : crossRepoPlannerOpen ? "cross-repo-planner" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : issueToPrOpen ? "issue-to-pr" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
           {globalSearchOpen ? (
             <GlobalSearch
               onClose={() => setGlobalSearchOpen(false)}
@@ -763,8 +795,11 @@ function App() {
               }}
               onOpenSettingsTab={openSettingsTab}
             />
+          ) : crossRepoPlannerOpen ? (
+            <CrossRepoChangePlannerPanel onClose={() => setCrossRepoPlannerOpen(false)} />
           ) : visualEditModeOpen ? (
             <VisualEditModePanel onClose={() => setVisualEditModeOpen(false)} />
+
           ) : runCenterOpen ? (
             <RunCenter onClose={() => setRunCenterOpen(false)} />
           ) : debateOpen ? (
@@ -818,7 +853,7 @@ function App() {
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !evidenceBoardOpen && !dailyBriefOpen && !crossRepoPlannerOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !issueToPrOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
