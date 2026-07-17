@@ -414,6 +414,51 @@ describe("settingsStore.skillAutoInvokeEnabled", () => {
   });
 });
 
+describe("settingsStore.desktopControlEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ desktopControlEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same "disabled = not offered" posture as `subagentsEnabled`/
+    // `skillAutoInvokeEnabled` above: Safe Desktop Control (see
+    // src-tauri/src/desktop_control.rs) is a research spike that can move
+    // the real mouse/keyboard on macOS, so it defaults off regardless of
+    // whatever else is persisted.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().desktopControlEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setDesktopControlEnabled(true);
+    expect(useSettingsStore.getState().desktopControlEnabled).toBe(true);
+    useSettingsStore.getState().setDesktopControlEnabled(false);
+    expect(useSettingsStore.getState().desktopControlEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setDesktopControlEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().desktopControlEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ desktopControlEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().desktopControlEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
 describe("settingsStore.maxConcurrentSubagents", () => {
   beforeEach(() => {
     useSettingsStore.setState({ maxConcurrentSubagents: 2 });

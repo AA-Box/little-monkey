@@ -39,6 +39,7 @@ The current working tree includes the shipped foundations described below. Some 
 ### Runtime and API Hub
 
 - Inspect CPU/memory and runtime inventory, estimate model fit, search configured catalogs, resume verified downloads, activate/roll back model versions, prune old versions, clean owned orphan data, and load/unload supported runtimes.
+- Track each installed model's source registry, license, quantization, chat template, and multimodal projector in a content-addressed, digest-verified manifest; reuse an already-verified payload across asset variants/versions instead of re-downloading identical bytes, and never trust a corrupt local copy for reuse.
 - Manage Ollama, `llama.cpp`, and MLX through one runtime contract with capability preflight, owned-process shutdown, logs, metrics, cancellation, and resource-aware scheduling.
 - Serve the advertised OpenAI-compatible routes and Anthropic-compatible Messages subset, plus separately scoped model discovery/download/load/unload/status/delete routes.
 - Keep loopback as the default. Non-loopback serving requires an exact interface, TLS identity, authentication, pairing, rate limits, an exact CORS allowlist, explicit backends/scopes, and a policy that excludes file, shell, Git, MCP, and other agent-tool routes.
