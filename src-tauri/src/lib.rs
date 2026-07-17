@@ -837,6 +837,7 @@ pub fn run() {
             sandbox::sandbox_discard,
             m3_commands::m3_hardware_snapshot,
             m3_commands::m3_hardware_profile,
+            m3_commands::m3_hardware_compatibility_report,
             m3_commands::m3_storage_status,
             m3_commands::m3_installed_models,
             m3_commands::m3_catalog_sources,

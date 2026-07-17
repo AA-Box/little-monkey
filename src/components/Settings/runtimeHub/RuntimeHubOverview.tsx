@@ -1,7 +1,24 @@
 import { Boxes, Cpu, Database, Gauge, HardDrive, Server } from "lucide-react";
 import { StatusPill } from "../../ui";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
+import type { M3AcceleratorStatus } from "../../../lib/runtimeHubClient";
 import { ErrorNotice, formatBytes, labelize, SectionHeading } from "./RuntimeHubShared";
+
+const COMPATIBILITY_TONE: Record<M3AcceleratorStatus, "success" | "warning" | "danger" | "neutral"> = {
+  available: "success",
+  not_detected: "neutral",
+  driver_too_old: "danger",
+  tool_missing: "warning",
+  unsupported: "neutral",
+};
+
+const COMPATIBILITY_LABEL: Record<M3AcceleratorStatus, string> = {
+  available: "Available",
+  not_detected: "Not detected",
+  driver_too_old: "Driver too old",
+  tool_missing: "Tool missing",
+  unsupported: "Unsupported here",
+};
 
 function MetricCard({
   icon: Icon,
@@ -33,6 +50,8 @@ export function RuntimeHubOverview() {
   const installedModels = useRuntimeHubStore((state) => state.installedModels);
   const runtimes = useRuntimeHubStore((state) => state.runtimes);
   const error = useRuntimeHubStore((state) => state.errors.overview);
+  const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
+  const compatibilityError = useRuntimeHubStore((state) => state.errors.compatibility);
 
   const usedPercent = storage?.quotaBytes
     ? Math.min(100, Math.max(0, (storage.usedBytes / storage.quotaBytes) * 100))
@@ -158,6 +177,60 @@ export function RuntimeHubOverview() {
           )}
         </div>
         {hardware && <p className="mt-3 text-xs text-muted">Snapshot captured {new Date(hardware.captured_at_ms).toLocaleString()}.</p>}
+      </section>
+
+      <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="runtime-compatibility-heading">
+        <SectionHeading
+          title="Hardware compatibility matrix (Driver Doctor)"
+          description="What will work, what falls back to CPU, and what needs a driver or runtime update — checked before you download, load, or install."
+        />
+        <ErrorNotice message={compatibilityError} />
+        <div id="runtime-compatibility-heading" className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[40rem] text-left text-xs">
+            <thead className="text-muted">
+              <tr className="border-b border-border">
+                <th className="px-2 py-2 font-medium">Backend</th>
+                <th className="px-2 py-2 font-medium">Status</th>
+                <th className="px-2 py-2 font-medium">Driver / compute</th>
+                <th className="px-2 py-2 font-medium">Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {compatibilityReport ? (
+                compatibilityReport.accelerators.map((accelerator) => (
+                  <tr key={accelerator.kind} className="border-b border-border/60 last:border-0">
+                    <td className="px-2 py-3 font-medium text-foreground">{labelize(accelerator.kind)}</td>
+                    <td className="px-2 py-3">
+                      <StatusPill tone={COMPATIBILITY_TONE[accelerator.status]}>
+                        {COMPATIBILITY_LABEL[accelerator.status]}
+                        {!accelerator.confirmed ? " (unconfirmed)" : ""}
+                      </StatusPill>
+                    </td>
+                    <td className="px-2 py-3 text-muted">
+                      {[accelerator.driverVersion, accelerator.computeCapability].filter(Boolean).join(" · ") || "—"}
+                    </td>
+                    <td className="px-2 py-3 text-muted">{accelerator.summary}</td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={4} className="px-2 py-3 text-muted">Detecting hardware compatibility…</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        {compatibilityReport?.jetson.detected && (
+          <p className="mt-3 text-xs text-muted">
+            Jetson device detected{compatibilityReport.jetson.model ? `: ${compatibilityReport.jetson.model}` : ""}. Use Jetson-appropriate CUDA/TensorRT builds rather than desktop CUDA packages.
+          </p>
+        )}
+        {compatibilityReport?.hybridGraphicsDetected && (
+          <p className="mt-2 text-xs text-muted">Hybrid or multi-GPU configuration detected; device selection may need to be explicit rather than automatic.</p>
+        )}
+        {compatibilityReport?.notes.map((note, index) => (
+          <p key={`compat-note-${index}`} className="mt-2 text-xs text-muted">{note}</p>
+        ))}
       </section>
 
       <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="runtime-capability-matrix-heading">

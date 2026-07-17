@@ -49,6 +49,39 @@ export interface HardwareProfile {
   preferred_accelerator: AcceleratorKind;
 }
 
+/** Hardware Compatibility Matrix / "Driver Doctor" status for one backend. */
+export type M3AcceleratorStatus =
+  | "available"
+  | "not_detected"
+  | "driver_too_old"
+  | "tool_missing"
+  | "unsupported";
+
+export interface M3AcceleratorCompatibility {
+  kind: AcceleratorKind;
+  status: M3AcceleratorStatus;
+  summary: string;
+  deviceNames: string[];
+  driverVersion: string | null;
+  computeCapability: string | null;
+  confirmed: boolean;
+}
+
+export interface M3JetsonInfo {
+  detected: boolean;
+  model: string | null;
+}
+
+export interface M3HardwareCompatibilityReport {
+  capturedAtMs: number;
+  os: string;
+  arch: string;
+  accelerators: M3AcceleratorCompatibility[];
+  jetson: M3JetsonInfo;
+  hybridGraphicsDetected: boolean;
+  notes: string[];
+}
+
 export interface M3StorageStatus {
   root: string;
   quotaBytes: number;
@@ -489,6 +522,8 @@ export async function sha256Text(value: string): Promise<string> {
 export const runtimeHubClient = {
   hardwareSnapshot: () => invoke<HardwareSnapshot>("m3_hardware_snapshot"),
   hardwareProfile: () => invoke<HardwareProfile>("m3_hardware_profile"),
+  hardwareCompatibilityReport: () =>
+    invoke<M3HardwareCompatibilityReport>("m3_hardware_compatibility_report"),
   storageStatus: () => invoke<M3StorageStatus>("m3_storage_status"),
   installedModels: () => invoke<M3InstalledModel[]>("m3_installed_models"),
   catalogSources: () => invoke<M3CatalogSourceConfig[]>("m3_catalog_sources"),
