@@ -3,6 +3,7 @@ import { AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, Tabs } from "../ui";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
+import { EcosystemDiscover } from "./EcosystemDiscover";
 import { EcosystemPackages } from "./EcosystemPackages";
 import { EcosystemPlugins } from "./EcosystemPlugins";
 import { EcosystemMcpApps, EcosystemOAuth } from "./EcosystemConnections";
@@ -60,7 +61,7 @@ export function EcosystemPanel() {
         </div>
       )}
 
-      {tab === "marketplace" && <EcosystemPackages view="marketplace" />}
+      {tab === "marketplace" && <EcosystemDiscover />}
       {tab === "installed" && <EcosystemPackages view="installed" />}
       {tab === "plugins" && <EcosystemPlugins />}
       {tab === "connections" && <EcosystemOAuth />}
