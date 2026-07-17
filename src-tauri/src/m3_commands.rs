@@ -9,6 +9,10 @@ use crate::compatibility_hub::{
     LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest, ScopedTokenView,
     SecurityAuditEvent,
 };
+use crate::context_cache::{
+    self, ContextCacheView, ContextFailureClassification, ContextFailureInput, ContextRuntimeKind,
+    EffectiveContextInput, EffectiveContextResolution,
+};
 use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
@@ -16,12 +20,14 @@ use crate::m3_runtime_hub::{
     M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck, M3DeleteModelRequest,
     M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
     M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
-    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeMetricsView,
-    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus, M3UnloadModelRequest,
+    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind,
+    M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus,
+    M3UnloadModelRequest,
 };
 use crate::runtime_adapter::{
     HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
-    OffloadPlanInput, RuntimeInventory, RuntimeLogTail, SchedulingInput, SchedulingPlan,
+    OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState, RuntimeLogTail,
+    SchedulingInput, SchedulingPlan,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -410,6 +416,138 @@ pub async fn m3_runtime_metrics(
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.runtime_metrics(&runtime_id, &context).await;
     finish(&state, &operation_id, result).await
+}
+
+fn context_runtime_kind(kind: M3RuntimeKind) -> ContextRuntimeKind {
+    match kind {
+        M3RuntimeKind::Ollama => ContextRuntimeKind::Ollama,
+        M3RuntimeKind::LlamaCpp => ContextRuntimeKind::LlamaCpp,
+        M3RuntimeKind::Mlx => ContextRuntimeKind::Mlx,
+    }
+}
+
+fn context_cache_sampled_at_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Context window / KV-cache state for one runtime: the context size this
+/// app has configured (or will configure) for its next load, plus — for a
+/// managed, currently running llama.cpp process — whatever live state its
+/// `/props` and `/slots` endpoints actually report. Ollama and MLX honestly
+/// report only what this app itself knows (the requested setting), since
+/// neither backend's API surfaces live KV-cache/context occupancy today.
+async fn context_cache_state_impl(
+    state: &M3CommandState,
+    runtime_id: &str,
+    context: &M3OperationContext,
+) -> Result<ContextCacheView, M3HubError> {
+    let capability = state
+        .hub
+        .list_runtimes()?
+        .into_iter()
+        .find(|entry| entry.descriptor.runtime_id == runtime_id)
+        .ok_or_else(|| M3HubError::NotFound(format!("unknown runtime {runtime_id}")))?;
+    let kind = context_runtime_kind(capability.descriptor.kind);
+    let persisted = state.hub.runtime_config(runtime_id)?;
+    let configured = context_cache::resolve_configured_context(
+        &capability.settings,
+        persisted.as_ref(),
+        context_cache::configured_context_key_candidates(kind),
+    );
+
+    let mut live = None;
+    if kind == ContextRuntimeKind::LlamaCpp {
+        if let Ok(M3RuntimeStatusView::Adapter { status, .. }) =
+            state.hub.runtime_status(runtime_id, context).await
+        {
+            let reachable = matches!(status.state, RuntimeLifecycleState::Ready | RuntimeLifecycleState::Starting);
+            if reachable {
+                if let Ok(transport) = ReqwestHttpTransport::new() {
+                    let cancellation = CancellationToken::new();
+                    live = Some(
+                        context_cache::fetch_llama_cpp_live_context_state(
+                            &status.runtime.endpoint,
+                            &transport,
+                            &cancellation,
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+    }
+
+    let reported_context_tokens = live.as_ref().and_then(|live| live.reported_context_tokens);
+    let context_tokens_in_use = live
+        .as_ref()
+        .and_then(|live| live.slots.iter().filter_map(|slot| slot.tokens_in_use).max());
+    let context_shift_detected = live.as_ref().and_then(|live| {
+        if live.slots.is_empty() {
+            None
+        } else if live.slots.iter().any(|slot| slot.context_shifted == Some(true)) {
+            Some(true)
+        } else if live.slots.iter().all(|slot| slot.context_shifted == Some(false)) {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    let total_slots = live.as_ref().and_then(|live| live.total_slots);
+    let notes = context_cache::context_cache_notes(kind, live.as_ref());
+    let effective_context_tokens = reported_context_tokens.or(configured.tokens);
+
+    Ok(ContextCacheView {
+        runtime_id: runtime_id.to_string(),
+        runtime_kind: kind,
+        configured,
+        reported_context_tokens,
+        context_tokens_in_use,
+        context_headroom_tokens: context_cache::context_headroom(effective_context_tokens, context_tokens_in_use),
+        context_shift_detected,
+        total_slots,
+        notes,
+        sampled_at_ms: context_cache_sampled_at_ms(),
+    })
+}
+
+#[tauri::command]
+pub async fn m3_context_cache_state(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    runtime_id: String,
+) -> Result<ContextCacheView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = context_cache_state_impl(&state, &runtime_id, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+/// Resolves a safe, user-visible effective context size for a load: the
+/// frontend supplies its requested size plus the already-computed offload
+/// plan's memory-aware bound (see `m3_offload_plan`) and any known model
+/// metadata/runtime setting bounds; this only tightens those bounds further
+/// and explains every reduction, never bypasses them.
+#[tauri::command]
+pub fn m3_context_effective_size(
+    input: EffectiveContextInput,
+) -> Result<EffectiveContextResolution, String> {
+    Ok(context_cache::resolve_effective_context(&input))
+}
+
+/// Classifies a plausibly context/cache-related generation failure or
+/// degradation into one of five categories (prompt too long, cache
+/// exhausted/context shift, memory pressure, runtime limitation, model
+/// metadata limit) with a plain-language explanation, or returns `null` when
+/// the supplied evidence gives no reason to believe context/cache/memory was
+/// the cause.
+#[tauri::command]
+pub fn m3_classify_context_failure(
+    input: ContextFailureInput,
+) -> Result<Option<ContextFailureClassification>, String> {
+    Ok(context_cache::classify_context_failure(&input))
 }
 
 #[tauri::command]

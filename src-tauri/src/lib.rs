@@ -70,6 +70,11 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+// Context window / KV-cache observability and long-context failure
+// classification (Phase 8, "Context and KV Cache Control Center"). Builds on
+// `runtime_adapter`'s settings/offload-planner types rather than duplicating
+// them.
+pub mod context_cache;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
@@ -889,6 +894,9 @@ pub fn run() {
             m3_commands::m3_runtime_unload_model,
             m3_commands::m3_runtime_logs,
             m3_commands::m3_runtime_metrics,
+            m3_commands::m3_context_cache_state,
+            m3_commands::m3_context_effective_size,
+            m3_commands::m3_classify_context_failure,
             m3_commands::m3_runtime_set_config,
             m3_commands::m3_runtime_config,
             m3_commands::m3_api_dispatch,
