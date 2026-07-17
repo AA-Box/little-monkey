@@ -11,15 +11,17 @@ use crate::compatibility_hub::{
 };
 use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
-    M3ActivateModelVersionRequest, M3ApiDispatchRequest, M3ApiDispatchResponse,
-    M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport, M3DeleteModelRequest,
-    M3DownloadRequest, M3HubError, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
+    M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
+    M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
+    M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck, M3DeleteModelRequest,
+    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
+    M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
     M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeMetricsView,
     M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus, M3UnloadModelRequest,
 };
 use crate::runtime_adapter::{
-    HardwareProfile, HardwareSnapshot, LocalRuntimeScheduler, RuntimeInventory, RuntimeLogTail,
-    SchedulingInput, SchedulingPlan,
+    HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
+    OffloadPlanInput, RuntimeInventory, RuntimeLogTail, SchedulingInput, SchedulingPlan,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -32,15 +34,21 @@ pub trait M3OwnedProcessShutdown: Send + Sync {
 
 pub struct M3CommandState {
     pub hub: Arc<M3RuntimeHub>,
+    /// Runtime component (llama.cpp/MLX/tokenizer/converter/projector/
+    /// accelerator-support) version manager. Kept as a separate hub from
+    /// `hub` — see `m3_runtime_hub`'s "Runtime Component Update Channels"
+    /// module section for why.
+    pub component_hub: Arc<M3ComponentHub>,
     operations: Mutex<BTreeMap<String, CancellationToken>>,
     catalog_mutation: Mutex<()>,
     owned_processes: Option<Arc<dyn M3OwnedProcessShutdown>>,
 }
 
 impl M3CommandState {
-    pub fn new(hub: Arc<M3RuntimeHub>) -> Self {
+    pub fn new(hub: Arc<M3RuntimeHub>, component_hub: Arc<M3ComponentHub>) -> Self {
         Self {
             hub,
+            component_hub,
             operations: Mutex::new(BTreeMap::new()),
             catalog_mutation: Mutex::new(()),
             owned_processes: None,
@@ -49,10 +57,12 @@ impl M3CommandState {
 
     pub fn with_owned_processes(
         hub: Arc<M3RuntimeHub>,
+        component_hub: Arc<M3ComponentHub>,
         owned_processes: Arc<dyn M3OwnedProcessShutdown>,
     ) -> Self {
         Self {
             hub,
+            component_hub,
             operations: Mutex::new(BTreeMap::new()),
             catalog_mutation: Mutex::new(()),
             owned_processes: Some(owned_processes),
@@ -156,6 +166,19 @@ pub fn m3_hardware_profile(
     state.hub.hardware_profile().map_err(command_error)
 }
 
+/// Hardware Compatibility Matrix / "Driver Doctor" report. The frontend
+/// fetches this before starting a model download, model load, or runtime
+/// install so the user sees a concrete compatibility report first.
+#[tauri::command]
+pub fn m3_hardware_compatibility_report(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3HardwareCompatibilityReport, String> {
+    state
+        .hub
+        .hardware_compatibility_report()
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub fn m3_storage_status(
     state: tauri::State<'_, M3CommandState>,
@@ -207,6 +230,16 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Simulates fit and computes a per-load offload plan (context size, batch
+/// size, GPU layers, projector placement, CPU spill, and parallelism) before
+/// a model is actually loaded. Pure and read-only like `m3_schedule_plan`:
+/// the frontend supplies a live hardware snapshot and the selected model's
+/// profile, and this never touches a runtime process.
+#[tauri::command]
+pub fn m3_offload_plan(input: OffloadPlanInput) -> Result<OffloadPlan, String> {
+    LocalOffloadPlanner::plan(&input).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -502,4 +535,89 @@ pub fn m3_lan_audit_events(
     state: tauri::State<'_, M3CommandState>,
 ) -> Result<Vec<SecurityAuditEvent>, String> {
     state.hub.security_audit_events().map_err(command_error)
+}
+
+// -------------------------------------------------------------------------
+// Runtime Component Update Channels
+// -------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn m3_component_storage_status(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3StorageStatus, String> {
+    state.component_hub.storage_status().map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m3_component_installed(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<M3InstalledComponentView>, String> {
+    state.component_hub.list_installed().map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m3_component_registry_entries(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    crate::m3_production::component_registry_entries(state.component_hub.root())
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn m3_component_replace_registry_entries(
+    state: tauri::State<'_, M3CommandState>,
+    entries: Vec<M3ComponentCatalogEntry>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let _guard = command_lock(&state.catalog_mutation)?;
+    crate::m3_production::replace_component_registry_entries(&state.component_hub, entries)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub async fn m3_component_list_registry(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.component_hub.list_registry(&context).await;
+    finish(&state, &operation_id, result).await
+}
+
+#[tauri::command]
+pub async fn m3_component_check_updates(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<M3ComponentUpdateCheck>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.component_hub.check_updates(&context).await;
+    finish(&state, &operation_id, result).await
+}
+
+#[tauri::command]
+pub async fn m3_component_install(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3InstallComponentRequest,
+) -> Result<M3InstalledComponentView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.component_hub.install_component(&request, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+#[tauri::command]
+pub async fn m3_component_activate_version(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3ActivateComponentVersionRequest,
+) -> Result<M3InstalledComponentView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state
+        .component_hub
+        .activate_component_version(&request, &context)
+        .await;
+    finish(&state, &operation_id, result).await
 }
