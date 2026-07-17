@@ -1322,7 +1322,7 @@ export const ko: Record<string, string> = {
   "RedTeamLab.source.screenshotOcr": "스크린샷 OCR",
   "RedTeamLab.source.knowledgeSource": "지식 소스",
   "RedTeamLab.source.webSearchResult": "웹 검색 결과",
-  "RedTeamLab.source.subagentOutput": "서브에이전트 출력"
+  "RedTeamLab.source.subagentOutput": "서브에이전트 출력",
 
   "EcosystemDiscover.searchLabel": "디스커버리 허브 검색",
   "EcosystemDiscover.searchPlaceholder": "패키지, 게시자 또는 기능 검색…",

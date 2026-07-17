@@ -1322,7 +1322,7 @@ export const ja: Record<string, string> = {
   "RedTeamLab.source.screenshotOcr": "スクリーンショットOCR",
   "RedTeamLab.source.knowledgeSource": "ナレッジソース",
   "RedTeamLab.source.webSearchResult": "Web検索結果",
-  "RedTeamLab.source.subagentOutput": "サブエージェント出力"
+  "RedTeamLab.source.subagentOutput": "サブエージェント出力",
 
   "EcosystemDiscover.searchLabel": "ディスカバリーハブを検索",
   "EcosystemDiscover.searchPlaceholder": "パッケージ、発行者、機能を検索…",

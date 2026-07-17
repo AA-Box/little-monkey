@@ -1322,7 +1322,7 @@ export const id: Record<string, string> = {
   "RedTeamLab.source.screenshotOcr": "OCR tangkapan layar",
   "RedTeamLab.source.knowledgeSource": "Sumber pengetahuan",
   "RedTeamLab.source.webSearchResult": "Hasil pencarian web",
-  "RedTeamLab.source.subagentOutput": "Output subagen"
+  "RedTeamLab.source.subagentOutput": "Output subagen",
 
   "EcosystemDiscover.searchLabel": "Cari di hub penemuan",
   "EcosystemDiscover.searchPlaceholder": "Cari paket, penerbit, atau kemampuan…",
