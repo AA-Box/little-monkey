@@ -27,6 +27,13 @@ interface TerminalStatusEvent {
   session: TerminalSession;
 }
 
+/** Mirrors Rust `TerminalIdentity` — local `user`/`host` shown in the prompt
+ * line. Purely cosmetic; never carries workspace or secret data. */
+export interface TerminalIdentity {
+  user: string;
+  host: string;
+}
+
 export interface TerminalEvidence {
   id: string;
   terminalSessionId: string;
@@ -38,6 +45,53 @@ export interface TerminalEvidence {
 
 export const MAX_TERMINAL_OUTPUT_CHARS = 256 * 1024;
 export const MAX_TERMINAL_EVIDENCE_CHARS = 12_000;
+
+/** Where the terminal panel is docked — bottom strip (default) or a
+ * right-hand sidebar column. A user-selected UI preference, persisted. */
+export type TerminalDock = "bottom" | "right";
+
+const DOCK_STORAGE_KEY = "little-monkey-terminal-dock";
+const SIZE_STORAGE_KEY = "little-monkey-terminal-size";
+
+/** Panel size per dock side, px: height when bottom-docked, width when
+ * right-docked. Clamped on read so a corrupted stored value can't wedge the
+ * panel off-screen. */
+export interface TerminalPanelSize {
+  bottom: number;
+  right: number;
+}
+
+export const TERMINAL_MIN_SIZE = 180;
+const DEFAULT_SIZE: TerminalPanelSize = { bottom: 320, right: 420 };
+
+export function clampTerminalSize(value: number): number {
+  const viewportCap = Math.max(
+    TERMINAL_MIN_SIZE,
+    Math.floor((typeof window === "undefined" ? 1200 : Math.max(window.innerWidth, window.innerHeight)) * 0.85),
+  );
+  return Math.min(viewportCap, Math.max(TERMINAL_MIN_SIZE, Math.round(value)));
+}
+
+function readInitialDock(): TerminalDock {
+  try {
+    const stored = localStorage.getItem(DOCK_STORAGE_KEY);
+    return stored === "right" ? "right" : "bottom";
+  } catch {
+    return "bottom";
+  }
+}
+
+function readInitialSize(): TerminalPanelSize {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SIZE_STORAGE_KEY) ?? "");
+    return {
+      bottom: clampTerminalSize(Number(stored?.bottom) || DEFAULT_SIZE.bottom),
+      right: clampTerminalSize(Number(stored?.right) || DEFAULT_SIZE.right),
+    };
+  } catch {
+    return { ...DEFAULT_SIZE };
+  }
+}
 
 /** Removes terminal control sequences and normalizes carriage-return output
  * before search, display, or model-context review. The PTY's raw bounded tail
@@ -81,8 +135,15 @@ export function buildTerminalEvidence(
 interface TerminalStore {
   sessions: TerminalSession[];
   activeSessionId: string | null;
+  /** User-selected dock side for the panel, persisted across restarts. */
+  dock: TerminalDock;
+  /** User-dragged panel size per dock side (px), persisted across restarts. */
+  panelSize: TerminalPanelSize;
+  setDock: (dock: TerminalDock) => void;
+  setPanelSize: (dock: TerminalDock, size: number) => void;
   historyByWorkspace: Record<string, string[]>;
   pendingEvidenceByChat: Record<string, TerminalEvidence[]>;
+  identity: TerminalIdentity | null;
   initialized: boolean;
   busy: boolean;
   error: string | null;
@@ -90,12 +151,18 @@ interface TerminalStore {
   createSession: (workspaceId: string, rows?: number, cols?: number) => Promise<TerminalSession>;
   setActive: (sessionId: string) => void;
   execute: (sessionId: string, command: string) => Promise<void>;
+  /** Raw keystroke path for the embedded emulator: forwards bytes to the PTY
+   * verbatim (arrows, tab, ^C, pastes) so the user's real shell does its own
+   * line editing/history/completions. Fire-and-forget error surface — a
+   * failed keystroke sets the store error but never throws mid-typing. */
+  write: (sessionId: string, data: string) => Promise<void>;
   interrupt: (sessionId: string) => Promise<void>;
   kill: (sessionId: string) => Promise<void>;
   restart: (sessionId: string, rows?: number, cols?: number) => Promise<TerminalSession>;
   close: (sessionId: string) => Promise<void>;
   resize: (sessionId: string, rows: number, cols: number) => Promise<void>;
   loadHistory: (workspaceId: string) => Promise<string[]>;
+  loadIdentity: () => Promise<void>;
   queueEvidence: (chatSessionId: string, evidence: TerminalEvidence) => void;
   consumeEvidence: (chatSessionId: string) => TerminalEvidence[];
   clearError: () => void;
@@ -142,8 +209,33 @@ export function disposeTerminalListenersForTests(): void {
 export const useTerminalStore = create<TerminalStore>((set, get) => ({
   sessions: [],
   activeSessionId: null,
+  dock: readInitialDock(),
+  panelSize: readInitialSize(),
+
+  setDock: (dock) => {
+    set({ dock });
+    try {
+      localStorage.setItem(DOCK_STORAGE_KEY, dock);
+    } catch {
+      // Best-effort persistence only.
+    }
+  },
+
+  setPanelSize: (dock, size) => {
+    const clamped = clampTerminalSize(size);
+    set((state) => {
+      const panelSize = { ...state.panelSize, [dock]: clamped };
+      try {
+        localStorage.setItem(SIZE_STORAGE_KEY, JSON.stringify(panelSize));
+      } catch {
+        // Best-effort persistence only.
+      }
+      return { panelSize };
+    });
+  },
   historyByWorkspace: {},
   pendingEvidenceByChat: {},
+  identity: null,
   initialized: false,
   busy: false,
   error: null,
@@ -200,6 +292,14 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
     } catch (error) {
       set({ busy: false, error: String(error) });
       throw error;
+    }
+  },
+
+  write: async (sessionId, data) => {
+    try {
+      await invoke("terminal_write", { sessionId, data });
+    } catch (error) {
+      set({ error: String(error) });
     }
   },
 
@@ -272,6 +372,17 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
     } catch (error) {
       set({ error: String(error) });
       return [];
+    }
+  },
+
+  loadIdentity: async () => {
+    if (get().identity || !isTauri()) return;
+    try {
+      const identity = await invoke<TerminalIdentity>("terminal_identity");
+      set({ identity });
+    } catch {
+      // Cosmetic prompt-line detail only — the panel falls back to the
+      // workspace path alone when identity can't be resolved.
     }
   },
 

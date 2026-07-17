@@ -1,17 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, FileText, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
+import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
   AdvancedSettingCapability,
+  ContextCacheView,
+  EffectiveContextResolution,
+  HardwareSnapshot,
   KeepAlive,
+  M3InstalledModel,
   M3RuntimeCapability,
   M3RuntimeKind,
+  OffloadPlan,
+  OffloadPlanInput,
   RunningModel,
   SettingValue,
 } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
 import {
   BusyButton,
+  CompatibilityWarningBanner,
   CONTROL_CLASS,
   ErrorNotice,
   Field,
@@ -67,6 +74,222 @@ export function keepAliveForRuntime(
     ? Math.min(1_440, Math.max(1, Math.round(minutes)))
     : 10;
   return { mode: "duration_ms", milliseconds: boundedMinutes * 60_000 };
+}
+
+/** Builds the pure input for `m3_offload_plan` from already-loaded Runtime
+ * Hub state: the live hardware snapshot, the model about to be loaded, and
+ * every other model currently resident on any runtime (so the plan reflects
+ * memory genuinely available right now, not just this runtime's own view). */
+export function buildOffloadPlanInput(
+  hardware: HardwareSnapshot,
+  model: M3InstalledModel,
+  runtimes: M3RuntimeCapability[],
+  runtimeDetails: Record<string, RuntimeDetail>,
+  requestedContextTokens?: number,
+): OffloadPlanInput {
+  const activeVersion = model.versions.find((version) => version.active);
+  const weightsBytes = activeVersion?.sizeBytes ?? model.estimatedRamBytes;
+  const others = runtimes
+    .flatMap((runtime) => runningModels(runtimeDetails[runtime.descriptor.runtimeId]))
+    .filter((resident) => resident.model_id !== model.modelId);
+  const reservedRamBytes = others.reduce((sum, resident) => sum + resident.memory_bytes, 0);
+  const reservedVramBytes = others.reduce((sum, resident) => sum + resident.vram_bytes, 0);
+  return {
+    hardware,
+    model: {
+      weights_bytes: weightsBytes,
+      estimated_ram_bytes: model.estimatedRamBytes,
+      estimated_vram_bytes: model.estimatedVramBytes,
+      required_accelerator: (model.requiredAccelerator as OffloadPlanInput["model"]["required_accelerator"]) ?? null,
+      has_vision_projector: model.capabilities.vision,
+    },
+    reserved: { ram_bytes: reservedRamBytes, vram_bytes: reservedVramBytes },
+    other_resident_count: others.length,
+    requested_context_tokens: requestedContextTokens ?? null,
+  };
+}
+
+const PROJECTOR_PLACEMENT_LABEL: Record<OffloadPlan["projector_placement"], string> = {
+  gpu: "GPU",
+  cpu: "CPU",
+  not_applicable: "N/A",
+};
+
+function OffloadPlanPanel({
+  plan,
+  busy,
+  error,
+}: {
+  plan: OffloadPlan | undefined;
+  busy: boolean | undefined;
+  error: string | undefined;
+}) {
+  if (!plan && !busy && !error) return null;
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3" aria-live="polite">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-foreground">Offload plan</p>
+        {busy && <StatusPill tone="neutral">Computing…</StatusPill>}
+      </div>
+      <ErrorNotice message={error} />
+      {plan && (
+        <>
+          <div className="mt-2 grid gap-2 text-xs text-muted sm:grid-cols-3">
+            <span>Accelerator: {labelize(plan.accelerator)}</span>
+            <span>
+              Context: {plan.context_tokens.toLocaleString()} tokens
+              {plan.context_tokens < plan.requested_context_tokens
+                ? ` (requested ${plan.requested_context_tokens.toLocaleString()})`
+                : ""}
+            </span>
+            <span>Batch size: {plan.batch_size}</span>
+            <span>GPU layers: {plan.gpu_layers} / {plan.estimated_total_layers}</span>
+            <span>CPU spill: {plan.cpu_spill_layers} layer{plan.cpu_spill_layers === 1 ? "" : "s"}</span>
+            <span>Parallel sequences: {plan.parallel_sequences}</span>
+            {plan.projector_placement !== "not_applicable" && (
+              <span>Projector: {PROJECTOR_PLACEMENT_LABEL[plan.projector_placement]}</span>
+            )}
+          </div>
+          {plan.rationale.length > 0 && (
+            <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
+              {plan.rationale.map((entry) => <li key={entry.field}>{entry.explanation}</li>)}
+            </ul>
+          )}
+          {plan.improvement_suggestions.length > 0 && (
+            <div className="mt-3 rounded-md border border-warning/30 bg-warning-soft p-2">
+              <p className="text-xs font-medium text-warning">How to improve this plan</p>
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-xs leading-5 text-warning">
+                {plan.improvement_suggestions.map((suggestion) => <li key={suggestion}>{suggestion}</li>)}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** One-line, honest summary of a runtime's configured context size: prefers
+ * a value the runtime itself confirmed live over one this app merely
+ * requested, and says so — never presents an estimate as a guaranteed fact. */
+export function contextCacheHeadline(view: ContextCacheView): string {
+  const tokens = view.reportedContextTokens ?? view.configured.tokens;
+  if (tokens == null) return "Context size unavailable for this runtime.";
+  const sourceLabel =
+    view.reportedContextTokens != null
+      ? "confirmed live by the runtime"
+      : view.configured.source === "runtime_configured"
+        ? "configured by this app"
+        : view.configured.source === "runtime_default"
+          ? "the runtime's default"
+          : "unavailable";
+  return `${tokens.toLocaleString()} tokens (${sourceLabel})`;
+}
+
+function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
+  if (!view) return null;
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+      <p className="text-xs font-semibold text-foreground">Context & cache</p>
+      <div className="mt-2 grid gap-2 text-xs text-muted sm:grid-cols-2">
+        <span>Context size: {contextCacheHeadline(view)}</span>
+        {view.contextTokensInUse != null && (
+          <span>Tokens in use: {view.contextTokensInUse.toLocaleString()}</span>
+        )}
+        {view.contextHeadroomTokens != null && (
+          <span>Headroom: {view.contextHeadroomTokens.toLocaleString()} tokens</span>
+        )}
+        {view.contextShiftDetected != null && (
+          <span>
+            Context shift: {view.contextShiftDetected ? "detected — earlier turns may have been dropped" : "not detected"}
+          </span>
+        )}
+        {view.totalSlots != null && <span>Server slots: {view.totalSlots}</span>}
+      </div>
+      {view.notes.length > 0 && (
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
+          {view.notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function EffectiveContextPanel({
+  runtime,
+  offloadPlan,
+}: {
+  runtime: M3RuntimeCapability;
+  offloadPlan: OffloadPlan | undefined;
+}) {
+  const resolveEffectiveContext = useRuntimeHubStore((state) => state.resolveEffectiveContext);
+  const contextSetting = runtime.settings.find((setting) => setting.key === "context_size" || setting.key === "num_ctx");
+  const schemaBounds = contextSetting?.schema.type === "integer" ? contextSetting.schema : undefined;
+  const [requested, setRequested] = useState(() => offloadPlan?.context_tokens ?? schemaBounds?.max ?? 4_096);
+  const [resolution, setResolution] = useState<EffectiveContextResolution | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+
+  if (!contextSetting || !offloadPlan) return null;
+
+  async function handleResolve() {
+    setBusy(true);
+    setError(undefined);
+    try {
+      const result = await resolveEffectiveContext({
+        requestedTokens: requested,
+        offloadPlanContextTokens: offloadPlan?.context_tokens ?? requested,
+        modelMetadataMaxContextTokens: null,
+        runtimeSettingMinTokens: schemaBounds?.min ?? null,
+        runtimeSettingMaxTokens: schemaBounds?.max ?? null,
+      });
+      setResolution(result);
+    } catch (thrown) {
+      setError(thrown instanceof Error ? thrown.message : String(thrown));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+      <p className="text-xs font-semibold text-foreground">Effective context size</p>
+      <p className="mt-1 text-xs text-muted">
+        Preview what a requested context size resolves to once bounded by the offload plan and this runtime&apos;s
+        configured limits, without loading anything.
+      </p>
+      <div className="mt-2 flex flex-wrap items-end gap-2">
+        <Field label="Requested tokens">
+          <input
+            type="number"
+            min={schemaBounds?.min}
+            max={schemaBounds?.max}
+            value={requested}
+            onChange={(event) => setRequested(Number(event.target.value))}
+            className={CONTROL_CLASS}
+          />
+        </Field>
+        <BusyButton type="button" busy={busy} onClick={() => void handleResolve()}>
+          Check
+        </BusyButton>
+      </div>
+      <ErrorNotice message={error} />
+      {resolution && (
+        <div className="mt-2 text-xs text-muted">
+          <p className="font-medium text-foreground">Effective: {resolution.effectiveTokens.toLocaleString()} tokens</p>
+          {resolution.rationale.length > 0 && (
+            <ul className="mt-1 list-disc space-y-1 pl-5 leading-5">
+              {resolution.rationale.map((entry) => (
+                <li key={entry}>{entry}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function SettingControl({
@@ -163,6 +386,14 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const loadModel = useRuntimeHubStore((state) => state.loadModel);
   const unloadModel = useRuntimeHubStore((state) => state.unloadModel);
   const saveConfig = useRuntimeHubStore((state) => state.setRuntimeConfig);
+  const hardware = useRuntimeHubStore((state) => state.hardware);
+  const allRuntimes = useRuntimeHubStore((state) => state.runtimes);
+  const runtimeDetails = useRuntimeHubStore((state) => state.runtimeDetails);
+  const offloadPlan = useRuntimeHubStore((state) => state.offloadPlans[runtimeId]);
+  const previewOffloadPlan = useRuntimeHubStore((state) => state.previewOffloadPlan);
+  const offloadBusy = busy[`offload-plan:${runtimeId}`];
+  const offloadError = errors[`offload-plan:${runtimeId}`];
+  const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
 
   const compatibleModels = installedModels.filter((model) => model.runtime === runtime.descriptor.kind);
   const [assetId, setAssetId] = useState(compatibleModels[0]?.assetId ?? "");
@@ -173,6 +404,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const [showLogs, setShowLogs] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showContextCache, setShowContextCache] = useState(false);
   const [settings, setSettings] = useState<Record<string, SettingValue>>(() =>
     Object.fromEntries(runtime.settings.map((setting) => [setting.key, setting.default_value])),
   );
@@ -184,6 +416,13 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   useEffect(() => {
     if (detail?.config) setSettings((current) => ({ ...current, ...detail.config }));
   }, [detail?.config]);
+
+  const selectedModel = compatibleModels.find((model) => model.assetId === assetId);
+  useEffect(() => {
+    if (!hardware || !selectedModel) return;
+    const input = buildOffloadPlanInput(hardware, selectedModel, allRuntimes, runtimeDetails);
+    void previewOffloadPlan(runtimeId, input).catch(() => {});
+  }, [hardware, selectedModel, allRuntimes, runtimeDetails, runtimeId, previewOffloadPlan]);
 
   const state = statusState(detail);
   const resident = runningModels(detail);
@@ -248,6 +487,9 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
       {runtime.canLoad && (
         <section className="mt-5 border-t border-border pt-4" aria-label={`Load a model in ${runtime.descriptor.label}`}>
           <SectionHeading title="Load model" description="Only verified models compatible with this runtime are listed." />
+          <div className="mt-3">
+            <CompatibilityWarningBanner report={compatibilityReport} />
+          </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Field label="Installed model">
               <select value={assetId} onChange={(event) => setAssetId(event.target.value)} className={CONTROL_CLASS} disabled={!compatibleModels.length}>
@@ -268,6 +510,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             )}
             <Toggle checked={replaceExisting} onChange={setReplaceExisting} label="Replace currently loaded model" description="Unload app-managed residents before loading this model." />
           </div>
+          <OffloadPlanPanel plan={offloadPlan} busy={offloadBusy} error={offloadError} />
           <ErrorNotice message={errors[`load:${runtimeId}`]} />
           <div className="mt-3 flex justify-end">
             <BusyButton type="button" variant="primary" busy={busy[`load:${runtimeId}`]} disabled={!assetId} onClick={handleLoad}>
@@ -334,6 +577,16 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             <Wrench size={15} aria-hidden="true" /> {showSettings ? "Hide advanced settings" : "Advanced settings"}
           </Button>
         )}
+        {detail?.contextCache && (
+          <Button
+            type="button"
+            className="min-h-11"
+            aria-expanded={showContextCache}
+            onClick={() => setShowContextCache((value) => !value)}
+          >
+            <Gauge size={15} aria-hidden="true" /> {showContextCache ? "Hide context & cache" : "Context & cache"}
+          </Button>
+        )}
       </div>
 
       {showLogs && detail?.logs && (
@@ -343,6 +596,12 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
         </div>
       )}
       {showMetrics && detail?.metrics && <div className="mt-4"><JsonView label="Live runtime metrics" value={detail.metrics} /></div>}
+      {showContextCache && detail?.contextCache && (
+        <div className="mt-4">
+          <ContextCachePanel view={detail.contextCache} />
+          <EffectiveContextPanel runtime={runtime} offloadPlan={offloadPlan} />
+        </div>
+      )}
 
       {showSettings && runtime.settings.length > 0 && (
         <section className="mt-4 rounded-lg border border-border bg-surface p-4" aria-label={`Advanced settings for ${runtime.descriptor.label}`}>

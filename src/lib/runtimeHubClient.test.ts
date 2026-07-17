@@ -5,13 +5,16 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import {
   createM3OperationId,
+  gateCapabilities,
   runtimeHubClient,
   sha256Text,
+  type ChatTemplateLabReport,
   type LanServerPolicy,
   type M3ApiDispatchRequest,
   type M3CancelInferenceRequest,
   type M3CatalogModel,
   type M3LoadModelRequest,
+  type M3ModelCapabilities,
   type M3SchedulingInput,
   type M3UnloadModelRequest,
   type PairingRequest,
@@ -36,6 +39,7 @@ describe("runtimeHubClient", () => {
 
     await runtimeHubClient.hardwareSnapshot();
     await runtimeHubClient.hardwareProfile();
+    await runtimeHubClient.hardwareCompatibilityReport();
     await runtimeHubClient.storageStatus();
     await runtimeHubClient.installedModels();
     await runtimeHubClient.catalogSources();
@@ -43,6 +47,7 @@ describe("runtimeHubClient", () => {
     await runtimeHubClient.runtimes();
     await runtimeHubClient.refreshRuntimes(operation);
     await runtimeHubClient.schedulePlan(scheduling);
+    await runtimeHubClient.chatTemplateLabReport("chatml");
     await runtimeHubClient.catalogSearch({ ...operation, query: "qwen", limit: 20 });
     await runtimeHubClient.modelDownload({ ...operation, request: { model, acceptedLicenseSha256: "digest" } });
     await runtimeHubClient.modelUpdate({ ...operation, assetId: "asset", request: { model, acceptedLicenseSha256: "digest" } });
@@ -78,6 +83,7 @@ describe("runtimeHubClient", () => {
     expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
       "m3_hardware_snapshot",
       "m3_hardware_profile",
+      "m3_hardware_compatibility_report",
       "m3_storage_status",
       "m3_installed_models",
       "m3_catalog_sources",
@@ -85,6 +91,7 @@ describe("runtimeHubClient", () => {
       "m3_runtimes",
       "m3_refresh_runtimes",
       "m3_schedule_plan",
+      "m3_chat_template_lab_report",
       "m3_catalog_search",
       "m3_model_download",
       "m3_model_update",
@@ -117,6 +124,7 @@ describe("runtimeHubClient", () => {
       "m3_http_server_status",
       "m3_http_server_store_tls_identity",
     ]);
+    expect(invokeMock).toHaveBeenCalledWith("m3_chat_template_lab_report", { template: "chatml" });
     expect(invokeMock).toHaveBeenCalledWith("m3_catalog_search", {
       operationId: "op-1",
       timeoutMs: 1000,
@@ -139,5 +147,64 @@ describe("runtimeHubClient", () => {
   it("creates traceable operation ids and hashes the exact license declaration", async () => {
     expect(createM3OperationId("catalog")).toMatch(/^catalog-/);
     expect(await sha256Text("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
+});
+
+describe("gateCapabilities", () => {
+  const declared: M3ModelCapabilities = {
+    chat: true,
+    embeddings: true,
+    toolCalling: true,
+    vision: true,
+    structuredOutput: true,
+  };
+
+  function reportWith(passed: ChatTemplateLabReport["results"][number]["area"][]): ChatTemplateLabReport {
+    const areas: ChatTemplateLabReport["results"][number]["area"][] = [
+      "tool_calling",
+      "system_prompt",
+      "stop_token",
+      "structured_output",
+      "vision",
+      "thinking",
+    ];
+    return {
+      templateFamily: "generic",
+      results: areas.map((area) => ({ area, passed: passed.includes(area), detail: "" })),
+    };
+  }
+
+  it("returns the declared capabilities unchanged when no report is available yet", () => {
+    expect(gateCapabilities(declared, undefined)).toEqual(declared);
+  });
+
+  it("only keeps a capability true when its fixture(s) passed, and never upgrades an undeclared one", () => {
+    const report = reportWith(["tool_calling", "system_prompt", "stop_token", "structured_output"]);
+    expect(gateCapabilities(declared, report)).toEqual({
+      chat: true,
+      embeddings: true,
+      toolCalling: true,
+      vision: false,
+      structuredOutput: true,
+    });
+
+    const nothingPassed = reportWith([]);
+    expect(gateCapabilities(declared, nothingPassed)).toEqual({
+      chat: false,
+      embeddings: true,
+      toolCalling: false,
+      vision: false,
+      structuredOutput: false,
+    });
+
+    const everythingPassed = reportWith([
+      "tool_calling",
+      "system_prompt",
+      "stop_token",
+      "structured_output",
+      "vision",
+      "thinking",
+    ]);
+    expect(gateCapabilities({ ...declared, toolCalling: false }, everythingPassed).toolCalling).toBe(false);
   });
 });
