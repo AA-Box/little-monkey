@@ -6,6 +6,7 @@ import { portabilityLocale } from "./portability";
 import { diagnosticsLocale } from "./diagnostics";
 import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
+import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
 import { approvalChainsLocale } from "./approvalChains";
@@ -105,6 +106,7 @@ export const ko: Record<string, string> = {
   "TeamModePanel.removeButton": "{{name}} 제거",
   "TeamModePanel.removeConfirm": "{{name}}을(를) 이 팀에서 제거하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
   ...knowledgeGraphExplorerLocale,
+  ...spreadsheetCopilotLocale,
   // Knowledge Graph Explorer (ROADMAP.md Phase 7) — real translations overriding the English `knowledgeGraphExplorerLocale` defaults spread above.
   "AppMenu.knowledgeGraphExplorer": "지식 그래프 탐색기",
   "KnowledgeGraphExplorer.title": "지식 그래프 탐색기",
@@ -122,6 +124,29 @@ export const ko: Record<string, string> = {
   "KnowledgeGraphExplorer.evidenceHeading": "증거",
   "KnowledgeGraphExplorer.evidenceEmpty": "위에서 관계 질문을 하면 여기에 경로와 그 출처 증거가 표시됩니다.",
   "KnowledgeGraphExplorer.noEvidence": "이 경로에 대해 기록된 증거 구간이 없습니다.",
+  // Spreadsheet Copilot (ROADMAP.md Phase 7) — real translations overriding the English `spreadsheetCopilotLocale` defaults spread above.
+  "AppMenu.spreadsheetCopilot": "스프레드시트 코파일럿",
+  "SpreadsheetCopilot.title": "스프레드시트 코파일럿",
+  "SpreadsheetCopilot.subtitle": "CSV를 불러오고 계산된 열, 정리 단계 또는 요약을 설명하면, 쓰기를 승인하기 전에 인용된 정확한 셀을 검토할 수 있습니다.",
+  "SpreadsheetCopilot.close": "스프레드시트 코파일럿 닫기",
+  "SpreadsheetCopilot.loadButton": "CSV 열기…",
+  "SpreadsheetCopilot.noFileHint": "시작하려면 CSV 파일을 여세요.",
+  "SpreadsheetCopilot.requestLabel": "작업을 설명하세요",
+  "SpreadsheetCopilot.requestPlaceholder": "예: 수량에 가격을 곱한 열 추가",
+  "SpreadsheetCopilot.proposeButton": "제안",
+  "SpreadsheetCopilot.noProposalHint": "작업을 설명하고 제안을 클릭하면 비교 가능한 변경 사항이 여기에 표시됩니다 — 승인하기 전까지는 파일에 아무것도 기록되지 않습니다.",
+  "SpreadsheetCopilot.citedRangesHeading": "인용된 셀 / 범위",
+  "SpreadsheetCopilot.diffHeading": "셀 변경 사항 ({{count}})",
+  "SpreadsheetCopilot.diffNewCell": "(새 셀)",
+  "SpreadsheetCopilot.diffBlank": "(빈 값)",
+  "SpreadsheetCopilot.approveWarning": "승인하면 이 변경 사항이 디스크의 CSV 파일에 기록됩니다. 인용된 셀이나 값이 잘못된 것 같으면 거부하세요.",
+  "SpreadsheetCopilot.rejectButton": "거부",
+  "SpreadsheetCopilot.approveButton": "승인 및 파일 쓰기",
+  "SpreadsheetCopilot.emptyState": "위에서 CSV 파일을 열어 그리드에 로드하세요.",
+  "SpreadsheetCopilot.gridChangedCell": "대기 중인 제안에 의해 변경됨",
+  "SpreadsheetCopilot.gridCitedCell": "대기 중인 제안에서 인용됨",
+  "SpreadsheetCopilot.gridEmptyHeader": "빈 값",
+  "SpreadsheetCopilot.gridTruncated": "전체 {{total}}행 중 처음 {{shown}}행을 표시하고 있습니다.",
   ...issueToPrLocale,
   ...triageLocale,
   ...approvalChainsLocale,

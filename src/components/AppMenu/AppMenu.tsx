@@ -26,6 +26,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Table2,
   Telescope,
   Wand2,
   Workflow,
@@ -52,6 +53,7 @@ interface AppMenuProps {
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
+  onOpenSpreadsheetCopilot: () => void;
   onOpenTerminal: () => void;
   onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
@@ -109,6 +111,7 @@ export function AppMenu({
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
+  onOpenSpreadsheetCopilot,
   onOpenTerminal,
   onOpenRedTeamLab,
   onOpenEvidenceBoard,
@@ -334,6 +337,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenKnowledgeGraph();
+            }}
+          />
+          <MenuRow
+            icon={<Table2 size={14} className="text-faint" />}
+            label={t("AppMenu.spreadsheetCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenSpreadsheetCopilot();
             }}
           />
           <MenuRow
