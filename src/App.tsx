@@ -14,6 +14,7 @@ import { SopCompilerPanel } from "./components/SopCompiler";
 import { McpGeneratorPanel } from "./components/McpGenerator";
 import { SideTaskDrawer } from "./components/SideTasks";
 import { GlobalSearch } from "./components/Search";
+import { CommandPalette } from "./components/Palette";
 import { AgentInbox } from "./components/Inbox";
 import { RedTeamLabPanel } from "./components/RedTeamLab";
 import { KnowledgeGraphExplorerPanel } from "./components/KnowledgeGraphExplorer";
@@ -50,6 +51,7 @@ import {
 import { onRunCancellationRequested } from "./lib/runProtocol";
 import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
+import { paletteClient } from "./lib/paletteClient";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
  * (captured the moment it was opened) so edits made by the agent afterwards
@@ -116,6 +118,7 @@ function App() {
   const [sopCompilerOpen, setSopCompilerOpen] = useState(false);
   const [mcpGeneratorOpen, setMcpGeneratorOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [agentInboxOpen, setAgentInboxOpen] = useState(false);
   const [redTeamLabOpen, setRedTeamLabOpen] = useState(false);
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
@@ -143,6 +146,7 @@ function App() {
     setSopCompilerOpen(false);
     setMcpGeneratorOpen(false);
     setGlobalSearchOpen(false);
+    setCommandPaletteOpen(false);
     setAgentInboxOpen(false);
     setRedTeamLabOpen(false);
     setKnowledgeGraphOpen(false);
@@ -157,6 +161,20 @@ function App() {
   const handleManagePrompts = useCallback(() => {
     openSettingsTab("prompts");
   }, [openSettingsTab]);
+
+  // Opens the Global Command Palette over whatever's currently shown —
+  // triggered by the in-window shortcut below (Cmd/Ctrl+Shift+K, only while
+  // focused) and by the OS-level global shortcut (works even unfocused; see
+  // `src-tauri/src/command_palette.rs`, which shows/focuses this window and
+  // emits `palette://open` for the listener further down).
+  const openCommandPalette = useCallback(() => {
+    setSettingsOpen(false);
+    setRunCenterOpen(false);
+    setBrowserWorkbenchOpen(false);
+    setGlobalSearchOpen(false);
+    setSettingsInitialTab(undefined);
+    setCommandPaletteOpen(true);
+  }, []);
 
   // App-wide accelerators. The same definitions are rendered by the
   // Keyboard Shortcuts Settings panel, so a displayed binding always has a
@@ -216,6 +234,7 @@ function App() {
         },
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
+        openCommandPalette: () => openCommandPalette(),
         sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
         sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
         sessionRename: () => activeSession && session.requestRename(activeSession.id),
@@ -244,7 +263,23 @@ function App() {
     // that stop bubbling for their own local Enter/Escape handling.
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [newSession, openSettingsTab, permissionPending]);
+  }, [newSession, openCommandPalette, openSettingsTab, permissionPending]);
+
+  // The OS-level global shortcut (works even when Little Monkey isn't the
+  // focused app) is registered in Rust and, on press, shows/focuses this
+  // window and emits this event — see `command_palette::show_palette`.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void paletteClient.onOpen(openCommandPalette).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [openCommandPalette]);
 
   useEffect(() => {
     void refreshRoots();
@@ -380,6 +415,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -396,6 +432,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -409,6 +446,7 @@ function App() {
             setSettingsOpen(false);
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
+            setCommandPaletteOpen(false);
             setIssueToPrOpen(false);
             setTrustScorecardsOpen(false);
             setSopCompilerOpen(false);
@@ -430,6 +468,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -439,6 +478,7 @@ function App() {
             setSettingsInitialTab(undefined);
             setBrowserWorkbenchOpen(true);
           }}
+          onOpenCommandPalette={openCommandPalette}
           onOpenIssueToPr={() => {
             setSettingsOpen(false);
             setRunCenterOpen(false);
@@ -447,6 +487,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -464,6 +505,7 @@ function App() {
             setGlobalSearchOpen(false);
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -481,6 +523,7 @@ function App() {
             setGlobalSearchOpen(false);
             setTrustScorecardsOpen(false);
             setMcpGeneratorOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -497,6 +540,7 @@ function App() {
             setIssueToPrOpen(false);
             setGlobalSearchOpen(false);
             setSopCompilerOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -514,6 +558,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
@@ -530,6 +575,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setKnowledgeGraphOpen(false);
             setEvidenceBoardOpen(false);
@@ -546,6 +592,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setEvidenceBoardOpen(false);
@@ -562,6 +609,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -578,6 +626,7 @@ function App() {
             setSopCompilerOpen(false);
             setMcpGeneratorOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setRedTeamLabOpen(false);
             setKnowledgeGraphOpen(false);
@@ -593,6 +642,7 @@ function App() {
             setRunCenterOpen(false);
             setBrowserWorkbenchOpen(false);
             setGlobalSearchOpen(false);
+            setCommandPaletteOpen(false);
             setAgentInboxOpen(false);
             setIssueToPrOpen(false);
             setTrustScorecardsOpen(false);
@@ -825,6 +875,12 @@ function App() {
         ))}
       </aside>
 
+      {commandPaletteOpen && (
+        <CommandPalette
+          onClose={() => setCommandPaletteOpen(false)}
+          onOpenSettingsTab={openSettingsTab}
+        />
+      )}
       <PermissionModal />
       <PrivacyFirewallGate />
       <SettingsModal

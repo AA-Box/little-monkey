@@ -24,6 +24,8 @@ import {
   type M3SchedulingPlan,
   type M3StorageStatus,
   type M3UnloadModelRequest,
+  type OffloadPlan,
+  type OffloadPlanInput,
   type PairedToken,
   type PairingChallenge,
   type PairingRequest,
@@ -84,6 +86,7 @@ interface RuntimeHubStoreState {
    * family detection is the Rust command's job (`chat_template_lab.rs`'s
    * `TemplateFamily::detect`), not something the frontend re-implements. */
   chatTemplateLabReports: Record<string, ChatTemplateLabReport>;
+  offloadPlans: Record<string, OffloadPlan>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -103,6 +106,7 @@ interface RuntimeHubStoreState {
   replaceCatalogSources: (sources: M3CatalogSourceConfig[]) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
+  previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
@@ -275,6 +279,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     cleanupReport: null,
     schedulingPlan: null,
     chatTemplateLabReports: {},
+    offloadPlans: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -466,6 +471,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           chatTemplateLabReports: { ...state.chatTemplateLabReports, [cacheKey]: report },
         }));
       } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    previewOffloadPlan: async (runtimeId, input) => {
+      const key = `offload-plan:${runtimeId}`;
+      begin(key);
+      try {
+        const plan = await runtimeHubClient.offloadPlan(input);
+        set((state) => ({ offloadPlans: { ...state.offloadPlans, [runtimeId]: plan } }));
+      } catch (error) {
+        set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
         fail(key, error);
         throw error;
       } finally {

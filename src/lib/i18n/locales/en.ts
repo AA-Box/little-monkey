@@ -5,7 +5,7 @@ import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
 import { developerLocale } from "./developer";
-import { issueToPrLocale } from "./issueToPr";
+import { paletteLocale } from "./palette";import { issueToPrLocale } from "./issueToPr";
 import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
 import { mcpGeneratorLocale } from "./mcpGenerator";
@@ -19,7 +19,6 @@ import { teamModeLocale } from "./teamMode";
 import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
-
 export const en: Record<string, string> = {
   ...crewLocale,
   ...runLocale,
@@ -28,7 +27,7 @@ export const en: Record<string, string> = {
   ...portabilityLocale,
   ...ecosystemLocale,
   ...developerLocale,
-  ...issueToPrLocale,
+  ...paletteLocale,  ...issueToPrLocale,
   ...trustScorecardsLocale,
   ...sopCompilerLocale,
   ...mcpGeneratorLocale,
@@ -41,8 +40,7 @@ export const en: Record<string, string> = {
   ...teamModeLocale,
   ...knowledgeGraphExplorerLocale,
   ...onboardingLocale,
-  ...dailyBriefLocale,
-  "ComparePicker.toolsBadge": "Tools",
+  ...dailyBriefLocale,  "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
   "AppMenu.integratedTerminal": "Integrated terminal",

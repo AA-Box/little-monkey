@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  Command,
   ClipboardCheck,
   Compass,
   GitPullRequest,
@@ -33,6 +34,7 @@ interface AppMenuProps {
   onOpenRunCenter: () => void;
   onOpenGlobalSearch: () => void;
   onOpenBrowserWorkbench: () => void;
+  onOpenCommandPalette: () => void;
   onOpenIssueToPr: () => void;
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
@@ -78,6 +80,7 @@ export function AppMenu({
   onOpenRunCenter,
   onOpenGlobalSearch,
   onOpenBrowserWorkbench,
+  onOpenCommandPalette,
   onOpenIssueToPr,
   onOpenTrustScorecards,
   onOpenSopCompiler,
@@ -141,6 +144,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenGlobalSearch();
+            }}
+          />
+          <MenuRow
+            icon={<Command size={14} className="text-faint" />}
+            label={t("AppMenu.commandPalette")}
+            onClick={() => {
+              closeAll();
+              onOpenCommandPalette();
             }}
           />
           <MenuRow
