@@ -13,6 +13,7 @@ import { securityAutofixLocale } from "./securityAutofix";
 import { paletteLocale } from "./palette";
 import { trustScorecardsLocale } from "./trustScorecards";
 import { sopCompilerLocale } from "./sopCompiler";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
 import { mcpGeneratorLocale } from "./mcpGenerator";
 import { connectorBuilderLocale } from "./connectorBuilder";
 import { specScorerLocale } from "./specScorer";
@@ -54,6 +55,7 @@ export const en: Record<string, string> = {
   ...paletteLocale,
   ...trustScorecardsLocale,
   ...sopCompilerLocale,
+  ...dbAdminGuardrailsLocale,
   ...mcpGeneratorLocale,
   ...connectorBuilderLocale,
   ...specScorerLocale,

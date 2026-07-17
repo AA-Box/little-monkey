@@ -61,6 +61,7 @@ interface AppMenuProps {
   onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
+  onOpenDbAdminGuardrails: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
   onOpenApiContractDiffLab: () => void;
@@ -122,6 +123,7 @@ export function AppMenu({
   onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
+  onOpenDbAdminGuardrails,
   onRestartOnboarding,
   onOpenDailyBrief,
   onOpenApiContractDiffLab,
@@ -425,6 +427,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenDebate();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dbAdminGuardrails")}
+            onClick={() => {
+              closeAll();
+              onOpenDbAdminGuardrails();
             }}
           />
           <MenuRow
