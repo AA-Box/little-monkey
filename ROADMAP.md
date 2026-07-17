@@ -1005,15 +1005,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** API compatibility regressions are caught before release and shown in Runtime/API Hub.
 
-### 12. Multimodal Projector and Vision Model Manager
-
-**Status:** Planned
-
-- Manage image/audio/projector components, projector memory sizing, model capability detection, and multimodal template tests.
-- Show when a vision/audio model is missing a required projector or runtime feature.
-
-**Acceptance:** Multimodal models load with explicit projector provenance, placement, and capability evidence.
-
 ### 13. Local Agent Integration Launcher
 
 **Status:** Planned
