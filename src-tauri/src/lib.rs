@@ -75,6 +75,11 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+// Model Conversion and Quantization Workbench (ROADMAP.md Phase 8): Tauri-free
+// GGUF/safetensors source detection, license risk surfacing, and pluggable
+// quantization backends (a real `llama-quantize` shell-out plus an honest
+// no-op passthrough fallback), with thin command glue in `m3_commands.rs`.
+pub mod quantization;
 // Context window / KV-cache observability and long-context failure
 // classification (Phase 8, "Context and KV Cache Control Center"). Builds on
 // `runtime_adapter`'s settings/offload-planner types rather than duplicating
@@ -481,6 +486,8 @@ pub fn run() {
         .expect("the operating system must provide an application data directory");
     let m3_state = m3_production::build_m3_command_state(&app_data_dir)
         .expect("failed to initialize the local runtime and API hub");
+    let quantization_state = m3_production::build_quantization_command_state(&app_data_dir)
+        .expect("failed to initialize the model conversion and quantization workbench");
     let m4_state = m4_commands::M4CommandState::production(&app_data_dir)
         .expect("failed to initialize packages, MCP Apps, and workflow services");
     let native_skills_state =
@@ -562,6 +569,7 @@ pub fn run() {
         .plugin(global_shortcuts)
         .manage(AppState::default())
         .manage(m3_state)
+        .manage(quantization_state)
         .manage(m3_http_server::M3HttpServerState::default())
         .manage(m4_state)
         .manage(native_skills_state)
@@ -946,6 +954,10 @@ pub fn run() {
             m3_commands::m3_lan_revoke_token,
             m3_commands::m3_lan_tokens,
             m3_commands::m3_lan_audit_events,
+            m3_commands::quantization_backends,
+            m3_commands::quantization_quant_types,
+            m3_commands::quantization_convert_path,
+            m3_commands::quantization_convert_installed_model,
             m3_commands::m3_component_storage_status,
             m3_commands::m3_component_installed,
             m3_commands::m3_component_registry_entries,

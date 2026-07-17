@@ -3513,6 +3513,37 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
     ))
 }
 
+/// Production wiring for the Model Conversion and Quantization Workbench
+/// (ROADMAP.md Phase 8): a storage root separate from the model manifest/blob
+/// store, and the real `llama-quantize` backend when it is genuinely found
+/// on this machine (see `quantization::find_llama_quantize_binary`),
+/// otherwise only the honest `Copy`-only passthrough fallback. No fabricated
+/// "always available" real quantizer — see `quantization.rs`'s module doc
+/// comment for the full honesty note, mirroring how the Runtime Component
+/// Update Channels PR documented its own registry-source honesty.
+pub fn build_quantization_command_state(
+    app_data_dir: impl AsRef<Path>,
+) -> M3HubResult<crate::m3_commands::M3QuantizationCommandState> {
+    let app_data_dir = app_data_dir.as_ref();
+    if !app_data_dir.is_absolute() {
+        return Err(M3HubError::State(
+            "Tauri app-data directory must be absolute".to_string(),
+        ));
+    }
+    ensure_private_directory(app_data_dir)?;
+    let root = app_data_dir.join("m3-quantization");
+    ensure_private_directory(&root)?;
+
+    let mut backends: Vec<Arc<dyn crate::quantization::QuantizationBackend>> = Vec::new();
+    if let Some(backend) = crate::quantization::LlamaCppQuantizeBackend::discover() {
+        backends.push(Arc::new(backend));
+    }
+    backends.push(Arc::new(crate::quantization::PassthroughGgufRequantize));
+
+    let workbench = crate::quantization::QuantizationWorkbench::new(root, backends);
+    Ok(crate::m3_commands::M3QuantizationCommandState::new(workbench))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
