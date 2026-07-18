@@ -752,6 +752,13 @@ pub struct MlxLaunchSpec {
 pub struct MlxMessage {
     pub role: String,
     pub text: String,
+    /// Inline images attached to this turn, as `data:<mime>;base64,<data>`
+    /// URIs (ROADMAP Phase 8 item 12). Empty for every non-vision message —
+    /// the verified, separately-installed MLX service package is expected to
+    /// decode and hand these to an MLX-VLM-style vision tower/projector; this
+    /// struct only carries the bytes across the process boundary.
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2236,6 +2243,7 @@ mod tests {
             messages: vec![MlxMessage {
                 role: "user".to_string(),
                 text: "Hello".to_string(),
+                images: Vec::new(),
             }],
             tools: Vec::new(),
             max_tokens: 32,

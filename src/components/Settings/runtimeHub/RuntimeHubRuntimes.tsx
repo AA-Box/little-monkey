@@ -95,6 +95,13 @@ export function buildOffloadPlanInput(
     .filter((resident) => resident.model_id !== model.modelId);
   const reservedRamBytes = others.reduce((sum, resident) => sum + resident.memory_bytes, 0);
   const reservedVramBytes = others.reduce((sum, resident) => sum + resident.vram_bytes, 0);
+  // Whether a projector is actually attached — not `model.capabilities.vision`
+  // alone (ROADMAP Phase 8 item 12): a model declared vision-capable with no
+  // projector reference at all has nothing for this plan to size or place,
+  // and the missing-projector warning in the load flow below is what should
+  // surface that gap, not a phantom memory reservation here.
+  const hasVisionProjector = activeVersion?.projector != null;
+  const projectorMemoryBytes = activeVersion?.estimatedProjectorMemoryBytes ?? 0;
   return {
     hardware,
     model: {
@@ -102,12 +109,32 @@ export function buildOffloadPlanInput(
       estimated_ram_bytes: model.estimatedRamBytes,
       estimated_vram_bytes: model.estimatedVramBytes,
       required_accelerator: (model.requiredAccelerator as OffloadPlanInput["model"]["required_accelerator"]) ?? null,
-      has_vision_projector: model.capabilities.vision,
+      has_vision_projector: hasVisionProjector,
+      projector_memory_bytes: hasVisionProjector ? projectorMemoryBytes : 0,
     },
     reserved: { ram_bytes: reservedRamBytes, vram_bytes: reservedVramBytes },
     other_resident_count: others.length,
     requested_context_tokens: requestedContextTokens ?? null,
   };
+}
+
+/** A clear, actionable warning when the selected model's active version
+ * declares a projector-requiring capability (vision) but that projector is
+ * missing or not yet locally verified (ROADMAP Phase 8 item 12) — surfaced
+ * near the load flow so a load is never attempted silently against a model
+ * that will fail or behave incorrectly without a working vision component.
+ * `null` when nothing needs surfacing (no active version, no projector
+ * requirement, or an already-verified projector). */
+export function missingProjectorWarning(model: M3InstalledModel): string | null {
+  const activeVersion = model.versions.find((version) => version.active);
+  if (!activeVersion) return null;
+  if (activeVersion.projectorVerification === "missing_reference") {
+    return `${model.displayName} is declared vision-capable but has no associated multimodal projector. Loading it will not provide working image understanding until a projector is added to its manifest.`;
+  }
+  if (activeVersion.projectorVerification === "unverified") {
+    return `${model.displayName}'s multimodal projector (${activeVersion.projector?.kind ?? "unknown"}) has not been verified locally yet. Verify it on the Models tab before relying on vision support.`;
+  }
+  return null;
 }
 
 const PROJECTOR_PLACEMENT_LABEL: Record<OffloadPlan["projector_placement"], string> = {
@@ -580,6 +607,11 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             )}
             <Toggle checked={replaceExisting} onChange={setReplaceExisting} label="Replace currently loaded model" description="Unload app-managed residents before loading this model." />
           </div>
+          {selectedModel && missingProjectorWarning(selectedModel) && (
+            <div className="mt-3 rounded-md border border-warning/30 bg-warning-soft p-3" role="alert">
+              <p className="text-xs leading-5 text-warning">{missingProjectorWarning(selectedModel)}</p>
+            </div>
+          )}
           <OffloadPlanPanel plan={offloadPlan} busy={offloadBusy} error={offloadError} />
           <ErrorNotice message={errors[`load:${runtimeId}`]} />
           <div className="mt-3 flex justify-end">

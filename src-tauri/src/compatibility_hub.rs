@@ -34,6 +34,12 @@ const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGES: usize = 100_000;
 const MAX_TOOLS: usize = 128;
 const MAX_ID_BYTES: usize = 512;
+/// Per-image cap on base64 text bytes (roughly 15 MB of raw image bytes at
+/// base64's ~4/3 inflation), independent of `MAX_TEXT_BYTES` so a single
+/// large image cannot silently starve the text budget for the rest of a
+/// request.
+const MAX_IMAGE_BASE64_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGES_PER_REQUEST: usize = 16;
 const MAX_AUDIT_EVENTS: usize = 10_000;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAIRING_ATTEMPTS: u8 = 5;
@@ -161,6 +167,26 @@ pub enum CanonicalContent {
         content: String,
         is_error: bool,
     },
+    /// An inline image block (ROADMAP Phase 8 item 12). Only base64-encoded
+    /// bytes are carried here, never a remote URL: this canonical model is
+    /// shared by the pass-through API server, which must never fetch an
+    /// attacker-supplied URL on a caller's behalf. `mime_type` is an
+    /// IANA-style image media type (e.g. `image/png`); callers are
+    /// responsible for decoding/validating the image bytes themselves before
+    /// handing them to a runtime.
+    Image {
+        mime_type: String,
+        data_base64: String,
+    },
+}
+
+impl CanonicalContent {
+    /// A `data:` URI combining `mime_type` and `data_base64`, the shape both
+    /// the OpenAI-compatible wire (`image_url.url`) and the MLX driver's
+    /// flattened image list expect.
+    pub fn image_data_url(mime_type: &str, data_base64: &str) -> String {
+        format!("data:{mime_type};base64,{data_base64}")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -407,7 +433,13 @@ pub fn compatibility_conformance_manifest() -> CompatibilityConformanceManifest 
                 streaming: true,
                 tools: true,
                 structured_output: true,
-                images: false,
+                // Base64 data-URI `image_url` content blocks only (ROADMAP
+                // Phase 8 item 12): `parse_openai_message` accepts them
+                // inbound, and `openai_request_body`/`canonical_message_to_mlx`
+                // compose them outbound to a local runtime. Remote
+                // `https://` image URLs are deliberately rejected rather than
+                // fetched by this parser (see `parse_openai_message`).
+                images: true,
                 audio: false,
                 unsupported_fields_rejected: true,
             },
@@ -656,6 +688,32 @@ fn translate_openai_chat(
     })
 }
 
+/// Parses an OpenAI-style `image_url.url` value into a `CanonicalContent::Image`.
+/// Only `data:<mime>;base64,<data>` URIs are accepted — a remote `https://`
+/// URL is rejected outright rather than fetched, since this parser runs
+/// inside the pass-through API server and must never make an outbound
+/// request on an untrusted caller's behalf (the same reasoning `reject_unknown`
+/// already applies to unrecognized fields elsewhere in this module).
+fn parse_data_url_image(url: &str, path: &str) -> CompatibilityResult<CanonicalContent> {
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Err(unsupported(
+            "multimodal_content",
+            "only base64 data: image URLs are supported; remote image URLs are not fetched by this compatibility subset",
+        ));
+    };
+    let Some((metadata, data_base64)) = rest.split_once(',') else {
+        return Err(invalid(path, "data URL is missing a comma-separated payload"));
+    };
+    let Some(mime_type) = metadata.strip_suffix(";base64") else {
+        return Err(invalid(path, "data URL must declare \";base64\" encoding"));
+    };
+    validate_image_content(mime_type, data_base64)?;
+    Ok(CanonicalContent::Image {
+        mime_type: mime_type.to_string(),
+        data_base64: data_base64.to_string(),
+    })
+}
+
 fn parse_openai_message(value: &Value, path: &str) -> CompatibilityResult<CanonicalMessage> {
     let object = require_object(value, path, "message must be an object")?;
     reject_unknown(
@@ -680,16 +738,35 @@ fn parse_openai_message(value: &Value, path: &str) -> CompatibilityResult<Canoni
                 for (index, block) in blocks.iter().enumerate() {
                     let block_path = format!("{path}.content[{index}]");
                     let block = require_object(block, &block_path, "content block must be object")?;
-                    reject_unknown(block, &["type", "text"], &block_path)?;
-                    if required_string(block, "type", &format!("{block_path}.type"))? != "text" {
-                        return Err(unsupported(
-                            "multimodal_content",
-                            "only text content blocks are advertised",
-                        ));
+                    match required_string(block, "type", &format!("{block_path}.type"))?.as_str() {
+                        "text" => {
+                            reject_unknown(block, &["type", "text"], &block_path)?;
+                            content.push(CanonicalContent::Text {
+                                text: required_string(block, "text", &format!("{block_path}.text"))?,
+                            });
+                        }
+                        "image_url" => {
+                            reject_unknown(block, &["type", "image_url"], &block_path)?;
+                            let image_url_path = format!("{block_path}.imageUrl");
+                            let image_object = require_object(
+                                block
+                                    .get("image_url")
+                                    .ok_or_else(|| invalid(&block_path, "missing image_url"))?,
+                                &image_url_path,
+                                "image_url must be an object",
+                            )?;
+                            reject_unknown(image_object, &["url", "detail"], &image_url_path)?;
+                            let url =
+                                required_string(image_object, "url", &format!("{image_url_path}.url"))?;
+                            content.push(parse_data_url_image(&url, &format!("{image_url_path}.url"))?);
+                        }
+                        _ => {
+                            return Err(unsupported(
+                                "multimodal_content",
+                                "only text and base64 image_url content blocks are advertised",
+                            ))
+                        }
                     }
-                    content.push(CanonicalContent::Text {
-                        text: required_string(block, "text", &format!("{block_path}.text"))?,
-                    });
                 }
             }
             _ => {
@@ -1491,6 +1568,12 @@ pub fn encode_response(
                             "tool results cannot be assistant output",
                         ))
                     }
+                    CanonicalContent::Image { .. } => {
+                        return Err(invalid(
+                            "response.content",
+                            "image content cannot be assistant output",
+                        ))
+                    }
                 }
             }
             if !text_parts.is_empty() {
@@ -1537,6 +1620,12 @@ pub fn encode_response(
                         return Err(invalid(
                             "response.content",
                             "tool results cannot be assistant output",
+                        ))
+                    }
+                    CanonicalContent::Image { .. } => {
+                        return Err(invalid(
+                            "response.content",
+                            "image content cannot be assistant output",
                         ))
                     }
                 }
@@ -1603,6 +1692,12 @@ fn ollama_response_content(content: &[CanonicalContent]) -> CompatibilityResult<
                 return Err(invalid(
                     "response.content",
                     "tool results cannot be assistant output",
+                ))
+            }
+            CanonicalContent::Image { .. } => {
+                return Err(invalid(
+                    "response.content",
+                    "image content cannot be assistant output",
                 ))
             }
         }
@@ -1912,6 +2007,9 @@ fn openai_response_content(
             })),
             CanonicalContent::ToolResult { .. } => {
                 return Err(invalid("response.content", "tool results cannot be assistant output"))
+            }
+            CanonicalContent::Image { .. } => {
+                return Err(invalid("response.content", "image content cannot be assistant output"))
             }
         }
     }
@@ -3202,6 +3300,7 @@ fn validate_canonical_request(request: &CanonicalInferenceRequest) -> Compatibil
         ));
     }
     let mut total_text = 0_usize;
+    let mut total_images = 0_usize;
     for message in &request.messages {
         if message.content.is_empty() {
             return Err(invalid("messages[].content", "must not be empty"));
@@ -3226,6 +3325,13 @@ fn validate_canonical_request(request: &CanonicalInferenceRequest) -> Compatibil
                     validate_id(tool_use_id, "messages[].toolResult.toolUseId")?;
                     total_text = total_text.saturating_add(content.len());
                 }
+                CanonicalContent::Image {
+                    mime_type,
+                    data_base64,
+                } => {
+                    validate_image_content(mime_type, data_base64)?;
+                    total_images += 1;
+                }
             }
         }
     }
@@ -3234,6 +3340,13 @@ fn validate_canonical_request(request: &CanonicalInferenceRequest) -> Compatibil
             "canonical text bytes",
             total_text as u64,
             MAX_TEXT_BYTES as u64,
+        ));
+    }
+    if total_images > MAX_IMAGES_PER_REQUEST {
+        return Err(limit(
+            "canonical image count",
+            total_images as u64,
+            MAX_IMAGES_PER_REQUEST as u64,
         ));
     }
     if request.tools.len() > MAX_TOOLS {
@@ -3557,6 +3670,41 @@ fn validate_text(value: &str, path: &str, max_bytes: usize) -> CompatibilityResu
     }
 }
 
+/// Validates an inline `CanonicalContent::Image` block: a plausible
+/// `image/...` media type and base64 text that actually decodes, within
+/// `MAX_IMAGE_BASE64_BYTES`. This never inspects the decoded image bytes
+/// themselves (no format sniffing) — that is left to whichever runtime
+/// ultimately receives them.
+fn validate_image_content(mime_type: &str, data_base64: &str) -> CompatibilityResult<()> {
+    validate_id(mime_type, "messages[].image.mimeType")?;
+    if !mime_type.starts_with("image/") {
+        return Err(invalid(
+            "messages[].image.mimeType",
+            "must start with \"image/\"",
+        ));
+    }
+    if data_base64.is_empty() {
+        return Err(invalid("messages[].image.dataBase64", "must not be empty"));
+    }
+    if data_base64.len() > MAX_IMAGE_BASE64_BYTES {
+        return Err(limit(
+            "canonical image base64 bytes",
+            data_base64.len() as u64,
+            MAX_IMAGE_BASE64_BYTES as u64,
+        ));
+    }
+    if base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .is_err()
+    {
+        return Err(invalid(
+            "messages[].image.dataBase64",
+            "must be valid base64",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_sha256(value: &str, path: &str) -> CompatibilityResult<()> {
     if value.len() == 64
         && value
@@ -3828,12 +3976,19 @@ mod tests {
         assert_eq!(manifest.endpoints.len(), 3);
         assert!(!manifest.workspace_tool_routes_exposed);
         assert!(manifest.endpoints.iter().all(|endpoint| {
-            endpoint.streaming
-                && endpoint.tools
-                && !endpoint.images
-                && !endpoint.audio
-                && endpoint.unsupported_fields_rejected
+            endpoint.streaming && endpoint.tools && !endpoint.audio && endpoint.unsupported_fields_rejected
         }));
+        // Only OpenAI Chat Completions composes/parses image content blocks
+        // today (base64 data URIs only); Responses and Anthropic Messages
+        // still reject any non-text content block (see their translators).
+        for endpoint in &manifest.endpoints {
+            let expected_images = endpoint.protocol == CompatibilityProtocol::OpenAiChatCompletions;
+            assert_eq!(
+                endpoint.images, expected_images,
+                "unexpected images flag for {:?}",
+                endpoint.protocol
+            );
+        }
         let route_paths = manifest
             .endpoints
             .iter()
@@ -3901,7 +4056,7 @@ mod tests {
             CanonicalContent::ToolResult { .. }
         ));
 
-        let image = json!({
+        let remote_image = json!({
             "model":"local-model",
             "messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]
         });
@@ -3909,7 +4064,7 @@ mod tests {
             translate_request(
                 CompatibilityProtocol::OpenAiChatCompletions,
                 "request-image",
-                &serde_json::to_vec(&image).expect("body")
+                &serde_json::to_vec(&remote_image).expect("body")
             ),
             Err(CompatibilityError::Unsupported { .. })
         ));
@@ -3923,6 +4078,35 @@ mod tests {
             ),
             Err(CompatibilityError::Unsupported { .. })
         ));
+
+        // A base64 data: URI, in contrast, is accepted and reaches the
+        // canonical model as a real `CanonicalContent::Image` (ROADMAP Phase
+        // 8 item 12) — remote URLs are the only thing rejected above.
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(b"not-a-real-png");
+        let inline_image = json!({
+            "model":"local-model",
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"text","text":"What is in this image?"},
+                    {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{data_base64}")}},
+                ],
+            }],
+        });
+        let request = translate_request(
+            CompatibilityProtocol::OpenAiChatCompletions,
+            "request-inline-image",
+            &serde_json::to_vec(&inline_image).expect("body"),
+        )
+        .expect("translate inline image");
+        assert_eq!(request.messages[0].content.len(), 2);
+        assert!(matches!(
+            request.messages[0].content[1],
+            CanonicalContent::Image { .. }
+        ));
+        assert!(
+            matches!(&request.messages[0].content[1], CanonicalContent::Image { mime_type, data_base64: decoded } if mime_type == "image/png" && decoded == &data_base64)
+        );
     }
 
     #[test]
