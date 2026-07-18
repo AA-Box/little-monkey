@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { FormEvent, KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -58,6 +59,7 @@ import {
   parseBuiltInSlashCommand,
   type BuiltInSlashCommandName,
 } from "../../lib/slashCommands";
+import { runSideQuestion, stopSideQuestion } from "../../lib/sideQuestion";
 import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
 import { mcpToolDefs } from "../../lib/mcpTools";
 import { useSettingsStore } from "../../store/settingsStore";
@@ -250,9 +252,14 @@ interface ChatWindowProps {
    * "Manage prompts…" row (see App.tsx's deep-link hook). */
   onManagePrompts: () => void;
   onOpenSettingsTab: (tab: SettingsTab) => void;
+  /** Optional host element in the window's title-bar strip (see App.tsx).
+   * When provided, the Compare/Crew pickers portal there instead of the
+   * composer footer — only the primary pane gets one; the split pane keeps
+   * its footer placement. */
+  headerActionsSlot?: HTMLElement | null;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -676,12 +683,23 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     };
     if (command === "stop") {
       requireNoArguments();
+      const stoppedSideQuestion = stopSideQuestion(sessionId);
       if (!useSessionStore.getState().runningTurns[sessionId]) {
-        appendCommandNotice(command, "No model turn is currently running.");
+        appendCommandNotice(
+          command,
+          stoppedSideQuestion ? "Cancelled the running side question." : "No model turn is currently running.",
+        );
         return;
       }
       stopTurn(sessionId);
       appendCommandNotice(command, "Cancellation requested. The run will finish only after the active model/tool acknowledges cancellation.");
+      return;
+    }
+    if (command === "btw") {
+      if (!commandArguments) {
+        throw new Error("Use /btw question — the answer is shown here but never added to the conversation.");
+      }
+      await runSideQuestion(sessionId, commandArguments);
       return;
     }
     if (command === "new") {
@@ -1210,6 +1228,31 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     if (event.key === "Enter") event.preventDefault();
   };
 
+  // Rendered either in the composer footer or portaled into the title-bar
+  // strip (`headerActionsSlot`) — same elements and state either way.
+  const comparisonPickers = (
+    <>
+      <CompareTargetPicker
+        value={compareTargets}
+        onChange={(targets) => {
+          setCompareTargets(targets);
+          if (targets.length > 0) setCrewId(null);
+        }}
+        disabled={sending || preparingTurn || startingComparison || startingCrew}
+        placement={headerActionsSlot ? "down" : "up"}
+      />
+      <CrewPicker
+        value={crewId}
+        onChange={(nextCrewId) => {
+          setCrewId(nextCrewId);
+          if (nextCrewId) setCompareTargets([]);
+        }}
+        disabled={sending || preparingTurn || startingComparison || startingCrew}
+        placement={headerActionsSlot ? "down" : "up"}
+      />
+    </>
+  );
+
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
       <MessageList
@@ -1333,22 +1376,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             <ModeSelector />
             <PersonaSelector sessionId={sessionId} onManagePrompts={onManagePrompts} />
             <AttachMenu onAddFiles={() => void handleAddFiles()} onAddFolder={() => void handleAddFolder()} />
-            <CompareTargetPicker
-              value={compareTargets}
-              onChange={(targets) => {
-                setCompareTargets(targets);
-                if (targets.length > 0) setCrewId(null);
-              }}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
-            />
-            <CrewPicker
-              value={crewId}
-              onChange={(nextCrewId) => {
-                setCrewId(nextCrewId);
-                if (nextCrewId) setCompareTargets([]);
-              }}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
-            />
+            {!headerActionsSlot && comparisonPickers}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <ModelSwitcher />
@@ -1359,6 +1387,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           </div>
         </div>
       </div>
+      {headerActionsSlot && createPortal(comparisonPickers, headerActionsSlot)}
     </div>
   );
 }

@@ -283,6 +283,15 @@ export interface SideTaskDrawerProps {
    * to — passed through to `openComposer`'s default seed when the drawer's
    * own "+ New" button is used instead of a message action. */
   sessionId: string;
+  /** Forces the drawer to its full-width content layout regardless of
+   * `drawerOpen` — set by App.tsx's right-sidebar fullscreen toggle. The
+   * collapse/expand button still reflects and controls the real
+   * `drawerOpen` state underneath. */
+  fullscreen?: boolean;
+  /** Renders as a fill-the-parent tab body (the right sidebar's Side-tasks
+   * tab): no own width, always the open content layout, no collapse
+   * affordance — the hosting region owns sizing and visibility. */
+  embedded?: boolean;
 }
 
 /**
@@ -294,11 +303,15 @@ export interface SideTaskDrawerProps {
  * `App.tsx`'s own workspace-panel collapse idiom (`w-96` expanded / `w-12`
  * collapsed) for visual consistency with the app's other side panel.
  */
-export function SideTaskDrawer({ sessionId }: SideTaskDrawerProps) {
+export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDrawerProps) {
   const open = useSideTaskStore((state) => state.drawerOpen);
+  const visualOpen = open || Boolean(fullscreen) || Boolean(embedded);
   const toggleDrawer = useSideTaskStore((state) => state.toggleDrawer);
   const composerOpen = useSideTaskStore((state) => state.composerOpen);
   const openComposer = useSideTaskStore((state) => state.openComposer);
+  // Both selectors build a fresh array per call — `useShallow` keeps the
+  // uncached snapshots from re-render-looping (React's "getSnapshot should
+  // be cached" guard), same as the other array-selector consumers.
   const visible = useSideTaskStore(useShallow(selectVisibleSideTasks));
   const archived = useSideTaskStore(useShallow(selectArchivedSideTasks));
   const runningCount = useSideTaskStore(selectRunningSideTaskCount);
@@ -309,19 +322,23 @@ export function SideTaskDrawer({ sessionId }: SideTaskDrawerProps) {
 
   return (
     <aside
-      className={`flex shrink-0 flex-col border-l border-border bg-surface transition-[width] duration-200 ${
-        open ? "w-96" : "w-12"
+      className={`flex h-full flex-col bg-surface ${
+        embedded
+          ? "min-h-0 w-full"
+          : fullscreen
+            ? "fixed inset-x-0 bottom-0 top-11 z-40 w-full border border-border"
+            : `shrink-0 border-l border-border transition-[width] duration-200 ${visualOpen ? "w-96" : "w-12"}`
       }`}
     >
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
-        {open && (
+        {visualOpen && (
           <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-faint">
             Side Tasks
             {runningCount > 0 && <StatusPill tone="warning">{runningCount}</StatusPill>}
           </span>
         )}
-        <div className={`flex items-center gap-1 ${open ? "" : "mx-auto"}`}>
-          {open && (
+        <div className={`flex items-center gap-1 ${visualOpen ? "" : "mx-auto"}`}>
+          {visualOpen && (
             <IconButton
               size="sm"
               aria-label="Start a new side task"
@@ -338,23 +355,25 @@ export function SideTaskDrawer({ sessionId }: SideTaskDrawerProps) {
               <Plus size={16} />
             </IconButton>
           )}
-          <IconButton
-            size="sm"
-            onClick={toggleDrawer}
-            aria-label={open ? "Collapse side tasks panel" : "Expand side tasks panel"}
-          >
-            {open ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
-          </IconButton>
+          {!embedded && (
+            <IconButton
+              size="sm"
+              onClick={toggleDrawer}
+              aria-label={open ? "Collapse side tasks panel" : "Expand side tasks panel"}
+            >
+              {open ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
+            </IconButton>
+          )}
         </div>
       </div>
 
-      {!open && runningCount > 0 && (
+      {!visualOpen && runningCount > 0 && (
         <div className="flex justify-center py-2">
           <Loader2 size={16} className="animate-spin text-warning" />
         </div>
       )}
 
-      {open && (
+      {visualOpen && (
         <div className="flex min-h-0 flex-1 flex-col">
           {composerOpen && <SideTaskComposer />}
 
