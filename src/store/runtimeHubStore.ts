@@ -151,6 +151,7 @@ interface RuntimeHubStoreState {
   downloadModel: (match: M3CatalogMatch) => Promise<void>;
   updateModel: (assetId: string, match: M3CatalogMatch) => Promise<void>;
   activateModelVersion: (assetId: string, versionKey: string) => Promise<void>;
+  verifyProjector: (assetId: string, versionKey: string, candidatePath: string) => Promise<void>;
   pruneModelVersions: (assetId: string) => Promise<void>;
   deleteModel: (assetId: string) => Promise<void>;
   cleanupOrphans: () => Promise<void>;
@@ -452,6 +453,25 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           operationId,
           timeoutMs: 30_000,
           request: { assetId, versionKey },
+        });
+        await refreshModelState();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    verifyProjector: async (assetId, versionKey, candidatePath) => {
+      const key = `verify-projector:${assetId}`;
+      const operationId = createM3OperationId("verify-projector");
+      begin(key, operationId);
+      try {
+        await runtimeHubClient.verifyProjector({
+          operationId,
+          timeoutMs: 30_000,
+          request: { assetId, versionKey, candidatePath },
         });
         await refreshModelState();
       } catch (error) {

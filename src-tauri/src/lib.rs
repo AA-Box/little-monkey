@@ -995,6 +995,7 @@ pub fn run() {
             m3_commands::m3_model_download,
             m3_commands::m3_model_update,
             m3_commands::m3_model_activate_version,
+            m3_commands::m3_verify_projector,
             m3_commands::m3_model_prune_versions,
             m3_commands::m3_model_delete,
             m3_commands::m3_cleanup_orphans,
