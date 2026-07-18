@@ -11,8 +11,18 @@ jobs:
   test:
     runs-on: ubuntu-22.04
 
+    env:
+      # Keep target/ small enough for the 14 GB hosted-runner disk
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
 
       - name: Install Linux system deps
         run: |

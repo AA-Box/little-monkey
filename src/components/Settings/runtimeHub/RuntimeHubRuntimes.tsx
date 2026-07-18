@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, FileText, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
+import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
   AdvancedSettingCapability,
+  ContextCacheView,
+  EffectiveContextResolution,
   HardwareSnapshot,
   KeepAlive,
+  M3DraftModelCandidate,
   M3InstalledModel,
   M3RuntimeCapability,
   M3RuntimeKind,
@@ -194,45 +197,220 @@ function OffloadPlanPanel({
   );
 }
 
+/** One-line, honest summary of a runtime's configured context size: prefers
+ * a value the runtime itself confirmed live over one this app merely
+ * requested, and says so — never presents an estimate as a guaranteed fact. */
+export function contextCacheHeadline(view: ContextCacheView): string {
+  const tokens = view.reportedContextTokens ?? view.configured.tokens;
+  if (tokens == null) return "Context size unavailable for this runtime.";
+  const sourceLabel =
+    view.reportedContextTokens != null
+      ? "confirmed live by the runtime"
+      : view.configured.source === "runtime_configured"
+        ? "configured by this app"
+        : view.configured.source === "runtime_default"
+          ? "the runtime's default"
+          : "unavailable";
+  return `${tokens.toLocaleString()} tokens (${sourceLabel})`;
+}
+
+function ContextCachePanel({ view }: { view: ContextCacheView | undefined }) {
+  if (!view) return null;
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+      <p className="text-xs font-semibold text-foreground">Context & cache</p>
+      <div className="mt-2 grid gap-2 text-xs text-muted sm:grid-cols-2">
+        <span>Context size: {contextCacheHeadline(view)}</span>
+        {view.contextTokensInUse != null && (
+          <span>Tokens in use: {view.contextTokensInUse.toLocaleString()}</span>
+        )}
+        {view.contextHeadroomTokens != null && (
+          <span>Headroom: {view.contextHeadroomTokens.toLocaleString()} tokens</span>
+        )}
+        {view.contextShiftDetected != null && (
+          <span>
+            Context shift: {view.contextShiftDetected ? "detected — earlier turns may have been dropped" : "not detected"}
+          </span>
+        )}
+        {view.totalSlots != null && <span>Server slots: {view.totalSlots}</span>}
+      </div>
+      {view.notes.length > 0 && (
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-xs leading-5 text-muted">
+          {view.notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function EffectiveContextPanel({
+  runtime,
+  offloadPlan,
+}: {
+  runtime: M3RuntimeCapability;
+  offloadPlan: OffloadPlan | undefined;
+}) {
+  const resolveEffectiveContext = useRuntimeHubStore((state) => state.resolveEffectiveContext);
+  const contextSetting = runtime.settings.find((setting) => setting.key === "context_size" || setting.key === "num_ctx");
+  const schemaBounds = contextSetting?.schema.type === "integer" ? contextSetting.schema : undefined;
+  const [requested, setRequested] = useState(() => offloadPlan?.context_tokens ?? schemaBounds?.max ?? 4_096);
+  const [resolution, setResolution] = useState<EffectiveContextResolution | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+
+  if (!contextSetting || !offloadPlan) return null;
+
+  async function handleResolve() {
+    setBusy(true);
+    setError(undefined);
+    try {
+      const result = await resolveEffectiveContext({
+        requestedTokens: requested,
+        offloadPlanContextTokens: offloadPlan?.context_tokens ?? requested,
+        modelMetadataMaxContextTokens: null,
+        runtimeSettingMinTokens: schemaBounds?.min ?? null,
+        runtimeSettingMaxTokens: schemaBounds?.max ?? null,
+      });
+      setResolution(result);
+    } catch (thrown) {
+      setError(thrown instanceof Error ? thrown.message : String(thrown));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+      <p className="text-xs font-semibold text-foreground">Effective context size</p>
+      <p className="mt-1 text-xs text-muted">
+        Preview what a requested context size resolves to once bounded by the offload plan and this runtime&apos;s
+        configured limits, without loading anything.
+      </p>
+      <div className="mt-2 flex flex-wrap items-end gap-2">
+        <Field label="Requested tokens">
+          <input
+            type="number"
+            min={schemaBounds?.min}
+            max={schemaBounds?.max}
+            value={requested}
+            onChange={(event) => setRequested(Number(event.target.value))}
+            className={CONTROL_CLASS}
+          />
+        </Field>
+        <BusyButton type="button" busy={busy} onClick={() => void handleResolve()}>
+          Check
+        </BusyButton>
+      </div>
+      <ErrorNotice message={error} />
+      {resolution && (
+        <div className="mt-2 text-xs text-muted">
+          <p className="font-medium text-foreground">Effective: {resolution.effectiveTokens.toLocaleString()} tokens</p>
+          {resolution.rationale.length > 0 && (
+            <ul className="mt-1 list-disc space-y-1 pl-5 leading-5">
+              {resolution.rationale.map((entry) => (
+                <li key={entry}>{entry}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Builds a `Field`'s hint text: the capability's description, a restart
+ * note, and — when this control can't actually be enabled right now — the
+ * reason why, so a disabled control is never left unexplained. */
+export function settingHint(capability: AdvancedSettingCapability, extra?: string): string {
+  const restartNote = capability.restart_required ? " Restart required." : "";
+  const unsupportedNote =
+    !capability.supported && capability.unsupported_reason ? ` ${capability.unsupported_reason}` : "";
+  return `${capability.description}${extra ?? ""}${restartNote}${unsupportedNote}`;
+}
+
 function SettingControl({
   capability,
   value,
   onChange,
+  draftModelCandidates,
 }: {
   capability: AdvancedSettingCapability;
   value: SettingValue;
   onChange: (value: SettingValue) => void;
+  draftModelCandidates?: M3DraftModelCandidate[];
 }) {
   const schema = capability.schema;
+  const disabled = !capability.supported;
+  const label = disabled ? (
+    <span className="inline-flex items-center gap-1.5">
+      {capability.label}
+      <StatusPill tone="neutral">Unavailable</StatusPill>
+    </span>
+  ) : (
+    capability.label
+  );
   if (schema.type === "boolean" && value.type === "boolean") {
     return (
       <Toggle
         checked={value.value}
         onChange={(next) => onChange({ type: "boolean", value: next })}
         label={capability.label}
-        description={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}
+        description={settingHint(capability)}
+        disabled={disabled}
       />
     );
   }
   if (schema.type === "choice" && value.type === "choice") {
     return (
-      <Field label={capability.label} hint={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}>
-        <select value={value.value} onChange={(event) => onChange({ type: "choice", value: event.target.value })} className={CONTROL_CLASS}>
+      <Field label={label} hint={settingHint(capability)}>
+        <select
+          value={value.value}
+          onChange={(event) => onChange({ type: "choice", value: event.target.value })}
+          className={CONTROL_CLASS}
+          disabled={disabled}
+        >
           {schema.options.map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </Field>
+    );
+  }
+  if (schema.type === "text" && value.type === "text" && capability.key === "speculative_decoding_draft_model") {
+    const candidates = draftModelCandidates ?? [];
+    return (
+      <Field label={label} hint={settingHint(capability)}>
+        <select
+          value={value.value}
+          onChange={(event) => onChange({ type: "text", value: event.target.value })}
+          className={CONTROL_CLASS}
+          disabled={disabled || candidates.length === 0}
+        >
+          <option value="">None (disabled)</option>
+          {candidates.map((candidate) => (
+            <option key={candidate.modelId} value={candidate.modelId}>
+              {candidate.displayName}
+            </option>
+          ))}
         </select>
       </Field>
     );
   }
   if (schema.type === "text" && value.type === "text") {
     return (
-      <Field label={capability.label} hint={`${capability.description} Up to ${schema.max_bytes} bytes.${capability.restart_required ? " Restart required." : ""}`}>
-        <input value={value.value} onChange={(event) => onChange({ type: "text", value: event.target.value })} className={CONTROL_CLASS} />
+      <Field label={label} hint={settingHint(capability, ` Up to ${schema.max_bytes} bytes.`)}>
+        <input
+          value={value.value}
+          onChange={(event) => onChange({ type: "text", value: event.target.value })}
+          className={CONTROL_CLASS}
+          disabled={disabled}
+        />
       </Field>
     );
   }
   if (schema.type === "integer" && value.type === "integer") {
     return (
-      <Field label={capability.label} hint={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}>
+      <Field label={label} hint={settingHint(capability)}>
         <input
           type="number"
           min={schema.min}
@@ -241,13 +419,14 @@ function SettingControl({
           value={value.value}
           onChange={(event) => onChange({ type: "integer", value: Number(event.target.value) })}
           className={CONTROL_CLASS}
+          disabled={disabled}
         />
       </Field>
     );
   }
   if (schema.type === "float" && value.type === "float") {
     return (
-      <Field label={capability.label} hint={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}>
+      <Field label={label} hint={settingHint(capability)}>
         <input
           type="number"
           min={schema.min}
@@ -256,13 +435,14 @@ function SettingControl({
           value={value.value}
           onChange={(event) => onChange({ type: "float", value: Number(event.target.value) })}
           className={CONTROL_CLASS}
+          disabled={disabled}
         />
       </Field>
     );
   }
   if (schema.type === "duration_ms" && value.type === "duration_ms") {
     return (
-      <Field label={capability.label} hint={`${capability.description} Milliseconds.${capability.restart_required ? " Restart required." : ""}`}>
+      <Field label={label} hint={settingHint(capability, " Milliseconds.")}>
         <input
           type="number"
           min={schema.min}
@@ -271,6 +451,7 @@ function SettingControl({
           value={value.value}
           onChange={(event) => onChange({ type: "duration_ms", value: Number(event.target.value) })}
           className={CONTROL_CLASS}
+          disabled={disabled}
         />
       </Field>
     );
@@ -296,6 +477,8 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const offloadBusy = busy[`offload-plan:${runtimeId}`];
   const offloadError = errors[`offload-plan:${runtimeId}`];
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
+  const settingCapabilities = useRuntimeHubStore((state) => state.settingCapabilities[runtimeId]);
+  const resolveSettingCapabilities = useRuntimeHubStore((state) => state.resolveSettingCapabilities);
 
   const compatibleModels = installedModels.filter((model) => model.runtime === runtime.descriptor.kind);
   const [assetId, setAssetId] = useState(compatibleModels[0]?.assetId ?? "");
@@ -306,6 +489,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const [showLogs, setShowLogs] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showContextCache, setShowContextCache] = useState(false);
   const [settings, setSettings] = useState<Record<string, SettingValue>>(() =>
     Object.fromEntries(runtime.settings.map((setting) => [setting.key, setting.default_value])),
   );
@@ -324,6 +508,18 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
     const input = buildOffloadPlanInput(hardware, selectedModel, allRuntimes, runtimeDetails);
     void previewOffloadPlan(runtimeId, input).catch(() => {});
   }, [hardware, selectedModel, allRuntimes, runtimeDetails, runtimeId, previewOffloadPlan]);
+
+  // Sampler/Batching/Speculative Decoding Controls (ROADMAP Phase 8 item
+  // 17): re-resolve which advanced settings can actually be enabled
+  // whenever the runtime or selected model changes. Runs even with no model
+  // selected (`selectedModel?.assetId ?? null`) so hardware-only gates
+  // (flash attention, mixed precision) are visible immediately.
+  useEffect(() => {
+    void resolveSettingCapabilities(runtimeId, selectedModel?.assetId ?? null).catch(() => {});
+  }, [runtimeId, selectedModel?.assetId, resolveSettingCapabilities]);
+
+  const gatedSettings = settingCapabilities?.settings ?? runtime.settings;
+  const draftModelCandidates = settingCapabilities?.draftModelCandidates ?? [];
 
   const state = statusState(detail);
   const resident = runningModels(detail);
@@ -483,6 +679,16 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             <Wrench size={15} aria-hidden="true" /> {showSettings ? "Hide advanced settings" : "Advanced settings"}
           </Button>
         )}
+        {detail?.contextCache && (
+          <Button
+            type="button"
+            className="min-h-11"
+            aria-expanded={showContextCache}
+            onClick={() => setShowContextCache((value) => !value)}
+          >
+            <Gauge size={15} aria-hidden="true" /> {showContextCache ? "Hide context & cache" : "Context & cache"}
+          </Button>
+        )}
       </div>
 
       {showLogs && detail?.logs && (
@@ -492,16 +698,23 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
         </div>
       )}
       {showMetrics && detail?.metrics && <div className="mt-4"><JsonView label="Live runtime metrics" value={detail.metrics} /></div>}
+      {showContextCache && detail?.contextCache && (
+        <div className="mt-4">
+          <ContextCachePanel view={detail.contextCache} />
+          <EffectiveContextPanel runtime={runtime} offloadPlan={offloadPlan} />
+        </div>
+      )}
 
       {showSettings && runtime.settings.length > 0 && (
         <section className="mt-4 rounded-lg border border-border bg-surface p-4" aria-label={`Advanced settings for ${runtime.descriptor.label}`}>
           <div className="grid gap-4 sm:grid-cols-2">
-            {runtime.settings.map((capability) => (
+            {gatedSettings.map((capability) => (
               <SettingControl
                 key={capability.key}
                 capability={capability}
                 value={settings[capability.key] ?? capability.default_value}
                 onChange={(value) => setSettings((current) => ({ ...current, [capability.key]: value }))}
+                draftModelCandidates={draftModelCandidates}
               />
             ))}
           </div>

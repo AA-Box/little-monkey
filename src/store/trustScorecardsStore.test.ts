@@ -79,6 +79,7 @@ const mcpServer: McpServerInfo = {
   tools: [],
   instructions: null,
   hasHttpToken: false,
+  hasOauth: false,
 };
 
 const skill: NativeSkillDescriptor = {

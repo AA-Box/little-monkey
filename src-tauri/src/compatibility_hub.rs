@@ -208,6 +208,16 @@ pub struct CanonicalToolDefinition {
     pub strict: bool,
 }
 
+/// Returns whether `name` matches a tool the request actually offered for
+/// this turn. Local-runtime and remote-model output parsers must call this
+/// before treating a materialized tool call as valid: a parsing bug, a
+/// confused model, or an adversarial response can otherwise name a tool that
+/// was never advertised, and a caller that trusts the name blindly would
+/// execute something it never agreed to expose.
+pub fn request_offers_tool(request: &CanonicalInferenceRequest, name: &str) -> bool {
+    request.tools.iter().any(|tool| tool.name == name)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CanonicalInferenceRequest {
@@ -229,6 +239,36 @@ pub struct CanonicalInferenceRequest {
 pub struct CanonicalUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+/// Canonical, protocol-agnostic embeddings request — the `/v1/embeddings`
+/// analogue of [`CanonicalInferenceRequest`]. Deliberately narrow: only the
+/// OpenAI-compatible `float` encoding of a batch of text inputs is
+/// advertised. `dimensions` truncation and `base64` encoding are rejected as
+/// unsupported rather than silently ignored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalEmbeddingRequest {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub model: String,
+    pub input: Vec<String>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalEmbeddingDatum {
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalEmbeddingResponse {
+    pub model: String,
+    pub data: Vec<CanonicalEmbeddingDatum>,
+    pub usage: CanonicalUsage,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -328,6 +368,20 @@ pub struct EndpointConformance {
     pub unsupported_fields_rejected: bool,
 }
 
+/// Conformance entry for a route that has no [`CompatibilityProtocol`] of its
+/// own — the `/v1/embeddings` bridge and the native-Ollama routes. Kept
+/// separate from [`EndpointConformance`] rather than stretching
+/// [`CompatibilityProtocol`] to cover them, since those routes are not
+/// translated through `translate_request`/`encode_response`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuxiliaryEndpointConformance {
+    pub method: String,
+    pub path: String,
+    pub description: String,
+    pub streaming: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompatibilityConformanceManifest {
@@ -336,12 +390,41 @@ pub struct CompatibilityConformanceManifest {
     pub endpoints: Vec<EndpointConformance>,
     pub lifecycle_paths: BTreeMap<String, String>,
     pub workspace_tool_routes_exposed: bool,
+    /// `/v1/embeddings` is always routed, but only genuinely produces
+    /// vectors when the resolved model's runtime driver implements
+    /// `embed()` (Ollama today); other backends fail with a clear
+    /// `unsupported` error rather than a fabricated vector.
+    pub embeddings_endpoint: AuxiliaryEndpointConformance,
+    /// Native-Ollama wire-format routes. `streaming: false` on `/api/chat`
+    /// is a documented, honest limitation: requests are served in full
+    /// before responding rather than incrementally token-by-token.
+    pub ollama_native_endpoints: Vec<AuxiliaryEndpointConformance>,
 }
 
 pub fn compatibility_conformance_manifest() -> CompatibilityConformanceManifest {
     CompatibilityConformanceManifest {
         manifest_version: CONFORMANCE_MANIFEST_VERSION,
         compatibility_schema_version: COMPATIBILITY_SCHEMA_VERSION,
+        embeddings_endpoint: AuxiliaryEndpointConformance {
+            method: "POST".to_string(),
+            path: "/v1/embeddings".to_string(),
+            description: "OpenAI-compatible embeddings; genuinely served only when the resolved model's runtime driver implements embed() (Ollama today) — otherwise returns unsupported rather than a fabricated vector.".to_string(),
+            streaming: false,
+        },
+        ollama_native_endpoints: vec![
+            AuxiliaryEndpointConformance {
+                method: "GET".to_string(),
+                path: "/api/tags".to_string(),
+                description: "Ollama-native installed-model listing.".to_string(),
+                streaming: false,
+            },
+            AuxiliaryEndpointConformance {
+                method: "POST".to_string(),
+                path: "/api/chat".to_string(),
+                description: "Ollama-native chat. Documented gap: responses are always returned complete rather than streamed incrementally, even when the request sets \"stream\":true.".to_string(),
+                streaming: false,
+            },
+        ],
         endpoints: vec![
             EndpointConformance {
                 protocol: CompatibilityProtocol::OpenAiChatCompletions,
@@ -418,6 +501,131 @@ pub fn translate_request(
     };
     validate_canonical_request(&request)?;
     Ok(request)
+}
+
+/// Translates an OpenAI-compatible `POST /v1/embeddings` body into the
+/// canonical embeddings request. Deliberately narrow, matching the rest of
+/// this file's "closed schema, honest rejection" style: `encoding_format`
+/// must be absent or `"float"` (base64 is rejected as unsupported, not
+/// silently mis-encoded) and `dimensions` truncation is rejected outright
+/// rather than pretending to honor it.
+pub fn translate_embeddings_request(
+    request_id: &str,
+    body: &[u8],
+) -> CompatibilityResult<CanonicalEmbeddingRequest> {
+    validate_id(request_id, "requestId")?;
+    if body.len() > MAX_BODY_BYTES {
+        return Err(limit(
+            "compatibility request bytes",
+            body.len() as u64,
+            MAX_BODY_BYTES as u64,
+        ));
+    }
+    let value: Value = serde_json::from_slice(body)?;
+    let object = require_object(&value, "$", "request must be an object")?;
+    reject_unknown(
+        object,
+        &["model", "input", "encoding_format", "dimensions", "user"],
+        "$",
+    )?;
+    let model = required_string(object, "model", "$.model")?;
+    let input = match object.get("input") {
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(invalid("$.input", "input array must not be empty"));
+            }
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| require_string(item, &format!("$.input[{index}]")))
+                .collect::<CompatibilityResult<Vec<_>>>()?
+        }
+        Some(_) => {
+            return Err(invalid(
+                "$.input",
+                "must be a string or an array of strings",
+            ))
+        }
+        None => return Err(invalid("$.input", "is required")),
+    };
+    if let Some(format) = object.get("encoding_format") {
+        if require_string(format, "$.encoding_format")? != "float" {
+            return Err(unsupported(
+                "encoding_format",
+                "only the float encoding format is advertised; base64 is not supported",
+            ));
+        }
+    }
+    if object.contains_key("dimensions") {
+        return Err(unsupported(
+            "dimensions",
+            "output-dimension truncation is not advertised",
+        ));
+    }
+    let request = CanonicalEmbeddingRequest {
+        schema_version: COMPATIBILITY_SCHEMA_VERSION,
+        request_id: request_id.to_string(),
+        model,
+        input,
+        metadata: Value::Null,
+    };
+    validate_canonical_embedding_request(&request)?;
+    Ok(request)
+}
+
+fn validate_canonical_embedding_request(
+    request: &CanonicalEmbeddingRequest,
+) -> CompatibilityResult<()> {
+    if request.schema_version != COMPATIBILITY_SCHEMA_VERSION {
+        return Err(invalid("schemaVersion", "is unsupported"));
+    }
+    validate_id(&request.request_id, "requestId")?;
+    validate_id(&request.model, "model")?;
+    if request.input.is_empty() || request.input.len() > MAX_MESSAGES {
+        return Err(limit(
+            "canonical embedding input count",
+            request.input.len() as u64,
+            MAX_MESSAGES as u64,
+        ));
+    }
+    let total_bytes: usize = request.input.iter().map(String::len).sum();
+    if total_bytes > MAX_TEXT_BYTES {
+        return Err(limit(
+            "canonical embedding input bytes",
+            total_bytes as u64,
+            MAX_TEXT_BYTES as u64,
+        ));
+    }
+    Ok(())
+}
+
+/// Encodes a canonical embeddings response into the OpenAI-compatible
+/// `/v1/embeddings` response shape.
+pub fn encode_embeddings_response(
+    response: &CanonicalEmbeddingResponse,
+) -> CompatibilityResult<Value> {
+    validate_id(&response.model, "model")?;
+    let data = response
+        .data
+        .iter()
+        .map(|datum| {
+            json!({
+                "object": "embedding",
+                "index": datum.index,
+                "embedding": datum.embedding,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "object": "list",
+        "data": data,
+        "model": response.model,
+        "usage": {
+            "prompt_tokens": response.usage.input_tokens,
+            "total_tokens": response.usage.input_tokens,
+        }
+    }))
 }
 
 fn translate_openai_chat(
@@ -1059,6 +1267,187 @@ fn parse_anthropic_tools(
         .collect()
 }
 
+/// Translates an Ollama-native `POST /api/chat` body into the canonical
+/// inference request, plus the client's requested `stream` flag (used only
+/// to choose the HTTP framing — see [`AuxiliaryEndpointConformance`]'s
+/// `/api/chat` note on its streaming limitation: the real backend is always
+/// called non-streaming and the complete response is returned either as one
+/// JSON object or, if streaming was requested, as one NDJSON line).
+///
+/// The returned request's `protocol` field is a nominal
+/// `OpenAiChatCompletions` placeholder — this request is never passed to
+/// `encode_response`/`encode_stream_event` (which dispatch on that field).
+/// Callers must render the response with [`encode_ollama_chat_response`].
+pub fn translate_ollama_chat_request(
+    request_id: &str,
+    body: &[u8],
+) -> CompatibilityResult<(CanonicalInferenceRequest, bool)> {
+    validate_id(request_id, "requestId")?;
+    if body.len() > MAX_BODY_BYTES {
+        return Err(limit(
+            "compatibility request bytes",
+            body.len() as u64,
+            MAX_BODY_BYTES as u64,
+        ));
+    }
+    let value: Value = serde_json::from_slice(body)?;
+    let object = require_object(&value, "$", "request must be an object")?;
+    reject_unknown(
+        object,
+        &[
+            "model", "messages", "tools", "format", "options", "keep_alive", "stream",
+        ],
+        "$",
+    )?;
+    let model = required_string(object, "model", "$.model")?;
+    let message_values = required_array(object, "messages", "$.messages")?;
+    let mut messages = Vec::with_capacity(message_values.len());
+    for (index, value) in message_values.iter().enumerate() {
+        messages.push(parse_ollama_message(
+            value,
+            &format!("$.messages[{index}]"),
+            index,
+        )?);
+    }
+    let tools = object
+        .get("tools")
+        .map(|value| parse_openai_tools(value, "$.tools"))
+        .transpose()?
+        .unwrap_or_default();
+    let response_schema = object
+        .get("format")
+        .map(|value| parse_ollama_format(value, "$.format"))
+        .transpose()?
+        .flatten();
+    let stream_requested = optional_bool(object, "stream", true, "$.stream")?;
+    let request = CanonicalInferenceRequest {
+        schema_version: COMPATIBILITY_SCHEMA_VERSION,
+        protocol: CompatibilityProtocol::OpenAiChatCompletions,
+        request_id: request_id.to_string(),
+        model,
+        messages,
+        tools,
+        max_output_tokens: 4_096,
+        temperature: None,
+        stream: false,
+        response_schema,
+        metadata: Value::Null,
+    };
+    validate_canonical_request(&request)?;
+    Ok((request, stream_requested))
+}
+
+fn parse_ollama_message(value: &Value, path: &str, index: usize) -> CompatibilityResult<CanonicalMessage> {
+    let object = require_object(value, path, "message must be an object")?;
+    reject_unknown(
+        object,
+        &["role", "content", "images", "tool_calls", "tool_call_id", "tool_name"],
+        path,
+    )?;
+    if object.contains_key("images") {
+        return Err(unsupported(
+            "images",
+            "vision content is not advertised by this compatibility subset",
+        ));
+    }
+    let role = required_string(object, "role", &format!("{path}.role"))?;
+    let canonical_role = match role.as_str() {
+        "system" => CanonicalRole::System,
+        "user" => CanonicalRole::User,
+        "assistant" => CanonicalRole::Assistant,
+        "tool" => CanonicalRole::Tool,
+        _ => return Err(invalid(format!("{path}.role"), "unsupported role")),
+    };
+    let mut content = Vec::new();
+    match object.get("content") {
+        Some(Value::String(text)) => {
+            if !text.is_empty() || canonical_role != CanonicalRole::Assistant {
+                content.push(CanonicalContent::Text {
+                    text: text.clone(),
+                });
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => return Err(invalid(format!("{path}.content"), "must be a string")),
+    }
+    if canonical_role == CanonicalRole::Tool {
+        // Older Ollama tool-result messages carry no `tool_call_id` at all;
+        // synthesize a stable, non-empty placeholder rather than failing
+        // canonical validation (which requires a non-empty id) or silently
+        // dropping the result.
+        let tool_use_id = optional_string(
+            object,
+            "tool_call_id",
+            &format!("unlinked-tool-result-{index}"),
+        )?;
+        let text = content
+            .iter()
+            .filter_map(|block| match block {
+                CanonicalContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        content = vec![CanonicalContent::ToolResult {
+            tool_use_id,
+            content: text,
+            is_error: false,
+        }];
+    }
+    if let Some(calls) = object.get("tool_calls") {
+        let calls = require_array(calls, &format!("{path}.tool_calls"), "must be an array")?;
+        for (call_index, call) in calls.iter().enumerate() {
+            let call_path = format!("{path}.tool_calls[{call_index}]");
+            let call_object = require_object(call, &call_path, "tool call must be an object")?;
+            reject_unknown(call_object, &["id", "function"], &call_path)?;
+            let function = require_object(
+                call_object
+                    .get("function")
+                    .ok_or_else(|| invalid(&call_path, "missing function"))?,
+                &format!("{call_path}.function"),
+                "function must be an object",
+            )?;
+            reject_unknown(
+                function,
+                &["name", "arguments"],
+                &format!("{call_path}.function"),
+            )?;
+            let name = required_string(function, "name", &format!("{call_path}.function.name"))?;
+            let input = function.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            if !input.is_object() {
+                return Err(invalid(
+                    format!("{call_path}.function.arguments"),
+                    "must be an object",
+                ));
+            }
+            let id = optional_string(call_object, "id", &format!("call-{index}-{call_index}"))?;
+            content.push(CanonicalContent::ToolUse { id, name, input });
+        }
+    }
+    if content.is_empty() {
+        return Err(invalid(path, "message contains no supported content"));
+    }
+    Ok(CanonicalMessage {
+        role: canonical_role,
+        content,
+    })
+}
+
+fn parse_ollama_format(value: &Value, path: &str) -> CompatibilityResult<Option<Value>> {
+    match value {
+        Value::String(kind) if kind == "json" => Ok(Some(json!({"type":"object"}))),
+        Value::String(_) => Err(unsupported(
+            "format",
+            "only \"json\" or a JSON schema object is advertised",
+        )),
+        Value::Object(_) => {
+            ensure_object_schema(value, path)?;
+            Ok(Some(value.clone()))
+        }
+        _ => Err(invalid(path, "must be \"json\" or a schema object")),
+    }
+}
+
 fn parse_openai_response_format(value: &Value, path: &str) -> CompatibilityResult<Option<Value>> {
     let object = require_object(value, path, "response_format must be object")?;
     let kind = required_string(object, "type", &format!("{path}.type"))?;
@@ -1256,6 +1645,71 @@ pub fn encode_response(
             }))
         }
     }
+}
+
+/// Encodes a canonical inference response into the Ollama-native
+/// `/api/chat` non-streaming response shape. `total_duration_ns` must be a
+/// real measured wall-clock duration around the backend call — never
+/// fabricated. The finer-grained `load_duration`/`prompt_eval_duration`/
+/// `eval_duration` breakdown fields are omitted (they are optional in
+/// Ollama's own schema) rather than filled with invented numbers, since
+/// this layer does not instrument that breakdown.
+pub fn encode_ollama_chat_response(
+    response: &CanonicalInferenceResponse,
+    total_duration_ns: u64,
+) -> CompatibilityResult<Value> {
+    validate_canonical_response(response)?;
+    let (text, tool_calls) = ollama_response_content(&response.content)?;
+    let mut message = json!({
+        "role": "assistant",
+        "content": text,
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    Ok(json!({
+        "model": response.model,
+        "created_at": rfc3339_from_seconds(response.created_at_seconds),
+        "message": message,
+        "done": true,
+        "done_reason": ollama_done_reason(&response.finish_reason),
+        "total_duration": total_duration_ns,
+        "prompt_eval_count": response.usage.input_tokens,
+        "eval_count": response.usage.output_tokens,
+    }))
+}
+
+fn ollama_response_content(content: &[CanonicalContent]) -> CompatibilityResult<(String, Vec<Value>)> {
+    let mut text = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in content {
+        match block {
+            CanonicalContent::Text { text: value } => text.push(value.as_str()),
+            CanonicalContent::ToolUse { name, input, .. } => tool_calls.push(json!({
+                "function": { "name": name, "arguments": input }
+            })),
+            CanonicalContent::ToolResult { .. } => {
+                return Err(invalid(
+                    "response.content",
+                    "tool results cannot be assistant output",
+                ))
+            }
+        }
+    }
+    Ok((text.join(""), tool_calls))
+}
+
+fn ollama_done_reason(reason: &str) -> &str {
+    match reason {
+        "max_tokens" | "length" => "length",
+        _ => "stop",
+    }
+}
+
+pub(crate) fn rfc3339_from_seconds(seconds: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(seconds as i64, 0)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string())
 }
 
 pub fn encode_stream_event(
@@ -1580,6 +2034,7 @@ pub enum ApiScope {
     ChatCompletions,
     Responses,
     Messages,
+    Embeddings,
     ModelDiscover,
     ModelDownload,
     ModelLoad,
@@ -3533,6 +3988,13 @@ mod tests {
             .iter()
             .map(|endpoint| endpoint.path.as_str())
             .chain(manifest.lifecycle_paths.values().map(String::as_str))
+            .chain(std::iter::once(manifest.embeddings_endpoint.path.as_str()))
+            .chain(
+                manifest
+                    .ollama_native_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.path.as_str()),
+            )
             .collect::<Vec<_>>();
         for forbidden in ["shell", "files", "git", "mcp", "workspace", "tools"] {
             assert!(
@@ -3540,6 +4002,15 @@ mod tests {
                 "forbidden route family {forbidden}"
             );
         }
+        assert_eq!(manifest.embeddings_endpoint.path, "/v1/embeddings");
+        assert!(!manifest.embeddings_endpoint.streaming);
+        let ollama_paths = manifest
+            .ollama_native_endpoints
+            .iter()
+            .map(|endpoint| endpoint.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(ollama_paths.contains(&"/api/tags"));
+        assert!(ollama_paths.contains(&"/api/chat"));
     }
 
     #[test]
@@ -3630,6 +4101,166 @@ mod tests {
         assert!(
             matches!(&request.messages[0].content[1], CanonicalContent::Image { mime_type, data_base64: decoded } if mime_type == "image/png" && decoded == &data_base64)
         );
+    }
+
+    #[test]
+    fn embeddings_request_translates_and_encodes_and_rejects_unsupported_fields() {
+        let single = json!({"model":"nomic-embed-text","input":"hello world"});
+        let request = translate_embeddings_request(
+            "request-embed-1",
+            &serde_json::to_vec(&single).expect("body"),
+        )
+        .expect("translate single embeddings");
+        assert_eq!(request.input, vec!["hello world".to_string()]);
+
+        let batch = json!({
+            "model":"nomic-embed-text",
+            "input":["hello","world"],
+            "encoding_format":"float"
+        });
+        let request = translate_embeddings_request(
+            "request-embed-2",
+            &serde_json::to_vec(&batch).expect("body"),
+        )
+        .expect("translate batch embeddings");
+        assert_eq!(request.input, vec!["hello".to_string(), "world".to_string()]);
+
+        let response = CanonicalEmbeddingResponse {
+            model: "nomic-embed-text".to_string(),
+            data: vec![
+                CanonicalEmbeddingDatum {
+                    index: 0,
+                    // Exact in both f32 and f64 so the JSON round trip
+                    // below can compare with `==` rather than tolerance.
+                    embedding: vec![0.5, 0.25],
+                },
+                CanonicalEmbeddingDatum {
+                    index: 1,
+                    embedding: vec![0.75, 1.0],
+                },
+            ],
+            usage: CanonicalUsage {
+                input_tokens: 6,
+                output_tokens: 0,
+            },
+        };
+        let encoded = encode_embeddings_response(&response).expect("encode embeddings");
+        assert_eq!(encoded["object"], "list");
+        assert_eq!(encoded["data"][0]["embedding"][1], 0.25);
+        assert_eq!(encoded["usage"]["prompt_tokens"], 6);
+        assert_eq!(encoded["usage"]["total_tokens"], 6);
+
+        let base64 = json!({"model":"nomic-embed-text","input":"x","encoding_format":"base64"});
+        assert!(matches!(
+            translate_embeddings_request("request-embed-3", &serde_json::to_vec(&base64).expect("body")),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
+
+        let dimensions = json!({"model":"nomic-embed-text","input":"x","dimensions":256});
+        assert!(matches!(
+            translate_embeddings_request(
+                "request-embed-4",
+                &serde_json::to_vec(&dimensions).expect("body")
+            ),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
+
+        let empty_input = json!({"model":"nomic-embed-text","input":[]});
+        assert!(matches!(
+            translate_embeddings_request(
+                "request-embed-5",
+                &serde_json::to_vec(&empty_input).expect("body")
+            ),
+            Err(CompatibilityError::InvalidRequest { .. })
+        ));
+
+        let unknown_field = json!({"model":"nomic-embed-text","input":"x","user":"abc"});
+        translate_embeddings_request(
+            "request-embed-6",
+            &serde_json::to_vec(&unknown_field).expect("body"),
+        )
+        .expect("user field is advertised and ignored");
+    }
+
+    #[test]
+    fn ollama_chat_request_translates_tool_calls_and_rejects_images() {
+        let body = json!({
+            "model":"llama3",
+            "messages":[
+                {"role":"system","content":"Be concise"},
+                {"role":"user","content":"What's the weather?"},
+                {"role":"assistant","content":"","tool_calls":[{"function":{"name":"weather","arguments":{"city":"Oslo"}}}]},
+                {"role":"tool","content":"sunny"}
+            ],
+            "tools":[{"type":"function","function":{"name":"weather","description":"Weather","parameters":{"type":"object"}}}],
+            "format":"json",
+            "stream":true
+        });
+        let (request, stream_requested) = translate_ollama_chat_request(
+            "request-ollama-chat",
+            &serde_json::to_vec(&body).expect("body"),
+        )
+        .expect("translate ollama chat");
+        assert!(stream_requested);
+        assert!(!request.stream);
+        assert_eq!(request.messages.len(), 4);
+        assert_eq!(request.tools.len(), 1);
+        assert!(request.response_schema.is_some());
+        assert!(matches!(
+            request.messages[2].content[0],
+            CanonicalContent::ToolUse { .. }
+        ));
+
+        let response = CanonicalInferenceResponse {
+            response_id: "resp-1".to_string(),
+            model: "llama3".to_string(),
+            content: vec![
+                CanonicalContent::Text {
+                    text: "It is sunny.".to_string(),
+                },
+                CanonicalContent::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "weather".to_string(),
+                    input: json!({"city": "Oslo"}),
+                },
+            ],
+            finish_reason: "stop".to_string(),
+            usage: CanonicalUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+            created_at_seconds: 1_700_000_000,
+        };
+        let encoded = encode_ollama_chat_response(&response, 42_000_000).expect("encode ollama chat");
+        assert_eq!(encoded["model"], "llama3");
+        assert_eq!(encoded["done"], true);
+        assert_eq!(encoded["message"]["content"], "It is sunny.");
+        assert_eq!(encoded["message"]["tool_calls"][0]["function"]["name"], "weather");
+        assert_eq!(encoded["total_duration"], 42_000_000_u64);
+        assert_eq!(encoded["prompt_eval_count"], 10);
+        assert_eq!(encoded["eval_count"], 5);
+
+        let images = json!({
+            "model":"llama3",
+            "messages":[{"role":"user","content":"describe","images":["base64data"]}]
+        });
+        assert!(matches!(
+            translate_ollama_chat_request("request-ollama-image", &serde_json::to_vec(&images).expect("body")),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
+
+        let unknown_field = json!({
+            "model":"llama3",
+            "messages":[{"role":"user","content":"hi"}],
+            "n": 2
+        });
+        assert!(matches!(
+            translate_ollama_chat_request(
+                "request-ollama-unknown",
+                &serde_json::to_vec(&unknown_field).expect("body")
+            ),
+            Err(CompatibilityError::Unsupported { .. })
+        ));
     }
 
     #[test]
@@ -4048,5 +4679,168 @@ mod tests {
                 | Err(CompatibilityError::Json(_))
                 | Err(CompatibilityError::CorruptState(_))
         ));
+    }
+
+    // -- Phase 8 item 10: tool-call and structured-output parser hardening --
+    //
+    // `request_offers_tool` is the shared guard every response-construction
+    // site (m3_production.rs, m3_runtime_hub.rs) calls before turning a
+    // model's tool call into an executable `CanonicalContent::ToolUse`. It
+    // must say yes only for names the request actually advertised.
+
+    fn tool_request(tools: &[&str]) -> CanonicalInferenceRequest {
+        CanonicalInferenceRequest {
+            schema_version: COMPATIBILITY_SCHEMA_VERSION,
+            protocol: CompatibilityProtocol::OpenAiChatCompletions,
+            request_id: "request-tools".to_string(),
+            model: "local-model".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                content: vec![CanonicalContent::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
+            tools: tools
+                .iter()
+                .map(|name| CanonicalToolDefinition {
+                    name: name.to_string(),
+                    description: "test tool".to_string(),
+                    input_schema: json!({"type":"object","properties":{}}),
+                    strict: false,
+                })
+                .collect(),
+            max_output_tokens: 32,
+            temperature: None,
+            stream: false,
+            response_schema: None,
+            metadata: Value::Null,
+        }
+    }
+
+    #[test]
+    fn request_offers_tool_matches_only_advertised_names() {
+        let request = tool_request(&["weather", "search"]);
+        assert!(request_offers_tool(&request, "weather"));
+        assert!(request_offers_tool(&request, "search"));
+        assert!(!request_offers_tool(&request, "shell_exec"));
+        assert!(!request_offers_tool(&request, ""));
+        assert!(!request_offers_tool(&request, "Weather"));
+
+        let no_tools = tool_request(&[]);
+        assert!(!request_offers_tool(&no_tools, "weather"));
+    }
+
+    /// Regression fixtures per malformed-input family: syntactically-broken
+    /// JSON bodies (the "almost valid JSON" case: trailing commas, single
+    /// quotes, unescaped control characters, and a body truncated mid-token
+    /// as a dropped connection would leave it) must all fail the same way —
+    /// a clean `CompatibilityError::Json`, never a panic and never a
+    /// partially-built request.
+    #[test]
+    fn malformed_json_mode_request_bodies_fail_cleanly_not_silently() {
+        struct Fixture {
+            name: &'static str,
+            body: &'static [u8],
+        }
+        let fixtures = [
+            Fixture {
+                name: "trailing_comma",
+                body: br#"{"model":"local-model","messages":[{"role":"user","content":"hi"}],}"#,
+            },
+            Fixture {
+                name: "single_quotes",
+                body: br#"{'model':'local-model','messages':[{'role':'user','content':'hi'}]}"#,
+            },
+            Fixture {
+                name: "unescaped_control_character",
+                body: b"{\"model\":\"local-model\",\"messages\":[{\"role\":\"user\",\"content\":\"broken\ncontrol\"}]}",
+            },
+            Fixture {
+                name: "truncated_mid_string",
+                body: br#"{"model":"local-model","messages":[{"role":"user","content":"h"#,
+            },
+            Fixture {
+                name: "truncated_mid_token",
+                body: br#"{"model":"local-model","messages":[{"role":"user","content":"hi"}],"stream":tr"#,
+            },
+        ];
+        for fixture in fixtures {
+            let result = translate_request(
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "request-adversarial",
+                fixture.body,
+            );
+            assert!(
+                matches!(result, Err(CompatibilityError::Json(_))),
+                "fixture {:?} should fail as a clean JSON error, got {result:?}",
+                fixture.name
+            );
+        }
+    }
+
+    /// Schema outputs that parse as JSON but violate the shape this app
+    /// actually advertises (missing required field, wrong top-level type,
+    /// duplicate tool names) must be rejected with a structured
+    /// `InvalidRequest`/`Unsupported` error rather than silently accepted.
+    #[test]
+    fn structured_output_schema_violations_are_rejected_with_structured_errors() {
+        struct Fixture {
+            name: &'static str,
+            body: Value,
+        }
+        let fixtures = [
+            Fixture {
+                name: "json_schema_missing_schema_field",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{"name":"answer"}}
+                }),
+            },
+            Fixture {
+                name: "json_schema_top_level_not_object",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"array"}}}
+                }),
+            },
+            Fixture {
+                name: "duplicate_tool_names",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "tools":[
+                        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+                        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}
+                    ]
+                }),
+            },
+            Fixture {
+                name: "tool_call_arguments_not_an_object",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[
+                        {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"weather","arguments":"42"}}]}
+                    ]
+                }),
+            },
+        ];
+        for fixture in fixtures {
+            let result = translate_request(
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "request-schema-violation",
+                &serde_json::to_vec(&fixture.body).expect("fixture body"),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CompatibilityError::InvalidRequest { .. })
+                        | Err(CompatibilityError::Unsupported { .. })
+                ),
+                "fixture {:?} should fail with a structured error, got {result:?}",
+                fixture.name
+            );
+        }
     }
 }

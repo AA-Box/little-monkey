@@ -8,10 +8,15 @@ const invokeMock = vi.fn();
 // the factory is a *different* binding than the one this file's test bodies
 // read later, since Vitest's hoisting transform isolates them.
 const statusHandlerRef = vi.hoisted(() => ({ current: null as ((event: { payload: unknown }) => void) | null }));
+const oauthStatusHandlerRef = vi.hoisted(() => ({ current: null as ((event: { payload: unknown }) => void) | null }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: (_name: string, handler: (event: { payload: unknown }) => void) => {
-    statusHandlerRef.current = handler;
+  listen: (name: string, handler: (event: { payload: unknown }) => void) => {
+    if (name === "mcp-oauth://status") {
+      oauthStatusHandlerRef.current = handler;
+    } else {
+      statusHandlerRef.current = handler;
+    }
     return Promise.resolve(() => {});
   },
 }));
@@ -31,13 +36,14 @@ function makeInfo(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
     tools: [],
     instructions: null,
     hasHttpToken: false,
+    hasOauth: false,
     ...overrides,
   };
 }
 
 beforeEach(() => {
   invokeMock.mockReset();
-  useMcpStore.setState({ servers: [] });
+  useMcpStore.setState({ servers: [], oauthStatus: {} });
 });
 
 describe("mcpStore.refresh", () => {
@@ -173,5 +179,73 @@ describe("mcp://status event handling", () => {
 
     expect(useMcpStore.getState().servers).toHaveLength(1);
     expect(useMcpStore.getState().servers[0].id).toBe("srv");
+  });
+});
+
+describe("mcpStore OAuth actions", () => {
+  it("oauthConnect seeds a discovering phase then invokes mcp_oauth_connect with server_id and client_id", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    const promise = useMcpStore.getState().oauthConnect("srv", "byo-client-id");
+    expect(useMcpStore.getState().oauthStatus.srv).toEqual({ phase: "discovering", error: null });
+    await promise;
+
+    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", { server_id: "srv", client_id: "byo-client-id" });
+  });
+
+  it("oauthConnect passes client_id as null when the caller didn't supply one", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await useMcpStore.getState().oauthConnect("srv");
+
+    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", { server_id: "srv", client_id: null });
+  });
+
+  it("oauthCancel invokes mcp_oauth_cancel with server_id", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await useMcpStore.getState().oauthCancel("srv");
+
+    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_cancel", { server_id: "srv" });
+  });
+
+  it("oauthDisconnect invokes mcp_oauth_disconnect, clears local oauth status, then refreshes", async () => {
+    useMcpStore.setState({ oauthStatus: { srv: { phase: "connected", error: null } } });
+    invokeMock.mockResolvedValueOnce(undefined).mockResolvedValueOnce([makeInfo({ hasOauth: false })]);
+
+    await useMcpStore.getState().oauthDisconnect("srv");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_oauth_disconnect", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_list_servers");
+    expect(useMcpStore.getState().oauthStatus.srv).toBeUndefined();
+  });
+});
+
+describe("mcp-oauth://status event handling", () => {
+  it("records phase/error transitions per server id", () => {
+    oauthStatusHandlerRef.current?.({ payload: { serverId: "srv", phase: "opening_browser", error: null } });
+    expect(useMcpStore.getState().oauthStatus.srv).toEqual({ phase: "opening_browser", error: null });
+
+    oauthStatusHandlerRef.current?.({ payload: { serverId: "srv", phase: "error", error: "denied" } });
+    expect(useMcpStore.getState().oauthStatus.srv).toEqual({ phase: "error", error: "denied" });
+  });
+
+  it("triggers a full refresh on a connected transition (to pick up hasOauth)", async () => {
+    invokeMock.mockResolvedValueOnce([makeInfo({ hasOauth: true })]);
+
+    oauthStatusHandlerRef.current?.({ payload: { serverId: "srv", phase: "connected", error: null } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invokeMock).toHaveBeenCalledWith("mcp_list_servers");
+    expect(useMcpStore.getState().servers[0]?.hasOauth).toBe(true);
+  });
+
+  it("keeps each server's oauth status independent", () => {
+    oauthStatusHandlerRef.current?.({ payload: { serverId: "a", phase: "waiting_for_browser", error: null } });
+    oauthStatusHandlerRef.current?.({ payload: { serverId: "b", phase: "needs_client_id", error: "no dcr" } });
+
+    expect(useMcpStore.getState().oauthStatus.a).toEqual({ phase: "waiting_for_browser", error: null });
+    expect(useMcpStore.getState().oauthStatus.b).toEqual({ phase: "needs_client_id", error: "no dcr" });
   });
 });

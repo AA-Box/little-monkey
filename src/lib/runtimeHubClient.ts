@@ -8,6 +8,7 @@ export type ApiScope =
   | "chat_completions"
   | "responses"
   | "messages"
+  | "embeddings"
   | "model_discover"
   | "model_download"
   | "model_load"
@@ -97,6 +98,53 @@ export interface M3ModelCapabilities {
   toolCalling: boolean;
   vision: boolean;
   structuredOutput: boolean;
+}
+
+/** Coarse chat-template family the Chat Template Compatibility Lab groups
+ * fixtures by — see `chat_template_lab.rs`'s module doc comment for why
+ * detection is deliberately this coarse. */
+export type TemplateFamily = "chatml" | "llama3" | "mistral" | "gemma" | "generic";
+
+/** One fixture area from the ROADMAP wording ("tool rendering, image
+ * blocks, thinking modes, system prompts, and stop tokens"), plus
+ * structured output. */
+export type CapabilityArea =
+  | "tool_calling"
+  | "system_prompt"
+  | "stop_token"
+  | "structured_output"
+  | "vision"
+  | "thinking";
+
+export interface ChatTemplateLabResult {
+  area: CapabilityArea;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ChatTemplateLabReport {
+  templateFamily: TemplateFamily;
+  results: ChatTemplateLabResult[];
+}
+
+/** Mirrors `chat_template_lab.rs`'s `gate_capabilities`: a capability can
+ * only stay `true` if it was already declared true AND the lab actually
+ * verified it for this template family. `embeddings` has no chat-template
+ * fixture and passes through unchanged. */
+export function gateCapabilities(
+  capabilities: M3ModelCapabilities,
+  report: ChatTemplateLabReport | undefined,
+): M3ModelCapabilities {
+  if (!report) return capabilities;
+  const passed = (area: CapabilityArea) =>
+    report.results.some((result) => result.area === area && result.passed);
+  return {
+    chat: capabilities.chat && passed("system_prompt") && passed("stop_token"),
+    embeddings: capabilities.embeddings,
+    toolCalling: capabilities.toolCalling && passed("tool_calling"),
+    vision: capabilities.vision && passed("vision"),
+    structuredOutput: capabilities.structuredOutput && passed("structured_output"),
+  };
 }
 
 export interface M3ModelLicense {
@@ -394,6 +442,29 @@ export interface AdvancedSettingCapability {
   schema: SettingValueSchema;
   default_value: SettingValue;
   restart_required: boolean;
+  /** Whether this control can actually be enabled for the current
+   * runtime/model/hardware combination — see `runtime_adapter.rs`'s
+   * `AdvancedSettingCapability` doc comment. When `false`, disable the
+   * control in the UI and show `unsupported_reason`. */
+  supported: boolean;
+  unsupported_reason: string | null;
+}
+
+/** One installed model that could serve as a speculative-decoding draft
+ * model for the target model settings were resolved against. See
+ * `m3_runtime_hub.rs`'s `M3DraftModelCandidate`. */
+export interface M3DraftModelCandidate {
+  modelId: string;
+  displayName: string;
+}
+
+/** Result of `m3_resolve_setting_capabilities`: `runtime.settings` narrowed
+ * to what the current hardware/model can actually honor, plus (for
+ * speculative decoding) the installed models that are valid draft-model
+ * choices right now. See `m3_runtime_hub.rs`'s `gate_advanced_settings`. */
+export interface M3SettingCapabilitiesView {
+  settings: AdvancedSettingCapability[];
+  draftModelCandidates: M3DraftModelCandidate[];
 }
 
 export interface M3RuntimeDescriptor {
@@ -411,7 +482,30 @@ export interface M3RuntimeCapability {
   canLogs: boolean;
   canMetrics: boolean;
   canInfer: boolean;
+  /** Whether this runtime's transport genuinely reaches an embeddings
+   * endpoint (Ollama's daemon today). See the Compatibility tab. */
+  canEmbed: boolean;
   settings: AdvancedSettingCapability[];
+}
+
+/** Phase 8 item 11: OpenAI/Ollama API compatibility matrix — one row per
+ * route x backend x (optionally) model, derived from real runtime/model
+ * capability state. See `RuntimeHubCompatibilityMatrix.tsx`. */
+export type M3CompatibilityStatus = "pass" | "unsupported" | "fail";
+
+export interface M3CompatibilityMatrixRow {
+  method: string;
+  route: string;
+  backend: ApiBackend;
+  runtimeId: string;
+  modelId: string | null;
+  status: M3CompatibilityStatus;
+  reason: string;
+}
+
+export interface M3CompatibilityMatrixReport {
+  generatedAtMs: number;
+  rows: M3CompatibilityMatrixRow[];
 }
 
 export interface RuntimeDescriptor {
@@ -494,6 +588,73 @@ export interface RuntimeInventory {
 export interface RuntimeLogTail {
   text: string;
   truncated: boolean;
+}
+
+// -- Context and KV Cache Control Center (Phase 8) -------------------------
+
+export type ContextLimitSource = "runtime_configured" | "runtime_default" | "unavailable";
+
+export interface ConfiguredContext {
+  tokens: number | null;
+  source: ContextLimitSource;
+  settingKey: string | null;
+}
+
+export type ContextRuntimeKind = "ollama" | "llama_cpp" | "mlx";
+
+export interface ContextCacheView {
+  runtimeId: string;
+  runtimeKind: ContextRuntimeKind;
+  configured: ConfiguredContext;
+  reportedContextTokens: number | null;
+  contextTokensInUse: number | null;
+  contextHeadroomTokens: number | null;
+  contextShiftDetected: boolean | null;
+  totalSlots: number | null;
+  notes: string[];
+  sampledAtMs: number;
+}
+
+export interface EffectiveContextInput {
+  requestedTokens: number;
+  offloadPlanContextTokens: number;
+  modelMetadataMaxContextTokens: number | null;
+  runtimeSettingMinTokens: number | null;
+  runtimeSettingMaxTokens: number | null;
+}
+
+export interface EffectiveContextResolution {
+  effectiveTokens: number;
+  cappedBy: string[];
+  rationale: string[];
+}
+
+export type ContextFailureClass =
+  | "prompt_too_long"
+  | "cache_exhausted_context_shift"
+  | "memory_pressure"
+  | "runtime_limitation"
+  | "model_metadata_limit";
+
+export interface ContextFailureClassification {
+  class: ContextFailureClass;
+  explanation: string;
+  evidence: string[];
+}
+
+export interface ContextFailureInput {
+  errorText?: string | null;
+  httpStatus?: number | null;
+  configuredContextTokens?: number | null;
+  requestedContextTokens?: number | null;
+  modelMetadataMaxContextTokens?: number | null;
+  promptTokens?: number | null;
+  contextShiftSignal?: boolean | null;
+  availableRamBytes?: number | null;
+  requiredRamBytes?: number | null;
+  availableVramBytes?: number | null;
+  requiredVramBytes?: number | null;
+  runtimeSupportsContextControl?: boolean | null;
 }
 
 export type KeepAlive = { mode: "duration_ms"; milliseconds: number } | { mode: "forever" };
@@ -624,6 +785,92 @@ export interface M3HttpServerStatus {
   lastError: string | null;
 }
 
+// --- Model Conversion and Quantization Workbench (ROADMAP.md Phase 8) ---
+
+export interface BackendDescriptor {
+  id: string;
+  available: boolean;
+}
+
+export interface QuantTypeDescriptor {
+  id: string;
+  cliName: string;
+  note: string;
+}
+
+export type SourceFormat = "gguf" | "safetensors";
+
+export interface GgufHeaderInfo {
+  version: number;
+  tensorCount: number;
+  metadataKvCount: number;
+  architecture: string | null;
+  name: string | null;
+  quantizationVersion: string | null;
+  declaredLicense: string | null;
+}
+
+export interface SafetensorsHeaderInfo {
+  headerSizeBytes: number;
+  tensorCount: number;
+  metadata: Record<string, string>;
+  declaredLicense: string | null;
+}
+
+export type SourceHeader = ({ kind: "gguf" } & GgufHeaderInfo) | ({ kind: "safetensors" } & SafetensorsHeaderInfo);
+
+export type LicenseSource = "installed_model_manifest" | "gguf_metadata" | "safetensors_metadata" | "none";
+export type LicenseRisk = "permissive" | "copyleft" | "restricted" | "unknown";
+
+export interface LicenseAssessment {
+  declaredName: string | null;
+  declaredSpdxId: string | null;
+  source: LicenseSource;
+  risk: LicenseRisk;
+  warning: string | null;
+}
+
+export interface QuantizationSourceInfo {
+  path: string;
+  format: SourceFormat;
+  sha256: string;
+  sizeBytes: number;
+  header: SourceHeader;
+}
+
+export interface QuantizationToolInfo {
+  backendId: string;
+  name: string;
+  version: string | null;
+  real: boolean;
+}
+
+export interface QuantizationOutputInfo {
+  path: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface QuantizationEvalResult {
+  method: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ConversionReport {
+  schemaVersion: number;
+  conversionId: string;
+  generatedAtMs: number;
+  source: QuantizationSourceInfo;
+  quantChoice: string;
+  allowRequantize: boolean;
+  tool: QuantizationToolInfo;
+  output: QuantizationOutputInfo;
+  tradeoffNote: string;
+  license: LicenseAssessment;
+  eval: QuantizationEvalResult;
+}
+
 export interface OperationArgs extends Record<string, unknown> {
   operationId: string;
   timeoutMs?: number | null;
@@ -652,8 +899,12 @@ export const runtimeHubClient = {
   runtimes: () => invoke<M3RuntimeCapability[]>("m3_runtimes"),
   refreshRuntimes: (args: OperationArgs) =>
     invoke<M3RuntimeCapability[]>("m3_refresh_runtimes", args),
+  resolveSettingCapabilities: (args: { runtimeId: string; assetId: string | null }) =>
+    invoke<M3SettingCapabilitiesView>("m3_resolve_setting_capabilities", args),
   schedulePlan: (input: M3SchedulingInput) =>
     invoke<M3SchedulingPlan>("m3_schedule_plan", { input }),
+  chatTemplateLabReport: (template: string | null) =>
+    invoke<ChatTemplateLabReport>("m3_chat_template_lab_report", { template }),
   offloadPlan: (input: OffloadPlanInput) => invoke<OffloadPlan>("m3_offload_plan", { input }),
   catalogSearch: (args: OperationArgs & { query: string; limit: number }) =>
     invoke<M3CatalogMatch[]>("m3_catalog_search", args),
@@ -686,6 +937,12 @@ export const runtimeHubClient = {
     invoke<RuntimeLogTail>("m3_runtime_logs", args),
   runtimeMetrics: (args: OperationArgs & { runtimeId: string }) =>
     invoke<M3RuntimeMetricsView>("m3_runtime_metrics", args),
+  contextCacheState: (args: OperationArgs & { runtimeId: string }) =>
+    invoke<ContextCacheView>("m3_context_cache_state", args),
+  contextEffectiveSize: (input: EffectiveContextInput) =>
+    invoke<EffectiveContextResolution>("m3_context_effective_size", { input }),
+  classifyContextFailure: (input: ContextFailureInput) =>
+    invoke<ContextFailureClassification | null>("m3_classify_context_failure", { input }),
   runtimeSetConfig: (request: { runtimeId: string; values: Record<string, SettingValue> }) =>
     invoke<Record<string, SettingValue>>("m3_runtime_set_config", { request }),
   runtimeConfig: (runtimeId: string) =>
@@ -694,6 +951,7 @@ export const runtimeHubClient = {
     invoke<M3ApiDispatchResponse>("m3_api_dispatch", args),
   apiCancelInference: (args: OperationArgs & { request: M3CancelInferenceRequest }) =>
     invoke<boolean>("m3_api_cancel_inference", args),
+  compatibilityMatrix: () => invoke<M3CompatibilityMatrixReport>("m3_compatibility_matrix"),
   lanValidatePolicy: (policy: LanServerPolicy) => invoke<void>("m3_lan_validate_policy", { policy }),
   lanConfigure: (policy: LanServerPolicy) => invoke<LanServerPolicy>("m3_lan_configure", { policy }),
   lanDisable: (confirmation: string) => invoke<boolean>("m3_lan_disable", { confirmation }),
@@ -711,6 +969,16 @@ export const runtimeHubClient = {
   httpServerStatus: () => invoke<M3HttpServerStatus>("m3_http_server_status"),
   httpServerStoreTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) =>
     invoke<string>("m3_http_server_store_tls_identity", { reference, certificatePem, privateKeyPem }),
+  quantizationBackends: () => invoke<BackendDescriptor[]>("quantization_backends"),
+  quantizationQuantTypes: () => invoke<QuantTypeDescriptor[]>("quantization_quant_types"),
+  quantizationConvertPath: (args: { sourcePath: string; quantChoice: string; allowRequantize: boolean }) =>
+    invoke<ConversionReport>("quantization_convert_path", args),
+  quantizationConvertInstalledModel: (args: {
+    assetId: string;
+    versionKey: string | null;
+    quantChoice: string;
+    allowRequantize: boolean;
+  }) => invoke<ConversionReport>("quantization_convert_installed_model", args),
   componentStorageStatus: () => invoke<M3StorageStatus>("m3_component_storage_status"),
   componentInstalled: () => invoke<M3InstalledComponent[]>("m3_component_installed"),
   componentRegistryEntries: () => invoke<M3ComponentCatalogEntry[]>("m3_component_registry_entries"),
