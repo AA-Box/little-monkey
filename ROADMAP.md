@@ -960,15 +960,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** User can preview and validate a custom model package before it enters the model library.
 
-### 7. Model Conversion and Quantization Workbench
-
-**Status:** Planned
-
-- Convert compatible Hugging Face, safetensors, GGUF, LoRA, and adapter inputs into local model packages.
-- Offer quantization choices with benchmark, quality, size, and license checks.
-
-**Acceptance:** A conversion produces a reproducible report, output digest, license warning, and eval result.
-
 ### 8. Chat Template and Renderer Compatibility Lab
 
 **Status:** Planned
@@ -986,15 +977,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Give users safe controls for long-context tradeoffs.
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
-
-### 11. OpenAI and Ollama API Compatibility Harness
-
-**Status:** Planned
-
-- Test `/v1/models`, chat/completions, embeddings, streaming/SSE, JSON schema, tool calls, model tags, and Ollama-native endpoints.
-- Keep a compatibility matrix per backend and model.
-
-**Acceptance:** API compatibility regressions are caught before release and shown in Runtime/API Hub.
 
 ### 12. Multimodal Projector and Vision Model Manager
 
@@ -1031,15 +1013,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Prefer safe fallbacks over failed loads.
 
 **Acceptance:** Device-specific profiles explain supported models, expected speed, and required runtime components.
-
-### 17. Sampler, Batching, and Speculative Decoding Controls
-
-**Status:** Research
-
-- Expose supported sampler options, batching, speculative decoding, flash attention, mixed precision, and model-family tuning.
-- Gate advanced controls behind model/runtime support checks.
-
-**Acceptance:** Advanced performance controls cannot be enabled when the selected model/runtime cannot honor them.
 
 ### 18. Runtime PR Watcher and Capability Feed
 

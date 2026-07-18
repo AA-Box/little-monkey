@@ -18,12 +18,16 @@ use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
     M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
-    M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck, M3DeleteModelRequest,
-    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
-    M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
-    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind,
-    M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus,
-    M3UnloadModelRequest,
+    M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck,
+    M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError,
+    M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest,
+    M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub,
+    M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
+    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
+};
+use crate::quantization::{
+    BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
+    QuantizationWorkbench,
 };
 use crate::runtime_adapter::{
     HardwareProfile, HardwareSnapshot, LocalOffloadPlanner, LocalRuntimeScheduler, OffloadPlan,
@@ -34,7 +38,9 @@ use crate::runtime_telemetry::{
     RecordLoadTraceRequest, RecordRequestTraceRequest, RuntimeTelemetryState, RuntimeTraceRecord,
     SupportBundle,
 };
+use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -265,6 +271,25 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Sampler/Batching/Speculative Decoding Controls (ROADMAP Phase 8 item 17):
+/// narrows `runtime_id`'s declared advanced settings down to what the
+/// current hardware and (if `asset_id` is given) selected model can
+/// actually honor — see `m3_runtime_hub.rs`'s `gate_advanced_settings` for
+/// the gating rules. `asset_id: None` still resolves the hardware-only
+/// gates (flash attention, mixed precision); only the speculative-decoding
+/// draft-model gate needs a target model.
+#[tauri::command]
+pub fn m3_resolve_setting_capabilities(
+    state: tauri::State<'_, M3CommandState>,
+    runtime_id: String,
+    asset_id: Option<String>,
+) -> Result<M3SettingCapabilitiesView, String> {
+    state
+        .hub
+        .resolve_setting_capabilities(&runtime_id, asset_id.as_deref())
+        .map_err(command_error)
 }
 
 /// Chat Template and Renderer Compatibility Lab report for one coarse
@@ -633,6 +658,18 @@ pub async fn m3_api_cancel_inference(
     finish(&state, &operation_id, result).await
 }
 
+/// Phase 8 item 11 acceptance criterion: "shown in Runtime/API Hub". Builds
+/// the per-route × backend × model compatibility matrix from real,
+/// currently-registered runtime/model capability state — see
+/// `M3RuntimeHub::compatibility_matrix`'s doc for why this is
+/// capability-derived rather than a live per-cell network probe.
+#[tauri::command]
+pub fn m3_compatibility_matrix(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3CompatibilityMatrixReport, String> {
+    state.hub.compatibility_matrix().map_err(command_error)
+}
+
 #[tauri::command]
 pub fn m3_lan_validate_policy(policy: LanServerPolicy) -> Result<(), String> {
     M3RuntimeHub::validate_lan_policy(&policy).map_err(command_error)
@@ -713,6 +750,133 @@ pub fn m3_lan_audit_events(
     state: tauri::State<'_, M3CommandState>,
 ) -> Result<Vec<SecurityAuditEvent>, String> {
     state.hub.security_audit_events().map_err(command_error)
+}
+
+// =========================================================================
+// Model Conversion and Quantization Workbench (ROADMAP.md Phase 8)
+// =========================================================================
+
+/// Owns the [`QuantizationWorkbench`] (its own storage root, independent of
+/// the model manifest/blob store owned by `M3CommandState`). The workbench
+/// itself holds no Tauri state; this is only the thin managed-state wrapper
+/// so commands can cheaply clone the `Arc` before moving it into
+/// `spawn_blocking` (conversion shells out to an external process and hashes
+/// files, both of which are blocking work).
+pub struct M3QuantizationCommandState {
+    pub workbench: Arc<QuantizationWorkbench>,
+}
+
+impl M3QuantizationCommandState {
+    pub fn new(workbench: QuantizationWorkbench) -> Self {
+        Self {
+            workbench: Arc::new(workbench),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuantTypeDescriptor {
+    pub id: String,
+    pub cli_name: String,
+    pub note: String,
+}
+
+#[tauri::command]
+pub fn quantization_backends(
+    state: tauri::State<'_, M3QuantizationCommandState>,
+) -> Result<Vec<BackendDescriptor>, String> {
+    Ok(state.workbench.list_backends())
+}
+
+#[tauri::command]
+pub fn quantization_quant_types(
+    state: tauri::State<'_, M3QuantizationCommandState>,
+) -> Result<Vec<QuantTypeDescriptor>, String> {
+    Ok(state
+        .workbench
+        .quant_types()
+        .into_iter()
+        .map(|(_quant, cli_name, note)| QuantTypeDescriptor {
+            id: cli_name.to_string(),
+            cli_name: cli_name.to_string(),
+            note: note.to_string(),
+        })
+        .collect())
+}
+
+fn parse_quant_choice(quant_choice: &str) -> Result<GgufQuantType, String> {
+    GgufQuantType::parse(quant_choice)
+        .ok_or_else(|| format!("unknown quantization type '{quant_choice}'"))
+}
+
+/// Converts/(re)quantizes an arbitrary GGUF or safetensors path on disk (not
+/// necessarily a Runtime Hub-installed model). License information is
+/// best-effort sniffed directly out of the source file/directory — see
+/// [`quantization_convert_installed_model`] to reuse an installed model's
+/// verified catalog license instead.
+#[tauri::command]
+pub async fn quantization_convert_path(
+    state: tauri::State<'_, M3QuantizationCommandState>,
+    source_path: String,
+    quant_choice: String,
+    allow_requantize: bool,
+) -> Result<ConversionReport, String> {
+    let quant_choice = parse_quant_choice(&quant_choice)?;
+    let workbench = state.workbench.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        workbench.convert(ConversionRequest {
+            source_path: PathBuf::from(source_path),
+            quant_choice,
+            allow_requantize,
+            license: DeclaredLicense::SniffFromSource,
+        })
+    })
+    .await
+    .map_err(|error| format!("quantization task join failed: {error}"))?
+    .map_err(|error| error.to_string())
+}
+
+/// Converts/(re)quantizes an already-installed Runtime Hub model version,
+/// reusing its verified catalog license (`M3ModelLicense`) instead of
+/// sniffing one out of the file. Defaults to the asset's active version
+/// when `version_key` is omitted.
+#[tauri::command]
+pub async fn quantization_convert_installed_model(
+    state: tauri::State<'_, M3QuantizationCommandState>,
+    m3_state: tauri::State<'_, M3CommandState>,
+    asset_id: String,
+    version_key: Option<String>,
+    quant_choice: String,
+    allow_requantize: bool,
+) -> Result<ConversionReport, String> {
+    let quant_choice = parse_quant_choice(&quant_choice)?;
+    let model = m3_state
+        .hub
+        .list_installed_models()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|model| model.asset_id == asset_id)
+        .ok_or_else(|| format!("no installed model with asset id '{asset_id}'"))?;
+    let target_version_key = version_key.unwrap_or_else(|| model.active_version_key.clone());
+    let version = model
+        .versions
+        .into_iter()
+        .find(|version| version.version_key == target_version_key)
+        .ok_or_else(|| format!("no installed version '{target_version_key}' for asset '{asset_id}'"))?;
+
+    let workbench = state.workbench.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        workbench.convert(ConversionRequest {
+            source_path: version.artifact_path,
+            quant_choice,
+            allow_requantize,
+            license: DeclaredLicense::FromInstalledModel(version.license),
+        })
+    })
+    .await
+    .map_err(|error| format!("quantization task join failed: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 // -------------------------------------------------------------------------

@@ -15,7 +15,8 @@
     "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
     "stage:cli": "node scripts/stage-cli-sidecar.mjs",
-    "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs"
+    "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs",
+    "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -45,6 +46,7 @@
     "@types/sql.js": "^1.4.11",
     "@vitejs/plugin-react": "^4.6.0",
     "tailwindcss": "^4.3.2",
+    "tauri-liquid-icon": "^1.1.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^4.1.10"

@@ -31,6 +31,8 @@
 //! module exercises anything other than `NullBackend`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +46,13 @@ use uuid::Uuid;
 /// indefinite" posture for the same reason: an unattended session left open
 /// for hours is its own risk even with every other gate in place.
 pub const MAX_SESSION_LIFETIME_MS: u64 = 30 * 60 * 1_000;
+
+/// A held cross-process desktop-control lock is considered stale — and may be
+/// reclaimed — once it is older than this bound, even if its owner pid still
+/// happens to be alive. A single control session can never legitimately
+/// outlive [`MAX_SESSION_LIFETIME_MS`], so a lock older than that can only be
+/// a leak from a crashed or wedged controller.
+const STALE_LOCK_MS: u64 = MAX_SESSION_LIFETIME_MS;
 
 /// Longest a single pending action waits for a human decision before it is
 /// treated as denied — mirrors `permissions::PERMISSION_TIMEOUT`'s "silence
@@ -286,7 +295,9 @@ pub enum ActionGate {
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<MutexGuard<'a, T>, String> {
-    mutex.lock().map_err(|_| format!("{label} lock is poisoned"))
+    mutex
+        .lock()
+        .map_err(|_| format!("{label} lock is poisoned"))
 }
 
 fn now_ms() -> u64 {
@@ -298,9 +309,65 @@ fn now_ms() -> u64 {
 
 fn validate_application_id(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        Err("Application/window identifier must be a non-empty, printable, bounded string".to_string())
+        Err(
+            "Application/window identifier must be a non-empty, printable, bounded string"
+                .to_string(),
+        )
     } else {
         Ok(())
+    }
+}
+
+/// Contents of the machine-wide desktop-control lock file. Persisted as JSON
+/// so a stale lock left by a crashed process can be inspected and reclaimed by
+/// a later controller (see [`STALE_LOCK_MS`] and `process_alive`).
+#[derive(Serialize, Deserialize)]
+struct LockContents {
+    pid: u32,
+    acquired_at_ms: u64,
+}
+
+/// RAII owner of the on-disk desktop-control lock file. Removing the file on
+/// drop is the process-exit backstop the design requires: even if a controller
+/// panics between `start_session_impl` and an explicit stop, dropping the
+/// [`DesktopControlState`] releases the lock so the next process is not blocked
+/// by a phantom owner.
+struct DesktopControlLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for DesktopControlLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Best-effort liveness probe mirroring `daemon::service::process_alive` — a
+/// lock whose owner pid is gone is always safe to reclaim regardless of age.
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -308,19 +375,141 @@ pub struct DesktopControlState {
     backend: Arc<dyn DesktopInputBackend>,
     sessions: Mutex<BTreeMap<String, ControlSession>>,
     pending: Mutex<HashMap<String, PendingControlAction>>,
+    /// Path of the machine-wide exclusive lock this state must hold while any
+    /// session is active, or `None` to disable cross-process locking (the
+    /// shape every in-module test and any pure in-process caller uses).
+    lock_path: Option<PathBuf>,
+    /// The currently-held lock guard, if this state owns an active session.
+    held_lock: Mutex<Option<DesktopControlLockGuard>>,
 }
 
 impl DesktopControlState {
     pub fn production() -> Self {
-        Self::with_backend(production_backend())
+        Self::with_backend_and_lock(production_backend(), None)
+    }
+
+    /// Production backend plus the machine-wide exclusive lock at
+    /// `<app_data>/desktop_control.lock`, so the local Tauri app and the
+    /// resident daemon can never drive real OS input at the same time even
+    /// though each constructs its own `DesktopControlState`.
+    pub fn production_with_lock(lock_path: PathBuf) -> Self {
+        Self::with_backend_and_lock(production_backend(), Some(lock_path))
     }
 
     pub fn with_backend(backend: Arc<dyn DesktopInputBackend>) -> Self {
+        Self::with_backend_and_lock(backend, None)
+    }
+
+    pub fn with_backend_and_lock(
+        backend: Arc<dyn DesktopInputBackend>,
+        lock_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             backend,
             sessions: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(HashMap::new()),
+            lock_path,
+            held_lock: Mutex::new(None),
         }
+    }
+
+    /// Acquire the machine-wide lock before a session may be created. A no-op
+    /// when cross-process locking is disabled (`lock_path` is `None`) or when
+    /// this state already owns the lock (a second concurrent session in the
+    /// same process is fine — the invariant is one *controller process* at a
+    /// time). A lock held by a live, recent process refuses the start.
+    fn acquire_lock(&self) -> Result<(), String> {
+        let Some(path) = self.lock_path.as_ref() else {
+            return Ok(());
+        };
+        let mut held = lock(&self.held_lock, "desktop control lock")?;
+        if held.is_some() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!("Could not prepare desktop-control lock directory: {error}")
+            })?;
+        }
+        // One reclaim attempt: if the existing lock is stale (dead owner or
+        // older than STALE_LOCK_MS) remove it and retry the create-new.
+        for attempt in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    let contents = LockContents {
+                        pid: std::process::id(),
+                        acquired_at_ms: now_ms(),
+                    };
+                    let bytes = serde_json::to_vec(&contents).map_err(|error| {
+                        format!("Could not encode desktop-control lock: {error}")
+                    })?;
+                    file.write_all(&bytes).map_err(|error| {
+                        format!("Could not write desktop-control lock: {error}")
+                    })?;
+                    file.sync_all().map_err(|error| {
+                        format!("Could not persist desktop-control lock: {error}")
+                    })?;
+                    *held = Some(DesktopControlLockGuard { path: path.clone() });
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt == 0 && self.reclaim_if_stale(path) {
+                        continue;
+                    }
+                    return Err(
+                        "Another control session is already active on this machine — stop it \
+                         (or wait for it to expire) before starting a new one"
+                            .to_string(),
+                    );
+                }
+                Err(error) => {
+                    return Err(format!("Could not create desktop-control lock: {error}"));
+                }
+            }
+        }
+        Err(
+            "Another control session is already active on this machine — stop it (or wait for \
+             it to expire) before starting a new one"
+                .to_string(),
+        )
+    }
+
+    /// Returns `true` (having removed the file) when the on-disk lock is stale
+    /// — unreadable, owned by a dead pid, or older than [`STALE_LOCK_MS`].
+    fn reclaim_if_stale(&self, path: &std::path::Path) -> bool {
+        let stale = match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<LockContents>(&bytes) {
+                Ok(contents) => {
+                    now_ms().saturating_sub(contents.acquired_at_ms) > STALE_LOCK_MS
+                        || !process_alive(contents.pid)
+                }
+                // A corrupt/partial lock file cannot represent a live owner.
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
+        if stale {
+            let _ = std::fs::remove_file(path);
+        }
+        stale
+    }
+
+    /// Drop the held lock once no session in this state is active any more.
+    fn release_lock_if_idle(&self) -> Result<(), String> {
+        if self.lock_path.is_none() {
+            return Ok(());
+        }
+        let any_active = lock(&self.sessions, "control sessions")?
+            .values()
+            .any(|session| session.active);
+        if !any_active {
+            *lock(&self.held_lock, "desktop control lock")? = None;
+        }
+        Ok(())
     }
 
     /// Core session-start logic, deliberately taking the caller's current
@@ -362,6 +551,9 @@ impl DesktopControlState {
                 "Session lifetime must be between 1 ms and {MAX_SESSION_LIFETIME_MS} ms"
             ));
         }
+        // Acquire the machine-wide exclusive lock before a session exists, so
+        // a refused start never leaves a half-created session behind.
+        self.acquire_lock()?;
         let created_at_ms = now_ms();
         let session = ControlSession {
             session_id: format!("desktop-control-{}", Uuid::new_v4()),
@@ -372,7 +564,8 @@ impl DesktopControlState {
             indicator_visible: true,
             approved_batch,
         };
-        lock(&self.sessions, "control sessions")?.insert(session.session_id.clone(), session.clone());
+        lock(&self.sessions, "control sessions")?
+            .insert(session.session_id.clone(), session.clone());
         Ok(session)
     }
 
@@ -389,6 +582,7 @@ impl DesktopControlState {
             })
             .unwrap_or(false);
         self.deny_pending_for_session(session_id)?;
+        self.release_lock_if_idle()?;
         Ok(was_active)
     }
 
@@ -413,7 +607,10 @@ impl DesktopControlState {
     /// Returns whether any session is still active — used to decide whether
     /// the visible indicator should keep showing.
     pub fn any_session_active(&self) -> Result<bool, String> {
-        Ok(self.sessions_snapshot()?.iter().any(|session| session.active))
+        Ok(self
+            .sessions_snapshot()?
+            .iter()
+            .any(|session| session.active))
     }
 
     fn require_active_session(
@@ -478,7 +675,10 @@ impl DesktopControlState {
                 sender,
             },
         );
-        Ok(ActionGate::Pending { action_id, receiver })
+        Ok(ActionGate::Pending {
+            action_id,
+            receiver,
+        })
     }
 
     /// Resolves a pending action by id, sending the decision through its
@@ -487,13 +687,43 @@ impl DesktopControlState {
     /// `respond_if_pending` split between this pure lookup and the
     /// `#[tauri::command]` wrapper that turns "not found" into an `Err`.
     pub fn resolve_if_pending(&self, action_id: &str, approve: bool) -> Result<bool, String> {
-        let Some(pending) = lock(&self.pending, "pending control actions")?.remove(action_id) else {
+        let Some(pending) = lock(&self.pending, "pending control actions")?.remove(action_id)
+        else {
             return Ok(false);
         };
         // If the receiving end was already dropped (e.g. the request timed
         // out just before this call), there's nothing left to notify.
         let _ = pending.sender.send(approve);
         Ok(true)
+    }
+
+    /// Complete a pending per-action approval that a non-batch session
+    /// produced via [`ActionGate::Pending`]. Resolves the pending entry (so
+    /// its oneshot is consumed exactly once) and, only if it still existed and
+    /// the decision was to allow, dispatches the action to the backend. Used
+    /// by headless callers (the resident daemon's remote desktop-control
+    /// routes) that decide the approval inline with a local prompt rather than
+    /// through the async `#[tauri::command]` await/resolve split — and it keeps
+    /// `execute` module-private. Returns whether the action actually ran.
+    ///
+    /// A `false` result with `approve == true` means the session was stopped
+    /// (or its approval timed out) between `begin_action` and this call — the
+    /// action is intentionally *not* executed in that race.
+    pub fn finish_pending(
+        &self,
+        action_id: &str,
+        action: &ControlAction,
+        approve: bool,
+    ) -> Result<bool, String> {
+        if !self.resolve_if_pending(action_id, approve)? {
+            return Ok(false);
+        }
+        if approve {
+            self.execute(action)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn deny_pending_for_session(&self, session_id: &str) -> Result<(), String> {
@@ -543,6 +773,9 @@ impl DesktopControlState {
             }
             count
         };
+        // Every session is now inactive, so the machine-wide lock is released
+        // unconditionally — this is the app-exit / kill-switch / revoke path.
+        self.release_lock_if_idle()?;
         Ok((sessions_deactivated, actions_cancelled))
     }
 }
@@ -567,7 +800,8 @@ pub fn desktop_control_start_session(
 ) -> Result<ControlSession, String> {
     ensure_main_window(&window)?;
     let mode = crate::permissions::get_permission_mode(permissions_state)?;
-    let session = state.start_session_impl(&mode, allowed_applications, lifetime_ms, approved_batch)?;
+    let session =
+        state.start_session_impl(&mode, allowed_applications, lifetime_ms, approved_batch)?;
     // Best-effort visible indicator — reuses the existing always-on-top
     // companion overlay window rather than building new window chrome (see
     // the design doc). A failure to show it never fails session start
@@ -620,7 +854,10 @@ pub async fn desktop_control_request_action(
                 executed: true,
             })
         }
-        ActionGate::Pending { action_id, receiver } => {
+        ActionGate::Pending {
+            action_id,
+            receiver,
+        } => {
             let _ = app.emit(
                 "desktop-control://action-pending",
                 PendingActionSummary {
@@ -730,7 +967,12 @@ mod tests {
             .start_session_impl("manual", allow(&["Notes"]), 0, false)
             .is_err());
         assert!(state
-            .start_session_impl("manual", allow(&["Notes"]), MAX_SESSION_LIFETIME_MS + 1, false)
+            .start_session_impl(
+                "manual",
+                allow(&["Notes"]),
+                MAX_SESSION_LIFETIME_MS + 1,
+                false
+            )
             .is_err());
         assert!(state
             .start_session_impl("manual", allow(&["Notes"]), MAX_SESSION_LIFETIME_MS, false)
@@ -744,13 +986,21 @@ mod tests {
             .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
             .unwrap();
 
-        let outside = state.begin_action(&session.session_id, "Safari", ControlAction::MouseMove { x: 1, y: 1 });
+        let outside = state.begin_action(
+            &session.session_id,
+            "Safari",
+            ControlAction::MouseMove { x: 1, y: 1 },
+        );
         match outside {
             Err(error) => assert!(error.contains("allowlist")),
             Ok(_) => panic!("action against a non-allowlisted target must be rejected"),
         }
 
-        let inside = state.begin_action(&session.session_id, "Notes", ControlAction::MouseMove { x: 1, y: 1 });
+        let inside = state.begin_action(
+            &session.session_id,
+            "Notes",
+            ControlAction::MouseMove { x: 1, y: 1 },
+        );
         assert!(matches!(inside, Ok(ActionGate::Pending { .. })));
     }
 
@@ -758,7 +1008,13 @@ mod tests {
     fn unknown_or_stopped_session_rejects_actions() {
         let state = state();
         assert!(state
-            .begin_action("does-not-exist", "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                "does-not-exist",
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string()
+                }
+            )
             .is_err());
 
         let session = state
@@ -766,7 +1022,13 @@ mod tests {
             .unwrap();
         assert!(state.stop_session(&session.session_id).unwrap());
         assert!(state
-            .begin_action(&session.session_id, "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string()
+                }
+            )
             .is_err());
     }
 
@@ -778,11 +1040,19 @@ mod tests {
             .unwrap();
 
         let gate = state
-            .begin_action(&session.session_id, "Notes", ControlAction::MouseClick { button: MouseButtonKind::Left })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::MouseClick {
+                    button: MouseButtonKind::Left,
+                },
+            )
             .unwrap();
         match gate {
             ActionGate::Executed(result) => assert!(result.is_ok()),
-            ActionGate::Pending { .. } => panic!("approved-batch session must not create a pending approval"),
+            ActionGate::Pending { .. } => {
+                panic!("approved-batch session must not create a pending approval")
+            }
         }
     }
 
@@ -794,9 +1064,19 @@ mod tests {
             .unwrap();
 
         let gate = state
-            .begin_action(&session.session_id, "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string(),
+                },
+            )
             .unwrap();
-        let ActionGate::Pending { action_id, receiver } = gate else {
+        let ActionGate::Pending {
+            action_id,
+            receiver,
+        } = gate
+        else {
             panic!("non-batch session must produce a pending approval");
         };
 
@@ -812,9 +1092,19 @@ mod tests {
             .unwrap();
 
         let gate = state
-            .begin_action(&session.session_id, "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string(),
+                },
+            )
             .unwrap();
-        let ActionGate::Pending { action_id, receiver } = gate else {
+        let ActionGate::Pending {
+            action_id,
+            receiver,
+        } = gate
+        else {
             panic!("non-batch session must produce a pending approval");
         };
 
@@ -835,9 +1125,19 @@ mod tests {
             .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
             .unwrap();
         let gate = state
-            .begin_action(&session.session_id, "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string(),
+                },
+            )
             .unwrap();
-        let ActionGate::Pending { action_id, receiver } = gate else {
+        let ActionGate::Pending {
+            action_id,
+            receiver,
+        } = gate
+        else {
             panic!("non-batch session must produce a pending approval");
         };
 
@@ -855,7 +1155,13 @@ mod tests {
             .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
             .unwrap();
         let gate = state
-            .begin_action(&session.session_id, "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string(),
+                },
+            )
             .unwrap();
         let ActionGate::Pending { receiver, .. } = gate else {
             panic!("non-batch session must produce a pending approval");
@@ -879,11 +1185,117 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         let snapshot = state.sessions_snapshot().unwrap();
-        assert!(!snapshot.iter().find(|s| s.session_id == session.session_id).unwrap().active);
+        assert!(
+            !snapshot
+                .iter()
+                .find(|s| s.session_id == session.session_id)
+                .unwrap()
+                .active
+        );
 
         assert!(state
-            .begin_action(&session.session_id, "Notes", ControlAction::KeyPress { key: "a".to_string() })
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::KeyPress {
+                    key: "a".to_string()
+                }
+            )
             .is_err());
+    }
+
+    fn temp_lock_path() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lm-desktop-control-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("desktop_control.lock")
+    }
+
+    #[test]
+    fn cross_process_lock_refuses_a_second_controller_until_released() {
+        let lock_path = temp_lock_path();
+        // Two independent controllers (the local app and the resident daemon
+        // in production) pointed at the same machine-wide lock file.
+        let first = DesktopControlState::with_backend_and_lock(
+            Arc::new(NullBackend),
+            Some(lock_path.clone()),
+        );
+        let second = DesktopControlState::with_backend_and_lock(
+            Arc::new(NullBackend),
+            Some(lock_path.clone()),
+        );
+
+        let session = first
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .expect("first controller should acquire the lock and start");
+
+        // While the first controller holds a live session, the second is
+        // refused — not silently allowed to also drive real input.
+        let refused = second
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .unwrap_err();
+        assert!(
+            refused.contains("Another control session is already active"),
+            "unexpected refusal message: {refused}"
+        );
+
+        // Releasing via stop_session hands the lock to the second controller.
+        assert!(first.stop_session(&session.session_id).unwrap());
+        let after_stop = second
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .expect("second controller should start once the first stops");
+        assert!(after_stop.active);
+
+        // Releasing via emergency_stop hands it back to the first controller.
+        second.emergency_stop().unwrap();
+        let after_emergency = first
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .expect("first controller should start once the second emergency-stops");
+        assert!(after_emergency.active);
+
+        first.emergency_stop().unwrap();
+        let _ = std::fs::remove_dir_all(lock_path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_stale_lock_older_than_the_bound_is_reclaimed() {
+        let lock_path = temp_lock_path();
+        // A leaked lock file older than any legitimate session lifetime must
+        // not permanently wedge desktop control, even if its recorded pid
+        // happens to still be a live process.
+        let contents = LockContents {
+            pid: std::process::id(),
+            acquired_at_ms: now_ms().saturating_sub(STALE_LOCK_MS + 1_000),
+        };
+        std::fs::write(&lock_path, serde_json::to_vec(&contents).unwrap()).unwrap();
+
+        let state = DesktopControlState::with_backend_and_lock(
+            Arc::new(NullBackend),
+            Some(lock_path.clone()),
+        );
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .expect("a lock older than STALE_LOCK_MS must be reclaimable");
+        assert!(session.active);
+
+        state.emergency_stop().unwrap();
+        let _ = std::fs::remove_dir_all(lock_path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_lock_file_is_reclaimed() {
+        let lock_path = temp_lock_path();
+        // A truncated/garbage lock file cannot describe a live owner.
+        std::fs::write(&lock_path, b"not json").unwrap();
+        let state = DesktopControlState::with_backend_and_lock(
+            Arc::new(NullBackend),
+            Some(lock_path.clone()),
+        );
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, false)
+            .expect("a corrupt lock must be reclaimable");
+        assert!(session.active);
+        state.emergency_stop().unwrap();
+        let _ = std::fs::remove_dir_all(lock_path.parent().unwrap());
     }
 
     #[test]
@@ -894,8 +1306,14 @@ mod tests {
         assert!(null.key_press("a").is_ok());
 
         let unsupported = UnsupportedBackend("no backend wired".to_string());
-        assert_eq!(unsupported.move_mouse(0, 0).unwrap_err(), "no backend wired");
-        assert_eq!(unsupported.click(MouseButtonKind::Left).unwrap_err(), "no backend wired");
+        assert_eq!(
+            unsupported.move_mouse(0, 0).unwrap_err(),
+            "no backend wired"
+        );
+        assert_eq!(
+            unsupported.click(MouseButtonKind::Left).unwrap_err(),
+            "no backend wired"
+        );
         assert_eq!(unsupported.key_press("a").unwrap_err(), "no backend wired");
     }
 }

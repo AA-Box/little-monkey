@@ -31,6 +31,8 @@ const MIGRATION_V2: i64 = 2;
 const MIGRATION_V2_CHECKSUM: &str = "profile-store-v2-2026-07-13";
 const MIGRATION_V3: i64 = 3;
 const MIGRATION_V3_CHECKSUM: &str = "run-archive-v3-2026-07-14";
+const MIGRATION_V4: i64 = 4;
+const MIGRATION_V4_CHECKSUM: &str = "approval-chains-v4-2026-07-16";
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -765,7 +767,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V3 {
+        if version > MIGRATION_V4 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -774,6 +776,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V1, MIGRATION_V1_CHECKSUM),
         (MIGRATION_V2, MIGRATION_V2_CHECKSUM),
         (MIGRATION_V3, MIGRATION_V3_CHECKSUM),
+        (MIGRATION_V4, MIGRATION_V4_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -821,6 +824,19 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
     if has_v3_before && !has_v2_before {
         return Err(LedgerError::MigrationConflict {
             version: MIGRATION_V3,
+        });
+    }
+    let has_v4_before = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V4],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if has_v4_before && !has_v3_before {
+        return Err(LedgerError::MigrationConflict {
+            version: MIGRATION_V4,
         });
     }
 
@@ -892,7 +908,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 3;")?;
+    let has_v4 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V4],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v4 {
+        transaction.execute_batch(MIGRATION_V4_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V4, MIGRATION_V4_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 4;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1421,6 +1454,46 @@ ALTER TABLE runs ADD COLUMN archived_at_ms INTEGER
     CHECK (archived_at_ms IS NULL OR archived_at_ms > 0);
 
 CREATE INDEX runs_archived_idx ON runs(archived_at_ms) WHERE archived_at_ms IS NOT NULL;
+"#;
+
+// Human Approval Chains (ROADMAP.md, Phase 3): standalone sibling tables for
+// `approval_chains.rs`'s multi-stage approval state machine — deliberately
+// NOT threaded through `runs`/`run_events` (a chain stage isn't a step of any
+// one immutable run; a chain can gate an arbitrary future action that has no
+// run yet, or none at all). `approval_chains.rs` reads/writes these directly
+// through `RunLedger::connection()`/`connection_mut()`, the same
+// "companion store sharing this database" pattern `profile_store.rs` already
+// uses for its own tables — see those methods' doc comments.
+const MIGRATION_V4_SQL: &str = r#"
+CREATE TABLE approval_chain_runs (
+    chain_id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    operation_sha256 TEXT NOT NULL CHECK (length(operation_sha256) = 64),
+    detail TEXT NOT NULL,
+    total_stages INTEGER NOT NULL CHECK (total_stages > 0),
+    current_stage INTEGER NOT NULL DEFAULT 0 CHECK (current_stage >= 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE INDEX approval_chain_runs_created_idx ON approval_chain_runs(created_at_ms);
+CREATE INDEX approval_chain_runs_status_idx ON approval_chain_runs(status, created_at_ms)
+    WHERE status = 'pending';
+
+CREATE TABLE approval_chain_stage_decisions (
+    chain_id TEXT NOT NULL REFERENCES approval_chain_runs(chain_id) ON DELETE RESTRICT,
+    stage_index INTEGER NOT NULL CHECK (stage_index >= 0),
+    stage_label TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('allow', 'deny', 'expired')),
+    escalated INTEGER NOT NULL DEFAULT 0 CHECK (escalated IN (0, 1)),
+    decided_at_ms INTEGER NOT NULL CHECK (decided_at_ms > 0),
+    decided_by_json BLOB,
+    PRIMARY KEY(chain_id, stage_index)
+) STRICT;
+
+CREATE INDEX approval_chain_stage_decisions_chain_idx
+    ON approval_chain_stage_decisions(chain_id, stage_index);
 "#;
 
 struct EventEffects<'a> {
@@ -2798,10 +2871,10 @@ mod tests {
         let database = TempDb::new("migration");
         {
             let ledger = RunLedger::open(&database.path).unwrap();
-            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3]);
+            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4]);
         }
         let ledger = RunLedger::open(&database.path).unwrap();
-        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3]);
+        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4]);
 
         let journal_mode = ledger
             .connection
@@ -2850,6 +2923,8 @@ mod tests {
             "profile_run_search_state",
             "profile_message_attachment_links",
             "profile_search_documents",
+            "approval_chain_runs",
+            "approval_chain_stage_decisions",
         ] {
             let exists = ledger
                 .connection

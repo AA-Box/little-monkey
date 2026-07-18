@@ -3,6 +3,8 @@ import {
   createM3OperationId,
   runtimeHubClient,
   sha256Text,
+  type BackendDescriptor,
+  type ConversionReport,
   type ChatTemplateLabReport,
   type HardwareProfile,
   type HardwareSnapshot,
@@ -13,6 +15,7 @@ import {
   type M3CatalogSourceConfig,
   type M3CatalogMatch,
   type M3CleanupReport,
+  type M3CompatibilityMatrixReport,
   type M3ComponentCatalogEntry,
   type M3ComponentUpdateCheck,
   type M3InstalledComponent,
@@ -25,6 +28,7 @@ import {
   type M3RuntimeStatusView,
   type M3SchedulingInput,
   type M3SchedulingPlan,
+  type M3SettingCapabilitiesView,
   type M3StorageStatus,
   type M3UnloadModelRequest,
   type ContextCacheView,
@@ -37,6 +41,7 @@ import {
   type PairedToken,
   type PairingChallenge,
   type PairingRequest,
+  type QuantTypeDescriptor,
   type RuntimeInventory,
   type RuntimeLogTail,
   type RuntimeTraceRecord,
@@ -58,7 +63,9 @@ export type RuntimeHubSection =
   | "catalogs"
   | "runtimes"
   | "api"
+  | "compatibility"
   | "lan"
+  | "quantization"
   | "telemetry";
 
 export interface RuntimeDetail {
@@ -96,6 +103,7 @@ interface RuntimeHubStoreState {
   catalogQuery: string;
   catalogResults: M3CatalogMatch[];
   apiResult: M3ApiDispatchResponse | null;
+  compatibilityMatrix: M3CompatibilityMatrixReport | null;
   lanPolicy: LanServerPolicy | null;
   lanTokens: ScopedToken[];
   lanAudit: SecurityAuditEvent[];
@@ -108,6 +116,9 @@ interface RuntimeHubStoreState {
   downloadProgress: Record<string, M3DownloadProgress>;
   cleanupReport: M3CleanupReport | null;
   schedulingPlan: M3SchedulingPlan | null;
+  quantizationBackends: BackendDescriptor[];
+  quantizationQuantTypes: QuantTypeDescriptor[];
+  quantizationReports: ConversionReport[];
   /** Keyed by the raw `template` string a model declares (an empty string
    * stands in for "no template"/`null`) — not by `TemplateFamily`, since
    * family detection is the Rust command's job (`chat_template_lab.rs`'s
@@ -116,6 +127,11 @@ interface RuntimeHubStoreState {
   offloadPlans: Record<string, OffloadPlan>;
   traces: RuntimeTraceRecord[];
   supportBundle: SupportBundle | null;
+  /** Keyed by runtimeId: the Sampler/Batching/Speculative Decoding gating
+   * result last resolved for that runtime (see `resolveSettingCapabilities`
+   * below). Absent until first resolved; the UI falls back to the
+   * runtime's raw, ungated `settings` list until then. */
+  settingCapabilities: Record<string, M3SettingCapabilitiesView>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -140,6 +156,7 @@ interface RuntimeHubStoreState {
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
+  resolveSettingCapabilities: (runtimeId: string, assetId: string | null) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
   resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
@@ -149,6 +166,7 @@ interface RuntimeHubStoreState {
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
   dispatchApi: (request: M3ApiDispatchRequest) => Promise<void>;
   cancelInference: (request: M3CancelInferenceRequest) => Promise<boolean>;
+  refreshCompatibilityMatrix: () => Promise<void>;
   refreshLan: () => Promise<void>;
   validateLanPolicy: (policy: LanServerPolicy) => Promise<void>;
   configureLan: (policy: LanServerPolicy) => Promise<void>;
@@ -162,6 +180,14 @@ interface RuntimeHubStoreState {
   refreshTraces: (runtimeId?: string | null) => Promise<void>;
   exportSupportBundle: () => Promise<SupportBundle>;
   clearSupportBundle: () => void;
+  refreshQuantization: () => Promise<void>;
+  convertPathQuantization: (sourcePath: string, quantChoice: string, allowRequantize: boolean) => Promise<void>;
+  convertInstalledModelQuantization: (
+    assetId: string,
+    versionKey: string | null,
+    quantChoice: string,
+    allowRequantize: boolean,
+  ) => Promise<void>;
 }
 
 function errorMessage(error: unknown): string {
@@ -307,6 +333,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     catalogQuery: "",
     catalogResults: [],
     apiResult: null,
+    compatibilityMatrix: null,
     lanPolicy: null,
     lanTokens: [],
     lanAudit: [],
@@ -319,10 +346,14 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    quantizationBackends: [],
+    quantizationQuantTypes: [],
+    quantizationReports: [],
     chatTemplateLabReports: {},
     offloadPlans: {},
     traces: [],
     supportBundle: null,
+    settingCapabilities: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -615,6 +646,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    resolveSettingCapabilities: async (runtimeId, assetId) => {
+      const key = `settings-gate:${runtimeId}`;
+      begin(key);
+      try {
+        const resolved = await runtimeHubClient.resolveSettingCapabilities({ runtimeId, assetId });
+        set((state) => ({ settingCapabilities: { ...state.settingCapabilities, [runtimeId]: resolved } }));
+      } catch (error) {
+        set((state) => ({ settingCapabilities: omitKey(state.settingCapabilities, runtimeId) }));
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
     cancelOperation: async (key) => {
       const operationId = get().activeOperations[key];
       if (!operationId) return false;
@@ -838,6 +884,19 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    refreshCompatibilityMatrix: async () => {
+      const key = "compatibility-matrix";
+      begin(key);
+      try {
+        const compatibilityMatrix = await runtimeHubClient.compatibilityMatrix();
+        set({ compatibilityMatrix });
+      } catch (error) {
+        fail(key, error);
+      } finally {
+        finish(key);
+      }
+    },
+
     refreshLan: async () => {
       const key = "lan-refresh";
       begin(key);
@@ -1036,6 +1095,56 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     },
 
     clearSupportBundle: () => set({ supportBundle: null }),
+
+    refreshQuantization: async () => {
+      const key = "quantization-refresh";
+      begin(key);
+      try {
+        const [quantizationBackends, quantizationQuantTypes] = await Promise.all([
+          runtimeHubClient.quantizationBackends(),
+          runtimeHubClient.quantizationQuantTypes(),
+        ]);
+        set({ quantizationBackends, quantizationQuantTypes });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    convertPathQuantization: async (sourcePath, quantChoice, allowRequantize) => {
+      const key = "quantization-convert";
+      begin(key);
+      try {
+        const report = await runtimeHubClient.quantizationConvertPath({ sourcePath, quantChoice, allowRequantize });
+        set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    convertInstalledModelQuantization: async (assetId, versionKey, quantChoice, allowRequantize) => {
+      const key = "quantization-convert";
+      begin(key);
+      try {
+        const report = await runtimeHubClient.quantizationConvertInstalledModel({
+          assetId,
+          versionKey,
+          quantChoice,
+          allowRequantize,
+        });
+        set((state) => ({ quantizationReports: [report, ...state.quantizationReports] }));
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
   };
 });
 

@@ -5,7 +5,8 @@
 //! one [`M3CommandState`]; no production dependency is supplied by the UI.
 
 use crate::compatibility_hub::{
-    request_offers_tool, CanonicalContent, CanonicalInferenceRequest, CanonicalInferenceResponse,
+    request_offers_tool, CanonicalContent, CanonicalEmbeddingDatum, CanonicalEmbeddingRequest,
+    CanonicalEmbeddingResponse, CanonicalInferenceRequest, CanonicalInferenceResponse,
     CanonicalMessage, CanonicalRole, CanonicalStreamEvent, CanonicalUsage, LanStateProtector,
     OsLanEntropy,
 };
@@ -1388,6 +1389,65 @@ impl OpenAiCompatibleM3InferenceEngine {
         let response = self.send(request, true, cancellation, context).await?;
         parse_openai_sse(response, request, sink, cancellation, context).await
     }
+
+    /// Real `POST {endpoint}/v1/embeddings` call. This is the genuine gap
+    /// closer: Ollama's local daemon serves an OpenAI-compatible embeddings
+    /// endpoint alongside chat on the same base URL, so this engine
+    /// (constructed with `OLLAMA_ENDPOINT`) produces real vectors. The same
+    /// engine constructed with `LLAMA_ENDPOINT` (the managed llama.cpp chat
+    /// instance, started without `--embeddings`) will reach a real HTTP
+    /// endpoint that itself returns an honest error — never a fabricated
+    /// vector.
+    async fn embed_inner(
+        &self,
+        request: &CanonicalEmbeddingRequest,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<CanonicalEmbeddingResponse> {
+        let body = json!({
+            "model": request.model,
+            "input": request.input,
+        });
+        let encoded = serde_json::to_vec(&body)?;
+        if encoded.len() > MAX_INFERENCE_REQUEST_BYTES {
+            return Err(M3HubError::Runtime(
+                "canonical embeddings request exceeds the production byte limit".to_string(),
+            ));
+        }
+        let url = self.endpoint.url("/v1/embeddings").map_err(runtime_error)?;
+        let operation = async {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
+                _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
+                response = self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded).send() => {
+                    response.map_err(|error| M3HubError::Transport(error.to_string()))
+                }
+            }
+        };
+        let response = tokio::time::timeout(Duration::from_millis(context.timeout_ms), operation)
+            .await
+            .map_err(|_| M3HubError::Timeout {
+                operation: "local embeddings request".to_string(),
+                timeout_ms: context.timeout_ms,
+            })??;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = read_bounded_response(response, 64 * 1024, cancellation, context).await?;
+            return Err(M3HubError::Runtime(format!(
+                "local embeddings endpoint returned HTTP {status}: {}",
+                String::from_utf8_lossy(&detail).trim()
+            )));
+        }
+        let bytes = read_bounded_response(
+            response,
+            MAX_INFERENCE_RESPONSE_BYTES,
+            cancellation,
+            context,
+        )
+        .await?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        parse_openai_embeddings_response(&value, request)
+    }
 }
 
 impl M3InferenceEngine for OpenAiCompatibleM3InferenceEngine {
@@ -1433,6 +1493,19 @@ impl M3InferenceEngine for OpenAiCompatibleM3InferenceEngine {
             } else {
                 Ok(false)
             }
+        })
+    }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            let cancellation = self.begin_request(&request.request_id)?;
+            let result = self.embed_inner(request, &cancellation, context).await;
+            self.finish_request(&request.request_id);
+            result
         })
     }
 }
@@ -1502,6 +1575,35 @@ impl CapabilityCheckedInferenceEngine {
         }
         Ok(())
     }
+
+    async fn validate_embed(
+        &self,
+        request: &CanonicalEmbeddingRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        let limits = RuntimeOperationLimits {
+            timeout_ms: context.timeout_ms,
+            ..RuntimeOperationLimits::default()
+        };
+        let runtime_context = RuntimeOperationContext::new(limits, context.cancellation.clone());
+        let inventory = self
+            .adapter
+            .inventory(&runtime_context)
+            .await
+            .map_err(runtime_error)?;
+        let model = inventory
+            .models
+            .iter()
+            .find(|model| model.model_id == request.model)
+            .ok_or_else(|| M3HubError::NotFound(format!("runtime model {}", request.model)))?;
+        if !model.capabilities.embeddings {
+            return Err(M3HubError::Unsupported(format!(
+                "model {} does not advertise embeddings",
+                request.model
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl M3InferenceEngine for CapabilityCheckedInferenceEngine {
@@ -1534,6 +1636,17 @@ impl M3InferenceEngine for CapabilityCheckedInferenceEngine {
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool> {
         self.inner.cancel(request_id, context)
+    }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            self.validate_embed(request, context).await?;
+            self.inner.embed(request, context).await
+        })
     }
 }
 
@@ -1748,6 +1861,54 @@ pub(crate) fn parse_openai_response(
             .get("created")
             .and_then(Value::as_u64)
             .unwrap_or(now_seconds()?),
+    })
+}
+
+fn parse_openai_embeddings_response(
+    value: &Value,
+    request: &CanonicalEmbeddingRequest,
+) -> M3HubResult<CanonicalEmbeddingResponse> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| M3HubError::Runtime("local embeddings response has no data".to_string()))?;
+    if data.len() != request.input.len() {
+        return Err(M3HubError::Runtime(format!(
+            "local embeddings endpoint returned {} vectors for {} inputs",
+            data.len(),
+            request.input.len()
+        )));
+    }
+    let mut items = Vec::with_capacity(data.len());
+    for (expected_index, datum) in data.iter().enumerate() {
+        let index = datum
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(expected_index as u64) as usize;
+        let embedding = datum
+            .get("embedding")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                M3HubError::Runtime("embedding datum has no embedding array".to_string())
+            })?
+            .iter()
+            .map(|component| {
+                component.as_f64().map(|value| value as f32).ok_or_else(|| {
+                    M3HubError::Runtime("embedding component is not numeric".to_string())
+                })
+            })
+            .collect::<M3HubResult<Vec<f32>>>()?;
+        items.push(CanonicalEmbeddingDatum { index, embedding });
+    }
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&request.model)
+        .to_string();
+    Ok(CanonicalEmbeddingResponse {
+        model,
+        data: items,
+        usage: parse_usage(value.get("usage")),
     })
 }
 
@@ -3511,6 +3672,37 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
         Arc::new(component_hub),
         process,
     ))
+}
+
+/// Production wiring for the Model Conversion and Quantization Workbench
+/// (ROADMAP.md Phase 8): a storage root separate from the model manifest/blob
+/// store, and the real `llama-quantize` backend when it is genuinely found
+/// on this machine (see `quantization::find_llama_quantize_binary`),
+/// otherwise only the honest `Copy`-only passthrough fallback. No fabricated
+/// "always available" real quantizer — see `quantization.rs`'s module doc
+/// comment for the full honesty note, mirroring how the Runtime Component
+/// Update Channels PR documented its own registry-source honesty.
+pub fn build_quantization_command_state(
+    app_data_dir: impl AsRef<Path>,
+) -> M3HubResult<crate::m3_commands::M3QuantizationCommandState> {
+    let app_data_dir = app_data_dir.as_ref();
+    if !app_data_dir.is_absolute() {
+        return Err(M3HubError::State(
+            "Tauri app-data directory must be absolute".to_string(),
+        ));
+    }
+    ensure_private_directory(app_data_dir)?;
+    let root = app_data_dir.join("m3-quantization");
+    ensure_private_directory(&root)?;
+
+    let mut backends: Vec<Arc<dyn crate::quantization::QuantizationBackend>> = Vec::new();
+    if let Some(backend) = crate::quantization::LlamaCppQuantizeBackend::discover() {
+        backends.push(Arc::new(backend));
+    }
+    backends.push(Arc::new(crate::quantization::PassthroughGgufRequantize));
+
+    let workbench = crate::quantization::QuantizationWorkbench::new(root, backends);
+    Ok(crate::m3_commands::M3QuantizationCommandState::new(workbench))
 }
 
 #[cfg(test)]
