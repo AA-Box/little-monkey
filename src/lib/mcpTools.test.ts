@@ -16,6 +16,7 @@ function makeServer(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
     tools: [{ name: "greet", description: "Say hello", inputSchema: { type: "object", properties: {} } }],
     instructions: null,
     hasHttpToken: false,
+    hasOauth: false,
     ...overrides,
   };
 }

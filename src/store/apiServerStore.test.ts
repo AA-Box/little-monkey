@@ -20,6 +20,8 @@ import {
   DEFAULT_API_SERVER_CONFIG,
   type ApiServerConfig,
   type ApiServerStatus,
+  type Backend,
+  type Scope,
   type TokenEntry,
 } from "./apiServerStore";
 
@@ -39,6 +41,7 @@ function makeToken(overrides: Partial<TokenEntry> = {}): TokenEntry {
     backends: ["local"],
     created_at: 1700000000000,
     last_used_at: null,
+    expires_at: null,
     ...overrides,
   };
 }
@@ -124,6 +127,7 @@ describe("apiServerStore.createToken/revokeToken", () => {
       label: "New key",
       scopes: ["chat"],
       backends: ["local"],
+      expiresAt: null,
     });
     expect(useApiServerStore.getState().mintedToken).toEqual({
       token: "lmk-abcdef0123456789abcdef0123456789",
@@ -140,6 +144,43 @@ describe("apiServerStore.createToken/revokeToken", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("api_server_revoke_token", { id: "a" });
     expect(useApiServerStore.getState().tokens.map((t) => t.id)).toEqual(["b"]);
+  });
+
+  it("createToken forwards an explicit expiresAt through to the backend", async () => {
+    const entry = makeToken({ id: "tok-expiring", expires_at: 1700000900000 });
+    invokeMock.mockResolvedValueOnce({ token: "lmk-abcdef0123456789abcdef0123456789", entry });
+
+    await useApiServerStore.getState().createToken("Expiring key", ["chat"], ["local"], 1700000900000);
+
+    expect(invokeMock).toHaveBeenCalledWith("api_server_create_token", {
+      label: "Expiring key",
+      scopes: ["chat"],
+      backends: ["local"],
+      expiresAt: 1700000900000,
+    });
+  });
+});
+
+describe("apiServerStore.exportAudit", () => {
+  it("fetches the redacted audit log without touching any other state", async () => {
+    const audit = [
+      {
+        id: "tok-1",
+        label: "My IDE",
+        scopes: ["chat"] as Scope[],
+        backends: ["local"] as Backend[],
+        created_at: 1,
+        last_used_at: null,
+        revoked_at: null,
+        expires_at: null,
+      },
+    ];
+    invokeMock.mockResolvedValueOnce(audit);
+
+    const result = await useApiServerStore.getState().exportAudit();
+
+    expect(invokeMock).toHaveBeenCalledWith("api_server_export_audit");
+    expect(result).toEqual(audit);
   });
 });
 
