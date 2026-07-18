@@ -3,8 +3,11 @@ import type { ButtonVariant } from "./Button";
 
 export type IconButtonSize = "sm" | "md";
 
+/** `active` = a toggled-on toolbar button (Claude-Desktop-style accent tint). */
+export type IconButtonVariant = ButtonVariant | "active";
+
 export interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: ButtonVariant;
+  variant?: IconButtonVariant;
   size?: IconButtonSize;
   children?: ReactNode;
   "aria-label": string;
@@ -18,11 +21,12 @@ const SIZE_CLASSES: Record<IconButtonSize, string> = {
   md: "h-9 w-9",
 };
 
-const VARIANT_CLASSES: Record<ButtonVariant, string> = {
+const VARIANT_CLASSES: Record<IconButtonVariant, string> = {
   primary: "bg-accent text-accent-foreground hover:bg-accent-hover",
   secondary:
     "bg-surface-2 text-foreground border border-border hover:bg-surface hover:border-border-strong",
   ghost: "text-muted hover:bg-surface-2 hover:text-foreground",
+  active: "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent-hover",
   danger: "bg-danger text-danger-foreground hover:bg-danger-hover",
 };
 
