@@ -1559,14 +1559,19 @@ setVisualEditModeOpen(false);
       </aside>
 
       {/* Center: chat, with a drag-region strip standing in for the title
-          bar. The dock-toggle icons used to live inline here, but that put
-          them inside this flex-1 column — every time the right region's
+          bar. The dock-toggle icons used to live inline here too, but that
+          put them inside this flex-1 column — every time the right region's
           width animated (open/close/resize/fullscreen), the column reflowed
           and the right-aligned icons visibly slid with it. They're fixed to
           the viewport's top-right corner instead (below), so their on-screen
-          position never moves regardless of what the sidebar is doing. */}
+          position never moves regardless of what the sidebar is doing. The
+          Compare/Crew/Knowledge portal target stays right here, in-flow —
+          it's unaffected by the sidebar and belongs at the strip's left
+          edge, right of the session sidebar. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center px-2" />
+        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center px-2">
+          <div ref={setChatHeaderActionsEl} className="flex items-center gap-1.5" />
+        </div>
         <SessionGrantBanner />
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
@@ -1966,11 +1971,6 @@ setVisualEditModeOpen(false);
           animates open/closed or resizes, and they must stay reachable even
           while a right-region panel is fullscreen. */}
       <div className="fixed right-3 top-2 z-50 flex items-center gap-1.5">
-        {/* Portal target for the primary ChatWindow's Compare/Crew pickers
-            (see ChatWindow's `headerActionsSlot` prop) — kept as the first
-            child so they land to the left of the icons below, regardless of
-            how many are currently shown. */}
-        <div ref={setChatHeaderActionsEl} className="flex items-center gap-1.5" />
         <IconButton
           size="sm"
           variant={diffPanelOpen ? "active" : "ghost"}
