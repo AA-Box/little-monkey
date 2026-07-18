@@ -13,18 +13,8 @@ jobs:
     # triplicate tsc/vitest/i18n-lint across the Rust test matrix below.
     runs-on: ubuntu-22.04
 
-    env:
-      # Keep target/ small enough for the 14 GB hosted-runner disk
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
 
       - name: Install Linux system deps
         run: |
@@ -73,8 +63,19 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    env:
+      # Keep target/ small enough for the 14 GB hosted-runner disk
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
 
       - name: Install Linux system deps
         if: startsWith(matrix.os, 'ubuntu')
@@ -120,9 +121,24 @@ jobs:
           Select-String -Path build.log -Pattern "Running.*getrandom" -Context 0,0 | ForEach-Object { $_.Line }
           Write-Host "--- lines mentioning getrandom_backend cfg ---"
           Select-String -Path build.log -Pattern "getrandom_backend" | ForEach-Object { $_.Line }
-          Write-Host "--- cargo config resolution ---"
-          cargo config get --manifest-path src-tauri/Cargo.toml build 2>&1
-          cargo config get --manifest-path src-tauri/Cargo.toml target.'cfg(target_os = "windows")' 2>&1
+          Write-Host "--- resolved .cargo/config.toml ---"
+          # `cargo config get` has no --manifest-path flag (it errors with
+          # "unexpected argument '--manifest-path' found"). It also can't be
+          # fixed by just dropping that flag: it's an unstable, nightly-only
+          # subcommand (`error: the 'cargo config' command is unstable, and
+          # only available on the nightly channel of Cargo, but this is the
+          # stable channel`) and this workflow uses dtolnay/rust-toolchain@stable,
+          # so it would still fail and skip the dumpbin step below. Also,
+          # cargo's config-file discovery walks upward from the *working
+          # directory*, not from --manifest-path — and `pnpm test:rust`
+          # (which this job actually runs) invokes cargo from the repo root,
+          # where .cargo/config.toml already lives, so it's already the file
+          # in effect. Just print it directly instead of querying cargo.
+          if (Test-Path .cargo/config.toml) {
+            Get-Content .cargo/config.toml
+          } else {
+            Write-Host "(no .cargo/config.toml found at repo root)"
+          }
 
       - uses: ilammy/msvc-dev-cmd@v1
         if: startsWith(matrix.os, 'windows')
