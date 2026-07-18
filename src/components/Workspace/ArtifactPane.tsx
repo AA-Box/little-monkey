@@ -78,18 +78,36 @@ function slugifyFileName(title: string): string {
  * tier-2 publish hasn't resolved yet (never a blank frame in the interim).
  *
  * Tier 2 (html containing a `<script>`, only while `artifactScriptsEnabled`):
- * `<iframe sandbox="allow-scripts" src={convertFileSrc(tier2Id, "artifact")} />`
- * — content is republished to Rust memory via `artifact_publish` and served
- * back by the `artifact://` custom protocol (`src-tauri/src/artifacts.rs`)
- * with a strict per-document CSP (`connect-src 'none'` etc.). Crucially,
- * `sandbox` here is `allow-scripts` and NOTHING else — no `allow-same-origin`
- * — which is what gives the frame an opaque origin: no cookies/storage, no
- * parent-DOM access, no popups, no top-window navigation. A future change
- * that "just adds allow-same-origin for convenience" would silently
- * reintroduce exactly the risk this pane is built to avoid. Published
- * content is removed (`artifact_remove`) whenever this effect's inputs
- * change and on unmount (pane close or the "session switch" effect below) —
- * see the publish effect's own doc comment.
+ * `<iframe sandbox="allow-scripts" src={blob:…} />`. The content is
+ * republished to Rust memory via `artifact_publish`, served back by the
+ * `artifact://` custom protocol (`src-tauri/src/artifacts.rs`) with a strict
+ * per-document CSP (`connect-src 'none'` etc.) that the protocol now also
+ * injects as a leading `<meta>`, then fetched by the trusted main frame and
+ * re-served to the iframe from a `blob:` object URL. Two independent
+ * properties make this safe:
+ *
+ *  - `sandbox` is `allow-scripts` and NOTHING else — no `allow-same-origin`
+ *    — giving the frame an opaque origin: no cookies/storage, no parent-DOM
+ *    access, no popups, no top-window navigation. A future change that "just
+ *    adds allow-same-origin for convenience" would silently reintroduce
+ *    exactly the risk this pane is built to avoid.
+ *  - The frame is loaded from a `blob:` URL, NOT straight from `artifact://`.
+ *    That is deliberate and load-bearing on Windows: there, `wry`'s WebView2
+ *    backend injects Tauri's IPC bridge (invoke key included) into every
+ *    subframe regardless of Tauri's `for_main_frame_only` flag, and Tauri's
+ *    `is_local_url` treats a custom-protocol frame (`http://artifact.localhost`)
+ *    as a trusted *local* origin — so a frame pointed straight at `artifact://`
+ *    could invoke privileged commands with this window's full capabilities. A
+ *    `blob:` origin is *remote* to Tauri's ACL, which grants it nothing (no
+ *    `remote` capability is configured), so the bridge is inert even where the
+ *    Windows leak still plants it. `examples/verify_artifact_ipc_isolation.rs`
+ *    is the automated per-OS gate for this. A future change that points this
+ *    frame back at `artifact://` directly would reopen the Windows escape.
+ *
+ * Published content is removed (`artifact_remove`) whenever the publish
+ * effect's inputs change and on unmount (pane close or the "session switch"
+ * effect below), and the blob URL is revoked alongside it — see those
+ * effects' own doc comments.
  */
 export function ArtifactPane() {
   const { t } = useT();
@@ -109,6 +127,10 @@ export function ArtifactPane() {
   // The tier-2 (`artifact://`) publish id for the currently shown block, once
   // `artifact_publish` resolves — `null` while unpublished/publishing/tier-1.
   const [tier2Id, setTier2Id] = useState<string | null>(null);
+  // The `blob:` object URL the tier-2 frame is actually loaded from — see the
+  // fetch-and-blob effect below and this component's doc comment for why the
+  // frame is loaded from a blob rather than straight from `artifact://`.
+  const [tier2BlobUrl, setTier2BlobUrl] = useState<string | null>(null);
   const [tier2Error, setTier2Error] = useState<string | null>(null);
   // Mermaid rendering result for the currently shown block, when it's a
   // `mermaid` fence — `null`/`null` while still rendering (see the effect
@@ -224,6 +246,40 @@ export function ArtifactPane() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [block?.ref.messageIndex, block?.ref.blockIndex, block?.content, block?.kind, artifactScriptsEnabled, refreshKey]);
 
+  // Fetch the published document (CSP meta already injected by
+  // `artifacts.rs`) and re-serve it to the frame from a `blob:` object URL —
+  // NOT by pointing the iframe straight at `artifact://` (see this
+  // component's doc comment for the Windows IPC-isolation reason a blob
+  // origin is load-bearing). The fetch runs in the trusted main frame, which
+  // the app CSP's `connect-src` allows to reach the `artifact` scheme; the
+  // resulting blob URL is revoked when this effect re-runs or unmounts so it
+  // never outlives the frame that used it.
+  useEffect(() => {
+    if (!tier2Id) {
+      setTier2BlobUrl(null);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    // `?v=` cache-busts the protocol response so a Refresh with unchanged
+    // content still re-fetches rather than reading a webview-cached body.
+    fetch(`${convertFileSrc(tier2Id, "artifact")}?v=${refreshKey}`)
+      .then((res) => res.text())
+      .then((html) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+        setTier2BlobUrl(objectUrl);
+      })
+      .catch((err) => {
+        if (!cancelled) setTier2Error(formatError(err));
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setTier2BlobUrl(null);
+    };
+  }, [tier2Id, refreshKey]);
+
   // Mermaid rendering: lazily renders a `mermaid`-kind block's raw diagram
   // text to an SVG string via `renderMermaidToSvg` (see `artifacts.ts`'s doc
   // comment — bundled mermaid ^11.16, `startOnLoad: false`,
@@ -336,12 +392,13 @@ export function ArtifactPane() {
 
   const theme = getStoredTheme();
   const hasScript = containsScriptTag(block.content);
-  // Whether THIS render should show the tier-2 (`artifact://`,
-  // `sandbox="allow-scripts"`) iframe rather than the tier-1 (empty-sandbox
-  // `srcdoc`) one — mirrors the publish effect's own eligibility check above,
-  // plus requiring `tier2Id` to have actually resolved (an in-flight publish
+  // Whether THIS render should show the tier-2 (`sandbox="allow-scripts"`,
+  // blob-loaded) iframe rather than the tier-1 (empty-sandbox `srcdoc`) one —
+  // mirrors the publish effect's own eligibility check above, plus requiring
+  // the `blob:` URL to have actually resolved (an in-flight publish/fetch
   // renders tier-1 in the meantime, never a blank frame).
-  const useTier2 = block.kind === "html" && artifactScriptsEnabled && hasScript && tier2Id !== null;
+  const useTier2 =
+    block.kind === "html" && artifactScriptsEnabled && hasScript && tier2BlobUrl !== null;
   const tabs = [
     { id: "preview", label: t("ArtifactPane.previewTab") },
     { id: "code", label: t("ArtifactPane.codeTab") },
@@ -458,21 +515,22 @@ export function ArtifactPane() {
                   : t("ArtifactPane.scriptsDisabledNotice")}
               </p>
             )}
-            {useTier2 && tier2Id ? (
-              // Tier 2: served by the `artifact://` custom protocol
-              // (`src-tauri/src/artifacts.rs`), NOT `srcdoc` — `sandbox`
-              // deliberately has `allow-scripts` and NOTHING else (in
-              // particular no `allow-same-origin`), which is what gives
-              // this frame an opaque origin with no cookies/storage/parent-
-              // DOM-access/popups/top-navigation. The query param is a
-              // cache-buster so a refresh with unchanged content still
-              // forces a real reload rather than showing a webview-cached
-              // response.
+            {useTier2 && tier2BlobUrl ? (
+              // Tier 2: the document published to the `artifact://` protocol
+              // (`src-tauri/src/artifacts.rs`) is fetched and re-served to
+              // this frame from a `blob:` URL (see the fetch-and-blob effect
+              // and this component's doc comment). `sandbox` deliberately has
+              // `allow-scripts` and NOTHING else (in particular no
+              // `allow-same-origin`), giving the frame an opaque origin with
+              // no cookies/storage/parent-DOM-access/popups/top-navigation;
+              // the blob URL additionally makes it a *remote* origin so
+              // Tauri's ACL denies any IPC the Windows WebView2 subframe leak
+              // might otherwise expose.
               <iframe
-                key={`tier2-${tier2Id}`}
+                key={`tier2-${tier2BlobUrl}`}
                 title={block.title}
                 sandbox="allow-scripts"
-                src={`${convertFileSrc(tier2Id, "artifact")}?v=${refreshKey}`}
+                src={tier2BlobUrl}
                 className="min-h-0 flex-1 border-0 bg-white"
               />
             ) : (

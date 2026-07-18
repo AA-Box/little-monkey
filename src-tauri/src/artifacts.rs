@@ -23,15 +23,20 @@
 //!   `allow-same-origin` (see `ArtifactPane.tsx`), which gives the frame an
 //!   opaque origin: no cookies, no localStorage, no parent-DOM access, no
 //!   popups, no top-window navigation.
-//! - No Tauri capability is ever granted to the `artifact` scheme —
-//!   `src-tauri/capabilities/default.json` scopes every permission to the
-//!   `main`/`session-*` *windows*, never to a URI scheme, and has no
-//!   `"remote"` entry that would extend those permissions to a
-//!   cross-origin/custom-protocol frame — so `invoke`/IPC is categorically
-//!   unreachable from inside an artifact frame. See this module's
-//!   `capability_config_grants_no_scheme_access` test, which pins that down
-//!   by inspecting the capability file directly, and the AUTOMATED
-//!   VERIFICATION note below for the corresponding in-webview check.
+//! - The frame is loaded from a `blob:` URL, not straight from `artifact://`.
+//!   This is load-bearing on Windows: there `wry`'s WebView2 backend injects
+//!   Tauri's IPC bridge (invoke key included) into every subframe regardless
+//!   of `for_main_frame_only`, and Tauri's `is_local_url` treats a
+//!   custom-protocol frame (`http://artifact.localhost`) as a trusted *local*
+//!   origin — so a frame pointed straight at `artifact://` COULD invoke the
+//!   privileged commands `capabilities/default.json` grants the `main`/
+//!   `session-*` windows. A `blob:` origin is *remote* to Tauri's ACL, and no
+//!   `"remote"` entry extends any capability to it, so `invoke`/IPC is inert
+//!   there even where the Windows leak still plants the bridge object. See
+//!   this module's `capability_config_grants_no_scheme_access` test (the ACL
+//!   half) and `examples/verify_artifact_ipc_isolation.rs` (the in-webview
+//!   half, which actually attempts an invoke from the frame and fails if it
+//!   runs).
 //! - Content is served only from the in-memory map below, by id, never from
 //!   disk — there is no path-traversal surface.
 //!
@@ -52,6 +57,20 @@ pub const MAX_ARTIFACT_BYTES: usize = 5 * 1024 * 1024;
 /// (by publish order) are evicted — mirrors `checkpoints.rs`'s
 /// `MAX_CHECKPOINTS` bounded-resource pattern.
 pub const MAX_ARTIFACTS: usize = 50;
+
+/// The single source of truth for the tier-2 artifact CSP. Emitted BOTH as
+/// the `Content-Security-Policy` HTTP response header (below) AND injected
+/// into the served document as a leading `<meta http-equiv>` (see
+/// [`inject_csp_meta`]). The header alone is no longer sufficient because the
+/// frontend loads the served document through a `blob:` URL — see
+/// `ArtifactPane.tsx`'s tier-2 doc comment for why (it makes the frame a
+/// *remote* origin so Tauri's ACL rejects any IPC the Windows WebView2
+/// subframe-script leak might otherwise expose), and a `blob:` document
+/// carries no response headers, so the CSP has to travel inside the document.
+/// `connect-src 'none'` is the load-bearing directive: it blocks every
+/// network exfiltration channel (fetch/XHR/WebSocket/beacon) regardless of
+/// the consuming iframe's `sandbox` attribute.
+pub const ARTIFACT_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'";
 
 /// One published tier-2 artifact, keyed by a server-generated uuid in
 /// `AppState::artifacts`.
@@ -159,6 +178,51 @@ pub fn remove_impl(artifacts: &mut HashMap<String, PublishedArtifact>, id: &str)
     artifacts.remove(id);
 }
 
+/// Injects a leading `<meta http-equiv="Content-Security-Policy">` carrying
+/// [`ARTIFACT_CSP`] into a served HTML document, so the policy still applies
+/// once the frontend re-loads the document from a headerless `blob:` URL (see
+/// `ArtifactPane.tsx`'s tier-2 doc comment). Placed as early as possible so
+/// no resource-triggering markup precedes it: right after `<head>` if one
+/// exists, otherwise as a fresh `<head>` right after the `<html …>` open tag,
+/// otherwise at the very start (browsers hoist a leading `<meta http-equiv>`
+/// into an implicit head). Multiple CSPs on one document combine as an
+/// intersection, so a policy the untrusted content itself adds can only ever
+/// tighten this one, never loosen it.
+fn inject_csp_meta(html: &str) -> String {
+    let meta = format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">",
+        ARTIFACT_CSP
+    );
+
+    // Case-insensitive search for the end of the first `<head …>` open tag,
+    // then the first `<html …>` open tag, without pulling in a regex/HTML
+    // parser for what is a single anchored insertion.
+    let lower = html.to_ascii_lowercase();
+    let after_open_tag = |needle: &str| -> Option<usize> {
+        lower
+            .find(needle)
+            .and_then(|start| html[start..].find('>').map(|rel| start + rel + 1))
+    };
+
+    if let Some(pos) = after_open_tag("<head") {
+        let mut out = String::with_capacity(html.len() + meta.len());
+        out.push_str(&html[..pos]);
+        out.push_str(&meta);
+        out.push_str(&html[pos..]);
+        out
+    } else if let Some(pos) = after_open_tag("<html") {
+        let mut out = String::with_capacity(html.len() + meta.len() + 13);
+        out.push_str(&html[..pos]);
+        out.push_str("<head>");
+        out.push_str(&meta);
+        out.push_str("</head>");
+        out.push_str(&html[pos..]);
+        out
+    } else {
+        format!("<head>{}</head>{}", meta, html)
+    }
+}
+
 /// Publish `content` (tagged `kind`, today only `"html"`) so it becomes
 /// servable at `artifact://localhost/<id>` (or `http://artifact.localhost/<id>`
 /// on Windows — see `convertFileSrc` in `ArtifactPane.tsx`). Every call
@@ -202,28 +266,36 @@ pub fn artifact_remove(state: tauri::State<'_, AppState>, id: String) -> Result<
 /// module's doc comment).
 ///
 /// AUTOMATED VERIFICATION (per the design doc's explicit phase-2 gate):
-/// asserting `window.__TAURI_INTERNALS__` is undefined *inside a loaded
-/// webview frame* isn't something `cargo test` can do — `#[test]`s run on a
-/// worker thread, never the process's real main thread, and creating a real
-/// WKWebView/WebView2/WebKitGTK requires exactly that (see `tauri::test`'s
+/// asserting a sandboxed artifact frame cannot reach Tauri IPC *inside a
+/// loaded webview frame* isn't something `cargo test` can do — `#[test]`s run
+/// on a worker thread, never the process's real main thread, and creating a
+/// real WKWebView/WebView2/WebKitGTK requires exactly that (see `tauri::test`'s
 /// own doc comment, which is why it ships a headless `MockRuntime` instead of
 /// a real one). `examples/verify_artifact_ipc_isolation.rs` is the automated
 /// replacement for what used to be a manual per-OS checklist here: it builds
 /// a real app using this exact `handle_request`, loads a published artifact
-/// through the same `sandbox="allow-scripts"` (no `allow-same-origin`) iframe
-/// shape `ArtifactPane.tsx` uses, and asserts `typeof
-/// window.__TAURI_INTERNALS__`/`typeof window.__TAURI__` read `"undefined"`
-/// inside it — run it directly (`cargo run --manifest-path src-tauri/Cargo.toml
-/// --example verify_artifact_ipc_isolation`) as part of the design doc's
-/// required per-OS release gate; see that file's own doc comment for exit
-/// codes, why it's an example rather than a `#[test]`, and — importantly — a
-/// concrete, Windows-specific risk found while building it (`wry`'s WebView2
-/// backend injects initialization scripts into every subframe regardless of
-/// Tauri's `for_main_frame_only` flag, and Tauri's own `is_local_url` treats
-/// any registered custom-protocol response as a "local" origin on Windows
-/// specifically) that makes running this check ON WINDOWS, not just macOS/
-/// Linux, the part of the 3-OS pass that actually matters most for this
-/// guarantee.
+/// exactly as `ArtifactPane.tsx` now does — fetched and re-served through a
+/// `blob:` URL into a `sandbox="allow-scripts"` (no `allow-same-origin`)
+/// iframe — and asserts the frame cannot actually *invoke* a command: it
+/// registers a canary command and fails if the frame ever gets it to run.
+/// Run it directly (`cargo run --manifest-path src-tauri/Cargo.toml --example
+/// verify_artifact_ipc_isolation`) as part of the design doc's required per-OS
+/// release gate; see that file's own doc comment for exit codes and why it's
+/// an example rather than a `#[test]`.
+///
+/// WHY THE FRAME IS LOADED VIA `blob:` AND NOT DIRECTLY FROM `artifact://`:
+/// on Windows specifically, `wry`'s WebView2 backend injects Tauri's IPC
+/// bridge (including the invoke key) into *every* subframe regardless of the
+/// `for_main_frame_only` flag Tauri sets, and Tauri's own `is_local_url`
+/// treats any registered custom-protocol response (`http://artifact.localhost`
+/// there) as a trusted *local* origin — so a subframe loaded straight from
+/// `artifact://` could invoke privileged commands with the host window's full
+/// capabilities. Re-serving the same document from a `blob:` URL gives the
+/// frame a *remote* origin instead, which Tauri's ACL grants nothing (no
+/// `remote` capability is configured), so the bridge is inert even where the
+/// Windows subframe-script leak still plants it. That is the property this
+/// check now verifies, and why running it ON WINDOWS is the part of the 3-OS
+/// pass that matters most.
 pub fn handle_request(
     state: &AppState,
     request: &tauri::http::Request<Vec<u8>>,
@@ -252,11 +324,15 @@ pub fn handle_request(
         .status(200)
         .header("Content-Type", artifact.mime)
         .header("X-Content-Type-Options", "nosniff")
-        .header(
-            "Content-Security-Policy",
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'",
-        )
-        .body(artifact.content.clone().into_bytes())
+        .header("Content-Security-Policy", ARTIFACT_CSP)
+        // The trusted main frame fetches this document (a cross-origin GET
+        // relative to its own origin) to re-serve it to the sandboxed frame
+        // from a `blob:` URL — see `ArtifactPane.tsx`. That fetch needs CORS
+        // to read the body; `*` is safe here because the content is already
+        // CSP-locked (`connect-src 'none'`, no `allow-same-origin`) and keyed
+        // by an unguessable per-publish uuid held only in memory.
+        .header("Access-Control-Allow-Origin", "*")
+        .body(inject_csp_meta(&artifact.content).into_bytes())
         .expect("building a response from an already-validated artifact never fails")
 }
 
@@ -288,7 +364,14 @@ mod tests {
 
         let response = handle_request(&state, &request_for(&format!("/{}", id)));
         assert_eq!(response.status(), 200);
-        assert_eq!(response.body(), &b"<h1>hi</h1>".to_vec());
+        let body = String::from_utf8(response.body().clone()).unwrap();
+        // The original content survives verbatim …
+        assert!(body.contains("<h1>hi</h1>"));
+        // … preceded by the injected CSP meta so the policy still applies
+        // once the frontend re-loads this document from a headerless `blob:`
+        // URL (see `ArtifactPane.tsx`'s tier-2 doc comment).
+        assert!(body.contains("http-equiv=\"Content-Security-Policy\""));
+        assert!(body.find("Content-Security-Policy").unwrap() < body.find("<h1>hi</h1>").unwrap());
         assert_eq!(
             response.headers().get("Content-Type").unwrap(),
             "text/html; charset=utf-8"
@@ -309,6 +392,33 @@ mod tests {
             "connect-src 'none' is what blocks network exfiltration"
         );
         assert!(csp.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn csp_meta_is_injected_inside_head_when_present() {
+        let injected = inject_csp_meta(
+            "<!doctype html><html><head><title>t</title></head><body>x</body></html>",
+        );
+        let head_open = injected.find("<head>").unwrap();
+        let meta = injected
+            .find("http-equiv=\"Content-Security-Policy\"")
+            .unwrap();
+        let title = injected.find("<title>").unwrap();
+        // Meta lands immediately after <head>, before any other head content.
+        assert!(head_open < meta && meta < title);
+        assert!(injected.contains("connect-src 'none'"));
+    }
+
+    #[test]
+    fn csp_meta_is_injected_before_body_when_no_head() {
+        // The exact shape the probe/most model artifacts use: no <head>.
+        let injected =
+            inject_csp_meta("<!doctype html><html><body><script>1</script></body></html>");
+        let meta = injected
+            .find("http-equiv=\"Content-Security-Policy\"")
+            .unwrap();
+        let script = injected.find("<script>").unwrap();
+        assert!(meta < script, "CSP must precede any script in the document");
     }
 
     #[test]
