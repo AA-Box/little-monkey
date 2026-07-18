@@ -19,6 +19,7 @@ import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, ty
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
+import { useTurnStatusStore } from '../store/turnStatusStore';
 import { useModelStore } from '../store/modelStore';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
 import { runSubagentTask } from './subagent';
@@ -647,6 +648,13 @@ export async function attemptStream(
   /** Durable run whose host-canonicalized provider endpoint/model must match
    * this request. Ignored by unauthenticated local runtimes. */
   runId?: string,
+  /** Whether this attempt's usage also counts toward the chat's live "✳ …
+   * N tokens" status line (`turnStatusStore`). True for everything that IS
+   * the turn's own work (main-loop attempts, failovers, context-trim
+   * summarization); the risk judge passes `false` — its side-channel
+   * classification calls run mid-turn under the same `sessionId` with
+   * `recordUsage: true`, and would otherwise silently inflate the label. */
+  recordTurnStatusTokens: boolean = true,
 ): Promise<AttemptResult> {
   if (target.kind === 'provider') recordRequest(target.providerId);
 
@@ -698,6 +706,12 @@ export async function attemptStream(
         if (recordUsage) {
           useUsageStore.getState().setUsage(sessionId, usage);
           useUsageHistoryStore.getState().recordUsage(describeUsageTarget(target), usage);
+          // Feeds the chat's live status line — a no-op when no turn is
+          // registered for `sessionId`. The risk judge opts out via
+          // `recordTurnStatusTokens` (see the param's doc comment).
+          if (recordTurnStatusTokens) {
+            useTurnStatusStore.getState().addTokens(sessionId, usage.totalTokens);
+          }
         }
       }
       // 'done' carries no data; the generator simply returns after it.

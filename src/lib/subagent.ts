@@ -80,6 +80,29 @@ function activityLabel(toolCall: ToolCall): string {
   return `${name}(${truncated})`;
 }
 
+/** In-flight runs' own AbortControllers, keyed by the run's Rust-facing
+ * `taskId` (a `crypto.randomUUID()`, guaranteed unique per concurrent run)
+ * — NOT the `storeKey`/`toolCallId` `subagentStore` renders by, whose
+ * provider-fallback `call_N` form can collide across two concurrent turns'
+ * subagents and would let Stop abort the wrong run. What lets the
+ * Background-tasks drawer stop ONE subagent without firing the parent
+ * turn's Stop. Entries are removed by `runSubagentTask`'s `finish` helper,
+ * so the map only ever holds live runs. */
+const activeSubagentControllers = new Map<string, AbortController>();
+
+/** Cancels one in-flight subagent run (the Background-tasks drawer's Stop
+ * button). `cancelId` is the run's Rust-facing turn id, surfaced as
+ * `SubagentRun.cancelId`. Returns `false` when the run isn't live — already
+ * finished, or from a previous app session. The run winds down through the
+ * exact same path the parent's Stop uses: its loop sees the aborted signal
+ * and finalizes as `'cancelled'` with `CANCELLED_TOOL_RESULT`. */
+export function cancelSubagentRun(cancelId: string): boolean {
+  const controller = activeSubagentControllers.get(cancelId);
+  if (!controller) return false;
+  controller.abort();
+  return true;
+}
+
 /** Whether a `write_file`/`edit_file` tool result string represents success
  * rather than the `{"error": ...}` shape `stringifyToolError` produces —
  * used only to decide whether to report a mutated path via
@@ -262,16 +285,49 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
   // Registered immediately (before any streaming happens) so `SubagentRow`
   // can render a spinner for this task the instant the parent turn
   // dispatches it — not just once the first `attemptStream` call settles.
-  useSubagentStore.getState().start({ sessionId, taskId: storeKey, description, profile });
+  useSubagentStore.getState().start({ sessionId, taskId: storeKey, cancelId: taskId, description, profile });
+
+  // This run's OWN signal: aborted by the parent turn's Stop (relayed from
+  // `parentSignal`) OR by `cancelSubagentRun` targeting just this run from
+  // the Background-tasks drawer. Everything below checks/passes `signal`,
+  // never `parentSignal` directly, so both cancellation sources flow
+  // through the same single wind-down path.
+  const ownController = new AbortController();
+  const signal = ownController.signal;
+  if (parentSignal?.aborted) ownController.abort();
+  else parentSignal?.addEventListener('abort', () => ownController.abort(), { once: true });
+  activeSubagentControllers.set(taskId, ownController);
 
   /** Marks this run terminal in both the live store and the persisted
    * session field, then returns `result` unchanged — the single exit point
    * every return statement below routes through, so every outcome (report,
    * error, cancellation, iteration-cap) reliably finalizes both places
-   * exactly once. */
+   * exactly once. Also retires the cancellation handle: a Stop click after
+   * this point is a no-op rather than an abort of a reused controller.
+   * The live store entry's stats are snapshotted into
+   * `ChatSession.subagentRunMeta` alongside the transcript, so the
+   * Background-tasks drawer and `SubagentRow` keep tokens/timing/status
+   * after a restart wipes the transient store. */
   const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
+    activeSubagentControllers.delete(taskId);
+    const live = useSubagentStore.getState().runs[storeKey];
     useSubagentStore.getState().finish(storeKey, status);
-    useSessionStore.getState().setSubagentRun(sessionId, storeKey, messages);
+    useSessionStore.getState().setSubagentRun(
+      sessionId,
+      storeKey,
+      messages,
+      live
+        ? {
+            status,
+            description: live.description,
+            profile: live.profile,
+            startedAt: live.startedAt,
+            finishedAt: Date.now(),
+            toolCallCount: live.toolCallCount,
+            usage: live.usage,
+          }
+        : undefined,
+    );
     return result;
   };
 
@@ -289,7 +345,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     const resolvedTarget = resolveSubagentTarget(target, profile);
 
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
-      if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
+      if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
 
@@ -297,11 +353,20 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       // child attempt's usage must never clobber the PARENT session's
       // context-usage ring. `onDelta` is omitted: nothing renders the
       // child's in-progress streaming content anywhere in this slice.
-      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, parentSignal, effort, sessionId, undefined, false);
+      const attempt = await attemptStream(resolvedTarget, wireHistory, tools, signal, effort, sessionId, undefined, false);
 
       if (attempt.usage) {
         useSubagentStore.getState().accumulateUsage(storeKey, attempt.usage);
         useUsageHistoryStore.getState().recordUsage(describeUsageTarget(resolvedTarget), attempt.usage);
+      }
+
+      // An abort (parent Stop or this run's own Stop button) surfaces as a
+      // stream exception, which would otherwise mislabel a deliberate
+      // cancellation as 'error'/"Failed". Narrowed to the streamError case
+      // so an abort that arrives AFTER a fully-streamed final reply still
+      // delivers the report through the branches below.
+      if (signal.aborted && attempt.streamError !== null) {
+        return finish('cancelled', CANCELLED_TOOL_RESULT);
       }
 
       if (attempt.streamError !== null) {
@@ -309,7 +374,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       }
 
       if (attempt.toolCalls.length === 0) {
-        if (parentSignal?.aborted && attempt.content.length === 0) return finish('cancelled', CANCELLED_TOOL_RESULT);
+        if (signal.aborted && attempt.content.length === 0) return finish('cancelled', CANCELLED_TOOL_RESULT);
         const finalMessage: ChatMessage = { role: 'assistant', content: attempt.content };
         messages = [...messages, finalMessage];
         useSubagentStore.getState().appendMessage(storeKey, finalMessage);
@@ -324,7 +389,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         // Once Stop has fired, remaining calls are not executed — but every
         // one still gets a (cancelled) result message, same invariant
         // `runAgentTurnBody`'s own loop upholds for the parent's tool calls.
-        const aborted = parentSignal?.aborted ?? false;
+        const aborted = signal.aborted;
         if (!aborted) {
           useSubagentStore.getState().recordToolCall(storeKey, activityLabel(toolCall));
         }
@@ -369,7 +434,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
                 parentCheckpointId,
                 runId ?? taskId,
                 mcpRegistry,
-                parentSignal,
+                signal,
                 risk,
                 undefined,
                 undefined,
@@ -402,7 +467,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         }
       }
 
-      if (parentSignal?.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
+      if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
       // Loop again: the child model gets its own tool results appended.
     }
 
