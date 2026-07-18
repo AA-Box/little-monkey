@@ -830,6 +830,7 @@ analytics-disable: true\n";
             can_logs: true,
             can_metrics: true,
             can_infer: true,
+            can_embed: false,
             settings: vec![AdvancedSettingCapability {
                 key: "context_size".to_string(),
                 label: "Context size".to_string(),
@@ -837,6 +838,8 @@ analytics-disable: true\n";
                 schema: SettingValueSchema::Integer { min: 128, max: 1_048_576, step: 1 },
                 default_value: SettingValue::Integer { value: 4_096 },
                 restart_required: true,
+                supported: true,
+                unsupported_reason: None,
             }],
         };
         let mut stored = BTreeMap::new();
