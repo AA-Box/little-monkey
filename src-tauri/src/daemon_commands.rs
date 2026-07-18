@@ -216,6 +216,7 @@ fn validate_remote_pair_request(request: &RemotePairRequest) -> Result<(), Strin
         "approve",
         "cancel",
         "kill",
+        "control-desktop",
     ];
     if request.actions.is_empty()
         || request

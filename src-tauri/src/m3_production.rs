@@ -5,9 +5,12 @@
 //! one [`M3CommandState`]; no production dependency is supplied by the UI.
 
 use crate::compatibility_hub::{
-    CanonicalContent, CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage,
-    CanonicalRole, CanonicalStreamEvent, CanonicalUsage, LanStateProtector, OsLanEntropy,
+    request_offers_tool, CanonicalContent, CanonicalEmbeddingDatum, CanonicalEmbeddingRequest,
+    CanonicalEmbeddingResponse, CanonicalInferenceRequest, CanonicalInferenceResponse,
+    CanonicalMessage, CanonicalRole, CanonicalStreamEvent, CanonicalUsage, LanStateProtector,
+    OsLanEntropy,
 };
+use crate::context_cache::{classify_context_failure, ContextFailureInput};
 use crate::m3_commands::{M3CommandState, M3OwnedProcessShutdown};
 use crate::m3_runtime_hub::{
     DefaultM3LanAccessFactory, HttpM3CatalogSource, M3AcceleratorCompatibility, M3AcceleratorStatus,
@@ -1333,10 +1336,27 @@ impl OpenAiCompatibleM3InferenceEngine {
         if !response.status().is_success() {
             let status = response.status();
             let detail = read_bounded_response(response, 64 * 1024, cancellation, context).await?;
-            return Err(M3HubError::Runtime(format!(
-                "local inference returned HTTP {status}: {}",
-                String::from_utf8_lossy(&detail).trim()
-            )));
+            let detail_text = String::from_utf8_lossy(&detail).trim().to_string();
+            // A runtime's own error body is the most reliable place to spot a
+            // context/cache/memory-related failure (e.g. llama-server's
+            // "the request exceeds the available context size, try
+            // increasing it"), so classify it here and fold the explanation
+            // into the message the user actually sees — this is a best-effort
+            // text/status classification only; it never fabricates numeric
+            // context/memory figures this call site doesn't have.
+            let classification = classify_context_failure(&ContextFailureInput {
+                error_text: Some(detail_text.clone()),
+                http_status: Some(status.as_u16()),
+                ..Default::default()
+            });
+            return Err(M3HubError::Runtime(match classification {
+                Some(classification) => format!(
+                    "local inference returned HTTP {status} [context:{}] {} (raw: {detail_text})",
+                    classification.class.slug(),
+                    classification.explanation
+                ),
+                None => format!("local inference returned HTTP {status}: {detail_text}"),
+            }));
         }
         Ok(response)
     }
@@ -1368,6 +1388,65 @@ impl OpenAiCompatibleM3InferenceEngine {
     ) -> M3HubResult<()> {
         let response = self.send(request, true, cancellation, context).await?;
         parse_openai_sse(response, request, sink, cancellation, context).await
+    }
+
+    /// Real `POST {endpoint}/v1/embeddings` call. This is the genuine gap
+    /// closer: Ollama's local daemon serves an OpenAI-compatible embeddings
+    /// endpoint alongside chat on the same base URL, so this engine
+    /// (constructed with `OLLAMA_ENDPOINT`) produces real vectors. The same
+    /// engine constructed with `LLAMA_ENDPOINT` (the managed llama.cpp chat
+    /// instance, started without `--embeddings`) will reach a real HTTP
+    /// endpoint that itself returns an honest error — never a fabricated
+    /// vector.
+    async fn embed_inner(
+        &self,
+        request: &CanonicalEmbeddingRequest,
+        cancellation: &CancellationToken,
+        context: &M3OperationContext,
+    ) -> M3HubResult<CanonicalEmbeddingResponse> {
+        let body = json!({
+            "model": request.model,
+            "input": request.input,
+        });
+        let encoded = serde_json::to_vec(&body)?;
+        if encoded.len() > MAX_INFERENCE_REQUEST_BYTES {
+            return Err(M3HubError::Runtime(
+                "canonical embeddings request exceeds the production byte limit".to_string(),
+            ));
+        }
+        let url = self.endpoint.url("/v1/embeddings").map_err(runtime_error)?;
+        let operation = async {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
+                _ = cancellation.cancelled() => Err(M3HubError::Cancelled { operation: "local embeddings request".to_string() }),
+                response = self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded).send() => {
+                    response.map_err(|error| M3HubError::Transport(error.to_string()))
+                }
+            }
+        };
+        let response = tokio::time::timeout(Duration::from_millis(context.timeout_ms), operation)
+            .await
+            .map_err(|_| M3HubError::Timeout {
+                operation: "local embeddings request".to_string(),
+                timeout_ms: context.timeout_ms,
+            })??;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = read_bounded_response(response, 64 * 1024, cancellation, context).await?;
+            return Err(M3HubError::Runtime(format!(
+                "local embeddings endpoint returned HTTP {status}: {}",
+                String::from_utf8_lossy(&detail).trim()
+            )));
+        }
+        let bytes = read_bounded_response(
+            response,
+            MAX_INFERENCE_RESPONSE_BYTES,
+            cancellation,
+            context,
+        )
+        .await?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        parse_openai_embeddings_response(&value, request)
     }
 }
 
@@ -1414,6 +1493,19 @@ impl M3InferenceEngine for OpenAiCompatibleM3InferenceEngine {
             } else {
                 Ok(false)
             }
+        })
+    }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            let cancellation = self.begin_request(&request.request_id)?;
+            let result = self.embed_inner(request, &cancellation, context).await;
+            self.finish_request(&request.request_id);
+            result
         })
     }
 }
@@ -1483,6 +1575,35 @@ impl CapabilityCheckedInferenceEngine {
         }
         Ok(())
     }
+
+    async fn validate_embed(
+        &self,
+        request: &CanonicalEmbeddingRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        let limits = RuntimeOperationLimits {
+            timeout_ms: context.timeout_ms,
+            ..RuntimeOperationLimits::default()
+        };
+        let runtime_context = RuntimeOperationContext::new(limits, context.cancellation.clone());
+        let inventory = self
+            .adapter
+            .inventory(&runtime_context)
+            .await
+            .map_err(runtime_error)?;
+        let model = inventory
+            .models
+            .iter()
+            .find(|model| model.model_id == request.model)
+            .ok_or_else(|| M3HubError::NotFound(format!("runtime model {}", request.model)))?;
+        if !model.capabilities.embeddings {
+            return Err(M3HubError::Unsupported(format!(
+                "model {} does not advertise embeddings",
+                request.model
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl M3InferenceEngine for CapabilityCheckedInferenceEngine {
@@ -1516,9 +1637,26 @@ impl M3InferenceEngine for CapabilityCheckedInferenceEngine {
     ) -> M3HubFuture<'a, bool> {
         self.inner.cancel(request_id, context)
     }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            self.validate_embed(request, context).await?;
+            self.inner.embed(request, context).await
+        })
+    }
 }
 
-fn openai_request_body(request: &CanonicalInferenceRequest, stream: bool) -> M3HubResult<Value> {
+/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs`'s
+/// compose-direction fixtures, so the compatibility lab exercises the exact
+/// wire-body builder real inference traffic uses.
+pub(crate) fn openai_request_body(
+    request: &CanonicalInferenceRequest,
+    stream: bool,
+) -> M3HubResult<Value> {
     let messages = request
         .messages
         .iter()
@@ -1600,6 +1738,12 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
     }
     let mut text = String::new();
     let mut calls = Vec::new();
+    // Image content blocks (ROADMAP Phase 8 item 12): collected as OpenAI
+    // vision-style `data:` URIs. Only populated when the message actually
+    // carries an image, so a plain text/tool message composes exactly as
+    // before (a bare string or `null` `content`), matching every existing
+    // wire fixture unchanged.
+    let mut images = Vec::new();
     for content in &message.content {
         match content {
             CanonicalContent::Text { text: value } => text.push_str(value),
@@ -1612,6 +1756,10 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
                     "function":{"name":name,"arguments":input.to_string()}
                 }));
             }
+            CanonicalContent::Image {
+                mime_type,
+                data_base64,
+            } => images.push(CanonicalContent::image_data_url(mime_type, data_base64)),
             CanonicalContent::ToolResult { .. } => {
                 return vec![Err(M3HubError::Runtime(
                     "tool results require a tool-role message".to_string(),
@@ -1628,7 +1776,16 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
     object.insert("role".to_string(), Value::String(role.to_string()));
     object.insert(
         "content".to_string(),
-        if text.is_empty() && !calls.is_empty() {
+        if !images.is_empty() {
+            let mut parts = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({"type":"text","text":text}));
+            }
+            for image in &images {
+                parts.push(json!({"type":"image_url","image_url":{"url":image}}));
+            }
+            Value::Array(parts)
+        } else if text.is_empty() && !calls.is_empty() {
             Value::Null
         } else {
             Value::String(text)
@@ -1640,7 +1797,9 @@ fn openai_messages(message: &CanonicalMessage) -> Vec<M3HubResult<Value>> {
     vec![Ok(Value::Object(object))]
 }
 
-fn parse_openai_response(
+/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs`'s
+/// non-streaming parse-direction fixtures.
+pub(crate) fn parse_openai_response(
     value: &Value,
     request: &CanonicalInferenceRequest,
 ) -> M3HubResult<CanonicalInferenceResponse> {
@@ -1672,10 +1831,20 @@ fn parse_openai_response(
                 .get("function")
                 .ok_or_else(|| M3HubError::Runtime("tool call function is missing".to_string()))?;
             let name = required_string(function, "name", "tool call name")?;
+            if !request_offers_tool(request, name) {
+                return Err(M3HubError::Runtime(format!(
+                    "local response called tool \"{name}\" that was not offered in this request"
+                )));
+            }
             let arguments = required_string(function, "arguments", "tool call arguments")?;
-            let input = serde_json::from_str(arguments).map_err(|error| {
+            let input: Value = serde_json::from_str(arguments).map_err(|error| {
                 M3HubError::Runtime(format!("tool call arguments are not JSON: {error}"))
             })?;
+            if !input.is_object() {
+                return Err(M3HubError::Runtime(
+                    "tool call arguments must decode to an object".to_string(),
+                ));
+            }
             content.push(CanonicalContent::ToolUse {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -1711,6 +1880,54 @@ fn parse_openai_response(
             .get("created")
             .and_then(Value::as_u64)
             .unwrap_or(now_seconds()?),
+    })
+}
+
+fn parse_openai_embeddings_response(
+    value: &Value,
+    request: &CanonicalEmbeddingRequest,
+) -> M3HubResult<CanonicalEmbeddingResponse> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| M3HubError::Runtime("local embeddings response has no data".to_string()))?;
+    if data.len() != request.input.len() {
+        return Err(M3HubError::Runtime(format!(
+            "local embeddings endpoint returned {} vectors for {} inputs",
+            data.len(),
+            request.input.len()
+        )));
+    }
+    let mut items = Vec::with_capacity(data.len());
+    for (expected_index, datum) in data.iter().enumerate() {
+        let index = datum
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(expected_index as u64) as usize;
+        let embedding = datum
+            .get("embedding")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                M3HubError::Runtime("embedding datum has no embedding array".to_string())
+            })?
+            .iter()
+            .map(|component| {
+                component.as_f64().map(|value| value as f32).ok_or_else(|| {
+                    M3HubError::Runtime("embedding component is not numeric".to_string())
+                })
+            })
+            .collect::<M3HubResult<Vec<f32>>>()?;
+        items.push(CanonicalEmbeddingDatum { index, embedding });
+    }
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&request.model)
+        .to_string();
+    Ok(CanonicalEmbeddingResponse {
+        model,
+        data: items,
+        usage: parse_usage(value.get("usage")),
     })
 }
 
@@ -1767,7 +1984,10 @@ async fn read_bounded_response(
     Ok(bytes)
 }
 
-struct OpenAiStreamState {
+/// `pub(crate)`: constructed via `Default` and driven through
+/// `ingest_sse_line`/`finish` directly by `chat_template_lab.rs`'s streaming
+/// fixtures — the same struct real SSE responses are parsed with.
+pub(crate) struct OpenAiStreamState {
     response_id: Option<String>,
     model: Option<String>,
     created: Option<u64>,
@@ -1802,7 +2022,13 @@ struct OpenAiStreamTool {
     content_index: usize,
     call_id: String,
     name: String,
+    /// Argument text not yet flushed downstream as a delta event.
     pending_arguments: String,
+    /// The full argument text seen so far, kept even after `pending_arguments`
+    /// is drained, so completion can verify the concatenation is actually
+    /// valid, complete JSON rather than trusting that a stream which stopped
+    /// sending bytes must have stopped because it was done.
+    full_arguments: String,
     started: bool,
 }
 
@@ -1900,6 +2126,17 @@ impl OpenAiStreamState {
                 .get("index")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| M3HubError::Runtime("stream tool index is missing".to_string()))?;
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                if !id.is_empty()
+                    && self.tools.iter().any(|(other_index, other)| {
+                        *other_index != upstream_index && other.call_id == id
+                    })
+                {
+                    return Err(M3HubError::Runtime(
+                        "stream reused a tool call id across a different index".to_string(),
+                    ));
+                }
+            }
             let tool = self.tools.entry(upstream_index).or_insert_with(|| {
                 let content_index = self.next_index;
                 self.next_index += 1;
@@ -1908,6 +2145,7 @@ impl OpenAiStreamState {
                     call_id: String::new(),
                     name: String::new(),
                     pending_arguments: String::new(),
+                    full_arguments: String::new(),
                     started: false,
                 }
             });
@@ -1934,6 +2172,7 @@ impl OpenAiStreamState {
                 }
                 if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                     tool.pending_arguments.push_str(arguments);
+                    tool.full_arguments.push_str(arguments);
                 }
             }
             if !tool.started && !tool.call_id.is_empty() && !tool.name.is_empty() {
@@ -1957,7 +2196,7 @@ impl OpenAiStreamState {
         Ok(())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         mut self,
         request: &CanonicalInferenceRequest,
         sink: &mut dyn M3CanonicalStreamSink,
@@ -1974,6 +2213,27 @@ impl OpenAiStreamState {
                 return Err(M3HubError::Runtime(
                     "local stream ended with an incomplete tool call".to_string(),
                 ));
+            }
+            // The stream may end (connection drop, truncated response) after
+            // some argument fragments were already flushed as deltas but
+            // before the JSON they form together is actually complete. Only
+            // `pending_arguments` gets drained on each flush, so checking it
+            // alone cannot tell a genuinely finished call from one cut off
+            // mid-token; re-parse everything seen for this call instead.
+            if serde_json::from_str::<Value>(&tool.full_arguments)
+                .ok()
+                .filter(Value::is_object)
+                .is_none()
+            {
+                return Err(M3HubError::Runtime(
+                    "local stream ended with a truncated or invalid tool call".to_string(),
+                ));
+            }
+            if !request_offers_tool(request, &tool.name) {
+                return Err(M3HubError::Runtime(format!(
+                    "local stream called tool \"{}\" that was not offered in this request",
+                    tool.name
+                )));
             }
             sink.emit(CanonicalStreamEvent::ToolCallEnd {
                 index: tool.content_index,
@@ -2035,7 +2295,11 @@ async fn parse_openai_sse(
     state.finish(request, sink)
 }
 
-fn ingest_sse_line(
+/// `pub(crate)`: drives a single synthetic SSE `data:` line through the same
+/// state machine a real streamed response uses; `chat_template_lab.rs` calls
+/// this directly (no live HTTP response required) to validate the streaming
+/// parse direction.
+pub(crate) fn ingest_sse_line(
     line: &str,
     request: &CanonicalInferenceRequest,
     sink: &mut dyn M3CanonicalStreamSink,
@@ -3429,10 +3693,43 @@ pub fn build_m3_command_state(app_data_dir: impl AsRef<Path>) -> M3HubResult<M3C
     ))
 }
 
+/// Production wiring for the Model Conversion and Quantization Workbench
+/// (ROADMAP.md Phase 8): a storage root separate from the model manifest/blob
+/// store, and the real `llama-quantize` backend when it is genuinely found
+/// on this machine (see `quantization::find_llama_quantize_binary`),
+/// otherwise only the honest `Copy`-only passthrough fallback. No fabricated
+/// "always available" real quantizer — see `quantization.rs`'s module doc
+/// comment for the full honesty note, mirroring how the Runtime Component
+/// Update Channels PR documented its own registry-source honesty.
+pub fn build_quantization_command_state(
+    app_data_dir: impl AsRef<Path>,
+) -> M3HubResult<crate::m3_commands::M3QuantizationCommandState> {
+    let app_data_dir = app_data_dir.as_ref();
+    if !app_data_dir.is_absolute() {
+        return Err(M3HubError::State(
+            "Tauri app-data directory must be absolute".to_string(),
+        ));
+    }
+    ensure_private_directory(app_data_dir)?;
+    let root = app_data_dir.join("m3-quantization");
+    ensure_private_directory(&root)?;
+
+    let mut backends: Vec<Arc<dyn crate::quantization::QuantizationBackend>> = Vec::new();
+    if let Some(backend) = crate::quantization::LlamaCppQuantizeBackend::discover() {
+        backends.push(Arc::new(backend));
+    }
+    backends.push(Arc::new(crate::quantization::PassthroughGgufRequantize));
+
+    let workbench = crate::quantization::QuantizationWorkbench::new(root, backends);
+    Ok(crate::m3_commands::M3QuantizationCommandState::new(workbench))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compatibility_hub::{CompatibilityProtocol, COMPATIBILITY_SCHEMA_VERSION};
+    use crate::compatibility_hub::{
+        CanonicalToolDefinition, CompatibilityProtocol, COMPATIBILITY_SCHEMA_VERSION,
+    };
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Incoming};
     use hyper::service::service_fn;
@@ -4069,10 +4366,10 @@ GPU1:
 
     #[test]
     fn build_compatibility_report_is_sane_with_no_gpu_tooling_present() {
-        // This is the acceptance-critical test: on a plain macOS dev machine
-        // with no CUDA/ROCm/Vulkan installed, the full report must build
-        // without panicking or erroring, and every non-Metal/non-macOS
-        // backend must cleanly resolve to NotDetected/ToolMissing/Unsupported
+        // This is the acceptance-critical test: on a plain dev machine or CI
+        // runner with no CUDA/ROCm/Vulkan installed, the full report must
+        // build without panicking or erroring, and every non-Metal backend
+        // must cleanly resolve to a well-formed, non-overclaiming status
         // rather than crashing.
         let snapshot = SystemM3HardwareProbe.snapshot().expect("hardware snapshot");
         let report = build_compatibility_report(&snapshot);
@@ -4089,14 +4386,42 @@ GPU1:
                     ));
                 }
                 AcceleratorKind::DirectMl => {
-                    assert_eq!(entry.status, M3AcceleratorStatus::Unsupported);
+                    // Off Windows, `directml_compatibility` always reports
+                    // `Unsupported` (see that function's early return). On
+                    // Windows, `Win32_VideoController` almost always reports
+                    // *some* display adapter — even a bare CI VM has a basic
+                    // one — so `Available` is the expected, correct outcome
+                    // there, not a bug: see `directml_compatibility`'s
+                    // `ToolMissing`/`NotDetected` arms are still reachable if
+                    // PowerShell/WMI itself is unavailable or reports no
+                    // device, so allow those too. What must never happen,
+                    // on any OS, is claiming `Available` without the
+                    // "unconfirmed" contract documented on
+                    // `M3AcceleratorCompatibility::confirmed` — only a
+                    // display adapter's presence is confirmed there, never
+                    // the DirectML runtime path itself.
+                    assert!(matches!(
+                        entry.status,
+                        M3AcceleratorStatus::Available
+                            | M3AcceleratorStatus::ToolMissing
+                            | M3AcceleratorStatus::NotDetected
+                            | M3AcceleratorStatus::Unsupported
+                    ));
+                    if entry.status == M3AcceleratorStatus::Available {
+                        assert!(
+                            !entry.confirmed,
+                            "DirectML must never claim to be confirmed available: only a display \
+                             adapter's presence can be checked, not the DirectML runtime path itself"
+                        );
+                        assert!(!entry.device_names.is_empty());
+                    }
                 }
                 AcceleratorKind::Cpu => unreachable!("CPU is not part of the compatibility matrix"),
             }
         }
         assert!(!report.jetson.detected);
         // `os` mirrors `std::env::consts::OS` (see `PlatformCapabilities::current`),
-        // not a hardcoded platform — this test runs on Linux CI as well as macOS.
+        // not a hardcoded platform — this test runs on Linux and Windows CI too.
         assert_eq!(report.os, std::env::consts::OS);
     }
 
@@ -4140,5 +4465,534 @@ GPU1:
         let report = crate::m3_runtime_hub::M3HardwareProbe::compatibility_report(&probe)
             .expect("compatibility report");
         assert_eq!(report.accelerators.len(), 5);
+    }
+
+    /// ROADMAP Phase 8 item 12 (Multimodal Projector and Vision Model
+    /// Manager): a user message carrying an inline image now genuinely
+    /// composes onto the OpenAI-compatible wire body used by the Ollama and
+    /// managed llama.cpp drivers, as a proper `image_url` content-array
+    /// entry alongside its accompanying text — the same real-composition
+    /// bar the Chat Template Compatibility Lab's `fixture_tool_calling`
+    /// already applies to tool calls on this exact function. Before this
+    /// change, `CanonicalContent` had no image variant at all, so this
+    /// round trip was structurally impossible.
+    #[test]
+    fn openai_request_body_composes_inline_image_content_alongside_text() {
+        let mut fixture = request("req-vision", "vision-model", false);
+        fixture.messages[0].content.push(CanonicalContent::Image {
+            mime_type: "image/png".to_string(),
+            data_base64: "cGxhY2Vob2xkZXItYnl0ZXM=".to_string(),
+        });
+        let body = openai_request_body(&fixture, false).expect("compose vision request");
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content is an array once an image is present");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,cGxhY2Vob2xkZXItYnl0ZXM="
+        );
+
+        // A plain text-only message (no image) must keep composing exactly
+        // as it always has — a bare string, not an array — so every
+        // existing non-vision fixture/driver is unaffected.
+        let text_only = request("req-text", "text-model", false);
+        let text_body = openai_request_body(&text_only, false).expect("compose text request");
+        assert_eq!(text_body["messages"][0]["content"], Value::String("hello".to_string()));
+    }
+
+    /// The MLX driver's flattened wire message has no native text slot for
+    /// images either; `canonical_message_to_mlx` (m3_runtime_hub.rs) carries
+    /// them in a dedicated `images` list instead. Exercised here (rather
+    /// than only in m3_runtime_hub.rs) because this is the other real
+    /// composition path the roadmap's "at least one real backend" bar
+    /// applies to, alongside the OpenAI-compatible wire above.
+    #[test]
+    fn canonical_message_to_mlx_carries_inline_images_separately_from_text() {
+        let message = CanonicalMessage {
+            role: CanonicalRole::User,
+            content: vec![
+                CanonicalContent::Text {
+                    text: "what is this?".to_string(),
+                },
+                CanonicalContent::Image {
+                    mime_type: "image/jpeg".to_string(),
+                    data_base64: "Zm9v".to_string(),
+                },
+            ],
+        };
+        let mlx_message = crate::m3_runtime_hub::canonical_message_to_mlx(&message).expect("flatten");
+        assert_eq!(mlx_message.text, "what is this?");
+        assert_eq!(mlx_message.images, vec!["data:image/jpeg;base64,Zm9v".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 8 item 10: tool-call and structured-output parser hardening.
+    //
+    // These fixtures drive the *real* production parsing code
+    // (`ingest_sse_line`, `OpenAiStreamState`, `parse_openai_response`) with
+    // adversarial and malformed input a real model or a flaky local network
+    // could actually produce. Every fixture must either reconstruct
+    // correctly (if the input is legal, just awkward) or fail cleanly with a
+    // structured `M3HubError` — never panic, never silently accept a
+    // truncated/corrupted tool call, and never materialize a tool call for a
+    // name the request did not offer.
+    // ------------------------------------------------------------------
+
+    fn request_with_tools(tools: &[&str]) -> CanonicalInferenceRequest {
+        let mut request = request("stream-tools", "local-model", true);
+        request.tools = tools
+            .iter()
+            .map(|name| CanonicalToolDefinition {
+                name: name.to_string(),
+                description: "test tool".to_string(),
+                input_schema: json!({"type":"object","properties":{}}),
+                strict: false,
+            })
+            .collect();
+        request
+    }
+
+    fn sse_line(value: &Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    /// Replays the exact buffering algorithm `parse_openai_sse` uses (buffer
+    /// raw bytes, split on `\n`, decode UTF-8 only once a full line is
+    /// buffered) against caller-supplied byte chunks, so tests can control
+    /// precisely where a "network read" boundary falls — including mid
+    /// multi-byte UTF-8 character or mid JSON-escape-sequence — while still
+    /// exercising the real `ingest_sse_line`/`OpenAiStreamState` production
+    /// code.
+    fn feed_openai_sse_bytes(
+        byte_chunks: &[&[u8]],
+        request: &CanonicalInferenceRequest,
+    ) -> M3HubResult<Vec<CanonicalStreamEvent>> {
+        let mut sink = EventSink::default();
+        let mut state = OpenAiStreamState::default();
+        let mut buffer: Vec<u8> = Vec::new();
+        for chunk in byte_chunks {
+            buffer.extend_from_slice(chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line = buffer.drain(..=position).collect::<Vec<_>>();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let line = std::str::from_utf8(&line)
+                    .map_err(|_| M3HubError::Runtime("local stream is not UTF-8".to_string()))?;
+                ingest_sse_line(line, request, &mut sink, &mut state)?;
+            }
+        }
+        if !buffer.is_empty() {
+            let line = std::str::from_utf8(&buffer)
+                .map_err(|_| M3HubError::Runtime("local stream is not UTF-8".to_string()))?;
+            ingest_sse_line(line.trim_end_matches('\r'), request, &mut sink, &mut state)?;
+        }
+        state.finish(request, &mut sink)?;
+        Ok(sink.0)
+    }
+
+    fn tool_call_arguments(events: &[CanonicalStreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                CanonicalStreamEvent::ToolCallArgumentsDelta { json_delta, .. } => {
+                    Some(json_delta.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The classic brace-counting bug: a naive parser that tracks `{`/`}`
+    /// depth to find the end of a streamed tool call breaks the moment a
+    /// *string value* inside the arguments itself contains braces or an
+    /// escaped quote. The production code never brace-counts partial JSON —
+    /// it concatenates fragments verbatim and only asks `serde_json` to
+    /// parse the result once the call is complete — so this must reconstruct
+    /// exactly, even when the streaming fragmentation boundary falls right
+    /// inside the embedded braces or the escape sequence.
+    #[test]
+    fn brace_in_string_tool_arguments_reconstruct_across_chunk_boundaries() {
+        let arguments_value = json!({
+            "note": "find {important} \"stuff\" caf\u{e9}",
+            "limit": 5
+        });
+        let arguments_text = arguments_value.to_string();
+        let mut braces = arguments_text.match_indices('{');
+        let _outer_open = braces.next().expect("outer open brace");
+        let (embedded_open, _) = braces.next().expect("embedded open brace");
+        let (embedded_close, _) = arguments_text
+            .match_indices('}')
+            .next()
+            .expect("embedded close brace");
+        let (escape_at, _) = arguments_text
+            .match_indices("\\\"")
+            .next()
+            .expect("escaped quote");
+        let mut cuts = vec![embedded_open + 1, embedded_close, escape_at + 1];
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut fragments = Vec::new();
+        let mut previous = 0;
+        for cut in cuts {
+            fragments.push(&arguments_text[previous..cut]);
+            previous = cut;
+        }
+        fragments.push(&arguments_text[previous..]);
+        assert!(
+            fragments.len() >= 3,
+            "expected the split to produce multiple fragments"
+        );
+
+        let request = request_with_tools(&["search"]);
+        let mut events_json = vec![sse_line(&json!({
+            "id":"resp-brace","model":"local-model",
+            "choices":[{"index":0,"delta":{"tool_calls":[{
+                "index":0,"id":"call_1","type":"function",
+                "function":{"name":"search","arguments":""}
+            }]},"finish_reason":null}]
+        }))];
+        for fragment in &fragments {
+            events_json.push(sse_line(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"function":{"arguments":fragment}
+                }]},"finish_reason":null}]
+            })));
+        }
+        events_json.push(sse_line(&json!({
+            "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":7}
+        })));
+        events_json.push("data: [DONE]\n\n".to_string());
+        let full_text = events_json.concat();
+
+        let events = feed_openai_sse_bytes(&[full_text.as_bytes()], &request)
+            .expect("brace-in-string tool call reconstructs");
+        assert!(matches!(
+            events.first(),
+            Some(CanonicalStreamEvent::ResponseStart { .. })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CanonicalStreamEvent::ToolCallStart { name, .. } if name == "search"
+        )));
+        let reconstructed = tool_call_arguments(&events);
+        let reconstructed_value: Value =
+            serde_json::from_str(&reconstructed).expect("reconstructed arguments are valid JSON");
+        assert_eq!(reconstructed_value, arguments_value);
+        assert!(matches!(
+            events.last(),
+            Some(CanonicalStreamEvent::ResponseCompleted { .. })
+        ));
+    }
+
+    /// A real TCP/HTTP chunk boundary has no idea where a UTF-8 character or
+    /// a JSON escape sequence starts or ends. The SSE ingestion loop must
+    /// buffer raw bytes until a full line is available before ever decoding
+    /// UTF-8 or parsing JSON, so the reconstruction must be identical
+    /// regardless of where the byte-level split lands.
+    #[test]
+    fn tool_call_stream_survives_byte_splits_mid_utf8_and_mid_escape() {
+        let arguments_value = json!({"city": "caf\u{e9} \"corner\""});
+        let arguments_text = arguments_value.to_string();
+        let body = format!(
+            "{}{}{}",
+            sse_line(&json!({
+                "id":"resp-utf8","model":"local-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","type":"function",
+                    "function":{"name":"lookup","arguments":arguments_text}
+                }]},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1}
+            })),
+            sse_line(&json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})),
+            "data: [DONE]\n\n",
+        );
+        let bytes = body.as_bytes();
+
+        // Cut #1: in the middle of the 2-byte UTF-8 encoding of 'é'.
+        let utf8_char_start = body.find('\u{e9}').expect("utf8 character present");
+        let utf8_cut = utf8_char_start + 1;
+        // Cut #2: in the middle of the escaped-quote sequence `\"`, found via
+        // `match_indices` on the whole (valid-UTF-8) string rather than by
+        // slicing at `utf8_cut`, which intentionally is not a char boundary.
+        let escape_at = body
+            .match_indices("\\\"")
+            .map(|(offset, _)| offset)
+            .find(|offset| *offset > utf8_cut)
+            .expect("escape sequence present after the utf8 cut");
+        let escape_cut = escape_at + 1;
+        assert!(utf8_cut < escape_cut && escape_cut < bytes.len());
+
+        let request = request_with_tools(&["lookup"]);
+        let chunks: Vec<&[u8]> = vec![
+            &bytes[..utf8_cut],
+            &bytes[utf8_cut..escape_cut],
+            &bytes[escape_cut..],
+        ];
+        let events =
+            feed_openai_sse_bytes(&chunks, &request).expect("byte-split stream reconstructs");
+        let reconstructed = tool_call_arguments(&events);
+        let reconstructed_value: Value =
+            serde_json::from_str(&reconstructed).expect("reconstructed arguments are valid JSON");
+        assert_eq!(reconstructed_value, arguments_value);
+    }
+
+    /// A connection that drops mid-argument must never be silently treated
+    /// as a complete, valid tool call: this reproduces a bug where
+    /// `finish()` only checked the *undrained* remainder (`pending_arguments`,
+    /// which is always emptied by the last successful flush) instead of the
+    /// full accumulated JSON, so a stream cut off right after flushing a
+    /// truncated fragment sailed through as `ToolCallEnd` with corrupted
+    /// arguments like `{"city": "Sto`.
+    #[test]
+    fn truncated_tool_call_stream_is_rejected_not_silently_accepted() {
+        let request = request_with_tools(&["weather"]);
+        let body = format!(
+            "{}{}",
+            sse_line(&json!({
+                "id":"resp-truncated","model":"local-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","type":"function",
+                    "function":{"name":"weather","arguments":""}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"function":{"arguments":"{\"city\": \"Sto"}
+                }]},"finish_reason":null}]
+            })),
+        );
+        // The connection drops here: no closing brace/quote, no
+        // finish_reason, no [DONE].
+        let result = feed_openai_sse_bytes(&[body.as_bytes()], &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("truncated") || message.contains("incomplete")),
+            "expected a clean truncation error, got {result:?}"
+        );
+    }
+
+    /// A tool call that never receives a name/id at all (truncated before
+    /// the first fragment completes) must also fail closed.
+    #[test]
+    fn tool_call_stream_missing_name_and_id_is_rejected() {
+        let request = request_with_tools(&["weather"]);
+        let body = sse_line(&json!({
+            "id":"resp-noname","model":"local-model",
+            "choices":[{"index":0,"delta":{"tool_calls":[{
+                "index":0,"function":{"arguments":"{\"city\":\"Oslo\"}"}
+            }]},"finish_reason":null}]
+        }));
+        let result = feed_openai_sse_bytes(&[body.as_bytes()], &request);
+        assert!(matches!(result, Err(M3HubError::Runtime(_))));
+    }
+
+    /// A model reusing the same tool-call id under a second, different
+    /// index is a protocol violation this app must reject rather than
+    /// silently merge or duplicate.
+    #[test]
+    fn duplicate_tool_call_id_reused_across_a_different_index_is_rejected() {
+        let request = request_with_tools(&["weather"]);
+        let body = format!(
+            "{}{}",
+            sse_line(&json!({
+                "id":"resp-dup","model":"local-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","type":"function",
+                    "function":{"name":"weather","arguments":"{}"}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":1,"id":"call_1","type":"function",
+                    "function":{"name":"weather","arguments":"{}"}
+                }]},"finish_reason":"tool_calls"}]
+            })),
+        );
+        let result = feed_openai_sse_bytes(&[body.as_bytes()], &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("reused")),
+            "expected a duplicate-id rejection, got {result:?}"
+        );
+    }
+
+    /// Two tool calls interleaved out of order (index 1's fragments arrive
+    /// before index 0 is even named) must still reconstruct both calls
+    /// correctly: fragment accumulation is keyed by index, not arrival
+    /// order.
+    #[test]
+    fn out_of_order_interleaved_tool_call_fragments_reconstruct_correctly() {
+        let request = request_with_tools(&["weather", "search"]);
+        let body = format!(
+            "{}{}{}{}{}",
+            sse_line(&json!({
+                "id":"resp-interleave","model":"local-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":1,"id":"call_2","type":"function",
+                    "function":{"name":"search","arguments":"{\"q\":"}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","type":"function",
+                    "function":{"name":"weather","arguments":"{\"city\":"}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":1,"function":{"arguments":"\"rust\"}"}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"function":{"arguments":"\"Oslo\"}"}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})),
+        );
+        let events =
+            feed_openai_sse_bytes(&[body.as_bytes()], &request).expect("interleaved streams ok");
+        // `ToolCallStart` fires in arrival order (call_2's index/name/id
+        // completed first in the delta stream).
+        let starts: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                CanonicalStreamEvent::ToolCallStart { call_id, name, .. } => {
+                    Some((call_id.as_str(), name.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![("call_2", "search"), ("call_1", "weather")]);
+        // `ToolCallEnd` is emitted from the finished-tools map keyed by
+        // upstream index, so it comes out in index order (0, then 1)
+        // regardless of arrival order — both orders are internally
+        // consistent as long as each call's own fragments never cross with
+        // the other's, which the assertions below confirm.
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                CanonicalStreamEvent::ToolCallEnd { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec!["call_1", "call_2"]);
+
+        let arguments_for = |call_id: &str| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        call_id: event_call_id,
+                        json_delta,
+                        ..
+                    } if event_call_id == call_id => Some(json_delta.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments_for("call_1")).expect("call_1 args are JSON"),
+            json!({"city": "Oslo"})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments_for("call_2")).expect("call_2 args are JSON"),
+            json!({"q": "rust"})
+        );
+    }
+
+    /// The other half of the acceptance criterion: a tool call naming
+    /// something the request never offered must never reach a caller as a
+    /// materialized `ToolUse`/`ToolCallEnd` — that would be exactly the kind
+    /// of accidental-execution surface this hardening exists to close.
+    #[test]
+    fn streaming_tool_call_naming_an_unoffered_tool_is_rejected() {
+        let request = request_with_tools(&["weather"]);
+        let body = format!(
+            "{}{}",
+            sse_line(&json!({
+                "id":"resp-unoffered","model":"local-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","type":"function",
+                    "function":{"name":"shell_exec","arguments":"{\"cmd\":\"rm -rf /\"}"}
+                }]},"finish_reason":null}]
+            })),
+            sse_line(&json!({
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+            })),
+        );
+        let result = feed_openai_sse_bytes(&[body.as_bytes()], &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
+            "expected an unoffered-tool rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_streaming_tool_call_naming_an_unoffered_tool_is_rejected() {
+        let request = request_with_tools(&["weather"]);
+        let body = json!({
+            "id":"resp-complete","model":"local-model","created":1,
+            "choices":[{"index":0,"message":{
+                "role":"assistant","content":null,
+                "tool_calls":[{"id":"call_1","type":"function","function":{
+                    "name":"shell_exec","arguments":"{\"cmd\":\"rm -rf /\"}"
+                }}]
+            },"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1}
+        });
+        let result = parse_openai_response(&body, &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
+            "expected an unoffered-tool rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_streaming_tool_call_arguments_must_decode_to_an_object() {
+        let request = request_with_tools(&["weather"]);
+        let body = json!({
+            "id":"resp-non-object","model":"local-model","created":1,
+            "choices":[{"index":0,"message":{
+                "role":"assistant","content":null,
+                "tool_calls":[{"id":"call_1","type":"function","function":{
+                    "name":"weather","arguments":"42"
+                }}]
+            },"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1}
+        });
+        assert!(matches!(
+            parse_openai_response(&body, &request),
+            Err(M3HubError::Runtime(_))
+        ));
+    }
+
+    /// A model can legitimately call a tool with no arguments; the empty
+    /// object must still round-trip as a normal, complete tool call.
+    #[test]
+    fn tool_call_with_empty_object_arguments_completes_normally() {
+        let request = request_with_tools(&["ping"]);
+        let body = format!(
+            "{}{}",
+            sse_line(&json!({
+                "id":"resp-empty","model":"local-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","type":"function",
+                    "function":{"name":"ping","arguments":"{}"}
+                }]},"finish_reason":"tool_calls"}]
+            })),
+            "data: [DONE]\n\n",
+        );
+        let events = feed_openai_sse_bytes(&[body.as_bytes()], &request)
+            .expect("empty-argument tool call completes");
+        assert!(matches!(
+            events.last(),
+            Some(CanonicalStreamEvent::ResponseCompleted { .. })
+        ));
     }
 }

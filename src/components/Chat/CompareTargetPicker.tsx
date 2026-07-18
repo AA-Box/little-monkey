@@ -27,9 +27,10 @@ export interface CompareTargetPickerProps {
   value: readonly ModelTargetSnapshot[];
   onChange: (next: ModelTargetSnapshot[]) => void;
   disabled?: boolean;
-  /** Which way the panel opens relative to the pill — "up" for the composer's
-   * bottom toolbar, "down" when rendered in a top bar. */
-  openDirection?: "up" | "down";
+  /** Which way the panel opens relative to the trigger. "up" suits the
+   * composer-footer placement (default); "down" the title-bar placement,
+   * where an upward panel would clip past the window's top edge. */
+  placement?: "up" | "down";
 }
 
 type CapabilityKind = "tools" | "vision";
@@ -95,7 +96,7 @@ function targetSearchText(target: ModelTargetSnapshot): string {
  * lives in a draft until Apply is pressed, and merely opening this control
  * never starts or switches a runtime.
  */
-export function CompareTargetPicker({ value, onChange, disabled = false, openDirection = "up" }: CompareTargetPickerProps) {
+export function CompareTargetPicker({ value, onChange, disabled = false, placement = "up" }: CompareTargetPickerProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -298,8 +299,8 @@ export function CompareTargetPicker({ value, onChange, disabled = false, openDir
           id={panelId}
           role="dialog"
           aria-labelledby={titleId}
-          className={`absolute right-0 z-30 flex max-h-[min(36rem,75vh)] w-[23rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl ${
-            openDirection === "down" ? "top-full mt-2" : "bottom-full mb-2"
+          className={`absolute z-30 flex max-h-[min(36rem,75vh)] w-[23rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl ${
+            placement === "up" ? "bottom-full right-0 mb-2" : "top-full left-0 mt-2"
           }`}
         >
           <div className="border-b border-border px-3.5 pb-3 pt-3.5">

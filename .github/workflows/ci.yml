@@ -8,7 +8,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  frontend:
+    # TS/JS checks are platform-independent — one OS is enough, no reason to
+    # triplicate tsc/vitest/i18n-lint across the Rust test matrix below.
     runs-on: ubuntu-22.04
 
     steps:
@@ -17,9 +19,72 @@ jobs:
       - name: Install Linux system deps
         run: |
           sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Frontend tests
+        run: pnpm test
+
+      - name: i18n key-lint
+        run: pnpm i18n:lint
+
+  rust-tests:
+    # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
+    # code — a single-OS CI job would silently never compile the arms that
+    # don't match its own target at all (cfg-gated blocks that don't match
+    # the runner's target are stripped before the compiler looks at them).
+    # Mirrors release.yml's platform set (minus the ARM runners, which only
+    # matter for release artifacts, not for compiling/testing).
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest pinned to windows-2022 specifically: the
+        # STATUS_ENTRYPOINT_NOT_FOUND crash (see .cargo/config.toml's
+        # comment) reproduces on whatever image windows-latest currently
+        # resolves to; a near-identical historical rust-lang/rust report
+        # (issue #123999, Windows Server 2019) was resolved by moving to
+        # windows-2022, so this is the next thing being tried before
+        # concluding the runner image itself is implicated.
+        os: [ubuntu-22.04, windows-2022, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      # Keep target/ small enough for the 14 GB hosted-runner disk
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring
 
       - name: Start a D-Bus Secret Service for keychain-backed tests
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
@@ -41,18 +106,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.os }}
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm exec tsc --noEmit
+      - name: Build test binaries only (Windows diagnostic pass)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          pnpm stage:cli:placeholder
+          cargo test --manifest-path src-tauri/Cargo.toml --no-run -vv 2>&1 | Tee-Object -FilePath build.log
+          Write-Host "--- rustc invocations mentioning getrandom ---"
+          Select-String -Path build.log -Pattern "Running.*getrandom" -Context 0,0 | ForEach-Object { $_.Line }
+          Write-Host "--- lines mentioning getrandom_backend cfg ---"
+          Select-String -Path build.log -Pattern "getrandom_backend" | ForEach-Object { $_.Line }
+          Write-Host "--- resolved .cargo/config.toml ---"
+          # `cargo config get` has no --manifest-path flag (it errors with
+          # "unexpected argument '--manifest-path' found"). It also can't be
+          # fixed by just dropping that flag: it's an unstable, nightly-only
+          # subcommand (`error: the 'cargo config' command is unstable, and
+          # only available on the nightly channel of Cargo, but this is the
+          # stable channel`) and this workflow uses dtolnay/rust-toolchain@stable,
+          # so it would still fail and skip the dumpbin step below. Also,
+          # cargo's config-file discovery walks upward from the *working
+          # directory*, not from --manifest-path — and `pnpm test:rust`
+          # (which this job actually runs) invokes cargo from the repo root,
+          # where .cargo/config.toml already lives, so it's already the file
+          # in effect. Just print it directly instead of querying cargo.
+          if (Test-Path .cargo/config.toml) {
+            Get-Content .cargo/config.toml
+          } else {
+            Write-Host "(no .cargo/config.toml found at repo root)"
+          }
 
-      - name: Frontend tests
-        run: pnpm test
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: startsWith(matrix.os, 'windows')
 
-      - name: i18n key-lint
-        run: pnpm i18n:lint
+      - name: Dump PE imports of the crashing test binary (Windows diagnostic pass)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri/target/debug/deps -Filter "little_monkey_lib-*.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Write-Host "Inspecting: $($exe.FullName)"
+          dumpbin /dependents $exe.FullName
+          dumpbin /imports $exe.FullName | Select-String -Pattern "\.dll|ordinal|ProcessPrng|bcrypt" -Context 0,2
 
       - name: Rust tests
         run: pnpm test:rust

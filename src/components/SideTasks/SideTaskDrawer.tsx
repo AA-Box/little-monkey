@@ -309,6 +309,9 @@ export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDraw
   const toggleDrawer = useSideTaskStore((state) => state.toggleDrawer);
   const composerOpen = useSideTaskStore((state) => state.composerOpen);
   const openComposer = useSideTaskStore((state) => state.openComposer);
+  // Both selectors build a fresh array per call — `useShallow` keeps the
+  // uncached snapshots from re-render-looping (React's "getSnapshot should
+  // be cached" guard), same as the other array-selector consumers.
   const visible = useSideTaskStore(useShallow(selectVisibleSideTasks));
   const archived = useSideTaskStore(useShallow(selectArchivedSideTasks));
   const runningCount = useSideTaskStore(selectRunningSideTaskCount);

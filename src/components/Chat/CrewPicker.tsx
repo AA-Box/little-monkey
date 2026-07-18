@@ -24,9 +24,10 @@ export interface CrewPickerProps {
   value: string | null;
   onChange: (crewId: string | null) => void;
   disabled?: boolean;
-  /** Which way the panel opens relative to the pill — "up" for the composer's
-   * bottom toolbar, "down" when rendered in a top bar. */
-  openDirection?: "up" | "down";
+  /** Which way the panel opens relative to the trigger. "up" suits the
+   * composer-footer placement (default); "down" the title-bar placement,
+   * where an upward panel would clip past the window's top edge. */
+  placement?: "up" | "down";
 }
 
 interface EditorState {
@@ -60,7 +61,7 @@ function actorDraft(
   };
 }
 
-export function CrewPicker({ value, onChange, disabled = false, openDirection = "up" }: CrewPickerProps) {
+export function CrewPicker({ value, onChange, disabled = false, placement = "up" }: CrewPickerProps) {
   const { t } = useT();
   const panelId = useId();
   const titleId = useId();
@@ -352,7 +353,7 @@ export function CrewPicker({ value, onChange, disabled = false, openDirection = 
           role="dialog"
           aria-labelledby={titleId}
           className={`absolute z-40 flex max-h-[min(42rem,80vh)] w-[32rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl ${
-            openDirection === "down" ? "right-0 top-full mt-2" : "left-0 bottom-full mb-2"
+            placement === "up" ? "bottom-full left-0 mb-2" : "top-full left-0 mt-2"
           }`}
         >
           <header className="border-b border-border px-3.5 py-3">

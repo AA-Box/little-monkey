@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { AlertCircle, CheckCircle2, LoaderCircle, TriangleAlert } from "lucide-react";
 import { Button } from "../../ui";
-import type { M3HardwareCompatibilityReport } from "../../../lib/runtimeHubClient";
+import type { M3HardwareCompatibilityReport, M3LocalModelStalenessWarning } from "../../../lib/runtimeHubClient";
 
 export const CONTROL_CLASS =
   "min-h-11 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-foreground placeholder:text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50";
@@ -29,7 +29,7 @@ export function Field({
   hint,
   children,
 }: {
-  label: string;
+  label: ReactNode;
   hint?: string;
   children: ReactNode;
 }) {
@@ -159,6 +159,37 @@ export function CompatibilityWarningBanner({
             <li key={`note-${index}`}>{note}</li>
           ))}
         </ul>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+ * an installed local model whose catalog has moved on to a different
+ * revision, and which hasn't been refreshed in a long time. Shown in the
+ * "Load model" flow — before the load actually starts — with a concrete
+ * migration path (the newer catalog entry's display name), mirroring
+ * `CompatibilityWarningBanner`'s "render nothing on the common case" shape.
+ */
+export function ModelRetirementWarningBanner({
+  warning,
+}: {
+  warning: M3LocalModelStalenessWarning | null | undefined;
+}) {
+  if (!warning) return null;
+  const ageDays = Math.floor(warning.ageMs / (24 * 60 * 60 * 1000));
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning-soft px-3 py-2.5 text-sm text-warning"
+    >
+      <TriangleAlert size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
+      <div className="min-w-0 space-y-1">
+        <p className="font-medium">This installed model looks outdated</p>
+        <p className="text-xs leading-5">
+          Installed revision {warning.installedRevision} hasn&apos;t been refreshed in about {ageDays} day{ageDays === 1 ? "" : "s"}, and the configured catalog now lists revision {warning.latestRevision}. Migration path: update to &ldquo;{warning.suggestedReplacementDisplayName}&rdquo; from the model catalog below before loading, or use &ldquo;Find updates&rdquo; on this model&apos;s installed card.
+        </p>
       </div>
     </div>
   );

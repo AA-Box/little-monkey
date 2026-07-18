@@ -5,23 +5,30 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  ClipboardList,
   GitBranch,
   Command,
   ClipboardCheck,
   Compass,
+  FileDiff,
+  Database,
   GitPullRequest,
   Globe,
   HelpCircle,
+  LayoutDashboard,
   ListTodo,
   Inbox,
   Network,
   Newspaper,
+  Plug,
+  Radar,
   Search,
   ServerCog,
   Settings as SettingsIcon,
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Table2,
   Telescope,
   Wand2,
   Workflow,
@@ -40,18 +47,30 @@ interface AppMenuProps {
   onOpenBrowserWorkbench: () => void;
   onOpenCommandPalette: () => void;
   onOpenIssueToPr: () => void;
+  onOpenSecurityAutofix: () => void;
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
+  onOpenConnectorBuilder: () => void;
+  onOpenMigrationAgent: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
+  onOpenSpreadsheetCopilot: () => void;
   onOpenTerminal: () => void;
   onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
+  onOpenDbAdminGuardrails: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenApiContractDiffLab: () => void;
+  onOpenGoldenDatasetBuilder: () => void;
+  onOpenDataNotebook: () => void;
+  onOpenSyntheticMonitoring: () => void;
+  onOpenCrossRepoIntelligence: () => void;
+  onOpenWorkCanvas: () => void;
+  onOpenPmCopilot: () => void;
   onOpenDeepResearch: () => void;
   onOpenBriefStudio: () => void;
   onOpenCrossRepoChangePlanner: () => void;
@@ -77,11 +96,57 @@ function MenuRow({ icon, label, onClick }: MenuRowProps) {
   );
 }
 
+interface MenuFlyoutProps {
+  icon: ReactNode;
+  label: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children: ReactNode;
+}
+
+/**
+ * A submenu row that opens a flyout panel to its side (same interaction as
+ * the language picker: hover to open, click to toggle). The flyout anchors
+ * to the row's bottom edge and grows upward, since the whole menu sits at
+ * the bottom of the sidebar.
+ */
+function MenuFlyout({ icon, label, open, onOpenChange, children }: MenuFlyoutProps) {
+  return (
+    <div
+      className="relative"
+      onMouseEnter={() => onOpenChange(true)}
+      onMouseLeave={() => onOpenChange(false)}
+    >
+      <button
+        type="button"
+        onClick={() => onOpenChange(!open)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-sm text-foreground hover:bg-surface-2 ${
+          open ? "bg-surface-2" : ""
+        }`}
+      >
+        {icon}
+        <span className="flex-1 truncate">{label}</span>
+        <ChevronRight size={14} className="shrink-0 text-faint" />
+      </button>
+
+      {open && (
+        <div className="absolute left-full bottom-0 ml-1 max-h-[70vh] min-w-[220px] overflow-y-auto whitespace-nowrap rounded-lg border border-border bg-background py-1 shadow-lg z-30">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * Sidebar footer: replaces the account/org switcher row a hosted app would
  * show here (no accounts in this local app) with an app-branded trigger that
- * opens Settings and a language flyout (native-name list with a
- * checkmark on the active locale, mirroring the reference language picker).
+ * opens the app menu. Everyday surfaces (search, palette, brief, inbox, runs)
+ * stay top-level; the tool catalog is grouped into flyout submenus so the
+ * menu itself stays a single short column; Settings/Language/help sit in a
+ * footer section below the groups.
  */
 export function AppMenu({
   onOpenSettings,
@@ -90,18 +155,30 @@ export function AppMenu({
   onOpenBrowserWorkbench,
   onOpenCommandPalette,
   onOpenIssueToPr,
+  onOpenSecurityAutofix,
   onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
+  onOpenConnectorBuilder,
+  onOpenMigrationAgent,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
+  onOpenSpreadsheetCopilot,
   onOpenTerminal,
   onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
+  onOpenDbAdminGuardrails,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenApiContractDiffLab,
+  onOpenGoldenDatasetBuilder,
+  onOpenDataNotebook,
+  onOpenSyntheticMonitoring,
+  onOpenCrossRepoIntelligence,
+  onOpenWorkCanvas,
+  onOpenPmCopilot,
   onOpenDeepResearch,
   onOpenBriefStudio,
   onOpenCrossRepoChangePlanner,
@@ -112,7 +189,7 @@ export function AppMenu({
   const setLocale = useLocaleStore((state) => state.setLocale);
 
   const [open, setOpen] = useState(false);
-  const [langOpen, setLangOpen] = useState(false);
+  const [openFlyout, setOpenFlyout] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -120,7 +197,7 @@ export function AppMenu({
     function handlePointerDown(event: PointerEvent) {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         setOpen(false);
-        setLangOpen(false);
+        setOpenFlyout(null);
       }
     }
     document.addEventListener("pointerdown", handlePointerDown);
@@ -129,8 +206,90 @@ export function AppMenu({
 
   const closeAll = () => {
     setOpen(false);
-    setLangOpen(false);
+    setOpenFlyout(null);
   };
+
+  const iconClass = "text-faint";
+
+  interface Item {
+    key: string;
+    icon: ReactNode;
+    label: string;
+    onOpen: () => void;
+  }
+
+  const topItems: Item[] = [
+    { key: "globalSearch", icon: <Search size={14} className={iconClass} />, label: t("AppMenu.globalSearch"), onOpen: onOpenGlobalSearch },
+    { key: "commandPalette", icon: <Command size={14} className={iconClass} />, label: t("AppMenu.commandPalette"), onOpen: onOpenCommandPalette },
+    { key: "dailyBrief", icon: <Newspaper size={14} className={iconClass} />, label: t("AppMenu.dailyBrief"), onOpen: onOpenDailyBrief },
+    { key: "agentInbox", icon: <Inbox size={14} className={iconClass} />, label: t("AppMenu.agentInbox"), onOpen: onOpenAgentInbox },
+    { key: "runCenter", icon: <Activity size={14} className={iconClass} />, label: t("AppMenu.runCenter"), onOpen: onOpenRunCenter },
+  ];
+
+  const groups: { key: string; icon: ReactNode; label: string; items: Item[] }[] = [
+    {
+      key: "buildShip",
+      icon: <GitBranch size={14} className={iconClass} />,
+      label: t("AppMenu.groupBuildShip"),
+      items: [
+        { key: "issueToPr", icon: <GitPullRequest size={14} className={iconClass} />, label: t("AppMenu.issueToPr"), onOpen: onOpenIssueToPr },
+        { key: "visualEditMode", icon: <Wand2 size={14} className={iconClass} />, label: t("AppMenu.visualEditMode"), onOpen: onOpenVisualEditMode },
+        { key: "browserWorkbench", icon: <Globe size={14} className={iconClass} />, label: t("AppMenu.browserWorkbench"), onOpen: onOpenBrowserWorkbench },
+        { key: "integratedTerminal", icon: <SquareTerminal size={14} className={iconClass} />, label: t("AppMenu.integratedTerminal"), onOpen: onOpenTerminal },
+        { key: "migrationAgent", icon: <GitBranch size={14} className={iconClass} />, label: t("AppMenu.migrationAgent"), onOpen: onOpenMigrationAgent },
+        { key: "crossRepoChangePlanner", icon: <GitBranch size={14} className={iconClass} />, label: t("AppMenu.crossRepoChangePlanner"), onOpen: onOpenCrossRepoChangePlanner },
+        { key: "crossRepoIntelligence", icon: <Network size={14} className={iconClass} />, label: t("AppMenu.crossRepoIntelligence"), onOpen: onOpenCrossRepoIntelligence },
+        { key: "apiContractDiffLab", icon: <FileDiff size={14} className={iconClass} />, label: t("AppMenu.apiContractDiffLab"), onOpen: onOpenApiContractDiffLab },
+      ],
+    },
+    {
+      key: "agentsAutomation",
+      icon: <Workflow size={14} className={iconClass} />,
+      label: t("AppMenu.groupAgentsAutomation"),
+      items: [
+        { key: "sopCompiler", icon: <Workflow size={14} className={iconClass} />, label: t("AppMenu.sopCompiler"), onOpen: onOpenSopCompiler },
+        { key: "mcpGenerator", icon: <ServerCog size={14} className={iconClass} />, label: t("AppMenu.mcpGenerator"), onOpen: onOpenMcpGenerator },
+        { key: "connectorBuilder", icon: <Plug size={14} className={iconClass} />, label: t("AppMenu.connectorBuilder"), onOpen: onOpenConnectorBuilder },
+        { key: "syntheticMonitoring", icon: <Radar size={14} className={iconClass} />, label: t("AppMenu.syntheticMonitoring"), onOpen: onOpenSyntheticMonitoring },
+        { key: "sideTasks", icon: <ListTodo size={14} className={iconClass} />, label: t("AppMenu.sideTasks"), onOpen: onOpenSideTasks },
+        { key: "debate", icon: <Swords size={14} className={iconClass} />, label: t("AppMenu.debate"), onOpen: onOpenDebate },
+      ],
+    },
+    {
+      key: "dataResearch",
+      icon: <Database size={14} className={iconClass} />,
+      label: t("AppMenu.groupDataResearch"),
+      items: [
+        { key: "knowledgeGraphExplorer", icon: <Network size={14} className={iconClass} />, label: t("AppMenu.knowledgeGraphExplorer"), onOpen: onOpenKnowledgeGraph },
+        { key: "spreadsheetCopilot", icon: <Table2 size={14} className={iconClass} />, label: t("AppMenu.spreadsheetCopilot"), onOpen: onOpenSpreadsheetCopilot },
+        { key: "dataNotebook", icon: <Database size={14} className={iconClass} />, label: t("AppMenu.dataNotebook"), onOpen: onOpenDataNotebook },
+        { key: "goldenDatasetBuilder", icon: <Database size={14} className={iconClass} />, label: t("AppMenu.goldenDatasetBuilder"), onOpen: onOpenGoldenDatasetBuilder },
+        { key: "evidenceBoard", icon: <ClipboardCheck size={14} className={iconClass} />, label: t("AppMenu.evidenceBoard"), onOpen: onOpenEvidenceBoard },
+        { key: "deepResearch", icon: <Telescope size={14} className={iconClass} />, label: t("AppMenu.deepResearch"), onOpen: onOpenDeepResearch },
+      ],
+    },
+    {
+      key: "planningDocs",
+      icon: <ClipboardList size={14} className={iconClass} />,
+      label: t("AppMenu.groupPlanningDocs"),
+      items: [
+        { key: "workCanvas", icon: <LayoutDashboard size={14} className={iconClass} />, label: t("AppMenu.workCanvas"), onOpen: onOpenWorkCanvas },
+        { key: "pmCopilot", icon: <ClipboardList size={14} className={iconClass} />, label: t("AppMenu.pmCopilot"), onOpen: onOpenPmCopilot },
+        { key: "briefStudio", icon: <BookOpenText size={14} className={iconClass} />, label: t("AppMenu.briefStudio"), onOpen: onOpenBriefStudio },
+      ],
+    },
+    {
+      key: "securityTrust",
+      icon: <ShieldCheck size={14} className={iconClass} />,
+      label: t("AppMenu.groupSecurityTrust"),
+      items: [
+        { key: "securityAutofix", icon: <ShieldAlert size={14} className={iconClass} />, label: t("AppMenu.securityAutofix"), onOpen: onOpenSecurityAutofix },
+        { key: "redTeamLab", icon: <ShieldAlert size={14} className={iconClass} />, label: t("AppMenu.redTeamLab"), onOpen: onOpenRedTeamLab },
+        { key: "trustScorecards", icon: <ShieldCheck size={14} className={iconClass} />, label: t("AppMenu.trustScorecards"), onOpen: onOpenTrustScorecards },
+        { key: "dbAdminGuardrails", icon: <Database size={14} className={iconClass} />, label: t("AppMenu.dbAdminGuardrails"), onOpen: onOpenDbAdminGuardrails },
+      ],
+    },
+  ];
 
   return (
     <div className="relative border-t border-border p-2" ref={containerRef}>
@@ -150,166 +309,44 @@ export function AppMenu({
 
       {open && (
         <div className="absolute bottom-full left-2 mb-1 min-w-[220px] whitespace-nowrap rounded-lg border border-border bg-background py-1 shadow-lg z-30">
-          <MenuRow
-            icon={<Search size={14} className="text-faint" />}
-            label={t("AppMenu.globalSearch")}
-            onClick={() => {
-              closeAll();
-              onOpenGlobalSearch();
-            }}
-          />
-          <MenuRow
-            icon={<Command size={14} className="text-faint" />}
-            label={t("AppMenu.commandPalette")}
-            onClick={() => {
-              closeAll();
-              onOpenCommandPalette();
-            }}
-          />
-          <MenuRow
-            icon={<Newspaper size={14} className="text-faint" />}
-            label={t("AppMenu.dailyBrief")}
-            onClick={() => {
-              closeAll();
-              onOpenDailyBrief();
-            }}
-          />
-          <MenuRow
-            icon={<Inbox size={14} className="text-faint" />}
-            label={t("AppMenu.agentInbox")}
-            onClick={() => {
-              closeAll();
-              onOpenAgentInbox();
-            }}
-          />
-          <MenuRow
-            icon={<Activity size={14} className="text-faint" />}
-            label={t("AppMenu.runCenter")}
-            onClick={() => {
-              closeAll();
-              onOpenRunCenter();
-            }}
-          />
-          <MenuRow
-            icon={<Globe size={14} className="text-faint" />}
-            label={t("AppMenu.browserWorkbench")}
-            onClick={() => {
-              closeAll();
-              onOpenBrowserWorkbench();
-            }}
-          />
-          <MenuRow
-            icon={<Wand2 size={14} className="text-faint" />}
-            label={t("AppMenu.visualEditMode")}
-            onClick={() => {
-              closeAll();
-              onOpenVisualEditMode();
-            }}
-          />
-          <MenuRow
-            icon={<GitPullRequest size={14} className="text-faint" />}
-            label={t("AppMenu.issueToPr")}
-            onClick={() => {
-              closeAll();
-              onOpenIssueToPr();
-            }}
-          />
-          <MenuRow
-            icon={<ShieldCheck size={14} className="text-faint" />}
-            label={t("AppMenu.trustScorecards")}
-            onClick={() => {
-              closeAll();
-              onOpenTrustScorecards();
-            }}
-          />
-          <MenuRow
-            icon={<Workflow size={14} className="text-faint" />}
-            label={t("AppMenu.sopCompiler")}
-            onClick={() => {
-              closeAll();
-              onOpenSopCompiler();
-            }}
-          />
-          <MenuRow
-            icon={<ServerCog size={14} className="text-faint" />}
-            label={t("AppMenu.mcpGenerator")}
-            onClick={() => {
-              closeAll();
-              onOpenMcpGenerator();
-            }}
-          />
-          <MenuRow
-            icon={<ListTodo size={14} className="text-faint" />}
-            label={t("AppMenu.sideTasks")}
-            onClick={() => {
-              closeAll();
-              onOpenSideTasks();
-            }}
-          />
-          <MenuRow
-            icon={<Telescope size={14} className="text-faint" />}
-            label={t("AppMenu.deepResearch")}
-            onClick={() => {
-              closeAll();
-              onOpenDeepResearch();
-            }}
-          />
-          <MenuRow
-            icon={<BookOpenText size={14} className="text-faint" />}
-            label={t("AppMenu.briefStudio")}
-            onClick={() => {
-              closeAll();
-              onOpenBriefStudio();
-            }}
-          />
-          <MenuRow
-            icon={<Network size={14} className="text-faint" />}
-            label={t("AppMenu.knowledgeGraphExplorer")}
-            onClick={() => {
-              closeAll();
-              onOpenKnowledgeGraph();
-            }}
-          />
-          <MenuRow
-            icon={<ClipboardCheck size={14} className="text-faint" />}
-            label={t("AppMenu.evidenceBoard")}
-            onClick={() => {
-              closeAll();
-              onOpenEvidenceBoard();
-            }}
-          />
-          <MenuRow
-            icon={<SquareTerminal size={14} className="text-faint" />}
-            label={t("AppMenu.integratedTerminal")}
-            onClick={() => {
-              closeAll();
-              onOpenTerminal();
-            }}
-          />
-          <MenuRow
-            icon={<GitBranch size={14} className="text-faint" />}
-            label={t("AppMenu.crossRepoChangePlanner")}
-            onClick={() => {
-              closeAll();
-              onOpenCrossRepoChangePlanner();
-            }}
-          />
-          <MenuRow
-            icon={<ShieldAlert size={14} className="text-faint" />}
-            label={t("AppMenu.redTeamLab")}
-            onClick={() => {
-              closeAll();
-              onOpenRedTeamLab();
-            }}
-          />
-          <MenuRow
-            icon={<Swords size={14} className="text-faint" />}
-            label={t("AppMenu.debate")}
-            onClick={() => {
-              closeAll();
-              onOpenDebate();
-            }}
-          />
+          {topItems.map((item) => (
+            <MenuRow
+              key={item.key}
+              icon={item.icon}
+              label={item.label}
+              onClick={() => {
+                closeAll();
+                item.onOpen();
+              }}
+            />
+          ))}
+
+          <div className="my-1 border-t border-border" />
+
+          {groups.map((group) => (
+            <MenuFlyout
+              key={group.key}
+              icon={group.icon}
+              label={group.label}
+              open={openFlyout === group.key}
+              onOpenChange={(next) => setOpenFlyout(next ? group.key : null)}
+            >
+              {group.items.map((item) => (
+                <MenuRow
+                  key={item.key}
+                  icon={item.icon}
+                  label={item.label}
+                  onClick={() => {
+                    closeAll();
+                    item.onOpen();
+                  }}
+                />
+              ))}
+            </MenuFlyout>
+          ))}
+
+          <div className="my-1 border-t border-border" />
+
           <MenuRow
             icon={<SettingsIcon size={14} className="text-faint" />}
             label={t("AppMenu.settings")}
@@ -318,49 +355,31 @@ export function AppMenu({
               onOpenSettings();
             }}
           />
-          <div className="my-1 border-t border-border" />
 
-          <div
-            className="relative"
-            onMouseEnter={() => setLangOpen(true)}
-            onMouseLeave={() => setLangOpen(false)}
+          <MenuFlyout
+            icon={<Globe size={14} className="text-faint" />}
+            label={t("AppMenu.language")}
+            open={openFlyout === "language"}
+            onOpenChange={(next) => setOpenFlyout(next ? "language" : null)}
           >
-            <button
-              type="button"
-              onClick={() => setLangOpen((prev) => !prev)}
-              aria-haspopup="menu"
-              aria-expanded={langOpen}
-              className={`flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-sm text-foreground hover:bg-surface-2 ${
-                langOpen ? "bg-surface-2" : ""
-              }`}
-            >
-              <Globe size={14} className="text-faint" />
-              <span className="flex-1 truncate">{t("AppMenu.language")}</span>
-              <ChevronRight size={14} className="shrink-0 text-faint" />
-            </button>
-
-            {langOpen && (
-              <div className="absolute left-full bottom-0 ml-1 max-h-[70vh] min-w-[220px] overflow-y-auto whitespace-nowrap rounded-lg border border-border bg-background py-1 shadow-lg z-30">
-                {LOCALES.map((entry) => {
-                  const isActive = entry.code === locale;
-                  return (
-                    <button
-                      key={entry.code}
-                      type="button"
-                      onClick={() => {
-                        setLocale(entry.code);
-                        closeAll();
-                      }}
-                      className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-sm text-foreground hover:bg-surface-2"
-                    >
-                      <span className="flex-1 truncate">{entry.nativeName}</span>
-                      {isActive && <Check size={14} className="shrink-0 text-accent" />}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+            {LOCALES.map((entry) => {
+              const isActive = entry.code === locale;
+              return (
+                <button
+                  key={entry.code}
+                  type="button"
+                  onClick={() => {
+                    setLocale(entry.code);
+                    closeAll();
+                  }}
+                  className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-sm text-foreground hover:bg-surface-2"
+                >
+                  <span className="flex-1 truncate">{entry.nativeName}</span>
+                  {isActive && <Check size={14} className="shrink-0 text-accent" />}
+                </button>
+              );
+            })}
+          </MenuFlyout>
 
           <MenuRow
             icon={<Compass size={14} className="text-faint" />}

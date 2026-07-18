@@ -23,7 +23,8 @@ export type RunKind =
   | "scheduled"
   | "browser"
   | "acp"
-  | "background";
+  | "background"
+  | "remote_desktop_control";
 export type RunStatus =
   | "queued"
   | "running"
