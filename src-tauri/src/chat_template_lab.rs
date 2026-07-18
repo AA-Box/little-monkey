@@ -305,6 +305,13 @@ fn fixture_tool_calling(_family: TemplateFamily) -> ChatTemplateLabResult {
     }
 
     // --- 1b. Parse direction: synthetic streamed tool-call response. ---
+    // Declares the same `read_file` tool as the compose-direction `request`
+    // above: the streamed/non-streaming parse checks below simulate the
+    // model calling that exact tool, and the compatibility layer's
+    // tool-call hardening (Phase 8, "Tool-Call and Structured-Output Parser
+    // Hardening") rejects any tool call naming a tool the request never
+    // offered — so this fixture request has to offer it, same as a real
+    // caller would.
     let stream_request = fixture_request(
         vec![CanonicalMessage {
             role: CanonicalRole::User,

@@ -405,6 +405,125 @@ export interface OffloadPlan {
   improvement_suggestions: string[];
 }
 
+// Runtime Telemetry and Memory Trace Viewer: bounded per-load/per-request
+// trace records plus a redacted support-bundle export. See
+// `src-tauri/src/runtime_telemetry.rs`'s module doc comment for exactly what
+// is captured, what is honestly `unavailable`, and how redaction works —
+// these types mirror that module's `#[serde(rename_all = "camelCase")]`
+// shapes exactly, except embedded already-existing types (`OffloadPlan`,
+// `AcceleratorKind`, `ProjectorPlacement`) which keep their own casing.
+export interface TraceFieldNote {
+  field: string;
+  reason: string;
+}
+
+export type TraceOutcome = "success" | "failed";
+
+export interface LoadTiming {
+  startedAtMs: number;
+  readyAtMs: number;
+  durationMs: number;
+}
+
+export interface RequestTiming {
+  startedAtMs: number;
+  endedAtMs: number;
+  durationMs: number;
+}
+
+/** Numeric/enum fields only — cannot carry prompt or response text. */
+export interface SamplerStats {
+  temperature: number | null;
+  topP: number | null;
+  topK: number | null;
+  maxOutputTokens: number | null;
+  repeatPenalty: number | null;
+  seed: number | null;
+}
+
+export interface TokenTiming {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  tokensPerSecond: number | null;
+  cachedPromptTokens: number | null;
+}
+
+export interface MemoryFootprint {
+  availableRamBytes: number;
+  availableVramBytes: number;
+}
+
+export interface OffloadPlacementSummary {
+  accelerator: AcceleratorKind;
+  contextTokens: number;
+  batchSize: number;
+  gpuLayers: number;
+  estimatedTotalLayers: number;
+  cpuSpillLayers: number;
+  projectorPlacement: ProjectorPlacement;
+  parallelSequences: number;
+}
+
+export type TraceEvent =
+  | { kind: "load"; timing: LoadTiming; offload: OffloadPlacementSummary | null; memory: MemoryFootprint | null }
+  | { kind: "request"; timing: RequestTiming; sampler: SamplerStats; tokens: TokenTiming };
+
+export interface RuntimeTraceRecord {
+  schemaVersion: number;
+  traceId: string;
+  runtimeId: string;
+  modelId: string;
+  recordedAtMs: number;
+  outcome: TraceOutcome;
+  errorMessage: string | null;
+  event: TraceEvent;
+  unavailable: TraceFieldNote[];
+}
+
+export interface RecordLoadTraceRequest {
+  runtimeId: string;
+  modelId: string;
+  startedAtMs: number;
+  readyAtMs: number;
+  offloadPlan: OffloadPlan | null;
+  errorMessage: string | null;
+}
+
+export interface RecordRequestTraceRequest {
+  runtimeId: string;
+  modelId: string;
+  startedAtMs: number;
+  endedAtMs: number;
+  sampler: SamplerStats;
+  tokens: TokenTiming;
+  errorMessage: string | null;
+}
+
+export interface RedactionSummary {
+  findingsRedacted: number;
+  byKind: Record<string, number>;
+}
+
+export interface RedactedLogTail {
+  runtimeId: string;
+  text: string;
+  truncated: boolean;
+  redaction: RedactionSummary;
+}
+
+export interface SupportBundle {
+  schemaVersion: number;
+  generatedAtMs: number;
+  appVersion: string;
+  platform: string;
+  hardware: HardwareSnapshot | null;
+  compatibility: M3HardwareCompatibilityReport | null;
+  traces: RuntimeTraceRecord[];
+  runtimeLogs: RedactedLogTail[];
+  redactionTotals: RedactionSummary;
+  excluded: string[];
+}
+
 export type SettingValue =
   | { type: "boolean"; value: boolean }
   | { type: "integer"; value: number }
@@ -1017,6 +1136,14 @@ export const runtimeHubClient = {
   componentActivateVersion: (
     args: OperationArgs & { request: { componentId: string; versionKey: string } },
   ) => invoke<M3InstalledComponent>("m3_component_activate_version", args),
+  telemetryRecordLoad: (request: RecordLoadTraceRequest) =>
+    invoke<RuntimeTraceRecord>("m3_telemetry_record_load", { request }),
+  telemetryRecordRequest: (request: RecordRequestTraceRequest) =>
+    invoke<RuntimeTraceRecord>("m3_telemetry_record_request", { request }),
+  telemetryRecentTraces: (runtimeId: string | null, limit: number) =>
+    invoke<RuntimeTraceRecord[]>("m3_telemetry_recent_traces", { runtimeId, limit }),
+  telemetrySupportBundle: (args: OperationArgs) =>
+    invoke<SupportBundle>("m3_telemetry_support_bundle", args),
   agentLauncherGenerateConfig: (tool: AgentTool, modelId: string, authToken: string | null) =>
     invoke<GeneratedAgentConfig>("agent_launcher_generate_config", { tool, modelId, authToken }),
   agentLauncherCheckDrift: (tool: AgentTool, pastedConfig: string) =>

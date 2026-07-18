@@ -91,6 +91,12 @@ pub mod quantization;
 // `runtime_adapter`'s settings/offload-planner types rather than duplicating
 // them.
 pub mod context_cache;
+// Runtime Telemetry and Memory Trace Viewer (Phase 8): bounded per-load/
+// per-request trace capture, redaction, and support-bundle assembly. Reuses
+// `runtime_adapter::OffloadPlan` and `m3_runtime_hub::M3RuntimeHub::runtime_logs`
+// rather than computing memory/offload/log data itself; Tauri-free and
+// unit-tested on its own, with thin command glue in `m3_commands`.
+pub mod runtime_telemetry;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
@@ -1028,6 +1034,10 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            m3_commands::m3_telemetry_record_load,
+            m3_commands::m3_telemetry_record_request,
+            m3_commands::m3_telemetry_recent_traces,
+            m3_commands::m3_telemetry_support_bundle,
             m3_commands::agent_launcher_generate_config,
             m3_commands::agent_launcher_check_drift,
             m3_http_server::m3_http_server_start,
