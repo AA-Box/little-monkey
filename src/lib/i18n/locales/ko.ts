@@ -987,7 +987,6 @@ export const ko: Record<string, string> = {
   "CheckpointTimeline.minutesAgo": "{{count}}분 전",
   "CheckpointTimeline.hoursAgo": "{{count}}시간 전",
   "CheckpointTimeline.daysAgo": "{{count}}일 전",
-  "EffortSelector.levelDefault": "기본값",
   "EffortSelector.levelLow": "낮음",
   "EffortSelector.levelMedium": "보통",
   "EffortSelector.levelHigh": "높음",

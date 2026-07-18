@@ -988,7 +988,6 @@ export const es419: Record<string, string> = {
   "CheckpointTimeline.minutesAgo": "hace {{count}} minuto(s)",
   "CheckpointTimeline.hoursAgo": "hace {{count}} hora(s)",
   "CheckpointTimeline.daysAgo": "hace {{count}} día(s)",
-  "EffortSelector.levelDefault": "Predeterminado",
   "EffortSelector.levelLow": "Bajo",
   "EffortSelector.levelMedium": "Medio",
   "EffortSelector.levelHigh": "Alto",

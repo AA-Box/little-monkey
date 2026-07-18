@@ -988,7 +988,6 @@ export const it: Record<string, string> = {
   "CheckpointTimeline.minutesAgo": "{{count}} minuto/i fa",
   "CheckpointTimeline.hoursAgo": "{{count}} ora/e fa",
   "CheckpointTimeline.daysAgo": "{{count}} giorno/i fa",
-  "EffortSelector.levelDefault": "Predefinito",
   "EffortSelector.levelLow": "Basso",
   "EffortSelector.levelMedium": "Medio",
   "EffortSelector.levelHigh": "Alto",
