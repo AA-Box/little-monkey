@@ -19,6 +19,9 @@ pub mod artifact_store;
 // activation and rollback. The manager is Tauri-free so desktop, CLI, and a
 // future user-owned runner share one ownership and integrity policy.
 pub mod asset_manager;
+// Native in-app browser pane: real tabbed child webviews (Claude-Desktop-
+// style) overlaid on the main webview via the `unstable` multiwebview API.
+pub mod browser_pane;
 // Disposable Chromium/CDP verification worker with request interception,
 // explicit origin grants, DNS re-checks, quotas, and durable evidence.
 pub mod browser_worker;
@@ -657,6 +660,7 @@ pub fn run() {
         .manage(m4_state)
         .manage(native_skills_state)
         .manage(browser_state)
+        .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
         .manage(palette_state)
         .manage(desktop_control_state)
@@ -762,6 +766,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            browser_pane::browser_pane_open_tab,
+            browser_pane::browser_pane_close_tab,
+            browser_pane::browser_pane_select_tab,
+            browser_pane::browser_pane_set_bounds,
+            browser_pane::browser_pane_set_visible,
+            browser_pane::browser_pane_navigate,
+            browser_pane::browser_pane_go_back,
+            browser_pane::browser_pane_go_forward,
+            browser_pane::browser_pane_reload,
+            browser_pane::browser_pane_favicon,
             cli_install::cli_install_status,
             cli_install::cli_install_set_enabled,
             llama::llama_start,
@@ -915,6 +929,8 @@ pub fn run() {
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
+            git::git_changed_files,
+            git::git_file_diff,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
             mcp::mcp_update_server,
