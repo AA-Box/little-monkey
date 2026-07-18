@@ -52,6 +52,10 @@ describe("runtimeHubClient", () => {
     await runtimeHubClient.modelDownload({ ...operation, request: { model, acceptedLicenseSha256: "digest" } });
     await runtimeHubClient.modelUpdate({ ...operation, assetId: "asset", request: { model, acceptedLicenseSha256: "digest" } });
     await runtimeHubClient.modelActivateVersion({ ...operation, request: { assetId: "asset", versionKey: "a".repeat(64) } });
+    await runtimeHubClient.verifyProjector({
+      ...operation,
+      request: { assetId: "asset", versionKey: "a".repeat(64), candidatePath: "/tmp/projector.bin" },
+    });
     await runtimeHubClient.modelPruneVersions({ ...operation, request: { assetId: "asset", confirmation: "PRUNE asset" } });
     await runtimeHubClient.modelDelete({ ...operation, request: { assetId: "asset", confirmation: "DELETE asset" } });
     await runtimeHubClient.cleanupOrphans({ ...operation, confirmation: "CLEAN ORPHANS" });
@@ -96,6 +100,7 @@ describe("runtimeHubClient", () => {
       "m3_model_download",
       "m3_model_update",
       "m3_model_activate_version",
+      "m3_verify_projector",
       "m3_model_prune_versions",
       "m3_model_delete",
       "m3_cleanup_orphans",
@@ -130,6 +135,11 @@ describe("runtimeHubClient", () => {
       timeoutMs: 1000,
       query: "qwen",
       limit: 20,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("m3_verify_projector", {
+      operationId: "op-1",
+      timeoutMs: 1000,
+      request: { assetId: "asset", versionKey: "a".repeat(64), candidatePath: "/tmp/projector.bin" },
     });
     expect(invokeMock).toHaveBeenCalledWith("m3_lan_complete_pairing", {
       challengeId: "challenge",

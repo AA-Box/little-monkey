@@ -91,6 +91,12 @@ pub mod quantization;
 // `runtime_adapter`'s settings/offload-planner types rather than duplicating
 // them.
 pub mod context_cache;
+// Runtime Telemetry and Memory Trace Viewer (Phase 8): bounded per-load/
+// per-request trace capture, redaction, and support-bundle assembly. Reuses
+// `runtime_adapter::OffloadPlan` and `m3_runtime_hub::M3RuntimeHub::runtime_logs`
+// rather than computing memory/offload/log data itself; Tauri-free and
+// unit-tested on its own, with thin command glue in `m3_commands`.
+pub mod runtime_telemetry;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
@@ -154,6 +160,10 @@ pub mod triage;
 mod models;
 pub mod ollama;
 pub mod providers;
+// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+// Tauri-free static-registry + comparison logic shared by `providers.rs`'s
+// cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
+pub mod model_retirement;
 // `pub` so a future `monkey-cli` `Stacks` subcommand (RAG design doc, slice 4)
 // can call `stacks::list_impl`/`reindex_impl`/`query_impl` directly, the
 // same AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`.
@@ -801,6 +811,7 @@ pub fn run() {
             providers::providers_set_key,
             providers::providers_remove_key,
             providers::providers_list_models,
+            providers::providers_check_model_retirements,
             providers::providers_stream_chat,
             providers::providers_cancel_chat,
             models::models_list_curated,
@@ -1003,9 +1014,11 @@ pub fn run() {
             m3_commands::m3_chat_template_lab_report,
             m3_commands::m3_offload_plan,
             m3_commands::m3_catalog_search,
+            m3_commands::m3_model_staleness_check,
             m3_commands::m3_model_download,
             m3_commands::m3_model_update,
             m3_commands::m3_model_activate_version,
+            m3_commands::m3_verify_projector,
             m3_commands::m3_model_prune_versions,
             m3_commands::m3_model_delete,
             m3_commands::m3_cleanup_orphans,
@@ -1045,6 +1058,10 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            m3_commands::m3_telemetry_record_load,
+            m3_commands::m3_telemetry_record_request,
+            m3_commands::m3_telemetry_recent_traces,
+            m3_commands::m3_telemetry_support_bundle,
             m3_commands::agent_launcher_generate_config,
             m3_commands::agent_launcher_check_drift,
             m3_http_server::m3_http_server_start,

@@ -978,33 +978,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
 
-### 12. Multimodal Projector and Vision Model Manager
-
-**Status:** Planned
-
-- Manage image/audio/projector components, projector memory sizing, model capability detection, and multimodal template tests.
-- Show when a vision/audio model is missing a required projector or runtime feature.
-
-**Acceptance:** Multimodal models load with explicit projector provenance, placement, and capability evidence.
-
-### 14. Model Retirement and Compatibility Warnings
-
-**Status:** Planned
-
-- Warn about retired cloud models, outdated local models, unsupported model families, and old agent model defaults.
-- Suggest replacements based on hardware, workflow, and privacy policy.
-
-**Acceptance:** Deprecated or unsafe model choices show a clear migration path before a run starts.
-
-### 15. Runtime Telemetry and Memory Trace Viewer
-
-**Status:** Planned
-
-- Capture load timing, token timing, cached prompt tokens, memory/VRAM use, offload placement, sampler stats, runtime logs, and crash traces.
-- Provide redacted support bundles.
-
-**Acceptance:** Runtime failures can be diagnosed from a trace without exposing prompts or secrets by default.
-
 ### 16. Edge Device Runtime Profiles
 
 **Status:** Research

@@ -160,6 +160,22 @@ export interface ProviderModelInfo {
   id: string;
 }
 
+/**
+ * Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+ * mirrors the Rust `CloudModelRetirementWarning` struct
+ * (`src-tauri/src/model_retirement.rs`) exactly. The retirement registry
+ * itself is a maintained, versioned, local static list — not a live-verified
+ * source, since there is no upstream API this app can call in this sandbox
+ * to ask "is this model retired?". See that module's doc comment.
+ */
+export interface CloudModelRetirementWarning {
+  provider_id: string;
+  model_id: string;
+  reason: string;
+  suggested_replacement_model_id: string | null;
+  replacement_note: string;
+}
+
 /** Context window size used when starting llama-server. */
 const DEFAULT_CTX_SIZE = 4096;
 /** GPU layers to offload to the GPU; a large value offloads the full model. */
@@ -270,6 +286,13 @@ export interface ModelStore {
   // --- Cloud AI providers (OpenAI/Anthropic/Gemini/OpenRouter/custom) ---
   providers: ProviderConfig[];
   providerModels: Record<string, ProviderModelInfo[]>;
+  /** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+   * 14): provider id -> model id -> retirement warning, computed once per
+   * `providerModels` refresh (see `setProviderKey`/`refreshProviderModels`)
+   * rather than on every render. A provider/model absent here simply hasn't
+   * been checked yet or isn't retired — read via
+   * `lib/modelRetirement.ts`'s `cloudModelRetirementWarning`. */
+  providerModelRetirements: Record<string, Record<string, CloudModelRetirementWarning>>;
   /** Provider id -> last failure message from a failed `setProviderKey`/`refreshProviderModels` call. */
   providerKeyError: Record<string, string>;
   /** Which provider id is selected to chat with, when `activeProvider === "provider"`. */
@@ -305,6 +328,31 @@ export interface ModelStore {
   setEffortForTarget: (targetKey: string, effort: EffortLevel | null) => void;
 }
 
+/**
+ * Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+ * checks a provider's whole fetched model list against the local retired-
+ * model registry (`model_retirement.rs`) in one batched call, so switching
+ * providers/models never needs a per-lookup round trip. Never throws — a
+ * check failure is diagnostic and must never block the model list refresh
+ * itself (mirrors `refreshCompatibilityReport`'s soft-fail shape in
+ * `runtimeHubStore.ts`).
+ */
+async function fetchProviderModelRetirements(
+  providerId: string,
+  models: ProviderModelInfo[],
+): Promise<Record<string, CloudModelRetirementWarning>> {
+  if (!models.length) return {};
+  try {
+    const warnings = await invoke<CloudModelRetirementWarning[]>("providers_check_model_retirements", {
+      providerId,
+      modelIds: models.map((model) => model.id),
+    });
+    return Object.fromEntries(warnings.map((warning) => [warning.model_id, warning]));
+  } catch {
+    return {};
+  }
+}
+
 export const useModelStore = create<ModelStore>((set, get) => ({
   curated: [],
   installed: [],
@@ -336,6 +384,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
 
   providers: [],
   providerModels: {},
+  providerModelRetirements: {},
   providerKeyError: {},
   activeProviderId: null,
   activeProviderModel: null,
@@ -548,10 +597,12 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     await invoke("providers_remove_custom", { id });
     set((state) => {
       const { [id]: _discardModels, ...restModels } = state.providerModels;
+      const { [id]: _discardRetirements, ...restRetirements } = state.providerModelRetirements;
       const { [id]: _discardError, ...restErrors } = state.providerKeyError;
       const stillActive = state.activeProviderId === id;
       return {
         providerModels: restModels,
+        providerModelRetirements: restRetirements,
         providerKeyError: restErrors,
         ...(stillActive
           ? { activeProvider: "local" as const, activeProviderId: null, activeProviderModel: null }
@@ -569,6 +620,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     try {
       const models = await invoke<ProviderModelInfo[]>("providers_set_key", { id, apiKey });
       set((state) => ({ providerModels: { ...state.providerModels, [id]: models } }));
+      const retirements = await fetchProviderModelRetirements(id, models);
+      set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
       await get().refreshProviders();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -581,9 +634,11 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     await invoke("providers_remove_key", { id });
     set((state) => {
       const { [id]: _discard, ...restModels } = state.providerModels;
+      const { [id]: _discardRetirements, ...restRetirements } = state.providerModelRetirements;
       const stillActive = state.activeProviderId === id;
       return {
         providerModels: restModels,
+        providerModelRetirements: restRetirements,
         ...(stillActive
           ? { activeProvider: "local" as const, activeProviderId: null, activeProviderModel: null }
           : {}),
@@ -600,6 +655,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     try {
       const models = await invoke<ProviderModelInfo[]>("providers_list_models", { id });
       set((state) => ({ providerModels: { ...state.providerModels, [id]: models } }));
+      const retirements = await fetchProviderModelRetirements(id, models);
+      set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({ providerKeyError: { ...state.providerKeyError, [id]: message } }));

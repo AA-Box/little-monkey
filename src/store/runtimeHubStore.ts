@@ -26,6 +26,7 @@ import {
   type M3HardwareCompatibilityReport,
   type M3HttpServerStatus,
   type M3LoadModelRequest,
+  type M3LocalModelStalenessWarning,
   type M3RuntimeCapability,
   type M3RuntimeMetricsView,
   type M3RuntimeStatusView,
@@ -49,10 +50,17 @@ import {
   type RuntimeLogTail,
   type RuntimePrWatcherCheckResult,
   type RuntimePrWatcherState,
+  type RuntimeTraceRecord,
   type ScopedToken,
   type SecurityAuditEvent,
   type SettingValue,
+  type SupportBundle,
 } from "../lib/runtimeHubClient";
+import {
+  extractModelIdFromRequestBody,
+  extractSamplerStatsFromRequestBody,
+  extractTokenTimingFromResponseBody,
+} from "../lib/runtimeTelemetry";
 
 export type RuntimeHubSection =
   | "overview"
@@ -63,8 +71,9 @@ export type RuntimeHubSection =
   | "api"
   | "compatibility"
   | "lan"
-  | "agents"
   | "quantization"
+  | "telemetry"
+  | "agents"
   | "upstream-watcher";
 
 export interface RuntimeDetail {
@@ -133,6 +142,12 @@ interface RuntimeHubStoreState {
    * `prWatcherState.relevantPrs` (which accumulates across every check) so
    * the UI can show "N new since last check" for just this run. */
   prWatcherLastResult: RuntimePrWatcherCheckResult | null;
+  /** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+   * 14): keyed by assetId. `null` means "checked, currently up to date";
+   * absent means "not checked yet". */
+  modelStalenessWarnings: Record<string, M3LocalModelStalenessWarning | null>;
+  traces: RuntimeTraceRecord[];
+  supportBundle: SupportBundle | null;
   /** Keyed by runtimeId: the Sampler/Batching/Speculative Decoding gating
    * result last resolved for that runtime (see `resolveSettingCapabilities`
    * below). Absent until first resolved; the UI falls back to the
@@ -151,6 +166,7 @@ interface RuntimeHubStoreState {
   downloadModel: (match: M3CatalogMatch) => Promise<void>;
   updateModel: (assetId: string, match: M3CatalogMatch) => Promise<void>;
   activateModelVersion: (assetId: string, versionKey: string) => Promise<void>;
+  verifyProjector: (assetId: string, versionKey: string, candidatePath: string) => Promise<void>;
   pruneModelVersions: (assetId: string) => Promise<void>;
   deleteModel: (assetId: string) => Promise<void>;
   cleanupOrphans: () => Promise<void>;
@@ -165,6 +181,7 @@ interface RuntimeHubStoreState {
   resolveSettingCapabilities: (runtimeId: string, assetId: string | null) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
+  checkModelStaleness: (assetId: string) => Promise<void>;
   resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
   classifyContextFailure: (input: ContextFailureInput) => Promise<ContextFailureClassification | null>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
@@ -183,6 +200,9 @@ interface RuntimeHubStoreState {
   startHttpServer: () => Promise<void>;
   stopHttpServer: () => Promise<void>;
   storeTlsIdentity: (reference: string, certificatePem: string, privateKeyPem: string) => Promise<string>;
+  refreshTraces: (runtimeId?: string | null) => Promise<void>;
+  exportSupportBundle: () => Promise<SupportBundle>;
+  clearSupportBundle: () => void;
   generateAgentConfig: (tool: AgentTool, modelId: string, authToken: string | null) => Promise<void>;
   clearAgentConfig: () => void;
   checkAgentConfigDrift: (tool: AgentTool, pastedConfig: string) => Promise<void>;
@@ -364,6 +384,9 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     offloadPlans: {},
     prWatcherState: null,
     prWatcherLastResult: null,
+    modelStalenessWarnings: {},
+    traces: [],
+    supportBundle: null,
     settingCapabilities: {},
     loaded: false,
 
@@ -451,6 +474,25 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           operationId,
           timeoutMs: 30_000,
           request: { assetId, versionKey },
+        });
+        await refreshModelState();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    verifyProjector: async (assetId, versionKey, candidatePath) => {
+      const key = `verify-projector:${assetId}`;
+      const operationId = createM3OperationId("verify-projector");
+      begin(key, operationId);
+      try {
+        await runtimeHubClient.verifyProjector({
+          operationId,
+          timeoutMs: 30_000,
+          request: { assetId, versionKey, candidatePath },
         });
         await refreshModelState();
       } catch (error) {
@@ -659,6 +701,25 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    checkModelStaleness: async (assetId) => {
+      // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8,
+      // item 14): diagnostic, additive information like the Hardware
+      // Compatibility Matrix report above — a staleness-check hiccup must
+      // never block the "Load model" flow itself, so failures are captured
+      // for display but never rethrown.
+      const key = `model-staleness:${assetId}`;
+      begin(key);
+      try {
+        const operationId = createM3OperationId("model-staleness-check");
+        const warning = await runtimeHubClient.modelStalenessCheck({ operationId, timeoutMs: 30_000, assetId });
+        set((state) => ({ modelStalenessWarnings: { ...state.modelStalenessWarnings, [assetId]: warning } }));
+      } catch (error) {
+        fail(key, error);
+      } finally {
+        finish(key);
+      }
+    },
+
     resolveSettingCapabilities: async (runtimeId, assetId) => {
       const key = `settings-gate:${runtimeId}`;
       begin(key);
@@ -771,10 +832,36 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const key = `load:${request.runtimeId}`;
       const operationId = createM3OperationId("runtime-load");
       begin(key, operationId);
+      const startedAtMs = Date.now();
+      // Reuses whatever offload plan `previewOffloadPlan` already computed
+      // for this runtime (the Runtime Hub's load flow always previews one
+      // before offering the load action) — this trace never computes its
+      // own placement/memory numbers, only reports the planner's.
+      const offloadPlan = get().offloadPlans[request.runtimeId] ?? null;
+      const recordTrace = (loadError: unknown) => {
+        // Wrapped in `Promise.resolve` (rather than chaining `.catch`
+        // directly off the client call) so this stays safe even if the
+        // client returns a non-promise, which test mocks default to.
+        void Promise.resolve(
+          runtimeHubClient.telemetryRecordLoad({
+            runtimeId: request.runtimeId,
+            modelId: request.assetId,
+            startedAtMs,
+            readyAtMs: Date.now(),
+            offloadPlan,
+            errorMessage: loadError === undefined ? null : errorMessage(loadError),
+          }),
+        ).catch(() => {
+          // Telemetry capture is best-effort and must never surface as a
+          // load failure to the user.
+        });
+      };
       try {
         await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
         await get().refreshRuntime(request.runtimeId);
+        recordTrace(undefined);
       } catch (error) {
+        recordTrace(error);
         fail(key, error);
         throw error;
       } finally {
@@ -820,10 +907,36 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const key = "api";
       const operationId = createM3OperationId("api-dispatch");
       begin(key, operationId);
+      const startedAtMs = Date.now();
+      // Only ever plucks a fixed allowlist of numeric sampler/usage keys —
+      // see `extractSamplerStatsFromRequestBody`/`extractTokenTimingFromResponseBody`
+      // in `lib/runtimeTelemetry.ts`. This request body is a free-form
+      // diagnostics payload the user can type anything into, so this is the
+      // one place in the Runtime Hub that must not assume the body is
+      // free of prompt content.
+      const sampler = extractSamplerStatsFromRequestBody(request.body);
+      const modelId = extractModelIdFromRequestBody(request.body) ?? request.requestId;
+      const recordTrace = (responseBody: unknown, dispatchError: unknown) => {
+        void Promise.resolve(
+          runtimeHubClient.telemetryRecordRequest({
+            runtimeId: request.runtimeId,
+            modelId,
+            startedAtMs,
+            endedAtMs: Date.now(),
+            sampler,
+            tokens: extractTokenTimingFromResponseBody(responseBody),
+            errorMessage: dispatchError === undefined ? null : errorMessage(dispatchError),
+          }),
+        ).catch(() => {
+          // Best-effort, same as `loadModel`'s trace capture.
+        });
+      };
       try {
         const apiResult = await runtimeHubClient.apiDispatch({ operationId, timeoutMs: 120_000, request });
         set({ apiResult });
+        recordTrace(apiResult.body, undefined);
       } catch (error) {
+        recordTrace(null, error);
         fail(key, error);
         throw error;
       } finally {
@@ -1025,6 +1138,38 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    refreshTraces: async (runtimeId = null) => {
+      const key = "telemetry-traces";
+      begin(key);
+      try {
+        const traces = await runtimeHubClient.telemetryRecentTraces(runtimeId, 100);
+        set({ traces });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    exportSupportBundle: async () => {
+      const key = "telemetry-support-bundle";
+      const operationId = createM3OperationId("telemetry-support-bundle");
+      begin(key, operationId);
+      try {
+        const supportBundle = await runtimeHubClient.telemetrySupportBundle({ operationId, timeoutMs: 30_000 });
+        set({ supportBundle });
+        return supportBundle;
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    clearSupportBundle: () => set({ supportBundle: null }),
+
     generateAgentConfig: async (tool, modelId, authToken) => {
       const key = "agent-launcher-generate";
       begin(key);
@@ -1042,7 +1187,6 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         finish(key);
       }
     },
-
     refreshQuantization: async () => {
       const key = "quantization-refresh";
       begin(key);
