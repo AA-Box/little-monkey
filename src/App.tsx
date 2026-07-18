@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FileDiff, FolderTree, Globe2, ListTodo, PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
+import { FileDiff, FolderTree, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, PanelRightClose, Plus, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
@@ -66,6 +66,7 @@ import { startSyntheticMonitoringScheduler } from "./store/syntheticMonitoringSt
 import { useT } from "./lib/i18n";
 import {
   detectShortcutPlatform,
+  shortcutDisplayLabel,
   shortcutIdForEvent,
   shouldHandleGlobalShortcut,
   type ShortcutIdForScope,
@@ -92,6 +93,54 @@ function formatError(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/** The panels the right sidebar can host as tabs. */
+type RightTabKind = "review" | "terminal" | "files" | "sideTasks" | "browser";
+
+const RIGHT_TAB_KINDS: readonly RightTabKind[] = ["review", "terminal", "browser", "files", "sideTasks"];
+
+const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
+  review: "App.rightPanelReview",
+  terminal: "App.rightPanelTerminal",
+  browser: "App.rightPanelBrowser",
+  files: "App.rightPanelWorkspace",
+  sideTasks: "App.rightPanelSideTasks",
+};
+
+const RIGHT_TAB_SHORTCUT_IDS: Record<
+  RightTabKind,
+  "openReview" | "openTerminal" | "openBrowserTab" | "openFiles" | "openSideTasksPanel"
+> = {
+  review: "openReview",
+  terminal: "openTerminal",
+  browser: "openBrowserTab",
+  files: "openFiles",
+  sideTasks: "openSideTasksPanel",
+};
+
+function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
+  const className = "shrink-0 text-faint";
+  switch (kind) {
+    case "review":
+      return <FileDiff size={size} className={className} />;
+    case "terminal":
+      return <SquareTerminal size={size} className={className} />;
+    case "browser":
+      return <Globe2 size={size} className={className} />;
+    case "files":
+      return <FolderTree size={size} className={className} />;
+    default:
+      return <ListTodo size={size} className={className} />;
+  }
+}
+
+/** Clamps a user-dragged right-menu width to a sane range, capped relative
+ * to the viewport so a wide drag on a big display can't be dragged into an
+ * unreasonably narrow chat column. */
+function clampRightMenuWidth(value: number): number {
+  const viewportCap = Math.max(220, Math.floor((typeof window === "undefined" ? 1200 : window.innerWidth) * 0.6));
+  return Math.min(viewportCap, Math.max(220, Math.round(value)));
 }
 
 function App() {
@@ -201,11 +250,116 @@ function App() {
       window.clearInterval(timer);
     };
   }, [diffPanelOpen]);
-  /** The right sidebar region shows at most ONE thing at a time (Claude-
-   * Desktop-style): nothing (default), the picker menu, the workspace
-   * panel, or the side-tasks drawer. A right-docked terminal overrides
-   * whatever is selected here. */
-  const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks" | "review">("none");
+  /** The right sidebar hosts real TABS: several panels open at once, one
+   * active, the rest kept mounted-but-hidden so their state (a running
+   * terminal, review scroll position, a browser page) survives switching —
+   * choosing one never closes another. */
+  const [rightTabs, setRightTabs] = useState<RightTabKind[]>([]);
+  const [activeRightTab, setActiveRightTab] = useState<RightTabKind | null>(null);
+  /** Whether the region is visible at all; with no tabs open it shows the
+   * centered picker menu. */
+  const [rightOpen, setRightOpen] = useState(false);
+  const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+  /** Right-region fullscreen — covers the whole region (tab strip + active
+   * tab). Reset when the region closes so it can't linger stale. */
+  const [rightFullscreen, setRightFullscreen] = useState(false);
+  useEffect(() => {
+    if (!rightOpen) setRightFullscreen(false);
+  }, [rightOpen]);
+
+  const openRightTab = useCallback((kind: RightTabKind) => {
+    setRightOpen(true);
+    setPlusMenuOpen(false);
+    setRightTabs((tabs) => (tabs.includes(kind) ? tabs : [...tabs, kind]));
+    setActiveRightTab(kind);
+    if (kind === "terminal") {
+      useTerminalStore.getState().setDock("right");
+      setTerminalOpen(true);
+    }
+    if (kind === "sideTasks") {
+      useSideTaskStore.getState().openDrawer();
+    }
+  }, []);
+
+  const closeRightTab = useCallback((kind: RightTabKind) => {
+    setRightTabs((tabs) => {
+      const next = tabs.filter((tab) => tab !== kind);
+      setActiveRightTab((active) => (active === kind ? next[next.length - 1] ?? null : active));
+      return next;
+    });
+    if (kind === "terminal" && useTerminalStore.getState().dock === "right") {
+      setTerminalOpen(false);
+    }
+  }, []);
+
+  // Dock moves migrate the terminal between its two homes: re-docked to the
+  // bottom (via the panel's dock button) it leaves the tab strip; re-docked
+  // to the right (same button on the bottom panel) it must gain a sidebar
+  // tab, otherwise an open right-docked terminal would have nowhere to
+  // render at all.
+  useEffect(() => {
+    if (terminalDock === "bottom") {
+      setRightTabs((tabs) => {
+        if (!tabs.includes("terminal")) return tabs;
+        const next = tabs.filter((tab) => tab !== "terminal");
+        setActiveRightTab((active) => (active === "terminal" ? next[next.length - 1] ?? null : active));
+        return next;
+      });
+    } else if (terminalOpen) {
+      openRightTab("terminal");
+    }
+  }, [terminalDock, terminalOpen, openRightTab]);
+
+  // User-resizable width for the right sidebar region, shared by every tab
+  // and persisted across restarts — mirrors the terminal's own drag-to-resize
+  // (TerminalPanel.tsx).
+  const RIGHT_MENU_WIDTH_KEY = "little-monkey-right-menu-width";
+  const [rightMenuWidth, setRightMenuWidthState] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem(RIGHT_MENU_WIDTH_KEY));
+      return Number.isFinite(stored) && stored > 0 ? clampRightMenuWidth(stored) : 288;
+    } catch {
+      return 288;
+    }
+  });
+  const setRightMenuWidth = useCallback((value: number) => {
+    const clamped = clampRightMenuWidth(value);
+    setRightMenuWidthState(clamped);
+    try {
+      localStorage.setItem(RIGHT_MENU_WIDTH_KEY, String(clamped));
+    } catch {
+      // Best-effort persistence only.
+    }
+  }, []);
+  const onMenuResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = rightMenuWidth;
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    // Live moves only update state; localStorage is written once on release
+    // — a synchronous storage write per pointermove makes the drag stutter.
+    let latest = startWidth;
+    const move = (moveEvent: PointerEvent) => {
+      latest = clampRightMenuWidth(startWidth + (startX - moveEvent.clientX));
+      setRightMenuWidthState(latest);
+    };
+    const up = () => {
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", up);
+      target.removeEventListener("pointercancel", up);
+      setRightMenuWidth(latest);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", up);
+    target.addEventListener("pointercancel", up);
+  }, [rightMenuWidth, setRightMenuWidth]);
+  const shortcutOverrides = useShortcutStore((s) => s.overrides);
+  const shortcutLabel = useCallback(
+    (id: Parameters<typeof shortcutDisplayLabel>[0]) =>
+      shortcutDisplayLabel(id, detectShortcutPlatform(), shortcutOverrides),
+    [shortcutOverrides],
+  );
   const [debateOpen, setDebateOpen] = useState(false);
   const [dbAdminGuardrailsOpen, setDbAdminGuardrailsOpen] = useState(false);
   const [apiContractDiffLabOpen, setApiContractDiffLabOpen] = useState(false);
@@ -262,9 +416,8 @@ function App() {
   const openBackgroundTasksPanel = useCallback(() => {
     useBrowserPaneStore.getState().setOpen(false);
     setDiffPanelOpen(false);
-    useSideTaskStore.getState().openDrawer();
-    setRightPanel("sideTasks");
-  }, []);
+    openRightTab("sideTasks");
+  }, [openRightTab]);
 
   const handleManagePrompts = useCallback(() => {
     openSettingsTab("prompts");
@@ -375,28 +528,38 @@ function App() {
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
         openCommandPalette: () => openCommandPalette(),
-        toggleRightSidebar: () => setRightPanel((panel) => (panel === "none" ? "menu" : "none")),
-        openTerminal: () => setTerminalOpen((open) => !open),
+        toggleRightSidebar: () => setRightOpen((open) => !open),
+        openTerminal: () => {
+          if (useTerminalStore.getState().dock === "right") {
+            openRightTab("terminal");
+          } else {
+            setTerminalOpen((open) => !open);
+          }
+        },
         openBrowser: () => {
           setDiffPanelOpen(false);
           const browserPane = useBrowserPaneStore.getState();
           browserPane.setOpen(!browserPane.open);
         },
+        openBrowserTab: () => {
+          useBrowserPaneStore.getState().setOpen(false);
+          setDiffPanelOpen(false);
+          openRightTab("browser");
+        },
         openReview: () => {
           useBrowserPaneStore.getState().setOpen(false);
           setDiffPanelOpen(false);
-          setRightPanel((panel) => (panel === "review" ? "none" : "review"));
+          openRightTab("review");
         },
         openFiles: () => {
           useBrowserPaneStore.getState().setOpen(false);
           setDiffPanelOpen(false);
-          setRightPanel((panel) => (panel === "workspace" ? "none" : "workspace"));
+          openRightTab("files");
         },
         openSideTasksPanel: () => {
           useBrowserPaneStore.getState().setOpen(false);
           setDiffPanelOpen(false);
-          useSideTaskStore.getState().openDrawer();
-          setRightPanel("sideTasks");
+          openRightTab("sideTasks");
         },
         sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
         sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
@@ -1324,8 +1487,7 @@ setVisualEditModeOpen(false);
           }}
           onOpenTerminal={() => setTerminalOpen(true)}
           onOpenSideTasks={() => {
-            useSideTaskStore.getState().openDrawer();
-            setRightPanel("sideTasks");
+            openRightTab("sideTasks");
           }}
           onOpenDebate={() => {
             setSettingsOpen(false);
@@ -1446,20 +1608,19 @@ setVisualEditModeOpen(false);
           </IconButton>
           <IconButton
             size="sm"
-            variant={rightPanel === "sideTasks" ? "active" : "ghost"}
+            variant={rightOpen && activeRightTab === "sideTasks" ? "active" : "ghost"}
             className="relative"
             onClick={() => {
-              if (rightPanel === "sideTasks") {
-                setRightPanel("none");
+              if (rightOpen && activeRightTab === "sideTasks") {
+                closeRightTab("sideTasks");
               } else {
                 setBrowserPaneOpen(false);
                 setDiffPanelOpen(false);
-                useSideTaskStore.getState().openDrawer();
-                setRightPanel("sideTasks");
+                openRightTab("sideTasks");
               }
             }}
-            aria-label={rightPanel === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
-            title={rightPanel === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
+            aria-label={rightOpen && activeRightTab === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
+            title={rightOpen && activeRightTab === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
           >
             <ListTodo size={15} />
             {runningBackgroundTaskCount > 0 && (
@@ -1468,12 +1629,26 @@ setVisualEditModeOpen(false);
               </span>
             )}
           </IconButton>
+          {/* Fullscreen covers the whole right region (tab strip + active
+              tab) — only reachable while the region is actually open, same
+              as the reference layout. */}
+          {rightOpen && (
+            <IconButton
+              size="sm"
+              variant="ghost"
+              onClick={() => setRightFullscreen((value) => !value)}
+              aria-label={rightFullscreen ? t("App.collapseRightSidebar") : t("App.expandRightSidebar")}
+              title={rightFullscreen ? t("App.collapseRightSidebar") : t("App.expandRightSidebar")}
+            >
+              {rightFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+            </IconButton>
+          )}
           <IconButton
             size="sm"
-            variant={rightPanel !== "none" ? "active" : "ghost"}
-            onClick={() => setRightPanel((panel) => (panel === "none" ? "menu" : "none"))}
-            aria-label={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
-            title={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+            variant={rightOpen ? "active" : "ghost"}
+            onClick={() => setRightOpen((open) => !open)}
+            aria-label={rightOpen ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
+            title={rightOpen ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
           >
             <PanelRight size={15} />
           </IconButton>
@@ -1662,146 +1837,213 @@ setVisualEditModeOpen(false);
         </div>
       )}
 
-      {/* Right region: hidden by default; shows exactly one of — the
-          right-docked terminal (overrides everything), the picker menu, the
-          side-tasks drawer, or the workspace panel. Claude-Desktop-style:
-          contents swap in place, they never stack beside each other. */}
+      {/* Right region: hidden by default. A persistent in-app browser or a
+          git diff view fully override it when open; otherwise it's the
+          right sidebar — real TABS (files/review/terminal/browser/side
+          tasks): several can be open at once, one active, the rest kept
+          mounted-but-hidden so their state (a running terminal, a loaded
+          review, a browser page) survives switching — choosing one never
+          closes another. A shared, drag-resizable width animates open and
+          closed; a fullscreen toggle covers the whole region. */}
       {browserPaneOpen ? (
         <BrowserPane
           obscured={settingsOpen || commandPaletteOpen || permissionPending || approvalChainPending}
         />
       ) : diffPanelOpen ? (
         <DiffPanel onClose={() => setDiffPanelOpen(false)} />
-      ) : terminalOpen && terminalDock === "right" ? (
-        <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
-      ) : rightPanel === "sideTasks" ? (
-        <SideTaskDrawer sessionId={activeSessionId} />
-      ) : rightPanel === "review" ? (
-        <aside className="flex w-[40rem] max-w-[60vw] shrink-0 flex-col border-l border-border bg-surface">
-          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-              {t("App.rightPanelReview")}
-            </span>
-            <IconButton size="sm" onClick={() => setRightPanel("none")} aria-label={t("App.closeRightSidebar")} className="ml-auto">
-              <X size={16} />
-            </IconButton>
-          </div>
-          <ReviewPanel />
-        </aside>
-      ) : rightPanel === "menu" ? (
-        <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-surface">
-          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-              {t("App.rightPanelMenuTitle")}
-            </span>
-            <IconButton size="sm" onClick={() => setRightPanel("none")} aria-label={t("App.closeRightSidebar")} className="ml-auto">
-              <X size={16} />
-            </IconButton>
-          </div>
-          <div className="flex flex-col gap-1 p-3">
-            <button
-              type="button"
-              onClick={() => setRightPanel("workspace")}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-            >
-              <FolderTree size={16} className="shrink-0 text-faint" /> {t("App.rightPanelWorkspace")}
-            </button>
-            <button
-              type="button"
-              disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
-              onClick={() => setRightPanel("review")}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
-            >
-              <FileDiff size={16} className="shrink-0 text-faint" /> {t("App.rightPanelReview")}
-            </button>
-            <button
-              type="button"
-              disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
-              onClick={() => {
-                useTerminalStore.getState().setDock("right");
-                setTerminalOpen(true);
-                setRightPanel("none");
-              }}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
-            >
-              <SquareTerminal size={16} className="shrink-0 text-faint" /> {t("App.rightPanelTerminal")}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                useSideTaskStore.getState().openDrawer();
-                setRightPanel("sideTasks");
-              }}
-              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-            >
-              <ListTodo size={16} className="shrink-0 text-faint" /> {t("App.rightPanelSideTasks")}
-            </button>
-          </div>
-        </aside>
-      ) : rightPanel === "workspace" ? (
-      <aside
-        className={`flex shrink-0 flex-col border-l border-border bg-surface transition-[width] duration-200 ${
-          workspacePanelOpen ? "w-96" : "w-12"
-        }`}
-      >
-        <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
-          {workspacePanelOpen && (
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-              {t("App.workspacePanelTitle")}
-            </span>
+      ) : (
+        <aside
+          className={`relative flex h-full flex-col overflow-hidden border-border bg-surface ${
+            rightOpen
+              ? rightFullscreen
+                ? "fixed inset-x-0 bottom-0 top-11 z-40 w-full border"
+                : "shrink-0 border-l transition-[width] duration-200 ease-out"
+              : "w-0 shrink-0 border-l-0 transition-[width] duration-200 ease-out"
+          }`}
+          style={rightOpen && !rightFullscreen ? { width: rightMenuWidth } : undefined}
+        >
+          {rightOpen && !rightFullscreen && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              onPointerDown={onMenuResizeStart}
+              className="absolute inset-y-0 left-0 z-20 w-1.5 cursor-ew-resize bg-transparent transition-colors hover:bg-accent/40 active:bg-accent/60"
+            />
           )}
-          <IconButton
-            size="sm"
-            onClick={() => setWorkspacePanelOpen((prev) => !prev)}
-            aria-label={workspacePanelOpen ? t("App.collapseWorkspacePanel") : t("App.expandWorkspacePanel")}
-            className="ml-auto"
-          >
-            {workspacePanelOpen ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
-          </IconButton>
-        </div>
 
-        {workspacePanelOpen && (activeArtifact ? (
-          <ArtifactPane />
-        ) : (
-          <div className="flex min-h-0 flex-1 flex-col">
-            <div className="min-h-0 flex-[3] border-b border-border">
-              <FileTree key={rootsVersion} onSelectFile={handleSelectFile} />
-            </div>
-            <div className="flex min-h-0 flex-[2] flex-col">
-              <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
-                <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
-                  {t("App.diffPanelTitle")}
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => void handleRefreshDiff()}
-                  disabled={!selectedFile || diffLoading}
+          {rightTabs.length === 0 ? (
+            <div className="flex flex-1 flex-col justify-center gap-1 p-3">
+              {RIGHT_TAB_KINDS.map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  disabled={(kind === "terminal" || kind === "review") && !primaryRoot(useWorkspaceStore.getState().roots)}
+                  onClick={() => openRightTab(kind)}
+                  className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
                 >
-                  {diffLoading ? t("App.diffRefreshing") : t("App.diffRefresh")}
-                </Button>
-              </div>
-              {diffError && <p className="px-3 pt-1.5 text-xs text-danger">{diffError}</p>}
-              <div className="min-h-0 flex-1 overflow-auto p-2 [overscroll-behavior:contain]">
-                {selectedFile ? (
-                  <DiffViewer
-                    fileName={selectedFile.path}
-                    oldValue={selectedFile.original}
-                    newValue={selectedFile.current}
-                    oldTitle={t("App.diffOldTitleOpened")}
-                    newTitle={t("App.diffNewTitleCurrent")}
-                  />
-                ) : (
-                  <p className="p-3 text-sm text-faint">
-                    {t("App.diffEmptyStateHint")}
-                  </p>
+                  <RightTabIcon kind={kind} size={16} />
+                  <span className="min-w-0 flex-1 truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                  <kbd className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-faint">
+                    {shortcutLabel(RIGHT_TAB_SHORTCUT_IDS[kind])}
+                  </kbd>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <>
+              {/* Tab strip: one chip per open tab, "+" opens the rest. The
+                  chips row scrolls horizontally in its own inner container —
+                  the "+" dropdown must live OUTSIDE that scroll container,
+                  because `overflow-x-auto` also clips absolutely-positioned
+                  children to the 44px strip. */}
+              <div className="relative shrink-0 border-b border-border">
+                <div data-tauri-drag-region className="flex h-11 items-center gap-1 overflow-x-auto px-3 [scrollbar-width:thin]">
+                  {rightTabs.map((kind) => (
+                    <div
+                      key={kind}
+                      className={`group inline-flex max-w-44 shrink-0 items-center rounded-lg text-sm transition-colors ${
+                        kind === activeRightTab ? "bg-surface-2 text-foreground" : "text-muted hover:bg-surface-2 hover:text-foreground"
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setActiveRightTab(kind)}
+                        className="inline-flex min-w-0 items-center gap-1.5 py-1.5 pl-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                      >
+                        <RightTabIcon kind={kind} size={15} />
+                        <span className="truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={t("App.closeRightTab")}
+                        onClick={() => closeRightTab(kind)}
+                        className="ml-0.5 mr-1 rounded-sm p-0.5 text-faint opacity-0 hover:text-danger focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent group-hover:opacity-100"
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  ))}
+                  {RIGHT_TAB_KINDS.some((kind) => !rightTabs.includes(kind)) && (
+                    <IconButton
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setPlusMenuOpen((open) => !open)}
+                      aria-label={t("App.openRightSidebar")}
+                    >
+                      <Plus size={15} />
+                    </IconButton>
+                  )}
+                </div>
+                {plusMenuOpen && (
+                  <>
+                    <div className="fixed inset-0 z-30" onClick={() => setPlusMenuOpen(false)} />
+                    <div className="absolute left-3 top-full z-40 mt-1 w-64 rounded-xl border border-border bg-background p-1.5 shadow-xl">
+                      {RIGHT_TAB_KINDS.filter((kind) => !rightTabs.includes(kind)).map((kind) => (
+                        <button
+                          key={kind}
+                          type="button"
+                          disabled={(kind === "terminal" || kind === "review") && !primaryRoot(useWorkspaceStore.getState().roots)}
+                          onClick={() => openRightTab(kind)}
+                          className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-foreground hover:bg-surface-2 disabled:opacity-50"
+                        >
+                          <RightTabIcon kind={kind} size={15} />
+                          <span className="min-w-0 flex-1 truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                          <kbd className="shrink-0 font-mono text-[11px] text-faint">{shortcutLabel(RIGHT_TAB_SHORTCUT_IDS[kind])}</kbd>
+                        </button>
+                      ))}
+                    </div>
+                  </>
                 )}
               </div>
-            </div>
-          </div>
-        ))}
-      </aside>
-      ) : null}
+
+              <div className="relative min-h-0 flex-1">
+                {rightTabs.map((kind) => (
+                  <div key={kind} className={`absolute inset-0 ${kind === activeRightTab ? "flex flex-col" : "hidden"}`}>
+                    {kind === "review" ? (
+                      <ReviewPanel />
+                    ) : kind === "terminal" ? (
+                      <TerminalPanel
+                        chatSessionId={activeSessionId}
+                        onClose={() => closeRightTab("terminal")}
+                        embedded
+                        hideFullscreenButton
+                      />
+                    ) : kind === "browser" ? (
+                      <BrowserWorkbench
+                        taskId={activeSessionId}
+                        chatSessionId={activeSessionId}
+                        onClose={() => closeRightTab("browser")}
+                        compact
+                      />
+                    ) : kind === "sideTasks" ? (
+                      <SideTaskDrawer sessionId={activeSessionId} embedded />
+                    ) : (
+                      <div className={`flex h-full flex-col ${workspacePanelOpen ? "w-full" : "w-12"}`}>
+                        <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
+                          {workspacePanelOpen && (
+                            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
+                              {t("App.workspacePanelTitle")}
+                            </span>
+                          )}
+                          <IconButton
+                            size="sm"
+                            onClick={() => setWorkspacePanelOpen((prev) => !prev)}
+                            aria-label={workspacePanelOpen ? t("App.collapseWorkspacePanel") : t("App.expandWorkspacePanel")}
+                            className="ml-auto"
+                          >
+                            {workspacePanelOpen ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
+                          </IconButton>
+                        </div>
+
+                        {workspacePanelOpen && (activeArtifact ? (
+                          <ArtifactPane />
+                        ) : (
+                          <div className="flex min-h-0 flex-1 flex-col">
+                            <div className="min-h-0 flex-[3] border-b border-border">
+                              <FileTree key={rootsVersion} onSelectFile={handleSelectFile} />
+                            </div>
+                            <div className="flex min-h-0 flex-[2] flex-col">
+                              <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
+                                <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
+                                  {t("App.diffPanelTitle")}
+                                </span>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => void handleRefreshDiff()}
+                                  disabled={!selectedFile || diffLoading}
+                                >
+                                  {diffLoading ? t("App.diffRefreshing") : t("App.diffRefresh")}
+                                </Button>
+                              </div>
+                              {diffError && <p className="px-3 pt-1.5 text-xs text-danger">{diffError}</p>}
+                              <div className="min-h-0 flex-1 overflow-auto p-2 [overscroll-behavior:contain]">
+                                {selectedFile ? (
+                                  <DiffViewer
+                                    fileName={selectedFile.path}
+                                    oldValue={selectedFile.original}
+                                    newValue={selectedFile.current}
+                                    oldTitle={t("App.diffOldTitleOpened")}
+                                    newTitle={t("App.diffNewTitleCurrent")}
+                                  />
+                                ) : (
+                                  <p className="p-3 text-sm text-faint">
+                                    {t("App.diffEmptyStateHint")}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </aside>
+      )}
 
       {commandPaletteOpen && (
         <CommandPalette

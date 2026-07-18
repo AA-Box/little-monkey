@@ -49,9 +49,16 @@ function xtermTheme(): {
 interface TerminalPanelProps {
   chatSessionId: string;
   onClose: () => void;
+  /** Renders as a fill-the-parent tab body (the right sidebar's Terminal
+   * tab): no own dock-based width/height, no resize handle — the hosting
+   * region owns sizing and its own fullscreen toggle covers this case. */
+  embedded?: boolean;
+  /** Hides this panel's own fullscreen toggle — used together with
+   * `embedded` since the hosting region already provides one. */
+  hideFullscreenButton?: boolean;
 }
 
-export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
+export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreenButton }: TerminalPanelProps) {
   const { t } = useT();
   const roots = useWorkspaceStore((state) => state.roots);
   const sessions = useTerminalStore((state) => state.sessions);
@@ -251,16 +258,18 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
   return (
     <section
       className={`flex flex-col overflow-hidden border-border bg-background ${
-        expanded
-          ? "fixed inset-0 z-40 border"
-          : dock === "bottom"
-            ? "relative min-h-44 shrink-0 rounded-t-xl border shadow-sm"
-            : "relative h-full min-w-56 shrink-0 border-l"
+        embedded
+          ? "h-full w-full flex-1"
+          : expanded
+            ? "fixed inset-0 z-40 border"
+            : dock === "bottom"
+              ? "relative min-h-44 shrink-0 rounded-t-xl border shadow-sm"
+              : "relative h-full min-w-56 shrink-0 border-l"
       }`}
-      style={expanded ? undefined : dock === "bottom" ? { height: panelSize.bottom } : { width: panelSize.right }}
+      style={embedded || expanded ? undefined : dock === "bottom" ? { height: panelSize.bottom } : { width: panelSize.right }}
       aria-label={t("TerminalPanel.title")}
     >
-      {!expanded && (
+      {!embedded && !expanded && (
         <div
           role="separator"
           aria-orientation={dock === "bottom" ? "horizontal" : "vertical"}
@@ -331,15 +340,17 @@ export function TerminalPanel({ chatSessionId, onClose }: TerminalPanelProps) {
         >
           {dock === "bottom" ? <PanelRight size={14} /> : <PanelBottom size={14} />}
         </IconButton>
-        <IconButton
-          size="sm"
-          variant="ghost"
-          onClick={() => setExpanded((value) => !value)}
-          aria-label={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
-          title={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
-        >
-          {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-        </IconButton>
+        {!hideFullscreenButton && (
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={() => setExpanded((value) => !value)}
+            aria-label={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
+            title={t(expanded ? "TerminalPanel.collapsePanel" : "TerminalPanel.expandPanel")}
+          >
+            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </IconButton>
+        )}
         <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("TerminalPanel.closePanel")}>
           <X size={14} />
         </IconButton>
