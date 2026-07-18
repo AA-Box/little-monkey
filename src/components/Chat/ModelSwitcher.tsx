@@ -1,15 +1,29 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown } from "lucide-react";
+import { Check, ChevronDown, TriangleAlert } from "lucide-react";
 
-import { useModelStore } from "../../store/modelStore";
+import { useModelStore, type CloudModelRetirementWarning } from "../../store/modelStore";
 import type { ModelInfo, OllamaModelInfo, ProviderModelInfo } from "../../store/modelStore";
 import { useSettingsStore, DEFAULT_PROVIDER_MODEL_FILTER } from "../../store/settingsStore";
+import { cloudModelRetirementWarning } from "../../lib/modelRetirement";
 import { useT } from "../../lib/i18n";
 
 /** Narrows `models` to a provider's curated allowlist — unfiltered while `showAll` is on, or until the user has actually checked something (an empty selection means "nothing curated yet", not "hide everything"). */
 function visibleProviderModels(models: ProviderModelInfo[], filter: { showAll: boolean; selectedModelIds: string[] }) {
   if (filter.showAll || filter.selectedModelIds.length === 0) return models;
   return models.filter((model) => filter.selectedModelIds.includes(model.id));
+}
+
+/** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14): a plain-language tooltip for a flagged cloud model, favoring a concrete "switch to this" suggestion when one is available. */
+function retirementTooltip(
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  warning: CloudModelRetirementWarning,
+): string {
+  return warning.suggested_replacement_model_id
+    ? t("ModelSwitcher.retiredTooltipWithReplacement", {
+        reason: warning.reason,
+        replacement: warning.suggested_replacement_model_id,
+      })
+    : t("ModelSwitcher.retiredTooltipNoReplacement", { reason: warning.reason, note: warning.replacement_note });
 }
 
 /**
@@ -28,6 +42,11 @@ export function ModelSwitcher() {
   const useOllamaModel = useModelStore((s) => s.useOllamaModel);
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
+  // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+  // 14): not read directly below — subscribing is what makes this dropdown
+  // re-render once the async retirement check resolves, since
+  // `cloudModelRetirementWarning` otherwise reads a point-in-time snapshot.
+  useModelStore((s) => s.providerModelRetirements);
   const activeProviderId = useModelStore((s) => s.activeProviderId);
   const activeProviderModel = useModelStore((s) => s.activeProviderModel);
   const useProviderModel = useModelStore((s) => s.useProviderModel);
@@ -62,6 +81,15 @@ export function ModelSwitcher() {
     label = activeProviderModel;
   }
 
+  // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+  // 14): surfaced right on the always-visible switcher pill, so a retired
+  // active selection is visible before a run starts — not just while
+  // picking a model from the dropdown.
+  const activeRetirement =
+    activeProvider === "provider" && activeProviderId && activeProviderModel
+      ? cloudModelRetirementWarning(activeProviderId, activeProviderModel)
+      : null;
+
   function handleSelectLocal(model: ModelInfo) {
     start(model).catch((error) => {
       console.error("Failed to start local model", error);
@@ -89,6 +117,11 @@ export function ModelSwitcher() {
         className="flex w-full cursor-pointer items-center gap-1 text-xs font-mono text-muted hover:text-foreground"
       >
         {label ? <span className="truncate">{label}</span> : <span className="truncate text-faint">{t("ModelSwitcher.noModel")}</span>}
+        {activeRetirement && (
+          <span className="shrink-0" title={retirementTooltip(t, activeRetirement)}>
+            <TriangleAlert size={12} className="text-warning" aria-label={t("ModelSwitcher.retiredBadge")} />
+          </span>
+        )}
         <ChevronDown size={12} className="shrink-0" />
       </button>
 
@@ -132,15 +165,23 @@ export function ModelSwitcher() {
                     models.map((model) => {
                       const isActive =
                         activeProvider === "provider" && activeProviderId === provider.id && activeProviderModel === model.id;
+                      const retirement = cloudModelRetirementWarning(provider.id, model.id);
                       return (
                         <button
                           key={`${provider.id}/${model.id}`}
                           type="button"
                           onClick={() => handleSelectProvider(provider.id, model.id)}
-                          className="flex w-full cursor-pointer items-center justify-between px-3 py-1.5 text-left text-sm hover:bg-surface-2"
+                          className="flex w-full cursor-pointer items-center justify-between gap-1.5 px-3 py-1.5 text-left text-sm hover:bg-surface-2"
                         >
                           <span className="truncate">{model.id}</span>
-                          {isActive && <Check size={14} className="shrink-0 text-accent" />}
+                          <span className="flex shrink-0 items-center gap-1.5">
+                            {retirement && (
+                              <span title={retirementTooltip(t, retirement)}>
+                                <TriangleAlert size={13} className="text-warning" aria-label={t("ModelSwitcher.retiredBadge")} />
+                              </span>
+                            )}
+                            {isActive && <Check size={14} className="text-accent" />}
+                          </span>
                         </button>
                       );
                     })

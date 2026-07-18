@@ -541,6 +541,22 @@ pub async fn providers_list_models(
     fetch_models(&base_url, &id, &api_key).await
 }
 
+/// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+/// flags any of `model_ids` (typically the provider's own already-fetched
+/// model list — see `providers_list_models`/`ProviderCard.tsx`) that this
+/// app's local, conservative retired-model registry recognizes, each with a
+/// migration hint. See `model_retirement.rs`'s module doc for the honest
+/// maintenance story (a versioned local list, not a live-verified source —
+/// there is no upstream API this app can call to ask "is this retired?").
+/// Pure and read-only: never touches the keychain or network.
+#[tauri::command]
+pub fn providers_check_model_retirements(
+    provider_id: String,
+    model_ids: Vec<String>,
+) -> Vec<crate::model_retirement::CloudModelRetirementWarning> {
+    crate::model_retirement::check_cloud_models_batch(&provider_id, &model_ids)
+}
+
 /// Buffers raw bytes across chunk boundaries and only ever hands out valid
 /// UTF-8 text, so a multi-byte character split across two network chunks
 /// (common with emoji/non-ASCII model output) never breaks `String`

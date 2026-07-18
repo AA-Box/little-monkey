@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import { Button, ModelListRow, StatusPill } from "../ui";
 import { useModelStore, type ProviderConfig, type ProviderModelInfo } from "../../store/modelStore";
 import { isVisionCapableProviderModel } from "../../lib/visionModels";
+import { cloudModelRetirementWarning } from "../../lib/modelRetirement";
 import { useSettingsStore } from "../../store/settingsStore";
 import { useT } from "../../lib/i18n";
 
@@ -44,6 +45,11 @@ export function ProviderCard({ provider }: ProviderCardProps) {
   // when a vision override changes in the Automation settings tab, since
   // `isVisionCapableProviderModel` otherwise reads a point-in-time snapshot.
   useSettingsStore((s) => s.visionOverrides);
+  // Same reasoning, for Model Retirement and Compatibility Warnings
+  // (ROADMAP.md Phase 8, item 14): `cloudModelRetirementWarning` reads a
+  // point-in-time snapshot too, and the retirement check resolves
+  // asynchronously slightly after `providerModels` itself updates.
+  useModelStore((s) => s.providerModelRetirements[provider.id]);
   const { t } = useT();
 
   const [apiKey, setApiKey] = useState("");
@@ -167,23 +173,45 @@ export function ProviderCard({ provider }: ProviderCardProps) {
             />
           )}
           <div className="flex max-h-48 flex-col gap-1.5 overflow-y-auto">
-            {filteredModels.map((model) => (
-              <ModelListRow
-                key={model.id}
-                title={model.id}
-                badge={
-                  isVisionCapableProviderModel(provider.id, model.id) && (
-                    <StatusPill tone="neutral">{t("ProviderCard.vision")}</StatusPill>
-                  )
-                }
-                isActive={
-                  activeProvider === "provider" &&
-                  activeProviderId === provider.id &&
-                  activeProviderModel === model.id
-                }
-                onUse={() => useProviderModel(provider.id, model.id)}
-              />
-            ))}
+            {filteredModels.map((model) => {
+              const retirement = cloudModelRetirementWarning(provider.id, model.id);
+              return (
+                <ModelListRow
+                  key={model.id}
+                  title={model.id}
+                  badge={
+                    <>
+                      {isVisionCapableProviderModel(provider.id, model.id) && (
+                        <StatusPill tone="neutral">{t("ProviderCard.vision")}</StatusPill>
+                      )}
+                      {retirement && (
+                        <span
+                          title={
+                            retirement.suggested_replacement_model_id
+                              ? t("ProviderCard.retiredTooltipWithReplacement", {
+                                  reason: retirement.reason,
+                                  replacement: retirement.suggested_replacement_model_id,
+                                })
+                              : t("ProviderCard.retiredTooltipNoReplacement", {
+                                  reason: retirement.reason,
+                                  note: retirement.replacement_note,
+                                })
+                          }
+                        >
+                          <StatusPill tone="warning">{t("ProviderCard.retired")}</StatusPill>
+                        </span>
+                      )}
+                    </>
+                  }
+                  isActive={
+                    activeProvider === "provider" &&
+                    activeProviderId === provider.id &&
+                    activeProviderModel === model.id
+                  }
+                  onUse={() => useProviderModel(provider.id, model.id)}
+                />
+              );
+            })}
             {filteredModels.length === 0 && (
               <p className="px-1 text-xs text-faint">{t("ProviderCard.noModelsMatch", { filter })}</p>
             )}

@@ -3,6 +3,7 @@ use little_monkey_lib::compatibility_hub::{
     LanStateProtector, PairingRequest, RateLimitPolicy, SecurityAuditKind, TlsPolicy,
 };
 use little_monkey_lib::m3_runtime_hub::*;
+use little_monkey_lib::model_retirement::STALE_LOCAL_MODEL_THRESHOLD_MS;
 use little_monkey_lib::runtime_adapter::{
     AdvancedSettingCapability, EndpointOrigin, EndpointPolicy, HardwareSnapshot, ModelCapabilities,
     PlatformCapabilities, ResidencyOwnership, RunningModel, RuntimeDescriptor, RuntimeInventory,
@@ -53,6 +54,28 @@ impl FixedClock {
 impl M3Clock for FixedClock {
     fn now_ms(&self) -> M3HubResult<u64> {
         Ok(self.0.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+/// A clock whose value is set explicitly by the test rather than
+/// auto-incrementing like [`FixedClock`] — needed to simulate real time
+/// passing (e.g. "this model was installed, then 200 days went by") without
+/// looping `now_ms()` billions of times.
+struct ControllableClock(AtomicU64);
+
+impl ControllableClock {
+    fn new(start: u64) -> Self {
+        Self(AtomicU64::new(start))
+    }
+
+    fn set(&self, value: u64) {
+        self.0.store(value, Ordering::SeqCst);
+    }
+}
+
+impl M3Clock for ControllableClock {
+    fn now_ms(&self) -> M3HubResult<u64> {
+        Ok(self.0.load(Ordering::SeqCst))
     }
 }
 
@@ -2175,4 +2198,121 @@ async fn transport_corruption_is_caught_by_the_final_digest_check_and_a_retry_re
         .artifact_path
         .clone();
     assert_eq!(fs::read(&active_path).unwrap(), bytes);
+}
+
+/// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+/// `M3RuntimeHub::model_staleness_check` reuses `search_catalog` (the same
+/// mechanism `RuntimeHubModels.tsx`'s "Find updates" button already drives)
+/// to detect a newer catalog revision, then only flags it once the installed
+/// version has also gone unrefreshed for a long time. This exercises the
+/// full pipeline — not just the pure comparison in `model_retirement.rs`'s
+/// own unit tests — with a controllable clock standing in for real time
+/// passing between install and check.
+#[tokio::test]
+async fn model_staleness_check_flags_a_long_unrefreshed_model_once_a_newer_revision_exists() {
+    let directory = TestDirectory::new("staleness-flagged");
+    let bytes_rev1 = payload(2_048, 21);
+    let mut model_rev1 = catalog_model(&bytes_rev1, "rev-1");
+    // `StaticCatalog::search` (this fixture) matches on `display_name`, and
+    // `model_staleness_check` queries by `model_id` — matching production's
+    // own "Find updates" query shape (`searchCatalog(model.modelId)` in
+    // `RuntimeHubModels.tsx`), which a real catalog source is expected to
+    // resolve. Give both revisions a display name containing the model id so
+    // this test fixture resolves the same query shape.
+    model_rev1.display_name = "local-model rev1".to_string();
+    let clock = Arc::new(ControllableClock::new(10_000));
+    let hub = M3RuntimeHub::new(
+        &directory.0,
+        test_config(),
+        M3RuntimeHubDependencies {
+            clock: clock.clone() as Arc<dyn M3Clock>,
+            hardware: Arc::new(FixedHardware(hardware())),
+            download: Arc::new(MutableDownload::new(bytes_rev1.clone(), "etag-rev1")),
+            catalogs: vec![Arc::new(StaticCatalog {
+                source_id: "test-catalog".to_string(),
+                entries: vec![model_rev1.clone()],
+            })],
+            runtimes: Vec::new(),
+            runtime_reconciler: None,
+            lan_factory: None,
+        },
+    )
+    .expect("M3 hub");
+    let context = M3OperationContext::new(10_000);
+
+    let matches = hub
+        .search_catalog("local-model", 10, &context)
+        .await
+        .expect("search catalog for rev-1");
+    assert_eq!(matches.len(), 1);
+    let installed = hub
+        .download_model(
+            &M3DownloadRequest {
+                accepted_license_sha256: matches[0].model.license.declaration_sha256(),
+                model: matches[0].model.clone(),
+            },
+            &context,
+        )
+        .await
+        .expect("install rev-1");
+    let asset_id = installed.asset_id.clone();
+    let installed_at_ms = installed
+        .versions
+        .iter()
+        .find(|version| version.active)
+        .expect("active version")
+        .installed_at_ms;
+    assert_eq!(installed_at_ms, 10_000, "controllable clock is exact, not auto-incrementing");
+
+    // Nothing to migrate to yet: still on the only revision the catalog
+    // knows about, however old.
+    clock.set(10_000 + STALE_LOCAL_MODEL_THRESHOLD_MS + 1);
+    assert_eq!(
+        hub.model_staleness_check(&asset_id, &context).await.expect("staleness check"),
+        None,
+        "no newer catalog revision exists yet — nothing to flag"
+    );
+
+    // The catalog moves on to a new revision of the same model/variant/source.
+    let bytes_rev2 = payload(2_048, 22);
+    let mut model_rev2 = catalog_model(&bytes_rev2, "rev-2");
+    model_rev2.display_name = "local-model rev2".to_string();
+    hub.replace_catalog_sources(vec![Arc::new(StaticCatalog {
+        source_id: "test-catalog".to_string(),
+        entries: vec![model_rev2],
+    })])
+    .expect("swap in a newer catalog revision");
+
+    // Freshly installed relative to the new clock value — not stale yet even
+    // though a newer revision now exists.
+    clock.set(installed_at_ms + STALE_LOCAL_MODEL_THRESHOLD_MS - 1);
+    assert_eq!(
+        hub.model_staleness_check(&asset_id, &context).await.expect("staleness check"),
+        None,
+        "a newer revision exists, but the install isn't old enough yet"
+    );
+
+    // Enough time has passed *and* a newer revision exists — now it's flagged.
+    clock.set(installed_at_ms + STALE_LOCAL_MODEL_THRESHOLD_MS + 1);
+    let warning = hub
+        .model_staleness_check(&asset_id, &context)
+        .await
+        .expect("staleness check")
+        .expect("should be flagged as stale");
+    assert_eq!(warning.asset_id, asset_id);
+    assert_eq!(warning.installed_revision, "rev-1");
+    assert_eq!(warning.latest_revision, "rev-2");
+    assert_eq!(warning.suggested_replacement_display_name, "local-model rev2");
+    assert!(warning.age_ms >= STALE_LOCAL_MODEL_THRESHOLD_MS);
+}
+
+#[tokio::test]
+async fn model_staleness_check_rejects_an_unknown_asset_id() {
+    let directory = TestDirectory::new("staleness-unknown-asset");
+    let hub = make_hub(&directory.0, Arc::new(MutableDownload::new(Vec::new(), "etag")), Vec::new(), Vec::new(), None, None);
+    let context = M3OperationContext::new(10_000);
+    assert!(matches!(
+        hub.model_staleness_check("does-not-exist", &context).await,
+        Err(M3HubError::NotFound(_))
+    ));
 }

@@ -26,6 +26,7 @@ import {
   type M3HardwareCompatibilityReport,
   type M3HttpServerStatus,
   type M3LoadModelRequest,
+  type M3LocalModelStalenessWarning,
   type M3RuntimeCapability,
   type M3RuntimeMetricsView,
   type M3RuntimeStatusView,
@@ -131,6 +132,10 @@ interface RuntimeHubStoreState {
    * `TemplateFamily::detect`), not something the frontend re-implements. */
   chatTemplateLabReports: Record<string, ChatTemplateLabReport>;
   offloadPlans: Record<string, OffloadPlan>;
+  /** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+   * 14): keyed by assetId. `null` means "checked, currently up to date";
+   * absent means "not checked yet". */
+  modelStalenessWarnings: Record<string, M3LocalModelStalenessWarning | null>;
   traces: RuntimeTraceRecord[];
   supportBundle: SupportBundle | null;
   /** Keyed by runtimeId: the Sampler/Batching/Speculative Decoding gating
@@ -166,6 +171,7 @@ interface RuntimeHubStoreState {
   resolveSettingCapabilities: (runtimeId: string, assetId: string | null) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
+  checkModelStaleness: (assetId: string) => Promise<void>;
   resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
   classifyContextFailure: (input: ContextFailureInput) => Promise<ContextFailureClassification | null>;
   loadModel: (request: M3LoadModelRequest) => Promise<void>;
@@ -364,6 +370,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     quantizationReports: [],
     chatTemplateLabReports: {},
     offloadPlans: {},
+    modelStalenessWarnings: {},
     traces: [],
     supportBundle: null,
     settingCapabilities: {},
@@ -675,6 +682,25 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         set((state) => ({ offloadPlans: omitKey(state.offloadPlans, runtimeId) }));
         fail(key, error);
         throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    checkModelStaleness: async (assetId) => {
+      // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8,
+      // item 14): diagnostic, additive information like the Hardware
+      // Compatibility Matrix report above — a staleness-check hiccup must
+      // never block the "Load model" flow itself, so failures are captured
+      // for display but never rethrown.
+      const key = `model-staleness:${assetId}`;
+      begin(key);
+      try {
+        const operationId = createM3OperationId("model-staleness-check");
+        const warning = await runtimeHubClient.modelStalenessCheck({ operationId, timeoutMs: 30_000, assetId });
+        set((state) => ({ modelStalenessWarnings: { ...state.modelStalenessWarnings, [assetId]: warning } }));
+      } catch (error) {
+        fail(key, error);
       } finally {
         finish(key);
       }
