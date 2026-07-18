@@ -182,6 +182,16 @@ pub struct CanonicalToolDefinition {
     pub strict: bool,
 }
 
+/// Returns whether `name` matches a tool the request actually offered for
+/// this turn. Local-runtime and remote-model output parsers must call this
+/// before treating a materialized tool call as valid: a parsing bug, a
+/// confused model, or an adversarial response can otherwise name a tool that
+/// was never advertised, and a caller that trusts the name blindly would
+/// execute something it never agreed to expose.
+pub fn request_offers_tool(request: &CanonicalInferenceRequest, name: &str) -> bool {
+    request.tools.iter().any(|tool| tool.name == name)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CanonicalInferenceRequest {
@@ -4491,5 +4501,168 @@ mod tests {
                 | Err(CompatibilityError::Json(_))
                 | Err(CompatibilityError::CorruptState(_))
         ));
+    }
+
+    // -- Phase 8 item 10: tool-call and structured-output parser hardening --
+    //
+    // `request_offers_tool` is the shared guard every response-construction
+    // site (m3_production.rs, m3_runtime_hub.rs) calls before turning a
+    // model's tool call into an executable `CanonicalContent::ToolUse`. It
+    // must say yes only for names the request actually advertised.
+
+    fn tool_request(tools: &[&str]) -> CanonicalInferenceRequest {
+        CanonicalInferenceRequest {
+            schema_version: COMPATIBILITY_SCHEMA_VERSION,
+            protocol: CompatibilityProtocol::OpenAiChatCompletions,
+            request_id: "request-tools".to_string(),
+            model: "local-model".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                content: vec![CanonicalContent::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
+            tools: tools
+                .iter()
+                .map(|name| CanonicalToolDefinition {
+                    name: name.to_string(),
+                    description: "test tool".to_string(),
+                    input_schema: json!({"type":"object","properties":{}}),
+                    strict: false,
+                })
+                .collect(),
+            max_output_tokens: 32,
+            temperature: None,
+            stream: false,
+            response_schema: None,
+            metadata: Value::Null,
+        }
+    }
+
+    #[test]
+    fn request_offers_tool_matches_only_advertised_names() {
+        let request = tool_request(&["weather", "search"]);
+        assert!(request_offers_tool(&request, "weather"));
+        assert!(request_offers_tool(&request, "search"));
+        assert!(!request_offers_tool(&request, "shell_exec"));
+        assert!(!request_offers_tool(&request, ""));
+        assert!(!request_offers_tool(&request, "Weather"));
+
+        let no_tools = tool_request(&[]);
+        assert!(!request_offers_tool(&no_tools, "weather"));
+    }
+
+    /// Regression fixtures per malformed-input family: syntactically-broken
+    /// JSON bodies (the "almost valid JSON" case: trailing commas, single
+    /// quotes, unescaped control characters, and a body truncated mid-token
+    /// as a dropped connection would leave it) must all fail the same way —
+    /// a clean `CompatibilityError::Json`, never a panic and never a
+    /// partially-built request.
+    #[test]
+    fn malformed_json_mode_request_bodies_fail_cleanly_not_silently() {
+        struct Fixture {
+            name: &'static str,
+            body: &'static [u8],
+        }
+        let fixtures = [
+            Fixture {
+                name: "trailing_comma",
+                body: br#"{"model":"local-model","messages":[{"role":"user","content":"hi"}],}"#,
+            },
+            Fixture {
+                name: "single_quotes",
+                body: br#"{'model':'local-model','messages':[{'role':'user','content':'hi'}]}"#,
+            },
+            Fixture {
+                name: "unescaped_control_character",
+                body: b"{\"model\":\"local-model\",\"messages\":[{\"role\":\"user\",\"content\":\"broken\ncontrol\"}]}",
+            },
+            Fixture {
+                name: "truncated_mid_string",
+                body: br#"{"model":"local-model","messages":[{"role":"user","content":"h"#,
+            },
+            Fixture {
+                name: "truncated_mid_token",
+                body: br#"{"model":"local-model","messages":[{"role":"user","content":"hi"}],"stream":tr"#,
+            },
+        ];
+        for fixture in fixtures {
+            let result = translate_request(
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "request-adversarial",
+                fixture.body,
+            );
+            assert!(
+                matches!(result, Err(CompatibilityError::Json(_))),
+                "fixture {:?} should fail as a clean JSON error, got {result:?}",
+                fixture.name
+            );
+        }
+    }
+
+    /// Schema outputs that parse as JSON but violate the shape this app
+    /// actually advertises (missing required field, wrong top-level type,
+    /// duplicate tool names) must be rejected with a structured
+    /// `InvalidRequest`/`Unsupported` error rather than silently accepted.
+    #[test]
+    fn structured_output_schema_violations_are_rejected_with_structured_errors() {
+        struct Fixture {
+            name: &'static str,
+            body: Value,
+        }
+        let fixtures = [
+            Fixture {
+                name: "json_schema_missing_schema_field",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{"name":"answer"}}
+                }),
+            },
+            Fixture {
+                name: "json_schema_top_level_not_object",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"array"}}}
+                }),
+            },
+            Fixture {
+                name: "duplicate_tool_names",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "tools":[
+                        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+                        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}
+                    ]
+                }),
+            },
+            Fixture {
+                name: "tool_call_arguments_not_an_object",
+                body: json!({
+                    "model":"local-model",
+                    "messages":[
+                        {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"weather","arguments":"42"}}]}
+                    ]
+                }),
+            },
+        ];
+        for fixture in fixtures {
+            let result = translate_request(
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "request-schema-violation",
+                &serde_json::to_vec(&fixture.body).expect("fixture body"),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CompatibilityError::InvalidRequest { .. })
+                        | Err(CompatibilityError::Unsupported { .. })
+                ),
+                "fixture {:?} should fail with a structured error, got {result:?}",
+                fixture.name
+            );
+        }
     }
 }

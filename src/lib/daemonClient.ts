@@ -77,6 +77,7 @@ const REMOTE_ACTIONS = new Set([
   "approve",
   "cancel",
   "kill",
+  "control-desktop",
 ]);
 
 export const daemonStatus = () => invoke<DaemonStatus>("daemon_desktop_status");

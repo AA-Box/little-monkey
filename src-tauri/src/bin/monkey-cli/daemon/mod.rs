@@ -97,6 +97,11 @@ pub enum DaemonCmd {
     /// Engage, release, or inspect the durable global kill switch.
     #[command(subcommand)]
     KillSwitch(KillSwitchCmd),
+    /// Local-only emergency controls for remote desktop-control sessions.
+    /// No network or pairing needed — the escape hatch for when you are
+    /// physically at the machine and the remote link is untrustworthy.
+    #[command(subcommand)]
+    DesktopControl(DesktopControlCmd),
     /// Configure or deliver persistent cron/filesystem/signed/GitHub triggers.
     #[command(subcommand)]
     Trigger(TriggerCmd),
@@ -168,6 +173,14 @@ pub enum KillSwitchCmd {
     Engage,
     Release,
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DesktopControlCmd {
+    /// Immediately force-stop every active remote desktop-control session on
+    /// the local daemon. Talks to the resident process through its own state
+    /// db — no network, no pairing, no signed request.
+    EmergencyStop,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -364,6 +377,7 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             decision,
         } => approve(run_id, request_id, (*decision).into()),
         DaemonCmd::KillSwitch(action) => kill_switch(action),
+        DaemonCmd::DesktopControl(action) => desktop_control_command(action),
         DaemonCmd::Trigger(action) => trigger_command(action),
         DaemonCmd::Remote(action) => remote::run(action).await,
         DaemonCmd::Serve => serve(cli).await,
@@ -1072,6 +1086,26 @@ fn kill_switch(action: &KillSwitchCmd) -> Result<(), String> {
     Ok(())
 }
 
+fn desktop_control_command(action: &DesktopControlCmd) -> Result<(), String> {
+    let paths = DaemonPaths::resolve()?;
+    let mut store = DaemonStore::open(&paths)?;
+    match action {
+        DesktopControlCmd::EmergencyStop => {
+            // Set the durable flag the resident serve loop polls; it force-
+            // stops every live desktop-control session on its next tick via
+            // `DesktopControlRuntime::enforce`. Setting it while no daemon is
+            // running is harmless — there are no live sessions to stop, and the
+            // flag is cleared when the service next starts.
+            store.set_meta("desktop_control_stop_requested", "1")?;
+            println!(
+                "Emergency stop requested; the resident daemon will force-stop every active \
+                 remote desktop-control session."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
     let paths = DaemonPaths::resolve()?;
     DaemonConfig::load(&paths)?;
@@ -1436,6 +1470,9 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     let _lock = DaemonLock::acquire(&paths.lock)?;
     let mut store = DaemonStore::open(&paths)?;
     store.set_meta("stop_requested", "0")?;
+    // A stale escape-hatch flag from a prior run must not instantly kill the
+    // first session of this run.
+    store.set_meta("desktop_control_stop_requested", "0")?;
     recover_preparing(&paths, &mut store)?;
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     reconcile_reserved_deliveries(&mut store, &mut shared)?;
@@ -1451,7 +1488,11 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         owner_id,
     );
     engine.recover()?;
-    remote::spawn_if_configured(paths.clone()).await?;
+    // One machine-wide desktop-control runtime, shared with the remote API so
+    // the serve loop can enforce revoke / kill-switch / escape-hatch stops on
+    // the very same live sessions the API creates.
+    let desktop_control = remote::DesktopControlRuntime::production(&paths);
+    remote::spawn_if_configured(paths.clone(), desktop_control.clone()).await?;
     spawn_knowledge_refresh_scheduler()?;
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
@@ -1475,6 +1516,21 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
             eprintln!("Persistent trigger delivery paused: {error}");
         }
         engine.tick()?;
+        // Enforce cross-process desktop-control stops: an engaged kill switch,
+        // a local `desktop-control emergency-stop` escape hatch, or a revoked
+        // device with a still-live session. Runs every tick; cheap when idle.
+        let kill_switch_engaged = engine.store.kill_switch().unwrap_or(false);
+        let escape_hatch = engine
+            .store
+            .get_meta("desktop_control_stop_requested")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1");
+        desktop_control.enforce(kill_switch_engaged, escape_hatch);
+        if escape_hatch {
+            let _ = engine.store.set_meta("desktop_control_stop_requested", "0");
+        }
         if engine.store.get_meta("stop_requested")?.as_deref() == Some("1") {
             engine.store.request_cancel_all(now)?;
             engine.tick()?;

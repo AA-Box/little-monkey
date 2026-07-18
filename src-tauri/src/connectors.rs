@@ -236,7 +236,11 @@ pub(crate) fn origin_of(url: &Url) -> Result<String, String> {
 /// this hang or exhaust memory. `allowed_origin` is pinned by the caller —
 /// Slack/Notion pass their own fixed hostname; Jira/S3 pass the origin
 /// derived from whatever site URL/endpoint the user just typed (see the
-/// module doc).
+/// module doc). `json_body`, when set, is sent as a JSON-serialized request
+/// body (`reqwest`'s `.json()`, which also sets `Content-Type`) — added for
+/// Inbox Triage's write actions (`triage.rs`: Slack `chat.postMessage`, a
+/// Jira issue comment), which need to POST a body; every verification call
+/// site above still passes `None`.
 pub(crate) async fn verified_call(
     method: reqwest::Method,
     url: &Url,
@@ -244,6 +248,7 @@ pub(crate) async fn verified_call(
     allow_loopback: bool,
     headers: &[(&'static str, String)],
     basic_auth: Option<(&str, &str)>,
+    json_body: Option<&Value>,
 ) -> Result<Vec<u8>, String> {
     let policy =
         crate::knowledge_pipeline::UrlSourcePolicy::new([allowed_origin], allow_loopback, false)
@@ -274,6 +279,9 @@ pub(crate) async fn verified_call(
     }
     if let Some((username, password)) = basic_auth {
         request = request.basic_auth(username, Some(password));
+    }
+    if let Some(body) = json_body {
+        request = request.json(body);
     }
 
     let response = request
@@ -315,6 +323,7 @@ async fn verify_slack(token: &str) -> Result<String, String> {
         false,
         &[("authorization", format!("Bearer {token}"))],
         None,
+        None,
     )
     .await?;
     let json: Value = serde_json::from_slice(&body)
@@ -343,6 +352,7 @@ async fn verify_notion(token: &str) -> Result<String, String> {
             ("authorization", format!("Bearer {token}")),
             ("notion-version", "2022-06-28".to_string()),
         ],
+        None,
         None,
     )
     .await?;
@@ -375,6 +385,7 @@ async fn verify_jira(site_url: &str, email: &str, token: &str) -> Result<String,
         false,
         &[("accept", "application/json".to_string())],
         Some((email, token)),
+        None,
     )
     .await?;
     let json: Value = serde_json::from_slice(&body)
@@ -596,6 +607,7 @@ async fn verify_s3(
             .iter()
             .map(|(key, value)| (*key, value.clone()))
             .collect::<Vec<_>>(),
+        None,
         None,
     )
     .await?;
@@ -1586,7 +1598,7 @@ mod tests {
         let origin = format!("http://{addr}");
         let url = Url::parse(&format!("http://{addr}/v1/users/me")).unwrap();
 
-        let body = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None)
+        let body = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None)
             .await
             .unwrap();
         assert_eq!(body, b"{\"ok\":true}");
@@ -1604,6 +1616,7 @@ mod tests {
             true,
             &[],
             None,
+            None,
         )
         .await;
         match result {
@@ -1618,7 +1631,7 @@ mod tests {
         let origin = format!("http://{addr}");
         let url = Url::parse(&format!("http://{addr}/")).unwrap();
 
-        let result = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None).await;
+        let result = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None).await;
         match result {
             Ok(_) => panic!("expected the redirect to be refused"),
             Err(message) => assert!(
@@ -1652,7 +1665,7 @@ mod tests {
         let origin = format!("http://{addr}");
         let url = Url::parse(&format!("http://{addr}/")).unwrap();
 
-        let result = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None).await;
+        let result = verified_call(reqwest::Method::GET, &url, &origin, true, &[], None, None).await;
         match result {
             Ok(_) => panic!("expected the oversized response to be rejected"),
             Err(message) => assert!(message.contains("size limit"), "unexpected error: {message}"),
@@ -1668,6 +1681,7 @@ mod tests {
             "http://127.0.0.1:9",
             false,
             &[],
+            None,
             None,
         )
         .await;

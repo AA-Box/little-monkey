@@ -5,11 +5,17 @@
 //! `sessions.rs`/`memory.rs`). Each server is either a `Stdio` child process
 //! (spawned via `rmcp`'s `TokioChildProcess`) or an `Http` remote endpoint
 //! (via `rmcp`'s streamable-HTTP client transport, over `reqwest`). An HTTP
-//! server's optional bearer token never lives in `mcp_servers.json` — it's
-//! saved to the OS keychain via `mcp_set_http_token`/`mcp_remove_http_token`,
-//! same `keyring::Entry::new(KEYCHAIN_SERVICE, ...)` convention as
-//! `providers.rs`, and attached as an `Authorization: Bearer <token>` header
-//! (via `StreamableHttpClientTransportConfig::auth_header`) when connecting.
+//! server's bearer token comes from one of two places, never from
+//! `mcp_servers.json` itself: either a manually pasted static token saved to
+//! the OS keychain via `mcp_set_http_token`/`mcp_remove_http_token` (same
+//! `keyring::Entry::new(KEYCHAIN_SERVICE, ...)` convention as
+//! `providers.rs`), or a generic MCP-spec OAuth 2.0 flow run via
+//! `mcp_oauth.rs`'s `mcp_oauth_connect` (RFC 8414 discovery + RFC 7591
+//! dynamic client registration + PKCE, built on `rmcp`'s
+//! `transport::auth` module) — see [`connect_impl`]'s `Http` branch for how
+//! the two are prioritized. Either way, the token is attached as an
+//! `Authorization: Bearer <token>` header (via
+//! `StreamableHttpClientTransportConfig::auth_header`) when connecting.
 //!
 //! Runtime connections live in `AppState::mcp`, a `tokio::sync::Mutex` (not
 //! `std::sync::Mutex`, unlike every other map in `AppState`) because
@@ -155,7 +161,7 @@ pub struct McpConfigFile {
 /// Deliberately allows `_` (unlike `checkpoints::validate_id`, which only
 /// ever sees its own generated UUIDs) since server ids are user-chosen
 /// slugs, e.g. "my_server".
-fn validate_id(id: &str) -> Result<(), String> {
+pub(crate) fn validate_id(id: &str) -> Result<(), String> {
     if !id.is_empty()
         && id
             .chars()
@@ -171,7 +177,7 @@ fn validate_id(id: &str) -> Result<(), String> {
 }
 
 /// Resolves (and creates, if missing) `<app_data_dir>/mcp_servers.json`'s path.
-fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -375,8 +381,26 @@ pub async fn connect_impl(
                 rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                     url.clone(),
                 );
-            if let Some(token) = read_http_token(&entry.id) {
-                config = config.auth_header(token);
+            // An OAuth-connected server (see `mcp_oauth::mcp_oauth_connect`)
+            // takes priority over a manually pasted static token: its
+            // presence means the user explicitly ran the OAuth flow for this
+            // server id, and `get_access_token_if_connected` auto-refreshes
+            // the token if it's expired. `Ok(None)` means no OAuth
+            // credentials are stored for this id at all — fall back to
+            // whatever static token (if any) was saved via
+            // `mcp_set_http_token`. An `Err` here (stored OAuth credentials
+            // exist but can't produce a usable token — e.g. refresh failed
+            // and re-authorization is required) is surfaced as a real
+            // connect failure rather than silently degrading to the static
+            // token, since that static token may be stale/absent precisely
+            // because OAuth was set up instead.
+            match crate::mcp_oauth::get_access_token_if_connected(state, &entry.id, url).await? {
+                Some(token) => config = config.auth_header(token),
+                None => {
+                    if let Some(token) = read_http_token(&entry.id) {
+                        config = config.auth_header(token);
+                    }
+                }
             }
 
             let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
@@ -639,6 +663,12 @@ pub struct McpServerInfo {
     /// (they have no keychain entry); lets the Settings UI show a "token
     /// saved" state without ever reading the secret back out.
     pub has_http_token: bool,
+    /// Whether this server currently has OAuth-derived credentials saved
+    /// (see `mcp_oauth.rs`) — never the credentials themselves. Always
+    /// `false` for `Stdio` servers. When both this and `has_http_token` are
+    /// `true`, [`connect_impl`] prefers the OAuth-derived token (see its
+    /// `Http` branch).
+    pub has_oauth: bool,
 }
 
 fn build_info(
@@ -661,6 +691,8 @@ fn build_info(
         instructions,
         has_http_token: matches!(entry.transport, McpTransport::Http { .. })
             && read_http_token(&entry.id).is_some(),
+        has_oauth: matches!(entry.transport, McpTransport::Http { .. })
+            && crate::mcp_oauth::has_oauth_credentials(&entry.id),
     }
 }
 
@@ -823,6 +855,7 @@ pub async fn mcp_remove_server(
     // server, which never has one) hits the `NoEntry` no-op path — never
     // fails the removal itself over keychain cleanup.
     let _ = remove_http_token_impl(&server_id);
+    let _ = crate::mcp_oauth::remove_oauth_credentials_impl(&server_id);
     Ok(())
 }
 
