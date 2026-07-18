@@ -27,8 +27,27 @@
 //! OS cursor: [`NullBackend`] (test double, always succeeds) and
 //! [`UnsupportedBackend`] (production fallback on platforms/environments
 //! without a wired input path, always a clear error) both implement it
-//! alongside the real macOS `enigo`-backed implementation. No test in this
-//! module exercises anything other than `NullBackend`.
+//! alongside the real `enigo`-backed implementation. No test in this module
+//! exercises anything other than `NullBackend`.
+//!
+//! Platform support for the real input path ([`EnigoBackend`], selected by
+//! [`production_backend`]):
+//! - **macOS** — real input (needs Accessibility permission). Runtime-verified.
+//! - **Windows** — real input via `enigo` (`SendInput` under the hood).
+//! - **Linux/X11** — real input via `enigo` (`x11rb`, `enigo`'s default
+//!   feature).
+//! - **Linux/Wayland** — deliberately *unsupported*: `production_backend`
+//!   detects a Wayland session (see [`is_wayland_session`]) and returns
+//!   [`UnsupportedBackend`] rather than constructing `enigo::Enigo`, since
+//!   synthetic input on Wayland needs an xdg-desktop-portal/libei integration
+//!   that is not built here. X11 sessions work today.
+//! - Everything else (BSD, etc.) — [`UnsupportedBackend`], as before.
+//!
+//! CAUTION: the Windows and Linux code paths below are compiled only on their
+//! own target_os, so they are NOT type-checked or runtime-verified in this
+//! macOS development environment. All non-trivial platform logic (the Wayland
+//! guard) is factored into pure, host-testable functions; the OS-gated blocks
+//! themselves are kept to a bare `enigo` call. See each block's own note.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -129,12 +148,16 @@ impl DesktopInputBackend for UnsupportedBackend {
     }
 }
 
-/// Real macOS input path. Not exercised by any test in this module (see the
-/// module doc) — only ever constructed by [`production_backend`].
-#[cfg(target_os = "macos")]
+/// Real input path (macOS, Windows, and Linux/X11). Not exercised by any test
+/// in this module (see the module doc) — only ever constructed by
+/// [`production_backend`]. The body is 100% `enigo`'s generic, cross-platform
+/// API (`Mouse`/`Keyboard` traits): nothing here is OS-specific, so the same
+/// struct/impl compiles unchanged on every supported target. `enigo` handles
+/// the per-OS input synthesis internally, in its own crate.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 struct EnigoBackend(Mutex<enigo::Enigo>);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 impl DesktopInputBackend for EnigoBackend {
     fn move_mouse(&self, x: i32, y: i32) -> Result<(), String> {
         use enigo::{Coordinate, Mouse};
@@ -174,7 +197,9 @@ impl DesktopInputBackend for EnigoBackend {
 /// covers the common non-printable ones. Anything else is rejected outright
 /// — silently guessing at an unrecognized key name is exactly the kind of
 /// "might do something other than what was approved" gap this spike avoids.
-#[cfg(target_os = "macos")]
+/// Every `enigo::Key` variant used here is ungated in `enigo`'s `Key` enum, so
+/// this parses identically on macOS, Windows, and Linux.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn parse_key(key: &str) -> Result<enigo::Key, String> {
     use enigo::Key;
     let mut chars = key.chars();
@@ -196,31 +221,102 @@ fn parse_key(key: &str) -> Result<enigo::Key, String> {
     })
 }
 
-/// Selects the real backend on macOS, or a clear [`UnsupportedBackend`]
-/// everywhere else (or if the real backend's own construction fails, e.g.
-/// missing Accessibility permission) — never a silent no-op. Only ever
-/// called once, from `DesktopControlState::production`; every test in this
-/// module constructs its own [`NullBackend`] instead.
+/// Message returned by [`production_backend`] when a Linux/Wayland session is
+/// detected — kept as a named constant so the wording is asserted in tests.
+/// Its only production use is Linux-gated, hence the non-Linux `allow`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const WAYLAND_UNSUPPORTED_MESSAGE: &str =
+    "Wayland session detected — desktop control needs an xdg-desktop-portal/libei integration \
+     that isn't built yet; X11 sessions work today.";
+
+/// Pure Wayland-session detector. Takes the relevant environment values as
+/// plain `Option<&str>` (it does *not* read the environment itself) so it is
+/// fully unit-testable on any host, including this macOS build machine where
+/// no `#[cfg(target_os = "linux")]` code is ever compiled.
+///
+/// Decision:
+/// - an explicit, non-empty `XDG_SESSION_TYPE` is authoritative: only the
+///   literal `"wayland"` (case-insensitive) counts as Wayland, so `"x11"`
+///   (or any other value) is treated as not-Wayland;
+/// - otherwise, a set, non-empty `WAYLAND_DISPLAY` is taken as Wayland;
+/// - with neither signal present we assume X11/unknown and return `false` (do
+///   not block — X11 is the supported Linux path).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_wayland_session(xdg_session_type: Option<&str>, wayland_display: Option<&str>) -> bool {
+    if let Some(session_type) = xdg_session_type {
+        if !session_type.trim().is_empty() {
+            return session_type.trim().eq_ignore_ascii_case("wayland");
+        }
+    }
+    wayland_display.is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Thin, Linux-only wrapper that reads the real `XDG_SESSION_TYPE` /
+/// `WAYLAND_DISPLAY` env vars and defers the actual decision to the pure
+/// [`is_wayland_session`] above.
+#[cfg(target_os = "linux")]
+fn is_wayland_session_from_env() -> bool {
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
+}
+
+/// Selects the real [`EnigoBackend`] on macOS / Windows / Linux-X11, or a clear
+/// [`UnsupportedBackend`] otherwise (Linux-Wayland, other OSes, or when the
+/// real backend's own construction fails, e.g. missing Accessibility
+/// permission on macOS) — never a silent no-op. Only ever called once, from
+/// `DesktopControlState::production`; every test in this module constructs its
+/// own [`NullBackend`] instead.
+///
+/// NOTE: the Windows and Linux arms below are compiled only on their own
+/// target_os and were NOT compiled or runtime-verified in this macOS
+/// development environment. Each arm is deliberately just a Wayland guard (a
+/// pure, host-tested function) plus one generic `enigo::Enigo::new` call whose
+/// API is identical across every target.
 fn production_backend() -> Arc<dyn DesktopInputBackend> {
-    #[cfg(target_os = "macos")]
+    // Linux/Wayland fails *closed and clearly* before any `enigo` construction:
+    // building `enigo::Enigo` (x11rb backend) under Wayland would either fail
+    // confusingly or behave unpredictably. X11 sessions fall through to enigo.
+    #[cfg(target_os = "linux")]
+    {
+        if is_wayland_session_from_env() {
+            return Arc::new(UnsupportedBackend(WAYLAND_UNSUPPORTED_MESSAGE.to_string()));
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         match enigo::Enigo::new(&enigo::Settings::default()) {
             Ok(engine) => Arc::new(EnigoBackend(Mutex::new(engine))),
-            Err(error) => Arc::new(UnsupportedBackend(format!(
-                "Could not initialize macOS input simulation — grant Accessibility access in \
-                 System Settings > Privacy & Security > Accessibility, then restart Little \
-                 Monkey: {error}"
+            Err(error) => Arc::new(UnsupportedBackend(backend_init_error_message(
+                &error.to_string(),
             ))),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Arc::new(UnsupportedBackend(
-            "Safe Desktop Control input simulation is not implemented on this platform yet — \
-             this research spike only wires a real backend on macOS"
+            "Safe Desktop Control input simulation is not implemented on this platform — a real \
+             backend is wired only on macOS, Windows, and Linux/X11"
                 .to_string(),
         ))
     }
+}
+
+/// Per-OS hint appended to an `enigo::Enigo::new` failure. Kept tiny and
+/// cfg-selected (only the host target's arm is ever compiled); the surrounding
+/// pure string formatting is what makes the message.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn backend_init_error_message(error: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let hint = "grant Accessibility access in System Settings > Privacy & Security > \
+                Accessibility, then restart Little Monkey";
+    #[cfg(target_os = "windows")]
+    let hint = "the current desktop session may not permit synthetic input (e.g. no interactive \
+                desktop, or a higher-integrity window has focus)";
+    #[cfg(target_os = "linux")]
+    let hint = "ensure an X11 display is reachable (DISPLAY set); Wayland sessions are not \
+                supported yet";
+    format!("Could not initialize desktop input simulation — {hint}: {error}")
 }
 
 /// A single control session, scoped to an explicit, non-empty allowlist of
@@ -1315,5 +1411,49 @@ mod tests {
             "no backend wired"
         );
         assert_eq!(unsupported.key_press("a").unwrap_err(), "no backend wired");
+    }
+
+    // ----- Wayland detection (pure, host-testable) -------------------------
+    //
+    // These run on this macOS build machine even though `is_wayland_session`'s
+    // only production caller is Linux-gated — that is the whole point of
+    // keeping the decision pure and env-free.
+
+    #[test]
+    fn wayland_session_type_is_detected() {
+        assert!(is_wayland_session(Some("wayland"), None));
+        // Case-insensitive and tolerant of surrounding whitespace.
+        assert!(is_wayland_session(Some("Wayland"), None));
+        assert!(is_wayland_session(Some(" wayland "), None));
+    }
+
+    #[test]
+    fn wayland_display_set_without_a_session_type_is_detected() {
+        assert!(is_wayland_session(None, Some("wayland-0")));
+    }
+
+    #[test]
+    fn x11_session_type_is_not_wayland_even_with_wayland_display_set() {
+        // An explicit session type is authoritative: `x11` is never Wayland,
+        // even if a stray WAYLAND_DISPLAY is also present (e.g. XWayland).
+        assert!(!is_wayland_session(Some("x11"), None));
+        assert!(!is_wayland_session(Some("x11"), Some("wayland-0")));
+    }
+
+    #[test]
+    fn no_signals_assumes_x11_and_does_not_block() {
+        assert!(!is_wayland_session(None, None));
+        // Empty values are treated as "unset" and must not block either.
+        assert!(!is_wayland_session(Some(""), None));
+        assert!(!is_wayland_session(Some("   "), Some("")));
+        // An unknown session type (not wayland) with no WAYLAND_DISPLAY is
+        // likewise not treated as Wayland.
+        assert!(!is_wayland_session(Some("tty"), None));
+    }
+
+    #[test]
+    fn wayland_unsupported_message_is_clear_about_x11_working() {
+        assert!(WAYLAND_UNSUPPORTED_MESSAGE.contains("Wayland"));
+        assert!(WAYLAND_UNSUPPORTED_MESSAGE.contains("X11 sessions work today"));
     }
 }

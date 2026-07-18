@@ -48,6 +48,15 @@ const CAPTURE_EVERY_N_ACTIONS: u32 = 10;
 /// timeout counts as a denial — silence is never consent.
 const CONSENT_TIMEOUT_SECONDS: u64 = 60;
 
+/// Consent-dialog titles and the two "allow" button labels, shared by every
+/// platform's prompter so the wording is identical across macOS/Windows/Linux
+/// (and, on Linux, so the label matched against zenity's stdout is guaranteed
+/// to equal the label we actually passed to `--extra-button`).
+const CONSENT_DIALOG_TITLE_SESSION: &str = "Little Monkey — Remote Desktop Control";
+const CONSENT_DIALOG_TITLE_ACTION: &str = "Little Monkey — Approve Action";
+const CONSENT_ALLOW_BATCH_LABEL: &str = "Allow (batch)";
+const CONSENT_ALLOW_PER_ACTION_LABEL: &str = "Allow (per-action)";
+
 /// The local operator's answer to the session consent prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionConsent {
@@ -56,7 +65,9 @@ pub enum SessionConsent {
     AllowBatch,
 }
 
-/// Seam for the local, visible consent surface. Production shells `osascript`;
+/// Seam for the local, visible consent surface. Production selects a native
+/// prompter per OS (see [`production_prompter`]): macOS shells `osascript`,
+/// Windows uses `MessageBoxW`, Linux uses `zenity` (falling back to `kdialog`);
 /// tests inject a double that returns a canned answer.
 pub trait ConsentPrompter: Send + Sync {
     /// Blocking, locally-visible prompt shown on the runner before a session is
@@ -67,59 +78,94 @@ pub trait ConsentPrompter: Send + Sync {
     fn confirm_action(&self, device_label: &str, description: &str) -> bool;
 }
 
+/// Selects the native consent surface for the current OS — the prompter
+/// counterpart to `desktop_control::production_backend`. macOS/Windows/Linux
+/// each get a real, locally-visible dialog; every other platform gets a
+/// default-deny [`DenyConsentPrompter`] (never a silent allow).
+///
+/// NOTE: only the arm matching this build's target_os is compiled. The Windows
+/// and Linux prompters below were therefore NOT compiled or runtime-verified in
+/// this macOS development environment; see each impl's own note.
+fn production_prompter() -> Arc<dyn ConsentPrompter> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(OsascriptConsentPrompter)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(MessageBoxConsentPrompter)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(ZenityKdialogConsentPrompter)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Arc::new(DenyConsentPrompter)
+    }
+}
+
+/// Maps a two-step yes/no consent flow to a [`SessionConsent`]. Both the
+/// Windows `MessageBoxW` path and the Linux `kdialog` fallback need this: neither
+/// can render three fully custom-labelled buttons in a single dialog, so they
+/// ask "allow at all?" then "batch?" in sequence. Pure and host-testable:
+/// - first "No"                  → Deny
+/// - first "Yes" + second "Yes"  → AllowBatch
+/// - first "Yes" + second "No"   → AllowPerAction
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+fn two_step_session_consent(allow: bool, batch: bool) -> SessionConsent {
+    if !allow {
+        SessionConsent::Deny
+    } else if batch {
+        SessionConsent::AllowBatch
+    } else {
+        SessionConsent::AllowPerAction
+    }
+}
+
 /// macOS `osascript` implementation. Every invocation is an argv array — never
-/// a shell string — matching `daemon_commands.rs`'s stated convention.
+/// a shell string — matching `daemon_commands.rs`'s stated convention. This is
+/// the one prompter compiled and runtime-verified in this dev environment.
+#[cfg(target_os = "macos")]
 pub struct OsascriptConsentPrompter;
 
+#[cfg(target_os = "macos")]
 impl ConsentPrompter for OsascriptConsentPrompter {
     fn confirm_session(&self, device_label: &str) -> SessionConsent {
-        #[cfg(target_os = "macos")]
-        {
-            let script = format!(
-                "display dialog {} with title {} buttons {{\"Deny\", \"Allow (per-action)\", \
-                 \"Allow (batch)\"}} default button \"Deny\" cancel button \"Deny\" with icon \
-                 caution giving up after {}",
-                apple_script_string(&format!(
-                    "Remote desktop control was requested by device \"{device_label}\".\n\nAllow \
-                     this device to control this Mac's keyboard and mouse?"
-                )),
-                apple_script_string("Little Monkey — Remote Desktop Control"),
-                CONSENT_TIMEOUT_SECONDS,
-            );
-            match run_osascript(&script) {
-                Some(output) if output.contains("Allow (batch)") => SessionConsent::AllowBatch,
-                Some(output) if output.contains("Allow (per-action)") => {
-                    SessionConsent::AllowPerAction
-                }
-                _ => SessionConsent::Deny,
+        let script = format!(
+            "display dialog {} with title {} buttons {{\"Deny\", \"{}\", \"{}\"}} default button \
+             \"Deny\" cancel button \"Deny\" with icon caution giving up after {}",
+            apple_script_string(&format!(
+                "Remote desktop control was requested by device \"{device_label}\".\n\nAllow \
+                 this device to control this Mac's keyboard and mouse?"
+            )),
+            apple_script_string(CONSENT_DIALOG_TITLE_SESSION),
+            CONSENT_ALLOW_PER_ACTION_LABEL,
+            CONSENT_ALLOW_BATCH_LABEL,
+            CONSENT_TIMEOUT_SECONDS,
+        );
+        match run_osascript(&script) {
+            Some(output) if output.contains(CONSENT_ALLOW_BATCH_LABEL) => {
+                SessionConsent::AllowBatch
             }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = device_label;
-            SessionConsent::Deny
+            Some(output) if output.contains(CONSENT_ALLOW_PER_ACTION_LABEL) => {
+                SessionConsent::AllowPerAction
+            }
+            _ => SessionConsent::Deny,
         }
     }
 
     fn confirm_action(&self, device_label: &str, description: &str) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            let script = format!(
-                "display dialog {} with title {} buttons {{\"Deny\", \"Allow\"}} default button \
-                 \"Deny\" cancel button \"Deny\" with icon caution giving up after {}",
-                apple_script_string(&format!(
-                    "Device \"{device_label}\" wants to perform: {description}"
-                )),
-                apple_script_string("Little Monkey — Approve Action"),
-                CONSENT_TIMEOUT_SECONDS,
-            );
-            matches!(run_osascript(&script), Some(output) if output.contains("button returned:Allow"))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (device_label, description);
-            false
-        }
+        let script = format!(
+            "display dialog {} with title {} buttons {{\"Deny\", \"Allow\"}} default button \
+             \"Deny\" cancel button \"Deny\" with icon caution giving up after {}",
+            apple_script_string(&format!(
+                "Device \"{device_label}\" wants to perform: {description}"
+            )),
+            apple_script_string(CONSENT_DIALOG_TITLE_ACTION),
+            CONSENT_TIMEOUT_SECONDS,
+        );
+        matches!(run_osascript(&script), Some(output) if output.contains("button returned:Allow"))
     }
 }
 
@@ -140,6 +186,257 @@ fn run_osascript(script: &str) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn apple_script_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+// ===========================================================================
+// Windows consent surface (`MessageBoxW`)
+//
+// COMPILED ONLY ON WINDOWS; NOT runtime-verified in this dev environment (no
+// Windows machine available). All UTF-16 conversion — the only non-trivial
+// logic — lives in the pure, host-tested `to_utf16_null_terminated`; the FFI
+// wrapper below is a bare `MessageBoxW` call. It requires an interactive
+// desktop session: a service running in Windows session 0 cannot show these
+// dialogs to the logged-in user (a known limitation, out of scope here).
+// ===========================================================================
+
+/// Windows native consent surface. `MessageBoxW` cannot show three fully
+/// custom-labelled buttons in one dialog, so `confirm_session` is a two-step
+/// Yes/No flow (allow? then batch?) mapped via [`two_step_session_consent`].
+#[cfg(target_os = "windows")]
+pub struct MessageBoxConsentPrompter;
+
+#[cfg(target_os = "windows")]
+impl ConsentPrompter for MessageBoxConsentPrompter {
+    fn confirm_session(&self, device_label: &str) -> SessionConsent {
+        let allow = message_box_yes_no(
+            CONSENT_DIALOG_TITLE_SESSION,
+            &format!("Remote desktop control requested by device \"{device_label}\". Allow?"),
+        );
+        if !allow {
+            return SessionConsent::Deny;
+        }
+        let batch = message_box_yes_no(
+            CONSENT_DIALOG_TITLE_SESSION,
+            "Allow this device to act without per-action approval (batch mode)? Choosing No \
+             means every action still needs a separate approval.",
+        );
+        two_step_session_consent(allow, batch)
+    }
+
+    fn confirm_action(&self, device_label: &str, description: &str) -> bool {
+        message_box_yes_no(
+            CONSENT_DIALOG_TITLE_ACTION,
+            &format!("Device \"{device_label}\" wants to perform: {description}. Allow?"),
+        )
+    }
+}
+
+/// Thin `MessageBoxW` wrapper: one modal Yes/No dialog, `true` iff Yes.
+#[cfg(target_os = "windows")]
+fn message_box_yes_no(title: &str, text: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+    let text_utf16 = to_utf16_null_terminated(text);
+    let title_utf16 = to_utf16_null_terminated(title);
+    // SAFETY: both buffers are valid, null-terminated UTF-16 and outlive the
+    // call; a null HWND means the dialog has no owner window.
+    let result = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text_utf16.as_ptr(),
+            title_utf16.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    };
+    result == IDYES
+}
+
+/// Convert a `&str` into the null-terminated UTF-16 buffer the Win32 `*W` APIs
+/// expect. Portable, allocation-only Rust — unit-tested on this macOS host even
+/// though its only production caller is Windows-gated.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn to_utf16_null_terminated(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// ===========================================================================
+// Linux consent surface (`zenity`, falling back to `kdialog`)
+//
+// COMPILED ONLY ON LINUX; NOT runtime-verified in this dev environment (no
+// Linux machine available). The one piece of real logic — turning zenity's
+// exit-code/stdout contract into a decision — lives in the pure, host-tested
+// `parse_zenity_session_consent` / `exit_code_is_yes`; the impl below just
+// spawns the tools (argv arrays, never a shell) and captures their output.
+// ===========================================================================
+
+/// Linux native consent surface. Prefers `zenity` (one dialog with two custom
+/// `--extra-button`s), falling back to `kdialog --yesno` in the same two-step
+/// shape as the Windows path. If NEITHER tool is on `PATH` this fails closed to
+/// [`SessionConsent::Deny`] / `false` and logs that the denial is a missing
+/// local-consent dependency, not a normal operator refusal.
+#[cfg(target_os = "linux")]
+pub struct ZenityKdialogConsentPrompter;
+
+#[cfg(target_os = "linux")]
+impl ConsentPrompter for ZenityKdialogConsentPrompter {
+    fn confirm_session(&self, device_label: &str) -> SessionConsent {
+        let question =
+            format!("Remote desktop control requested by device \"{device_label}\". Allow?");
+        // zenity: both custom extra buttons in a single dialog. Its default OK
+        // and Cancel buttons are treated as Deny — only the two extra-button
+        // labels count as consent.
+        if let Some(output) = run_consent_tool(
+            "zenity",
+            &[
+                "--question".to_string(),
+                format!("--title={CONSENT_DIALOG_TITLE_SESSION}"),
+                format!("--text={question}"),
+                format!("--timeout={CONSENT_TIMEOUT_SECONDS}"),
+                format!("--extra-button={CONSENT_ALLOW_BATCH_LABEL}"),
+                format!("--extra-button={CONSENT_ALLOW_PER_ACTION_LABEL}"),
+            ],
+        ) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return parse_zenity_session_consent(
+                output.status.code(),
+                &stdout,
+                CONSENT_ALLOW_BATCH_LABEL,
+                CONSENT_ALLOW_PER_ACTION_LABEL,
+            );
+        }
+        // zenity unavailable → kdialog two-step (kdialog has no clean
+        // three-custom-button primitive either).
+        let Some(allow) = kdialog_yes_no(&question) else {
+            no_local_consent_tool();
+            return SessionConsent::Deny;
+        };
+        if !allow {
+            return SessionConsent::Deny;
+        }
+        // A second-dialog spawn failure fails closed to the more restrictive
+        // per-action mode rather than granting batch.
+        let batch = kdialog_yes_no(
+            "Allow this device to act without per-action approval (batch mode)? Choosing No \
+             means every action still needs a separate approval.",
+        )
+        .unwrap_or(false);
+        two_step_session_consent(allow, batch)
+    }
+
+    fn confirm_action(&self, device_label: &str, description: &str) -> bool {
+        let question = format!("Device \"{device_label}\" wants to perform: {description}. Allow?");
+        // A plain yes/no is enough here: zenity --question is OK/Cancel.
+        if let Some(output) = run_consent_tool(
+            "zenity",
+            &[
+                "--question".to_string(),
+                format!("--title={CONSENT_DIALOG_TITLE_ACTION}"),
+                format!("--text={question}"),
+                format!("--timeout={CONSENT_TIMEOUT_SECONDS}"),
+            ],
+        ) {
+            return exit_code_is_yes(output.status.code());
+        }
+        match kdialog_yes_no(&question) {
+            Some(answer) => answer,
+            None => {
+                no_local_consent_tool();
+                false
+            }
+        }
+    }
+}
+
+/// Spawn a local consent GUI tool with an argv array (never a shell), capturing
+/// its output. `None` means the tool could not be run at all (not installed /
+/// not on `PATH`, or any other spawn error) — the caller then tries the next
+/// tool or fails closed; `Some(output)` means it ran and its exit status /
+/// stdout carry the operator's answer.
+#[cfg(target_os = "linux")]
+fn run_consent_tool(program: &str, args: &[String]) -> Option<std::process::Output> {
+    std::process::Command::new(program).args(args).output().ok()
+}
+
+/// One `kdialog --yesno` dialog: `Some(true)` for Yes, `Some(false)` for No,
+/// `None` if kdialog could not be run.
+#[cfg(target_os = "linux")]
+fn kdialog_yes_no(text: &str) -> Option<bool> {
+    run_consent_tool("kdialog", &["--yesno".to_string(), text.to_string()])
+        .map(|output| exit_code_is_yes(output.status.code()))
+}
+
+/// Logs that a denial was forced by the *absence* of any local consent tool,
+/// so it is not mistaken for a normal operator denial.
+#[cfg(target_os = "linux")]
+fn no_local_consent_tool() {
+    eprintln!(
+        "remote desktop-control: no local consent tool is available (neither `zenity` nor \
+         `kdialog` is on PATH) — denying. This is a missing-dependency default-deny, NOT a \
+         normal operator denial; install zenity or kdialog to enable local consent prompts."
+    );
+}
+
+/// Decide a session consent from zenity's raw exit code + stdout. Pure and
+/// host-testable (it parses already-captured strings/codes, so it needs no
+/// zenity installed).
+///
+/// zenity `--question` with two `--extra-button` values:
+/// - OK pressed:        exit 0, empty stdout          → Deny
+/// - Cancel pressed:    exit 1, empty stdout          → Deny
+/// - `--extra-button`:  exit 1, stdout = button label → the matching consent
+/// - `--timeout` fired: exit 5, empty stdout          → Deny
+/// - killed (no status)                               → Deny
+///
+/// Only a stdout equal to one of the two extra-button labels we passed counts
+/// as consent; the plain OK/Cancel buttons and every failure mode are a denial
+/// ("silence is never consent").
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_zenity_session_consent(
+    exit_code: Option<i32>,
+    stdout: &str,
+    batch_label: &str,
+    per_action_label: &str,
+) -> SessionConsent {
+    // A dialog that never exited cleanly (killed / crashed) is never consent.
+    if exit_code.is_none() {
+        return SessionConsent::Deny;
+    }
+    match stdout.trim() {
+        label if label == batch_label => SessionConsent::AllowBatch,
+        label if label == per_action_label => SessionConsent::AllowPerAction,
+        _ => SessionConsent::Deny,
+    }
+}
+
+/// `true` iff the process exited successfully (code 0). Used for the plain
+/// yes/no tools — zenity `--question` (OK = 0) and `kdialog --yesno` (Yes = 0);
+/// every other code, and a killed process, is "no". Pure and host-testable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn exit_code_is_yes(exit_code: Option<i32>) -> bool {
+    exit_code == Some(0)
+}
+
+/// Fallback for platforms with no wired local consent surface (BSD, etc.):
+/// always deny, since there is no way to show the operator a prompt — a
+/// default-deny, never a silent allow.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub struct DenyConsentPrompter;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+impl ConsentPrompter for DenyConsentPrompter {
+    fn confirm_session(&self, device_label: &str) -> SessionConsent {
+        let _ = device_label;
+        eprintln!(
+            "remote desktop-control: no local consent surface on this platform — denying \
+             (default-deny, not an operator denial)"
+        );
+        SessionConsent::Deny
+    }
+    fn confirm_action(&self, device_label: &str, description: &str) -> bool {
+        let _ = (device_label, description);
+        false
+    }
 }
 
 /// Per-session recording bookkeeping.
@@ -165,14 +462,15 @@ pub struct DesktopControlRuntime {
 }
 
 impl DesktopControlRuntime {
-    /// Production runtime: the real (macOS `enigo`) input backend guarded by
-    /// the machine-wide `<app_data>/desktop_control.lock`, an `osascript`
-    /// consent prompter, and durable session recording enabled.
+    /// Production runtime: the real `enigo` input backend (macOS/Windows/
+    /// Linux-X11) guarded by the machine-wide `<app_data>/desktop_control.lock`,
+    /// the OS-native consent prompter for this platform (see
+    /// [`production_prompter`]), and durable session recording enabled.
     pub fn production(paths: &DaemonPaths) -> Arc<Self> {
         let lock_path = app_data(paths).join("desktop_control.lock");
         Arc::new(Self {
             state: Arc::new(DesktopControlState::production_with_lock(lock_path)),
-            prompter: Arc::new(OsascriptConsentPrompter),
+            prompter: production_prompter(),
             paths: paths.clone(),
             device_sessions: Mutex::new(BTreeMap::new()),
             recordings: Mutex::new(BTreeMap::new()),
@@ -840,5 +1138,88 @@ mod tests {
             button: MouseButtonKind::Left,
         };
         assert!(runtime.action("device-one", "Phone", request).is_ok());
+    }
+
+    // ----- pure consent-parsing helpers (host-testable) --------------------
+    //
+    // These cover the Windows and Linux prompters' only non-trivial logic even
+    // though those prompters themselves are not compiled on this macOS host:
+    // the functions are platform-agnostic pure Rust on purpose.
+
+    #[test]
+    fn two_step_flow_maps_to_the_right_consent() {
+        assert_eq!(two_step_session_consent(false, false), SessionConsent::Deny);
+        assert_eq!(two_step_session_consent(false, true), SessionConsent::Deny);
+        assert_eq!(
+            two_step_session_consent(true, true),
+            SessionConsent::AllowBatch
+        );
+        assert_eq!(
+            two_step_session_consent(true, false),
+            SessionConsent::AllowPerAction
+        );
+    }
+
+    #[test]
+    fn utf16_conversion_is_null_terminated() {
+        assert_eq!(to_utf16_null_terminated(""), vec![0]);
+        assert_eq!(to_utf16_null_terminated("Hi"), vec![0x48, 0x69, 0]);
+        // Non-ASCII is encoded as UTF-16 (em dash U+2014) and still terminated.
+        let out = to_utf16_null_terminated("A—");
+        assert_eq!(out.first(), Some(&0x41));
+        assert_eq!(out.last(), Some(&0));
+        assert!(out.contains(&0x2014));
+    }
+
+    #[test]
+    fn zenity_extra_button_labels_map_to_consent() {
+        let (batch, per) = (CONSENT_ALLOW_BATCH_LABEL, CONSENT_ALLOW_PER_ACTION_LABEL);
+        // An extra button prints its label to stdout and exits 1.
+        assert_eq!(
+            parse_zenity_session_consent(Some(1), &format!("{batch}\n"), batch, per),
+            SessionConsent::AllowBatch
+        );
+        assert_eq!(
+            parse_zenity_session_consent(Some(1), &format!("{per}\n"), batch, per),
+            SessionConsent::AllowPerAction
+        );
+    }
+
+    #[test]
+    fn zenity_ok_cancel_timeout_and_kill_are_all_denials() {
+        let (batch, per) = (CONSENT_ALLOW_BATCH_LABEL, CONSENT_ALLOW_PER_ACTION_LABEL);
+        // OK: exit 0, empty stdout.
+        assert_eq!(
+            parse_zenity_session_consent(Some(0), "", batch, per),
+            SessionConsent::Deny
+        );
+        // Cancel: exit 1, empty stdout.
+        assert_eq!(
+            parse_zenity_session_consent(Some(1), "", batch, per),
+            SessionConsent::Deny
+        );
+        // --timeout fired: exit 5, empty stdout.
+        assert_eq!(
+            parse_zenity_session_consent(Some(5), "", batch, per),
+            SessionConsent::Deny
+        );
+        // Killed by a signal: no exit status at all.
+        assert_eq!(
+            parse_zenity_session_consent(None, "", batch, per),
+            SessionConsent::Deny
+        );
+        // A stdout that is not one of our labels is never consent.
+        assert_eq!(
+            parse_zenity_session_consent(Some(1), "something else", batch, per),
+            SessionConsent::Deny
+        );
+    }
+
+    #[test]
+    fn exit_code_yes_only_on_zero() {
+        assert!(exit_code_is_yes(Some(0)));
+        assert!(!exit_code_is_yes(Some(1)));
+        assert!(!exit_code_is_yes(Some(5)));
+        assert!(!exit_code_is_yes(None));
     }
 }

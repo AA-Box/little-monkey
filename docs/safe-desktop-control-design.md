@@ -88,12 +88,29 @@ requesting a bad action," not "the sandbox was broken into."
   has to look at what they're approving. A future phase could add
   accessibility-tree-based heuristics as an additional (never sole) layer,
   but that is out of scope here.
-- **Windows/Linux input backends.** Only macOS gets a real `enigo`-backed
-  input path in this spike (`#[cfg(target_os = "macos")]`). Every other
-  platform compiles and registers the same commands, but every action
-  returns a clear "unsupported on this platform" error rather than silently
-  no-op-ing or crashing. Extending real input simulation to other platforms
-  is future work once the macOS path is proven.
+- **Linux/Wayland input backend.** The real `enigo`-backed input path now
+  covers **macOS, Windows, and Linux/X11** (`EnigoBackend`, gated
+  `any(target_os = "macos", target_os = "windows", target_os = "linux")`).
+  **Linux/Wayland is explicitly *not* supported**: `production_backend`
+  detects a Wayland session (via the pure `is_wayland_session` helper, reading
+  `XDG_SESSION_TYPE`/`WAYLAND_DISPLAY`) and returns the `UnsupportedBackend`
+  clear-error fallback *before* constructing `enigo::Enigo`, because synthetic
+  input on Wayland needs an xdg-desktop-portal/libei integration that is not
+  built here. Constructing `enigo` under Wayland would fail confusingly or
+  behave unpredictably, so we fail clearly instead. Any other platform (BSD,
+  etc.) keeps the same clear "unsupported on this platform" error. Wiring the
+  Wayland portal/libei path is future work.
+
+  **Verification honesty:** the Windows and Linux/X11 input paths are compiled
+  only when building *for* those targets. This spike was developed on macOS
+  with no Windows/Linux cross-compilation available, so those `#[cfg]`-gated
+  blocks were **not compiled, type-checked, or runtime-verified here** — only
+  the macOS path was. To keep the unverifiable surface tiny, every OS-gated
+  block is just a generic `enigo` call (whose API is identical across targets)
+  plus, on Linux, the Wayland guard; all non-trivial decision logic lives in
+  pure functions (`is_wayland_session`) that *are* compiled and unit-tested on
+  macOS. The `enigo` crate's default `x11rb` feature supplies the Linux/X11
+  backend, and its `Key` variants used here are all cross-platform.
 - **Remote/paired-device control.** Explicitly a separate, later ROADMAP item
   ("Remote PC Control", still Research) that depends on this one shipping
   first. Not touched here.
@@ -147,3 +164,13 @@ approval/emergency-stop *logic*, never on anything the OS actually sees. See
 `src-tauri/src/desktop_control.rs`'s `#[cfg(test)] mod tests` for the exact
 cases: bypass-mode refusal, allowlist enforcement, emergency-stop idempotency,
 and the pending-action oneshot resume path.
+
+The cross-platform additions follow the same posture: the platform-specific
+input/consent decision logic is factored into pure, env-free functions that
+compile and run on *any* host — `is_wayland_session` (Wayland detection) in
+`desktop_control.rs`, and `two_step_session_consent` / `parse_zenity_session_consent`
+/ `exit_code_is_yes` / `to_utf16_null_terminated` in the daemon's
+`daemon/remote/desktop.rs`. These are all unit-tested on the macOS build
+machine even though their production callers are Windows/Linux-gated. The
+OS-gated glue that actually calls `enigo`, `MessageBoxW`, `zenity`, or
+`kdialog` is kept minimal precisely because it cannot be exercised here.
