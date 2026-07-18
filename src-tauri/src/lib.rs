@@ -929,6 +929,7 @@ pub fn run() {
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
+            git::git_review,
             git::git_changed_files,
             git::git_file_diff,
             mcp::mcp_list_servers,

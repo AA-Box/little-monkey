@@ -46,7 +46,7 @@ import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore, selectRunningSideTaskCount } from "./store/sideTaskStore";
-import { ArtifactPane, FileTree, DiffPanel, DiffViewer, PermissionModal, ApprovalChainModal, SessionGrantBanner } from "./components/Workspace";
+import { ArtifactPane, FileTree, DiffPanel, DiffViewer, PermissionModal, ApprovalChainModal, ReviewPanel, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
@@ -200,7 +200,7 @@ function App() {
    * Desktop-style): nothing (default), the picker menu, the workspace
    * panel, or the side-tasks drawer. A right-docked terminal overrides
    * whatever is selected here. */
-  const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks">("none");
+  const [rightPanel, setRightPanel] = useState<"none" | "menu" | "workspace" | "sideTasks" | "review">("none");
   const [debateOpen, setDebateOpen] = useState(false);
   const [dbAdminGuardrailsOpen, setDbAdminGuardrailsOpen] = useState(false);
   const [apiContractDiffLabOpen, setApiContractDiffLabOpen] = useState(false);
@@ -361,6 +361,29 @@ function App() {
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
         openCommandPalette: () => openCommandPalette(),
+        toggleRightSidebar: () => setRightPanel((panel) => (panel === "none" ? "menu" : "none")),
+        openTerminal: () => setTerminalOpen((open) => !open),
+        openBrowser: () => {
+          setDiffPanelOpen(false);
+          const browserPane = useBrowserPaneStore.getState();
+          browserPane.setOpen(!browserPane.open);
+        },
+        openReview: () => {
+          useBrowserPaneStore.getState().setOpen(false);
+          setDiffPanelOpen(false);
+          setRightPanel((panel) => (panel === "review" ? "none" : "review"));
+        },
+        openFiles: () => {
+          useBrowserPaneStore.getState().setOpen(false);
+          setDiffPanelOpen(false);
+          setRightPanel((panel) => (panel === "workspace" ? "none" : "workspace"));
+        },
+        openSideTasksPanel: () => {
+          useBrowserPaneStore.getState().setOpen(false);
+          setDiffPanelOpen(false);
+          useSideTaskStore.getState().openDrawer();
+          setRightPanel("sideTasks");
+        },
         sessionTogglePin: () => activeSession && session.togglePin(activeSession.id),
         sessionToggleUnread: () => activeSession && session.toggleUnread(activeSession.id),
         sessionRename: () => activeSession && session.requestRename(activeSession.id),
@@ -1637,6 +1660,18 @@ setVisualEditModeOpen(false);
         <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
       ) : rightPanel === "sideTasks" ? (
         <SideTaskDrawer sessionId={activeSessionId} />
+      ) : rightPanel === "review" ? (
+        <aside className="flex w-[40rem] max-w-[60vw] shrink-0 flex-col border-l border-border bg-surface">
+          <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
+              {t("App.rightPanelReview")}
+            </span>
+            <IconButton size="sm" onClick={() => setRightPanel("none")} aria-label={t("App.closeRightSidebar")} className="ml-auto">
+              <X size={16} />
+            </IconButton>
+          </div>
+          <ReviewPanel />
+        </aside>
       ) : rightPanel === "menu" ? (
         <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-surface">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
@@ -1654,6 +1689,14 @@ setVisualEditModeOpen(false);
               className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
             >
               <FolderTree size={16} className="shrink-0 text-faint" /> {t("App.rightPanelWorkspace")}
+            </button>
+            <button
+              type="button"
+              disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+              onClick={() => setRightPanel("review")}
+              className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+            >
+              <FileDiff size={16} className="shrink-0 text-faint" /> {t("App.rightPanelReview")}
             </button>
             <button
               type="button"

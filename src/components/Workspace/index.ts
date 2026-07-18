@@ -15,3 +15,5 @@ export { SessionGrantBanner } from "./SessionGrantBanner";
 export { WorkspaceBar } from "./WorkspaceBar";
 
 export { ArtifactPane } from "./ArtifactPane";
+
+export { ReviewPanel } from "./ReviewPanel";
