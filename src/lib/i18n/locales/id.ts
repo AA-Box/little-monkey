@@ -988,7 +988,6 @@ export const id: Record<string, string> = {
   "CheckpointTimeline.minutesAgo": "{{count}} menit yang lalu",
   "CheckpointTimeline.hoursAgo": "{{count}} jam yang lalu",
   "CheckpointTimeline.daysAgo": "{{count}} hari yang lalu",
-  "EffortSelector.levelDefault": "Bawaan",
   "EffortSelector.levelLow": "Rendah",
   "EffortSelector.levelMedium": "Sedang",
   "EffortSelector.levelHigh": "Tinggi",

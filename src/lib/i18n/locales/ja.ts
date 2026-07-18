@@ -987,7 +987,6 @@ export const ja: Record<string, string> = {
   "CheckpointTimeline.minutesAgo": "{{count}}分前",
   "CheckpointTimeline.hoursAgo": "{{count}}時間前",
   "CheckpointTimeline.daysAgo": "{{count}}日前",
-  "EffortSelector.levelDefault": "デフォルト",
   "EffortSelector.levelLow": "低",
   "EffortSelector.levelMedium": "中",
   "EffortSelector.levelHigh": "高",

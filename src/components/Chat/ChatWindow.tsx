@@ -9,6 +9,7 @@ import { compactSessionNow, runAgentTurn, stopTurn } from "../../lib/agentLoop";
 import type { AttachmentRef } from "../../lib/agentLoop";
 import { startComparison } from "../../lib/compareRunner";
 import { startCrew } from "../../lib/crewRunner";
+import { startUltracode } from "../../lib/ultracodeRunner";
 import type { ModelTargetSnapshot } from "../../lib/modelTargets";
 import { isImagePath, readImageAsDataUrl } from "../../lib/imageAttachment";
 import { textContent } from "../../lib/llamaClient";
@@ -283,6 +284,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [compareTargets, setCompareTargets] = useState<ModelTargetSnapshot[]>([]);
   const [startingCrew, setStartingCrew] = useState(false);
   const [crewId, setCrewId] = useState<string | null>(null);
+  const [startingUltracode, setStartingUltracode] = useState(false);
+  const [ultracodeMode, setUltracodeMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
@@ -844,7 +847,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       });
       return;
     }
-    if (sending || startingComparison || startingCrew || preparingTurnRef.current) return;
+    if (sending || startingComparison || startingCrew || startingUltracode || preparingTurnRef.current) return;
 
     preparingTurnRef.current = true;
     setPreparingTurn(true);
@@ -861,6 +864,22 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setPreparingTurn(false);
 
     const pendingAttachments = attachments;
+    if (ultracodeMode) {
+      setError(null);
+      setStartingUltracode(true);
+      try {
+        await startUltracode(sessionId, text, pendingAttachments, skillInvocations);
+        setInput("");
+        setAttachments([]);
+        requestAnimationFrame(resizeTextarea);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setStartingUltracode(false);
+        textareaRef.current?.focus();
+      }
+      return;
+    }
     if (crewId) {
       setError(null);
       setStartingCrew(true);
@@ -898,7 +917,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setAttachments([]);
     requestAnimationFrame(resizeTextarea);
     sendTurn(text, pendingAttachments, skillInvocations);
-  }, [input, sending, startingComparison, startingCrew, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice]);
+  }, [input, sending, startingComparison, startingCrew, startingUltracode, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice]);
 
   const handleStop = useCallback(() => {
     stopTurn(sessionId);
@@ -1242,22 +1261,33 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         value={compareTargets}
         onChange={(targets) => {
           setCompareTargets(targets);
-          if (targets.length > 0) setCrewId(null);
+          if (targets.length > 0) {
+            setCrewId(null);
+            setUltracodeMode(false);
+          }
         }}
-        disabled={sending || preparingTurn || startingComparison || startingCrew}
+        disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
         placement={headerActionsSlot ? "down" : "up"}
       />
       <CrewPicker
         value={crewId}
         onChange={(nextCrewId) => {
           setCrewId(nextCrewId);
-          if (nextCrewId) setCompareTargets([]);
+          if (nextCrewId) {
+            setCompareTargets([]);
+            setUltracodeMode(false);
+          }
         }}
-        disabled={sending || preparingTurn || startingComparison || startingCrew}
+        disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
         placement={headerActionsSlot ? "down" : "up"}
       />
     </>
   );
+
+  // Knowledge (StackPicker) portals alongside Compare/Crew when a header
+  // slot exists; otherwise it stays in its original composer-footer spot
+  // (see the split pane's fallback render below) rather than jumping rows.
+  const stackPicker = <StackPicker sessionId={sessionId} placement={headerActionsSlot ? "down" : "up"} />;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
@@ -1276,8 +1306,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             <span className="min-w-0 break-words">{error}</span>
             <button
               type="button"
-              onClick={compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
+              onClick={compareTargets.length >= 2 || crewId || ultracodeMode ? handleSend : handleRetry}
+              disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
               className="shrink-0 cursor-pointer rounded-md border border-danger px-2 py-0.5 text-xs transition-colors hover:bg-danger hover:text-danger-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               {t("ChatWindow.retryButton")}
@@ -1364,13 +1394,13 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                 onKeyDown={handleKeyDown}
                 placeholder={t("ChatWindow.inputPlaceholder")}
                 rows={1}
-                disabled={preparingTurn || startingComparison || startingCrew}
+                disabled={preparingTurn || startingComparison || startingCrew || startingUltracode}
                 className="max-h-48 min-h-[2.25rem] flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-relaxed text-foreground outline-none placeholder:text-faint"
               />
               <button
                 type="button"
                 onClick={sending ? handleStop : handleSend}
-                disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
+                disabled={preparingTurn || startingComparison || startingCrew || startingUltracode || (!sending && !input.trim())}
                 aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
                 className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
@@ -1388,14 +1418,31 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <ModelSwitcher />
-            <StackPicker sessionId={sessionId} />
-            <EffortSelector />
+            {!headerActionsSlot && stackPicker}
+            <EffortSelector
+              ultracodeActive={ultracodeMode}
+              onUltracodeChange={(active) => {
+                setUltracodeMode(active);
+                if (active) {
+                  setCompareTargets([]);
+                  setCrewId(null);
+                }
+              }}
+              disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
+            />
             <CheckpointTimeline sessionId={sessionId} />
             <ContextUsageIndicator sessionId={sessionId} />
           </div>
         </div>
       </div>
-      {headerActionsSlot && createPortal(comparisonPickers, headerActionsSlot)}
+      {headerActionsSlot &&
+        createPortal(
+          <>
+            {comparisonPickers}
+            {stackPicker}
+          </>,
+          headerActionsSlot,
+        )}
     </div>
   );
 }
