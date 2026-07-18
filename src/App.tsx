@@ -44,7 +44,7 @@ import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore } from "./store/sideTaskStore";
-import { ArtifactPane, FileTree, DiffViewer, PermissionModal, SessionGrantBanner } from "./components/Workspace";
+import { ArtifactPane, FileTree, DiffViewer, PermissionModal, ApprovalChainModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
@@ -54,6 +54,7 @@ import { useArtifactStore } from "./store/artifactStore";
 import { usePermissionStore } from "./store/permissionStore";
 import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
+import { subscribeToLocalAppsChanges, subscribeToLocalAppRunRequests } from "./store/localAppsStore";
 import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
@@ -429,6 +430,20 @@ function App() {
   useEffect(() => {
     if (isTauri() && getCurrentWindow().label === "main") {
       recoverDaemonDesktopTurns();
+    }
+  }, []);
+
+  // Local App Builder (ROADMAP.md, Phase 3): a published app's static page
+  // triggers a run over HTTP, but only the desktop app's own frontend loop
+  // can actually execute a recipe (`recipeRunner.ts`'s `runRecipeNow`) — see
+  // `local_apps.rs`'s module doc. Main-window-only, same reasoning as the
+  // scheduler and daemon-recovery effects above: every window shares the
+  // same local API server, so running this in a secondary window too would
+  // race to handle the same run request twice.
+  useEffect(() => {
+    void subscribeToLocalAppsChanges();
+    if (isTauri() && getCurrentWindow().label === "main") {
+      void subscribeToLocalAppRunRequests();
     }
   }, []);
 
@@ -1634,6 +1649,7 @@ setVisualEditModeOpen(false);
         />
       )}
       <PermissionModal />
+      <ApprovalChainModal />
       <PrivacyFirewallGate />
       <SettingsModal
         open={settingsOpen}

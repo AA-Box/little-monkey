@@ -180,6 +180,7 @@ describe("connectorBuilderStore.runSimulator + registerWithMcp gating", () => {
           tools: [],
           instructions: null,
           hasHttpToken: false,
+          hasOauth: false,
         },
       ],
     });

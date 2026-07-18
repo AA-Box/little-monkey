@@ -69,6 +69,13 @@ export interface TriageStore {
    * on the Rust side (`request_permission`, a distinct tool name per action
    * kind) — this call can reject with "Permission denied". */
   sendDraft: (itemId: string) => Promise<void>;
+  /** Hides the item from this session's queue view only — matches
+   * `TriagePanel.discardedNotice`'s copy ("Discarded from this session's
+   * view"). Never touches `triage.json` or the backend: the item is still
+   * there and will reappear the next time `list()`/`refresh()` runs (a
+   * fresh app launch, or an explicit queue refresh), unlike `sendDraft`
+   * which removes it for good. */
+  discard: (itemId: string) => void;
 }
 
 // Sequencing guard for concurrent list()/refresh() calls — same rationale
@@ -123,6 +130,10 @@ export const useTriageStore = create<TriageStore>((set, get) => ({
 
   sendDraft: async (itemId) => {
     await invoke("triage_send_draft", { itemId });
+    set({ items: get().items.filter((item) => item.id !== itemId) });
+  },
+
+  discard: (itemId) => {
     set({ items: get().items.filter((item) => item.id !== itemId) });
   },
 }));

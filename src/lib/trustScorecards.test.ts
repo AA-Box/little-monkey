@@ -171,6 +171,7 @@ describe("trustScorecards", () => {
         tools: [],
         instructions: null,
         hasHttpToken: false,
+        hasOauth: false,
         ...overrides,
       };
     }

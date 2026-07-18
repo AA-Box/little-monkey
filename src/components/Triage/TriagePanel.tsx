@@ -171,13 +171,12 @@ function ItemRow({ item, selected, onSelect }: { item: TriageItem; selected: boo
   );
 }
 
-function ItemDetail({ item }: { item: TriageItem }) {
+function ItemDetail({ item, onDiscard }: { item: TriageItem; onDiscard: (itemId: string) => void }) {
   const { t } = useT();
   const generateDraft = useTriageStore((s) => s.generateDraft);
   const sendDraft = useTriageStore((s) => s.sendDraft);
   const [generating, setGenerating] = useState(false);
   const [sending, setSending] = useState(false);
-  const [discarded, setDiscarded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const chatTarget = getActiveChatTarget();
@@ -205,10 +204,6 @@ function ItemDetail({ item }: { item: TriageItem }) {
       setError(err instanceof Error ? err.message : String(err));
       setSending(false);
     }
-  }
-
-  if (discarded) {
-    return <p className="p-3 text-xs text-faint">{t("TriagePanel.discardedNotice")}</p>;
   }
 
   const action = item.suggested_action;
@@ -250,7 +245,7 @@ function ItemDetail({ item }: { item: TriageItem }) {
       {error && <p className="text-xs text-danger">{error}</p>}
 
       <div className="flex flex-wrap justify-end gap-2">
-        <Button variant="ghost" size="sm" onClick={() => setDiscarded(true)} disabled={sending}>
+        <Button variant="ghost" size="sm" onClick={() => onDiscard(item.id)} disabled={sending}>
           <Trash2 size={12} />
           {t("TriagePanel.discardButton")}
         </Button>
@@ -290,6 +285,7 @@ export function TriagePanel() {
   const error = useTriageStore((s) => s.error);
   const list = useTriageStore((s) => s.list);
   const refresh = useTriageStore((s) => s.refresh);
+  const discard = useTriageStore((s) => s.discard);
   const refreshConnectors = useConnectorsStore((s) => s.refresh);
 
   const [sources, setSources] = useState<TriageSourceSpec[]>([]);
@@ -384,7 +380,7 @@ export function TriagePanel() {
 
         <div className="rounded-lg border border-border bg-surface">
           {selected ? (
-            <ItemDetail key={selected.id} item={selected} />
+            <ItemDetail key={selected.id} item={selected} onDiscard={discard} />
           ) : (
             <p className="p-3 text-xs text-faint">{t("TriagePanel.noSelectionState")}</p>
           )}

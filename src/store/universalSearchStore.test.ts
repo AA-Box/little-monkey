@@ -73,6 +73,7 @@ function mcpServer(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
     tools: [{ name: "search_issues", description: "Search issues", inputSchema: {} }],
     instructions: null,
     hasHttpToken: false,
+    hasOauth: false,
     ...overrides,
   };
 }

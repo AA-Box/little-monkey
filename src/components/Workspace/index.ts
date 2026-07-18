@@ -6,6 +6,8 @@ export type { DiffViewerProps } from "./DiffViewer";
 
 export { PermissionModal } from "./PermissionModal";
 
+export { ApprovalChainModal } from "./ApprovalChainModal";
+
 export { SessionGrantBanner } from "./SessionGrantBanner";
 
 export { WorkspaceBar } from "./WorkspaceBar";

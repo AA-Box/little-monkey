@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Button, StatusPill } from "../ui";
 import type { PillTone } from "../ui/StatusPill";
-import { useApiServerStore, type Backend, type Scope } from "../../store/apiServerStore";
+import { useApiServerStore, type Backend, type Scope, type TokenAuditEntry } from "../../store/apiServerStore";
 import { useT } from "../../lib/i18n";
+import { buildWidgetEmbedSnippet, resolveExpiryPreset, type TokenExpiryPreset } from "../../lib/chatWidgetEmbed";
 
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` (the description-supporting
@@ -54,8 +55,9 @@ const STATUS_TONES: Record<string, PillTone> = {
   error: "danger",
 };
 
-const SCOPE_OPTIONS: Scope[] = ["chat", "models", "embeddings"];
+const SCOPE_OPTIONS: Scope[] = ["chat", "models", "embeddings", "knowledge", "workflow_run", "artifact_read"];
 const BACKEND_OPTIONS: Backend[] = ["local", "ollama", "providers"];
+const EXPIRY_PRESETS: TokenExpiryPreset[] = ["never", "1h", "1d", "7d", "30d", "90d"];
 
 /**
  * Settings "API Server" tab (phase 2): on/off toggle, port field (applies
@@ -78,6 +80,7 @@ export function ApiServerPanel() {
   const createToken = useApiServerStore((s) => s.createToken);
   const revokeToken = useApiServerStore((s) => s.revokeToken);
   const dismissMintedToken = useApiServerStore((s) => s.dismissMintedToken);
+  const exportAudit = useApiServerStore((s) => s.exportAudit);
 
   useEffect(() => {
     void refresh();
@@ -99,12 +102,71 @@ export function ApiServerPanel() {
   const [createLabel, setCreateLabel] = useState("");
   const [createScopes, setCreateScopes] = useState<Scope[]>(["chat", "models"]);
   const [createBackends, setCreateBackends] = useState<Backend[]>(["local", "ollama"]);
+  const [createExpiry, setCreateExpiry] = useState<TokenExpiryPreset>("never");
   const [creatingToken, setCreatingToken] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [confirmingRevokeId, setConfirmingRevokeId] = useState<string | null>(null);
 
+  const [auditRows, setAuditRows] = useState<TokenAuditEntry[] | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [copiedAudit, setCopiedAudit] = useState(false);
+
+  const [widgetTokenId, setWidgetTokenId] = useState<string>("");
+  const [widgetTokenValue, setWidgetTokenValue] = useState("");
+  const [widgetTitle, setWidgetTitle] = useState("");
+  const [widgetModel, setWidgetModel] = useState("");
+  const [copiedWidgetSnippet, setCopiedWidgetSnippet] = useState(false);
+
   const running = status.status === "running" || status.status === "starting";
   const baseUrl = `http://127.0.0.1:${status.port || config.port}/v1`;
+
+  // Defaults the widget token picker to whichever token was most recently
+  // minted (its plaintext is still in hand via `mintedToken`), falling back
+  // to the first existing token otherwise — but never auto-fills a
+  // plaintext for a token this session didn't just create, since Little
+  // Monkey never persists or re-reveals one (see `chatWidgetEmbed.ts`'s doc
+  // comment).
+  useEffect(() => {
+    if (widgetTokenId && tokens.some((t) => t.id === widgetTokenId)) return;
+    const defaultId = mintedToken?.entry.id ?? tokens[0]?.id ?? "";
+    setWidgetTokenId(defaultId);
+  }, [tokens, mintedToken, widgetTokenId]);
+
+  useEffect(() => {
+    if (mintedToken && mintedToken.entry.id === widgetTokenId) {
+      setWidgetTokenValue(mintedToken.token);
+    }
+  }, [mintedToken, widgetTokenId]);
+
+  const widgetSelectedToken = tokens.find((t) => t.id === widgetTokenId) ?? null;
+  // Scopes beyond `chat` on the embedded token — the SDK README's own
+  // guidance is "do not reuse a token that also carries models/embeddings/
+  // knowledge/artifact_read/workflow_run" for the widget, since the plaintext
+  // ends up readable by anyone who views the embedding page's source.
+  const widgetExtraScopeLabels = widgetSelectedToken
+    ? widgetSelectedToken.scopes.filter((scope) => scope !== "chat").map((scope) => t(`ApiServerPanel.scope.${scope}`))
+    : [];
+
+  // Manually switching the reference-token dropdown must not leave a stale
+  // plaintext (from a previously selected token) paired with a scope warning
+  // that now describes a *different* token — only re-populate the plaintext
+  // automatically when switching back to the token just minted this session.
+  function handleWidgetTokenIdChange(nextId: string) {
+    setWidgetTokenId(nextId);
+    setWidgetTokenValue(mintedToken && mintedToken.entry.id === nextId ? mintedToken.token : "");
+  }
+
+  const widgetSnippet = useMemo(
+    () =>
+      buildWidgetEmbedSnippet({
+        baseUrl,
+        token: widgetTokenValue,
+        model: widgetModel.trim() || undefined,
+        title: widgetTitle.trim() || undefined,
+      }),
+    [baseUrl, widgetTokenValue, widgetModel, widgetTitle],
+  );
 
   async function handleToggle(value: boolean) {
     setError(null);
@@ -174,12 +236,25 @@ export function ApiServerPanel() {
     setCreateError(null);
     setCreatingToken(true);
     try {
-      await createToken(createLabel.trim(), createScopes, createBackends);
+      await createToken(createLabel.trim(), createScopes, createBackends, resolveExpiryPreset(createExpiry));
       setCreateLabel("");
+      setCreateExpiry("never");
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : String(err));
     } finally {
       setCreatingToken(false);
+    }
+  }
+
+  async function handleRefreshAudit() {
+    setAuditError(null);
+    setAuditLoading(true);
+    try {
+      setAuditRows(await exportAudit());
+    } catch (err) {
+      setAuditError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAuditLoading(false);
     }
   }
 
@@ -195,6 +270,14 @@ export function ApiServerPanel() {
 
   function formatDate(ms: number): string {
     return new Date(ms).toLocaleString();
+  }
+
+  // A token past its `expires_at` already gets a 401 from every request
+  // (see `authenticate`'s expiry check) whether or not it's been explicitly
+  // revoked — so the panel must never call it "Active" just because it's
+  // still sitting in `config.tokens` rather than `config.revoked`.
+  function isExpired(expiresAt: number | null): boolean {
+    return expiresAt !== null && expiresAt <= Date.now();
   }
 
   return (
@@ -384,6 +467,16 @@ export function ApiServerPanel() {
                   {t("ApiServerPanel.createdLabel", { date: formatDate(token.created_at) })}
                   {" · "}
                   {token.last_used_at ? t("ApiServerPanel.lastUsedLabel", { date: formatDate(token.last_used_at) }) : t("ApiServerPanel.neverUsedLabel")}
+                  {" · "}
+                  {token.expires_at ? (
+                    <span className={isExpired(token.expires_at) ? "font-medium text-danger" : undefined}>
+                      {isExpired(token.expires_at)
+                        ? t("ApiServerPanel.expiredLabel", { date: formatDate(token.expires_at) })
+                        : t("ApiServerPanel.expiresLabel", { date: formatDate(token.expires_at) })}
+                    </span>
+                  ) : (
+                    t("ApiServerPanel.neverExpiresLabel")
+                  )}
                 </p>
               </div>
             ))}
@@ -424,6 +517,21 @@ export function ApiServerPanel() {
             </div>
           </div>
 
+          <label className="flex items-center justify-between gap-2 text-xs text-muted">
+            <span>{t("ApiServerPanel.createTokenExpiryLabel")}</span>
+            <select
+              value={createExpiry}
+              onChange={(event) => setCreateExpiry(event.target.value as TokenExpiryPreset)}
+              className="h-7 rounded-md border border-border bg-surface px-2 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              {EXPIRY_PRESETS.map((preset) => (
+                <option key={preset} value={preset}>
+                  {t(`ApiServerPanel.expiryPreset.${preset}`)}
+                </option>
+              ))}
+            </select>
+          </label>
+
           {createError && <p className="text-xs text-danger">{createError}</p>}
 
           <Button
@@ -434,6 +542,174 @@ export function ApiServerPanel() {
           >
             {creatingToken ? t("ApiServerPanel.createTokenCreatingButton") : t("ApiServerPanel.createTokenButton")}
           </Button>
+        </div>
+      </section>
+
+      <section>
+        <div className="mb-1 flex items-center justify-between">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-faint">{t("ApiServerPanel.auditHeading")}</h3>
+          <div className="flex items-center gap-2">
+            {auditRows && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => void copy(JSON.stringify(auditRows, null, 2), setCopiedAudit)}
+              >
+                {copiedAudit ? t("ApiServerPanel.copiedButton") : t("ApiServerPanel.auditCopyButton")}
+              </Button>
+            )}
+            <Button variant="secondary" size="sm" onClick={() => void handleRefreshAudit()} disabled={auditLoading}>
+              {auditLoading ? t("ApiServerPanel.auditRefreshingButton") : t("ApiServerPanel.auditRefreshButton")}
+            </Button>
+          </div>
+        </div>
+        <p className="mb-1.5 text-xs text-faint">{t("ApiServerPanel.auditDescription")}</p>
+
+        {auditError && <p className="mb-1.5 text-xs text-danger">{auditError}</p>}
+
+        {auditRows === null ? (
+          <p className="px-1 text-xs text-faint">{t("ApiServerPanel.auditNotLoadedState")}</p>
+        ) : auditRows.length === 0 ? (
+          <p className="px-1 text-xs text-faint">{t("ApiServerPanel.auditEmptyState")}</p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {auditRows.map((row) => {
+              const rowExpired = !row.revoked_at && isExpired(row.expires_at);
+              return (
+                <div key={row.id} className="rounded-lg border border-border bg-background p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-medium text-foreground">{row.label}</span>
+                    {row.scopes.map((scope) => (
+                      <span key={scope} className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted">
+                        {t(`ApiServerPanel.scope.${scope}`)}
+                      </span>
+                    ))}
+                    <span
+                      className={`ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase ${
+                        row.revoked_at
+                          ? "bg-danger-soft text-danger"
+                          : rowExpired
+                            ? "bg-warning-soft text-warning"
+                            : "bg-accent-soft text-accent"
+                      }`}
+                    >
+                      {row.revoked_at
+                        ? t("ApiServerPanel.auditRevokedBadge")
+                        : rowExpired
+                          ? t("ApiServerPanel.auditExpiredBadge")
+                          : t("ApiServerPanel.auditActiveBadge")}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-faint">
+                    {t("ApiServerPanel.createdLabel", { date: formatDate(row.created_at) })}
+                    {row.revoked_at ? (
+                      <>
+                        {" · "}
+                        {t("ApiServerPanel.auditRevokedLabel", { date: formatDate(row.revoked_at) })}
+                      </>
+                    ) : row.expires_at ? (
+                      <>
+                        {" · "}
+                        {rowExpired
+                          ? t("ApiServerPanel.expiredLabel", { date: formatDate(row.expires_at) })
+                          : t("ApiServerPanel.expiresLabel", { date: formatDate(row.expires_at) })}
+                      </>
+                    ) : (
+                      <>
+                        {" · "}
+                        {t("ApiServerPanel.neverExpiresLabel")}
+                      </>
+                    )}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("ApiServerPanel.widgetHeading")}</h3>
+        <p className="mb-1.5 text-xs text-faint">{t("ApiServerPanel.widgetDescription")}</p>
+
+        <div className="flex flex-col gap-2.5 rounded-lg border border-border bg-background p-3">
+          {tokens.length === 0 ? (
+            <p className="text-xs text-faint">{t("ApiServerPanel.widgetNoTokensState")}</p>
+          ) : (
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              {t("ApiServerPanel.widgetTokenLabel")}
+              <select
+                value={widgetTokenId}
+                onChange={(event) => handleWidgetTokenIdChange(event.target.value)}
+                className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                {tokens.map((token) => (
+                  <option key={token.id} value={token.id}>
+                    {token.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          {widgetSelectedToken && !widgetSelectedToken.scopes.includes("chat") && (
+            <p className="rounded-md bg-warning-soft px-2 py-1.5 text-xs text-warning">
+              {t("ApiServerPanel.widgetScopeWarning")}
+            </p>
+          )}
+
+          {widgetSelectedToken && widgetExtraScopeLabels.length > 0 && (
+            <p className="rounded-md bg-warning-soft px-2 py-1.5 text-xs text-warning">
+              {t("ApiServerPanel.widgetBroadScopeWarning", { scopes: widgetExtraScopeLabels.join(", ") })}
+            </p>
+          )}
+
+          <label className="flex flex-col gap-1 text-xs text-muted">
+            {t("ApiServerPanel.widgetPasteTokenLabel")}
+            <input
+              type="text"
+              value={widgetTokenValue}
+              onChange={(event) => setWidgetTokenValue(event.target.value)}
+              placeholder={t("ApiServerPanel.widgetPasteTokenPlaceholder")}
+              className="h-8 rounded-md border border-border bg-surface px-2.5 font-mono text-xs text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+          </label>
+
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <label className="flex flex-1 flex-col gap-1 text-xs text-muted">
+              {t("ApiServerPanel.widgetTitleLabel")}
+              <input
+                type="text"
+                value={widgetTitle}
+                onChange={(event) => setWidgetTitle(event.target.value)}
+                placeholder={t("ApiServerPanel.widgetTitlePlaceholder")}
+                className="h-8 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            </label>
+            <label className="flex flex-1 flex-col gap-1 text-xs text-muted">
+              {t("ApiServerPanel.widgetModelLabel")}
+              <input
+                type="text"
+                value={widgetModel}
+                onChange={(event) => setWidgetModel(event.target.value)}
+                placeholder={t("ApiServerPanel.widgetModelPlaceholder")}
+                className="h-8 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            </label>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-muted">{t("ApiServerPanel.widgetSnippetLabel")}</span>
+              <Button variant="secondary" size="sm" onClick={() => void copy(widgetSnippet, setCopiedWidgetSnippet)}>
+                {copiedWidgetSnippet ? t("ApiServerPanel.copiedButton") : t("ApiServerPanel.widgetCopySnippetButton")}
+              </Button>
+            </div>
+            <pre className="max-h-48 overflow-auto rounded-md border border-border bg-surface p-2.5 font-mono text-xs text-foreground">
+              {widgetSnippet}
+            </pre>
+            <p className="text-xs text-faint">{t("ApiServerPanel.widgetSnippetHint")}</p>
+          </div>
         </div>
       </section>
     </div>
