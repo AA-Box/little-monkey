@@ -1,4 +1,17 @@
 import { create } from "zustand";
+import {
+  DEFAULT_APPEARANCE_SETTINGS,
+  applyAppearance,
+  getStoredThemePreference,
+  isAccentColor,
+  isMotionPreference,
+  isTextScale,
+  isThemePreference,
+  type AccentColor,
+  type MotionPreference,
+  type TextScale,
+  type ThemePreference,
+} from "../lib/theme";
 
 /** localStorage key the full settings blob is persisted under after every mutation.
  * Exported so tests can clear it and re-import the module to genuinely
@@ -18,6 +31,16 @@ export interface ProviderRateLimit {
 }
 
 export interface SettingsState {
+  /** UI theme choice. `system` follows the OS preference; the resolved value is applied to `data-theme`. */
+  themePreference: ThemePreference;
+  /** App accent color applied via root CSS variables. */
+  accentColor: AccentColor;
+  /** Global interface text scale applied to the root font-size. */
+  textScale: TextScale;
+  /** Motion preference for app transitions and animations. */
+  motionPreference: MotionPreference;
+  /** Strengthens borders and secondary text for easier scanning. */
+  highContrastEnabled: boolean;
   /** Retry the next configured cloud provider when one errors before any content streams back. */
   autoFailoverEnabled: boolean;
   /** Auto-switch to a vision-capable model when an image is attached and the active one can't see. */
@@ -52,6 +75,58 @@ export interface SettingsState {
   artifactScriptsEnabled: boolean;
   /** Whether `runTurnGuarded` (see `agentLoop.ts`) auto-opens the newest previewable artifact from a just-finished turn in `ArtifactPane`. Default false, mirroring `verifyEnabled`'s "automatically doing something on the user's behalf should be opt-in" posture — a user who didn't ask for a preview shouldn't have the workspace panel commandeered out from under them. Only artifacts produced by the turn that just completed are considered, never ones already sitting earlier in the transcript. */
   artifactAutoPreview: boolean;
+  /** Whether the `task` tool (subagent delegation — see `subagent.ts`'s
+   * `runSubagentTask`) is offered to the model this turn (see
+   * `agentLoop.ts`'s `toolsForSettings` filter). Default false: a weak local
+   * model may misuse or loop on it, so this ships default-off exactly like
+   * `verifyEnabled` — "automatically doing something on the model's own
+   * initiative should be opt-in". Turning it off makes `task` invisible to
+   * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
+   * not offered" treatment of `remember`. */
+  subagentsEnabled: boolean;
+  /** Whether the model can invoke an installed skill on its own initiative
+   * (see `tools.ts`'s `SKILL_INVOKE_TOOL` and `agentLoop.ts`'s
+   * `toolsForSettings` filter), in addition to a user explicitly typing
+   * `/command`. Default false, same posture as `subagentsEnabled` —
+   * "automatically doing something on the model's own initiative should be
+   * opt-in". Turning it off makes both the `skill` tool AND the "## Available
+   * skills" catalog invisible to the model (not merely denied), mirroring
+   * `memoryEnabled`'s "disabled = not offered" treatment of `remember`;
+   * explicit `/command` invocation is unaffected either way. */
+  skillAutoInvokeEnabled: boolean;
+  /** How many `task` tool calls in the same round trip `runToolCallsForRound`
+   * (see `agentLoop.ts`) will run concurrently via its bounded promise pool —
+   * every other tool call in the round stays sequential regardless of this
+   * value (see that function's own doc comment). Range 1-4, default 2:
+   * mirrors `verifyMaxRounds`'s small-integer-range pattern. A value of 1
+   * behaves like slice 1/2 (subagents never overlap); permission-prompt
+   * storms from several concurrent `code`-profile subagents in manual mode
+   * are the reason this stays capped at 4 rather than "however many the
+   * model asks for" — see the design doc's "Permission-prompt storms" risk. */
+  maxConcurrentSubagents: number;
+  /** Optional per-profile provider-model override for subagent runs (slice
+   * 4) — resolved in `subagent.ts`'s `runSubagentTask`, which uses it INSTEAD
+   * of the parent turn's own resolved target for that one profile, e.g.
+   * running every `explore` subagent on a cheap/fast model while the parent
+   * conversation stays on something stronger. Keyed by profile; a profile
+   * absent from this map (the default, empty map) means "same target as the
+   * parent turn", exactly like slices 1-3 behaved before this setting
+   * existed. Deliberately provider-only (never `'local'`/`'ollama'`, unlike
+   * `ResolvedTarget` generally) — restricting the override to provider
+   * targets keeps the settings-panel picker to the same
+   * provider-then-model dropdown pair `visionOverrides` already uses,
+   * rather than a three-way target-kind picker for a minor v1 win (see the
+   * design doc's "keep this genuinely optional... don't force a UI" note). */
+  subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  /** Whether the Safe Desktop Control settings panel (see
+   * `src-tauri/src/desktop_control.rs` and `docs/safe-desktop-control-design.md`)
+   * is reachable at all. Default false — same "disabled = not offered"
+   * posture as `subagentsEnabled`/`skillAutoInvokeEnabled`: this is a
+   * research spike that can move the real mouse/keyboard on macOS, so it
+   * stays off until a user deliberately opts in, in addition to every
+   * backend-side gate (never-bypass, allowlist, per-action approval,
+   * emergency stop) already enforced regardless of this setting. */
+  desktopControlEnabled: boolean;
 
   setAutoFailoverEnabled: (value: boolean) => void;
   setAutoVisionSwitchEnabled: (value: boolean) => void;
@@ -74,6 +149,23 @@ export interface SettingsState {
   setRiskAnnotationsEnabled: (value: boolean) => void;
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
+  setSubagentsEnabled: (value: boolean) => void;
+  setSkillAutoInvokeEnabled: (value: boolean) => void;
+  setMaxConcurrentSubagents: (value: number) => void;
+  setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
+  clearSubagentProfileModel: (profile: 'explore' | 'code') => void;
+  setDesktopControlEnabled: (value: boolean) => void;
+  setThemePreference: (value: ThemePreference) => void;
+  setAccentColor: (value: AccentColor) => void;
+  setTextScale: (value: TextScale) => void;
+  setMotionPreference: (value: MotionPreference) => void;
+  setHighContrastEnabled: (value: boolean) => void;
+}
+
+/** A single per-profile subagent model override — see `subagentProfileModels`'s own doc comment. */
+export interface SubagentModelOverride {
+  providerId: string;
+  model: string;
 }
 
 /** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
@@ -104,8 +196,17 @@ export const MAX_CHECKPOINT_RETENTION = 100;
 const DEFAULT_VERIFY_MAX_ROUNDS = 1;
 export const MIN_VERIFY_MAX_ROUNDS = 0;
 export const MAX_VERIFY_MAX_ROUNDS = 3;
+/** See `maxConcurrentSubagents`'s own doc comment for why this range. */
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2;
+export const MIN_MAX_CONCURRENT_SUBAGENTS = 1;
+export const MAX_MAX_CONCURRENT_SUBAGENTS = 4;
 
 interface PersistedShape {
+  themePreference: ThemePreference;
+  accentColor: AccentColor;
+  textScale: TextScale;
+  motionPreference: MotionPreference;
+  highContrastEnabled: boolean;
   autoFailoverEnabled: boolean;
   autoVisionSwitchEnabled: boolean;
   contextTrimEnabled: boolean;
@@ -123,10 +224,17 @@ interface PersistedShape {
   riskAnnotationsEnabled: boolean;
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
+  subagentsEnabled: boolean;
+  skillAutoInvokeEnabled: boolean;
+  maxConcurrentSubagents: number;
+  subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  desktopControlEnabled: boolean;
 }
 
 function defaults(): PersistedShape {
   return {
+    ...DEFAULT_APPEARANCE_SETTINGS,
+    themePreference: getStoredThemePreference(),
     autoFailoverEnabled: true,
     autoVisionSwitchEnabled: true,
     contextTrimEnabled: true,
@@ -144,7 +252,27 @@ function defaults(): PersistedShape {
     riskAnnotationsEnabled: false,
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
+    subagentsEnabled: false,
+    skillAutoInvokeEnabled: false,
+    maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+    subagentProfileModels: {},
+    desktopControlEnabled: false,
   };
+}
+
+/** Defensive per-entry validation for a persisted `subagentProfileModels` blob — same posture as `sanitizeProviderModelFilters` just above: one malformed/hand-edited entry must not corrupt the rest or crash hydration. */
+function sanitizeSubagentProfileModels(raw: unknown): Partial<Record<'explore' | 'code', SubagentModelOverride>> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Partial<Record<'explore' | 'code', SubagentModelOverride>> = {};
+  for (const profile of ['explore', 'code'] as const) {
+    const entry = (raw as Record<string, unknown>)[profile];
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as Partial<SubagentModelOverride>;
+    if (typeof candidate.providerId === "string" && candidate.providerId && typeof candidate.model === "string" && candidate.model) {
+      out[profile] = { providerId: candidate.providerId, model: candidate.model };
+    }
+  }
+  return out;
 }
 
 /** Defensive per-entry validation for a persisted `providerModelFilters` blob — one malformed entry (e.g. hand-edited localStorage) must not corrupt the rest. */
@@ -173,6 +301,12 @@ function hydrate(): PersistedShape {
     const parsed = JSON.parse(raw) as Partial<PersistedShape> | null;
     if (!parsed || typeof parsed !== "object") return fallback;
     return {
+      themePreference: isThemePreference(parsed.themePreference) ? parsed.themePreference : fallback.themePreference,
+      accentColor: isAccentColor(parsed.accentColor) ? parsed.accentColor : fallback.accentColor,
+      textScale: isTextScale(parsed.textScale) ? parsed.textScale : fallback.textScale,
+      motionPreference: isMotionPreference(parsed.motionPreference) ? parsed.motionPreference : fallback.motionPreference,
+      highContrastEnabled:
+        typeof parsed.highContrastEnabled === "boolean" ? parsed.highContrastEnabled : fallback.highContrastEnabled,
       autoFailoverEnabled: typeof parsed.autoFailoverEnabled === "boolean" ? parsed.autoFailoverEnabled : fallback.autoFailoverEnabled,
       autoVisionSwitchEnabled:
         typeof parsed.autoVisionSwitchEnabled === "boolean" ? parsed.autoVisionSwitchEnabled : fallback.autoVisionSwitchEnabled,
@@ -211,6 +345,18 @@ function hydrate(): PersistedShape {
         typeof parsed.artifactScriptsEnabled === "boolean" ? parsed.artifactScriptsEnabled : fallback.artifactScriptsEnabled,
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
+      subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      skillAutoInvokeEnabled:
+        typeof parsed.skillAutoInvokeEnabled === "boolean" ? parsed.skillAutoInvokeEnabled : fallback.skillAutoInvokeEnabled,
+      maxConcurrentSubagents:
+        typeof parsed.maxConcurrentSubagents === "number" &&
+        parsed.maxConcurrentSubagents >= MIN_MAX_CONCURRENT_SUBAGENTS &&
+        parsed.maxConcurrentSubagents <= MAX_MAX_CONCURRENT_SUBAGENTS
+          ? Math.round(parsed.maxConcurrentSubagents)
+          : fallback.maxConcurrentSubagents,
+      subagentProfileModels: sanitizeSubagentProfileModels(parsed.subagentProfileModels),
+      desktopControlEnabled:
+        typeof parsed.desktopControlEnabled === "boolean" ? parsed.desktopControlEnabled : fallback.desktopControlEnabled,
     };
   } catch {
     return fallback;
@@ -228,8 +374,48 @@ function persist(state: PersistedShape): void {
 
 const initial = hydrate();
 
+function applyCurrentAppearance(state: SettingsState): void {
+  applyAppearance({
+    themePreference: state.themePreference,
+    accentColor: state.accentColor,
+    textScale: state.textScale,
+    motionPreference: state.motionPreference,
+    highContrastEnabled: state.highContrastEnabled,
+  });
+}
+
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   ...initial,
+
+  setThemePreference: (value) => {
+    set({ themePreference: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setAccentColor: (value) => {
+    set({ accentColor: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setTextScale: (value) => {
+    set({ textScale: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setMotionPreference: (value) => {
+    set({ motionPreference: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setHighContrastEnabled: (value) => {
+    set({ highContrastEnabled: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
 
   setAutoFailoverEnabled: (value) => {
     set({ autoFailoverEnabled: value });
@@ -354,6 +540,40 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setArtifactAutoPreview: (value) => {
     set({ artifactAutoPreview: value });
+    persist({ ...get() });
+  },
+
+  setSubagentsEnabled: (value) => {
+    set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setSkillAutoInvokeEnabled: (value) => {
+    set({ skillAutoInvokeEnabled: value });
+    persist({ ...get() });
+  },
+
+  setMaxConcurrentSubagents: (value) => {
+    const clamped = Math.min(MAX_MAX_CONCURRENT_SUBAGENTS, Math.max(MIN_MAX_CONCURRENT_SUBAGENTS, Math.round(value)));
+    set({ maxConcurrentSubagents: clamped });
+    persist({ ...get() });
+  },
+
+  setSubagentProfileModel: (profile, override) => {
+    set((state) => ({ subagentProfileModels: { ...state.subagentProfileModels, [profile]: override } }));
+    persist({ ...get() });
+  },
+
+  clearSubagentProfileModel: (profile) => {
+    set((state) => {
+      const { [profile]: _discard, ...rest } = state.subagentProfileModels;
+      return { subagentProfileModels: rest };
+    });
+    persist({ ...get() });
+  },
+
+  setDesktopControlEnabled: (value) => {
+    set({ desktopControlEnabled: value });
     persist({ ...get() });
   },
 }));

@@ -18,7 +18,8 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
-use crate::{checkpoints, memory, permissions, workspace, AppState};
+use crate::workspace::display_relative_path;
+use crate::{checkpoints, memory, native_skill_commands, permissions, workspace, AppState};
 
 /// Directory names that are never descended into by [`tool_grep`] — build
 /// output, VCS metadata, and dependency trees are noisy, huge, and almost
@@ -28,7 +29,11 @@ const GREP_SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "dist"];
 /// Directory names that are never descended into by [`list_workspace_paths`]
 /// — VCS metadata, build output, and dependency/cache trees that would
 /// otherwise flood the "@"-mention autocomplete list with noise.
-const MENTION_SKIP_DIRS: [&str; 10] = [
+///
+/// `pub(crate)` (unlike `GREP_SKIP_DIRS` above) so `stacks.rs`'s source
+/// folder walker can reuse the exact same skip-dir philosophy instead of
+/// duplicating the list — see that module's `collect_source_files`.
+pub(crate) const MENTION_SKIP_DIRS: [&str; 10] = [
     ".git",
     "node_modules",
     "target",
@@ -60,7 +65,10 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read a UTF-8 text file from the workspace.
 #[tauri::command]
-pub async fn tool_read_file(state: tauri::State<'_, AppState>, path: String) -> Result<String, String> {
+pub async fn tool_read_file(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
     let (resolved, _) = workspace::resolve_path_and_root(state.inner(), &path)?;
 
     if !resolved.is_file() {
@@ -82,7 +90,8 @@ pub async fn tool_list_dir(
         return Err(format!("'{}' is not a directory", path));
     }
 
-    let read_dir = std::fs::read_dir(&resolved).map_err(|e| format!("Failed to list '{}': {}", path, e))?;
+    let read_dir =
+        std::fs::read_dir(&resolved).map_err(|e| format!("Failed to list '{}': {}", path, e))?;
 
     let mut entries = Vec::new();
     for entry in read_dir {
@@ -156,11 +165,12 @@ pub async fn tool_grep(
         let display_path = format!(
             "{}{}",
             label_prefix,
-            entry
-                .path()
-                .strip_prefix(&display_root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
+            display_relative_path(
+                entry
+                    .path()
+                    .strip_prefix(&display_root)
+                    .unwrap_or_else(|_| entry.path())
+            )
         );
 
         for (idx, line) in content.lines().enumerate() {
@@ -236,7 +246,10 @@ fn glob_impl(
             continue;
         }
 
-        let relative = entry.path().strip_prefix(search_root).unwrap_or_else(|_| entry.path());
+        let relative = entry
+            .path()
+            .strip_prefix(search_root)
+            .unwrap_or_else(|_| entry.path());
         if !matcher.is_match(relative) {
             continue;
         }
@@ -244,11 +257,12 @@ fn glob_impl(
         let display_path = format!(
             "{}{}",
             label_prefix,
-            entry
-                .path()
-                .strip_prefix(display_root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
+            display_relative_path(
+                entry
+                    .path()
+                    .strip_prefix(display_root)
+                    .unwrap_or_else(|_| entry.path())
+            )
         );
         let modified = entry
             .metadata()
@@ -275,7 +289,26 @@ fn glob_impl(
 /// contain before ever setting these): the optional LLM risk-judge
 /// classification for this call, combined here with the authoritative
 /// `permissions::path_risk_floor` (which always wins) into the
-/// `RiskAssessment` shown on the permission prompt.
+/// `RiskAssessment` shown on the permission prompt. `agent_label` is the same
+/// story — frontend-injected only — but is passed straight through to
+/// [`permissions::request_permission`] as its own field rather than folded
+/// into `detail`: see that field's doc comment on
+/// `PermissionRequestPayload` for why detail-prefixing was the bug (a
+/// `code`-profile subagent's `description` is itself model-supplied text,
+/// and folding it into a string the frontend later re-parses by regex let a
+/// crafted description forge/corrupt the shown detail).
+///
+/// `file_write_lock` (see `AppState`'s doc comment on that field) is
+/// acquired AFTER permission is granted, held across the checkpoint backup
+/// and the write itself, and released before returning — the whole point is
+/// to serialize the backup+write pair for a given path against another
+/// concurrent `write_file`/`edit_file` call (most plausibly two `code`-
+/// profile subagents in the same round, see
+/// `agentLoop.ts::runToolCallsForRound`) that resolves to the SAME path,
+/// which could otherwise race past `record_original`'s dedup and interleave
+/// with this call's own `std::fs::write`, silently discarding one write with
+/// no error. Never held across an `.await` (permission is requested BEFORE
+/// acquiring it), so a plain `std::sync::Mutex` guard is safe to hold here.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -289,8 +322,10 @@ pub async fn tool_write_file(
     content: String,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
+    agent_label: Option<String>,
 ) -> Result<String, String> {
     // Resolved BEFORE the permission prompt (unlike this function's
     // pre-Phase-2 ordering) so `path_risk_floor` can be checked against the
@@ -300,8 +335,27 @@ pub async fn tool_write_file(
     let risk = permissions::compute_risk(Some((&resolved, &root)), risk_level, risk_reason);
 
     let detail = format!("Write {} bytes to {}", content.len(), path);
-    permissions::request_permission(&app, state.inner(), "write_file", detail, turn_id.as_deref(), risk)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "write_file",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        risk,
+        agent_label.as_deref(),
+    )
+    .await?;
+
+    // Serializes the backup+write critical section against any other
+    // concurrent write_file/edit_file targeting the same path — see this
+    // function's own doc comment above for the race this closes. Dropped
+    // automatically at the end of this synchronous block (no `.await` while
+    // held).
+    let _write_guard = state
+        .file_write_lock
+        .lock()
+        .map_err(|_| "File-write lock poisoned".to_string())?;
 
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
@@ -310,7 +364,8 @@ pub async fn tool_write_file(
             .map_err(|e| format!("Failed to create parent directories for '{}': {}", path, e))?;
     }
 
-    std::fs::write(&resolved, &content).map_err(|e| format!("Failed to write '{}': {}", path, e))?;
+    std::fs::write(&resolved, &content)
+        .map_err(|e| format!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Wrote {} bytes to {}", content.len(), path))
 }
@@ -338,7 +393,10 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
         preview.push(format!("- {}", truncate(line)));
     }
     if old_lines.len() > MAX_PREVIEW_LINES {
-        preview.push(format!("  … ({} more removed lines)", old_lines.len() - MAX_PREVIEW_LINES));
+        preview.push(format!(
+            "  … ({} more removed lines)",
+            old_lines.len() - MAX_PREVIEW_LINES
+        ));
     }
 
     let new_lines: Vec<&str> = new_string.lines().collect();
@@ -346,7 +404,10 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
         preview.push(format!("+ {}", truncate(line)));
     }
     if new_lines.len() > MAX_PREVIEW_LINES {
-        preview.push(format!("  … ({} more added lines)", new_lines.len() - MAX_PREVIEW_LINES));
+        preview.push(format!(
+            "  … ({} more added lines)",
+            new_lines.len() - MAX_PREVIEW_LINES
+        ));
     }
 
     preview.join("\n")
@@ -357,8 +418,20 @@ fn build_diff_preview(old_string: &str, new_string: &str) -> String {
 /// is found more than once (to avoid ambiguous edits). `checkpoint_id` is
 /// injected by the frontend agent loop (not the model) so the pre-mutation
 /// backup lands in the calling turn's own checkpoint. `risk_level`/
-/// `risk_reason` are likewise frontend-injected — see `tool_write_file`'s doc
-/// comment, identical treatment here.
+/// `risk_reason`/`agent_label` are likewise frontend-injected — see
+/// `tool_write_file`'s doc comment, identical treatment here.
+///
+/// The initial `current`/`occurrences` check below (before the permission
+/// prompt) is a best-effort pre-check only, purely to build the diff preview
+/// and reject an obviously-bad call before ever prompting. The content it
+/// actually mutates is RE-READ fresh from disk after `file_write_lock` is
+/// acquired (see `tool_write_file`'s doc comment on that field/lock) and the
+/// occurrence check is redone against that fresh read — so if another
+/// concurrent `write_file`/`edit_file` call for the SAME path completed in
+/// between (most plausibly two `code`-profile subagents in the same round —
+/// see `agentLoop.ts::runToolCallsForRound`), this call correctly errors
+/// (`old_string` no longer found/unique) instead of silently clobbering that
+/// other call's write with a `replacen` computed against stale content.
 ///
 /// `rename_all = "snake_case"`: the model's tool-call arguments arrive with
 /// snake_case keys (as declared in the frontend tool schema) and are passed
@@ -373,8 +446,10 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     new_string: String,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
+    agent_label: Option<String>,
 ) -> Result<String, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
@@ -386,8 +461,8 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
         return Err(format!("'{}' is not a file", path));
     }
 
-    let current =
-        std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let current = std::fs::read_to_string(&resolved)
+        .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
 
     let occurrences = current.matches(old_string.as_str()).count();
     if occurrences == 0 {
@@ -404,13 +479,51 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
     let preview = build_diff_preview(&old_string, &new_string);
     let detail = format!("Edit {}\n{}", path, preview);
 
-    permissions::request_permission(&app, state.inner(), "edit_file", detail, turn_id.as_deref(), risk)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "edit_file",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        risk,
+        agent_label.as_deref(),
+    )
+    .await?;
+
+    // Serializes the re-read+backup+write critical section against any
+    // other concurrent write_file/edit_file targeting the same path — see
+    // this function's own doc comment above and `tool_write_file`'s for the
+    // race this closes.
+    let _write_guard = state
+        .file_write_lock
+        .lock()
+        .map_err(|_| "File-write lock poisoned".to_string())?;
+
+    // Re-read fresh, now that we hold the lock: `current` above may already
+    // be stale if another call mutated this same path while this call's own
+    // permission prompt was pending.
+    let fresh = std::fs::read_to_string(&resolved)
+        .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let fresh_occurrences = fresh.matches(old_string.as_str()).count();
+    if fresh_occurrences == 0 {
+        return Err(format!(
+            "old_string not found in '{}' — the file changed since this edit was prepared (likely a concurrent edit).",
+            path
+        ));
+    }
+    if fresh_occurrences > 1 {
+        return Err(format!(
+            "old_string appears {} times in '{}'; it must be unique. Include more surrounding context.",
+            fresh_occurrences, path
+        ));
+    }
 
     checkpoints::record_original(state.inner(), checkpoint_id.as_deref(), &resolved)?;
 
-    let updated = current.replacen(old_string.as_str(), new_string.as_str(), 1);
-    std::fs::write(&resolved, &updated).map_err(|e| format!("Failed to write '{}': {}", path, e))?;
+    let updated = fresh.replacen(old_string.as_str(), new_string.as_str(), 1);
+    std::fs::write(&resolved, &updated)
+        .map_err(|e| format!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Edited {}", path))
 }
@@ -428,7 +541,16 @@ pub async fn tool_edit_file<R: tauri::Runtime>(
 /// `permissions.rs`'s module doc comment and `mode_short_circuit` — it can
 /// NEVER be threaded into anything that decides whether this call is
 /// auto-approved. `run_shell` always falls through to a real prompt in every
-/// mode below `"bypass"`, full stop.
+/// mode below `"bypass"`, full stop. `agent_label` is passed straight through
+/// to `request_permission` as its own field (see that field's doc comment on
+/// `PermissionRequestPayload`) — same cosmetic-only treatment, and the same
+/// "never affects auto-approval" guarantee applies to it too. Deliberately
+/// NOT folded into `detail`: `command` here is the raw, fully model-supplied
+/// shell command text, and a detail-string prefix a model could itself
+/// mimic (e.g. a command literally containing `"Subagent 'x': ..."`) would
+/// let a crafted command spoof/misattribute an ordinary parent-turn command
+/// as a vetted subagent's — passing `agent_label` as its own field instead
+/// of text `detail` shares means there is nothing for `command` to forge.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
@@ -437,12 +559,23 @@ pub async fn tool_run_shell(
     cwd: Option<String>,
     checkpoint_id: Option<String>,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
     risk_level: Option<String>,
     risk_reason: Option<String>,
+    agent_label: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
-    permissions::request_permission(&app, state.inner(), "run_shell", command.clone(), turn_id.as_deref(), risk)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "run_shell",
+        command.clone(),
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        risk,
+        agent_label.as_deref(),
+    )
+    .await?;
 
     checkpoints::record_shell(state.inner(), checkpoint_id.as_deref())?;
 
@@ -512,7 +645,10 @@ pub async fn tool_run_shell(
             .tool_cancel
             .lock()
             .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -531,8 +667,11 @@ pub async fn tool_run_shell(
 /// acceptEdits/auto, blocked in plan mode — see `permissions::mode_short_circuit`).
 /// Takes no path — it only ever writes app-data, never a workspace file — so
 /// unlike the other mutating tools it skips `workspace::resolve_path_and_root`
-/// sandboxing entirely; it still requires a workspace to be open, since a
-/// fact has to be keyed by some project's canonical root.
+/// sandboxing entirely. When no workspace is open, the fact is keyed under
+/// `memory::GLOBAL_SCOPE_KEY` instead of a project root — otherwise a plain
+/// chat with no folder open (e.g. "remember my name") silently had nowhere
+/// to save to and the tool call failed outright, even though the model had
+/// already told the user it remembered.
 ///
 /// `checkpoint_id` is deliberately NOT accepted here (unlike write/edit/
 /// run_shell): a remembered fact isn't a workspace file, so there is nothing
@@ -550,11 +689,23 @@ pub async fn tool_remember(
     state: tauri::State<'_, AppState>,
     text: String,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<memory::Fact, String> {
-    permissions::request_permission(&app, state.inner(), "remember", text.clone(), turn_id.as_deref(), None)
-        .await?;
+    permissions::request_permission(
+        &app,
+        state.inner(),
+        "remember",
+        text.clone(),
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
 
-    let root = workspace::primary_root_canon(state.inner())?;
+    let root = workspace::primary_root_canon(state.inner())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| memory::GLOBAL_SCOPE_KEY.to_string());
     let path = memory::memories_file_path(&app)?;
 
     // Serialized against concurrent split-pane `tool_remember` calls (and
@@ -562,8 +713,33 @@ pub async fn tool_remember(
     // whole `memories.json` file is rewritten on every add, so two
     // unsynchronized concurrent writers could otherwise silently drop one
     // fact's write.
-    let _lock = state.memory_lock.lock().map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root.to_string_lossy(), &text, "agent")
+    let _lock = state
+        .memory_lock
+        .lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
+    memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())
+}
+
+/// Read one bundled file from an installed native skill's folder — the
+/// progressive-disclosure counterpart to a skill's `resource_files` listing
+/// (see `native_skills.rs`'s `SkillDescriptor.resource_files` and
+/// `NativeSkillManager::read_resource`): the model reads a specific bundled
+/// reference/script only once it actually needs it, instead of the whole
+/// bundle being loaded up front. Read-only, so no `permissions::request_permission`
+/// gate — same posture as `tool_read_file`.
+#[tauri::command]
+pub async fn tool_read_skill_resource(
+    app: tauri::State<'_, AppState>,
+    native: tauri::State<'_, native_skill_commands::NativeSkillsCommandState>,
+    command: String,
+    path: String,
+) -> Result<String, String> {
+    let workspace = native_skill_commands::optional_primary_workspace(&app)?;
+    let manager = native.manager.clone();
+    native_skill_commands::run_blocking(move || {
+        manager.read_resource(&command, &path, workspace.as_deref())
+    })
+    .await
 }
 
 /// Cancel in-flight tool invocations: kills running `tool_run_shell` child
@@ -617,7 +793,9 @@ pub struct WorkspacePathsResult {
 /// [`tool_list_dir`] and [`tool_grep`], it is intentionally NOT
 /// permission-gated.
 #[tauri::command]
-pub fn list_workspace_paths(state: tauri::State<'_, AppState>) -> Result<WorkspacePathsResult, String> {
+pub fn list_workspace_paths(
+    state: tauri::State<'_, AppState>,
+) -> Result<WorkspacePathsResult, String> {
     let roots = workspace::all_roots(state.inner())?;
 
     let mut entries = Vec::new();
@@ -659,11 +837,7 @@ pub fn list_workspace_paths(state: tauri::State<'_, AppState>) -> Result<Workspa
                 Err(_) => continue,
             };
 
-            let relative_str = relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            let relative_str = display_relative_path(relative);
 
             // Primary-root entries stay unprefixed (no behavior change for
             // the common single-folder case); secondary-root entries are
@@ -760,7 +934,10 @@ mod tests {
     fn glob_rejects_invalid_pattern() {
         let tree = TempTree::new();
         let err = glob_impl("a{b", &tree.path, &tree.path, "").unwrap_err();
-        assert!(err.contains("Invalid glob pattern"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid glob pattern"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -783,11 +960,15 @@ mod tests {
 
         let state = crate::AppState::default();
         *state.permissions.mode.lock().unwrap() = "acceptEdits".to_string();
-        state.workspace_roots.lock().unwrap().push(workspace::WorkspaceRoot {
-            id: canonical.to_string_lossy().to_string(),
-            label: "test".to_string(),
-            path: canonical,
-        });
+        state
+            .workspace_roots
+            .lock()
+            .unwrap()
+            .push(workspace::WorkspaceRoot {
+                id: canonical.to_string_lossy().to_string(),
+                label: "test".to_string(),
+                path: canonical,
+            });
         state.checkpoints.lock().unwrap().insert(
             "test-checkpoint".to_string(),
             checkpoints::ActiveCheckpoint {
@@ -898,5 +1079,73 @@ mod tests {
             std::fs::read_to_string(tree.path.join("hello.txt")).unwrap(),
             "hello old world"
         );
+    }
+
+    /// Reproduces (and pins the fix for) the `tool_edit_file` half of the
+    /// review-flagged concurrent-write race: two concurrent edits targeting
+    /// the SAME path, both prepared against the same pre-existing
+    /// `old_string`, driven through the real command function (not just the
+    /// underlying primitives — see `checkpoints.rs`'s own concurrency test
+    /// for that side) via genuine tokio multi-thread parallelism. Without
+    /// `file_write_lock` and the fresh re-read/re-check performed under it
+    /// (see `tool_edit_file`'s doc comment), both calls could see
+    /// `old_string` present in their own pre-permission read and both
+    /// blindly `replacen` + write, silently discarding one edit with no
+    /// error. With the fix, exactly one call wins and the other correctly
+    /// errors (`old_string` no longer present) instead of corrupting the
+    /// file or losing a write silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_edit_file_calls_to_the_same_path_never_silently_lose_a_write() {
+        use tauri::Manager;
+
+        for _ in 0..20 {
+            let tree = TempTree::new();
+            std::fs::write(tree.path.join("shared.txt"), "hello OLD world").unwrap();
+
+            let app = mock_app_with_workspace(&tree.path);
+            let handle = app.handle().clone();
+
+            let run = |handle: tauri::AppHandle<tauri::test::MockRuntime>,
+                       new_value: &'static str| {
+                tokio::spawn(async move {
+                    // Widen the window for the two calls to genuinely
+                    // overlap before either takes the file-write lock.
+                    tokio::task::yield_now().await;
+                    let state = handle.state::<crate::AppState>();
+                    tool_edit_file(
+                        handle.clone(),
+                        state,
+                        "shared.txt".to_string(),
+                        "OLD".to_string(),
+                        new_value.to_string(),
+                        Some("test-checkpoint".to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                })
+            };
+
+            let a = run(handle.clone(), "FROM_A");
+            let b = run(handle.clone(), "FROM_B");
+            let (result_a, result_b) = tokio::join!(a, b);
+            let result_a = result_a.unwrap();
+            let result_b = result_b.unwrap();
+
+            let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
+            assert_eq!(
+                successes, 1,
+                "expected exactly one edit to win, got: {result_a:?} / {result_b:?}"
+            );
+
+            let final_content = std::fs::read_to_string(tree.path.join("shared.txt")).unwrap();
+            assert!(
+                final_content == "hello FROM_A world" || final_content == "hello FROM_B world",
+                "file content corrupted rather than a clean win by one editor: {final_content:?}"
+            );
+        }
     }
 }

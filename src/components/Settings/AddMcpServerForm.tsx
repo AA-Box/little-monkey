@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { Button } from "../ui";
 import { useMcpStore, type McpTransport } from "../../store/mcpStore";
@@ -11,6 +11,22 @@ interface EnvRow {
   id: number;
   key: string;
   value: string;
+}
+
+export interface McpServerDraft {
+  transportKind: "stdio" | "http";
+  label: string;
+  command?: string;
+  argsText?: string;
+  env?: Record<string, string>;
+  url?: string;
+  token?: string;
+  timeoutText?: string;
+}
+
+interface AddMcpServerFormProps {
+  draft?: McpServerDraft | null;
+  draftVersion?: number;
 }
 
 let nextRowId = 0;
@@ -34,7 +50,7 @@ function parseTimeoutSecs(raw: string): number | null {
  * never touches `mcp_servers.json`). Both transports share a per-server
  * timeout field wired to `McpServerEntry.timeout_secs`.
  */
-export function AddMcpServerForm() {
+export function AddMcpServerForm({ draft, draftVersion = 0 }: AddMcpServerFormProps) {
   const addServer = useMcpStore((s) => s.addServer);
   const connect = useMcpStore((s) => s.connect);
   const setHttpToken = useMcpStore((s) => s.setHttpToken);
@@ -50,6 +66,19 @@ export function AddMcpServerForm() {
   const [timeoutText, setTimeoutText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!draft) return;
+    setTransportKind(draft.transportKind);
+    setLabel(draft.label);
+    setCommand(draft.command ?? "");
+    setArgsText(draft.argsText ?? "");
+    setEnvRows(Object.entries(draft.env ?? {}).map(([key, value]) => ({ id: nextRowId++, key, value })));
+    setUrl(draft.url ?? "");
+    setToken(draft.token ?? "");
+    setTimeoutText(draft.timeoutText ?? "");
+    setError(null);
+  }, [draft, draftVersion]);
 
   const canSubmit =
     label.trim().length > 0 &&
@@ -211,6 +240,7 @@ export function AddMcpServerForm() {
 
           <div className="flex flex-col gap-1.5">
             <span className="text-xs text-muted">{t("AddMcpServerForm.envLabel")}</span>
+            <span className="text-xs text-faint">{t("AddMcpServerForm.envHelpText")}</span>
             {envRows.map((row) => (
               <div key={row.id} className="flex items-center gap-1.5">
                 <input

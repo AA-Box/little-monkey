@@ -4,6 +4,7 @@
 //! This is a *routing reverse proxy*, not a new inference engine: it runs a
 //! small hyper-1 HTTP server on a tokio task, bound to `127.0.0.1` only (no
 //! LAN bind — that's an explicitly later, separately-gated phase), and
+//! [`handle_request`] — the `AppHandle`-free, `monkey-cli`-reusable core —
 //! exposes exactly five routes:
 //!
 //!   - `GET  /health`              — unauthenticated liveness probe
@@ -15,17 +16,42 @@
 //!   - `OPTIONS /v1/*`             — CORS preflight (unauthenticated)
 //!   - everything else            — `404`
 //!
+//! Phase 5 (Private Developer API/Embeddable Chat Widget, ROADMAP.md) layers
+//! three more routes on top, in [`handle_extended_request`] — reachable only
+//! from the GUI's own accept loop (never from `monkey-cli api-serve`, which has
+//! no `AppHandle` to give them):
+//!
+//!   - `POST /v1/knowledge/query`      — [`Scope::Knowledge`], wraps
+//!                                       `knowledge_service::knowledge_v2_query`
+//!   - `GET  /v1/artifacts/{id}`       — [`Scope::ArtifactRead`], wraps
+//!                                       `artifact_commands::artifact_blob_read_base64`
+//!   - `GET  /v1/workflows/runs/{id}`  — [`Scope::WorkflowRun`], wraps
+//!                                       `run_commands::run_get` (status only)
+//!
 //! SECURITY: this surface is deliberately narrow. It must NEVER grow a route
 //! that reaches the agent's tool-dispatch layer (`tool_run_shell` and
 //! friends in `tools.rs`) — doing so would turn a local HTTP server into a
 //! remote-code-execution surface for anything that can reach loopback. Any
-//! future change to the `match` in [`handle_request`] must preserve that
-//! invariant.
+//! future change to the `match` in [`handle_request`] or
+//! [`handle_extended_request`] must preserve that invariant. This is exactly
+//! why `Scope::WorkflowRun` only ever gates a *read-only run status* lookup
+//! here, never a route that submits a new run: `run_commands::run_submit`
+//! only records a `RunSpec` into the durable ledger, but the app's own
+//! frontend event loop is what actually turns a ledger entry into live tool
+//! execution once it observes one — and that loop has no way to distinguish
+//! "a run this same desktop app's user started" from "a run an external HTTP
+//! caller just injected". Exposing run-submission here would hand any local
+//! process holding a `workflow_run`-scoped token exactly the remote-tool-
+//! execution surface this module's core invariant forbids. Wiring an actual
+//! "trigger a workflow over the API" route is therefore a deliberate
+//! non-goal of this stage, not an oversight — it needs its own dedicated
+//! design (most likely an explicit per-run approval, mirroring
+//! `permissions.rs`) before it can be added safely.
 //!
 //! Structured like `checkpoints.rs`/`web.rs`: an `AppHandle`-free,
 //! independently testable core ([`handle_request`], [`route_model`]) plus a
 //! thin `#[tauri::command]` layer that owns the actual listening socket and
-//! `AppState` bookkeeping. `pub` (not `mod`) so a future `lm-cli` `api-serve`
+//! `AppState` bookkeeping. `pub` (not `mod`) so a future `monkey-cli` `api-serve`
 //! subcommand (design doc phase 4) can reuse [`handle_request`] directly,
 //! the same reasoning as `web`/`prompts`/`rules` above it in `lib.rs`.
 //!
@@ -280,6 +306,23 @@ pub enum Scope {
     Chat,
     Models,
     Embeddings,
+    /// Gates `POST /v1/knowledge/query` — see [`handle_knowledge_query`].
+    Knowledge,
+    /// Gates `GET /v1/workflows/runs/{id}` — read-only run status, never
+    /// run submission. See the module doc comment's "why not submission"
+    /// note and [`handle_workflow_run_status`].
+    WorkflowRun,
+    /// Gates `GET /v1/artifacts/{id}` — see [`handle_artifact_read`].
+    ArtifactRead,
+    /// Gates `POST /v1/local-apps/{id}/run` — see [`local_apps`] and
+    /// [`handle_local_app_run`]. Only ever minted by
+    /// [`mint_local_app_token`], never by [`mint_token`] (the generic
+    /// create-token flow rejects it outright) — a token carrying this scope
+    /// is meaningless without also matching [`TokenEntry::bound_local_app_id`],
+    /// which the generic flow never sets. `backends` is always empty on a
+    /// token carrying only this scope, so it can never route through
+    /// `chat`/`models`/`embeddings` either — see [`mint_local_app_token`].
+    LocalAppRun,
 }
 
 /// Which upstream a [`TokenEntry`] may be routed to. Mirrors [`ModelRoute`]
@@ -304,7 +347,7 @@ fn backend_label(backend: Backend) -> &'static str {
 /// secret that ever reaches disk — see [`mint_token`]. `#[serde(default)]`
 /// throughout for the same hand-edited-file leniency as `CustomProviderEntry`/
 /// `WebSettings`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
     #[serde(default)]
     pub id: String,
@@ -320,6 +363,17 @@ pub struct TokenEntry {
     pub created_at: u64,
     #[serde(default)]
     pub last_used_at: Option<u64>,
+    /// Epoch milliseconds after which [`authenticate`] rejects this token,
+    /// or `None` for a token that never expires — the pre-phase-5 default,
+    /// preserved by `#[serde(default)]` for every token already on disk.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Set only by [`mint_local_app_token`] — the one Local App id this
+    /// token's [`Scope::LocalAppRun`] scope is allowed to run, checked by
+    /// [`authenticate_local_app_token`] against the id in the request path.
+    /// `None` for every ordinary token minted by [`mint_token`].
+    #[serde(default)]
+    pub bound_local_app_id: Option<String>,
 }
 
 /// Frontend-facing view of a [`TokenEntry`] with the digest stripped —
@@ -334,6 +388,7 @@ pub struct TokenEntryView {
     pub backends: Vec<Backend>,
     pub created_at: u64,
     pub last_used_at: Option<u64>,
+    pub expires_at: Option<u64>,
 }
 
 impl From<&TokenEntry> for TokenEntryView {
@@ -345,8 +400,104 @@ impl From<&TokenEntry> for TokenEntryView {
             backends: entry.backends.clone(),
             created_at: entry.created_at,
             last_used_at: entry.last_used_at,
+            expires_at: entry.expires_at,
         }
     }
+}
+
+/// A revoked token's audit trail — appended to by [`revoke_token_with_state_impl`]
+/// and never pruned, so revocation history survives even though the matching
+/// [`TokenEntry`] is removed from `ApiServerConfig::tokens` (the hard delete
+/// that makes a revoked token stop authenticating immediately). Carries the
+/// full pre-revocation snapshot (scopes/backends/created_at/last_used_at),
+/// not just `{id, label, revoked_at}` — [`api_server_export_audit`] needs
+/// those extra fields to show a revoked token's original grant in the export,
+/// not just that it once existed. Never carries `sha256` — same
+/// "digest never leaves the Rust side beyond `authenticate`" principle as
+/// [`TokenEntryView`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedTokenEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub scopes: Vec<Scope>,
+    #[serde(default)]
+    pub backends: Vec<Backend>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_used_at: Option<u64>,
+    #[serde(default)]
+    pub revoked_at: u64,
+    /// Snapshot of [`TokenEntry::expires_at`] at revocation time — carried
+    /// through so [`TokenAuditEntry`] can still tell an expired grant from a
+    /// non-expiring one after the [`TokenEntry`] itself is gone.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+/// Redacted audit-log row returned by [`api_server_export_audit`] — the
+/// union of every still-active [`TokenEntry`] (`revoked_at: None`) and every
+/// [`RevokedTokenEntry`] (`revoked_at: Some`), with `sha256`/plaintext never
+/// present in either source, so there's no field here that could leak them.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenAuditEntry {
+    pub id: String,
+    pub label: String,
+    pub scopes: Vec<Scope>,
+    pub backends: Vec<Backend>,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+    /// Epoch milliseconds after which this token stopped authenticating, or
+    /// `None` if it never expires — mirrors [`TokenEntry::expires_at`] /
+    /// [`RevokedTokenEntry::expires_at`] so the audit log can distinguish a
+    /// still-live token (`revoked_at: None`, `expires_at` in the future or
+    /// `None`) from one that lapsed on its own (`revoked_at: None`,
+    /// `expires_at` in the past) instead of rendering both as "Active".
+    pub expires_at: Option<u64>,
+}
+
+/// Pure merge behind [`api_server_export_audit`] — active tokens first
+/// (`revoked_at: None`), then the revoked log — split out so it's testable
+/// against a plain [`ApiServerConfig`] value with no file I/O or `AppHandle`.
+fn export_audit_impl(config: &ApiServerConfig) -> Vec<TokenAuditEntry> {
+    let mut out: Vec<TokenAuditEntry> = config
+        .tokens
+        .iter()
+        .map(|t| TokenAuditEntry {
+            id: t.id.clone(),
+            label: t.label.clone(),
+            scopes: t.scopes.clone(),
+            backends: t.backends.clone(),
+            created_at: t.created_at,
+            last_used_at: t.last_used_at,
+            revoked_at: None,
+            expires_at: t.expires_at,
+        })
+        .collect();
+    out.extend(config.revoked.iter().map(|r| TokenAuditEntry {
+        id: r.id.clone(),
+        label: r.label.clone(),
+        scopes: r.scopes.clone(),
+        backends: r.backends.clone(),
+        created_at: r.created_at,
+        last_used_at: r.last_used_at,
+        revoked_at: Some(r.revoked_at),
+        expires_at: r.expires_at,
+    }));
+    out
+}
+
+/// Returns every token's redacted audit trail — active and revoked alike —
+/// for the Settings panel's audit-log export. Never includes `sha256` or the
+/// plaintext token: [`TokenAuditEntry`] simply has no field for either.
+#[tauri::command]
+pub fn api_server_export_audit(app: AppHandle) -> Result<Vec<TokenAuditEntry>, String> {
+    let config = load_config_impl(&config_file_path(&app)?)?;
+    Ok(export_audit_impl(&config))
 }
 
 fn default_port() -> u16 {
@@ -374,6 +525,11 @@ pub struct ApiServerConfig {
     pub expose_providers: bool,
     #[serde(default)]
     pub tokens: Vec<TokenEntry>,
+    /// Audit trail of revoked tokens — see [`RevokedTokenEntry`]. Never
+    /// surfaced through [`ApiServerConfigView`]; only through
+    /// [`api_server_export_audit`].
+    #[serde(default)]
+    pub revoked: Vec<RevokedTokenEntry>,
 }
 
 impl Default for ApiServerConfig {
@@ -385,6 +541,7 @@ impl Default for ApiServerConfig {
             expose_ollama: true,
             expose_providers: false,
             tokens: Vec::new(),
+            revoked: Vec::new(),
         }
     }
 }
@@ -416,7 +573,7 @@ impl From<&ApiServerConfig> for ApiServerConfigView {
 
 /// Resolves (and creates, if missing) `<app_data_dir>/api_server.json`'s
 /// path — same shape as `providers.rs::providers_file_path`/
-/// `web.rs::settings_file_path`. `pub` so a future `lm-cli` `api-serve`
+/// `web.rs::settings_file_path`. `pub` so a future `monkey-cli` `api-serve`
 /// subcommand (phase 4) can resolve the same path with its own
 /// APP_IDENTIFIER, the same config-drift concern the design doc flags.
 pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -425,14 +582,18 @@ pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join(CONFIG_FILE))
 }
 
 /// Core load logic, parameterized by path so it needs no `AppHandle` —
-/// directly unit-testable and reusable from `lm-cli`. A missing file (the
+/// directly unit-testable and reusable from `monkey-cli`. A missing file (the
 /// common case — nothing configured yet) is simply [`ApiServerConfig::default`],
 /// never an error, same stance as `web.rs::load_settings_impl`.
 pub fn load_config_impl(path: &Path) -> Result<ApiServerConfig, String> {
@@ -446,8 +607,8 @@ pub fn load_config_impl(path: &Path) -> Result<ApiServerConfig, String> {
 /// Core save logic: atomic sibling temp file + rename, same idiom as
 /// `sessions.rs`'s `save_to` / `web.rs`'s `save_settings_impl`.
 pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), String> {
-    let payload =
-        serde_json::to_string_pretty(config).map_err(|e| format!("Failed to serialize api_server.json: {e}"))?;
+    let payload = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize api_server.json: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write api_server.json: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize api_server.json: {e}"))?;
@@ -466,7 +627,10 @@ pub fn save_config_impl(path: &Path, config: &ApiServerConfig) -> Result<(), Str
 pub enum ModelRoute {
     Llama,
     Ollama,
-    Providers { provider_id: String, model_id: String },
+    Providers {
+        provider_id: String,
+        model_id: String,
+    },
     Unknown,
 }
 
@@ -545,23 +709,110 @@ fn route_backend(route: &ModelRoute) -> Option<Backend> {
 /// A token that matched on the current request, stripped down to just what
 /// route handlers need to enforce scope/backend restrictions — returned by
 /// [`authenticate`].
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TokenAuth {
     id: String,
     scopes: Vec<Scope>,
     backends: Vec<Backend>,
+    /// See [`TokenEntry::bound_local_app_id`].
+    bound_local_app_id: Option<String>,
 }
 
 /// The subset of a [`TokenEntry`] needed to authenticate one request —
 /// deliberately not the full struct (no `label`/`created_at`), assembled
 /// fresh from `api_server.json` in [`build_deps`] on every request so a
 /// revoked token stops working immediately without a server restart.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct StoredToken {
     id: String,
     sha256: String,
     scopes: Vec<Scope>,
     backends: Vec<Backend>,
+    /// See [`TokenEntry::expires_at`] — checked by [`authenticate`].
+    expires_at: Option<u64>,
+    /// See [`TokenEntry::bound_local_app_id`].
+    bound_local_app_id: Option<String>,
+}
+
+/// Shared `403` gate for every route (the original five and the phase-5
+/// extended three alike) that requires a specific [`Scope`] — same "`None`
+/// auth means unrestricted, `Some` must contain the scope" shape every
+/// inline `if let Some(auth) = authed { if !auth.scopes.contains(...) }`
+/// check above already uses; factored out here specifically so it's
+/// directly unit-testable with no `AppHandle` (see the module doc comment on
+/// [`handle_extended_request`]'s three routes needing one to actually run,
+/// which the scope gate itself must not).
+fn require_scope(
+    authed: Option<&TokenAuth>,
+    scope: Scope,
+    label: &str,
+) -> Result<(), Response<ResponseBody>> {
+    if let Some(auth) = authed {
+        if !auth.scopes.contains(&scope) {
+            return Err(forbidden_response(&format!(
+                "This token isn't scoped for `{label}`."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Which of the three phase-5 extended routes (if any) a method+path pair
+/// matches — pure and `AppHandle`-free so the routing decision itself is
+/// unit-testable independently of the AppHandle-requiring handlers it feeds
+/// into. Mirrors the plain `match` [`handle_request`] uses for the original
+/// five routes.
+#[derive(Debug, PartialEq, Eq)]
+enum ExtendedRoute {
+    KnowledgeQuery,
+    ArtifactRead(String),
+    WorkflowRunStatus(String),
+    /// `POST /v1/local-apps/{id}/run` — see [`handle_local_app_run`].
+    LocalAppRun(String),
+    /// `GET /local-apps/{id}` or `GET /local-apps/{id}/{rel_path}` — see
+    /// [`handle_local_app_static`]. Unauthenticated: a published Local App's
+    /// static page must open in a plain browser tab with no bearer token.
+    LocalAppStatic { app_id: String, rel_path: String },
+}
+
+fn extended_route_for(method: &Method, path: &str) -> Option<ExtendedRoute> {
+    if method == Method::POST && path == "/v1/knowledge/query" {
+        return Some(ExtendedRoute::KnowledgeQuery);
+    }
+    if method == Method::POST {
+        if let Some(id) = path
+            .strip_prefix("/v1/local-apps/")
+            .and_then(|rest| rest.strip_suffix("/run"))
+        {
+            if !id.is_empty() && !id.contains('/') {
+                return Some(ExtendedRoute::LocalAppRun(id.to_string()));
+            }
+        }
+    }
+    if method == Method::GET {
+        if let Some(id) = path.strip_prefix("/v1/artifacts/") {
+            if !id.is_empty() {
+                return Some(ExtendedRoute::ArtifactRead(id.to_string()));
+            }
+        }
+        if let Some(run_id) = path.strip_prefix("/v1/workflows/runs/") {
+            if !run_id.is_empty() {
+                return Some(ExtendedRoute::WorkflowRunStatus(run_id.to_string()));
+            }
+        }
+        if let Some(rest) = path.strip_prefix("/local-apps/") {
+            let mut parts = rest.splitn(2, '/');
+            let app_id = parts.next().unwrap_or("");
+            let rel_path = parts.next().unwrap_or("");
+            if !app_id.is_empty() {
+                return Some(ExtendedRoute::LocalAppStatic {
+                    app_id: app_id.to_string(),
+                    rel_path: rel_path.to_string(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Everything a single request needs to be routed/authenticated/served,
@@ -569,7 +820,7 @@ struct StoredToken {
 /// and a small JSON file read — see [`build_deps`]) so llama's live
 /// port/status/model *and* the current token list are never stale mid-
 /// connection. No `AppHandle` here by design — this is what makes
-/// [`handle_request`] directly unit-testable and, later, `lm-cli`-reusable.
+/// [`handle_request`] directly unit-testable and, later, `monkey-cli`-reusable.
 #[derive(Clone)]
 pub struct ServerDeps {
     pub llama_port: u16,
@@ -610,7 +861,9 @@ pub struct ServerRequest {
 fn full_body(bytes: impl Into<Bytes>) -> ResponseBody {
     // `Full<Bytes>`'s `Error` is `Infallible` — map it into `BoxError` so
     // every response path shares one concrete body type.
-    Full::new(bytes.into()).map_err(|never: Infallible| match never {}).boxed()
+    Full::new(bytes.into())
+        .map_err(|never: Infallible| match never {})
+        .boxed()
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<ResponseBody> {
@@ -655,9 +908,18 @@ fn not_found_response() -> Response<ResponseBody> {
 fn cors_preflight_response() -> Response<ResponseBody> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"))
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Authorization"))
+        .header(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        )
+        .header(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, OPTIONS"),
+        )
+        .header(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type, Authorization"),
+        )
         .body(full_body(Bytes::new()))
         .expect("building a fixed-shape preflight response never fails")
 }
@@ -670,8 +932,10 @@ fn cors_preflight_response() -> Response<ResponseBody> {
 /// token for any request carrying an `Origin` header, even when
 /// `require_token` is off — see its doc comment.
 fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
-    resp.headers_mut()
-        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
     resp
 }
 
@@ -682,7 +946,10 @@ fn with_cors(mut resp: Response<ResponseBody>) -> Response<ResponseBody> {
 /// means the request is authenticated as that specific token, and route
 /// handlers must still check `auth.scopes`/`auth.backends`. `Err(response)`
 /// is the exact response to return immediately.
-fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
+fn authenticate(
+    deps: &ServerDeps,
+    headers: &HeaderMap,
+) -> Result<Option<TokenAuth>, Response<ResponseBody>> {
     // `require_token: false` is documented (module doc comment) as an escape
     // hatch for tools that literally can't set a custom header — it was
     // never meant to also hand out unauthenticated access to whatever
@@ -729,10 +996,24 @@ fn authenticate(deps: &ServerDeps, headers: &HeaderMap) -> Result<Option<TokenAu
     let digest = sha256_hex(token);
     for stored in &deps.tokens {
         if constant_time_eq(&digest, &stored.sha256) {
+            // An expired match falls through to the exact same generic
+            // "incorrect API key" error below (via `break`, not a distinct
+            // early `return Err(...)`) rather than a dedicated "token
+            // expired" response — deliberately, so a caller can't use the
+            // response to distinguish "this token existed but expired" from
+            // "this token never existed at all", the same steady-state
+            // "an authentication failure must not describe why via the
+            // response" this file already holds for the wrong-token case.
+            if let Some(expires_at) = stored.expires_at {
+                if now_ms() >= expires_at {
+                    break;
+                }
+            }
             return Ok(Some(TokenAuth {
                 id: stored.id.clone(),
                 scopes: stored.scopes.clone(),
                 backends: stored.backends.clone(),
+                bound_local_app_id: stored.bound_local_app_id.clone(),
             }));
         }
     }
@@ -819,8 +1100,12 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     // security-review finding this gate closes).
     if deps.expose_providers && backend_visible(authed, Backend::Providers) {
         for provider in &deps.providers {
-            let Ok(api_key) = providers::read_key(&provider.id) else { continue };
-            if let Ok(models) = providers::fetch_models(&provider.base_url, &provider.id, &api_key).await {
+            let Ok(api_key) = providers::read_key(&provider.id) else {
+                continue;
+            };
+            if let Ok(models) =
+                providers::fetch_models(&provider.base_url, &provider.id, &api_key).await
+            {
                 for model in models {
                     data.push(json!({
                         "id": format!("{}/{}", provider.id, model.id),
@@ -835,7 +1120,11 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
 }
 
-async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, body: Bytes) -> Response<ResponseBody> {
+async fn handle_chat_completions(
+    deps: &ServerDeps,
+    authed: Option<&TokenAuth>,
+    body: Bytes,
+) -> Response<ResponseBody> {
     if let Some(auth) = authed {
         if !auth.scopes.contains(&Scope::Chat) {
             return forbidden_response("This token isn't scoped for `chat`.");
@@ -844,17 +1133,39 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
 
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body", "invalid_request_error"),
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON body",
+                "invalid_request_error",
+            )
+        }
     };
 
-    let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let stream = parsed.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stream = parsed
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref(), &deps.providers);
+    let route = route_model(
+        &model,
+        deps.llama_ready,
+        deps.llama_model_stem.as_deref(),
+        &deps.providers,
+    );
 
     if route == ModelRoute::Unknown {
         // Mirrors OpenAI's own wording for a request with no `model`.
-        return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "you must provide a model parameter",
+            "model_not_found",
+        );
     }
 
     // Same "only advertise/serve what's actually exposed" stance as
@@ -866,7 +1177,11 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
         ModelRoute::Llama | ModelRoute::Unknown => false,
     };
     if backend_disabled {
-        return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Unknown model '{model}'"),
+            "model_not_found",
+        );
     }
 
     if let Some(auth) = authed {
@@ -883,7 +1198,10 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
     let request_builder = match &route {
         ModelRoute::Llama => deps
             .client
-            .post(format!("http://127.0.0.1:{}/v1/chat/completions", deps.llama_port))
+            .post(format!(
+                "http://127.0.0.1:{}/v1/chat/completions",
+                deps.llama_port
+            ))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
         ModelRoute::Ollama => deps
@@ -891,17 +1209,31 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
             .post(format!("{}/v1/chat/completions", deps.ollama_base_url))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
-        ModelRoute::Providers { provider_id, model_id } => {
+        ModelRoute::Providers {
+            provider_id,
+            model_id,
+        } => {
             // `provider_id` is guaranteed to match an entry in
             // `deps.providers` — `route_model` only ever produces this
             // variant for a known provider id — but a defensive `NOT_FOUND`
             // beats an `unwrap` panic if that invariant is ever broken.
-            let Some(base_url) = deps.providers.iter().find(|p| &p.id == provider_id).map(|p| p.base_url.clone()) else {
-                return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+            let Some(base_url) = deps
+                .providers
+                .iter()
+                .find(|p| &p.id == provider_id)
+                .map(|p| p.base_url.clone())
+            else {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Unknown model '{model}'"),
+                    "model_not_found",
+                );
             };
             let api_key = match providers::read_key(provider_id) {
                 Ok(key) => key,
-                Err(e) => return error_response(StatusCode::BAD_GATEWAY, &e, "provider_not_configured"),
+                Err(e) => {
+                    return error_response(StatusCode::BAD_GATEWAY, &e, "provider_not_configured")
+                }
             };
             // Forward the caller's own OpenAI-shaped body verbatim (their
             // `stream`/`temperature`/etc. survive untouched) — only the
@@ -920,7 +1252,11 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
             // reused verbatim, unmodified.
             let mut outgoing = parsed.clone();
             outgoing["model"] = json!(model_id);
-            let request = deps.client.post(format!("{base_url}/chat/completions")).bearer_auth(&api_key).json(&outgoing);
+            let request = deps
+                .client
+                .post(format!("{base_url}/chat/completions"))
+                .bearer_auth(&api_key)
+                .json(&outgoing);
             providers::add_anthropic_headers(request, provider_id, &api_key)
         }
         ModelRoute::Unknown => unreachable!("handled above"),
@@ -937,12 +1273,17 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or(if stream { "text/event-stream" } else { "application/json" })
+        .unwrap_or(if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        })
         .to_string();
 
     if stream {
@@ -955,7 +1296,9 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
             .body(BodyExt::boxed(StreamBody::new(byte_stream)))
-            .expect("building a streaming response from an upstream status + content-type never fails")
+            .expect(
+                "building a streaming response from an upstream status + content-type never fails",
+            )
     } else {
         match upstream.bytes().await {
             Ok(bytes) => Response::builder()
@@ -985,7 +1328,11 @@ async fn handle_chat_completions(deps: &ServerDeps, authed: Option<&TokenAuth>, 
 /// supported yet" apart from "unknown model". Not streamed — embeddings
 /// responses are always a single buffered JSON payload, unlike chat
 /// completions.
-async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: Bytes) -> Response<ResponseBody> {
+async fn handle_embeddings(
+    deps: &ServerDeps,
+    authed: Option<&TokenAuth>,
+    body: Bytes,
+) -> Response<ResponseBody> {
     if let Some(auth) = authed {
         if !auth.scopes.contains(&Scope::Embeddings) {
             return forbidden_response("This token isn't scoped for `embeddings`.");
@@ -994,14 +1341,33 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
 
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body", "invalid_request_error"),
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON body",
+                "invalid_request_error",
+            )
+        }
     };
-    let model = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    let route = route_model(&model, deps.llama_ready, deps.llama_model_stem.as_deref(), &deps.providers);
+    let route = route_model(
+        &model,
+        deps.llama_ready,
+        deps.llama_model_stem.as_deref(),
+        &deps.providers,
+    );
 
     if route == ModelRoute::Unknown {
-        return error_response(StatusCode::NOT_FOUND, "you must provide a model parameter", "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "you must provide a model parameter",
+            "model_not_found",
+        );
     }
 
     if let ModelRoute::Providers { .. } = &route {
@@ -1013,7 +1379,11 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
     }
 
     if route == ModelRoute::Ollama && !deps.expose_ollama {
-        return error_response(StatusCode::NOT_FOUND, &format!("Unknown model '{model}'"), "model_not_found");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Unknown model '{model}'"),
+            "model_not_found",
+        );
     }
 
     if route == ModelRoute::Llama && !deps.llama_embeddings_enabled {
@@ -1059,7 +1429,8 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     match upstream.bytes().await {
         Ok(bytes) => Response::builder()
             .status(status)
@@ -1074,6 +1445,372 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
     }
 }
 
+// ---------------------------------------------------------------------
+// Phase 5 extended routes (GUI-only — need a real `AppHandle`)
+// ---------------------------------------------------------------------
+
+/// `POST /v1/knowledge/query` — thin wrapper around
+/// `knowledge_service::knowledge_v2_query`, reused verbatim. Read-only (a
+/// hybrid search over an already-indexed stack), so this carries no more
+/// risk than `handle_models` already does.
+async fn handle_knowledge_query(
+    app: &AppHandle,
+    authed: Option<&TokenAuth>,
+    body: Bytes,
+) -> Response<ResponseBody> {
+    if let Err(resp) = require_scope(authed, Scope::Knowledge, "knowledge") {
+        return resp;
+    }
+
+    let request: crate::knowledge_service::KnowledgeQueryRequest =
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid JSON body: {e}"),
+                    "invalid_request_error",
+                )
+            }
+        };
+
+    match crate::knowledge_service::knowledge_v2_query(app.clone(), request).await {
+        Ok(value) => match serde_json::to_value(&value) {
+            Ok(json) => json_response(StatusCode::OK, json),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encode the knowledge query response",
+                "internal_error",
+            ),
+        },
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e, "knowledge_query_failed"),
+    }
+}
+
+/// `GET /v1/artifacts/{id}` — thin wrapper around
+/// `artifact_commands::artifact_blob_read_base64`, reused verbatim. That
+/// command already rejects path traversal (ids are content-addressed, never
+/// filesystem paths) and caps the decoded size, so this route adds no new
+/// surface beyond exposing an existing, already-hardened read over HTTP.
+async fn handle_artifact_read(
+    app: &AppHandle,
+    authed: Option<&TokenAuth>,
+    id: String,
+) -> Response<ResponseBody> {
+    if let Err(resp) = require_scope(authed, Scope::ArtifactRead, "artifact_read") {
+        return resp;
+    }
+
+    let state = app.state::<AppState>();
+    match crate::artifact_commands::artifact_blob_read_base64(app.clone(), state, id) {
+        Ok(content) => match serde_json::to_value(&content) {
+            Ok(json) => json_response(StatusCode::OK, json),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encode the artifact response",
+                "internal_error",
+            ),
+        },
+        Err(e) => error_response(StatusCode::NOT_FOUND, &e, "artifact_not_found"),
+    }
+}
+
+/// `GET /v1/workflows/runs/{id}` — status only, never submission. See the
+/// module doc comment's "why not submission" note for the security
+/// reasoning; wraps `run_commands::run_get` verbatim.
+async fn handle_workflow_run_status(
+    app: &AppHandle,
+    authed: Option<&TokenAuth>,
+    run_id: String,
+) -> Response<ResponseBody> {
+    if let Err(resp) = require_scope(authed, Scope::WorkflowRun, "workflow_run") {
+        return resp;
+    }
+
+    let state = app.state::<AppState>();
+    match crate::run_commands::run_get(app.clone(), state, run_id) {
+        Ok(Some(run)) => match serde_json::to_value(&run) {
+            Ok(json) => json_response(StatusCode::OK, json),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encode the run status response",
+                "internal_error",
+            ),
+        },
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "Run not found", "run_not_found"),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, &e, "run_lookup_failed"),
+    }
+}
+
+/// A published Local App's `run` route is a standing invitation for any
+/// local process to trigger a scoped recipe execution, so unlike every
+/// other route in this file it must always require its own valid, correctly
+/// -bound bearer token — regardless of the server's global `require_token`
+/// toggle, which exists only as an escape hatch for tools that can't set a
+/// custom header on the `chat`/`models`/`embeddings` routes it was designed
+/// for. Honoring that toggle here would mean "leave API auth off" also
+/// silently hands out unauthenticated recipe-execution triggers to anything
+/// on loopback. Returns the matched [`TokenAuth`] only when it both carries
+/// [`Scope::LocalAppRun`] *and* its [`TokenEntry::bound_local_app_id`]
+/// matches `app_id` from the request path — this pairing is what makes it
+/// structurally impossible for a Local App's token to run any recipe other
+/// than the one it was minted for.
+fn authenticate_local_app_token(
+    deps: &ServerDeps,
+    headers: &HeaderMap,
+    app_id: &str,
+) -> Result<TokenAuth, Response<ResponseBody>> {
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(token) = provided else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Missing bearer token for this Local App.",
+            "invalid_api_key",
+        ));
+    };
+    let digest = sha256_hex(token);
+    for stored in &deps.tokens {
+        if constant_time_eq(&digest, &stored.sha256) {
+            if let Some(expires_at) = stored.expires_at {
+                if now_ms() >= expires_at {
+                    break;
+                }
+            }
+            if !stored.scopes.contains(&Scope::LocalAppRun)
+                || stored.bound_local_app_id.as_deref() != Some(app_id)
+            {
+                return Err(forbidden_response(
+                    "This token isn't scoped to run this Local App.",
+                ));
+            }
+            return Ok(TokenAuth {
+                id: stored.id.clone(),
+                scopes: stored.scopes.clone(),
+                backends: stored.backends.clone(),
+                bound_local_app_id: stored.bound_local_app_id.clone(),
+            });
+        }
+    }
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        "Incorrect API key provided for this Local App.",
+        "invalid_api_key",
+    ))
+}
+
+/// `GET /local-apps/{id}` / `GET /local-apps/{id}/{rel_path}` — serves the
+/// static page `local_apps::publish_impl` generated, scoped strictly to that
+/// one app's own directory. Unauthenticated by design (see
+/// [`handle_extended_request`]'s doc comment): opening the link in a plain
+/// browser tab must work with no bearer token at all. Path-traversal safety
+/// is entirely `local_apps::read_static_file`'s job (canonicalize + verify
+/// prefix, the same convention `native_skills.rs` uses).
+async fn handle_local_app_static(
+    app: &AppHandle,
+    app_id: &str,
+    rel_path: &str,
+) -> Response<ResponseBody> {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve the app data directory",
+            "internal_error",
+        );
+    };
+    match crate::local_apps::read_static_file(&app_data_dir, app_id, rel_path) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(full_body(bytes))
+            .expect("building a static-file response from a fixed status + content-type never fails"),
+        Err(_) => not_found_response(),
+    }
+}
+
+/// `POST /v1/local-apps/{id}/run` — the one and only way a published Local
+/// App triggers its bound recipe. Deliberately never executes anything
+/// itself: it validates the request, requires a fresh human approval via
+/// [`permissions::request_permission`] (the same "Default deny" gate every
+/// other new external-write action in this codebase goes through — see
+/// `triage.rs`'s `triage_send_draft_impl` for the identical pattern), then
+/// emits [`crate::local_apps::LOCAL_APP_RUN_REQUESTED_EVENT`] for the
+/// desktop app's own frontend event loop to actually run the recipe
+/// (`recipeRunner.ts`'s `runRecipeNow`, tagged with this app's id) and
+/// produce its Run Capsule — mirroring how `run_submit` only ever records a
+/// ledger entry and leaves live tool execution to that same frontend loop
+/// (see this module's doc comment).
+async fn handle_local_app_run(
+    app: &AppHandle,
+    authed: &TokenAuth,
+    app_id: String,
+    body: Bytes,
+) -> Response<ResponseBody> {
+    if !crate::local_apps::is_valid_app_id(&app_id) || authed.bound_local_app_id.as_deref() != Some(app_id.as_str()) {
+        return not_found_response();
+    }
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve the app data directory",
+            "internal_error",
+        );
+    };
+    let config = match crate::local_apps::config_file_path(app)
+        .and_then(|path| crate::local_apps::load_config_impl(&path))
+    {
+        Ok(config) => config,
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error")
+        }
+    };
+    let Some(def) = config.apps.iter().find(|a| a.id == app_id) else {
+        return not_found_response();
+    };
+    if !def.enabled {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "This Local App has been unpublished.",
+            "app_disabled",
+        );
+    }
+
+    let state = app.state::<AppState>();
+    let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
+    let recipe = match crate::recipes::resolve_recipe_with_path(
+        &def.recipe_name,
+        workspace_root.as_deref(),
+        &app_data_dir,
+    ) {
+        Ok((recipe, _path)) => recipe,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &e, "recipe_unavailable");
+        }
+    };
+
+    let overrides: std::collections::HashMap<String, String> = if body.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid JSON body: {e}"),
+                    "invalid_request_error",
+                )
+            }
+        }
+    };
+    let values = match crate::recipes::resolve_param_values(&recipe, &overrides) {
+        Ok(values) => values,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e, "invalid_params"),
+    };
+
+    let mut param_summary: Vec<String> = values
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    param_summary.sort();
+    let detail = format!(
+        "Local App '{}' wants to run recipe '{}' with parameters: {}",
+        def.name,
+        def.recipe_name,
+        if param_summary.is_empty() {
+            "(none)".to_string()
+        } else {
+            param_summary.join(", ")
+        }
+    );
+    if let Err(e) = crate::permissions::request_permission(
+        app,
+        state.inner(),
+        "local_app_run",
+        detail,
+        None,
+        None,
+        None,
+        Some(&def.name),
+    )
+    .await
+    {
+        return forbidden_response(&e);
+    }
+
+    let _ = app.emit(
+        crate::local_apps::LOCAL_APP_RUN_REQUESTED_EVENT,
+        crate::local_apps::LocalAppRunRequestedPayload {
+            app_id: app_id.clone(),
+            recipe_name: def.recipe_name.clone(),
+            params: values,
+        },
+    );
+
+    json_response(
+        StatusCode::ACCEPTED,
+        json!({ "status": "accepted", "app_id": app_id }),
+    )
+}
+
+/// Dispatches the three phase-5 extended routes when `path`/`method` match
+/// one (see [`extended_route_for`]), applying the same [`authenticate`] gate
+/// [`handle_request`] uses before returning `None` so unmatched requests
+/// fall through unchanged. Only ever called with `Some(app)` from
+/// [`serve_one_request`] — see the module doc comment on why `monkey-cli`
+/// (which calls `serve_one_request` with `None`) never reaches these routes.
+async fn handle_extended_request(
+    app: &AppHandle,
+    deps: &ServerDeps,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<(Response<ResponseBody>, Option<String>)> {
+    let route = extended_route_for(method, path)?;
+
+    // These two routes intentionally never go through the generic
+    // `authenticate` gate below: `LocalAppStatic` must serve to a plain
+    // browser tab with no bearer token at all, and `LocalAppRun` must always
+    // require its own correctly-bound bearer token regardless of the
+    // server's global `require_token` toggle — see
+    // [`authenticate_local_app_token`]'s doc comment for why.
+    if let ExtendedRoute::LocalAppStatic { app_id, rel_path } = &route {
+        let response = handle_local_app_static(app, app_id, rel_path).await;
+        return Some((with_cors(response), None));
+    }
+    if let ExtendedRoute::LocalAppRun(app_id) = &route {
+        let authed = match authenticate_local_app_token(deps, headers, app_id) {
+            Ok(authed) => authed,
+            Err(response) => return Some((with_cors(response), None)),
+        };
+        let matched_token_id = Some(authed.id.clone());
+        let response = handle_local_app_run(app, &authed, app_id.clone(), body.clone()).await;
+        return Some((with_cors(response), matched_token_id));
+    }
+
+    let authed = match authenticate(deps, headers) {
+        Ok(authed) => authed,
+        Err(response) => return Some((with_cors(response), None)),
+    };
+    let matched_token_id = authed.as_ref().map(|a| a.id.clone());
+
+    let response = match route {
+        ExtendedRoute::KnowledgeQuery => {
+            handle_knowledge_query(app, authed.as_ref(), body.clone()).await
+        }
+        ExtendedRoute::ArtifactRead(id) => handle_artifact_read(app, authed.as_ref(), id).await,
+        ExtendedRoute::WorkflowRunStatus(run_id) => {
+            handle_workflow_run_status(app, authed.as_ref(), run_id).await
+        }
+        ExtendedRoute::LocalAppRun(_) | ExtendedRoute::LocalAppStatic { .. } => {
+            unreachable!("handled above")
+        }
+    };
+    Some((with_cors(response), matched_token_id))
+}
+
 /// The core router: a plain `match` on method + path, no framework — see the
 /// module doc's security note on why this surface must stay exactly these
 /// five routes. Returns the response to send *and*, when a token
@@ -1081,8 +1818,16 @@ async fn handle_embeddings(deps: &ServerDeps, authed: Option<&TokenAuth>, body: 
 /// its scope/backend checks), that token's id — [`serve_one_request`]'s
 /// caller uses this to bump `last_used_at` without `handle_request` itself
 /// needing any I/O or `AppHandle`.
-pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> (Response<ResponseBody>, Option<String>) {
-    let ServerRequest { method, path, headers, body } = req;
+pub async fn handle_request(
+    deps: &ServerDeps,
+    req: ServerRequest,
+) -> (Response<ResponseBody>, Option<String>) {
+    let ServerRequest {
+        method,
+        path,
+        headers,
+        body,
+    } = req;
 
     // `/health` is the one unauthenticated route (a liveness probe has to
     // work before a caller has a token to hand it).
@@ -1104,7 +1849,9 @@ pub async fn handle_request(deps: &ServerDeps, req: ServerRequest) -> (Response<
 
     let response = match (method, path.as_str()) {
         (Method::GET, "/v1/models") => handle_models(deps, authed.as_ref()).await,
-        (Method::POST, "/v1/chat/completions") => handle_chat_completions(deps, authed.as_ref(), body).await,
+        (Method::POST, "/v1/chat/completions") => {
+            handle_chat_completions(deps, authed.as_ref(), body).await
+        }
         (Method::POST, "/v1/embeddings") => handle_embeddings(deps, authed.as_ref(), body).await,
         _ => not_found_response(),
     };
@@ -1131,16 +1878,22 @@ struct ServerRuntime {
 
 /// Pure merge of built-in presets + a caller-supplied custom-provider list
 /// into the routing catalog — split out from [`build_provider_catalog`] so
-/// `lm-cli`'s `api-serve` subcommand (design doc phase 4) can build the same
+/// `monkey-cli`'s `api-serve` subcommand (design doc phase 4) can build the same
 /// catalog from its own `AppHandle`-free custom-provider loader
 /// (`providers_cli::load_custom_providers`) without duplicating the
 /// preset+custom merge logic. See [`run_cli_server`].
 fn provider_catalog_from(custom: Vec<providers::CustomProviderEntry>) -> Vec<ProviderSummary> {
     let mut out: Vec<ProviderSummary> = providers::providers_list_presets()
         .into_iter()
-        .map(|p| ProviderSummary { id: p.id, base_url: p.base_url })
+        .map(|p| ProviderSummary {
+            id: p.id,
+            base_url: p.base_url,
+        })
         .collect();
-    out.extend(custom.into_iter().map(|c| ProviderSummary { id: c.id, base_url: c.base_url }));
+    out.extend(custom.into_iter().map(|c| ProviderSummary {
+        id: c.id,
+        base_url: c.base_url,
+    }));
     out
 }
 
@@ -1168,6 +1921,8 @@ fn tokens_from_config(config: &ApiServerConfig) -> Vec<StoredToken> {
             sha256: t.sha256.clone(),
             scopes: t.scopes.clone(),
             backends: t.backends.clone(),
+            expires_at: t.expires_at,
+            bound_local_app_id: t.bound_local_app_id.clone(),
         })
         .collect()
 }
@@ -1214,7 +1969,7 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
 /// Probes the managed llama-server process's readiness and reports the
 /// model id it advertises — the CLI-context substitute for reading
 /// `AppState::llama` in-process (which only exists inside the GUI). Used
-/// exclusively by [`run_cli_server`]: `lm-cli api-serve` runs as its own OS
+/// exclusively by [`run_cli_server`]: `monkey-cli api-serve` runs as its own OS
 /// process with no Tauri `AppState`, but llama-server (if the GUI already
 /// started it) is a plain independent TCP listener on `port` that anyone on
 /// loopback can reach, so a `/health` + `/v1/models` probe is a faithful
@@ -1246,8 +2001,17 @@ async fn probe_llama_server(client: &reqwest::Client, port: u16) -> (bool, Optio
         None => None,
     };
     let model_id = model_id
-        .and_then(|v| v.get("data").and_then(|d| d.as_array()).and_then(|arr| arr.first().cloned()))
-        .and_then(|entry| entry.get("id").and_then(|id| id.as_str()).map(str::to_string));
+        .and_then(|v| {
+            v.get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|arr| arr.first().cloned())
+        })
+        .and_then(|entry| {
+            entry
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        });
 
     (true, model_id)
 }
@@ -1275,7 +2039,9 @@ where
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                let Some(data) = frame.data_ref() else { continue };
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
                 if collected.len() + data.len() > limit {
                     return Err(with_cors(error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -1300,8 +2066,15 @@ where
 
 /// Adapts a real hyper request into the `AppHandle`-free [`handle_request`]
 /// core: reads the body (capped — see [`read_capped_body`]) and hands
-/// everything off unchanged.
-async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
+/// everything off unchanged. `app`, when `Some` (the GUI accept loop; never
+/// `monkey-cli`, which has none), also gives [`handle_extended_request`] a
+/// chance to claim one of the three phase-5 extended routes before falling
+/// through to `handle_request`'s original five.
+async fn serve_one_request(
+    deps: ServerDeps,
+    req: Request<Incoming>,
+    app: Option<&AppHandle>,
+) -> Result<(Response<ResponseBody>, Option<String>), Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
@@ -1310,13 +2083,32 @@ async fn serve_one_request(deps: ServerDeps, req: Request<Incoming>) -> Result<(
         Err(response) => return Ok((response, None)),
     };
 
-    Ok(handle_request(&deps, ServerRequest { method, path, headers, body }).await)
+    if let Some(app) = app {
+        if let Some(result) =
+            handle_extended_request(app, &deps, &method, &path, &headers, &body).await
+        {
+            return Ok(result);
+        }
+    }
+
+    Ok(handle_request(
+        &deps,
+        ServerRequest {
+            method,
+            path,
+            headers,
+            body,
+        },
+    )
+    .await)
 }
 
 fn bump_request_count(app: &AppHandle) {
     let state = app.state::<AppState>();
     let payload = {
-        let Ok(mut s) = state.api_server.lock() else { return };
+        let Ok(mut s) = state.api_server.lock() else {
+            return;
+        };
         s.request_count += 1;
         s.last_request_at = Some(now_ms());
         status_payload(&s)
@@ -1332,8 +2124,12 @@ fn bump_request_count(app: &AppHandle) {
 /// with no `AppHandle` — same `*_with_state_impl` shape as
 /// `mcp.rs::add_server_with_state_impl`.
 fn record_token_used_with_state(state: &AppState, path: &Path, token_id: &str) {
-    let Ok(_guard) = state.api_server_config_lock.lock() else { return };
-    let Ok(mut config) = load_config_impl(path) else { return };
+    let Ok(_guard) = state.api_server_config_lock.lock() else {
+        return;
+    };
+    let Ok(mut config) = load_config_impl(path) else {
+        return;
+    };
     if let Some(entry) = config.tokens.iter_mut().find(|t| t.id == token_id) {
         entry.last_used_at = Some(now_ms());
         let _ = save_config_impl(path, &config);
@@ -1343,7 +2139,9 @@ fn record_token_used_with_state(state: &AppState, path: &Path, token_id: &str) {
 /// Best-effort: a failure to record "last used" (corrupt file, race with a
 /// concurrent revoke) never fails the request that's already been served.
 fn record_token_used(app: &AppHandle, token_id: &str) {
-    let Ok(path) = config_file_path(app) else { return };
+    let Ok(path) = config_file_path(app) else {
+        return;
+    };
     record_token_used_with_state(&app.state::<AppState>(), &path, token_id);
 }
 
@@ -1356,7 +2154,12 @@ fn record_token_used(app: &AppHandle, token_id: &str) {
 /// `ApiServerState` before notifying this loop, and doing it here too would
 /// race that same-port-restart concern right back in (see the review finding
 /// `ApiServerState::accept_task`'s doc comment addresses).
-async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<Notify>, runtime: Arc<ServerRuntime>) {
+async fn run_accept_loop(
+    app: AppHandle,
+    listener: TcpListener,
+    shutdown: Arc<Notify>,
+    runtime: Arc<ServerRuntime>,
+) {
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -1373,7 +2176,8 @@ async fn run_accept_loop(app: AppHandle, listener: TcpListener, shutdown: Arc<No
                         let app_for_req = app_for_conn.clone();
                         let deps = build_deps(&app_for_req, &runtime_for_conn);
                         async move {
-                            let (resp, matched_token_id) = serve_one_request(deps, req).await?;
+                            let (resp, matched_token_id) =
+                                serve_one_request(deps, req, Some(&app_for_req)).await?;
                             if let Some(token_id) = matched_token_id {
                                 record_token_used(&app_for_req, &token_id);
                             }
@@ -1407,13 +2211,13 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 }
 
 // ---------------------------------------------------------------------
-// lm-cli `api-serve` (design doc phase 4): the SAME routing/proxy core
+// monkey-cli `api-serve` (design doc phase 4): the SAME routing/proxy core
 // (`ServerDeps`/`serve_one_request`/`handle_request`/`bind_listener`/
 // `load_config_impl`) the GUI uses, with no `AppHandle`/`AppState` at all —
 // only the surrounding bookkeeping differs (stdout/stderr logging instead
 // of `apiserver://status` events, an `AtomicU64` instead of
 // `AppState::api_server.request_count`, an HTTP probe instead of reading
-// `AppState::llama` in-process). `lm-cli`'s `main.rs` resolves the
+// `AppState::llama` in-process). `monkey-cli`'s `main.rs` resolves the
 // `api_server.json`/`providers.json` paths itself (the same
 // `APP_IDENTIFIER`-hardcoding technique `providers_cli.rs`/
 // `checkpoints_cli.rs` already use) and hands them in here — see the design
@@ -1425,7 +2229,7 @@ fn record_bind_error(state: &mut ApiServerState, message: String) {
 /// Runs the local API server as a blocking, headless accept loop — never
 /// returns on success (Ctrl+C/SIGINT ends the process the same way `ollama
 /// serve`'s passthrough does); returns `Err` only for a bind failure, so
-/// `lm-cli`'s `main` can print it and exit non-zero exactly like every other
+/// `monkey-cli`'s `main` can print it and exit non-zero exactly like every other
 /// subcommand's error path (`fail()`).
 ///
 /// `load_custom_providers` is re-invoked on every accepted connection (not
@@ -1477,7 +2281,8 @@ pub async fn run_cli_server(
                 let cli_state = cli_state.clone();
                 async move {
                     let config = load_config_impl(&config_path).unwrap_or_default();
-                    let (llama_ready, llama_model_stem) = probe_llama_server(&client, llama_port).await;
+                    let (llama_ready, llama_model_stem) =
+                        probe_llama_server(&client, llama_port).await;
                     let deps = ServerDeps {
                         llama_port,
                         llama_ready,
@@ -1498,12 +2303,16 @@ pub async fn run_cli_server(
                         client,
                     };
 
-                    let (resp, matched_token_id) = serve_one_request(deps, req).await?;
+                    let (resp, matched_token_id) = serve_one_request(deps, req, None).await?;
                     let n = request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(token_id) = &matched_token_id {
                         record_token_used_with_state(&cli_state, &config_path, token_id);
                     }
-                    eprintln!("[api-serve] request #{n} {} -> {}", req_log_hint(matched_token_id.as_deref()), resp.status());
+                    eprintln!(
+                        "[api-serve] request #{n} {} -> {}",
+                        req_log_hint(matched_token_id.as_deref()),
+                        resp.status()
+                    );
                     Ok::<_, Infallible>(resp)
                 }
             });
@@ -1703,7 +2512,8 @@ pub async fn api_server_set_config(
     state: State<'_, AppState>,
     config: ApiServerConfigView,
 ) -> Result<ApiServerConfigView, String> {
-    let (updated, needs_restart) = set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
+    let (updated, needs_restart) =
+        set_config_with_state_impl(state.inner(), &config_file_path(&app)?, config)?;
     if needs_restart {
         stop_server_core(&app).await?;
         start_server_core(&app).await?;
@@ -1716,7 +2526,12 @@ pub async fn api_server_set_config(
 /// [`create_token_with_state_impl`] so the "plaintext never ends up in the
 /// persisted entry" property is testable with no file/lock/`AppState` at all
 /// — see `tests::creating_a_token_never_persists_its_plaintext`.
-fn mint_token(label: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> Result<(String, TokenEntry), String> {
+fn mint_token(
+    label: &str,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+    expires_at: Option<u64>,
+) -> Result<(String, TokenEntry), String> {
     let label = label.trim().to_string();
     if label.is_empty() {
         return Err("Label is required".to_string());
@@ -1724,8 +2539,21 @@ fn mint_token(label: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> Result
     if scopes.is_empty() {
         return Err("Select at least one scope".to_string());
     }
+    // `LocalAppRun` is meaningless without `bound_local_app_id`, which this
+    // generic flow never sets — see `Scope::LocalAppRun`'s doc comment.
+    // Only `mint_local_app_token` may ever produce a token carrying it.
+    if scopes.contains(&Scope::LocalAppRun) {
+        return Err(
+            "Scope 'local_app_run' can only be granted by publishing a Local App".to_string(),
+        );
+    }
     if backends.is_empty() {
         return Err("Select at least one backend".to_string());
+    }
+    if let Some(expires_at) = expires_at {
+        if expires_at <= now_ms() {
+            return Err("Expiration must be in the future".to_string());
+        }
     }
 
     let token = generate_token();
@@ -1737,18 +2565,47 @@ fn mint_token(label: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> Result
         backends,
         created_at: now_ms(),
         last_used_at: None,
+        expires_at,
+        bound_local_app_id: None,
     };
     Ok((token, entry))
 }
 
-fn create_token_with_state_impl(
+/// Mints a token that can do exactly one thing: `POST` the `run` route for
+/// one specific published Local App — see [`Scope::LocalAppRun`]'s doc
+/// comment. `backends` is always empty: `Backend::{Local,Ollama,Providers}`
+/// only ever gate the model-proxying routes (`chat`/`models`/`embeddings`),
+/// and a Local App token must never be able to reach any of them — an empty
+/// list makes [`backend_visible`]'s check fail closed for every one of them,
+/// independent of `scopes`.
+pub fn mint_local_app_token(label: &str, bound_local_app_id: &str) -> (String, TokenEntry) {
+    let token = generate_token();
+    let entry = TokenEntry {
+        id: Uuid::new_v4().to_string(),
+        label: label.to_string(),
+        sha256: sha256_hex(&token),
+        scopes: vec![Scope::LocalAppRun],
+        backends: Vec::new(),
+        created_at: now_ms(),
+        last_used_at: None,
+        expires_at: None,
+        bound_local_app_id: Some(bound_local_app_id.to_string()),
+    };
+    (token, entry)
+}
+
+/// Locked read-modify-write persistence for [`mint_local_app_token`] — same
+/// shape as [`create_token_with_state_impl`], called from
+/// `local_apps::publish_impl` rather than a Tauri command directly (Local
+/// Apps have their own `local_apps_publish` command, which mints this token
+/// as one step of a larger operation).
+pub fn create_local_app_token_with_state(
     state: &AppState,
     path: &Path,
     label: &str,
-    scopes: Vec<Scope>,
-    backends: Vec<Backend>,
+    bound_local_app_id: &str,
 ) -> Result<(String, TokenEntry), String> {
-    let (token, entry) = mint_token(label, scopes, backends)?;
+    let (token, entry) = mint_local_app_token(label, bound_local_app_id);
     let _guard = state
         .api_server_config_lock
         .lock()
@@ -1759,17 +2616,54 @@ fn create_token_with_state_impl(
     Ok((token, entry))
 }
 
-fn revoke_token_with_state_impl(state: &AppState, path: &Path, id: &str) -> Result<(), String> {
+fn create_token_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    label: &str,
+    scopes: Vec<Scope>,
+    backends: Vec<Backend>,
+    expires_at: Option<u64>,
+) -> Result<(String, TokenEntry), String> {
+    let (token, entry) = mint_token(label, scopes, backends, expires_at)?;
     let _guard = state
         .api_server_config_lock
         .lock()
         .map_err(|_| "API server config lock poisoned".to_string())?;
     let mut config = load_config_impl(path)?;
-    let before = config.tokens.len();
-    config.tokens.retain(|t| t.id != id);
-    if config.tokens.len() == before {
+    config.tokens.push(entry.clone());
+    save_config_impl(path, &config)?;
+    Ok((token, entry))
+}
+
+/// Removes the token from `config.tokens` (the hard delete that makes it
+/// stop authenticating immediately — see [`authenticate`]) and appends its
+/// pre-revocation snapshot to `config.revoked` (the audit trail that
+/// survives — see [`RevokedTokenEntry`]) in the same locked read-modify-write
+/// cycle, so the two never drift apart.
+pub(crate) fn revoke_token_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    id: &str,
+) -> Result<(), String> {
+    let _guard = state
+        .api_server_config_lock
+        .lock()
+        .map_err(|_| "API server config lock poisoned".to_string())?;
+    let mut config = load_config_impl(path)?;
+    let Some(index) = config.tokens.iter().position(|t| t.id == id) else {
         return Err(format!("Unknown token '{id}'"));
-    }
+    };
+    let removed = config.tokens.remove(index);
+    config.revoked.push(RevokedTokenEntry {
+        id: removed.id,
+        label: removed.label,
+        scopes: removed.scopes,
+        backends: removed.backends,
+        created_at: removed.created_at,
+        last_used_at: removed.last_used_at,
+        revoked_at: now_ms(),
+        expires_at: removed.expires_at,
+    });
     save_config_impl(path, &config)
 }
 
@@ -1789,13 +2683,28 @@ pub fn api_server_create_token(
     label: String,
     scopes: Vec<Scope>,
     backends: Vec<Backend>,
+    expires_at: Option<u64>,
 ) -> Result<CreateTokenResult, String> {
-    let (token, entry) = create_token_with_state_impl(state.inner(), &config_file_path(&app)?, &label, scopes, backends)?;
-    Ok(CreateTokenResult { token, entry: TokenEntryView::from(&entry) })
+    let (token, entry) = create_token_with_state_impl(
+        state.inner(),
+        &config_file_path(&app)?,
+        &label,
+        scopes,
+        backends,
+        expires_at,
+    )?;
+    Ok(CreateTokenResult {
+        token,
+        entry: TokenEntryView::from(&entry),
+    })
 }
 
 #[tauri::command]
-pub fn api_server_revoke_token(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn api_server_revoke_token(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     revoke_token_with_state_impl(state.inner(), &config_file_path(&app)?, &id)
 }
 
@@ -1812,7 +2721,10 @@ mod tests {
     use std::io::{Read, Write};
 
     fn test_provider(id: &str, base_url: &str) -> ProviderSummary {
-        ProviderSummary { id: id.to_string(), base_url: base_url.to_string() }
+        ProviderSummary {
+            id: id.to_string(),
+            base_url: base_url.to_string(),
+        }
     }
 
     fn test_deps(ollama_base_url: String) -> ServerDeps {
@@ -1825,14 +2737,29 @@ mod tests {
             require_token: false,
             expose_ollama: true,
             expose_providers: false,
-            providers: vec![test_provider("openai", "https://api.openai.com/v1"), test_provider("anthropic", "https://api.anthropic.com/v1")],
+            providers: vec![
+                test_provider("openai", "https://api.openai.com/v1"),
+                test_provider("anthropic", "https://api.anthropic.com/v1"),
+            ],
             tokens: Vec::new(),
             client: reqwest::Client::new(),
         }
     }
 
-    fn stored_token(id: &str, plaintext: &str, scopes: Vec<Scope>, backends: Vec<Backend>) -> StoredToken {
-        StoredToken { id: id.to_string(), sha256: sha256_hex(plaintext), scopes, backends }
+    fn stored_token(
+        id: &str,
+        plaintext: &str,
+        scopes: Vec<Scope>,
+        backends: Vec<Backend>,
+    ) -> StoredToken {
+        StoredToken {
+            id: id.to_string(),
+            sha256: sha256_hex(plaintext),
+            scopes,
+            backends,
+            expires_at: None,
+            bound_local_app_id: None,
+        }
     }
 
     fn get_request(path: &str) -> ServerRequest {
@@ -1854,7 +2781,10 @@ mod tests {
     }
 
     fn with_bearer(mut req: ServerRequest, token: &str) -> ServerRequest {
-        req.headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        req.headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
         req
     }
 
@@ -1868,8 +2798,16 @@ mod tests {
         // `prompts.rs::tests::temp_file`).
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("little_monkey_api_server_test_{}_{}_{}.json", std::process::id(), n, nanos))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_api_server_test_{}_{}_{}.json",
+            std::process::id(),
+            n,
+            nanos
+        ))
     }
 
     fn no_providers() -> Vec<ProviderSummary> {
@@ -1877,41 +2815,85 @@ mod tests {
     }
 
     fn two_providers() -> Vec<ProviderSummary> {
-        vec![test_provider("openai", "https://api.openai.com/v1"), test_provider("anthropic", "https://api.anthropic.com/v1")]
+        vec![
+            test_provider("openai", "https://api.openai.com/v1"),
+            test_provider("anthropic", "https://api.anthropic.com/v1"),
+        ]
     }
 
     #[test]
     fn route_model_matches_llama_exactly() {
         assert_eq!(
-            route_model("qwen2.5-7b-instruct", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            route_model(
+                "qwen2.5-7b-instruct",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &no_providers()
+            ),
             ModelRoute::Llama
         );
     }
 
     #[test]
     fn route_model_falls_back_to_ollama_for_any_other_nonempty_id() {
-        assert_eq!(route_model("llama3.1:8b", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Ollama);
+        assert_eq!(
+            route_model(
+                "llama3.1:8b",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &no_providers()
+            ),
+            ModelRoute::Ollama
+        );
         // Even when llama isn't ready, a non-empty id is assumed to be an
         // Ollama tag — Ollama is the source of truth for whether it exists.
-        assert_eq!(route_model("qwen2.5-7b-instruct", false, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Ollama);
-        assert_eq!(route_model("anything", true, None, &no_providers()), ModelRoute::Ollama);
+        assert_eq!(
+            route_model(
+                "qwen2.5-7b-instruct",
+                false,
+                Some("qwen2.5-7b-instruct"),
+                &no_providers()
+            ),
+            ModelRoute::Ollama
+        );
+        assert_eq!(
+            route_model("anything", true, None, &no_providers()),
+            ModelRoute::Ollama
+        );
     }
 
     #[test]
     fn route_model_is_unknown_only_when_blank() {
-        assert_eq!(route_model("", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Unknown);
-        assert_eq!(route_model("   ", true, Some("qwen2.5-7b-instruct"), &no_providers()), ModelRoute::Unknown);
+        assert_eq!(
+            route_model("", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            ModelRoute::Unknown
+        );
+        assert_eq!(
+            route_model("   ", true, Some("qwen2.5-7b-instruct"), &no_providers()),
+            ModelRoute::Unknown
+        );
     }
 
     #[test]
     fn route_model_routes_a_known_provider_prefixed_id_to_providers() {
         assert_eq!(
-            route_model("openai/gpt-4o", true, Some("qwen2.5-7b-instruct"), &two_providers()),
-            ModelRoute::Providers { provider_id: "openai".to_string(), model_id: "gpt-4o".to_string() }
+            route_model(
+                "openai/gpt-4o",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &two_providers()
+            ),
+            ModelRoute::Providers {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-4o".to_string()
+            }
         );
         assert_eq!(
             route_model("anthropic/claude-opus-4-8", false, None, &two_providers()),
-            ModelRoute::Providers { provider_id: "anthropic".to_string(), model_id: "claude-opus-4-8".to_string() }
+            ModelRoute::Providers {
+                provider_id: "anthropic".to_string(),
+                model_id: "claude-opus-4-8".to_string()
+            }
         );
     }
 
@@ -1921,7 +2903,15 @@ mod tests {
         // as an Ollama tag (Ollama namespaced tags can themselves contain a
         // slash) — exactly the design doc's "otherwise treat as Ollama tag"
         // fallback.
-        assert_eq!(route_model("library/llama3", true, Some("qwen2.5-7b-instruct"), &two_providers()), ModelRoute::Ollama);
+        assert_eq!(
+            route_model(
+                "library/llama3",
+                true,
+                Some("qwen2.5-7b-instruct"),
+                &two_providers()
+            ),
+            ModelRoute::Ollama
+        );
     }
 
     #[test]
@@ -1929,7 +2919,10 @@ mod tests {
         assert_eq!(route_backend(&ModelRoute::Llama), Some(Backend::Local));
         assert_eq!(route_backend(&ModelRoute::Ollama), Some(Backend::Ollama));
         assert_eq!(
-            route_backend(&ModelRoute::Providers { provider_id: "openai".to_string(), model_id: "gpt-4o".to_string() }),
+            route_backend(&ModelRoute::Providers {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-4o".to_string()
+            }),
             Some(Backend::Providers)
         );
         assert_eq!(route_backend(&ModelRoute::Unknown), None);
@@ -1941,7 +2934,10 @@ mod tests {
         let b = generate_token();
         assert!(a.starts_with(TOKEN_PREFIX));
         assert_eq!(a.len(), TOKEN_PREFIX.len() + 32);
-        assert!(a.chars().skip(TOKEN_PREFIX.len()).all(|c| c.is_ascii_hexdigit()));
+        assert!(a
+            .chars()
+            .skip(TOKEN_PREFIX.len())
+            .all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two generated tokens collided — RNG is broken");
     }
 
@@ -1968,7 +2964,14 @@ mod tests {
         first_byte_flipped.replace_range(0..1, if &base[0..1] == "0" { "1" } else { "0" });
         let mut last_byte_flipped = base.clone();
         let last = base.len() - 1;
-        last_byte_flipped.replace_range(last..last + 1, if &base[last..last + 1] == "0" { "1" } else { "0" });
+        last_byte_flipped.replace_range(
+            last..last + 1,
+            if &base[last..last + 1] == "0" {
+                "1"
+            } else {
+                "0"
+            },
+        );
 
         assert!(!constant_time_eq(&base, &first_byte_flipped));
         assert!(!constant_time_eq(&base, &last_byte_flipped));
@@ -1979,7 +2982,12 @@ mod tests {
     async fn health_requires_no_token_even_when_auth_is_on() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "t1",
+            "lmk-real-token",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
 
         let (resp, matched) = handle_request(&deps, get_request("/health")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1993,7 +3001,12 @@ mod tests {
     async fn missing_or_wrong_bearer_token_is_rejected_on_protected_routes() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "t1",
+            "lmk-real-token",
+            vec![Scope::Models],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
         let (resp, matched) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2020,7 +3033,12 @@ mod tests {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
         deps.llama_ready = false;
-        deps.tokens = vec![stored_token("tok-1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-1",
+            "lmk-real-token",
+            vec![Scope::Models],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
         let req = with_bearer(get_request("/v1/models"), "lmk-real-token");
         let (resp, matched) = handle_request(&deps, req).await;
@@ -2052,9 +3070,17 @@ mod tests {
     async fn token_missing_the_required_scope_is_rejected_with_403() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-models-only", "lmk-models-only", vec![Scope::Models], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-models-only",
+            "lmk-models-only",
+            vec![Scope::Models],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"qwen2.5-7b-instruct"}"#), "lmk-models-only");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"qwen2.5-7b-instruct"}"#),
+            "lmk-models-only",
+        );
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         // Still authenticated as a real token, even though this particular
@@ -2066,11 +3092,19 @@ mod tests {
     async fn token_scoped_to_local_backend_is_rejected_when_the_request_routes_to_ollama() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-local-only", "lmk-local-only", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-local-only",
+            "lmk-local-only",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
 
         // "llama3.1:8b" isn't the ready llama stem, so `route_model` sends
         // it to Ollama — a token scoped to `local` only must be rejected.
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#), "lmk-local-only");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+            "lmk-local-only",
+        );
         let (resp, _) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
@@ -2079,9 +3113,17 @@ mod tests {
     async fn token_scoped_to_the_matching_backend_is_accepted() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-ollama", "lmk-ollama-scoped", vec![Scope::Chat], vec![Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-ollama",
+            "lmk-ollama-scoped",
+            vec![Scope::Chat],
+            vec![Backend::Ollama],
+        )];
 
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#), "lmk-ollama-scoped");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+            "lmk-ollama-scoped",
+        );
         let (resp, matched) = handle_request(&deps, req).await;
         // 502, not 403: the scope/backend check passed, and it proceeded to
         // (unsuccessfully) proxy to the dummy unreachable address.
@@ -2102,14 +3144,19 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_with_blank_model_returns_404() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"messages":[]}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"messages":[]}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn chat_completions_with_invalid_json_returns_400() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", "not json")).await;
+        let (resp, _) =
+            handle_request(&deps, post_request("/v1/chat/completions", "not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2124,7 +3171,9 @@ mod tests {
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
-        assert!(data.iter().any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
+        assert!(data
+            .iter()
+            .any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
     }
 
     #[tokio::test]
@@ -2142,7 +3191,11 @@ mod tests {
     async fn chat_completions_404s_for_an_ollama_routed_model_when_expose_ollama_is_off() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_ollama = false;
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2152,7 +3205,11 @@ mod tests {
         // provider-prefixed id must 404 exactly like an unexposed Ollama tag,
         // never silently proxy anyway.
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2164,7 +3221,8 @@ mod tests {
     /// depend on whether a real key happens to be configured for "openai" on
     /// the machine running this test.
     #[tokio::test]
-    async fn token_without_providers_backend_is_rejected_even_when_expose_providers_is_globally_on() {
+    async fn token_without_providers_backend_is_rejected_even_when_expose_providers_is_globally_on()
+    {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
         deps.require_token = true;
@@ -2175,7 +3233,10 @@ mod tests {
             vec![Backend::Local, Backend::Ollama],
         )];
 
-        let req = with_bearer(post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#), "lmk-no-providers");
+        let req = with_bearer(
+            post_request("/v1/chat/completions", r#"{"model":"openai/gpt-4o"}"#),
+            "lmk-no-providers",
+        );
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(matched.as_deref(), Some("tok-no-providers"));
@@ -2195,7 +3256,10 @@ mod tests {
         // A provider id that should never realistically have a real
         // keychain entry on the machine running this test, so the outcome
         // here is deterministic regardless of what's actually configured.
-        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.providers = vec![test_provider(
+            "zzz-test-provider-no-key",
+            "https://example.invalid/v1",
+        )];
         deps.tokens = vec![stored_token(
             "tok-with-providers",
             "lmk-with-providers",
@@ -2204,7 +3268,10 @@ mod tests {
         )];
 
         let req = with_bearer(
-            post_request("/v1/chat/completions", r#"{"model":"zzz-test-provider-no-key/some-model"}"#),
+            post_request(
+                "/v1/chat/completions",
+                r#"{"model":"zzz-test-provider-no-key/some-model"}"#,
+            ),
             "lmk-with-providers",
         );
         let (resp, matched) = handle_request(&deps, req).await;
@@ -2214,7 +3281,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_provider_route_reports_provider_not_configured_with_no_token_required() {
+    async fn chat_completions_provider_route_reports_provider_not_configured_with_no_token_required(
+    ) {
         // A provider id with no saved key deterministically 502s before ever
         // sending a request — this only exercises the routing decision (and
         // that it's reachable with `require_token: false`, unlike the
@@ -2222,11 +3290,17 @@ mod tests {
         // a real network call to a mock upstream to exercise.
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
-        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.providers = vec![test_provider(
+            "zzz-test-provider-no-key",
+            "https://example.invalid/v1",
+        )];
 
         let (resp, _) = handle_request(
             &deps,
-            post_request("/v1/chat/completions", r#"{"model":"zzz-test-provider-no-key/some-model"}"#),
+            post_request(
+                "/v1/chat/completions",
+                r#"{"model":"zzz-test-provider-no-key/some-model"}"#,
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -2239,22 +3313,30 @@ mod tests {
     async fn models_endpoint_omits_provider_models_when_no_key_is_configured() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
-        deps.providers = vec![test_provider("zzz-test-provider-no-key", "https://example.invalid/v1")];
+        deps.providers = vec![test_provider(
+            "zzz-test-provider-no-key",
+            "https://example.invalid/v1",
+        )];
 
         let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
-        assert!(data.iter().all(|m| m["owned_by"] != "zzz-test-provider-no-key"));
+        assert!(data
+            .iter()
+            .all(|m| m["owned_by"] != "zzz-test-provider-no-key"));
     }
 
     #[tokio::test]
     async fn embeddings_501s_when_llama_wasnt_started_with_embeddings() {
         // `test_deps` defaults `llama_embeddings_enabled` to `false`.
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) =
-            handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2279,8 +3361,11 @@ mod tests {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.llama_port = addr.port();
         deps.llama_embeddings_enabled = true;
-        let (resp, _) =
-            handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         handle.join().unwrap();
@@ -2290,7 +3375,14 @@ mod tests {
     async fn embeddings_501s_for_a_provider_routed_model() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.expose_providers = true;
-        let (resp, _) = handle_request(&deps, post_request("/v1/embeddings", r#"{"model":"openai/text-embedding-3-small"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request(
+                "/v1/embeddings",
+                r#"{"model":"openai/text-embedding-3-small"}"#,
+            ),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2301,9 +3393,17 @@ mod tests {
     async fn embeddings_requires_the_embeddings_scope() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-chat-only", "lmk-chat-only", vec![Scope::Chat], vec![Backend::Local, Backend::Ollama])];
+        deps.tokens = vec![stored_token(
+            "tok-chat-only",
+            "lmk-chat-only",
+            vec![Scope::Chat],
+            vec![Backend::Local, Backend::Ollama],
+        )];
 
-        let req = with_bearer(post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#), "lmk-chat-only");
+        let req = with_bearer(
+            post_request("/v1/embeddings", r#"{"model":"qwen2.5-7b-instruct"}"#),
+            "lmk-chat-only",
+        );
         let (resp, _) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
@@ -2319,7 +3419,12 @@ mod tests {
     async fn options_preflight_on_v1_routes_returns_cors_headers_and_needs_no_token() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("t1", "lmk-real-token", vec![Scope::Chat], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "t1",
+            "lmk-real-token",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+        )];
 
         let req = ServerRequest {
             method: Method::OPTIONS,
@@ -2329,7 +3434,10 @@ mod tests {
         };
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
         assert!(resp.headers().get("access-control-allow-methods").is_some());
         assert!(matched.is_none());
     }
@@ -2338,13 +3446,22 @@ mod tests {
     async fn every_response_carries_the_cors_allow_origin_header() {
         let deps = test_deps("http://127.0.0.1:1".to_string());
         let (resp, _) = handle_request(&deps, get_request("/health")).await;
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
 
         let (resp, _) = handle_request(&deps, get_request("/v1/models")).await;
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
 
         let (resp, _) = handle_request(&deps, get_request("/v1/nope")).await;
-        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
     }
 
     /// Spins up a bare-bones raw-TCP "upstream" that writes back a fixed
@@ -2356,7 +3473,8 @@ mod tests {
     async fn sse_streaming_passthrough_preserves_upstream_bytes_exactly() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let canned: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let canned: &[u8] =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
 
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
@@ -2372,7 +3490,14 @@ mod tests {
         });
 
         let deps = test_deps(format!("http://{addr}"));
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b","stream":true}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request(
+                "/v1/chat/completions",
+                r#"{"model":"llama3.1:8b","stream":true}"#,
+            ),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body_bytes(resp).await;
         assert_eq!(&bytes[..], canned);
@@ -2385,7 +3510,11 @@ mod tests {
         // Port 1 on loopback: nothing listens there, so the connection is
         // refused immediately — a deterministic "unreachable upstream".
         let deps = test_deps("http://127.0.0.1:1".to_string());
-        let (resp, _) = handle_request(&deps, post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#)).await;
+        let (resp, _) = handle_request(
+            &deps,
+            post_request("/v1/chat/completions", r#"{"model":"llama3.1:8b"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -2407,27 +3536,54 @@ mod tests {
 
     #[tokio::test]
     async fn bind_listener_succeeds_on_an_available_port() {
-        let listener = bind_listener(0).await.expect("binding port 0 (OS-assigned) should always succeed");
+        let listener = bind_listener(0)
+            .await
+            .expect("binding port 0 (OS-assigned) should always succeed");
         assert!(listener.local_addr().unwrap().port() > 0);
     }
 
     #[test]
     fn creating_a_token_never_persists_its_plaintext() {
-        let (token, entry) = mint_token("CI", vec![Scope::Chat], vec![Backend::Local]).unwrap();
-        assert_ne!(entry.sha256, token, "the persisted entry must never contain the plaintext token");
+        let (token, entry) =
+            mint_token("CI", vec![Scope::Chat], vec![Backend::Local], None).unwrap();
+        assert_ne!(
+            entry.sha256, token,
+            "the persisted entry must never contain the plaintext token"
+        );
         assert_eq!(entry.sha256, sha256_hex(&token));
 
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(!json.contains(&token), "serialized TokenEntry must never contain the plaintext token");
+        assert!(
+            !json.contains(&token),
+            "serialized TokenEntry must never contain the plaintext token"
+        );
     }
 
     #[test]
     fn mint_token_rejects_blank_label_or_empty_scopes_or_backends() {
-        assert!(mint_token("", vec![Scope::Chat], vec![Backend::Local]).is_err());
-        assert!(mint_token("   ", vec![Scope::Chat], vec![Backend::Local]).is_err());
-        assert!(mint_token("ok", vec![], vec![Backend::Local]).is_err());
-        assert!(mint_token("ok", vec![Scope::Chat], vec![]).is_err());
-        assert!(mint_token("ok", vec![Scope::Chat], vec![Backend::Local]).is_ok());
+        assert!(mint_token("", vec![Scope::Chat], vec![Backend::Local], None).is_err());
+        assert!(mint_token("   ", vec![Scope::Chat], vec![Backend::Local], None).is_err());
+        assert!(mint_token("ok", vec![], vec![Backend::Local], None).is_err());
+        assert!(mint_token("ok", vec![Scope::Chat], vec![], None).is_err());
+        assert!(mint_token("ok", vec![Scope::Chat], vec![Backend::Local], None).is_ok());
+    }
+
+    #[test]
+    fn mint_token_rejects_an_expiration_that_is_not_in_the_future() {
+        assert!(mint_token(
+            "ok",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+            Some(now_ms().saturating_sub(1_000)),
+        )
+        .is_err());
+        assert!(mint_token(
+            "ok",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+            Some(now_ms() + 1_000_000),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2440,7 +3596,10 @@ mod tests {
             backends: vec![Backend::Local],
             created_at: 1,
             last_used_at: None,
-        };
+            expires_at: None,
+        
+            ..Default::default()
+};
         let view = TokenEntryView::from(&entry);
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("sha256"));
@@ -2473,6 +3632,8 @@ mod tests {
             backends: vec![Backend::Local],
             created_at: 1,
             last_used_at: None,
+            expires_at: None,
+            ..Default::default()
         });
 
         save_config_impl(&path, &config).unwrap();
@@ -2492,7 +3653,13 @@ mod tests {
         let path = temp_config_path();
         let state = AppState::default();
 
-        let view = ApiServerConfigView { port: 1234, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let view = ApiServerConfigView {
+            port: 1234,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+        };
         let (_, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
         assert!(!needs_restart, "server is stopped — no restart needed");
 
@@ -2500,9 +3667,18 @@ mod tests {
             let mut s = state.api_server.lock().unwrap();
             s.status = "running".to_string();
         }
-        let view = ApiServerConfigView { port: 5555, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let view = ApiServerConfigView {
+            port: 5555,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+        };
         let (updated, needs_restart) = set_config_with_state_impl(&state, &path, view).unwrap();
-        assert!(needs_restart, "server is running — a config change must trigger a restart");
+        assert!(
+            needs_restart,
+            "server is running — a config change must trigger a restart"
+        );
         assert_eq!(updated.port, 5555);
 
         let _ = std::fs::remove_file(&path);
@@ -2512,7 +3688,13 @@ mod tests {
     fn set_config_rejects_a_zero_port() {
         let path = temp_config_path();
         let state = AppState::default();
-        let view = ApiServerConfigView { port: 0, autostart: false, require_token: true, expose_ollama: true, expose_providers: false };
+        let view = ApiServerConfigView {
+            port: 0,
+            autostart: false,
+            require_token: true,
+            expose_ollama: true,
+            expose_providers: false,
+        };
         assert!(set_config_with_state_impl(&state, &path, view).is_err());
     }
 
@@ -2521,8 +3703,15 @@ mod tests {
         let path = temp_config_path();
         let state = AppState::default();
 
-        let (token, entry) =
-            create_token_with_state_impl(&state, &path, "My IDE", vec![Scope::Chat, Scope::Models], vec![Backend::Local]).unwrap();
+        let (token, entry) = create_token_with_state_impl(
+            &state,
+            &path,
+            "My IDE",
+            vec![Scope::Chat, Scope::Models],
+            vec![Backend::Local],
+            None,
+        )
+        .unwrap();
         assert!(token.starts_with(TOKEN_PREFIX));
 
         let loaded = load_config_impl(&path).unwrap();
@@ -2533,8 +3722,18 @@ mod tests {
         revoke_token_with_state_impl(&state, &path, &entry.id).unwrap();
         let loaded = load_config_impl(&path).unwrap();
         assert!(loaded.tokens.is_empty());
+        assert_eq!(
+            loaded.revoked.len(),
+            1,
+            "revocation must append an audit-trail entry, not just delete the token"
+        );
+        assert_eq!(loaded.revoked[0].id, entry.id);
+        assert_eq!(loaded.revoked[0].label, "My IDE");
 
-        assert!(revoke_token_with_state_impl(&state, &path, &entry.id).is_err(), "revoking an already-gone id must error, not silently succeed");
+        assert!(
+            revoke_token_with_state_impl(&state, &path, &entry.id).is_err(),
+            "revoking an already-gone id must error, not silently succeed"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2551,6 +3750,8 @@ mod tests {
             backends: vec![],
             created_at: 1,
             last_used_at: None,
+            expires_at: None,
+            ..Default::default()
         });
         config.tokens.push(TokenEntry {
             id: "b".to_string(),
@@ -2560,6 +3761,8 @@ mod tests {
             backends: vec![],
             created_at: 1,
             last_used_at: None,
+            expires_at: None,
+            ..Default::default()
         });
         save_config_impl(&path, &config).unwrap();
 
@@ -2567,8 +3770,20 @@ mod tests {
         record_token_used_with_state(&state, &path, "b");
 
         let reloaded = load_config_impl(&path).unwrap();
-        assert!(reloaded.tokens.iter().find(|t| t.id == "a").unwrap().last_used_at.is_none());
-        assert!(reloaded.tokens.iter().find(|t| t.id == "b").unwrap().last_used_at.is_some());
+        assert!(reloaded
+            .tokens
+            .iter()
+            .find(|t| t.id == "a")
+            .unwrap()
+            .last_used_at
+            .is_none());
+        assert!(reloaded
+            .tokens
+            .iter()
+            .find(|t| t.id == "b")
+            .unwrap()
+            .last_used_at
+            .is_some());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2586,7 +3801,8 @@ mod tests {
     /// here is tested through a `*_with_state_impl`/`*_impl` taking an
     /// explicit `&Path` instead) — `tokio::time::timeout` is the hang guard.
     #[tokio::test]
-    async fn config_triggered_restart_onto_an_already_taken_port_surfaces_status_error_without_hanging() {
+    async fn config_triggered_restart_onto_an_already_taken_port_surfaces_status_error_without_hanging(
+    ) {
         let mut state = ApiServerState::default();
 
         // Simulates a healthy running server on an OS-assigned port, exactly
@@ -2611,9 +3827,12 @@ mod tests {
         }
         state.status = "stopped".to_string();
 
-        let bind_result = tokio::time::timeout(std::time::Duration::from_secs(2), bind_listener(conflicting_port))
-            .await
-            .expect("bind_listener must not hang when the target port is already taken");
+        let bind_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bind_listener(conflicting_port),
+        )
+        .await
+        .expect("bind_listener must not hang when the target port is already taken");
 
         match bind_result {
             Ok(_) => panic!("expected a bind conflict against an already-bound port"),
@@ -2629,7 +3848,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Phase 4: lm-cli `api-serve` reuse (`provider_catalog_from`,
+    // Phase 4: monkey-cli `api-serve` reuse (`provider_catalog_from`,
     // `tokens_from_config`, `probe_llama_server`)
     // -------------------------------------------------------------
 
@@ -2646,7 +3865,9 @@ mod tests {
         assert!(catalog.iter().any(|p| p.id == "openai"));
         assert!(catalog.iter().any(|p| p.id == "anthropic"));
         // ...alongside the custom entry.
-        assert!(catalog.iter().any(|p| p.id == "my-local-router" && p.base_url == "http://127.0.0.1:9999/v1"));
+        assert!(catalog
+            .iter()
+            .any(|p| p.id == "my-local-router" && p.base_url == "http://127.0.0.1:9999/v1"));
     }
 
     #[test]
@@ -2666,6 +3887,8 @@ mod tests {
             backends: vec![Backend::Local, Backend::Ollama],
             created_at: 1,
             last_used_at: None,
+            expires_at: None,
+            ..Default::default()
         });
 
         let tokens = tokens_from_config(&config);
@@ -2707,7 +3930,8 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
-                let body = r#"{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}"#;
+                let body =
+                    r#"{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -2726,10 +3950,10 @@ mod tests {
     }
 
     /// Regression guard for the phase-4 CLI reuse: `run_cli_server` must
-    /// still surface a conflicting port as an `Err` (so `lm-cli`'s `fail()`
+    /// still surface a conflicting port as an `Err` (so `monkey-cli`'s `fail()`
     /// prints it and exits non-zero) rather than hanging or panicking —
     /// mirrors `config_triggered_restart_onto_an_already_taken_port_...`
-    /// above, but through the actual public entry point `lm-cli` calls.
+    /// above, but through the actual public entry point `monkey-cli` calls.
     #[tokio::test]
     async fn run_cli_server_reports_a_bind_conflict_as_an_error() {
         let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2749,6 +3973,381 @@ mod tests {
     }
 
     // -------------------------------------------------------------
+    // Phase 5: expiry, revocation audit trail, extended-route scopes
+    // -------------------------------------------------------------
+
+    fn stored_token_expiring(
+        id: &str,
+        plaintext: &str,
+        scopes: Vec<Scope>,
+        backends: Vec<Backend>,
+        expires_at: Option<u64>,
+    ) -> StoredToken {
+        let mut token = stored_token(id, plaintext, scopes, backends);
+        token.expires_at = expires_at;
+        token
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_an_expired_token_with_the_same_generic_error_as_an_unknown_one() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token_expiring(
+            "tok-expired",
+            "lmk-expired",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+            Some(now_ms().saturating_sub(1_000)),
+        )];
+
+        let req = with_bearer(get_request("/v1/models"), "lmk-expired");
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(matched.is_none());
+
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let expired_message = value["error"]["message"].as_str().unwrap().to_string();
+
+        // Same response body as a token that was never minted at all — an
+        // expired token must not be distinguishable from an unknown one.
+        let req = with_bearer(get_request("/v1/models"), "lmk-never-existed");
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(matched.is_none());
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["message"].as_str().unwrap(), expired_message);
+    }
+
+    #[tokio::test]
+    async fn authenticate_accepts_a_token_whose_expiry_is_still_in_the_future() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![stored_token_expiring(
+            "tok-not-yet-expired",
+            "lmk-not-yet-expired",
+            vec![Scope::Models],
+            vec![Backend::Local],
+            Some(now_ms() + 1_000_000),
+        )];
+
+        let req = with_bearer(get_request("/v1/models"), "lmk-not-yet-expired");
+        let (resp, matched) = handle_request(&deps, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(matched.as_deref(), Some("tok-not-yet-expired"));
+    }
+
+    #[test]
+    fn revoked_token_no_longer_authenticates_while_its_audit_trail_survives() {
+        let path = temp_config_path();
+        let state = AppState::default();
+
+        let (token, entry) = create_token_with_state_impl(
+            &state,
+            &path,
+            "Revoke me",
+            vec![Scope::Chat],
+            vec![Backend::Local],
+            None,
+        )
+        .unwrap();
+
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = tokens_from_config(&load_config_impl(&path).unwrap());
+        assert!(
+            authenticate(&deps, &with_bearer(get_request("/"), &token).headers).is_ok(),
+            "the token must authenticate before it's revoked"
+        );
+
+        revoke_token_with_state_impl(&state, &path, &entry.id).unwrap();
+
+        deps.tokens = tokens_from_config(&load_config_impl(&path).unwrap());
+        assert!(
+            authenticate(&deps, &with_bearer(get_request("/"), &token).headers).is_err(),
+            "a revoked token must be denied, not silently accepted"
+        );
+
+        let audit = export_audit_impl(&load_config_impl(&path).unwrap());
+        let revoked_row = audit.iter().find(|row| row.id == entry.id).unwrap();
+        assert!(revoked_row.revoked_at.is_some());
+        assert_eq!(revoked_row.label, "Revoke me");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_audit_never_includes_the_digest_or_plaintext_for_active_or_revoked_tokens() {
+        let mut config = ApiServerConfig::default();
+        let plaintext = "lmk-super-secret-value";
+        config.tokens.push(TokenEntry {
+            id: "active-1".to_string(),
+            label: "Active".to_string(),
+            sha256: sha256_hex(plaintext),
+            scopes: vec![Scope::Chat],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+            expires_at: None,
+            ..Default::default()
+        });
+        config.revoked.push(RevokedTokenEntry {
+            id: "revoked-1".to_string(),
+            label: "Revoked".to_string(),
+            scopes: vec![Scope::Knowledge],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+            revoked_at: 2,
+            expires_at: None,
+        });
+
+        let audit = export_audit_impl(&config);
+        assert_eq!(audit.len(), 2);
+
+        let json = serde_json::to_string(&audit).unwrap();
+        assert!(!json.contains("sha256"));
+        assert!(!json.contains(plaintext));
+        assert!(!json.contains(&sha256_hex(plaintext)));
+
+        let active_row = audit.iter().find(|row| row.id == "active-1").unwrap();
+        assert!(active_row.revoked_at.is_none());
+        let revoked_row = audit.iter().find(|row| row.id == "revoked-1").unwrap();
+        assert_eq!(revoked_row.revoked_at, Some(2));
+    }
+
+    #[test]
+    fn export_audit_carries_expires_at_so_an_expired_but_unrevoked_token_is_distinguishable_from_a_genuinely_active_one(
+    ) {
+        let mut config = ApiServerConfig::default();
+        config.tokens.push(TokenEntry {
+            id: "expired-1".to_string(),
+            label: "Expired but not revoked".to_string(),
+            sha256: sha256_hex("lmk-expired-value"),
+            scopes: vec![Scope::Chat],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+            expires_at: Some(now_ms() - 1_000),
+            ..Default::default()
+        });
+        config.tokens.push(TokenEntry {
+            id: "active-2".to_string(),
+            label: "Genuinely active".to_string(),
+            sha256: sha256_hex("lmk-active-value"),
+            scopes: vec![Scope::Chat],
+            backends: vec![Backend::Local],
+            created_at: 1,
+            last_used_at: None,
+            expires_at: None,
+            ..Default::default()
+        });
+
+        let audit = export_audit_impl(&config);
+        let expired_row = audit.iter().find(|row| row.id == "expired-1").unwrap();
+        assert!(expired_row.revoked_at.is_none());
+        assert!(expired_row.expires_at.is_some_and(|ms| ms < now_ms()));
+
+        let active_row = audit.iter().find(|row| row.id == "active-2").unwrap();
+        assert!(active_row.revoked_at.is_none());
+        assert!(active_row.expires_at.is_none());
+    }
+
+    #[test]
+    fn require_scope_rejects_a_chat_only_token_on_a_knowledge_gated_route() {
+        let chat_only = TokenAuth {
+            id: "tok-chat-only".to_string(),
+            scopes: vec![Scope::Chat],
+            backends: vec![Backend::Local],
+            ..Default::default()
+        };
+        assert!(require_scope(Some(&chat_only), Scope::Knowledge, "knowledge").is_err());
+        assert!(require_scope(Some(&chat_only), Scope::WorkflowRun, "workflow_run").is_err());
+        assert!(require_scope(Some(&chat_only), Scope::ArtifactRead, "artifact_read").is_err());
+        // Still allowed for the scope it actually carries.
+        assert!(require_scope(Some(&chat_only), Scope::Chat, "chat").is_ok());
+    }
+
+    #[test]
+    fn require_scope_accepts_a_token_carrying_the_new_phase_5_scopes() {
+        let full = TokenAuth {
+            id: "tok-full".to_string(),
+            scopes: vec![Scope::Knowledge, Scope::WorkflowRun, Scope::ArtifactRead],
+            backends: vec![Backend::Local],
+            ..Default::default()
+        };
+        assert!(require_scope(Some(&full), Scope::Knowledge, "knowledge").is_ok());
+        assert!(require_scope(Some(&full), Scope::WorkflowRun, "workflow_run").is_ok());
+        assert!(require_scope(Some(&full), Scope::ArtifactRead, "artifact_read").is_ok());
+    }
+
+    #[test]
+    fn require_scope_allows_everything_when_no_token_is_matched() {
+        // Mirrors `backend_visible`'s "None auth means unrestricted" rule —
+        // only reached when `require_token` is off and no bearer was sent.
+        assert!(require_scope(None, Scope::Knowledge, "knowledge").is_ok());
+        assert!(require_scope(None, Scope::WorkflowRun, "workflow_run").is_ok());
+        assert!(require_scope(None, Scope::ArtifactRead, "artifact_read").is_ok());
+    }
+
+    #[test]
+    fn extended_route_for_matches_exactly_the_three_phase_5_routes() {
+        assert_eq!(
+            extended_route_for(&Method::POST, "/v1/knowledge/query"),
+            Some(ExtendedRoute::KnowledgeQuery)
+        );
+        assert_eq!(
+            extended_route_for(&Method::GET, "/v1/artifacts/abc123"),
+            Some(ExtendedRoute::ArtifactRead("abc123".to_string()))
+        );
+        assert_eq!(
+            extended_route_for(&Method::GET, "/v1/workflows/runs/run-1"),
+            Some(ExtendedRoute::WorkflowRunStatus("run-1".to_string()))
+        );
+        // Wrong method for the knowledge route, empty ids, and unrelated
+        // paths must all fall through so `handle_request`'s original five
+        // routes (or the final 404) still get a chance at them.
+        assert_eq!(extended_route_for(&Method::GET, "/v1/knowledge/query"), None);
+        assert_eq!(extended_route_for(&Method::GET, "/v1/artifacts/"), None);
+        assert_eq!(extended_route_for(&Method::GET, "/v1/workflows/runs/"), None);
+        assert_eq!(extended_route_for(&Method::GET, "/v1/models"), None);
+    }
+
+    #[test]
+    fn extended_route_for_matches_the_local_app_run_and_static_routes() {
+        assert_eq!(
+            extended_route_for(&Method::POST, "/v1/local-apps/app-1/run"),
+            Some(ExtendedRoute::LocalAppRun("app-1".to_string()))
+        );
+        assert_eq!(
+            extended_route_for(&Method::GET, "/local-apps/app-1"),
+            Some(ExtendedRoute::LocalAppStatic {
+                app_id: "app-1".to_string(),
+                rel_path: String::new()
+            })
+        );
+        assert_eq!(
+            extended_route_for(&Method::GET, "/local-apps/app-1/index.html"),
+            Some(ExtendedRoute::LocalAppStatic {
+                app_id: "app-1".to_string(),
+                rel_path: "index.html".to_string()
+            })
+        );
+        // Wrong method, a blank id, and a run path with an extra segment
+        // must all fall through instead of matching.
+        assert_eq!(extended_route_for(&Method::GET, "/v1/local-apps/app-1/run"), None);
+        assert_eq!(extended_route_for(&Method::POST, "/v1/local-apps//run"), None);
+        assert_eq!(extended_route_for(&Method::GET, "/local-apps/"), None);
+    }
+
+    // -------------------------------------------------------------
+    // Local App Builder (ROADMAP.md, Phase 3): scoped-token enforcement
+    // -------------------------------------------------------------
+
+    fn local_app_stored_token(id: &str, plaintext: &str, bound_local_app_id: &str) -> StoredToken {
+        StoredToken {
+            id: id.to_string(),
+            sha256: sha256_hex(plaintext),
+            scopes: vec![Scope::LocalAppRun],
+            backends: Vec::new(),
+            expires_at: None,
+            bound_local_app_id: Some(bound_local_app_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn mint_local_app_token_produces_a_scope_and_binding_that_cannot_reach_anything_else() {
+        let (_token, entry) = mint_local_app_token("Local App: nightly-audit", "app-1");
+        assert_eq!(entry.scopes, vec![Scope::LocalAppRun]);
+        assert!(entry.backends.is_empty());
+        assert_eq!(entry.bound_local_app_id.as_deref(), Some("app-1"));
+    }
+
+    #[test]
+    fn mint_token_rejects_the_local_app_run_scope_from_the_generic_create_token_flow() {
+        let result = mint_token(
+            "Manually crafted",
+            vec![Scope::LocalAppRun],
+            vec![Backend::Local],
+            None,
+        );
+        assert!(result.unwrap_err().contains("local_app_run"));
+    }
+
+    #[test]
+    fn authenticate_local_app_token_accepts_only_the_exact_bound_app_id() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
+
+        let headers = with_bearer(get_request("/"), "lmk-app1").headers;
+        assert!(authenticate_local_app_token(&deps, &headers, "app-1").is_ok());
+
+        // The exact same token must be rejected for a different app id —
+        // this is the core "impossible to do anything beyond running that
+        // one recipe" guarantee.
+        let rejection = authenticate_local_app_token(&deps, &headers, "app-2");
+        assert!(rejection.is_err());
+    }
+
+    #[test]
+    fn authenticate_local_app_token_rejects_a_token_with_no_local_app_run_scope() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.tokens = vec![stored_token("tok-chat", "lmk-chat-only", vec![Scope::Chat], vec![Backend::Local])];
+        let headers = with_bearer(get_request("/"), "lmk-chat-only").headers;
+        assert!(authenticate_local_app_token(&deps, &headers, "app-1").is_err());
+    }
+
+    #[test]
+    fn authenticate_local_app_token_rejects_missing_or_wrong_bearer_and_ignores_require_token_toggle() {
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = false; // must not matter for this route
+        deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
+
+        let no_bearer = HeaderMap::new();
+        assert!(authenticate_local_app_token(&deps, &no_bearer, "app-1").is_err());
+
+        let wrong_bearer = with_bearer(get_request("/"), "lmk-never-existed").headers;
+        assert!(authenticate_local_app_token(&deps, &wrong_bearer, "app-1").is_err());
+    }
+
+    #[test]
+    fn a_local_app_token_cannot_reach_chat_models_or_embeddings_through_the_ordinary_routes() {
+        // Exercises the real dispatcher, not just the scope-membership check:
+        // a token minted with only `Scope::LocalAppRun` and empty `backends`
+        // must be turned away by every one of `handle_request`'s five
+        // ordinary routes — this is what makes it structurally impossible
+        // for a published Local App's token to do anything beyond running
+        // its one bound recipe.
+        let mut deps = test_deps("http://127.0.0.1:1".to_string());
+        deps.require_token = true;
+        deps.tokens = vec![local_app_stored_token("tok-app1", "lmk-app1", "app-1")];
+
+        for path in ["/v1/models", "/v1/chat/completions", "/v1/embeddings"] {
+            let req = if path == "/v1/models" {
+                with_bearer(get_request(path), "lmk-app1")
+            } else {
+                with_bearer(post_request(path, "{}"), "lmk-app1")
+            };
+            let (resp, matched) = tokio_test_block_on(handle_request(&deps, req));
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "path {path} must reject a Local-App-scoped token"
+            );
+            assert_eq!(matched.as_deref(), Some("tok-app1"));
+        }
+    }
+
+    fn tokio_test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    // -------------------------------------------------------------
     // Review-finding regressions
     // -------------------------------------------------------------
 
@@ -2761,7 +4360,12 @@ mod tests {
 
     #[test]
     fn backend_visible_respects_a_matched_tokens_backend_list() {
-        let auth = TokenAuth { id: "t".to_string(), scopes: vec![Scope::Models], backends: vec![Backend::Local] };
+        let auth = TokenAuth {
+            id: "t".to_string(),
+            scopes: vec![Scope::Models],
+            backends: vec![Backend::Local],
+            ..Default::default()
+        };
         assert!(backend_visible(Some(&auth), Backend::Local));
         assert!(!backend_visible(Some(&auth), Backend::Ollama));
         assert!(!backend_visible(Some(&auth), Backend::Providers));
@@ -2801,14 +4405,21 @@ mod tests {
     async fn models_endpoint_includes_the_local_model_for_a_token_scoped_for_the_local_backend() {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = true;
-        deps.tokens = vec![stored_token("tok-local", "lmk-local", vec![Scope::Models], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-local",
+            "lmk-local",
+            vec![Scope::Models],
+            vec![Backend::Local],
+        )];
 
         let req = with_bearer(get_request("/v1/models"), "lmk-local");
         let (resp, _) = handle_request(&deps, req).await;
         let bytes = body_bytes(resp).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = value["data"].as_array().unwrap();
-        assert!(data.iter().any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
+        assert!(data
+            .iter()
+            .any(|m| m["id"] == "qwen2.5-7b-instruct" && m["owned_by"] == "local"));
     }
 
     /// The core regression for the CORS/`require_token: false` finding: a
@@ -2820,13 +4431,20 @@ mod tests {
     /// open drive `/v1/chat/completions` (including a real, credential-
     /// spending provider call) with zero authentication.
     #[tokio::test]
-    async fn a_request_carrying_an_origin_header_is_never_exempt_from_auth_even_when_require_token_is_off() {
+    async fn a_request_carrying_an_origin_header_is_never_exempt_from_auth_even_when_require_token_is_off(
+    ) {
         let mut deps = test_deps("http://127.0.0.1:1".to_string());
         deps.require_token = false;
-        deps.tokens = vec![stored_token("tok-1", "lmk-real-token", vec![Scope::Models], vec![Backend::Local])];
+        deps.tokens = vec![stored_token(
+            "tok-1",
+            "lmk-real-token",
+            vec![Scope::Models],
+            vec![Backend::Local],
+        )];
 
         let mut req = get_request("/v1/models");
-        req.headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        req.headers
+            .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         let (resp, matched) = handle_request(&deps, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(matched.is_none());
@@ -2835,7 +4453,9 @@ mod tests {
         // this isn't a blanket ban on `Origin`, just a requirement that a
         // real token accompany it.
         let mut authed_req = get_request("/v1/models");
-        authed_req.headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        authed_req
+            .headers
+            .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         let authed_req = with_bearer(authed_req, "lmk-real-token");
         let (resp, matched) = handle_request(&deps, authed_req).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2859,15 +4479,23 @@ mod tests {
 
     #[tokio::test]
     async fn read_capped_body_returns_the_bytes_when_well_within_the_limit() {
-        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"hello world")))]);
-        let bytes = read_capped_body(StreamBody::new(stream), 1024).await.unwrap();
+        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(
+            Bytes::from_static(b"hello world"),
+        ))]);
+        let bytes = read_capped_body(StreamBody::new(stream), 1024)
+            .await
+            .unwrap();
         assert_eq!(&bytes[..], b"hello world");
     }
 
     #[tokio::test]
     async fn read_capped_body_rejects_a_single_oversized_frame_with_413() {
-        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"0123456789")))]);
-        let response = read_capped_body(StreamBody::new(stream), 4).await.unwrap_err();
+        let stream = futures_util::stream::iter(vec![Ok::<_, BoxError>(Frame::data(
+            Bytes::from_static(b"0123456789"),
+        ))]);
+        let response = read_capped_body(StreamBody::new(stream), 4)
+            .await
+            .unwrap_err();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let bytes = body_bytes(response).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2885,7 +4513,9 @@ mod tests {
             Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"12345"))),
             Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"67890"))),
         ]);
-        let response = read_capped_body(StreamBody::new(stream), 6).await.unwrap_err();
+        let response = read_capped_body(StreamBody::new(stream), 6)
+            .await
+            .unwrap_err();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -2893,9 +4523,14 @@ mod tests {
     /// body" finding: a failed frame read must surface as its own distinct
     /// `400 body_read_error`, never as `Ok(Bytes::new())`.
     #[tokio::test]
-    async fn read_capped_body_reports_a_distinct_error_instead_of_silently_substituting_an_empty_body() {
-        let stream = futures_util::stream::iter(vec![Err::<Frame<Bytes>, BoxError>("simulated connection drop".into())]);
-        let response = read_capped_body(StreamBody::new(stream), 1024).await.unwrap_err();
+    async fn read_capped_body_reports_a_distinct_error_instead_of_silently_substituting_an_empty_body(
+    ) {
+        let stream = futures_util::stream::iter(vec![Err::<Frame<Bytes>, BoxError>(
+            "simulated connection drop".into(),
+        )]);
+        let response = read_capped_body(StreamBody::new(stream), 1024)
+            .await
+            .unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = body_bytes(response).await;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2913,12 +4548,21 @@ mod tests {
     #[tokio::test]
     async fn awaiting_the_accept_loops_join_handle_before_rebinding_avoids_the_restart_race() {
         for _ in 0..20 {
-            let port = {
-                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                l.local_addr().unwrap().port()
-            };
+            // Bind the accept loop's own listener straight to an OS-assigned
+            // port (0) and read the port back off THAT listener, rather than
+            // probing with a throwaway `std::net::TcpListener` first and
+            // reusing the number after dropping it. The probe-then-reuse
+            // shape leaves a window between "probe listener dropped" and
+            // "accept-loop listener bound" where any other socket on the
+            // machine (including another iteration of this same loop running
+            // concurrently under `cargo test`'s default parallelism) can
+            // claim that exact port first — a pure test-scaffolding race
+            // with zero connection to the actual behavior under test, which
+            // this rewrite eliminates entirely by never letting the port go
+            // unheld between "chosen" and "in use".
+            let listener = bind_listener(0).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
             let shutdown = Arc::new(Notify::new());
-            let listener = bind_listener(port).await.unwrap();
             let shutdown_for_task = shutdown.clone();
             let handle = tokio::spawn(async move {
                 loop {
@@ -2939,10 +4583,29 @@ mod tests {
             shutdown.notify_one();
             handle.await.unwrap();
 
-            let rebound = bind_listener(port).await;
+            // The rebind itself still has an unavoidable window (closing and
+            // reopening a literal port number is inherently a real socket
+            // operation, not just an in-process handoff), but it's now the
+            // ONLY window in this test, and it's as small as an immediate
+            // `.await` — a truly external process would need to win a race
+            // measured in microseconds to land in it. A regression in
+            // `stop_server_core` itself (the actual thing under test: not
+            // awaiting the accept loop's `JoinHandle` before rebinding) would
+            // fail this deterministically on every attempt, since the OLD
+            // listener would still be alive and holding the port — so a
+            // bounded retry here only ever absorbs the residual, unrelated
+            // OS-level port race, never a real regression.
+            let mut rebound = bind_listener(port).await;
+            for _ in 0..2 {
+                if rebound.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                rebound = bind_listener(port).await;
+            }
             assert!(
                 rebound.is_ok(),
-                "rebinding immediately after joining the accept loop's task must succeed every time, not race the old listener's teardown"
+                "rebinding after joining the accept loop's task must succeed, not race the old listener's teardown: {rebound:?}"
             );
         }
     }

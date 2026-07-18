@@ -1,6 +1,11 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  ANTHROPIC_EFFORT_FALLBACK_KEY,
+  effortForProviderModel,
+  ollamaModelTargetKey,
+} from "../lib/modelTargets";
 import { useUsageStore } from "./usageStore";
 
 /**
@@ -19,6 +24,8 @@ export interface ModelInfo {
   path: string | null;
   /** True for a model registered via `models_add_external` (a `.gguf` file outside the app's models dir) — the app never owns or deletes that file. */
   is_external: boolean;
+  /** "chat" (tool-calling instruct model) or "embedding" — see `models.rs::ModelKind`. Defaults to "chat" on the Rust side for pre-existing entries, so this is always present in practice. */
+  kind: "chat" | "embedding";
 }
 
 export type LlamaStatus = "stopped" | "starting" | "ready" | "error";
@@ -36,7 +43,7 @@ interface LlamaStatusEvent {
 }
 
 /** localStorage key for the "start with embeddings" preference — mirrors
- * `EFFORT_STORAGE_KEY`'s persistence pattern below. */
+ * `EFFORT_BY_TARGET_STORAGE_KEY`'s persistence pattern below. */
 const EMBEDDINGS_ENABLED_STORAGE_KEY = "little-monkey-llama-embeddings-enabled";
 
 function readInitialEmbeddingsEnabled(): boolean {
@@ -86,25 +93,52 @@ interface OllamaPullProgressEvent {
 export type ActiveProvider = "local" | "ollama" | "provider";
 
 /**
- * Anthropic's `output_config.effort` levels (low/medium/high/xhigh/max) —
- * see `providers.rs::build_chat_request`, which only forwards this for
- * `provider_id === "anthropic"`. Every other provider ignores it.
+ * The app's five-level effort scale — Anthropic's native
+ * `output_config.effort` values. `providers.rs::build_chat_request` shapes
+ * these per provider on the wire: verbatim for Anthropic, clamped onto the
+ * three-level `reasoning_effort` scale for OpenAI/Gemini/OpenRouter, and
+ * omitted entirely for custom providers.
  */
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
-const EFFORT_STORAGE_KEY = "little-monkey-effort";
+/** Legacy single-global effort key (Anthropic-only control) — superseded by
+ * the per-target map below; read once to migrate an existing choice. */
+const LEGACY_EFFORT_STORAGE_KEY = "little-monkey-effort";
+const EFFORT_BY_TARGET_STORAGE_KEY = "little-monkey-effort-by-target";
 const VALID_EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 
-function readInitialEffort(): EffortLevel {
+function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === "string" && (VALID_EFFORT_LEVELS as string[]).includes(value);
+}
+
+function readInitialEffortByTarget(): Record<string, EffortLevel> {
   try {
-    const stored = localStorage.getItem(EFFORT_STORAGE_KEY);
-    if (stored && (VALID_EFFORT_LEVELS as string[]).includes(stored)) {
-      return stored as EffortLevel;
+    const raw = localStorage.getItem(EFFORT_BY_TARGET_STORAGE_KEY);
+    if (raw !== null) {
+      const parsed: unknown = JSON.parse(raw);
+      const map: Record<string, EffortLevel> = {};
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed)) {
+          if (isEffortLevel(value)) map[key] = value;
+        }
+      }
+      return map;
+    }
+    // One-time migration from the legacy single-global control, which only
+    // ever applied to Anthropic: a stored level becomes the Anthropic-wide
+    // fallback entry (per-model keys can't be enumerated at hydration), so
+    // an existing choice keeps affecting every Anthropic model until a
+    // per-model level (or Default) is picked.
+    const legacy = localStorage.getItem(LEGACY_EFFORT_STORAGE_KEY);
+    if (isEffortLevel(legacy)) {
+      const seeded: Record<string, EffortLevel> = { [ANTHROPIC_EFFORT_FALLBACK_KEY]: legacy };
+      localStorage.setItem(EFFORT_BY_TARGET_STORAGE_KEY, JSON.stringify(seeded));
+      return seeded;
     }
   } catch {
-    // Best-effort; fall through to the default.
+    // Best-effort; fall through to the empty default.
   }
-  return "high";
+  return {};
 }
 
 /**
@@ -124,6 +158,22 @@ export interface ProviderConfig {
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */
 export interface ProviderModelInfo {
   id: string;
+}
+
+/**
+ * Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+ * mirrors the Rust `CloudModelRetirementWarning` struct
+ * (`src-tauri/src/model_retirement.rs`) exactly. The retirement registry
+ * itself is a maintained, versioned, local static list — not a live-verified
+ * source, since there is no upstream API this app can call in this sandbox
+ * to ask "is this model retired?". See that module's doc comment.
+ */
+export interface CloudModelRetirementWarning {
+  provider_id: string;
+  model_id: string;
+  reason: string;
+  suggested_replacement_model_id: string | null;
+  replacement_note: string;
 }
 
 /** Context window size used when starting llama-server. */
@@ -180,7 +230,7 @@ export interface ModelStore {
   /** Whether the next `start()` should launch llama-server with `--embeddings`
    * (surfaced as a checkbox in the Models panel — see `docs/roadmap/p1-local-api-server.md`
    * phase 3). Persisted to localStorage so the preference survives a restart,
-   * same as `effort` below. Only takes effect on the *next* start — restarting
+   * same as `effortByTarget` below. Only takes effect on the *next* start — restarting
    * a model that's currently running is required to pick up a change, exactly
    * like every other llama-server launch flag (ctx size, gpu layers). */
   embeddingsEnabled: boolean;
@@ -224,6 +274,8 @@ export interface ModelStore {
   pullOllamaModel: (tag: string) => Promise<void>;
   /** Import a local `.gguf` file or Safetensors model directory into Ollama under `name` (via `ollama create`), tracking progress/errors the same way as `pullOllamaModel`. */
   importOllamaModel: (name: string, path: string) => Promise<void>;
+  /** Create a model from a full, user-authored Modelfile via Modelfile Studio's hardened `ollama_create_from_modelfile` command — re-parses/re-validates `modelfileText` server-side regardless of any prior preview, then streams `ollama create` output the same way as `pullOllamaModel`/`importOllamaModel` (keyed by `shortName`). */
+  createModelfileModel: (shortName: string, modelfileText: string) => Promise<void>;
   /** Select an already-pulled Ollama tag as the active chat target. Instant, no backend call. */
   useOllamaModel: (tag: string) => void;
   /** Remove a locally-pulled Ollama tag, then refresh. */
@@ -234,6 +286,13 @@ export interface ModelStore {
   // --- Cloud AI providers (OpenAI/Anthropic/Gemini/OpenRouter/custom) ---
   providers: ProviderConfig[];
   providerModels: Record<string, ProviderModelInfo[]>;
+  /** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+   * 14): provider id -> model id -> retirement warning, computed once per
+   * `providerModels` refresh (see `setProviderKey`/`refreshProviderModels`)
+   * rather than on every render. A provider/model absent here simply hasn't
+   * been checked yet or isn't retired — read via
+   * `lib/modelRetirement.ts`'s `cloudModelRetirementWarning`. */
+  providerModelRetirements: Record<string, Record<string, CloudModelRetirementWarning>>;
   /** Provider id -> last failure message from a failed `setProviderKey`/`refreshProviderModels` call. */
   providerKeyError: Record<string, string>;
   /** Which provider id is selected to chat with, when `activeProvider === "provider"`. */
@@ -257,10 +316,41 @@ export interface ModelStore {
   /** Select an already-fetched provider model as the active chat target. Instant, no backend call. */
   useProviderModel: (providerId: string, modelId: string) => void;
 
-  /** Anthropic `output_config.effort` level, persisted to localStorage. Only meaningful/sent when chatting against the "anthropic" provider. */
-  effort: EffortLevel;
-  /** Update the effort level and persist it to localStorage. */
-  setEffort: (effort: EffortLevel) => void;
+  /** Per-model effort levels keyed by model-target key (see
+   * `modelTargets.ts`'s `providerModelTargetKey`/`ollamaModelTargetKey`),
+   * persisted to localStorage. A model with no entry sends no effort field
+   * at all — the provider's own default applies (OpenAI hard-errors on
+   * `reasoning_effort` for non-reasoning models, so "unset" must mean
+   * "absent from the request", never a guessed level). */
+  effortByTarget: Record<string, EffortLevel>;
+  /** Set the effort level for one model target — or, with `null`, clear it
+   * back to "Default" (nothing sent) — and persist the map. */
+  setEffortForTarget: (targetKey: string, effort: EffortLevel | null) => void;
+}
+
+/**
+ * Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+ * checks a provider's whole fetched model list against the local retired-
+ * model registry (`model_retirement.rs`) in one batched call, so switching
+ * providers/models never needs a per-lookup round trip. Never throws — a
+ * check failure is diagnostic and must never block the model list refresh
+ * itself (mirrors `refreshCompatibilityReport`'s soft-fail shape in
+ * `runtimeHubStore.ts`).
+ */
+async function fetchProviderModelRetirements(
+  providerId: string,
+  models: ProviderModelInfo[],
+): Promise<Record<string, CloudModelRetirementWarning>> {
+  if (!models.length) return {};
+  try {
+    const warnings = await invoke<CloudModelRetirementWarning[]>("providers_check_model_retirements", {
+      providerId,
+      modelIds: models.map((model) => model.id),
+    });
+    return Object.fromEntries(warnings.map((warning) => [warning.model_id, warning]));
+  } catch {
+    return {};
+  }
 }
 
 export const useModelStore = create<ModelStore>((set, get) => ({
@@ -294,6 +384,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
 
   providers: [],
   providerModels: {},
+  providerModelRetirements: {},
   providerKeyError: {},
   activeProviderId: null,
   activeProviderModel: null,
@@ -429,6 +520,27 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     }
   },
 
+  createModelfileModel: async (shortName, modelfileText) => {
+    set((state) => {
+      const { [shortName]: _discard, ...rest } = state.ollamaPullError;
+      return { ollamaPullError: rest };
+    });
+    try {
+      await invoke("ollama_create_from_modelfile", { shortName, modelfileText });
+      set((state) => {
+        const { [shortName]: _discard, ...rest } = state.ollamaPullProgress;
+        return { ollamaPullProgress: rest };
+      });
+      await get().refreshOllama();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        ollamaPullError: { ...state.ollamaPullError, [shortName]: message },
+      }));
+      throw err;
+    }
+  },
+
   useOllamaModel: (tag) => {
     set({ activeProvider: "ollama", activeOllamaModel: tag });
     // Best-effort, fire-and-forget lookup of this tag's context length so
@@ -485,10 +597,12 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     await invoke("providers_remove_custom", { id });
     set((state) => {
       const { [id]: _discardModels, ...restModels } = state.providerModels;
+      const { [id]: _discardRetirements, ...restRetirements } = state.providerModelRetirements;
       const { [id]: _discardError, ...restErrors } = state.providerKeyError;
       const stillActive = state.activeProviderId === id;
       return {
         providerModels: restModels,
+        providerModelRetirements: restRetirements,
         providerKeyError: restErrors,
         ...(stillActive
           ? { activeProvider: "local" as const, activeProviderId: null, activeProviderModel: null }
@@ -506,6 +620,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     try {
       const models = await invoke<ProviderModelInfo[]>("providers_set_key", { id, apiKey });
       set((state) => ({ providerModels: { ...state.providerModels, [id]: models } }));
+      const retirements = await fetchProviderModelRetirements(id, models);
+      set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
       await get().refreshProviders();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -518,9 +634,11 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     await invoke("providers_remove_key", { id });
     set((state) => {
       const { [id]: _discard, ...restModels } = state.providerModels;
+      const { [id]: _discardRetirements, ...restRetirements } = state.providerModelRetirements;
       const stillActive = state.activeProviderId === id;
       return {
         providerModels: restModels,
+        providerModelRetirements: restRetirements,
         ...(stillActive
           ? { activeProvider: "local" as const, activeProviderId: null, activeProviderModel: null }
           : {}),
@@ -537,6 +655,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     try {
       const models = await invoke<ProviderModelInfo[]>("providers_list_models", { id });
       set((state) => ({ providerModels: { ...state.providerModels, [id]: models } }));
+      const retirements = await fetchProviderModelRetirements(id, models);
+      set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({ providerKeyError: { ...state.providerKeyError, [id]: message } }));
@@ -553,63 +673,82 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     }));
   },
 
-  effort: readInitialEffort(),
+  effortByTarget: readInitialEffortByTarget(),
 
-  setEffort: (effort) => {
-    set({ effort });
+  setEffortForTarget: (targetKey, effort) => {
+    const next = { ...get().effortByTarget };
+    if (effort === null) {
+      delete next[targetKey];
+      // Choosing "Default" for an Anthropic model also retires the migrated
+      // legacy fallback (which only ever exists via the one-time migration
+      // of the old single-global control) — without this, the fallback would
+      // immediately re-apply and "Default" would be unreachable. The old
+      // control was global across Anthropic models anyway, so retiring it
+      // globally on the first explicit Default matches its own semantics.
+      if (targetKey.startsWith(`${ANTHROPIC_EFFORT_FALLBACK_KEY}:`)) {
+        delete next[ANTHROPIC_EFFORT_FALLBACK_KEY];
+      }
+    } else {
+      next[targetKey] = effort;
+    }
+    set({ effortByTarget: next });
     try {
-      localStorage.setItem(EFFORT_STORAGE_KEY, effort);
+      localStorage.setItem(EFFORT_BY_TARGET_STORAGE_KEY, JSON.stringify(next));
     } catch {
       // Best-effort persistence; a failure here shouldn't block the switch.
     }
   },
 }));
 
-void listen<LlamaStatusEvent>("llama://status", (event) => {
-  useModelStore.setState((state) => ({
-    llamaStatus: event.payload.status,
-    active: event.payload.model_path
-      ? state.installed.find((m) => m.path === event.payload.model_path) ??
-        state.active
-      : state.active,
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for llama://status events", error);
-});
-
-void listen<DownloadProgressEvent>("models://download-progress", (event) => {
-  const { file, downloaded, total } = event.payload;
-  useModelStore.setState((state) => ({
-    downloadProgress: {
-      ...state.downloadProgress,
-      [file]: { downloaded, total },
-    },
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for models://download-progress events", error);
-});
-
-void listen<OllamaStatusEvent>("ollama://status", (event) => {
-  useModelStore.setState({
-    ollamaReachable: event.payload.reachable,
-    ollamaVersion: event.payload.version,
-    ollamaBinaryFound: event.payload.binary_found,
+// These backend events only exist under the Tauri shell — in plain-browser
+// dev (`vite` without it) `listen` itself throws, so don't subscribe at all.
+if (isTauri()) {
+  void listen<LlamaStatusEvent>("llama://status", (event) => {
+    useModelStore.setState((state) => ({
+      llamaStatus: event.payload.status,
+      active: event.payload.model_path
+        ? state.installed.find((m) => m.path === event.payload.model_path) ??
+          state.active
+        : state.active,
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for llama://status events", error);
   });
-}).catch((error) => {
-  console.error("Failed to listen for ollama://status events", error);
-});
 
-void listen<OllamaPullProgressEvent>("ollama://pull-progress", (event) => {
-  const { tag, line } = event.payload;
-  useModelStore.setState((state) => ({
-    ollamaPullProgress: {
-      ...state.ollamaPullProgress,
-      [tag]: line,
-    },
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for ollama://pull-progress events", error);
-});
+  void listen<DownloadProgressEvent>("models://download-progress", (event) => {
+    const { file, downloaded, total } = event.payload;
+    useModelStore.setState((state) => ({
+      downloadProgress: {
+        ...state.downloadProgress,
+        [file]: { downloaded, total },
+      },
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for models://download-progress events", error);
+  });
+
+  void listen<OllamaStatusEvent>("ollama://status", (event) => {
+    useModelStore.setState({
+      ollamaReachable: event.payload.reachable,
+      ollamaVersion: event.payload.version,
+      ollamaBinaryFound: event.payload.binary_found,
+    });
+  }).catch((error) => {
+    console.error("Failed to listen for ollama://status events", error);
+  });
+
+  void listen<OllamaPullProgressEvent>("ollama://pull-progress", (event) => {
+    const { tag, line } = event.payload;
+    useModelStore.setState((state) => ({
+      ollamaPullProgress: {
+        ...state.ollamaPullProgress,
+        [tag]: line,
+      },
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for ollama://pull-progress events", error);
+  });
+}
 
 /**
  * Fast, synchronous resolution of what `agentLoop.ts` should chat against
@@ -640,4 +779,29 @@ export function getActiveChatTarget(): ChatTarget {
     return { kind: "provider", providerId: activeProviderId, model: activeProviderModel };
   }
   return { kind: "local" };
+}
+
+/**
+ * Resolves the effort level to send for a chat target from the per-model
+ * `effortByTarget` map — structurally accepts both `ChatTarget` above and
+ * `turnEngine.ts`'s `ResolvedTarget`. `undefined` means the user left this
+ * model on "Default": no effort field is sent at all and the provider's own
+ * default applies (the Rust proxy additionally owns the per-provider wire
+ * mapping/omission — see `providers.rs::build_chat_request`).
+ */
+export function effortForTarget(
+  target:
+    | { kind: "local" }
+    | { kind: "ollama"; model: string | null }
+    | { kind: "provider"; providerId: string | null; model: string | null },
+): EffortLevel | undefined {
+  const { effortByTarget } = useModelStore.getState();
+  if (target.kind === "provider") {
+    if (!target.providerId || !target.model) return undefined;
+    return effortForProviderModel(effortByTarget, target.providerId, target.model);
+  }
+  if (target.kind === "ollama" && target.model) {
+    return effortByTarget[ollamaModelTargetKey(target.model)];
+  }
+  return undefined;
 }

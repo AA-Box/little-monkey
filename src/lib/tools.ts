@@ -243,6 +243,70 @@ export const TOOLS: ToolDef[] = [
 ];
 
 /**
+ * Builds the `search_docs` tool's description, naming the actual attached
+ * stacks so the model knows what's searchable without a separate lookup
+ * call — mirrors `stack: Option<String>`'s resolution in
+ * `stacks.rs::resolve_search_stack_ids`: pass one of these names to search
+ * just that stack, or omit it to search every indexed stack (the model's own
+ * visible universe here is exactly the attached stacks this description
+ * lists, even though the Rust side itself has no separate notion of
+ * "attached" — see that function's doc comment for why).
+ */
+function searchDocsDescription(attachedStackNames: string[]): string {
+  const stackList = attachedStackNames.join(', ');
+  return `Search the attached knowledge stack(s) for passages relevant to a query, returning the top matches with their source file path and a relevance score. Attached stacks: ${stackList}. Pass "stack" to search only one of them by name, or omit it to search across all of them. Cite source paths when using results in your answer.`;
+}
+
+/**
+ * A `search_docs` `ToolDef` naming `attachedStackNames` in its description —
+ * built fresh per turn (see `buildTools` below) rather than a fixed constant,
+ * since the whole point is that the model sees the actual current stack
+ * names, not a generic placeholder.
+ */
+function searchDocsTool(attachedStackNames: string[]): ToolDef {
+  return {
+    type: 'function',
+    function: {
+      name: 'search_docs',
+      description: searchDocsDescription(attachedStackNames),
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The search query — a question or phrase to find relevant passages for.',
+          },
+          stack: {
+            type: 'string',
+            description: 'Optional: the name of one specific attached stack to search. Omit to search across all attached stacks.',
+          },
+          max_results: {
+            type: 'integer',
+            description: 'Maximum number of passages to return (default 6).',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+/**
+ * Wraps the base `TOOLS` array with `search_docs` appended, ONLY when at
+ * least one knowledge stack is attached to the session (`attachedStackNames`
+ * non-empty) — an unattached session has nothing for the tool to search, so
+ * offering it would just invite a confusing "no stacks" error. Called once
+ * per turn by `agentLoop.ts`'s `runAgentTurnBody`, the same place
+ * `toolsForMode`/`toolsForSettings` already shape the per-turn tool list —
+ * see that module's doc comment for where this slots into the composition
+ * chain (`toolsForSettings(toolsForMode(buildTools(...), mode), ...)`).
+ */
+export function buildTools(attachedStackNames: string[]): ToolDef[] {
+  return attachedStackNames.length > 0 ? [...TOOLS, searchDocsTool(attachedStackNames)] : TOOLS;
+}
+
+/**
  * A frontend-only tool: presenting a structured plan for the user to
  * approve before switching out of Plan Mode (see `agentLoop.ts`'s
  * `toolsForMode`/`PLAN_NOTE_PREFIX`/`PlanNotice`). Deliberately kept OUT of
@@ -251,13 +315,167 @@ export const TOOLS: ToolDef[] = [
  * entry in `TOOLS`, it has NO `tool_present_plan` counterpart in
  * `src-tauri/src/tools.rs`: `turnEngine.ts`'s `executeToolCall` short-circuits
  * this name before it ever reaches `invoke`. This is an intentional
- * three-way-registry-drift exception (TS tools.ts / Rust tools.rs / lm-cli
+ * three-way-registry-drift exception (TS tools.ts / Rust tools.rs / monkey-cli
  * tools_def.rs normally mirror each other 1:1 — see this module's top
  * doc comment) called out explicitly in the Plan/Act design doc
  * (docs/roadmap/p2-plan-act-safety.md) as a known, accepted risk: a reader
  * scanning tools.rs for `present_plan` and finding nothing should look here,
  * not assume a missing Rust command.
  */
+/**
+ * Tool names offered to a subagent's own tool-calling loop, keyed by
+ * `profile` — see `subagent.ts`'s `runSubagentTask` and the "Restricted tool
+ * sets" section of `docs/roadmap/p3-subagents.md`. `explore` is every
+ * ungated read-only tool (a subagent that can only read needs no new trust
+ * beyond what the parent already has); `code` (slice 3) adds the mutating
+ * tools, which still go through the exact same Rust commands and permission
+ * gate as the parent's own calls.
+ *
+ * CRITICAL: `'task'` must never appear in either list — this is what caps
+ * delegation depth at 1 structurally (a subagent can never spawn another
+ * subagent) rather than via a runtime recursion guard. `TASK_TOOL` is kept
+ * as its own constant below, deliberately never added to `TOOLS`, so there
+ * is no name in `TOOLS` for these filters to ever accidentally let through.
+ * See `tools.test.ts` for the test proving this by construction.
+ */
+const EXPLORE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set(['read_file', 'list_dir', 'glob', 'grep']);
+const CODE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set([...EXPLORE_PROFILE_TOOL_NAMES, 'write_file', 'edit_file', 'run_shell']);
+
+export function toolsForProfile(profile: 'explore' | 'code'): ToolDef[] {
+  const names = profile === 'code' ? CODE_PROFILE_TOOL_NAMES : EXPLORE_PROFILE_TOOL_NAMES;
+  return TOOLS.filter((tool) => names.has(tool.function.name));
+}
+
+/**
+ * The `task` tool: delegates a scoped subtask to a subagent that runs its
+ * own isolated tool-calling loop (see `subagent.ts`'s `runSubagentTask`) and
+ * returns only a final report to the parent turn — the child's own
+ * exploration noise never touches the parent's context. Deliberately kept
+ * OUT of the `TOOLS` array above (see `toolsForProfile`'s doc comment for
+ * why) and only appended to the per-turn tool list by `agentLoop.ts`'s
+ * `toolsForSettings` when `settingsStore.subagentsEnabled` is on — a weak
+ * local model that never had this toggle turned on should never even see
+ * the schema.
+ *
+ * `profile` allows both `'explore'` and `'code'` as of slice 3 — a `'code'`
+ * subagent can write/edit/run shell through the exact same permission gate
+ * and checkpoint hooks as the parent (see `executeToolCall`'s `task` branch
+ * and `subagent.ts`'s `runSubagentTask` for the parent-checkpoint-id +
+ * child-own-turn-id pairing that makes this safe). `executeToolCall`
+ * (`turnEngine.ts`) intercepts this name before the `invoke('tool_'+name)`
+ * dispatch, exactly like `present_plan` — it has no `tool_task` Rust command
+ * either.
+ */
+export const TASK_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'task',
+    description:
+      'Delegate a scoped subtask to a subagent with its own isolated tool-calling loop and restricted tool set. The subagent cannot see this conversation, so give it a fully self-contained prompt. Only its final report is returned to you — use this for broad exploration or an independent subtask you want kept out of your own context. Multiple task calls in the same turn may run in parallel.',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: {
+          type: 'string',
+          description: 'A short (3-6 word) label for this subtask, shown to the user.',
+        },
+        prompt: {
+          type: 'string',
+          description: "Full, self-contained instructions for the subagent — it has no access to this conversation, so include all necessary context (file paths, what to look for, what to report back).",
+        },
+        profile: {
+          type: 'string',
+          enum: ['explore', 'code'],
+          description:
+            "Tool access profile for the subagent. 'explore' gives read-only tools (read_file, list_dir, glob, grep) — use it for research and investigation. 'code' additionally allows write_file, edit_file, and run_shell — its edits land in this turn's own checkpoint and go through the same permission prompts as your own edits — use it for an independent, disjoint implementation subtask.",
+        },
+      },
+      required: ['description', 'prompt', 'profile'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * The `skill` tool: lets the model invoke one of the skills listed in the
+ * turn's "## Available skills" catalog (see `skills.ts`'s
+ * `composeSkillCatalog`) on its own initiative, instead of only ever loading
+ * a skill the user explicitly typed `/command` for. Deliberately kept OUT of
+ * the `TOOLS` array above (only appended to the per-turn tool list by
+ * `agentLoop.ts`'s `toolsForSettings` when `settingsStore.skillAutoInvokeEnabled`
+ * is on AND at least one skill remains uninvoked this turn — a user who
+ * hasn't opted in should never even see the schema, same posture as
+ * `TASK_TOOL`'s `subagentsEnabled` gate). Frontend-only, same as `TASK_TOOL`/
+ * `PRESENT_PLAN_TOOL`: it has no `tool_skill` Rust command — `turnEngine.ts`'s
+ * `executeToolCall` intercepts this name before the `invoke` dispatch and
+ * resolves it against the turn's own `SkillToolContext.availableSkills`
+ * instead, returning the matched skill's instructions (and any bundled
+ * `resource_files` listing) as the tool result.
+ */
+export const SKILL_INVOKE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'skill',
+    description:
+      "Invoke one of the skills listed in the \"## Available skills\" section of the system prompt by its command name, when it matches what the user is asking for. The skill's full instructions are returned as this call's result — apply them for the rest of this turn. Do not invoke a skill the request doesn't actually need, and never invoke the same skill twice in one turn.",
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The skill\'s command name, without the leading slash, exactly as listed in the catalog (e.g. "review", not "/review").',
+        },
+        arguments: {
+          type: 'string',
+          description: 'Optional free-text arguments/context to pass to the skill — usually the relevant part of the user\'s request.',
+        },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * The `read_skill_resource` tool: reads one bundled file (other than
+ * `SKILL.md` itself) from a native skill's folder — the progressive-
+ * disclosure counterpart to a skill's `resource_files` listing (see
+ * `skills.ts`'s `SlashSkill.resourceFiles` and the instructions block
+ * `composeSkillSystemPrompt`/the `skill` tool's result both append it to).
+ * Unlike `SKILL_INVOKE_TOOL`, this DOES have a real Rust command
+ * (`tool_read_skill_resource` in `src-tauri/src/tools.rs`, delegating to
+ * `NativeSkillManager::read_resource`), so it flows through the ordinary
+ * `invoke('tool_' + name, args)` dispatch in `turnEngine.ts` — no special
+ * interception needed. Appended to the per-turn tool list by
+ * `agentLoop.ts`'s `toolsForSettings` whenever any currently available skill
+ * has at least one bundled resource file, independent of
+ * `skillAutoInvokeEnabled` — explicit `/command` invocation should be able to
+ * read bundled files too, not just an auto-invoked skill.
+ */
+export const READ_SKILL_RESOURCE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'read_skill_resource',
+    description:
+      "Read one bundled file from a skill's folder, by the skill's command name and the file's path as listed in its \"Bundled files\" line. Only works for a skill that has already been invoked (explicitly or via the skill tool) this turn.",
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The skill\'s command name, without the leading slash.',
+        },
+        path: {
+          type: 'string',
+          description: 'The bundled file\'s path, exactly as listed in the skill\'s "Bundled files" line (e.g. "references/info.md").',
+        },
+      },
+      required: ['command', 'path'],
+      additionalProperties: false,
+    },
+  },
+};
+
 export const PRESENT_PLAN_TOOL: ToolDef = {
   type: 'function',
   function: {

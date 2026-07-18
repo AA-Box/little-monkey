@@ -1,12 +1,38 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 
-import { executeToolCall, PRESENT_PLAN_RESULT, type RiskAnnotationContext } from "./turnEngine";
+// `executeToolCall`'s `task` branch delegates to `subagent.ts`'s
+// `runSubagentTask` — mocked out entirely here so these tests can pin the
+// DELEGATION contract (which params get threaded through, error handling)
+// without also having to drive a real child model-streaming loop; the child
+// loop itself is covered by `subagent.test.ts`.
+const runSubagentTaskMock = vi.fn();
+vi.mock("./subagent", () => ({ runSubagentTask: (...args: unknown[]) => runSubagentTaskMock(...args) }));
+
+// `attemptStream`'s `recordUsage` tests below need a controllable stream —
+// mocked here rather than hitting a real provider.
+const streamProviderChatMock = vi.fn();
+vi.mock("./providerClient", () => ({ streamProviderChat: (...args: unknown[]) => streamProviderChatMock(...args) }));
+
+import {
+  attemptStream,
+  CANCELLED_TOOL_RESULT,
+  executeToolCall,
+  isToolCallAllowed,
+  PRESENT_PLAN_RESULT,
+  stringifyToolError,
+  type ResolvedTarget,
+  type RiskAnnotationContext,
+  type SkillToolContext,
+  type SubagentContext,
+} from "./turnEngine";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
-import type { ToolCall } from "./llamaClient";
+import type { StreamEvent, ToolCall, ToolDef } from "./llamaClient";
+import type { SlashSkill } from "./skills";
+import { useUsageStore } from "../store/usageStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -50,6 +76,56 @@ describe("executeToolCall / present_plan", () => {
     invokeMock.mockResolvedValue("ok");
     await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
     expect(invokeMock).toHaveBeenCalledWith("tool_read_file", expect.objectContaining({ path: "a.txt" }));
+  });
+});
+
+// `allowed_stack_names` is the server-side enforcement point for
+// `search_docs`'s session scoping (see `stacks.rs`'s
+// `resolve_search_stack_ids` doc comment for the privacy gap this closes):
+// it must always be injected with THIS turn's actual attached-stack names,
+// regardless of what (if anything) the model itself passed.
+describe("executeToolCall / search_docs stack scoping", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue([]);
+  });
+
+  it("injects the session's attached stack names as allowed_stack_names", async () => {
+    await executeToolCall(
+      call("search_docs", { query: "budget planning" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      ["Work Docs", "Wiki"]
+    );
+
+    const [command, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(command).toBe("tool_search_docs");
+    expect(sentArgs.allowed_stack_names).toEqual(["Work Docs", "Wiki"]);
+  });
+
+  it("defaults allowed_stack_names to an empty array when no attached names are supplied", async () => {
+    await executeToolCall(call("search_docs", { query: "anything" }), null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.allowed_stack_names).toEqual([]);
+  });
+
+  it("overwrites a model-supplied allowed_stack_names — the model can never widen its own scope", async () => {
+    await executeToolCall(
+      call("search_docs", { query: "q", allowed_stack_names: ["Diary"] }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      ["Work Docs"]
+    );
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.allowed_stack_names).toEqual(["Work Docs"]);
   });
 });
 
@@ -174,5 +250,625 @@ describe("executeToolCall / risk_level and risk_reason scrubbing", () => {
     const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
     expect(sentArgs.risk_level).toBeUndefined();
     expect(sentArgs.risk_reason).toBeUndefined();
+  });
+});
+
+// `task` is another frontend-only tool, same treatment as `present_plan`
+// above — it has no `tool_task` Rust command, so `invoke` must never be
+// called for it either. These tests also pin the delegation contract that
+// makes subagents safe: the PARENT's checkpoint id passed straight through,
+// but a brand-new (never the parent's) turn id for the child, and the
+// transcript-validity invariant (a `task` call always gets SOME string
+// result, even when `runSubagentTask` itself throws).
+describe("executeToolCall / task delegation", () => {
+  const fakeTarget: ResolvedTarget = { kind: "local", baseUrl: "http://localhost:8090" };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    runSubagentTaskMock.mockReset();
+  });
+
+  it("never reaches invoke for a task tool call", async () => {
+    runSubagentTaskMock.mockResolvedValue("a report");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+    const result = await executeToolCall(
+      call("task", { description: "find X", prompt: "find every caller of X", profile: "explore" }),
+      "checkpoint-1",
+      "parent-turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(result).toBe("a report");
+  });
+
+  it("returns a tool-error result without calling runSubagentTask when no subagent context is configured", async () => {
+    const result = await executeToolCall(call("task", { description: "d", prompt: "p", profile: "explore" }), null, "turn-1", emptyMcpRegistry);
+
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toHaveProperty("error");
+  });
+
+  it("passes the PARENT's checkpoint id through unchanged, but a brand-new turn id for the child (never the parent's)", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget, effort: "high" };
+
+    await executeToolCall(
+      call("task", { description: "find X", prompt: "find every caller of X", profile: "explore" }),
+      "parent-checkpoint-123",
+      "parent-turn-abc",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    expect(runSubagentTaskMock).toHaveBeenCalledTimes(1);
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.parentCheckpointId).toBe("parent-checkpoint-123");
+    expect(params.taskId).not.toBe("parent-turn-abc");
+    expect(typeof params.taskId).toBe("string");
+    expect(params.taskId.length).toBeGreaterThan(0);
+    expect(params.sessionId).toBe("session-1");
+    expect(params.target).toBe(fakeTarget);
+    expect(params.effort).toBe("high");
+    expect(params.description).toBe("find X");
+    expect(params.prompt).toBe("find every caller of X");
+    expect(params.profile).toBe("explore");
+  });
+
+  it("passes the originating tool_call's own id as toolCallId — the subagentStore/ChatSession.subagentRuns correlation key, distinct from taskId", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+    const toolCall = call("task", { description: "find X", prompt: "p", profile: "explore" });
+
+    await executeToolCall(toolCall, null, "parent-turn", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.toolCallId).toBe(toolCall.id);
+    expect(params.toolCallId).not.toBe(params.taskId);
+  });
+
+  it("gives each task call its own distinct turn id, even across two calls in the same tool round trip", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    await executeToolCall(call("task", { description: "a", prompt: "p", profile: "explore" }), null, "parent-turn", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+    await executeToolCall(call("task", { description: "b", prompt: "p", profile: "explore" }), null, "parent-turn", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    const firstTaskId = runSubagentTaskMock.mock.calls[0][0].taskId;
+    const secondTaskId = runSubagentTaskMock.mock.calls[1][0].taskId;
+    expect(firstTaskId).not.toBe(secondTaskId);
+  });
+
+  it("defaults a missing/invalid profile to 'explore' rather than passing the model's raw value through", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    await executeToolCall(call("task", { description: "d", prompt: "p" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    expect(runSubagentTaskMock.mock.calls[0][0].profile).toBe("explore");
+  });
+
+  // The transcript-validity invariant this whole feature depends on: a
+  // `task` call must ALWAYS get a tool result, even when the child loop
+  // blows up unexpectedly — `executeToolCall`'s own try/catch around the
+  // `task` branch must swallow it, not let it propagate to the caller
+  // (`runAgentTurnBody`'s tool-calling loop), which would otherwise crash
+  // the whole turn on an exception from deep inside a subagent.
+  it("never propagates an exception thrown by runSubagentTask — returns a stringifyToolError-shaped result instead", async () => {
+    runSubagentTaskMock.mockRejectedValue(new Error("child loop exploded"));
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    const result = await executeToolCall(
+      call("task", { description: "d", prompt: "p", profile: "explore" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    expect(result).toBe(stringifyToolError(new Error("child loop exploded")));
+  });
+
+  // Review findings: a code-profile subagent's mutations must get the same
+  // risk classification the parent's own calls would, and must be able to
+  // report mutated paths back into the parent's own `mutatedFiles` tracking
+  // (see `SubagentContext.risk`/`onMutatedPath`'s doc comments) — both
+  // threaded straight through to `runSubagentTask`'s params.
+  it("threads SubagentContext.risk and onMutatedPath through to runSubagentTask's params unchanged", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify: vi.fn() };
+    const onMutatedPath = vi.fn();
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget, risk, onMutatedPath };
+
+    await executeToolCall(
+      call("task", { description: "d", prompt: "p", profile: "code" }),
+      "checkpoint-1",
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      subagent
+    );
+
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.risk).toBe(risk);
+    expect(params.onMutatedPath).toBe(onMutatedPath);
+  });
+
+  it("passes risk/onMutatedPath through as undefined when SubagentContext never set them", async () => {
+    runSubagentTaskMock.mockResolvedValue("done");
+    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
+
+    await executeToolCall(call("task", { description: "d", prompt: "p", profile: "explore" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, subagent);
+
+    const params = runSubagentTaskMock.mock.calls[0][0];
+    expect(params.risk).toBeUndefined();
+    expect(params.onMutatedPath).toBeUndefined();
+  });
+});
+
+// `skill` is a third frontend-only tool (see `tools.ts`'s `SKILL_INVOKE_TOOL`
+// doc comment) — same "invoke must never be called" invariant as
+// `present_plan`/`task` above, plus the auto-invocation-specific contract:
+// unknown/duplicate/over-cap commands are rejected with a tool error rather
+// than throwing, and a successful call both returns the skill's instructions
+// AND records the command in `invokedCommands` so a later call in the same
+// turn sees it as already-invoked.
+describe("executeToolCall / skill invocation", () => {
+  function fakeSkill(command: string, overrides: Partial<SlashSkill> = {}): SlashSkill {
+    return {
+      id: command,
+      source: "native",
+      command,
+      name: command,
+      description: `Handles ${command}`,
+      instructions: `Do ${command} carefully.`,
+      version: "1.0.0",
+      contentSha256: "a".repeat(64),
+      permissions: [],
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("never reaches invoke for a skill tool call", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review")],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(
+      call("skill", { command: "review" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(result).toContain("Do review carefully.");
+    expect(context.invokedCommands.has("review")).toBe(true);
+  });
+
+  it("includes allowed-tools and bundled-file listings in the result", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review", { allowedTools: ["read_file", "grep"], resourceFiles: ["references/info.md"] })],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(call("skill", { command: "review" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+
+    expect(result).toContain("Allowed tools while active: read_file, grep");
+    expect(result).toContain("Bundled files (read via read_skill_resource): references/info.md");
+  });
+
+  it("accepts a leading slash in the command argument", async () => {
+    const context: SkillToolContext = { availableSkills: [fakeSkill("review")], invokedCommands: new Set(), maxSkillsPerTurn: 5 };
+    const result = await executeToolCall(call("skill", { command: "/review" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(result).toContain("Do review carefully.");
+  });
+
+  it("returns a tool error without calling invoke when no skill context is configured", async () => {
+    const result = await executeToolCall(call("skill", { command: "review" }), null, "turn-1", emptyMcpRegistry);
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toHaveProperty("error");
+  });
+
+  it("rejects an unknown command", async () => {
+    const context: SkillToolContext = { availableSkills: [fakeSkill("review")], invokedCommands: new Set(), maxSkillsPerTurn: 5 };
+    const result = await executeToolCall(call("skill", { command: "does-not-exist" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(result).error).toMatch(/No enabled skill/);
+    expect(context.invokedCommands.size).toBe(0);
+  });
+
+  it("rejects a command already invoked this turn (explicit or previously model-invoked)", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review")],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(call("skill", { command: "review" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(result).error).toMatch(/already invoked/);
+  });
+
+  it("rejects once the per-turn skill cap is reached", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("review"), fakeSkill("verify")],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 1,
+    };
+    const result = await executeToolCall(call("skill", { command: "verify" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(result).error).toMatch(/at most 1 skill/);
+  });
+});
+
+// `read_skill_resource` has a real `tool_read_skill_resource` Rust command
+// (unlike `skill` above), but its own tool description promises it "only
+// works for a skill that has already been invoked this turn" — these tests
+// pin that this is actually enforced here, before the generic `invoke`
+// dispatch, rather than just asserted in prose the model might not honor.
+describe("executeToolCall / read_skill_resource invocation gate", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("resource contents");
+  });
+
+  it("rejects when the named skill has not been invoked this turn", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [{ id: "review", source: "native", command: "review", name: "review", description: "d", instructions: "i", version: "1.0.0", contentSha256: "a".repeat(64), permissions: [] }],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(
+      call("read_skill_resource", { command: "review", path: "references/info.md" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result).error).toMatch(/has not been invoked this turn/);
+  });
+
+  it("allows the call once the skill was invoked (explicitly or via the skill tool) this turn", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [{ id: "review", source: "native", command: "review", name: "review", description: "d", instructions: "i", version: "1.0.0", contentSha256: "a".repeat(64), permissions: [] }],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 5,
+    };
+    const result = await executeToolCall(
+      call("read_skill_resource", { command: "review", path: "references/info.md" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context
+    );
+    expect(invokeMock).toHaveBeenCalledWith("tool_read_skill_resource", { command: "review", path: "references/info.md" });
+    expect(result).toBe("resource contents");
+  });
+
+  it("returns a tool error without calling invoke when no skill context is configured", async () => {
+    const result = await executeToolCall(call("read_skill_resource", { command: "review", path: "references/info.md" }), null, "turn-1", emptyMcpRegistry);
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(JSON.parse(result)).toHaveProperty("error");
+  });
+});
+
+// slice 3: `code`-profile subagents mean `write_file`/`edit_file`/`run_shell`
+// can now be dispatched from INSIDE `subagent.ts`'s `runSubagentTask`, not
+// just the parent turn — these tests pin the two invariants that make that
+// safe: (1) `agent_label` (subagent attribution, purely cosmetic — forwarded
+// to Rust as its own field, see `permissions.rs`'s
+// `PermissionRequestPayload.agent_label`) is never model-suppliable,
+// mirroring the `risk_level`/`risk_reason` scrub tests above; (2) a mutating
+// call routed
+// through `executeToolCall` with the PARENT's checkpoint id but the CHILD's
+// own turn id (exactly how `subagent.ts` calls it) forwards both correctly
+// and distinctly — the crux pairing the design doc calls out.
+describe("executeToolCall / agent_label scrubbing (subagent attribution, slice 3)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("ok");
+  });
+
+  it("strips a model-supplied agent_label before dispatch — the model can never forge its own subagent attribution", async () => {
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x", agent_label: "totally not a subagent" }), null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBeUndefined();
+  });
+
+  it("injects the caller-supplied agentLabel, overwriting whatever the model tried to pass", async () => {
+    await executeToolCall(
+      call("write_file", { path: "a.txt", content: "x", agent_label: "model-forged label" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "refactor auth"
+    );
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBe("refactor auth");
+  });
+
+  it("never adds an agent_label key at all for an ordinary parent-turn call (no agentLabel supplied)", async () => {
+    await executeToolCall(call("write_file", { path: "a.txt", content: "x" }), null, "turn-1", emptyMcpRegistry);
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBeUndefined();
+  });
+
+  it("only injects agent_label for write_file/edit_file/run_shell, never for a read-only tool", async () => {
+    await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, "some label");
+
+    const [, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(sentArgs.agent_label).toBeUndefined();
+  });
+
+  it("applies to edit_file and run_shell too, not just write_file", async () => {
+    await executeToolCall(
+      call("edit_file", { path: "a.txt", old_string: "a", new_string: "b" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "edit label"
+    );
+    await executeToolCall(call("run_shell", { command: "ls" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, "shell label");
+
+    const [, editArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    const [, shellArgs] = invokeMock.mock.calls[1] as [string, Record<string, unknown>];
+    expect(editArgs.agent_label).toBe("edit label");
+    expect(shellArgs.agent_label).toBe("shell label");
+  });
+});
+
+// The other half of "get this pairing exactly right" (design doc, slice 3):
+// a `code`-profile subagent's own mutating tool calls must carry the
+// PARENT's checkpoint id (so writes land in the parent turn's checkpoint,
+// revertable via the existing CheckpointRow) but a DISTINCT, child-owned
+// turn id (so Rust's per-turn `tool_cancel`/permission-`pending` maps scope
+// cancellation and prompts to the subagent, not the parent's own in-flight
+// call). `subagent.ts`'s `runSubagentTask` calls `executeToolCall` with
+// exactly `(toolCall, parentCheckpointId, taskId, ...)` — this test exercises
+// `executeToolCall` directly with that same argument shape.
+describe("executeToolCall / checkpoint_id + turn_id pairing for a code-profile subagent's tool call", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("Wrote 2 bytes to a.txt");
+  });
+
+  it("forwards the PARENT's checkpoint id but the CHILD's own (distinct) turn id for a write_file call", async () => {
+    const parentCheckpointId = "parent-checkpoint-123";
+    const parentTurnId = "parent-turn-abc";
+    const childTurnId = "child-turn-xyz";
+
+    await executeToolCall(call("write_file", { path: "a.txt", content: "hi" }), parentCheckpointId, childTurnId, emptyMcpRegistry);
+
+    const [command, sentArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(command).toBe("tool_write_file");
+    expect(sentArgs.checkpoint_id).toBe(parentCheckpointId);
+    expect(sentArgs.turn_id).toBe(childTurnId);
+    expect(sentArgs.turn_id).not.toBe(parentTurnId);
+  });
+
+  it("same pairing holds for edit_file and run_shell", async () => {
+    const parentCheckpointId = "parent-checkpoint-456";
+    const childTurnId = "child-turn-789";
+
+    await executeToolCall(call("edit_file", { path: "a.txt", old_string: "a", new_string: "b" }), parentCheckpointId, childTurnId, emptyMcpRegistry);
+    await executeToolCall(call("run_shell", { command: "ls" }), parentCheckpointId, childTurnId, emptyMcpRegistry);
+
+    const [, editArgs] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    const [, shellArgs] = invokeMock.mock.calls[1] as [string, Record<string, unknown>];
+    expect(editArgs.checkpoint_id).toBe(parentCheckpointId);
+    expect(editArgs.turn_id).toBe(childTurnId);
+    expect(shellArgs.checkpoint_id).toBe(parentCheckpointId);
+    expect(shellArgs.turn_id).toBe(childTurnId);
+  });
+});
+
+// Stop-button scoping for a subagent tree (design doc: "Stop in the parent
+// pane cancels the whole tree, Stop in the OTHER split pane touches
+// nothing"). `subagent.ts` passes the PARENT's own `AbortSignal` straight
+// through to `executeToolCall` as `signal`, but with the CHILD's own turn id
+// — so on abort, `tools_cancel_running` must be called with the CHILD's turn
+// id, and a different turn's own (unrelated) AbortController aborting must
+// never trigger it at all.
+describe("executeToolCall / Stop-button cancellation scoping (subagent tree)", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("cancels via tools_cancel_running scoped to the CHILD's own turn id when the (parent's) signal aborts mid-invocation", async () => {
+    let rejectInvoke: (reason?: unknown) => void = () => {};
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "tool_run_shell") {
+        return new Promise((_resolve, reject) => {
+          rejectInvoke = reject;
+        });
+      }
+      return Promise.resolve(undefined); // tools_cancel_running
+    });
+
+    const parentSignalStandIn = new AbortController();
+    const childTurnId = "child-turn-1";
+    const resultPromise = executeToolCall(call("run_shell", { command: "sleep 10" }), null, childTurnId, emptyMcpRegistry, parentSignalStandIn.signal);
+
+    parentSignalStandIn.abort();
+    const result = await resultPromise;
+    rejectInvoke(new Error("aborted (unused)"));
+
+    expect(result).toBe(CANCELLED_TOOL_RESULT);
+    expect(invokeMock).toHaveBeenCalledWith("tools_cancel_running", { turnId: childTurnId });
+  });
+
+  it("a DIFFERENT (unrelated) turn's own AbortController aborting never cancels this call or touches its turn id", async () => {
+    invokeMock.mockImplementation((cmd: string) => (cmd === "tool_run_shell" ? Promise.resolve({ stdout: "ok" }) : Promise.resolve(undefined)));
+
+    const thisCallsOwnController = new AbortController(); // never aborted — "the parent pane's own turn"
+    const otherPaneController = new AbortController(); // "the other split pane's turn"
+    otherPaneController.abort();
+
+    const result = await executeToolCall(call("run_shell", { command: "echo hi" }), null, "this-turn", emptyMcpRegistry, thisCallsOwnController.signal);
+
+    expect(JSON.parse(result)).toEqual({ stdout: "ok" });
+    expect(invokeMock).not.toHaveBeenCalledWith("tools_cancel_running", expect.anything());
+  });
+});
+
+// `recordUsage` (attemptStream's newest parameter) is what stops a
+// subagent's own model calls from clobbering the PARENT session's
+// context-usage ring in `useUsageStore` — see `subagent.ts`'s
+// `runSubagentTask`, the one caller that passes `false`. These tests pin the
+// parameter's behavior directly against a controllable fake stream.
+describe("attemptStream / recordUsage", () => {
+  const fakeTarget: ResolvedTarget = { kind: "provider", providerId: "openai", model: "gpt-test" };
+
+  async function* fakeUsageStream(): AsyncGenerator<StreamEvent> {
+    yield { type: "usage", usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
+    yield { type: "done" };
+  }
+
+  beforeEach(() => {
+    streamProviderChatMock.mockReset();
+    streamProviderChatMock.mockImplementation(() => fakeUsageStream());
+    useUsageStore.setState({ usageBySession: {}, contextLimit: null });
+  });
+
+  it("records usage into useUsageStore by default (recordUsage defaults to true — every pre-existing caller is unaffected)", async () => {
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1");
+
+    expect(useUsageStore.getState().usageBySession["session-1"]).toEqual({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+    });
+  });
+
+  it("does not record usage into useUsageStore when recordUsage is false — a subagent child call must never clobber the parent session's usage ring", async () => {
+    await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1", undefined, false);
+
+    expect(useUsageStore.getState().usageBySession["session-1"]).toBeUndefined();
+  });
+
+  // Slice 4 (per-subagent token usage in SubagentRow): `recordUsage: false`
+  // must only gate the `useUsageStore` write above, never the CALLER's own
+  // visibility into its attempt's usage — `subagent.ts`'s `runSubagentTask`
+  // reads this field to accumulate a per-subagent total.
+  it("still returns the attempt's own usage on the result even when recordUsage is false", async () => {
+    const result = await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1", undefined, false);
+
+    expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+  });
+
+  it("returns usage undefined when no usage event ever arrives", async () => {
+    streamProviderChatMock.mockImplementation(async function* (): AsyncGenerator<StreamEvent> {
+      yield { type: "done" };
+    });
+
+    const result = await attemptStream(fakeTarget, [], [], undefined, undefined, "session-1");
+
+    expect(result.usage).toBeUndefined();
+  });
+});
+
+// Effort used to be forwarded for Anthropic only; it now travels for EVERY
+// provider target, because the Rust proxy owns the per-provider wire
+// mapping/omission (verbatim output_config.effort for Anthropic, clamped
+// reasoning_effort for OpenAI/Gemini/OpenRouter, dropped entirely for custom
+// endpoints — see providers.rs::build_chat_request and its tests).
+describe("attemptStream / effort forwarding", () => {
+  async function* fakeDoneStream(): AsyncGenerator<StreamEvent> {
+    yield { type: "done" };
+  }
+
+  beforeEach(() => {
+    streamProviderChatMock.mockReset();
+    streamProviderChatMock.mockImplementation(() => fakeDoneStream());
+  });
+
+  it.each(["anthropic", "openai", "gemini", "openrouter"])(
+    "forwards the resolved effort to the provider proxy for %s targets",
+    async (providerId) => {
+      const target: ResolvedTarget = { kind: "provider", providerId, model: "some-model" };
+
+      await attemptStream(target, [], [], undefined, "max", "session-1");
+
+      expect(streamProviderChatMock).toHaveBeenCalledTimes(1);
+      expect(streamProviderChatMock.mock.calls[0][5]).toBe("max");
+    },
+  );
+
+  it("still forwards effort for a custom provider — the Rust side omits it from that wire request", async () => {
+    const target: ResolvedTarget = { kind: "provider", providerId: "my-custom-provider", model: "m" };
+
+    await attemptStream(target, [], [], undefined, "high", "session-1");
+
+    expect(streamProviderChatMock.mock.calls[0][5]).toBe("high");
+  });
+
+  it("forwards undefined (Default: no effort field at all) when the caller resolved none", async () => {
+    const target: ResolvedTarget = { kind: "provider", providerId: "openai", model: "gpt-test" };
+
+    await attemptStream(target, [], [], undefined, undefined, "session-1");
+
+    expect(streamProviderChatMock.mock.calls[0][5]).toBeUndefined();
+  });
+});
+
+// `isToolCallAllowed` now lives here (moved from `agentLoop.ts`, which
+// re-exports it for backward compatibility — see that module's own doc
+// comment) specifically so `subagent.ts`'s child tool-calling loop can reuse
+// the exact same gate `agentLoop.ts`'s parent loop applies, rather than a
+// parallel/duplicated check. `agentLoop.test.ts` still separately covers
+// this via its own import (proving the re-export is the same function).
+describe("isToolCallAllowed", () => {
+  function toolDef(name: string): ToolDef {
+    return { type: "function", function: { name, description: "", parameters: { type: "object", properties: {} } } };
+  }
+
+  it("returns true when the tool call's name matches one of the offered tools", () => {
+    expect(isToolCallAllowed(call("write_file"), [toolDef("write_file")])).toBe(true);
+  });
+
+  it("returns false when the tool call's name was never offered", () => {
+    expect(isToolCallAllowed(call("write_file"), [toolDef("read_file")])).toBe(false);
   });
 });

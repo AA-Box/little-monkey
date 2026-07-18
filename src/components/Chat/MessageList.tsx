@@ -2,14 +2,18 @@ import { memo, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   BookmarkX,
+  BookOpen,
+  Bot,
   Brain,
   ChevronRight,
   ClipboardCheck,
+  Eye,
   FilePenLine,
   FileSearch,
   FileText,
   Folder,
   Globe,
+  ListChecks,
   MessageSquareX,
   Plug,
   RefreshCw,
@@ -31,24 +35,36 @@ import {
   isMemoryNotice,
   isMentionNotice,
   isPlanNotice,
+  isPrivacyNotice,
+  isRecipeNotice,
+  isSourcesNotice,
   isSwitchNotice,
   isVerifyFixNotice,
   isVerifyNotice,
   parseCheckpointNotice,
   parseMemoryNotice,
   parsePlanNotice,
+  parseRecipeNotice,
+  parseSourcesNotice,
   parseVerifyNotice,
   type CheckpointNotice,
   type MemoryNotice,
   type PlanNotice,
+  type RecipeNotice,
+  type SourcesNotice,
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
+import { isBtwNotice, isCommandNotice, parseBtwNotice, parseCommandNotice, type BtwNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
-import MessageBubble from "./MessageBubble";
+import { useLocalAppsStore } from "../../store/localAppsStore";
+import MessageBubble, { markdownComponents, PROSE_CLASSES } from "./MessageBubble";
+import ReactMarkdown from "react-markdown";
 import PlanCard from "./PlanCard";
+import SubagentRow from "./SubagentRow";
+import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
 
 export interface MessageListProps {
@@ -65,16 +81,30 @@ export interface MessageListProps {
   /** Called when the user asks to regenerate the last turn — omit to hide
    * the affordance. */
   onRetry?: () => void;
+  /** Real transcript index represented by `messages[0]`. Comparison cards
+   * render only their branch suffix, but artifact/checkpoint actions still
+   * need indices into the full persisted transcript. */
+  messageIndexOffset?: number;
+  /** Threaded straight through to every `MessageBubble` — see that
+   * component's own `onStartSideTask` doc comment. Omitted entirely hides
+   * the affordance (e.g. inside a subagent's own mini-transcript, which
+   * never renders through this list at all). */
+  onStartSideTask?: (index: number) => void;
 }
 
 type TimelineItem =
   | { kind: "bubble"; key: string; message: ChatMessage; index: number }
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
+  | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "notice"; key: string; text: string }
+  | { kind: "command"; key: string; notice: CommandNotice }
+  | { kind: "btw"; key: string; notice: BtwNotice }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
+  | { kind: "sources"; key: string; notice: SourcesNotice }
+  | { kind: "recipe"; key: string; notice: RecipeNotice }
   | { kind: "typing"; key: string };
 
 /**
@@ -87,9 +117,9 @@ type TimelineItem =
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
  *   synthetic notices (compaction, model switch, per-turn checkpoint,
- *   remembered fact, presented plan).
+ *   remembered fact, presented plan, doc-chat sources).
  */
-function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
+function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): TimelineItem[] {
   const resultByCallId = new Map<string, string>();
   for (const msg of messages) {
     if (msg.role === "tool" && msg.tool_call_id) {
@@ -101,8 +131,9 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
   const items: TimelineItem[] = [];
 
   messages.forEach((msg, index) => {
+    const messageIndex = index + messageIndexOffset;
     if (msg.role === "user") {
-      items.push({ kind: "bubble", key: `msg-${index}`, message: msg, index });
+      items.push({ kind: "bubble", key: `msg-${messageIndex}`, message: msg, index: messageIndex });
       return;
     }
 
@@ -111,13 +142,29 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
       const toolCalls = msg.tool_calls ?? [];
 
       if (hasContent) {
-        items.push({ kind: "bubble", key: `msg-${index}`, message: msg, index });
+        items.push({ kind: "bubble", key: `msg-${messageIndex}`, message: msg, index: messageIndex });
       } else if (toolCalls.length === 0 && index === messages.length - 1) {
         items.push({ kind: "typing", key: `typing-${index}` });
       }
 
       for (const toolCall of toolCalls) {
         renderedCallIds.add(toolCall.id);
+        // A `task` call gets its own dedicated `SubagentRow` (live status +
+        // expandable child transcript) rather than the generic `ToolCallRow`
+        // every other tool renders as — see `SubagentRow.tsx`. `toolCall.id`
+        // is what `subagentStore`/`ChatSession.subagentRuns` are keyed by
+        // (see `subagent.ts`'s `RunSubagentTaskParams.toolCallId` doc
+        // comment for why THIS id, not the Rust-facing turn id).
+        if (toolCall.function.name === "task") {
+          items.push({
+            kind: "subagent",
+            key: `subagent-${toolCall.id}`,
+            taskId: toolCall.id,
+            args: toolCall.function.arguments,
+            result: resultByCallId.get(toolCall.id),
+          });
+          continue;
+        }
         items.push({
           kind: "tool",
           key: `tool-${toolCall.id}`,
@@ -150,21 +197,21 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
       if (isCheckpointNotice(msg)) {
         const notice = parseCheckpointNotice(msg);
         if (notice) {
-          items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex: index });
+          items.push({ kind: "checkpoint", key: `checkpoint-${notice.id}`, notice, messageIndex });
         }
         return;
       }
       if (isMemoryNotice(msg)) {
         const notice = parseMemoryNotice(msg);
         if (notice) {
-          items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex: index });
+          items.push({ kind: "memory", key: `memory-${notice.id}`, notice, messageIndex });
         }
         return;
       }
       if (isPlanNotice(msg)) {
         const notice = parsePlanNotice(msg);
         if (notice) {
-          items.push({ kind: "plan", key: `plan-${notice.id}`, notice, messageIndex: index });
+          items.push({ kind: "plan", key: `plan-${notice.id}`, notice, messageIndex });
         }
         return;
       }
@@ -175,7 +222,37 @@ function buildTimeline(messages: ChatMessage[]): TimelineItem[] {
         }
         return;
       }
-      if (isCompactionMarker(msg) || isSwitchNotice(msg) || isMentionNotice(msg) || isVerifyFixNotice(msg)) {
+      if (isSourcesNotice(msg)) {
+        const notice = parseSourcesNotice(msg);
+        if (notice) {
+          items.push({ kind: "sources", key: `sources-${index}`, notice });
+        }
+        return;
+      }
+      if (isRecipeNotice(msg)) {
+        const notice = parseRecipeNotice(msg);
+        if (notice) {
+          items.push({ kind: "recipe", key: `recipe-${index}`, notice });
+        }
+        return;
+      }
+      if (isBtwNotice(msg)) {
+        const notice = parseBtwNotice(msg);
+        if (notice) items.push({ kind: "btw", key: `btw-${index}`, notice });
+        return;
+      }
+      if (isCommandNotice(msg)) {
+        const notice = parseCommandNotice(msg);
+        if (notice) items.push({ kind: "command", key: `command-${index}`, notice });
+        return;
+      }
+      if (
+        isCompactionMarker(msg) ||
+        isSwitchNotice(msg) ||
+        isMentionNotice(msg) ||
+        isVerifyFixNotice(msg) ||
+        isPrivacyNotice(msg)
+      ) {
         items.push({ kind: "notice", key: `notice-${index}`, text: textContent(msg.content) });
       }
     }
@@ -192,7 +269,7 @@ function formatJson(raw: string): string {
   }
 }
 
-function resultLooksLikeError(raw: string): boolean {
+export function resultLooksLikeError(raw: string): boolean {
   try {
     const parsed: unknown = JSON.parse(raw);
     return typeof parsed === "object" && parsed !== null && "error" in parsed;
@@ -212,6 +289,13 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   remember: Brain,
   web_fetch: Globe,
   web_search: Search,
+  search_docs: BookOpen,
+  // `task` (subagent delegation) is special-cased in `buildTimeline` to
+  // render as a dedicated `SubagentRow` instead of a plain `ToolCallRow` —
+  // kept here anyway as the icon for the "orphaned tool result" fallback
+  // path (a persisted transcript with a `task` result but no matching
+  // `tool_calls` entry, e.g. after history truncation).
+  task: Bot,
 };
 
 function toolIcon(name: string): LucideIcon {
@@ -225,7 +309,7 @@ function toolIcon(name: string): LucideIcon {
 /** Memoized like `MessageBubble`: props are plain strings (stable for every
  * settled call), so streaming deltas to the transcript's last message don't
  * re-render the (potentially long) tool-call history. */
-const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
+export const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
   const pending = result === undefined;
@@ -286,6 +370,47 @@ const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
   );
 });
 
+/**
+ * Renders a `/btw` side-question exchange — Claude-Desktop-style: the question
+ * and its Markdown answer appear inline in the transcript, visually set apart
+ * from the conversation proper (dashed border, "aside" label), because the
+ * exchange is display-only and never sent to a model on later turns (see
+ * `isBtwNotice` filtering in the wire builders).
+ */
+const BtwRow = memo(function BtwRow({ notice }: { notice: BtwNotice }) {
+  return (
+    <div className="flex justify-start">
+      <div className={`max-w-[85%] overflow-hidden rounded-md border border-dashed px-3 py-2 ${
+        notice.ok ? "border-border bg-surface-2/50" : "border-danger bg-danger-soft"
+      }`}>
+        <div className="mb-1 flex items-baseline gap-2">
+          <span className="font-mono text-[11px] font-semibold text-faint">/btw</span>
+          <span className="text-xs font-medium text-muted">{notice.question}</span>
+        </div>
+        {notice.answer ? (
+          <div className={`${PROSE_CLASSES} text-xs`}>
+            <ReactMarkdown components={markdownComponents}>{notice.answer}</ReactMarkdown>
+          </div>
+        ) : null}
+        {!notice.done && <div className="mt-1 text-xs text-faint animate-pulse">…</div>}
+      </div>
+    </div>
+  );
+});
+
+const CommandRow = memo(function CommandRow({ notice }: { notice: CommandNotice }) {
+  return (
+    <div className="flex justify-start">
+      <div className={`max-w-[85%] overflow-hidden rounded-md border px-3 py-2 ${
+        notice.ok ? "border-border bg-surface-2" : "border-danger bg-danger-soft"
+      }`}>
+        <div className="mb-1 font-mono text-[11px] font-semibold text-faint">/{notice.command}</div>
+        <pre className="whitespace-pre-wrap break-words font-sans text-xs text-muted">{notice.text}</pre>
+      </div>
+    </div>
+  );
+});
+
 /** The three restore scopes a checkpoint notice offers — Claude Code
  * /rewind semantics: code only / conversation only / both. */
 type RestoreScope = "files" | "conversation" | "both";
@@ -319,8 +444,19 @@ const CheckpointRow = memo(function CheckpointRow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const turnRunning = useSessionStore(selectTurnRunning(sessionId));
+
+  // Notices recorded before manifest v2 (see `CheckpointNotice`'s doc
+  // comment) never got an `anchorIndex`/`label` at all — the preview modal
+  // needs both (it identifies the turn's own message range from them), so
+  // there's nothing to preview for those, same as they already can't offer
+  // conversation rewind.
+  const previewSubject =
+    typeof notice.anchorIndex === "number" && typeof notice.label === "string"
+      ? { id: notice.id, anchorIndex: notice.anchorIndex, label: notice.label, shellRan: Boolean(notice.shellRan), reverted: Boolean(notice.reverted) }
+      : null;
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -408,6 +544,16 @@ const CheckpointRow = memo(function CheckpointRow({
           <span title={notice.files.join("\n")}>
             {t("MessageList.checkpointFilesChanged", { count: notice.files.length, files: fileNames.join(", ") })}
           </span>
+          {previewSubject && (
+            <button
+              type="button"
+              onClick={() => setPreviewOpen(true)}
+              className="flex cursor-pointer items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-muted transition-colors hover:text-foreground"
+            >
+              <Eye size={11} />
+              {t("CheckpointTimeline.previewButton")}
+            </button>
+          )}
           {notice.reverted ? (
             <>
               <span className="font-medium text-muted">{t("MessageList.checkpointRevertedLabel")}</span>
@@ -477,6 +623,14 @@ const CheckpointRow = memo(function CheckpointRow({
         )}
         {error && <div className="text-danger">{error}</div>}
       </div>
+      {previewOpen && previewSubject && (
+        <CheckpointPreviewModal
+          sessionId={sessionId}
+          checkpoint={previewSubject}
+          onClose={() => setPreviewOpen(false)}
+          onChanged={() => void useCheckpointStore.getState().refresh(sessionId)}
+        />
+      )}
     </div>
   );
 });
@@ -544,6 +698,31 @@ const MemoryRow = memo(function MemoryRow({
   );
 });
 
+/** Renders one `[Recipe]` notice — purely informational, no action to take
+ * (unlike `MemoryRow`'s Forget button): just marks that this session was
+ * started by `recipeRunner.ts`'s "Run now" (design doc slice 2), naming
+ * which recipe. */
+const RecipeRow = memo(function RecipeRow({ notice }: { notice: RecipeNotice }) {
+  const { t } = useT();
+  // Only known once `localAppsStore` has been refreshed at least once
+  // (App.tsx's boot effect) — falls back to the plain notice below when the
+  // app was since unpublished or the list hasn't loaded yet.
+  const localApp = useLocalAppsStore((s) =>
+    notice.localAppId ? s.apps.find((a) => a.id === notice.localAppId) : undefined,
+  );
+  const label = localApp
+    ? t("MessageList.recipeStartedFromLocalApp", { name: notice.name, appName: localApp.name })
+    : t("MessageList.recipeStarted", { name: notice.name });
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] items-center gap-2 rounded-md bg-surface-2 px-3 py-1.5 text-center text-xs text-faint">
+        <ListChecks size={12} className="shrink-0" />
+        <span>{label}</span>
+      </div>
+    </div>
+  );
+});
+
 /** Renders one `[Verify]` notice: the configured command's label, a
  * pass/fail `StatusPill`, its duration, and a collapsible output block —
  * reuses `ToolCallRow`'s collapse affordance rather than introducing a new
@@ -584,6 +763,69 @@ const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) 
             )}
           </div>
         )}
+      </div>
+    </div>
+  );
+});
+
+/**
+ * Renders a doc-chat `[Sources]` notice (see `SOURCES_NOTE_PREFIX`): the
+ * retrieved passages as collapsible chips, each showing the source file name
+ * and its stack badge collapsed, expanding to the full snippet on click —
+ * same collapse affordance as `ToolCallRow`/`VerifyRow`, just one toggle per
+ * chip instead of one for the whole row, since a doc-chat turn typically
+ * retrieves several passages at once and showing every snippet by default
+ * would dominate the transcript.
+ */
+const SourcesRow = memo(function SourcesRow({ notice }: { notice: SourcesNotice }) {
+  const { t } = useT();
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
+
+  if (notice.results.length === 0) return null;
+
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
+        <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted">
+          <BookOpen size={13} className="shrink-0 text-faint" />
+          <span className="font-medium text-foreground">
+            {t("MessageList.sourcesHeading", { count: notice.results.length })}
+          </span>
+        </div>
+        <div className="flex flex-col gap-1 border-t border-border px-2 py-2">
+          {notice.results.map((result, i) => {
+            const fileName = result.path.split(/[\\/]/).filter(Boolean).pop() ?? result.path;
+            const open = openIndex === i;
+            return (
+              <div
+                key={`${result.path}-${i}`}
+                className="overflow-hidden rounded-md border border-border bg-background"
+              >
+                <button
+                  type="button"
+                  onClick={() => setOpenIndex(open ? null : i)}
+                  title={result.path}
+                  className="flex w-full cursor-pointer items-center gap-2 px-2 py-1 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+                >
+                  <ChevronRight
+                    size={11}
+                    className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+                  />
+                  <FileText size={12} className="shrink-0 text-faint" />
+                  <span className="truncate font-mono">{fileName}</span>
+                  <span className="ml-auto shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-faint">
+                    {result.stack}
+                  </span>
+                </button>
+                {open && (
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-border bg-surface-2 px-2 py-1.5 font-mono text-[11px] text-muted">
+                    {result.snippet}
+                  </pre>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
@@ -646,7 +888,15 @@ function canRetry(messages: ChatMessage[]): boolean {
   return messages.some((m) => m.role === "user");
 }
 
-export default function MessageList({ sessionId, messages, onEditUserMessage, editingDisabled, onRetry }: MessageListProps) {
+export default function MessageList({
+  sessionId,
+  messages,
+  onEditUserMessage,
+  editingDisabled,
+  onRetry,
+  messageIndexOffset = 0,
+  onStartSideTask,
+}: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -665,15 +915,18 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
     stickToBottomRef.current = distanceFromBottom < 96;
   };
 
-  const items = buildTimeline(messages);
+  const items = buildTimeline(messages, messageIndexOffset);
   const showRetry = Boolean(onRetry) && !editingDisabled && canRetry(messages);
   const runningVerifyLabel = useSessionStore(selectRunningVerifyLabel(sessionId));
+  const session = useSessionStore((state) => state.sessions.find((candidate) => candidate.id === sessionId));
+  const messageTranslations = session?.messageTranslations ?? [];
+  const preferredTranslationLocale = session?.displayTranslationLocale ?? null;
 
   return (
     <div
       ref={containerRef}
       onScroll={handleScroll}
-      className="min-h-0 flex-1 overflow-y-auto bg-background px-4 py-6"
+      className="min-h-0 flex-1 overflow-y-auto bg-background px-4 py-6 [overscroll-behavior:contain]"
     >
       {items.length === 0 ? (
         <EmptyState />
@@ -690,14 +943,28 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
                   sessionId={sessionId}
                   onEditMessage={editable ? onEditUserMessage : undefined}
                   editDisabled={editingDisabled}
+                  translations={messageTranslations}
+                  preferredTranslationLocale={preferredTranslationLocale}
+                  onStartSideTask={onStartSideTask}
                 />
               );
             }
             if (item.kind === "tool") {
               return <ToolCallRow key={item.key} name={item.name} args={item.args} result={item.result} />;
             }
+            if (item.kind === "subagent") {
+              return (
+                <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
+              );
+            }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;
+            }
+            if (item.kind === "command") {
+              return <CommandRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "btw") {
+              return <BtwRow key={item.key} notice={item.notice} />;
             }
             if (item.kind === "checkpoint") {
               return (
@@ -722,6 +989,12 @@ export default function MessageList({ sessionId, messages, onEditUserMessage, ed
             }
             if (item.kind === "verify") {
               return <VerifyRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "sources") {
+              return <SourcesRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "recipe") {
+              return <RecipeRow key={item.key} notice={item.notice} />;
             }
             return <TypingIndicator key={item.key} />;
           })}

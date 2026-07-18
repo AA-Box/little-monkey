@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { THEME_STORAGE_KEY } from "../lib/theme";
 import { STORAGE_KEY, useSettingsStore } from "./settingsStore";
 
 describe("settingsStore.checkpointRetention", () => {
@@ -322,5 +323,350 @@ describe("settingsStore.artifactAutoPreview", () => {
     const fresh = await import("./settingsStore");
     expect(fresh.useSettingsStore.getState().artifactAutoPreview).toBe(false);
     localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.subagentsEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ subagentsEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as verifyEnabled's
+    // own default test above — `beforeEach` forces `false` regardless, so
+    // only a fresh module import actually covers `defaults()`. Defaults OFF,
+    // same posture as `verifyEnabled`: a weak local model may misuse or loop
+    // on the `task` tool, so delegation should be opt-in.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setSubagentsEnabled(true);
+    expect(useSettingsStore.getState().subagentsEnabled).toBe(true);
+    useSettingsStore.getState().setSubagentsEnabled(false);
+    expect(useSettingsStore.getState().subagentsEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSubagentsEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ subagentsEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentsEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.skillAutoInvokeEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ skillAutoInvokeEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same posture as `subagentsEnabled`: the model acting on its own
+    // initiative (here, invoking a skill without an explicit `/command`)
+    // should be opt-in, not default-on.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().skillAutoInvokeEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setSkillAutoInvokeEnabled(true);
+    expect(useSettingsStore.getState().skillAutoInvokeEnabled).toBe(true);
+    useSettingsStore.getState().setSkillAutoInvokeEnabled(false);
+    expect(useSettingsStore.getState().skillAutoInvokeEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSkillAutoInvokeEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().skillAutoInvokeEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ skillAutoInvokeEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().skillAutoInvokeEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.desktopControlEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ desktopControlEnabled: false });
+  });
+
+  it("defaults to false when nothing is persisted", async () => {
+    // Same "disabled = not offered" posture as `subagentsEnabled`/
+    // `skillAutoInvokeEnabled` above: Safe Desktop Control (see
+    // src-tauri/src/desktop_control.rs) is a research spike that can move
+    // the real mouse/keyboard on macOS, so it defaults off regardless of
+    // whatever else is persisted.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().desktopControlEnabled).toBe(false);
+  });
+
+  it("toggles off and on", () => {
+    useSettingsStore.getState().setDesktopControlEnabled(true);
+    expect(useSettingsStore.getState().desktopControlEnabled).toBe(true);
+    useSettingsStore.getState().setDesktopControlEnabled(false);
+    expect(useSettingsStore.getState().desktopControlEnabled).toBe(false);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setDesktopControlEnabled(true);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().desktopControlEnabled).toBe(true);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores a non-boolean persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ desktopControlEnabled: "nope" }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().desktopControlEnabled).toBe(false);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.maxConcurrentSubagents", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ maxConcurrentSubagents: 2 });
+  });
+
+  it("defaults to 2 when nothing is persisted", async () => {
+    // Same "exercise the real hydration path" rationale as verifyMaxRounds's
+    // own default test above — `beforeEach` forces `2` regardless, so only a
+    // fresh module import actually covers `defaults()`.
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(2);
+  });
+
+  it("clamps below the 1-subagent floor", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(0);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(1);
+  });
+
+  it("clamps above the 4-subagent ceiling", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(10);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(4);
+  });
+
+  it("rounds fractional input", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(3.4);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(3);
+  });
+
+  it("accepts an in-range value unchanged", () => {
+    useSettingsStore.getState().setMaxConcurrentSubagents(3);
+    expect(useSettingsStore.getState().maxConcurrentSubagents).toBe(3);
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setMaxConcurrentSubagents(4);
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(4);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("ignores an out-of-range persisted value and falls back to the default", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ maxConcurrentSubagents: 99 }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().maxConcurrentSubagents).toBe(2);
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+// Slice 4: optional per-profile model override — genuinely optional, so the
+// default (empty map) must mean "no override for either profile", exactly
+// what `subagent.ts`'s `resolveSubagentTarget` treats as "use the parent's
+// own target unchanged".
+describe("settingsStore.subagentProfileModels", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ subagentProfileModels: {} });
+  });
+
+  it("defaults to an empty map when nothing is persisted", async () => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({});
+  });
+
+  it("sets an override for one profile without touching the other", () => {
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    expect(useSettingsStore.getState().subagentProfileModels).toEqual({
+      explore: { providerId: "openrouter", model: "cheap-model" },
+    });
+    expect(useSettingsStore.getState().subagentProfileModels.code).toBeUndefined();
+  });
+
+  it("clears a previously-set override back to 'no override' for that profile", () => {
+    useSettingsStore.getState().setSubagentProfileModel("code", { providerId: "anthropic", model: "claude" });
+    useSettingsStore.getState().clearSubagentProfileModel("code");
+    expect(useSettingsStore.getState().subagentProfileModels.code).toBeUndefined();
+  });
+
+  it("persists across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setSubagentProfileModel("explore", { providerId: "openrouter", model: "cheap-model" });
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({
+      explore: { providerId: "openrouter", model: "cheap-model" },
+    });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("drops a malformed persisted entry (missing model) rather than corrupting the whole map", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ subagentProfileModels: { explore: { providerId: "openrouter" }, code: { providerId: "x", model: "y" } } }));
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().subagentProfileModels).toEqual({ code: { providerId: "x", model: "y" } });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+});
+
+describe("settingsStore.appearance", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      themePreference: "system",
+      accentColor: "default",
+      textScale: "medium",
+      motionPreference: "system",
+      highContrastEnabled: false,
+    });
+  });
+
+  it("defaults to the standard appearance when nothing is persisted", async () => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(THEME_STORAGE_KEY);
+    }
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState()).toMatchObject({
+      themePreference: "system",
+      accentColor: "default",
+      textScale: "medium",
+      motionPreference: "system",
+      highContrastEnabled: false,
+    });
+  });
+
+  it("updates every appearance field through its setter", () => {
+    const settings = useSettingsStore.getState();
+    settings.setThemePreference("dark");
+    settings.setAccentColor("teal");
+    settings.setTextScale("large");
+    settings.setMotionPreference("reduced");
+    settings.setHighContrastEnabled(true);
+
+    expect(useSettingsStore.getState()).toMatchObject({
+      themePreference: "dark",
+      accentColor: "teal",
+      textScale: "large",
+      motionPreference: "reduced",
+      highContrastEnabled: true,
+    });
+  });
+
+  it("persists appearance across a hydrate() reload", async () => {
+    if (typeof localStorage === "undefined") return;
+    useSettingsStore.getState().setThemePreference("dark");
+    useSettingsStore.getState().setAccentColor("rose");
+    useSettingsStore.getState().setTextScale("small");
+    useSettingsStore.getState().setMotionPreference("reduced");
+    useSettingsStore.getState().setHighContrastEnabled(true);
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState()).toMatchObject({
+      themePreference: "dark",
+      accentColor: "rose",
+      textScale: "small",
+      motionPreference: "reduced",
+      highContrastEnabled: true,
+    });
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(THEME_STORAGE_KEY);
+  });
+
+  it("falls back for malformed persisted appearance fields", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        themePreference: "midnight",
+        accentColor: "ultraviolet",
+        textScale: "giant",
+        motionPreference: "spinny",
+        highContrastEnabled: "yes",
+      }),
+    );
+    localStorage.removeItem(THEME_STORAGE_KEY);
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState()).toMatchObject({
+      themePreference: "system",
+      accentColor: "default",
+      textScale: "medium",
+      motionPreference: "system",
+      highContrastEnabled: false,
+    });
+    localStorage.removeItem(STORAGE_KEY);
+  });
+
+  it("migrates the old theme-only storage key when the settings blob is absent", async () => {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.setItem(THEME_STORAGE_KEY, "dark");
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().themePreference).toBe("dark");
+    localStorage.removeItem(THEME_STORAGE_KEY);
   });
 });

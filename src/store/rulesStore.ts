@@ -17,13 +17,24 @@ export interface RuleFile {
 /**
  * Mirrors the Rust `Fact` struct (src-tauri/src/memory.rs) exactly — field
  * names/casing must match the serde JSON representation returned by
- * `memory_list`.
+ * `memory_list`. `enabled`/`source_turn_id` are optional here (rather than
+ * required) purely so existing hand-written test fixtures that predate
+ * those fields keep compiling — real backend responses always include both.
  */
 export interface MemoryFact {
   id: string;
   text: string;
   source: "agent" | "user";
   created_at: string;
+  /** Soft-disable flag (Memory Studio). `memory_list` already filters to
+   * `enabled: true` facts only, so in practice every fact reaching this
+   * store has this `true` — Memory Studio's own full listing
+   * (`memory_list_all` / `MemoryEntry`, see `memoryStudio.ts`) is where a
+   * `false` value is actually seen and actionable. */
+  enabled?: boolean;
+  /** The chat turn this fact was remembered from, when known — `null`/absent
+   * for facts added via the Settings "Add fact" affordance. */
+  source_turn_id?: string | null;
 }
 
 export interface RulesStore {

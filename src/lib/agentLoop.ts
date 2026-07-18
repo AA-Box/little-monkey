@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { TOOLS, PRESENT_PLAN_TOOL } from './tools';
+import { PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -35,10 +35,13 @@ import {
   attemptStream,
   CANCELLED_TOOL_RESULT,
   executeToolCall,
+  isToolCallAllowed,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
+  type SkillToolContext,
+  type SubagentContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
@@ -48,18 +51,43 @@ import {
   type DirEntry,
   type ResolvedTextReference,
 } from './mentions';
-import { currentSystemPrompt } from './systemPrompt';
+import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
+import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
+import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
-import { getActiveChatTarget, useModelStore } from '../store/modelStore';
+import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
+import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
+import { useStackStore, type StackQueryResult } from '../store/stackStore';
+import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
+import {
+  buildModelTargetInventory,
+  type ModelTargetSnapshot,
+} from './modelTargets';
+import { beginDurableRun, type DurableRunRecorder } from './durableRun';
+import { requestRunCancellation } from './runProtocol';
+import { registerRunCancellation } from './runCancellationRegistry';
+import {
+  buildDaemonDesktopRecipe,
+  daemonDesktopRoute,
+  loadActiveDaemonTurns,
+  removeActiveDaemonTurn,
+  saveActiveDaemonTurn,
+  submitDaemonDesktopTurn,
+  watchDaemonDesktopTurn,
+  type ActiveDaemonDesktopTurn,
+  type FrozenAttachmentInput,
+} from './daemonDesktopTurn';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -79,6 +107,15 @@ export function isSwitchNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(SWITCH_NOTE_PREFIX);
 }
 
+/** Matches the OpenRouter (and OpenAI-compat-alike) 404 body some free/small
+ * models return when tools are merely *offered* in the request, even for a
+ * turn the model never intended to call one — every turn offers the full
+ * tool list (see `toolsForTurn` below), so without this the model is
+ * unusable for plain chat too. Caught in `runAgentTurn` to retry the same
+ * target once with an empty tool list rather than surfacing a raw error or
+ * failing the target over. */
+const TOOL_UNSUPPORTED_ERROR_PATTERN = /support(?:s|ing)? tool use/i;
+
 /** Prefix identifying a synthetic notice listing "@"-mentions that failed to
  * resolve this turn (typo'd path, unreadable file — see `resolveReferences`)
  * — same pattern as `SWITCH_NOTE_PREFIX`, so the user learns why the model
@@ -87,6 +124,51 @@ export const MENTION_NOTE_PREFIX = '[Mentions]';
 
 export function isMentionNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MENTION_NOTE_PREFIX);
+}
+
+/** Prefix identifying a synthetic Privacy Firewall notice (ROADMAP.md Phase
+ * 5) — redaction, block, or local-only-fallback switch — inserted into the
+ * transcript by the pre-turn gate in `runAgentTurnBody`. Same rendering
+ * convention as `SWITCH_NOTE_PREFIX`/`MENTION_NOTE_PREFIX` above. */
+export const PRIVACY_NOTE_PREFIX = '[Privacy firewall]';
+
+export function isPrivacyNotice(message: ChatMessage): boolean {
+  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PRIVACY_NOTE_PREFIX);
+}
+
+/**
+ * Builds the `{is, parse, format}` trio every `[Prefix]{json}` synthetic
+ * notice below (Checkpoint/Plan/Memory/Verify/Sources) needs — before this
+ * factory each of those five was an independent hand-rolled copy of the same
+ * three functions (a `startsWith` check, a `JSON.parse` wrapped in a
+ * try/catch that degrades to `null` on anything malformed, and a
+ * `JSON.stringify` back onto the prefix). `isValid` — the payload's own
+ * shape check — is the only thing that actually varies per notice type; it's
+ * supplied as a type guard so `parse`'s return type narrows to `T` without a
+ * cast at every call site. Plain-text notices with no JSON payload
+ * (`SWITCH_NOTE_PREFIX`/`MENTION_NOTE_PREFIX` above, `VERIFY_FIX_NOTE_PREFIX`
+ * below) deliberately stay outside this factory — there's no payload to
+ * parse, so wrapping them here would just be a `parse`/`format` pair nobody
+ * calls.
+ */
+function makeNotice<T>(prefix: string, isValid: (value: unknown) => value is T) {
+  function is(message: ChatMessage): boolean {
+    return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(prefix);
+  }
+  function parse(message: ChatMessage): T | null {
+    if (!is(message)) return null;
+    try {
+      const parsed: unknown = JSON.parse((message.content as string).slice(prefix.length));
+      if (isValid(parsed)) return parsed;
+    } catch {
+      // Malformed payload — treat as "not this notice type".
+    }
+    return null;
+  }
+  function format(notice: T): string {
+    return `${prefix}${JSON.stringify(notice)}`;
+  }
+  return { is, parse, format };
 }
 
 /** Prefix identifying a synthetic per-turn checkpoint notice inserted into
@@ -178,34 +260,23 @@ export function checkpointChainBlockReason(checkpoints: CheckpointChainLink[], t
   return null;
 }
 
-export function isCheckpointNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(CHECKPOINT_NOTE_PREFIX);
+function isCheckpointPayload(value: unknown): value is CheckpointNotice {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as CheckpointNotice).id === 'string' &&
+    Array.isArray((value as CheckpointNotice).files)
+  );
 }
 
+const checkpointNoticeCodec = makeNotice<CheckpointNotice>(CHECKPOINT_NOTE_PREFIX, isCheckpointPayload);
+
+export const isCheckpointNotice = checkpointNoticeCodec.is;
 /** Parses a checkpoint notice's JSON payload; `null` for anything malformed. */
-export function parseCheckpointNotice(message: ChatMessage): CheckpointNotice | null {
-  if (!isCheckpointNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(CHECKPOINT_NOTE_PREFIX.length));
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as CheckpointNotice).id === 'string' &&
-      Array.isArray((parsed as CheckpointNotice).files)
-    ) {
-      return parsed as CheckpointNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a checkpoint notice".
-  }
-  return null;
-}
-
+export const parseCheckpointNotice = checkpointNoticeCodec.parse;
 /** Serializes a checkpoint notice back into message content — used both when
  * the notice is first added and when the Revert button marks it reverted. */
-export function formatCheckpointNotice(notice: CheckpointNotice): string {
-  return `${CHECKPOINT_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatCheckpointNotice = checkpointNoticeCodec.format;
 
 /** Prefix identifying a synthetic notice inserted after a `present_plan` tool
  * call (Plan Mode only — see `toolsForMode`) — cloned from the
@@ -229,43 +300,31 @@ export interface PlanNotice {
   status: 'proposed' | 'approved' | 'dismissed';
 }
 
-export function isPlanNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(PLAN_NOTE_PREFIX);
+function isPlanPayload(value: unknown): value is PlanNotice {
+  const openQuestions = (value as PlanNotice | null)?.openQuestions;
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as PlanNotice).id === 'string' &&
+      typeof (value as PlanNotice).title === 'string' &&
+      typeof (value as PlanNotice).plan === 'string' &&
+      typeof (value as PlanNotice).status === 'string' &&
+      // openQuestions is optional, but if present it must actually be a
+      // string[], or PlanCard's `.map()` over it throws at render time (e.g.
+      // a persisted/hand-edited session whose payload sets it to a truthy
+      // non-array like a string).
+      (openQuestions === undefined || (Array.isArray(openQuestions) && openQuestions.every((q) => typeof q === 'string'))),
+  );
 }
 
+const planNoticeCodec = makeNotice<PlanNotice>(PLAN_NOTE_PREFIX, isPlanPayload);
+
+export const isPlanNotice = planNoticeCodec.is;
 /** Parses a plan notice's JSON payload; `null` for anything malformed. */
-export function parsePlanNotice(message: ChatMessage): PlanNotice | null {
-  if (!isPlanNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(PLAN_NOTE_PREFIX.length));
-    const openQuestions = (parsed as PlanNotice | null)?.openQuestions;
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as PlanNotice).id === 'string' &&
-      typeof (parsed as PlanNotice).title === 'string' &&
-      typeof (parsed as PlanNotice).plan === 'string' &&
-      typeof (parsed as PlanNotice).status === 'string' &&
-      // Mirrors parseCheckpointNotice's Array.isArray(files) check just
-      // above — openQuestions is optional, but if present it must actually
-      // be a string[], or PlanCard's `.map()` over it throws at render time
-      // (e.g. a persisted/hand-edited session whose payload sets it to a
-      // truthy non-array like a string).
-      (openQuestions === undefined || (Array.isArray(openQuestions) && openQuestions.every((q) => typeof q === 'string')))
-    ) {
-      return parsed as PlanNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a plan notice".
-  }
-  return null;
-}
-
+export const parsePlanNotice = planNoticeCodec.parse;
 /** Serializes a plan notice back into message content — used both when the
  * notice is first added and when Approve/Keep planning rewrite its status. */
-export function formatPlanNotice(notice: PlanNotice): string {
-  return `${PLAN_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatPlanNotice = planNoticeCodec.format;
 
 /**
  * Extracts a `present_plan` tool call's arguments into the fields a
@@ -324,34 +383,23 @@ export interface MemoryNotice {
   forgotten?: boolean;
 }
 
-export function isMemoryNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(MEMORY_NOTE_PREFIX);
+function isMemoryPayload(value: unknown): value is MemoryNotice {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as MemoryNotice).id === 'string' &&
+    typeof (value as MemoryNotice).text === 'string'
+  );
 }
 
+const memoryNoticeCodec = makeNotice<MemoryNotice>(MEMORY_NOTE_PREFIX, isMemoryPayload);
+
+export const isMemoryNotice = memoryNoticeCodec.is;
 /** Parses a memory notice's JSON payload; `null` for anything malformed. */
-export function parseMemoryNotice(message: ChatMessage): MemoryNotice | null {
-  if (!isMemoryNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(MEMORY_NOTE_PREFIX.length));
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as MemoryNotice).id === 'string' &&
-      typeof (parsed as MemoryNotice).text === 'string'
-    ) {
-      return parsed as MemoryNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a memory notice".
-  }
-  return null;
-}
-
+export const parseMemoryNotice = memoryNoticeCodec.parse;
 /** Serializes a memory notice back into message content — used both when the
  * notice is first added and when the Forget button marks it forgotten. */
-export function formatMemoryNotice(notice: MemoryNotice): string {
-  return `${MEMORY_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatMemoryNotice = memoryNoticeCodec.format;
 
 /** Prefix identifying a synthetic notice inserted after a turn that mutated
  * files ran the workspace's configured verification commands (see
@@ -379,33 +427,22 @@ export interface VerifyNotice {
   durationMs: number;
 }
 
-export function isVerifyNotice(message: ChatMessage): boolean {
-  return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_NOTE_PREFIX);
+function isVerifyPayload(value: unknown): value is VerifyNotice {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as VerifyNotice).label === 'string' &&
+    typeof (value as VerifyNotice).ok === 'boolean'
+  );
 }
 
+const verifyNoticeCodec = makeNotice<VerifyNotice>(VERIFY_NOTE_PREFIX, isVerifyPayload);
+
+export const isVerifyNotice = verifyNoticeCodec.is;
 /** Parses a verify notice's JSON payload; `null` for anything malformed. */
-export function parseVerifyNotice(message: ChatMessage): VerifyNotice | null {
-  if (!isVerifyNotice(message)) return null;
-  try {
-    const parsed: unknown = JSON.parse((message.content as string).slice(VERIFY_NOTE_PREFIX.length));
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof (parsed as VerifyNotice).label === 'string' &&
-      typeof (parsed as VerifyNotice).ok === 'boolean'
-    ) {
-      return parsed as VerifyNotice;
-    }
-  } catch {
-    // Malformed payload — treat as "not a verify notice".
-  }
-  return null;
-}
-
+export const parseVerifyNotice = verifyNoticeCodec.parse;
 /** Serializes a verify notice back into message content. */
-export function formatVerifyNotice(notice: VerifyNotice): string {
-  return `${VERIFY_NOTE_PREFIX}${JSON.stringify(notice)}`;
-}
+export const formatVerifyNotice = verifyNoticeCodec.format;
 
 /** Prefix identifying the plain-text "fix this" instruction appended to the
  * transcript when a verification failure triggers a feed-back round (see
@@ -431,34 +468,275 @@ const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
 /**
  * Filters `remember` out of the tool list offered to the model this turn
  * when the settingsStore `memoryEnabled` toggle is off, and/or `web_fetch`
- * and `web_search` out when `webToolsEnabled` is off. This is the ONLY
- * effect of either toggle — rules and previously-saved facts are still
+ * and `web_search` out when `webToolsEnabled` is off, then APPENDS
+ * `TASK_TOOL` when `subagentsEnabled` is on. This is the ONLY effect of any
+ * of the three toggles — rules and previously-saved facts are still
  * injected into the system prompt unconditionally (see `runAgentTurnBody`'s
  * `useRulesStore.getState().refresh()` call); turning `memoryEnabled` off
  * stops the agent from saving *new* facts on its own, it is not amnesia.
  * Likewise, `webToolsEnabled` off just makes the two web tools invisible to
  * the model — it doesn't touch anything else.
+ *
+ * `subagentsEnabled` is deliberately handled in THIS function — the single
+ * existing per-turn tool-list composer both Plan/Act (`toolsForMode`'s
+ * `present_plan` append) and RAG (`buildTools`'s conditional `search_docs`
+ * append) already extended — rather than a new parallel "toolsForSubagents"
+ * filter: one composition chain
+ * (`toolsForSettings(toolsForMode([...buildTools(...), ...mcpDefs], mode), ...)`,
+ * see `runAgentTurnBody`) stays the one place to audit everything the model
+ * is offered. Default `false` mirrors every other call site that doesn't
+ * pass it, so `task` is never accidentally offered by an existing caller
+ * that hasn't been updated for it.
+ *
+ * `skillToolEnabled`/`readSkillResourceToolEnabled` follow the same posture,
+ * appending `SKILL_INVOKE_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
+ * `runAgentTurnBody`'s call site for exactly what each is computed from.
+ * They're independent: `readSkillResourceToolEnabled` is NOT gated on
+ * `settingsStore.skillAutoInvokeEnabled` at all — reading a bundled file
+ * should work for an explicitly `/command`-invoked skill too, not just an
+ * auto-invoked one.
  */
-export function toolsForSettings(tools: ToolDef[], memoryEnabled: boolean, webToolsEnabled = true): ToolDef[] {
-  return tools.filter((tool) => {
+export function toolsForSettings(
+  tools: ToolDef[],
+  memoryEnabled: boolean,
+  webToolsEnabled = true,
+  subagentsEnabled = false,
+  skillToolEnabled = false,
+  readSkillResourceToolEnabled = false,
+): ToolDef[] {
+  const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
+  return [
+    ...filtered,
+    ...(subagentsEnabled ? [TASK_TOOL] : []),
+    ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
+    ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
+  ];
 }
 
 /**
- * Whether `toolCall` was actually among the tools offered to the model this
- * turn. `toolsForSettings` only shapes the *schema* sent to the model (e.g.
- * dropping `remember` when `memoryEnabled` is off) — nothing downstream of
- * that used to check it, so a model that still emitted a disabled or
- * hallucinated tool call (a real risk with local/quantized models that don't
- * strictly respect the offered tool schema) would have it executed anyway.
- * The tool-calling loop calls this before dispatch and rejects (without
- * executing) anything that fails it.
+ * `allowed-tools` enforcement (see each `SlashSkill.allowedTools`'s doc
+ * comment): every skill invoked so far this turn (explicit AND
+ * model-invoked, both live in `invokedCommands` — see `skillToolContext` in
+ * `runAgentTurnBody`) that declares `allowedTools` narrows what's on offer.
+ * Favors NOT restricting on ambiguity: if any invoked skill omits
+ * `allowedTools` (or none are invoked yet), returns `null` (unrestricted);
+ * only when EVERY invoked skill declares one does this return the union of
+ * their sets, so stacking a restrictive skill with a permissive one never
+ * silently locks the model out of tools the permissive skill actually needs.
  */
-export function isToolCallAllowed(toolCall: ToolCall, toolsForTurn: ToolDef[]): boolean {
-  return toolsForTurn.some((tool) => tool.function.name === toolCall.function.name);
+export function allowedToolsRestriction(
+  invokedCommands: ReadonlySet<string>,
+  availableSkills: SlashSkill[],
+): ReadonlySet<string> | null {
+  const invoked = availableSkills.filter((candidate) => invokedCommands.has(candidate.command));
+  if (invoked.length === 0 || invoked.some((candidate) => !candidate.allowedTools || candidate.allowedTools.length === 0)) {
+    return null;
+  }
+  return new Set(invoked.flatMap((candidate) => candidate.allowedTools ?? []));
+}
+
+/**
+ * Applies `allowedToolsRestriction`'s result (if any) to a per-turn tool
+ * list — the `skill` tool itself always stays offered even under a
+ * restrictive list (deliberate exception): this app stacks up to
+ * `MAX_SKILLS_PER_TURN` skills per turn (unlike a single-skill-at-a-time
+ * model), so a restrictive skill must never strand the model unable to
+ * invoke a different, less-restricted one.
+ */
+export function applyAllowedToolsRestriction(tools: ToolDef[], restriction: ReadonlySet<string> | null): ToolDef[] {
+  if (restriction === null) return tools;
+  return tools.filter((tool) => tool.function.name === 'skill' || restriction.has(tool.function.name));
+}
+
+/** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
+ * `KnowledgeStack` — kept local (rather than importing the full interface)
+ * since only these three fields matter for the derived description. */
+interface AttachedStackLike {
+  name: string;
+  indexed_at: number | null;
+  chunk_count: number;
+}
+
+/**
+ * Derives each attached stack's short prompt-facing `description` (see
+ * `systemPrompt.ts`'s `AttachedStackPromptInfo`) from its index status —
+ * `chunk_count` once indexed, or a "not indexed yet" note so the model
+ * doesn't expect `search_docs` to return anything for a stack that hasn't
+ * been indexed at all. Pure so it can be unit-tested independent of
+ * `stackStore`/`sessionStore`, same reasoning as `toolsForMode`/
+ * `toolsForSettings` above.
+ */
+export function attachedStackPromptInfo(stacks: AttachedStackLike[]): AttachedStackPromptInfo[] {
+  return stacks.map((stack) => ({
+    name: stack.name,
+    description:
+      stack.indexed_at !== null ? `${stack.chunk_count} chunk${stack.chunk_count === 1 ? '' : 's'} indexed` : 'not indexed yet',
+  }));
+}
+
+/** Prefix identifying a synthetic notice inserted before the first model call
+ * of a turn when the session's doc-chat mode is on (see
+ * `ChatSession.docChatMode`, `StackPicker.tsx`) — cloned from the
+ * `CHECKPOINT_NOTE_PREFIX` pattern above. Carries the top-k passages
+ * `stacks_query` retrieved for the user's own message, so `MessageList` can
+ * render collapsible source chips and the model can answer with citations
+ * instead of needing to call `search_docs` itself first. Added to the
+ * transcript via the same `addMessage` every other notice in this module
+ * uses — never handled as a separate "wire-only" message — which is also
+ * what makes its token cost visible to `contextTrimmer.ts`'s
+ * `estimateHistoryTokens` for free: that function sums every message in
+ * history generically with no per-notice-type special-casing, so retrieved
+ * passages count toward compaction thresholds exactly like everything else
+ * already flowing through `addMessage` (the RAG design doc's context-bloat
+ * risk — see `contextTrimmer.test.ts`'s doc-chat coverage). */
+export const SOURCES_NOTE_PREFIX = '[Sources]';
+
+/** One retrieval hit inside a `SourcesNotice` — mirrors the fields of
+ * `stacks.rs`'s `StackQueryResult` (as returned by the `stacks_query`
+ * command) that the citation UI/prompt actually need, renamed to the design
+ * doc's `{path, stack, score, snippet}` shape rather than the wire's
+ * snake_case `source_path`/`stack_name`/`text` — see
+ * `runAgentTurnBody`'s doc-chat block for that mapping. */
+export interface SourcesNoticeResult {
+  path: string;
+  stack: string;
+  score: number;
+  snippet: string;
+}
+
+/** Payload embedded in a sources notice message. */
+export interface SourcesNotice {
+  results: SourcesNoticeResult[];
+}
+
+function isSourcesPayload(value: unknown): value is SourcesNotice {
+  const results = (value as SourcesNotice | null)?.results;
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      Array.isArray(results) &&
+      results.every(
+        (r): r is SourcesNoticeResult =>
+          Boolean(r) &&
+          typeof r === 'object' &&
+          typeof (r as SourcesNoticeResult).path === 'string' &&
+          typeof (r as SourcesNoticeResult).stack === 'string' &&
+          typeof (r as SourcesNoticeResult).score === 'number' &&
+          typeof (r as SourcesNoticeResult).snippet === 'string',
+      ),
+  );
+}
+
+const sourcesNoticeCodec = makeNotice<SourcesNotice>(SOURCES_NOTE_PREFIX, isSourcesPayload);
+
+export const isSourcesNotice = sourcesNoticeCodec.is;
+/** Parses a sources notice's JSON payload; `null` for anything malformed. */
+export const parseSourcesNotice = sourcesNoticeCodec.parse;
+/** Serializes a sources notice back into message content. */
+export const formatSourcesNotice = sourcesNoticeCodec.format;
+
+export const hardenSourcesNoticeForModel = protectKnowledgeNoticeForModel;
+
+/** Prefix identifying a synthetic notice inserted at the start of a session
+ * created by `recipeRunner.ts`'s "Run now" (design doc:
+ * docs/roadmap/p3-scheduled-automation.md, slice 2) — the 6th notice type
+ * anticipated by ROADMAP.md §3.4, and the first to use `makeNotice` from
+ * day one rather than being a 6th hand-rolled copy. Marks the session as
+ * recipe-originated so `MessageList` can show which recipe (and, once
+ * slice 3 ships, whether it was a scheduled run) started it. */
+export const RECIPE_NOTE_PREFIX = '[Recipe]';
+
+/** Payload embedded in a recipe notice message. */
+export interface RecipeNotice {
+  name: string;
+  /** Absolute path the recipe was loaded from, if known — omitted for a
+   * recipe resolved only by name (the common case; see `recipesStore.ts`). */
+  path?: string;
+  /** Set only when this run was triggered through a published Local App's
+   * `run` route (see `localAppsStore.ts`'s run-request listener) rather than
+   * a direct "Run now"/scheduled invocation — the id of that Local App, so
+   * `MessageList`/Run Capsule viewers can show which published app started
+   * this run. */
+  localAppId?: string;
+}
+
+function isRecipePayload(value: unknown): value is RecipeNotice {
+  return !!value && typeof value === 'object' && typeof (value as RecipeNotice).name === 'string';
+}
+
+const recipeNoticeCodec = makeNotice<RecipeNotice>(RECIPE_NOTE_PREFIX, isRecipePayload);
+
+export const isRecipeNotice = recipeNoticeCodec.is;
+/** Parses a recipe notice's JSON payload; `null` for anything malformed. */
+export const parseRecipeNotice = recipeNoticeCodec.parse;
+/** Serializes a recipe notice back into message content. */
+export const formatRecipeNotice = recipeNoticeCodec.format;
+
+/**
+ * Re-exported for backward compatibility — `isToolCallAllowed` now lives in
+ * `turnEngine.ts` (see that module's doc comment) so `subagent.ts`'s own
+ * child tool-calling loop can reuse the exact same gate this loop's own
+ * dispatch below applies, rather than a parallel/duplicated check. Re-export
+ * of the binding already imported above (not a fresh `export ... from`) so
+ * this file's own use of it below and the public export are the same value.
+ */
+export { isToolCallAllowed };
+
+/**
+ * Runs one round's worth of model-requested tool calls, splitting `task`
+ * calls out to run CONCURRENTLY (bounded by `maxConcurrentSubagents`, the
+ * "builds on split-pane turn-safe concurrency" payoff called out in the
+ * design doc's Parallelism section — the Rust per-turn `tool_cancel`/
+ * permission-`pending` maps and the queued `PermissionModal` were already
+ * built for N concurrent turns, not just 2) while every other call stays
+ * strictly sequential, exactly as before this feature — a subagent's own
+ * tool calls are already serialized within `runSubagentTask`'s own loop, so
+ * only concurrency ACROSS multiple `task` calls in the same round is new.
+ *
+ * `results[i]` always corresponds to `toolCalls[i]` regardless of which
+ * call actually finished first — several providers reject a `tool_calls`
+ * round trip whose `tool` results don't come back in the same order the
+ * calls were requested in, so this ordering guarantee is load-bearing, not
+ * cosmetic. `runOne` is a plain callback (not baked in here) so this stays
+ * unit-testable with a fake, controllable-timing implementation instead of
+ * needing a real `executeToolCall`/Tauri `invoke`.
+ */
+export async function runToolCallsForRound(
+  toolCalls: ToolCall[],
+  maxConcurrentSubagents: number,
+  runOne: (toolCall: ToolCall) => Promise<string>
+): Promise<string[]> {
+  const results: string[] = new Array(toolCalls.length);
+  const taskIndices: number[] = [];
+  const sequentialIndices: number[] = [];
+  toolCalls.forEach((toolCall, index) => {
+    (toolCall.function.name === 'task' ? taskIndices : sequentialIndices).push(index);
+  });
+
+  const sequentialRun = (async () => {
+    for (const index of sequentialIndices) {
+      results[index] = await runOne(toolCalls[index]);
+    }
+  })();
+
+  // A small bounded worker pool over `taskIndices` only — `sequentialRun`
+  // above already owns every non-`task` index, so these two loops never
+  // touch the same slot and can safely run at the same time.
+  const poolSize = Math.max(1, Math.min(4, Math.floor(maxConcurrentSubagents) || 1, taskIndices.length || 1));
+  let nextTaskCursor = 0;
+  const workers = Array.from({ length: poolSize }, async () => {
+    while (nextTaskCursor < taskIndices.length) {
+      const index = taskIndices[nextTaskCursor++];
+      results[index] = await runOne(toolCalls[index]);
+    }
+  });
+
+  await Promise.all([sequentialRun, ...workers]);
+  return results;
 }
 
 /** Shape of a successful `tool_remember` result (the created/deduplicated
@@ -636,6 +914,7 @@ export async function runVerificationPhase(
     // never leaves a stale "running" row behind.
     useSessionStore.getState().setRunningVerifyLabel(sessionId, cmd.label || cmd.command);
     try {
+      useUsageHistoryStore.getState().recordVerifyRun();
       const invocation = invoke<VerifyRunResult>('verify_run', { commandId: cmd.id, turnId });
       const result = signal ? await Promise.race([invocation, abortedPromise(signal).then(() => null)]) : await invocation;
 
@@ -728,8 +1007,20 @@ async function resolveBaseUrl(): Promise<string> {
  * (its API key lives in the OS keychain, never here); local llama.cpp and
  * the unauthenticated local Ollama daemon both use the direct-`fetch`
  * `streamChat` path.
+ *
+ * Exported so `sideTaskRunner.ts` can default a newly-started side task onto
+ * whatever model the main chat is currently using, without re-implementing
+ * this resolution logic (or the local-runtime `resolveBaseUrl` lookup a
+ * from-scratch version would need) a second time — a side task's own loop is
+ * deliberately independent of the parent turn (see that module's doc
+ * comment), but "which model is active right now" is still a single, shared
+ * piece of app state both should read the same way.
  */
-async function resolveTarget(): Promise<ResolvedTarget> {
+/** Exported (in addition to the module's own uses above) so
+ * `issueToPrRunner.ts` can resolve the exact same active-target rules for
+ * its own headless, panel-driven agent turn — see that module's doc comment
+ * for why it reuses this rather than re-deriving target resolution. */
+export async function resolveTarget(): Promise<ResolvedTarget> {
   const target = getActiveChatTarget();
 
   if (target.kind === 'provider') {
@@ -747,7 +1038,88 @@ async function resolveTarget(): Promise<ResolvedTarget> {
   }
 
   const baseUrl = await resolveBaseUrl();
-  return { kind: 'local', baseUrl };
+  return { kind: 'local', baseUrl, modelLabel: useModelStore.getState().active?.name ?? 'Local model' };
+}
+
+/** Deterministic `/compact` entry point. It reuses the same compaction and
+ * one-shot summary path as automatic context trimming, but never appends a
+ * user/model turn. The persisted transcript is replaced only after a full
+ * compacted result has been produced. */
+export async function compactSessionNow(sessionId: string): Promise<{ changed: boolean; removedMessages: number }> {
+  const sessionState = useSessionStore.getState();
+  if (sessionState.runningTurns[sessionId]) {
+    throw new Error("Stop the active turn before compacting this chat.");
+  }
+  const history = sessionMessages(sessionId);
+  if (history.length === 0) return { changed: false, removedMessages: 0 };
+
+  const settings = useSettingsStore.getState();
+  const target = await resolveTarget();
+  const result = await applyContextCompaction(history, {
+    strategy: settings.contextTrimStrategy,
+    contextLimit: useUsageStore.getState().contextLimit,
+    thresholdPercent: 100,
+    sendForSummary: async (dropped) => {
+      const summary = await attemptStream(
+        target,
+        [
+          {
+            role: 'system',
+            content:
+              'Summarize the following earlier conversation concisely for another AI assistant to continue from. Preserve key facts, decisions, file paths, and code context. Reply with only the summary text.',
+          },
+          { role: 'user', content: renderForSummary(dropped) },
+        ],
+        [],
+        undefined,
+        effortForTarget(target),
+        sessionId,
+      );
+      if (summary.streamError) throw new Error(summary.streamError);
+      return summary.content.trim() || '(summary unavailable)';
+    },
+  });
+  if (!result.changed) return { changed: false, removedMessages: 0 };
+  useSessionStore.getState().replaceMessages(sessionId, result.messages);
+  return {
+    changed: true,
+    removedMessages: Math.max(0, history.length - result.messages.length + 1),
+  };
+}
+
+/** Resolves a streaming target back to the immutable inventory record that
+ * contains its endpoint/model/capability evidence. The inventory is built
+ * once at run start; later global model changes cannot rewrite the ledger
+ * snapshot. */
+/** Exported so `issueToPrRunner.ts` can build the `target` field
+ * `beginDurableRun` needs for its own headless run, the same reuse reasoning
+ * as `resolveTarget` above. */
+export function snapshotForResolvedTarget(target: ResolvedTarget): ModelTargetSnapshot | null {
+  const state = useModelStore.getState();
+  const inventory = buildModelTargetInventory({
+    installed: state.installed,
+    active: state.active,
+    llamaStatus: state.llamaStatus,
+    ollamaModels: state.ollamaModels,
+    ollamaReachable: state.ollamaReachable,
+    providers: state.providers,
+    providerModels: state.providerModels,
+    effortByTarget: state.effortByTarget,
+  });
+  if (target.kind === 'local') {
+    return inventory.targets.find((candidate) => candidate.kind === 'local') ?? null;
+  }
+  if (target.kind === 'ollama') {
+    return inventory.targets.find(
+      (candidate) => candidate.kind === 'ollama' && candidate.model === target.model,
+    ) ?? null;
+  }
+  return inventory.targets.find(
+    (candidate) =>
+      candidate.kind === 'provider' &&
+      candidate.providerId === target.providerId &&
+      candidate.model === target.model,
+  ) ?? null;
 }
 
 /** Human-readable label for a switch notice. */
@@ -765,6 +1137,48 @@ function applyTargetSwitch(target: ResolvedTarget): void {
     useModelStore.getState().useOllamaModel(target.model);
   }
   // 'local' is never produced as a switch target — see buildFailoverChain/findVisionCandidate.
+}
+
+/** Whether `target` (an already-*resolved* target, unlike `activeTargetSatisfiesVision`
+ * below which reads live store state) can see images — used to decide whether
+ * older image-bearing turns still in `history` need stripping before this
+ * particular target sees them. See `stripImagesForTextOnlyTarget`. */
+function resolvedTargetSupportsVision(target: ResolvedTarget): boolean {
+  if (target.kind === 'provider') return isVisionCapableProviderModel(target.providerId, target.model);
+  if (target.kind === 'ollama') {
+    const model = useModelStore.getState().ollamaModels.find((m) => m.name === target.model);
+    return model ? isVisionCapableOllamaModel(model) : false;
+  }
+  return false;
+}
+
+/**
+ * A conversation can carry an image from an earlier turn (sent to a
+ * vision-capable model) into a later turn where the user has since switched
+ * to a text-only model — `requireVision` below only accounts for THIS turn's
+ * *new* attachments, not images already baked into stored history, so
+ * without this the text-only model's provider rejects the whole request over
+ * a `ChatContentPart[]` it can't parse (image content from turns ago). Called
+ * per-target (not just once) since a mid-turn failover can move between
+ * vision and non-vision targets. A no-op (returns `messages` unchanged) for
+ * a target that does support vision. The image bytes themselves are never
+ * recoverable here — a text-only model genuinely cannot see them regardless
+ * — but a bare `textContent()` call would also erase every *trace* that an
+ * image was ever attached, leaving the model to silently misread "what's in
+ * that image?" a few turns later as referring to nothing. A short marker is
+ * appended per stripped message instead, so the model at least knows why it
+ * can't answer.
+ */
+function stripImagesForTextOnlyTarget(messages: ChatMessage[], target: ResolvedTarget): ChatMessage[] {
+  if (resolvedTargetSupportsVision(target)) return messages;
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    const imageCount = message.content.filter((part) => part.type === 'image_url').length;
+    const text = textContent(message.content);
+    if (imageCount === 0) return { ...message, content: text };
+    const marker = `[${imageCount} image${imageCount > 1 ? 's' : ''} attached here — not visible to the current model]`;
+    return { ...message, content: text.length > 0 ? `${text}\n\n${marker}` : marker };
+  });
 }
 
 /** Whether the currently active target satisfies `requireVision` (always `true` when vision isn't required). Local llama.cpp models are never vision-capable — see `visionModels.ts`. */
@@ -827,6 +1241,27 @@ function buildFailoverChain(requireVision: boolean): ResolvedTarget[] {
   return chain;
 }
 
+/**
+ * The Privacy Firewall's (ROADMAP.md Phase 5) "switch to local" fallback —
+ * the currently selected Ollama model if one is configured, otherwise its
+ * first cached model. Deliberately never managed llama.cpp: starting that
+ * requires an explicit, already-downloaded model and an `llama_start` call
+ * (see `modelStore.ts::start`) this gate has no basis to make unattended,
+ * the same reasoning `buildFailoverChain`'s doc comment gives for why local
+ * llama.cpp never appears in *that* automatic switch chain either. Returns
+ * `null` when no Ollama model is configured at all, in which case the
+ * caller cancels the turn rather than guessing at a target.
+ */
+function findLocalOnlyTarget(): ResolvedTarget | null {
+  const state = useModelStore.getState();
+  const preferred =
+    state.activeOllamaModel && state.ollamaModels.some((model) => model.name === state.activeOllamaModel)
+      ? state.activeOllamaModel
+      : state.ollamaModels[0]?.name;
+  if (!preferred) return null;
+  return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: preferred };
+}
+
 /** Searches every configured target (cloud providers first, then Ollama) for one that can see images, for the pre-turn vision auto-switch. Returns `null` if nothing qualifies. */
 function findVisionCandidate(): ResolvedTarget | null {
   const chain = buildFailoverChain(true);
@@ -843,13 +1278,18 @@ export interface AttachmentRef {
   path: string;
   isDir: boolean;
   /** Set at pick-time in `ChatWindow.tsx` for image files — its presence (alongside `dataUrl`) is what routes this attachment to the vision content-part path instead of the text-inlining path below. */
-  kind?: 'image';
+  kind?: 'image' | 'inline_text';
   /** The already-base64-encoded `data:` URL for an image attachment, read once at pick-time (see `imageAttachment.ts`) so this module never re-reads the file. */
   dataUrl?: string;
+  /** Bounded, user-approved inline text. Currently used by terminal evidence
+   * so it never needs to masquerade as a readable workspace path. */
+  content?: string;
+  /** Optional chip label for virtual attachments such as terminal evidence. */
+  label?: string;
 }
 
 /** A single resolved image attachment, ready to become a `ChatContentPart`. */
-interface ResolvedImage {
+export interface ResolvedImage {
   path: string;
   dataUrl: string;
 }
@@ -867,16 +1307,30 @@ interface ResolvedImage {
  * surface a notice instead of the failure staying invisible. Resolution
  * failure never fails the turn.
  */
-async function resolveReferences(
+export async function resolveReferences(
   text: string,
   attachments: AttachmentRef[]
 ): Promise<{ textRefs: ResolvedTextReference[]; images: ResolvedImage[]; unresolved: string[] }> {
   const images: ResolvedImage[] = [];
   const textAttachments: AttachmentRef[] = [];
+  const textRefs: ResolvedTextReference[] = [];
+  const inlinePaths = new Set<string>();
 
   for (const attachment of attachments) {
     if (attachment.kind === 'image') {
       if (attachment.dataUrl) images.push({ path: attachment.path, dataUrl: attachment.dataUrl });
+      continue;
+    }
+    if (attachment.kind === 'inline_text') {
+      if (attachment.content && !inlinePaths.has(attachment.path)) {
+        inlinePaths.add(attachment.path);
+        textRefs.push({
+          path: attachment.path,
+          isDir: false,
+          content: attachment.content,
+          source: 'terminal',
+        });
+      }
       continue;
     }
     textAttachments.push(attachment);
@@ -890,7 +1344,6 @@ async function resolveReferences(
     merged.set(attachment.path, attachment.isDir);
   }
 
-  const textRefs: ResolvedTextReference[] = [];
   const unresolved: string[] = [];
 
   for (const [path, isDir] of merged) {
@@ -926,7 +1379,7 @@ async function resolveReferences(
  * references also need expanding, what gets substituted into the *wire*
  * payload — see `runAgentTurn`.
  */
-function toMessageContent(text: string, images: ResolvedImage[]): string | ChatContentPart[] {
+export function toMessageContent(text: string, images: ResolvedImage[]): string | ChatContentPart[] {
   if (images.length === 0) return text;
   const parts: ChatContentPart[] = [{ type: 'text', text }];
   for (const image of images) parts.push({ type: 'image_url', image_url: { url: image.dataUrl } });
@@ -954,6 +1407,23 @@ function toMessageContent(text: string, images: ResolvedImage[]): string | ChatC
  * pane — owns its controller: a pane switch mid-turn must leave the turn
  * stoppable from whichever pane shows its session later. */
 const turnControllers = new Map<string, AbortController>();
+const externallyRequestedCancellations = new Set<string>();
+const cancellationDisposers = new Map<AbortController, Array<() => void>>();
+
+function registerDurableController(runId: string, controller: AbortController): void {
+  const dispose = registerRunCancellation(runId, () => {
+    externallyRequestedCancellations.add(runId);
+    controller.abort();
+  });
+  const existing = cancellationDisposers.get(controller) ?? [];
+  existing.push(dispose);
+  cancellationDisposers.set(controller, existing);
+}
+
+interface DurableTurnContext {
+  recorder: DurableRunRecorder | null;
+  failure: string | null;
+}
 
 /** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
  * buttons call this instead of holding their own AbortController — see
@@ -966,7 +1436,27 @@ export async function runAgentTurn(
   sessionId: string,
   userText: string,
   attachments: AttachmentRef[] = [],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // Caller-supplied turn id, in place of the `crypto.randomUUID()` this
+  // function generates internally by default. The one real consumer is
+  // `recipeRunner.ts`: it needs the id *before* the turn starts so it can
+  // call `permissions.rs`'s `set_permission_mode_for_turn` ahead of time
+  // (and `clear_permission_mode_for_turn` once `done` settles) instead of
+  // flipping the app's single global mode for the run's duration — see
+  // `RecipeRunHandle`'s doc comment. Every other caller omits this and gets
+  // an internally-generated id, unchanged from before.
+  turnIdOverride?: string,
+  skillInvocations: SkillInvocationSnapshot[] = [],
+  // Every skill installed/enabled for this session, not just the ones
+  // `skillInvocations` already explicitly invoked — lets the (opt-in, see
+  // `settingsStore.skillAutoInvokeEnabled`) `skill` tool auto-invoke any of
+  // the rest. Only threaded through to `runTurnGuarded`'s in-process loop —
+  // the daemon path (`runDaemonAgentTurn`) has its own independent
+  // Rust-side tool composition (see `daemonDesktopTurn.ts`'s `tool_profile`)
+  // and isn't part of this feature yet, so it's simply never passed there.
+  // Default `[]` mirrors `skillInvocations`'s own default, so every other
+  // caller (`PlanCard.tsx`, `recipeRunner.ts`) is unaffected.
+  availableSkills: SlashSkill[] = [],
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -976,17 +1466,249 @@ export async function runAgentTurn(
     throw new Error('A turn is already running in this session.');
   }
   const controller = new AbortController();
+  const turnId = turnIdOverride ?? crypto.randomUUID();
   if (signal) {
     if (signal.aborted) controller.abort();
     else signal.addEventListener('abort', () => controller.abort(), { once: true });
   }
   turnControllers.set(sessionId, controller);
+  registerDurableController(turnId, controller);
   useSessionStore.getState().markTurnRunning(sessionId, true);
+  const startedAt = Date.now();
   try {
-    await runTurnGuarded(sessionId, userText, attachments, controller.signal);
+    const route = await daemonDesktopRoute();
+    if (route === 'daemon') {
+      await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
+    } else {
+      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, availableSkills);
+    }
   } finally {
     turnControllers.delete(sessionId);
+    cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
+    cancellationDisposers.delete(controller);
+    externallyRequestedCancellations.delete(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
+    useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
+  }
+}
+
+function daemonProjectionContent(
+  projection: Awaited<ReturnType<typeof watchDaemonDesktopTurn>>,
+): string {
+  if (!projection.terminal) {
+    return projection.output || `⏳ ${projection.status}`;
+  }
+  if (projection.terminalStatus === 'succeeded') {
+    return projection.output || projection.summary || 'Background turn completed.';
+  }
+  if (projection.terminalStatus === 'cancelled') {
+    return projection.output || projection.status || 'Background turn stopped.';
+  }
+  const error = projection.error || projection.status || 'The resident agent did not complete the turn.';
+  return projection.output ? `${projection.output}\n\n[Background run error: ${error}]` : `[Background run error: ${error}]`;
+}
+
+async function attachDaemonTurnToChat(
+  link: ActiveDaemonDesktopTurn,
+  controller: AbortController,
+): Promise<void> {
+  let latestContent = link.output || '⏳ Reconnecting to the resident runner…';
+  let terminal = false;
+  try {
+    const projection = await watchDaemonDesktopTurn(link, controller.signal, {
+      onLinkChanged: saveActiveDaemonTurn,
+      onProjection: (next) => {
+        latestContent = daemonProjectionContent(next);
+        useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
+          content: latestContent,
+        });
+      },
+    });
+    terminal = projection.terminal;
+    latestContent = daemonProjectionContent(projection);
+    useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
+      content: latestContent,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
+      content: link.output
+        ? `${link.output}\n\n[Lost connection to resident run: ${message}]`
+        : `[Lost connection to resident run: ${message}]`,
+    });
+    // Keep the link: a later app start can replay all durable events after
+    // the last committed sequence instead of treating a transient IPC/SQLite
+    // failure as terminal.
+    throw error;
+  } finally {
+    // Only terminal runs are removed by the successful path. A stopped UI
+    // controller can return before the daemon commits Cancelled, so preserve
+    // its link for startup recovery in that case.
+    if (terminal) removeActiveDaemonTurn(link.runId);
+  }
+}
+
+async function runDaemonAgentTurn(
+  sessionId: string,
+  userText: string,
+  attachments: AttachmentRef[],
+  signal: AbortSignal,
+  turnId: string,
+  skillInvocations: SkillInvocationSnapshot[],
+): Promise<void> {
+  const store = useSessionStore.getState();
+  const priorMessages = sessionMessages(sessionId);
+  const anchorIndex = priorMessages.length;
+  store.addMessage(sessionId, { role: 'user', content: userText });
+
+  const { textRefs, images, unresolved } = await resolveReferences(userText, attachments);
+  if (images.length > 0) {
+    store.updateMessageAt(sessionId, anchorIndex, { content: toMessageContent(userText, images) });
+  }
+  if (signal.aborted) throw new DOMException('Turn cancelled', 'AbortError');
+
+  const settings = useSettingsStore.getState();
+  if (!activeTargetSatisfiesVision(images.length > 0) && settings.autoVisionSwitchEnabled) {
+    const candidate = findVisionCandidate();
+    if (candidate) applyTargetSwitch(candidate);
+  }
+  const resolvedTarget = await resolveTarget();
+  const targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
+  if (!targetSnapshot) {
+    throw new Error('The selected model target could not be frozen for the resident runner.');
+  }
+
+  await useRulesStore.getState().refresh();
+  const session = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
+  const attachedStackIds = session?.attachedStackIds ?? [];
+  const attachedStacks = attachedStackIds.length > 0
+    ? useStackStore.getState().stacks.filter((stack) => attachedStackIds.includes(stack.id))
+    : [];
+  const attachedStacksForPrompt = attachedStackPromptInfo(attachedStacks);
+  const docChatMode = session?.docChatMode ?? false;
+  let sourcesNotice: string | null = null;
+  if (docChatMode && attachedStackIds.length > 0) {
+    try {
+      const hits = await invoke<StackQueryResult[]>('stacks_query', {
+        stackIds: attachedStackIds,
+        query: userText,
+      });
+      if (hits.length > 0) {
+        sourcesNotice = formatSourcesNotice({
+          results: hits.map((hit) => ({
+            path: hit.source_path,
+            stack: hit.stack_name,
+            score: hit.score,
+            snippet: hit.text,
+          })),
+        });
+      }
+    } catch {
+      // Same best-effort semantics as the local turn path.
+    }
+  }
+
+  const composedText = composeReferencedText(userText, textRefs);
+  const wireCurrent: ChatMessage = {
+    role: 'user',
+    content: toMessageContent(composedText, images),
+  };
+  const history: ChatMessage[] = [
+    ...priorMessages,
+    ...(sourcesNotice ? [{ role: 'system' as const, content: sourcesNotice }] : []),
+    wireCurrent,
+  ];
+  const targetHistory = stripImagesForTextOnlyTarget(history, resolvedTarget);
+  const frozenAttachments: FrozenAttachmentInput[] = [
+    ...textRefs.map((reference) => ({
+      path: reference.path,
+      kind: reference.isDir ? 'directory' as const : 'file' as const,
+      mediaType: 'text/plain; charset=utf-8',
+      content: reference.content,
+    })),
+    ...images.map((image) => ({
+      path: image.path,
+      kind: 'image' as const,
+      mediaType: image.dataUrl.slice(5, image.dataUrl.indexOf(';')) || 'application/octet-stream',
+      content: image.dataUrl,
+    })),
+  ];
+  const mode = usePermissionStore.getState().mode;
+  const recipe = await buildDaemonDesktopRecipe({
+    sessionId,
+    turnId,
+    userText,
+    systemPrompt: composeSkillSystemPrompt(
+      currentSystemPrompt(session?.personaId ?? null, attachedStacksForPrompt, docChatMode),
+      skillInvocations,
+    ),
+    history: targetHistory,
+    resolvedTarget,
+    targetSnapshot,
+    roots: useWorkspaceStore.getState().roots,
+    permissionMode: mode,
+    allowNetwork: settings.webToolsEnabled,
+    memoryEnabled: settings.memoryEnabled,
+    verifyEnabled: settings.verifyEnabled,
+    verifyMaxRounds: settings.verifyMaxRounds,
+    subagentsEnabled: settings.subagentsEnabled,
+    effort: effortForTarget(resolvedTarget) ?? null,
+    mcpServers: useMcpStore.getState().servers,
+    attachedStackIds,
+    attachedStackNames: attachedStacks.map((stack) => stack.name),
+    attachments: frozenAttachments,
+  });
+  const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  if (signal.aborted) {
+    await import('./daemonClient').then(({ daemonCancel }) => daemonCancel(queued.run_id, 'Stopped before attach'));
+  }
+
+  if (unresolved.length > 0) {
+    store.addMessage(sessionId, {
+      role: 'system',
+      content: `${MENTION_NOTE_PREFIX} Couldn't read ${unresolved.map((path) => `@${path}`).join(', ')} — the resident snapshot contains only successfully resolved attachments.`,
+    });
+  }
+  if (sourcesNotice) store.addMessage(sessionId, { role: 'system', content: sourcesNotice });
+  const assistantIndex = sessionMessages(sessionId).length;
+  store.addMessage(sessionId, { role: 'assistant', content: '⏳ Queued in the resident runner…' });
+  const link: ActiveDaemonDesktopTurn = {
+    sessionId,
+    turnId,
+    runId: queued.run_id,
+    assistantIndex,
+    lastSequence: 0,
+    output: '',
+  };
+  saveActiveDaemonTurn(link);
+  const controller = turnControllers.get(sessionId);
+  if (!controller) throw new Error('Desktop turn controller disappeared before daemon attach.');
+  registerDurableController(queued.run_id, controller);
+  await attachDaemonTurnToChat(link, controller);
+  maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
+}
+
+/** Reattaches chat placeholders to nonterminal daemon runs after an app or
+ * WebView restart. The durable event sequence is replayed from the exact
+ * last committed sequence stored with each link. */
+export function recoverDaemonDesktopTurns(): void {
+  for (const link of loadActiveDaemonTurns()) {
+    if (turnControllers.has(link.sessionId)) continue;
+    if (!useSessionStore.getState().sessions.some((session) => session.id === link.sessionId)) {
+      removeActiveDaemonTurn(link.runId);
+      continue;
+    }
+    const controller = new AbortController();
+    turnControllers.set(link.sessionId, controller);
+    useSessionStore.getState().markTurnRunning(link.sessionId, true);
+    registerDurableController(link.runId, controller);
+    void attachDaemonTurnToChat(link, controller).finally(() => {
+      turnControllers.delete(link.sessionId);
+      cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
+      cancellationDisposers.delete(controller);
+      externallyRequestedCancellations.delete(link.runId);
+      useSessionStore.getState().markTurnRunning(link.sessionId, false);
+    });
   }
 }
 
@@ -1030,7 +1752,10 @@ async function runTurnGuarded(
   sessionId: string,
   userText: string,
   attachments: AttachmentRef[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  turnId: string,
+  skillInvocations: SkillInvocationSnapshot[],
+  availableSkills: SlashSkill[] = [],
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -1059,15 +1784,35 @@ async function runTurnGuarded(
     label: userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS),
     maxKeep: useSettingsStore.getState().checkpointRetention,
   }).catch(() => null);
-  // Distinct from checkpointId (which can be null): scopes shell
-  // cancellation and permission prompts to this turn on the Rust side.
-  const turnId = crypto.randomUUID();
+  // Distinct from checkpointId (which can be null): scopes shell,
+  // cancellation, permission prompts, and durable run events to this turn.
+  const durable: DurableTurnContext = { recorder: null, failure: null };
+  let thrown: unknown = null;
   try {
-    await runAgentTurnBody(sessionId, userText, attachments, checkpointId, turnId, signal);
+    await runAgentTurnBody(
+      sessionId,
+      userText,
+      attachments,
+      checkpointId,
+      turnId,
+      durable,
+      signal,
+      skillInvocations,
+      availableSkills,
+    );
     maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
+  } catch (error) {
+    thrown = error;
+    throw error;
   } finally {
     if (checkpointId !== null) {
       const summary = await invoke<CheckpointNotice>('checkpoint_end', { id: checkpointId }).catch(() => null);
+      if (summary) {
+        durable.recorder?.recordCheckpoint(
+          summary.id,
+          summary.label ?? (userText.slice(0, CHECKPOINT_LABEL_MAX_CHARS) || 'Workspace checkpoint'),
+        );
+      }
       if (summary && summary.files.length > 0) {
         useSessionStore.getState().addMessage(sessionId, {
           role: 'system',
@@ -1086,6 +1831,21 @@ async function runTurnGuarded(
       // and forget: a panel that isn't open just gets a fresher cache.
       void useCheckpointStore.getState().refresh(sessionId);
     }
+    if (durable.recorder) {
+      if (signal.aborted && !externallyRequestedCancellations.delete(durable.recorder.runId)) {
+        await requestRunCancellation(durable.recorder.runId, 'Stopped from chat').catch((error) =>
+          console.error('Failed to record cancellation request', error),
+        );
+      }
+      const terminal = signal.aborted
+        ? durable.recorder.cancel('Stopped by the user')
+        : thrown !== null
+          ? durable.recorder.fail(thrown)
+          : durable.failure !== null
+            ? durable.recorder.fail(new Error(durable.failure), true)
+            : durable.recorder.complete('Desktop turn completed');
+      await terminal.catch((error) => console.error('Failed to finalize durable run', error));
+    }
   }
 }
 
@@ -1098,7 +1858,10 @@ async function runAgentTurnBody(
   attachments: AttachmentRef[],
   checkpointId: string | null,
   turnId: string,
-  signal?: AbortSignal
+  durable: DurableTurnContext,
+  signal?: AbortSignal,
+  skillInvocations: SkillInvocationSnapshot[] = [],
+  availableSkills: SlashSkill[] = [],
 ): Promise<void> {
   // Every transcript mutation this turn makes is pinned to the session the
   // turn was submitted from — the user may be running another turn in the
@@ -1138,7 +1901,7 @@ async function runAgentTurnBody(
   }
 
   const composedText = composeReferencedText(userText, textRefs);
-  const wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
+  let wireContent = textRefs.length > 0 ? toMessageContent(composedText, images) : null;
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
@@ -1169,7 +1932,77 @@ async function runAgentTurnBody(
   // once per turn and only advanced (never rebuilt) on a pre-first-token
   // failure, so a target that succeeds stays in use for every subsequent
   // tool round trip within this same turn.
-  const primaryTarget = await resolveTarget();
+  let primaryTarget = await resolveTarget();
+
+  // Distinct from the block above: that one is about a NEW image attached
+  // THIS turn; this one is an OLDER image already sitting in history from a
+  // previous turn, now that the resolved target can't see it (e.g. the user
+  // switched to a text-only model since). Deliberately not auto-switched —
+  // unlike the new-attachment case, silently jumping back to a vision model
+  // on every later turn would undo the user's own model choice — so this
+  // just surfaces a notice and leaves the decision to them.
+  // `stripImagesForTextOnlyTarget` (used below, per-target) does the actual
+  // stripping so the request itself doesn't fail either way.
+  if (!requireVision && !resolvedTargetSupportsVision(primaryTarget) && storedMessages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'))) {
+    addMessage({
+      role: 'system',
+      content: `${SWITCH_NOTE_PREFIX} This conversation has an earlier image that ${targetLabel(primaryTarget)} can't see — this reply won't see it either. Switch to a vision-capable model if you need it referenced.`,
+    });
+  }
+
+  // Privacy Firewall (ROADMAP.md Phase 5): a visible data boundary before
+  // this turn's content — `composedText`, i.e. the typed message plus every
+  // "@"-mention/attachment it expanded into above, so a secret hiding in a
+  // referenced FILE is caught exactly like one typed directly — leaves the
+  // machine for a CLOUD model. Local llama.cpp and Ollama targets never
+  // leave the machine, so the gate is skipped entirely for those. Run after
+  // the vision-switch checks above so their notices describe the model the
+  // user actually picked, not one this gate might still redirect away from.
+  //
+  // OUT OF SCOPE this pass (see `privacy_firewall.rs`'s own module doc):
+  // every other outbound path — connector writes, MCP tool results, a
+  // paired device (Phase 4, unshipped) — is not gated here. The scanner and
+  // policy engine are destination-agnostic specifically so those call sites
+  // are additive later, not a redesign of this one.
+  if (primaryTarget.kind === 'provider') {
+    const workspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
+    const gate = await usePrivacyFirewallStore
+      .getState()
+      .gateOutbound(composedText, 'cloud_model', workspaceId);
+
+    if (gate.action === 'cancelled') {
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} This turn was blocked from being sent to ${targetLabel(primaryTarget)} and was cancelled.`,
+      });
+      return;
+    }
+
+    if (gate.action === 'switch_local') {
+      const local = findLocalOnlyTarget();
+      if (!local) {
+        addMessage({
+          role: 'system',
+          content: `${PRIVACY_NOTE_PREFIX} This turn was blocked from being sent to ${targetLabel(primaryTarget)}, and no local-only model is configured to switch to — the turn was cancelled. Configure an Ollama model to enable the local-only fallback.`,
+        });
+        return;
+      }
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Switched to ${targetLabel(local)} — this turn's content was blocked from leaving the machine.`,
+      });
+      primaryTarget = local;
+      applyTargetSwitch(local);
+    } else if (gate.content !== composedText) {
+      const redactedCount = gate.report.findings.filter((finding) => finding.action !== 'allow').length;
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
+      });
+      wireContent = toMessageContent(gate.content, images);
+    }
+  }
+
   const sequence: ResolvedTarget[] =
     settings.autoFailoverEnabled && primaryTarget.kind === 'provider'
       ? [primaryTarget, ...buildFailoverChain(requireVision).filter((c) => !(c.kind === 'provider' && c.providerId === primaryTarget.providerId && c.model === primaryTarget.model))]
@@ -1177,15 +2010,43 @@ async function runAgentTurnBody(
   let sequenceIndex = 0;
   let target = sequence[0];
 
-  const effort = useModelStore.getState().effort;
+  // Per-model, so it must track the target: re-resolved below whenever a
+  // failover switch changes `target` mid-turn.
+  let effort = effortForTarget(primaryTarget);
 
-  // Read once per turn, like `effort` above — not re-derived on every
+  // Read once per turn — not re-derived on every
   // tool-calling round trip, so a mode switch mid-turn (possible via the
   // split pane's shared global mode, or the user clicking Approve on a plan
   // card mid-turn) never changes what's offered partway through this turn's
   // own tool-calling loop. See `toolsForMode`'s doc comment for why
   // `present_plan` is gated on this snapshot.
   const mode = usePermissionStore.getState().mode;
+
+  const startDurableRecorder = async (
+    resolvedTarget: ResolvedTarget,
+    runId: string,
+  ): Promise<DurableRunRecorder | null> => {
+    const targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
+    if (!targetSnapshot) return null;
+    return beginDurableRun({
+      runId,
+      kind: 'interactive',
+      task: userText,
+      instructions: `Session ${sessionId}`,
+      target: targetSnapshot,
+      roots: useWorkspaceStore.getState().roots,
+      permissionMode: mode,
+      allowNetwork: settings.webToolsEnabled,
+      allowExternalMutations: mode !== 'plan',
+    });
+  };
+  // Durable recording is additive during the engine migration. A profile
+  // opened by an older host still runs normally; the protocol-version probe
+  // inside `beginDurableRun` returns null in that case.
+  durable.recorder = await startDurableRecorder(primaryTarget, turnId).catch((error) => {
+    console.error('Failed to start durable run', error);
+    return null;
+  });
 
   // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
   // newly remembered facts) before building the system prompt below — two
@@ -1202,10 +2063,80 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
-  const toolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...TOOLS, ...mcpDefs], mode),
+
+  // This session's attached knowledge stacks (see `ChatSession.attachedStackIds`,
+  // `StackPicker.tsx`), resolved against the current stack registry once per
+  // turn — same "computed once, not re-derived every round trip" stance as
+  // `mode`/`mcpDefs` above. Empty for the overwhelming majority of turns (no
+  // stacks attached), in which case `buildTools` returns the base list
+  // unchanged and the system prompt gets no stacks guidance line.
+  const attachedStackIds = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.attachedStackIds ?? [];
+  const attachedStacks =
+    attachedStackIds.length > 0
+      ? useStackStore.getState().stacks.filter((stack) => attachedStackIds.includes(stack.id))
+      : [];
+  const attachedStackNames = attachedStacks.map((stack) => stack.name);
+  const attachedStacksForPrompt = attachedStackPromptInfo(attachedStacks);
+
+  // This session's doc-chat toggle (see `ChatSession.docChatMode`,
+  // `StackPicker.tsx`) — read once per turn, same stance as `attachedStackIds`
+  // just above. Used both for the auto-retrieval block right below and for
+  // every iteration's system prompt (see `currentSystemPrompt`'s call inside
+  // the loop), so a toggle flipped mid-turn never changes behavior partway
+  // through this turn's own tool-calling loop.
+  const docChatMode = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.docChatMode ?? false;
+
+  // Doc-chat mode (RAG design doc slice 3): auto-retrieve the top-k passages
+  // for this turn's own message BEFORE the first model call below, so the
+  // model never has to remember to call `search_docs` itself. Gated on at
+  // least one attached stack — with none, there's nothing to search, and
+  // `stacks_query` would just error. The notice is appended via `addMessage`
+  // exactly like every other synthetic notice in this module (see
+  // `SOURCES_NOTE_PREFIX`'s doc comment for why this alone is enough to make
+  // it show up in every subsequent iteration's wire payload AND count toward
+  // `contextTrimmer.ts`'s token estimate). Retrieval failure — a stack mid-
+  // reindex, the embed server down, a corrupt index — must never block the
+  // turn, so it's swallowed silently: the model just proceeds without
+  // sources for this turn, same as an unattached session always has.
+  if (docChatMode && attachedStackIds.length > 0 && !signal?.aborted) {
+    try {
+      const hits = await invoke<StackQueryResult[]>('stacks_query', { stackIds: attachedStackIds, query: userText });
+      if (hits.length > 0) {
+        addMessage({
+          role: 'system',
+          content: formatSourcesNotice({
+            results: hits.map((hit) => ({ path: hit.source_path, stack: hit.stack_name, score: hit.score, snippet: hit.text })),
+          }),
+        });
+      }
+    } catch {
+      // See doc comment above — retrieval failure must never block the turn.
+    }
+  }
+
+  // Every command already invoked this turn — explicit `/command`
+  // invocations are already known before the loop starts; a model-invoked
+  // `skill` tool call (see `turnEngine.ts`'s `SkillToolContext`) mutates this
+  // SAME `Set` in place as the turn progresses, so both the catalog
+  // (`composeSkillCatalog`, below) and the `allowed-tools` restriction
+  // (`toolsOfferedThisIteration`, inside the loop) see later model-invoked
+  // skills too, not just the ones known up front.
+  const invokedSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command));
+  const skillToolContext: SkillToolContext = {
+    availableSkills,
+    invokedCommands: invokedSkillCommands,
+    maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+  };
+  const skillToolEnabled =
+    settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
+  const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
+  const baseToolsForTurn: ToolDef[] = toolsForSettings(
+    toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
-    settings.webToolsEnabled
+    settings.webToolsEnabled,
+    settings.subagentsEnabled,
+    skillToolEnabled,
+    readSkillResourceToolEnabled,
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -1217,7 +2148,18 @@ async function runAgentTurnBody(
       },
       { role: 'user', content: renderForSummary(dropped) },
     ];
-    const result = await attemptStream(target, summaryMessages, [], signal, effort, sessionId);
+    const result = await attemptStream(
+      target,
+      summaryMessages,
+      [],
+      signal,
+      effort,
+      sessionId,
+      undefined,
+      true,
+      undefined,
+      durable.recorder?.runId,
+    );
     if (result.streamError) throw new Error(result.streamError);
     return result.content.trim() || '(summary unavailable)';
   };
@@ -1244,7 +2186,19 @@ async function runAgentTurnBody(
         toolName,
         toolArgs,
         workspaceRootPath,
-        (judgeMessages, judgeSignal) => attemptStream(target, judgeMessages, [], judgeSignal, effort, sessionId),
+        (judgeMessages, judgeSignal) =>
+          attemptStream(
+            target,
+            judgeMessages,
+            [],
+            judgeSignal,
+            effort,
+            sessionId,
+            undefined,
+            true,
+            undefined,
+            durable.recorder?.runId,
+          ),
         signal
       ),
   };
@@ -1300,7 +2254,29 @@ async function runAgentTurnBody(
     // very next round trip, and a dangling id just resolves to no persona —
     // see `resolvePersona`).
     const personaId = useSessionStore.getState().sessions.find((s) => s.id === sessionId)?.personaId ?? null;
-    const systemMessage: ChatMessage = { role: 'system', content: currentSystemPrompt(personaId) };
+    // Recomputed every iteration (not just once before the loop, same
+    // "rebuilt every round trip" stance as `systemMessage` below): a
+    // model-invoked `skill` tool call in an EARLIER iteration of this same
+    // turn may have added to `invokedSkillCommands`, which can newly trigger
+    // (or, if that skill declared no `allowedTools`, newly LIFT) an
+    // `allowed-tools` restriction for this next round trip — see
+    // `allowedToolsRestriction`'s doc comment.
+    const toolsForTurn = applyAllowedToolsRestriction(
+      baseToolsForTurn,
+      allowedToolsRestriction(invokedSkillCommands, availableSkills),
+    );
+    const systemMessage: ChatMessage = {
+      role: 'system',
+      content: [
+        composeSkillSystemPrompt(
+          currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
+          skillInvocations,
+        ),
+        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+    };
 
     // Build the wire payload for this request: the system prompt first, then
     // `history` — identical to the stored transcript unless this turn's user
@@ -1309,17 +2285,71 @@ async function runAgentTurnBody(
     // itself (and what's stored/rendered) is left untouched. No substitution
     // is needed when there were no text references (`wireContent === null`):
     // `storedUserMessage` already carries any images directly.
-    const wireHistory: ChatMessage[] = [
+    const fullWireHistory: ChatMessage[] = [
       systemMessage,
       ...(wireContent !== null
         ? history.map((message) => (message === storedUserMessage ? { ...message, content: wireContent } : message))
         : history),
-    ];
+    ]
+      // `/btw` side-question exchanges are display-only: stored in the
+      // transcript but never part of the conversation a model sees.
+      .filter((message) => !isBtwNotice(message))
+      .map(hardenSourcesNoticeForModel);
+    // Strips any image content left over from earlier turns when `target`
+    // can't see images — see `stripImagesForTextOnlyTarget`'s doc comment.
+    const wireHistoryFor = (t: ResolvedTarget): ChatMessage[] => stripImagesForTextOnlyTarget(fullWireHistory, t);
 
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
-    let attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+    let attempt = await attemptStream(
+      target,
+      wireHistoryFor(target),
+      toolsForTurn,
+      signal,
+      effort,
+      sessionId,
+      (content) => updateLastMessage({ content }),
+      true,
+      undefined,
+      durable.recorder?.runId,
+    );
+
+    // Some cloud routes (notably free-tier OpenRouter models) reject a
+    // request outright just because tools were offered, even when the model
+    // never intended to call one this turn. Retry the SAME target once with
+    // no tools instead of treating it as a dead target — switching providers
+    // or surfacing a raw error would be wrong when the model is otherwise
+    // fine for a plain-text reply. Only tool_calls can be lost this way
+    // (`toolsForTurn` empty on retry means the model literally cannot emit
+    // one), so the outer round-trip loop just sees a normal plain answer.
+    if (attempt.streamError !== null && !attempt.contentStarted && toolsForTurn.length > 0 && TOOL_UNSUPPORTED_ERROR_PATTERN.test(attempt.streamError)) {
+      durable.recorder?.recordStatus(
+        `status-${turnId}-${iteration}-tools`,
+        `Target rejected tool calling; retrying without tools: ${attempt.streamError}`,
+      );
+      if (attempt.usage) {
+        durable.recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+      }
+      removeLastMessage();
+      addMessage({
+        role: 'system',
+        content: `${SWITCH_NOTE_PREFIX} ${targetLabel(target)} doesn't support tool calling — retrying this turn without tools.`,
+      });
+      addMessage({ role: 'assistant', content: '' });
+      attempt = await attemptStream(
+        target,
+        wireHistoryFor(target),
+        [],
+        signal,
+        effort,
+        sessionId,
+        (content) => updateLastMessage({ content }),
+        true,
+        undefined,
+        durable.recorder?.runId,
+      );
+    }
 
     // Failover: only ever retry a *different* target when nothing streamed
     // back yet for this attempt — once tokens have started arriving, a
@@ -1329,8 +2359,26 @@ async function runAgentTurnBody(
     // `updateLastMessage` below keeps targeting the placeholder rather than
     // clobbering the notice that was just inserted after it.
     while (attempt.streamError !== null && !attempt.contentStarted && sequenceIndex + 1 < sequence.length) {
+      if (attempt.usage) {
+        durable.recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+      }
+      await durable.recorder
+        ?.fail(new Error(`Target failed before output: ${attempt.streamError}`), true)
+        .catch((error) => console.error('Failed to close failed-over durable run', error));
       sequenceIndex += 1;
       target = sequence[sequenceIndex];
+      effort = effortForTarget(target);
+      durable.recorder = await startDurableRecorder(
+        target,
+        `${turnId}-failover-${sequenceIndex}`,
+      ).catch((error) => {
+        console.error('Failed to start failover durable run', error);
+        return null;
+      });
+      if (durable.recorder) {
+        const controller = turnControllers.get(sessionId);
+        if (controller) registerDurableController(durable.recorder.runId, controller);
+      }
       applyTargetSwitch(target);
       removeLastMessage();
       addMessage({
@@ -1338,12 +2386,29 @@ async function runAgentTurnBody(
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
       addMessage({ role: 'assistant', content: '' });
-      attempt = await attemptStream(target, wireHistory, toolsForTurn, signal, effort, sessionId, (content) => updateLastMessage({ content }));
+      attempt = await attemptStream(
+        target,
+        wireHistoryFor(target),
+        toolsForTurn,
+        signal,
+        effort,
+        sessionId,
+        (content) => updateLastMessage({ content }),
+        true,
+        undefined,
+        durable.recorder?.runId,
+      );
     }
 
     const { content, toolCalls, streamError } = attempt;
+    const messageId = `message-${turnId}-${iteration}`;
+    durable.recorder?.recordModelOutput(messageId, content);
+    if (attempt.usage) {
+      durable.recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+    }
 
     if (streamError !== null) {
+      durable.failure = streamError;
       updateLastMessage({
         content: content.length > 0 ? `${content}\n\n[Error: ${streamError}]` : `[Error: ${streamError}]`,
       });
@@ -1363,7 +2428,18 @@ async function runAgentTurnBody(
       // hasn't hit Stop) before returning — see `runVerificationPhase`'s doc
       // comment for exactly what gates this.
       if (!signal?.aborted && mutatedFiles.size > 0) {
+        const verificationStartedAt = Date.now();
         const failure = await runVerificationPhase(sessionId, turnId, addMessage, signal);
+        if (settings.verifyEnabled && !signal?.aborted) {
+          durable.recorder?.recordVerification(
+            failure?.label ?? 'Workspace verification',
+            failure === null,
+            failure === null
+              ? 'Configured verification completed without a reported failure.'
+              : `Exit ${failure.code ?? 'timeout'}: ${failure.output}`,
+            Date.now() - verificationStartedAt,
+          );
+        }
         // A command failed and there's a feed-back round left to spend —
         // append one fix instruction and send the loop around again instead
         // of returning. `mutatedFiles` is cleared so only edits made in
@@ -1388,7 +2464,28 @@ async function runAgentTurnBody(
     // before executing them and feeding results back.
     updateLastMessage({ content, tool_calls: toolCalls });
 
-    for (const toolCall of toolCalls) {
+    // Executes every call in this round — `task` calls run concurrently
+    // (bounded by `settings.maxConcurrentSubagents`), everything else stays
+    // sequential — see `runToolCallsForRound`'s own doc comment for why, and
+    // for the order-preservation guarantee the rest of this loop depends on.
+    const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
+      const toolStartedAt = Date.now();
+      const recorder = durable.recorder;
+      await recorder?.recordToolProposed(
+        toolCall.id,
+        toolCall.function.name,
+        toolCall.function.arguments ?? '{}',
+      );
+      recorder?.recordToolStarted(toolCall.id);
+      const finishObservedTool = async (result: string): Promise<string> => {
+        await recorder?.recordToolFinished(
+          toolCall.id,
+          result,
+          Date.now() - toolStartedAt,
+          result === CANCELLED_TOOL_RESULT || signal?.aborted === true,
+        );
+        return result;
+      };
       // Reject (without executing) any call whose name wasn't actually
       // offered to the model this turn — e.g. `remember` after
       // `memoryEnabled` was turned off, or any other tool a local/quantized
@@ -1398,25 +2495,65 @@ async function runAgentTurnBody(
       // polite suggestion the model can ignore. Still gets a result message,
       // same invariant as the cancelled-call path below.
       if (!isToolCallAllowed(toolCall, toolsForTurn)) {
-        addMessage({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
-        });
-        continue;
+        return finishObservedTool(
+          stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
+        );
       }
 
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
       // (several providers reject such a history on the next turn).
-      const resultContent = signal?.aborted
-        ? CANCELLED_TOOL_RESULT
-        : await executeToolCall(toolCall, checkpointId, turnId, mcpRegistry, signal, riskAnnotation);
+      // Built fresh per call (not hoisted once before the loop) so a `task`
+      // call always sees the CURRENT `target` — a failover switch earlier in
+      // this same iteration (or, in principle, an auto-vision switch on the
+      // next one) must never leave a subagent resolving a target the parent
+      // has since moved off of. See `SubagentContext`'s doc comment in
+      // `turnEngine.ts`.
+      if (signal?.aborted) return finishObservedTool(CANCELLED_TOOL_RESULT);
+      // `risk`/`onMutatedPath` thread THIS turn's own risk-annotation context
+      // and mutated-file tracking down into a `code`-profile child's own
+      // write_file/edit_file/run_shell calls — without these, a subagent's
+      // mutations would silently skip risk classification (even when the
+      // parent turn has it enabled) and never trip `runVerificationPhase`
+      // (since `mutatedFiles` below is otherwise only ever populated from
+      // this round's own top-level `toolCalls`, which for a `task` call is
+      // just the single `task` entry, never the child's nested writes).
+      const subagentContext: SubagentContext = {
+        sessionId,
+        runId: durable.recorder?.runId,
+        target,
+        effort,
+        risk: riskAnnotation,
+        onMutatedPath: (path) => mutatedFiles.add(path),
+      };
+      const result = await executeToolCall(
+        toolCall,
+        checkpointId,
+        durable.recorder?.runId ?? turnId,
+        mcpRegistry,
+        signal,
+        riskAnnotation,
+        attachedStackNames,
+        subagentContext,
+        undefined,
+        skillToolContext,
+      );
+      return finishObservedTool(result);
+    });
+
+    for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex++) {
+      const toolCall = toolCalls[toolCallIndex];
+      const resultContent = results[toolCallIndex];
+      const modelResultContent = protectToolResult(
+        toolCall.function.name,
+        resultContent,
+        mcpRegistry.has(toolCall.function.name),
+      );
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
-        content: resultContent,
+        content: modelResultContent,
       };
       addMessage(toolMessage);
 
@@ -1480,6 +2617,7 @@ async function runAgentTurnBody(
   // Safety cap reached: the model kept requesting tools without ever
   // settling on a final answer. Surface this clearly instead of looping
   // forever or silently truncating.
+  durable.failure = `Reached the safety limit of ${MAX_ITERATIONS} tool-calling iterations.`;
   addMessage({
     role: 'assistant',
     content: `Stopped after reaching the safety limit of ${MAX_ITERATIONS} tool-calling iterations without a final answer.`,

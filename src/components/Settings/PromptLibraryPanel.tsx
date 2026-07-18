@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Download, Pencil, Plus, Star, Trash2, Upload } from "lucide-react";
+import { Download, Pencil, Plus, RotateCcw, ShieldAlert, Star, Trash2, Upload, X } from "lucide-react";
 import { Button } from "../ui";
 import {
   findByCommand,
@@ -12,9 +12,13 @@ import {
   type PromptKind,
 } from "../../store/promptStore";
 import { useT } from "../../lib/i18n";
+import { BUILT_IN_SLASH_COMMANDS } from "../../lib/slashCommands";
+import { useSkillProposalStore } from "../../store/skillProposalStore";
+import { NativeSkillsManager } from "./NativeSkillsManager";
 
 /** Same slash-trigger slug shape the design doc pins for `PromptEntry.command`. */
 const COMMAND_PATTERN = /^[a-z0-9-]{1,32}$/;
+const RESERVED_COMMANDS = new Set<string>(BUILT_IN_SLASH_COMMANDS.map((entry) => entry.command));
 
 /** `@tauri-apps/plugin-dialog` file-type filter shared by the Import/Export
  * pickers — the library only ever round-trips JSON. */
@@ -55,10 +59,10 @@ const EMPTY_DRAFT: DraftState = {
  * Settings "Prompts" tab: the saved persona/snippet list (kind badge, name,
  * `/command`, first-line preview, edit/delete) plus an inline create/edit
  * form — modeled on `McpPanel.tsx`/`AddMcpServerForm.tsx`'s shape. Personas
- * aren't applied to the conversation yet (that lands with the agent-loop
- * wiring in a later slice); this tab only manages the library and the kind
- * radio, and snippets are immediately usable via the "/"-command popup in
- * the chat input (see `SlashCommandAutocomplete.tsx`).
+ * selected via `PersonaSelector` flow into the system prompt per-turn (see
+ * `agentLoop.ts`); this tab manages the library and the kind radio, and
+ * snippets are immediately usable via the "/"-command popup in the chat
+ * input (see `SlashCommandAutocomplete.tsx`).
  */
 export function PromptLibraryPanel() {
   const { t } = useT();
@@ -70,6 +74,10 @@ export function PromptLibraryPanel() {
   const exportPayload = usePromptStore((s) => s.exportPayload);
   const defaultPersonaId = usePromptStore((s) => s.defaultPersonaId);
   const setDefaultPersona = usePromptStore((s) => s.setDefaultPersona);
+  const proposals = useSkillProposalStore((s) => s.proposals);
+  const approveProposal = useSkillProposalStore((s) => s.approveProposal);
+  const rejectProposal = useSkillProposalStore((s) => s.rejectProposal);
+  const rollbackProposal = useSkillProposalStore((s) => s.rollbackProposal);
 
   const [draft, setDraft] = useState<DraftState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -81,12 +89,15 @@ export function PromptLibraryPanel() {
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [importedCount, setImportedCount] = useState<number | null>(null);
+  const [proposalBusy, setProposalBusy] = useState<string | null>(null);
+  const [proposalError, setProposalError] = useState<string | null>(null);
 
   const commandError = useMemo(() => {
     if (!draft) return null;
     const command = draft.command.trim();
     if (command.length === 0) return t("PromptLibraryPanel.commandRequiredError");
     if (!COMMAND_PATTERN.test(command)) return t("PromptLibraryPanel.commandFormatError");
+    if (RESERVED_COMMANDS.has(command)) return `/${command} is reserved by a built-in command.`;
     const collision = findByCommand(entries, command);
     if (collision && collision.id !== draft.id) return t("PromptLibraryPanel.commandTakenError");
     return null;
@@ -203,8 +214,10 @@ export function PromptLibraryPanel() {
   }
 
   return (
-    <div className="flex flex-col gap-3 p-2">
+    <div className="flex flex-col gap-3 py-2">
       <p className="text-xs text-muted">{t("PromptLibraryPanel.description")}</p>
+
+      <NativeSkillsManager />
 
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="secondary" size="sm" onClick={() => void handleExport()} disabled={exportBusy || entries.length === 0}>
@@ -238,6 +251,76 @@ export function PromptLibraryPanel() {
         </div>
       )}
 
+      {proposals.length > 0 && (
+        <section className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3">
+          <div>
+            <h3 className="text-sm font-medium text-foreground">Learned skill proposals</h3>
+            <p className="text-xs text-faint">
+              /learn drafts stay quarantined until you inspect the exact instructions and approve their SHA-256 digest.
+            </p>
+          </div>
+          {proposalError && <p className="text-xs text-danger">{proposalError}</p>}
+          {proposals.map((proposal) => (
+            <div key={proposal.id} className="rounded-md border border-border bg-background p-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-xs text-foreground">/{proposal.command}</span>
+                <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase ${
+                  proposal.status === "quarantined"
+                    ? "bg-warning-soft text-warning"
+                    : proposal.status === "applied"
+                      ? "bg-success-soft text-success"
+                      : "bg-surface-2 text-faint"
+                }`}>{proposal.status.replace("_", " ")}</span>
+                <span className="ml-auto font-mono text-[10px] text-faint" title={proposal.contentSha256}>
+                  sha256:{proposal.contentSha256.slice(0, 12)}…
+                </span>
+              </div>
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-sans text-xs text-muted">
+                {proposal.instructions}
+              </pre>
+              {proposal.riskFlags.length > 0 && (
+                <div className="mt-2 flex items-start gap-1.5 text-xs text-warning">
+                  <ShieldAlert size={13} className="mt-0.5 shrink-0" />
+                  <span>{proposal.riskFlags.join("; ")}</span>
+                </div>
+              )}
+              <div className="mt-2 flex justify-end gap-1.5">
+                {proposal.status === "quarantined" && (
+                  <>
+                    <Button variant="ghost" size="sm" onClick={() => rejectProposal(proposal.id)}>
+                      <X size={12} /> Reject
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={proposalBusy === proposal.id}
+                      onClick={() => {
+                        if (
+                          proposal.riskFlags.length > 0 &&
+                          !window.confirm(`This skill has ${proposal.riskFlags.length} risk warning(s). Approve the reviewed digest anyway?`)
+                        ) return;
+                        setProposalBusy(proposal.id);
+                        setProposalError(null);
+                        void approveProposal(proposal.id, proposal.contentSha256)
+                          .catch((reason: unknown) => setProposalError(reason instanceof Error ? reason.message : String(reason)))
+                          .finally(() => setProposalBusy(null));
+                      }}
+                    >
+                      Approve exact digest
+                    </Button>
+                  </>
+                )}
+                {proposal.status === "applied" && (
+                  <Button variant="ghost" size="sm" onClick={() => rollbackProposal(proposal.id)}>
+                    <RotateCcw size={12} /> Roll back
+                  </Button>
+                )}
+              </div>
+            </div>
+          ))}
+        </section>
+      )}
+
       {entries.length === 0 ? (
         <p className="px-1 text-xs text-faint">{t("PromptLibraryPanel.emptyState")}</p>
       ) : (
@@ -250,7 +333,11 @@ export function PromptLibraryPanel() {
                     entry.kind === "persona" ? "bg-accent-soft text-accent" : "bg-surface-2 text-muted"
                   }`}
                 >
-                  {entry.kind === "persona" ? t("PromptLibraryPanel.personaBadge") : t("PromptLibraryPanel.snippetBadge")}
+                  {entry.kind === "persona"
+                    ? t("PromptLibraryPanel.personaBadge")
+                    : entry.kind === "skill"
+                      ? t("PromptLibraryPanel.skillBadge")
+                      : t("PromptLibraryPanel.snippetBadge")}
                 </span>
                 <span className="truncate text-sm font-medium text-foreground">{entry.name}</span>
                 <span className="truncate font-mono text-xs text-faint">/{entry.command}</span>
@@ -335,6 +422,16 @@ export function PromptLibraryPanel() {
                 className="accent-accent"
               />
               {t("PromptLibraryPanel.kindPersonaLabel")}
+            </label>
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="radio"
+                name="prompt-kind"
+                checked={draft.kind === "skill"}
+                onChange={() => setDraft((prev) => (prev ? { ...prev, kind: "skill" } : prev))}
+                className="accent-accent"
+              />
+              {t("PromptLibraryPanel.kindSkillLabel")}
             </label>
           </div>
 

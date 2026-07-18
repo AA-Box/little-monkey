@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /**
@@ -63,6 +63,40 @@ export interface McpServerInfo {
   /** Whether a bearer token is currently saved in the keychain for this
    * server (never the token itself) — always `false` for `stdio` servers. */
   hasHttpToken: boolean;
+  /** Whether this server currently has OAuth-derived credentials saved (see
+   * `src-tauri/src/mcp_oauth.rs`) — never the credentials themselves.
+   * Always `false` for `stdio` servers. When both this and `hasHttpToken`
+   * are `true`, the backend prefers the OAuth-derived token. */
+  hasOauth: boolean;
+}
+
+/** Progress phase of an in-flight (or just-finished) `oauthConnect` call —
+ * mirrors the string values `mcp_oauth.rs`'s `emit_progress` produces via
+ * the `mcp-oauth://status` event. `"idle"` is a frontend-only value (never
+ * emitted by the backend) used before any connect attempt has been made for
+ * a server this session. */
+export type McpOAuthPhase =
+  | "idle"
+  | "discovering"
+  | "needs_client_id"
+  | "opening_browser"
+  | "waiting_for_browser"
+  | "exchanging_token"
+  | "connected"
+  | "error"
+  | "cancelled";
+
+export interface McpOAuthStatus {
+  phase: McpOAuthPhase;
+  error: string | null;
+}
+
+/** Payload of the `mcp-oauth://status` Tauri event emitted by
+ * `src-tauri/src/mcp_oauth.rs::emit_progress`. */
+interface McpOAuthStatusEvent {
+  serverId: string;
+  phase: Exclude<McpOAuthPhase, "idle">;
+  error: string | null;
 }
 
 /**
@@ -100,6 +134,14 @@ export interface McpStore {
   setHttpToken: (id: string, token: string) => Promise<void>;
   /** Remove an HTTP server's saved bearer token from the OS keychain. */
   removeHttpToken: (id: string) => Promise<void>;
+  /** Live progress of an in-flight/last `oauthConnect` call, keyed by server id — updated by `mcp-oauth://status` events. */
+  oauthStatus: Record<string, McpOAuthStatus>;
+  /** Runs a full generic MCP-spec OAuth 2.0 connect for an HTTP server (RFC 8414 discovery, RFC 7591 dynamic client registration or `clientId` as a fallback, PKCE, opening the system browser, awaiting the loopback redirect). Progress streams via `oauthStatus`; this promise resolves once the flow finishes (or rejects on failure/cancellation). */
+  oauthConnect: (id: string, clientId?: string) => Promise<void>;
+  /** Cancels an in-flight `oauthConnect` for `id`. A no-op if none is running. */
+  oauthCancel: (id: string) => Promise<void>;
+  /** Clears an HTTP server's saved OAuth credentials from the keychain. */
+  oauthDisconnect: (id: string) => Promise<void>;
 }
 
 export const useMcpStore = create<McpStore>((set, get) => ({
@@ -149,36 +191,77 @@ export const useMcpStore = create<McpStore>((set, get) => ({
     await invoke("mcp_remove_http_token", { server_id: id });
     await get().refresh();
   },
+
+  oauthStatus: {},
+
+  oauthConnect: async (id, clientId) => {
+    // `mcp-oauth://status` events (see the listener below) are the source
+    // of truth for phase transitions while this is in flight; this just
+    // seeds an immediate "discovering" phase so the UI doesn't sit blank
+    // for the brief window before the first event arrives.
+    set((state) => ({ oauthStatus: { ...state.oauthStatus, [id]: { phase: "discovering", error: null } } }));
+    await invoke("mcp_oauth_connect", { server_id: id, client_id: clientId ?? null });
+  },
+
+  oauthCancel: async (id) => {
+    await invoke("mcp_oauth_cancel", { server_id: id });
+  },
+
+  oauthDisconnect: async (id) => {
+    await invoke("mcp_oauth_disconnect", { server_id: id });
+    set((state) => {
+      const { [id]: _removed, ...rest } = state.oauthStatus;
+      return { oauthStatus: rest };
+    });
+    await get().refresh();
+  },
 }));
 
-void listen<McpStatusEvent>("mcp://status", (event) => {
-  const { serverId, status, error } = event.payload;
+// Tauri-shell only: in plain-browser dev `listen` itself throws.
+if (isTauri()) {
+  void listen<McpStatusEvent>("mcp://status", (event) => {
+    const { serverId, status, error } = event.payload;
 
-  if (status === "connected") {
-    // The event doesn't carry the full tool list (just a count) — refresh
-    // to pick up what `mcp_connect` just cached, same reasoning as
-    // modelStore's `llama://status` handler re-deriving `active` from a
-    // fresh list rather than trusting a partial event payload.
-    void useMcpStore.getState().refresh();
-    return;
-  }
+    if (status === "connected") {
+      // The event doesn't carry the full tool list (just a count) — refresh
+      // to pick up what `mcp_connect` just cached, same reasoning as
+      // modelStore's `llama://status` handler re-deriving `active` from a
+      // fresh list rather than trusting a partial event payload.
+      void useMcpStore.getState().refresh();
+      return;
+    }
 
-  useMcpStore.setState((state) => ({
-    servers: state.servers.map((server) =>
-      server.id === serverId
-        ? {
-            ...server,
-            status,
-            error,
-            // A disconnect (manual or from disabling the server) invalidates
-            // the cached tool list on the Rust side too — mirror that here
-            // so `mcpTools.ts` never offers a stale tool from a server that
-            // isn't actually reachable anymore.
-            ...(status === "disconnected" ? { tools: [], instructions: null } : {}),
-          }
-        : server
-    ),
-  }));
-}).catch((error) => {
-  console.error("Failed to listen for mcp://status events", error);
-});
+    useMcpStore.setState((state) => ({
+      servers: state.servers.map((server) =>
+        server.id === serverId
+          ? {
+              ...server,
+              status,
+              error,
+              // A disconnect (manual or from disabling the server) invalidates
+              // the cached tool list on the Rust side too — mirror that here
+              // so `mcpTools.ts` never offers a stale tool from a server that
+              // isn't actually reachable anymore.
+              ...(status === "disconnected" ? { tools: [], instructions: null } : {}),
+            }
+          : server
+      ),
+    }));
+  }).catch((error) => {
+    console.error("Failed to listen for mcp://status events", error);
+  });
+
+  void listen<McpOAuthStatusEvent>("mcp-oauth://status", (event) => {
+    const { serverId, phase, error } = event.payload;
+    useMcpStore.setState((state) => ({
+      oauthStatus: { ...state.oauthStatus, [serverId]: { phase, error } },
+    }));
+    if (phase === "connected") {
+      // Picks up the just-saved OAuth credentials as `hasOauth: true` — the
+      // event itself doesn't carry the server's full config/status.
+      void useMcpStore.getState().refresh();
+    }
+  }).catch((error) => {
+    console.error("Failed to listen for mcp-oauth://status events", error);
+  });
+}

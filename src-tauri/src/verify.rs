@@ -124,7 +124,8 @@ fn load_configs_from(path: &Path) -> VerifyConfigMap {
 /// Core save logic: write to a sibling temp file, then rename over the real
 /// one — same atomic-write pattern as `sessions.rs::save_to`.
 fn save_configs_to(path: &Path, configs: &VerifyConfigMap) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(configs).map_err(|e| format!("Failed to serialize verify configs: {}", e))?;
+    let json = serde_json::to_string_pretty(configs)
+        .map_err(|e| format!("Failed to serialize verify configs: {}", e))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).map_err(|e| format!("Failed to write verify configs: {}", e))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize verify configs: {}", e))?;
@@ -137,7 +138,9 @@ fn save_configs_to(path: &Path, configs: &VerifyConfigMap) -> Result<(), String>
 /// trailing slash, relative path at the call site, etc.).
 fn resolve_root_key(state: &AppState, workspace_path: Option<&str>) -> Result<String, String> {
     let canon = match workspace_path {
-        Some(p) => PathBuf::from(p).canonicalize().map_err(|e| format!("Invalid workspace path '{}': {}", p, e))?,
+        Some(p) => PathBuf::from(p)
+            .canonicalize()
+            .map_err(|e| format!("Invalid workspace path '{}': {}", p, e))?,
         None => workspace::primary_root_canon(state)?,
     };
     Ok(canon.to_string_lossy().to_string())
@@ -147,7 +150,7 @@ fn resolve_root_key(state: &AppState, workspace_path: Option<&str>) -> Result<St
 /// disk, given an already-resolved `configs_path` and the workspace's
 /// canonicalized `root` — the same key shape `resolve_root_key` produces
 /// (`root.to_string_lossy()`), just without needing an `AppState`/`AppHandle`
-/// to derive either from. `lm-cli` (`verify_cli.rs`) computes `configs_path`
+/// to derive either from. `monkey-cli` (`verify_cli.rs`) computes `configs_path`
 /// via the same hardcoded-identifier app-data convention `providers_cli.rs`
 /// uses for `providers.json`, so both binaries read the exact same
 /// `verify_configs.json` the desktop app's Settings > Verification tab
@@ -156,7 +159,10 @@ fn resolve_root_key(state: &AppState, workspace_path: Option<&str>) -> Result<St
 /// `verify_get_config`'s own tolerance.
 pub fn load_config_for_workspace(configs_path: &Path, root: &Path) -> VerifyConfig {
     let key = root.to_string_lossy().to_string();
-    load_configs_from(configs_path).get(&key).cloned().unwrap_or_default()
+    load_configs_from(configs_path)
+        .get(&key)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Finds `command_id` within `config.commands` — the ONLY way `verify_run`
@@ -188,7 +194,7 @@ fn cap_output(s: String) -> String {
 /// this module's doc comment for why verify commands are deliberately never
 /// permission-gated) and minus checkpoint recording (verify commands aren't
 /// model tool calls, so there's no `checkpoint_id` to thread through).
-/// `AppHandle`-free so `lm-cli` (a later slice) can call this directly, the
+/// `AppHandle`-free so `monkey-cli` (a later slice) can call this directly, the
 /// same `begin_impl`/`end_impl` split `checkpoints.rs` uses.
 ///
 /// Mirrors `tool_run_shell`'s `tokio::select!` over: the command completing,
@@ -221,7 +227,11 @@ pub async fn run_command_impl(
         // without this, the spawned process would keep running orphaned.
         .kill_on_drop(true);
 
-    let timeout = Duration::from_secs(cmd.timeout_secs.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS).max(1));
+    let timeout = Duration::from_secs(
+        cmd.timeout_secs
+            .unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS)
+            .max(1),
+    );
 
     let child = match command_builder.spawn() {
         Ok(child) => child,
@@ -243,11 +253,12 @@ pub async fn run_command_impl(
     // kills a command the other pane's turn is still running — exact
     // `tool_run_shell` pattern (see `AppState::tool_cancel`'s doc comment).
     let cancel_key = turn_id.unwrap_or_default().to_string();
-    let cancel: Option<Arc<Notify>> = state
-        .tool_cancel
-        .lock()
-        .ok()
-        .map(|mut guard| guard.entry(cancel_key.clone()).or_insert_with(|| Arc::new(Notify::new())).clone());
+    let cancel: Option<Arc<Notify>> = state.tool_cancel.lock().ok().map(|mut guard| {
+        guard
+            .entry(cancel_key.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    });
 
     let (outcome, timed_out): (Result<std::process::Output, String>, bool) = match &cancel {
         Some(cancel) => tokio::select! {
@@ -268,7 +279,10 @@ pub async fn run_command_impl(
     // `tool_run_shell`, so the map doesn't accumulate one entry per turn
     // forever.
     if let Ok(mut guard) = state.tool_cancel.lock() {
-        if guard.get(&cancel_key).is_some_and(|n| Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -323,7 +337,11 @@ pub fn verify_get_config(
 /// workspace is primary right now, so there's no way to write a config for a
 /// folder that isn't the one currently open in this window.
 #[tauri::command]
-pub fn verify_set_config(app: tauri::AppHandle, state: tauri::State<'_, AppState>, config: VerifyConfig) -> Result<(), String> {
+pub fn verify_set_config(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    config: VerifyConfig,
+) -> Result<(), String> {
     let key = resolve_root_key(state.inner(), None)?;
     let path = verify_configs_path(&app)?;
     let mut configs = load_configs_from(&path);
@@ -363,8 +381,17 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("little_monkey_verify_test_{}_{}_{}_{}", std::process::id(), n, nanos, name))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "little_monkey_verify_test_{}_{}_{}_{}",
+            std::process::id(),
+            n,
+            nanos,
+            name
+        ))
     }
 
     fn command(id: &str, cmd: &str) -> VerifyCommand {
@@ -384,7 +411,9 @@ mod tests {
         let mut configs = VerifyConfigMap::new();
         configs.insert(
             "/some/root".to_string(),
-            VerifyConfig { commands: vec![command("a", "echo hi")] },
+            VerifyConfig {
+                commands: vec![command("a", "echo hi")],
+            },
         );
         save_configs_to(&path, &configs).unwrap();
 
@@ -415,14 +444,19 @@ mod tests {
         assert_eq!(round_tripped.timeout_secs, Some(45));
     }
 
-    /// `lm-cli` (`verify_cli.rs`) is the only consumer of this — it never
+    /// `monkey-cli` (`verify_cli.rs`) is the only consumer of this — it never
     /// has an `AppState`/`AppHandle` to derive `resolve_root_key` through,
     /// only a plain `configs_path` and its own canonicalized workspace root.
     #[test]
     fn load_config_for_workspace_finds_the_matching_root_and_defaults_for_others() {
         let path = temp_path("cli_config.json");
         let mut configs = VerifyConfigMap::new();
-        configs.insert("/some/root".to_string(), VerifyConfig { commands: vec![command("a", "echo hi")] });
+        configs.insert(
+            "/some/root".to_string(),
+            VerifyConfig {
+                commands: vec![command("a", "echo hi")],
+            },
+        );
         save_configs_to(&path, &configs).unwrap();
 
         let found = load_config_for_workspace(&path, Path::new("/some/root"));
@@ -453,7 +487,9 @@ mod tests {
     /// rejects an id that isn't configured.
     #[test]
     fn find_command_rejects_unknown_id() {
-        let config = VerifyConfig { commands: vec![command("real-id", "echo hi")] };
+        let config = VerifyConfig {
+            commands: vec![command("real-id", "echo hi")],
+        };
         assert!(find_command(&config, "not-a-real-id").is_none());
     }
 
@@ -463,7 +499,9 @@ mod tests {
     /// the `id` field is ever matched against.
     #[test]
     fn find_command_never_matches_by_command_string() {
-        let config = VerifyConfig { commands: vec![command("real-id", "echo hi")] };
+        let config = VerifyConfig {
+            commands: vec![command("real-id", "echo hi")],
+        };
         assert!(find_command(&config, "echo hi").is_none());
         assert!(find_command(&config, "real-id").is_some());
     }
@@ -531,7 +569,11 @@ mod tests {
 
         let result = run_command_impl(&state, &cwd, &cmd, None).await;
 
-        assert!(result.stdout.len() <= VERIFY_OUTPUT_CAP + 64, "stdout not capped: {} chars", result.stdout.len());
+        assert!(
+            result.stdout.len() <= VERIFY_OUTPUT_CAP + 64,
+            "stdout not capped: {} chars",
+            result.stdout.len()
+        );
         assert!(result.stdout.starts_with("… (truncated)"));
 
         let _ = std::fs::remove_dir_all(&cwd);
@@ -551,7 +593,10 @@ mod tests {
         // the user hitting Stop mid-run.
         let notify = {
             let mut guard = state.tool_cancel.lock().unwrap();
-            guard.entry(turn_id.clone()).or_insert_with(|| Arc::new(Notify::new())).clone()
+            guard
+                .entry(turn_id.clone())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone()
         };
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;

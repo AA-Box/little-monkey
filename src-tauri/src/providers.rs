@@ -29,10 +29,21 @@ use crate::AppState;
 
 const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
 
-/// Valid values for Anthropic's `output_config.effort` field — the same set
-/// the native Messages API accepts. Ignored for every other provider (their
-/// OpenAI-compatible surfaces have no equivalent knob).
+/// Valid values for the app's effort scale — the five levels Anthropic's
+/// native `output_config.effort` field accepts. Other providers with a
+/// reasoning knob get a clamped subset on the wire (see
+/// `clamped_reasoning_effort`); providers without one get nothing.
 const VALID_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Maps the app's five-level effort scale onto the three-level
+/// `reasoning_effort` scale OpenAI-compatible reasoning surfaces accept:
+/// `xhigh`/`max` clamp down to `high`, everything else passes through.
+pub fn clamped_reasoning_effort(effort: &str) -> &str {
+    match effort {
+        "xhigh" | "max" => "high",
+        other => other,
+    }
+}
 
 /// A single built-in provider preset.
 struct ProviderPresetDef {
@@ -125,8 +136,12 @@ fn providers_file_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     if !base.exists() {
-        std::fs::create_dir_all(&base)
-            .map_err(|e| format!("Failed to create app data directory {}: {e}", base.display()))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
     }
     Ok(base.join("providers.json"))
 }
@@ -143,8 +158,8 @@ pub fn read_custom_providers(app: &AppHandle) -> Result<Vec<CustomProviderEntry>
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let parsed: ProvidersFile =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    let parsed: ProvidersFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
     Ok(parsed.custom)
 }
 
@@ -153,9 +168,10 @@ fn write_custom_providers(app: &AppHandle, entries: &[CustomProviderEntry]) -> R
     let file = ProvidersFile {
         custom: entries.to_vec(),
     };
-    let serialized =
-        serde_json::to_string_pretty(&file).map_err(|e| format!("Failed to serialize provider config: {e}"))?;
-    std::fs::write(&path, serialized).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    let serialized = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("Failed to serialize provider config: {e}"))?;
+    std::fs::write(&path, serialized)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 /// Pure preset-then-custom lookup, parameterized by an already-loaded
@@ -179,6 +195,17 @@ fn find_base_url(app: &AppHandle, id: &str) -> Result<String, String> {
     resolve_base_url(id, &custom)
 }
 
+/// Secret-free stable reference written into durable run snapshots. The
+/// actual credential remains in the OS keychain and is still loaded only for
+/// the lifetime of one request.
+pub fn credential_ref_id(id: &str) -> String {
+    format!("keychain:{KEYCHAIN_SERVICE}:{id}")
+}
+
+pub fn configured_endpoint(app: &AppHandle, id: &str) -> Result<String, String> {
+    find_base_url(app, id).map(|value| value.trim_end_matches('/').to_string())
+}
+
 pub fn has_key(id: &str) -> bool {
     keyring::Entry::new(KEYCHAIN_SERVICE, id)
         .and_then(|e| e.get_password())
@@ -194,6 +221,45 @@ pub fn read_key(provider_id: &str) -> Result<String, String> {
         }
         other => format!("Failed to read saved key: {other}"),
     })
+}
+
+/// Converts a provider id into its env-var name for [`read_key_with_env`]:
+/// `openrouter` -> `LITTLE_MONKEY_API_KEY_OPENROUTER`. Non-alphanumeric
+/// characters (a custom provider id could contain `-`) become `_`, matching
+/// standard env-var naming.
+fn provider_env_var_name(provider_id: &str) -> String {
+    let upper: String = provider_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("LITTLE_MONKEY_API_KEY_{upper}")
+}
+
+/// `read_key`, but tried only after two env-var fallbacks that don't exist
+/// for the keychain-only path: `LITTLE_MONKEY_API_KEY_<PROVIDER_ID_UPPER>`
+/// first, then the generic `LITTLE_MONKEY_API_KEY` — for `monkey-cli task
+/// run` in CI, where there is no OS keychain to read from at all (design doc
+/// slice 1). Scoped to reading only (never persisted anywhere), and the GUI
+/// never calls this — `read_key` itself, and its keychain-only behavior when
+/// neither env var is set, are both completely unchanged.
+pub fn read_key_with_env(provider_id: &str) -> Result<String, String> {
+    if let Ok(key) = std::env::var(provider_env_var_name(provider_id)) {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    if let Ok(key) = std::env::var("LITTLE_MONKEY_API_KEY") {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    read_key(provider_id)
 }
 
 fn remove_key_impl(provider_id: &str) -> Result<(), String> {
@@ -271,7 +337,11 @@ fn unique_slug(label: &str, existing: &HashSet<String>) -> String {
 /// already-OpenAI-shaped body it forwards verbatim, without duplicating the
 /// header names/version string in a third place. `pub` for that reuse; no
 /// behavior change to either existing call site.
-pub fn add_anthropic_headers(request: reqwest::RequestBuilder, provider_id: &str, api_key: &str) -> reqwest::RequestBuilder {
+pub fn add_anthropic_headers(
+    request: reqwest::RequestBuilder,
+    provider_id: &str,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
     if provider_id == "anthropic" {
         request
             .header("x-api-key", api_key)
@@ -291,7 +361,13 @@ pub async fn fetch_models(
     api_key: &str,
 ) -> Result<Vec<ProviderModelInfo>, String> {
     let client = reqwest::Client::new();
-    let request = add_anthropic_headers(client.get(format!("{base_url}/models")).bearer_auth(api_key), provider_id, api_key);
+    let request = add_anthropic_headers(
+        client
+            .get(format!("{base_url}/models"))
+            .bearer_auth(api_key),
+        provider_id,
+        api_key,
+    );
 
     let response = request
         .send()
@@ -372,7 +448,11 @@ pub fn providers_list_configured(app: AppHandle) -> Result<Vec<ProviderConfig>, 
 /// Registers a new custom OpenAI-compatible provider (Groq, Mistral,
 /// self-hosted, etc.) with no key yet — call `providers_set_key` next.
 #[tauri::command]
-pub fn providers_add_custom(app: AppHandle, label: String, base_url: String) -> Result<ProviderConfig, String> {
+pub fn providers_add_custom(
+    app: AppHandle,
+    label: String,
+    base_url: String,
+) -> Result<ProviderConfig, String> {
     let label = label.trim().to_string();
     if label.is_empty() {
         return Err("Label is required".to_string());
@@ -422,7 +502,11 @@ pub fn providers_remove_custom(app: AppHandle, id: String) -> Result<(), String>
 /// returns the model list immediately so the caller doesn't need a second
 /// round trip.
 #[tauri::command]
-pub async fn providers_set_key(app: AppHandle, id: String, api_key: String) -> Result<Vec<ProviderModelInfo>, String> {
+pub async fn providers_set_key(
+    app: AppHandle,
+    id: String,
+    api_key: String,
+) -> Result<Vec<ProviderModelInfo>, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
         return Err("API key is required".to_string());
@@ -431,7 +515,8 @@ pub async fn providers_set_key(app: AppHandle, id: String, api_key: String) -> R
     let base_url = find_base_url(&app, &id)?;
     let models = fetch_models(&base_url, &id, &api_key).await?;
 
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id).map_err(|e| format!("Failed to access keychain: {e}"))?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &id)
+        .map_err(|e| format!("Failed to access keychain: {e}"))?;
     entry
         .set_password(&api_key)
         .map_err(|e| format!("Failed to save key to keychain: {e}"))?;
@@ -447,10 +532,29 @@ pub fn providers_remove_key(id: String) -> Result<(), String> {
 
 /// Manual "refresh models" — re-fetches using the already-saved key.
 #[tauri::command]
-pub async fn providers_list_models(app: AppHandle, id: String) -> Result<Vec<ProviderModelInfo>, String> {
+pub async fn providers_list_models(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<ProviderModelInfo>, String> {
     let base_url = find_base_url(&app, &id)?;
     let api_key = read_key(&id)?;
     fetch_models(&base_url, &id, &api_key).await
+}
+
+/// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+/// flags any of `model_ids` (typically the provider's own already-fetched
+/// model list — see `providers_list_models`/`ProviderCard.tsx`) that this
+/// app's local, conservative retired-model registry recognizes, each with a
+/// migration hint. See `model_retirement.rs`'s module doc for the honest
+/// maintenance story (a versioned local list, not a live-verified source —
+/// there is no upstream API this app can call to ask "is this retired?").
+/// Pure and read-only: never touches the keychain or network.
+#[tauri::command]
+pub fn providers_check_model_retirements(
+    provider_id: String,
+    model_ids: Vec<String>,
+) -> Vec<crate::model_retirement::CloudModelRetirementWarning> {
+    crate::model_retirement::check_cloud_models_batch(&provider_id, &model_ids)
 }
 
 /// Buffers raw bytes across chunk boundaries and only ever hands out valid
@@ -464,7 +568,9 @@ pub struct Utf8ChunkAccumulator {
 
 impl Utf8ChunkAccumulator {
     pub fn new() -> Self {
-        Self { leftover: Vec::new() }
+        Self {
+            leftover: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> String {
@@ -514,6 +620,7 @@ pub async fn providers_stream_chat(
     messages: Vec<serde_json::Value>,
     tools: Vec<serde_json::Value>,
     effort: Option<String>,
+    run_id: Option<String>,
 ) -> Result<(), String> {
     if let Some(ref e) = effort {
         if !VALID_EFFORT_LEVELS.contains(&e.as_str()) {
@@ -521,14 +628,34 @@ pub async fn providers_stream_chat(
         }
     }
 
+    let frozen_endpoint = match run_id.as_deref() {
+        Some(run_id) => Some(crate::run_commands::provider_endpoint_for_run(
+            &app,
+            state.inner(),
+            run_id,
+            &provider_id,
+            &model,
+        )?),
+        None => None,
+    };
     let cancel = Arc::new(Notify::new());
     state
         .stream_cancels
         .lock()
         .unwrap()
         .insert(request_id.clone(), cancel.clone());
-
-    let result = run_stream_chat(&app, &request_id, &provider_id, &model, messages, tools, effort, cancel).await;
+    let result = run_stream_chat(
+        &app,
+        &request_id,
+        &provider_id,
+        &model,
+        messages,
+        tools,
+        effort,
+        cancel,
+        frozen_endpoint,
+    )
+    .await;
 
     state.stream_cancels.lock().unwrap().remove(&request_id);
 
@@ -559,15 +686,19 @@ pub fn providers_cancel_chat(app: AppHandle, request_id: String) -> Result<(), S
 /// streaming proxy (below) and the CLI, which talks to the same providers
 /// directly — no WebView/keychain-proxy split needed in a terminal.
 ///
-/// `effort` maps to Anthropic's native `output_config.effort` field
-/// (low/medium/high/xhigh/max — see platform.claude.com's effort docs). It's
-/// not part of the OpenAI chat/completions schema (OpenAI's own
-/// `reasoning_effort` is a different field the Anthropic compat layer
-/// ignores), but the compat layer forwards unrecognized top-level JSON keys
-/// straight through to the underlying Messages API request, the same way it
-/// documents doing for `thinking`. Only sent for `provider_id == "anthropic"`
-/// — every other provider either has no such knob or a differently-shaped
-/// one, and sending it there would be a meaningless extra field at best.
+/// `effort` is shaped per provider. Anthropic gets its native
+/// `output_config.effort` field verbatim (low/medium/high/xhigh/max — see
+/// platform.claude.com's effort docs): it's not part of the OpenAI
+/// chat/completions schema, but Anthropic's compat layer forwards
+/// unrecognized top-level JSON keys straight through to the underlying
+/// Messages API request, the same way it documents doing for `thinking`.
+/// OpenAI and Gemini's compat surface take the OpenAI-schema
+/// `reasoning_effort` field, and OpenRouter normalizes the same scale under
+/// `reasoning.effort` — all three only know low/medium/high, so the two
+/// Anthropic-only top levels clamp down to `high`. Custom/unknown providers
+/// get nothing: OpenAI-compatible servers commonly hard-reject
+/// `reasoning_effort` on non-reasoning models, so an unknowable endpoint
+/// must never receive a speculative field.
 pub fn build_chat_request(
     client: &reqwest::Client,
     base_url: &str,
@@ -580,19 +711,43 @@ pub fn build_chat_request(
 ) -> reqwest::RequestBuilder {
     let mut body = json!({
         "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
         "stream": true,
         "model": model,
     });
 
-    if provider_id == "anthropic" {
-        if let Some(effort) = effort {
-            body["output_config"] = json!({ "effort": effort });
+    // `tool_choice` without at least one tool is rejected by a number of
+    // OpenAI-compatible/custom endpoints. No-tools runs (notably Compare)
+    // omit both fields rather than sending an empty catalog plus "auto".
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
+
+    // OpenAI-compatible streaming APIs only include the terminal usage
+    // chunk when explicitly requested. Anthropic/Gemini compatibility
+    // endpoints reject or ignore this OpenAI-only extension, matching the
+    // CLI's request-shaping rule.
+    if provider_id != "anthropic" && provider_id != "gemini" {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+
+    if let Some(effort) = effort {
+        match provider_id {
+            "anthropic" => body["output_config"] = json!({ "effort": effort }),
+            "openai" | "gemini" => {
+                body["reasoning_effort"] = json!(clamped_reasoning_effort(effort));
+            }
+            "openrouter" => {
+                body["reasoning"] = json!({ "effort": clamped_reasoning_effort(effort) });
+            }
+            _ => {}
         }
     }
 
-    let request = client.post(format!("{base_url}/chat/completions")).bearer_auth(api_key).json(&body);
+    let request = client
+        .post(format!("{base_url}/chat/completions"))
+        .bearer_auth(api_key)
+        .json(&body);
     add_anthropic_headers(request, provider_id, api_key)
 }
 
@@ -605,18 +760,43 @@ async fn run_stream_chat(
     tools: Vec<serde_json::Value>,
     effort: Option<String>,
     cancel: Arc<Notify>,
+    frozen_endpoint: Option<String>,
 ) -> Result<(), String> {
-    let base_url = find_base_url(app, provider_id)?;
+    let base_url = match frozen_endpoint {
+        Some(endpoint) => endpoint,
+        None => configured_endpoint(app, provider_id)?,
+    };
     let api_key = read_key(provider_id)?;
 
     let client = reqwest::Client::new();
-    let request =
-        build_chat_request(&client, &base_url, provider_id, &api_key, model, &messages, &tools, effort.as_deref());
+    let request = build_chat_request(
+        &client,
+        &base_url,
+        provider_id,
+        &api_key,
+        model,
+        &messages,
+        &tools,
+        effort.as_deref(),
+    );
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach {base_url}: {e}"))?;
+    // Stop button: race connection establishment itself, not just the body
+    // stream below. Without this, a slow/hung provider (a loaded free-tier
+    // model queuing before it sends headers) makes cancellation inert until
+    // `send()` resolves on its own — the run would sit in `cancelling`
+    // forever with no way to actually stop it.
+    let response = tokio::select! {
+        _ = cancel.notified() => {
+            let _ = app.emit(
+                "provider://chat-done",
+                json!({ "request_id": request_id, "cancelled": true }),
+            );
+            return Ok(());
+        }
+        result = request.send() => {
+            result.map_err(|e| format!("Failed to reach {base_url}: {e}"))?
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -691,8 +871,14 @@ mod tests {
 
     #[test]
     fn validate_base_url_accepts_http_and_https() {
-        assert_eq!(validate_base_url("https://api.openai.com/v1").unwrap(), "https://api.openai.com/v1");
-        assert_eq!(validate_base_url("http://localhost:8080/v1/").unwrap(), "http://localhost:8080/v1");
+        assert_eq!(
+            validate_base_url("https://api.openai.com/v1").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            validate_base_url("http://localhost:8080/v1/").unwrap(),
+            "http://localhost:8080/v1"
+        );
     }
 
     #[test]
@@ -702,6 +888,29 @@ mod tests {
         assert!(validate_base_url("api.openai.com/v1").is_err());
         assert!(validate_base_url("").is_err());
         assert!(validate_base_url("https://").is_err());
+    }
+
+    #[test]
+    fn provider_env_var_name_upcases_and_prefixes() {
+        assert_eq!(
+            provider_env_var_name("openrouter"),
+            "LITTLE_MONKEY_API_KEY_OPENROUTER"
+        );
+        assert_eq!(
+            provider_env_var_name("anthropic"),
+            "LITTLE_MONKEY_API_KEY_ANTHROPIC"
+        );
+    }
+
+    #[test]
+    fn provider_env_var_name_replaces_non_alphanumeric_chars() {
+        // A custom provider id could contain a hyphen — standard env-var
+        // naming replaces it with an underscore rather than dropping it
+        // (dropping could collide two distinct provider ids onto one var).
+        assert_eq!(
+            provider_env_var_name("my-custom-provider"),
+            "LITTLE_MONKEY_API_KEY_MY_CUSTOM_PROVIDER"
+        );
     }
 
     #[test]
@@ -720,39 +929,113 @@ mod tests {
         assert_eq!(unique_slug("Mistral", &existing), "mistral");
     }
 
-    #[test]
-    fn build_chat_request_adds_output_config_effort_for_anthropic_only() {
+    fn request_body(provider_id: &str, effort: Option<&str>) -> serde_json::Value {
         let client = reqwest::Client::new();
-
-        let anthropic_req = build_chat_request(
+        let request = build_chat_request(
             &client,
-            "https://api.anthropic.com/v1",
-            "anthropic",
+            "https://example.com/v1",
+            provider_id,
             "key",
-            "claude-opus-4-8",
+            "some-model",
             &[],
             &[],
-            Some("xhigh"),
+            effort,
         )
         .build()
         .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(anthropic_req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(body["output_config"]["effort"], "xhigh");
+        serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
 
-        let openai_req = build_chat_request(
+    #[test]
+    fn build_chat_request_sends_anthropic_effort_verbatim_at_all_five_levels() {
+        for level in VALID_EFFORT_LEVELS {
+            let body = request_body("anthropic", Some(level));
+            assert_eq!(body["output_config"]["effort"], *level);
+            assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("reasoning").is_none());
+            assert!(body.get("stream_options").is_none());
+        }
+    }
+
+    #[test]
+    fn build_chat_request_clamps_effort_to_reasoning_effort_for_openai_and_gemini() {
+        for provider in ["openai", "gemini"] {
+            for (level, wire) in [
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "high"),
+                ("xhigh", "high"),
+                ("max", "high"),
+            ] {
+                let body = request_body(provider, Some(level));
+                assert_eq!(body["reasoning_effort"], wire, "{provider} {level}");
+                assert!(body.get("output_config").is_none());
+                assert!(body.get("reasoning").is_none());
+            }
+        }
+        // The OpenAI-only stream_options extension is orthogonal to effort.
+        assert_eq!(
+            request_body("openai", Some("max"))["stream_options"]["include_usage"],
+            true
+        );
+        assert!(request_body("gemini", Some("max"))
+            .get("stream_options")
+            .is_none());
+    }
+
+    #[test]
+    fn build_chat_request_nests_clamped_effort_under_reasoning_for_openrouter() {
+        assert_eq!(
+            request_body("openrouter", Some("medium"))["reasoning"]["effort"],
+            "medium"
+        );
+        let clamped = request_body("openrouter", Some("max"));
+        assert_eq!(clamped["reasoning"]["effort"], "high");
+        assert!(clamped.get("reasoning_effort").is_none());
+        assert!(clamped.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_chat_request_omits_effort_entirely_for_custom_providers() {
+        let body = request_body("my-custom-provider", Some("max"));
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn build_chat_request_omits_every_effort_field_when_effort_is_none() {
+        for provider in ["anthropic", "openai", "gemini", "openrouter", "custom-x"] {
+            let body = request_body(provider, None);
+            assert!(body.get("output_config").is_none(), "{provider}");
+            assert!(body.get("reasoning_effort").is_none(), "{provider}");
+            assert!(body.get("reasoning").is_none(), "{provider}");
+        }
+    }
+
+    #[test]
+    fn build_chat_request_offers_tools_with_auto_tool_choice_only_when_tools_exist() {
+        let body = request_body("openai", None);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+
+        let client = reqwest::Client::new();
+        let tool_req = build_chat_request(
             &client,
             "https://api.openai.com/v1",
             "openai",
             "key",
             "gpt-4o",
             &[],
-            &[],
-            Some("xhigh"),
+            &[json!({"type": "function", "function": {"name": "read_file"}})],
+            None,
         )
         .build()
         .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(openai_req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert!(body.get("output_config").is_none());
+        let body: serde_json::Value =
+            serde_json::from_slice(tool_req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

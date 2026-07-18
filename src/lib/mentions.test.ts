@@ -73,6 +73,7 @@ describe('composeReferencedText', () => {
     expect(result).toContain('Referenced files:');
     expect(result).toContain('### a.ts');
     expect(result).toContain('```\nconst a = 1;\n```');
+    expect(result).toContain('BEGIN UNTRUSTED DATA');
     expect(result.endsWith('explain this')).toBe(true);
   });
 
@@ -80,7 +81,17 @@ describe('composeReferencedText', () => {
     const result = composeReferencedText('what is in here', [
       { path: 'src', isDir: true, content: '- lib/\n- main.tsx' },
     ]);
-    expect(result).toContain('### src\n- lib/\n- main.tsx');
+    expect(result).toContain('### src\n[Untrusted data from workspace directory src]');
+    expect(result).toContain('- lib/\n- main.tsx');
     expect(result).not.toContain('```');
+  });
+
+  it('labels terminal evidence as untrusted context rather than a workspace file', () => {
+    const result = composeReferencedText('review this run', [
+      { path: 'terminal://term-1/1.txt', isDir: false, content: 'tests passed', source: 'terminal' },
+    ]);
+    expect(result).toContain('Referenced context:');
+    expect(result).toContain('Untrusted data from terminal evidence terminal://term-1/1.txt');
+    expect(result).toContain('tests passed');
   });
 });

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronDown, Plus } from "lucide-react";
+import { ChevronDown, Plus, SlidersHorizontal } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import { useModelStore } from "../../store/modelStore";
 import { OllamaModelList } from "./OllamaModelList";
 import { OllamaPullForm } from "./OllamaPullForm";
 import { OllamaImportForm } from "./OllamaImportForm";
+import { ModelfileStudio } from "./ModelfileStudio";
 import { useT } from "../../lib/i18n";
 
 /**
@@ -60,7 +61,7 @@ export function OllamaPanel() {
   }, [signinOllama]);
 
   return (
-    <div className="flex flex-col gap-2 p-2">
+    <div className="flex flex-col gap-2 py-2">
       <div className="flex flex-wrap items-center gap-2 px-1">
         <StatusPill tone={ollamaReachable ? "success" : "neutral"}>
           {ollamaReachable ? t("OllamaPanel.statusConnected") : t("OllamaPanel.statusNotRunning")}
@@ -107,6 +108,17 @@ export function OllamaPanel() {
         <div className="flex flex-col gap-2 border-t border-border p-2">
           <OllamaPullForm />
           <OllamaImportForm />
+        </div>
+      </details>
+
+      <details className="group rounded-lg border border-border">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-sm text-muted [&::-webkit-details-marker]:hidden">
+          <SlidersHorizontal size={14} />
+          {t("OllamaPanel.modelfileStudioLabel")}
+          <ChevronDown size={14} className="ml-auto transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="flex flex-col gap-2 border-t border-border p-2">
+          <ModelfileStudio />
         </div>
       </details>
     </div>

@@ -1,12 +1,20 @@
-import { Children, isValidElement, memo, useState, type ReactNode } from "react";
+import { Children, isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { Eye, Pencil } from "lucide-react";
+import { Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { useArtifactStore } from "../../store/artifactStore";
 import { useT } from "../../lib/i18n";
+import {
+  cancelTranslation,
+  defaultTranslationLocale,
+  messageTranslationKey,
+  TRANSLATION_LOCALES,
+  translateMessage,
+} from "../../lib/translation";
+import type { MessageTranslation } from "../../store/sessionStore";
 
 export interface MessageBubbleProps {
   message: ChatMessage;
@@ -28,6 +36,18 @@ export interface MessageBubbleProps {
   onEditMessage?: (index: number, newText: string) => void;
   /** Disables the edit affordance while a turn is in flight. */
   editDisabled?: boolean;
+  /** Present to show a "Start side task" hover action on both user and
+   * assistant bubbles (ROADMAP.md's "Side Tasks" acceptance: start a side
+   * task "from selected chat context") — omitted entirely hides the
+   * affordance, same convention as `onEditMessage`. Called with this
+   * message's own transcript `index`; the handler (`ChatWindow.tsx`) reads
+   * the message back out to build the side task's seed. */
+  onStartSideTask?: (index: number) => void;
+  /** Original-preserving translations already saved for this message. */
+  translations?: readonly MessageTranslation[];
+  /** Thread-level locale preference. Individual controls can still switch
+   * back to the original without mutating that preference. */
+  preferredTranslationLocale?: string | null;
 }
 
 /**
@@ -161,10 +181,16 @@ function UserBubble({
   content,
   onEdit,
   editDisabled,
+  displayText,
+  translationControls,
+  onStartSideTask,
 }: {
   content: string | ChatContentPart[];
   onEdit?: (newText: string) => void;
   editDisabled?: boolean;
+  displayText?: string;
+  translationControls?: ReactNode;
+  onStartSideTask?: () => void;
 }) {
   // Editing only ever operates on the text portion — an edited-and-resubmitted
   // message doesn't carry its original image attachment forward (matches
@@ -198,6 +224,7 @@ function UserBubble({
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 commit();
@@ -234,16 +261,32 @@ function UserBubble({
   return (
     <div className="group flex justify-end">
       <div className="flex max-w-[75%] items-start gap-1.5">
-        {onEdit && (
-          <button
-            type="button"
-            onClick={() => setEditing(true)}
-            disabled={editDisabled}
-            aria-label={t("MessageBubble.editMessageAriaLabel")}
-            className="mt-2.5 shrink-0 cursor-pointer text-faint opacity-0 transition-opacity duration-150 hover:text-foreground group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
-          >
-            <Pencil size={13} />
-          </button>
+        {(translationControls || onEdit || onStartSideTask) && (
+          <div className="mt-1.5 flex shrink-0 items-center gap-0.5">
+            {translationControls}
+            {onStartSideTask && (
+              <button
+                type="button"
+                onClick={onStartSideTask}
+                aria-label="Start side task from this message"
+                title="Start side task from this message"
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+              >
+                <Split size={13} />
+              </button>
+            )}
+            {onEdit && (
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                disabled={editDisabled}
+                aria-label={t("MessageBubble.editMessageAriaLabel")}
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-0"
+              >
+                <Pencil size={13} />
+              </button>
+            )}
+          </div>
         )}
         <div className="flex flex-col gap-2 rounded-2xl border border-border bg-surface-2 px-4 py-2 text-sm text-foreground">
           {images.length > 0 && (
@@ -258,22 +301,230 @@ function UserBubble({
               ))}
             </div>
           )}
-          {text && <div className="whitespace-pre-wrap">{text}</div>}
+          {(displayText ?? text) && <div className="whitespace-pre-wrap">{displayText ?? text}</div>}
         </div>
       </div>
     </div>
   );
 }
 
-function AssistantMessage({ content, sessionId, index }: { content: string; sessionId: string; index: number }) {
+function AssistantMessage({
+  content,
+  sessionId,
+  index,
+  translationControls,
+  onStartSideTask,
+}: {
+  content: string;
+  sessionId: string;
+  index: number;
+  translationControls?: ReactNode;
+  onStartSideTask?: () => void;
+}) {
   const { t } = useT();
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
-    <div className="w-full min-w-0">
-      <div className="mb-1.5 text-xs font-medium text-muted">{t("MessageBubble.assistantName")}</div>
+    <div className="group relative w-full min-w-0">
+      <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted">
+        {t("MessageBubble.assistantName")}
+        {onStartSideTask && (
+          <button
+            type="button"
+            onClick={onStartSideTask}
+            aria-label="Start side task from this message"
+            title="Start side task from this message"
+            className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+          >
+            <Split size={12} />
+          </button>
+        )}
+      </div>
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>
+      {translationControls && <div className="absolute -bottom-5 left-0 z-10">{translationControls}</div>}
+    </div>
+  );
+}
+
+function sameContent(left: ChatMessage["content"], right: ChatMessage["content"]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function TranslationControls({
+  sessionId,
+  index,
+  message,
+  translations,
+  preferredLocale,
+  disabled,
+  onDisplay,
+  align,
+}: {
+  sessionId: string;
+  index: number;
+  message: ChatMessage;
+  translations: readonly MessageTranslation[];
+  preferredLocale: string | null;
+  disabled: boolean;
+  onDisplay: (translation: MessageTranslation | null) => void;
+  align: "start" | "end";
+}) {
+  const { t } = useT();
+  const [locale, setLocale] = useState(preferredLocale ?? defaultTranslationLocale());
+  const [running, setRunning] = useState(false);
+  const [showTranslation, setShowTranslation] = useState(Boolean(preferredLocale));
+  const [latest, setLatest] = useState<MessageTranslation | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const saved = [...translations].reverse().find((translation) =>
+    translation.messageIndex === index &&
+    translation.locale.toLowerCase() === locale.toLowerCase() &&
+    sameContent(translation.originalContent, message.content),
+  ) ?? null;
+  const available = latest && latest.locale.toLowerCase() === locale.toLowerCase() && sameContent(latest.originalContent, message.content)
+    ? latest
+    : saved;
+
+  useEffect(() => {
+    if (preferredLocale) {
+      setLocale(preferredLocale);
+      setShowTranslation(true);
+    } else {
+      setShowTranslation(false);
+    }
+  }, [preferredLocale]);
+
+  useEffect(() => {
+    onDisplay(showTranslation ? available : null);
+  }, [available, onDisplay, showTranslation]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [menuOpen]);
+
+  const start = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      const translation = await translateMessage(sessionId, index, locale);
+      setLatest(translation);
+      setShowTranslation(true);
+      setMenuOpen(false);
+      onDisplay(translation);
+    } catch (caught) {
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const controlVisible = menuOpen || running || available !== null || preferredLocale !== null;
+
+  return (
+    <div
+      ref={containerRef}
+      className={`relative flex items-center gap-0.5 text-xs text-muted transition-opacity duration-150 ${controlVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          setMenuOpen(false);
+        }
+      }}
+    >
+      <button
+        type="button"
+        aria-label={running ? t("Translation.cancel") : t("Translation.translate")}
+        aria-haspopup="dialog"
+        aria-expanded={menuOpen}
+        title={running ? t("Translation.cancel") : t("Translation.translate")}
+        disabled={disabled && !running}
+        onClick={() => {
+          if (running) cancelTranslation(messageTranslationKey(sessionId, index));
+          else setMenuOpen((value) => !value);
+        }}
+        className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {running ? <LoaderCircle size={13} className="animate-spin" /> : <Languages size={13} />}
+      </button>
+
+      {available && (
+        <button
+          type="button"
+          onClick={() => setShowTranslation((value) => !value)}
+          className="flex h-7 cursor-pointer items-center gap-1 rounded-md px-1.5 text-faint transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:text-foreground"
+          title={showTranslation ? t("Translation.showOriginal") : t("Translation.showTranslation")}
+        >
+          <Eye size={12} />
+          <span>{showTranslation ? t("Translation.showOriginal") : t("Translation.showTranslation")}</span>
+        </button>
+      )}
+
+      {menuOpen && (
+        <div
+          role="dialog"
+          aria-label={t("Translation.translate")}
+          className={`absolute top-full z-30 mt-1 w-64 rounded-xl border border-border bg-background p-3 text-left shadow-lg ${align === "end" ? "right-0" : "left-0"}`}
+        >
+          <label className="block text-[11px] font-medium text-muted">
+            {t("Translation.languageLabel")}
+            <select
+              autoFocus
+              value={locale}
+              disabled={running}
+              onChange={(event) => {
+                setLocale(event.target.value);
+                setShowTranslation(false);
+                setError(null);
+              }}
+              className="mt-1.5 w-full cursor-pointer rounded-md border border-border bg-background px-2.5 py-2 text-xs text-foreground outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/20"
+            >
+              {TRANSLATION_LOCALES.map(({ code, label }) => <option key={code} value={code}>{label}</option>)}
+            </select>
+          </label>
+
+          <div className="mt-2.5 flex items-center justify-between gap-2">
+            {available ? <span className="text-[10px] text-faint">{t("Translation.preserved")}</span> : <span />}
+            {running ? (
+              <button
+                type="button"
+                onClick={() => cancelTranslation(messageTranslationKey(sessionId, index))}
+                className="flex min-h-8 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-xs text-muted hover:bg-surface-2 hover:text-foreground"
+              >
+                <LoaderCircle size={12} className="animate-spin" />
+                {t("Translation.cancel")}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void start()}
+                disabled={disabled}
+                className="flex min-h-8 cursor-pointer items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-accent-foreground hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Languages size={12} />
+                {t("Translation.translate")}
+              </button>
+            )}
+          </div>
+
+          {error && (
+            <div className="mt-2 flex items-start justify-between gap-2 rounded-md bg-danger-soft px-2 py-1.5 text-[11px] leading-relaxed text-danger" role="alert">
+              <span>{t("Translation.error", { error })}</span>
+              <button type="button" onClick={() => setError(null)} aria-label="Dismiss translation error" className="shrink-0 cursor-pointer rounded p-0.5 hover:bg-danger/10">
+                <X size={12} />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -291,19 +542,53 @@ function AssistantMessage({ content, sessionId, index }: { content: string; sess
  * expensive enough that re-rendering the whole transcript per token visibly
  * stutters on long conversations).
  */
-function MessageBubble({ message, index, sessionId, onEditMessage, editDisabled }: MessageBubbleProps) {
+function MessageBubble({
+  message,
+  index,
+  sessionId,
+  onEditMessage,
+  editDisabled,
+  translations = [],
+  preferredTranslationLocale = null,
+  onStartSideTask,
+}: MessageBubbleProps) {
+  const [displayedTranslation, setDisplayedTranslation] = useState<MessageTranslation | null>(null);
+  const controls = textContent(message.content).trim() ? (
+    <TranslationControls
+      sessionId={sessionId}
+      index={index}
+      message={message}
+      translations={translations}
+      preferredLocale={preferredTranslationLocale}
+      disabled={editDisabled === true}
+      onDisplay={setDisplayedTranslation}
+      align={message.role === "user" ? "end" : "start"}
+    />
+  ) : null;
+  const startSideTask = onStartSideTask ? () => onStartSideTask(index) : undefined;
   if (message.role === "user") {
     return (
       <UserBubble
         content={message.content}
+        displayText={displayedTranslation?.translatedText}
+        translationControls={controls}
         onEdit={onEditMessage ? (text) => onEditMessage(index, text) : undefined}
         editDisabled={editDisabled}
+        onStartSideTask={startSideTask}
       />
     );
   }
 
   if (message.role === "assistant") {
-    return <AssistantMessage content={textContent(message.content)} sessionId={sessionId} index={index} />;
+    return (
+      <AssistantMessage
+        content={displayedTranslation?.translatedText ?? textContent(message.content)}
+        sessionId={sessionId}
+        index={index}
+        translationControls={controls}
+        onStartSideTask={startSideTask}
+      />
+    );
   }
 
   return null;

@@ -1,9 +1,27 @@
 import { useState } from "react";
-import { ChevronDown, Plug, RefreshCw, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  Cloud,
+  GitPullRequest,
+  HardDrive,
+  Mail,
+  MessageCircle,
+  Plug,
+  RefreshCw,
+  Ticket,
+  Trash2,
+  type LucideIcon,
+} from "lucide-react";
 import { Button, StatusPill, type PillTone } from "../ui";
-import { useMcpStore, type McpServerEntry, type McpServerInfo, type McpStatus } from "../../store/mcpStore";
+import {
+  useMcpStore,
+  type McpOAuthPhase,
+  type McpServerEntry,
+  type McpServerInfo,
+  type McpStatus,
+} from "../../store/mcpStore";
 import { useT } from "../../lib/i18n";
-import { AddMcpServerForm } from "./AddMcpServerForm";
+import { AddMcpServerForm, type McpServerDraft } from "./AddMcpServerForm";
 
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` rather than promoted prematurely. */
@@ -48,6 +66,119 @@ const STATUS_TONE: Record<McpStatus, PillTone> = {
  * "context bloat" risk note: no hard cap, just a nudge toward allowlisting. */
 const TOOL_COUNT_WARNING_THRESHOLD = 40;
 
+interface AppConnectorTemplate {
+  id: string;
+  labelKey: string;
+  descriptionKey: string;
+  badgeKey: string;
+  detailKey: string;
+  icon: LucideIcon;
+  draft: McpServerDraft;
+}
+
+export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
+  {
+    id: "github",
+    labelKey: "McpPanel.templateGitHubLabel",
+    descriptionKey: "McpPanel.templateGitHubDescription",
+    badgeKey: "McpPanel.templateLocalBadge",
+    detailKey: "McpPanel.templateGitHubDetail",
+    icon: GitPullRequest,
+    draft: {
+      transportKind: "stdio",
+      label: "GitHub",
+      command: "docker",
+      argsText: [
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "-e",
+        "GITHUB_TOOLSETS",
+        "-e",
+        "GITHUB_READ_ONLY",
+        "ghcr.io/github/github-mcp-server",
+      ].join("\n"),
+      env: {
+        GITHUB_TOOLSETS: "repos,issues,pull_requests,actions",
+        GITHUB_READ_ONLY: "1",
+      },
+      timeoutText: "90",
+    },
+  },
+  {
+    id: "slack",
+    labelKey: "McpPanel.templateSlackLabel",
+    descriptionKey: "McpPanel.templateSlackDescription",
+    badgeKey: "McpPanel.templateRemoteBadge",
+    detailKey: "McpPanel.templateSlackDetail",
+    icon: MessageCircle,
+    draft: {
+      transportKind: "http",
+      label: "Slack",
+      url: "https://mcp.slack.com/mcp",
+      timeoutText: "90",
+    },
+  },
+  {
+    id: "atlassian",
+    labelKey: "McpPanel.templateAtlassianLabel",
+    descriptionKey: "McpPanel.templateAtlassianDescription",
+    badgeKey: "McpPanel.templateRemoteBadge",
+    detailKey: "McpPanel.templateAtlassianDetail",
+    icon: Ticket,
+    draft: {
+      transportKind: "http",
+      label: "Atlassian",
+      url: "https://mcp.atlassian.com/v1/mcp/authv2",
+      timeoutText: "90",
+    },
+  },
+  {
+    id: "google-drive",
+    labelKey: "McpPanel.templateGoogleDriveLabel",
+    descriptionKey: "McpPanel.templateGoogleDriveDescription",
+    badgeKey: "McpPanel.templateRemoteBadge",
+    detailKey: "McpPanel.templateGoogleDriveDetail",
+    icon: HardDrive,
+    draft: {
+      transportKind: "http",
+      label: "Google Drive",
+      url: "https://drivemcp.googleapis.com/mcp/v1",
+      timeoutText: "90",
+    },
+  },
+  {
+    id: "gmail",
+    labelKey: "McpPanel.templateGmailLabel",
+    descriptionKey: "McpPanel.templateGmailDescription",
+    badgeKey: "McpPanel.templateRemoteBadge",
+    detailKey: "McpPanel.templateGmailDetail",
+    icon: Mail,
+    draft: {
+      transportKind: "http",
+      label: "Gmail",
+      url: "https://gmailmcp.googleapis.com/mcp/v1",
+      timeoutText: "90",
+    },
+  },
+  {
+    id: "custom-http",
+    labelKey: "McpPanel.templateCustomHttpLabel",
+    descriptionKey: "McpPanel.templateCustomHttpDescription",
+    badgeKey: "McpPanel.templateRemoteBadge",
+    detailKey: "McpPanel.templateCustomHttpDetail",
+    icon: Cloud,
+    draft: {
+      transportKind: "http",
+      label: "Custom app",
+      url: "",
+      timeoutText: "60",
+    },
+  },
+];
+
 function toEntry(server: McpServerInfo, overrides: Partial<McpServerEntry> = {}): McpServerEntry {
   return {
     id: server.id,
@@ -72,6 +203,136 @@ function transportSummary(server: McpServerInfo): string {
   return server.transport.type === "stdio"
     ? [server.transport.command, ...server.transport.args].join(" ")
     : server.transport.url;
+}
+
+/** Status-pill tone per live `mcp-oauth://status` phase — mirrors
+ * `STATUS_TONE`'s role for `McpStatus`. `"idle"` never reaches this (the
+ * pill is only rendered once `oauthStatus[server.id]` exists). */
+const OAUTH_PHASE_TONE: Partial<Record<McpOAuthPhase, PillTone>> = {
+  discovering: "warning",
+  needs_client_id: "warning",
+  opening_browser: "warning",
+  waiting_for_browser: "warning",
+  exchanging_token: "warning",
+  connected: "success",
+  error: "danger",
+  cancelled: "neutral",
+};
+
+/**
+ * Generic MCP-spec OAuth 2.0 "Connect via OAuth" action for one HTTP
+ * server's connection-settings disclosure (see `ServerRow`) — an
+ * alternative to (not a replacement for) the manual bearer-token field right
+ * above it. Streams live phase transitions from `mcpStore.oauthStatus` (fed
+ * by `src-tauri/src/mcp_oauth.rs`'s `mcp-oauth://status` events): opening the
+ * browser, waiting for it, exchanging the code, or — for a server whose
+ * authorization server doesn't support dynamic client registration (e.g.
+ * Google's) — prompting for a client id from the user's own OAuth app
+ * registration and retrying.
+ */
+function OAuthConnectSection({ server }: { server: McpServerInfo }) {
+  const { t } = useT();
+  const oauthConnect = useMcpStore((s) => s.oauthConnect);
+  const oauthCancel = useMcpStore((s) => s.oauthCancel);
+  const oauthDisconnect = useMcpStore((s) => s.oauthDisconnect);
+  const connect = useMcpStore((s) => s.connect);
+  const phaseInfo = useMcpStore((s) => s.oauthStatus[server.id]);
+
+  const [clientIdInput, setClientIdInput] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+
+  const phase: McpOAuthPhase = phaseInfo?.phase ?? "idle";
+
+  async function handleConnect(clientId?: string) {
+    setConnecting(true);
+    try {
+      await oauthConnect(server.id, clientId);
+      // `mcp_oauth_connect` only saves credentials to the keychain — it
+      // never itself connects/reconnects the MCP server (see that command's
+      // own doc comment), so the server's top-level status pill would
+      // otherwise stay "disconnected" until the user separately notices and
+      // hits the unrelated Reconnect button. Follow success with the normal
+      // connect, same as `AddMcpServerForm`'s add-then-connect flow; a
+      // failure here surfaces via the server row's own status pill
+      // (`mcp://status` -> "error"), nothing further to do.
+      await connect(server.id).catch(() => {});
+    } catch {
+      // Surfaced via `phaseInfo.error`/the status pill already — the
+      // `mcp-oauth://status` event that caused this rejection landed first.
+    } finally {
+      setConnecting(false);
+    }
+  }
+
+  async function handleDisconnect() {
+    setDisconnecting(true);
+    try {
+      await oauthDisconnect(server.id);
+    } finally {
+      setDisconnecting(false);
+    }
+  }
+
+  if (server.hasOauth) {
+    return (
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="font-mono text-xs text-muted">{t("McpPanel.oauthConnected")}</span>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void handleDisconnect()}
+          disabled={disconnecting}
+          className="text-danger hover:bg-danger-soft"
+        >
+          {disconnecting ? t("McpPanel.oauthDisconnectingButton") : t("McpPanel.oauthDisconnectButton")}
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void handleConnect(clientIdInput.trim() || undefined)}
+          disabled={connecting}
+        >
+          {connecting ? t("McpPanel.oauthConnectingButton") : t("McpPanel.oauthConnectButton")}
+        </Button>
+        {connecting && (
+          <Button variant="ghost" size="sm" onClick={() => void oauthCancel(server.id)}>
+            {t("McpPanel.oauthCancelButton")}
+          </Button>
+        )}
+        {phase !== "idle" && (
+          <StatusPill tone={OAUTH_PHASE_TONE[phase] ?? "neutral"}>{t(`McpPanel.oauthPhase_${phase}`)}</StatusPill>
+        )}
+      </div>
+      {phase === "needs_client_id" && (
+        <div className="flex items-center gap-1.5">
+          <input
+            type="text"
+            value={clientIdInput}
+            onChange={(event) => setClientIdInput(event.target.value)}
+            placeholder={t("McpPanel.oauthClientIdPlaceholder")}
+            className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+          />
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void handleConnect(clientIdInput.trim())}
+            disabled={!clientIdInput.trim() || connecting}
+          >
+            {t("McpPanel.oauthContinueButton")}
+          </Button>
+        </div>
+      )}
+      {phase === "error" && phaseInfo?.error && <p className="text-xs text-danger">{lastErrorLine(phaseInfo.error)}</p>}
+    </div>
+  );
 }
 
 /** One configured server: status pill, enable toggle, reconnect/remove
@@ -234,35 +495,43 @@ function ServerRow({ server }: { server: McpServerInfo }) {
           </div>
 
           {server.transport.type === "http" && (
-            <div className="flex flex-col gap-1">
-              {server.hasHttpToken ? (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="font-mono text-xs text-muted">{t("McpPanel.tokenSaved")}</span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => void handleRemoveToken()}
-                    disabled={removingToken}
-                    className="text-danger hover:bg-danger-soft"
-                  >
-                    {removingToken ? t("McpPanel.tokenRemovingButton") : t("McpPanel.tokenRemoveButton")}
-                  </Button>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1.5">
-                  <input
-                    type="password"
-                    value={tokenInput}
-                    onChange={(event) => setTokenInput(event.target.value)}
-                    placeholder={t("McpPanel.tokenPlaceholder")}
-                    autoComplete="off"
-                    className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
-                  />
-                  <Button variant="ghost" size="sm" onClick={() => void handleSaveToken()} disabled={savingToken || !tokenInput.trim()}>
-                    {savingToken ? t("McpPanel.tokenSavingButton") : t("McpPanel.tokenSaveButton")}
-                  </Button>
-                </div>
-              )}
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-faint">{t("McpPanel.oauthSectionHeading")}</span>
+                <OAuthConnectSection server={server} />
+              </div>
+
+              <div className="flex flex-col gap-1 border-t border-border pt-2">
+                <span className="text-xs font-medium text-faint">{t("McpPanel.tokenSectionHeading")}</span>
+                {server.hasHttpToken ? (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono text-xs text-muted">{t("McpPanel.tokenSaved")}</span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void handleRemoveToken()}
+                      disabled={removingToken}
+                      className="text-danger hover:bg-danger-soft"
+                    >
+                      {removingToken ? t("McpPanel.tokenRemovingButton") : t("McpPanel.tokenRemoveButton")}
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="password"
+                      value={tokenInput}
+                      onChange={(event) => setTokenInput(event.target.value)}
+                      placeholder={t("McpPanel.tokenPlaceholder")}
+                      autoComplete="off"
+                      className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+                    />
+                    <Button variant="ghost" size="sm" onClick={() => void handleSaveToken()} disabled={savingToken || !tokenInput.trim()}>
+                      {savingToken ? t("McpPanel.tokenSavingButton") : t("McpPanel.tokenSaveButton")}
+                    </Button>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -308,15 +577,61 @@ function ServerRow({ server }: { server: McpServerInfo }) {
 export function McpPanel() {
   const { t } = useT();
   const servers = useMcpStore((s) => s.servers);
+  const [draft, setDraft] = useState<McpServerDraft | null>(null);
+  const [draftVersion, setDraftVersion] = useState(0);
 
   const totalCachedTools = servers
     .filter((s) => s.enabled && s.status === "connected")
     .reduce((sum, s) => sum + s.tools.length, 0);
 
   return (
-    <div className="flex flex-col gap-3 p-2">
+    <div className="flex flex-col gap-3 py-2">
       <p className="text-xs text-muted">{t("McpPanel.description")}</p>
       <p className="rounded-md bg-warning-soft px-2 py-1.5 text-xs text-warning">{t("McpPanel.sideEffectsNotice")}</p>
+
+      <section className="rounded-lg border border-border bg-surface p-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-foreground">{t("McpPanel.appConnectorsHeading")}</h3>
+            <p className="mt-1 text-xs leading-5 text-muted">{t("McpPanel.appConnectorsDescription")}</p>
+          </div>
+        </div>
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          {APP_CONNECTOR_TEMPLATES.map((template) => {
+            const Icon = template.icon;
+            return (
+              <article key={template.id} className="rounded-lg border border-border bg-background p-3">
+                <div className="flex items-start gap-3">
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-surface-2 text-muted">
+                    <Icon size={17} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h4 className="text-sm font-semibold text-foreground">{t(template.labelKey)}</h4>
+                      <span className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium text-faint">
+                        {t(template.badgeKey)}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs leading-5 text-muted">{t(template.descriptionKey)}</p>
+                    <p className="mt-2 text-[11px] leading-4 text-faint">{t(template.detailKey)}</p>
+                  </div>
+                </div>
+                <div className="mt-3 flex justify-end">
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      setDraft({ ...template.draft, env: template.draft.env ? { ...template.draft.env } : undefined });
+                      setDraftVersion((version) => version + 1);
+                    }}
+                  >
+                    {t("McpPanel.useTemplateButton")}
+                  </Button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
 
       {totalCachedTools > TOOL_COUNT_WARNING_THRESHOLD && (
         <p className="rounded-md bg-warning-soft px-2 py-1.5 text-xs text-warning">
@@ -337,7 +652,7 @@ export function McpPanel() {
         </div>
       )}
 
-      <AddMcpServerForm />
+      <AddMcpServerForm draft={draft} draftVersion={draftVersion} />
     </div>
   );
 }

@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// Shared with `memory.rs`'s `fact_deserializes_canonical_fixture` Rust test
+// (which reads the same file via `include_str!`) — see the note on the
+// `it(...)` below that uses this.
+import canonicalFactFixture from "../../src-tauri/fixtures/memory-fact.canonical.json";
 
 const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 
 import { useRulesStore, type MemoryFact, type RuleFile } from "./rulesStore";
 
@@ -73,6 +77,20 @@ describe("rulesStore.refresh", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("memory_list");
     expect(useRulesStore.getState().facts).toEqual([fact]);
+  });
+
+  /** Reads the exact same file `memory.rs`'s
+   * `fact_deserializes_canonical_fixture` Rust test reads via
+   * `include_str!` — a single shared fixture, not two independently
+   * hand-typed literals, is what actually pins the TS<->Rust `Fact` schema
+   * against drift, since `monkey-cli` reads `Fact` directly without going
+   * through this store at all. */
+  it("caches the same canonical fact the Rust unit test pins", async () => {
+    mockInvokes([], [canonicalFactFixture as MemoryFact]);
+
+    await useRulesStore.getState().refresh();
+
+    expect(useRulesStore.getState().facts).toEqual([canonicalFactFixture]);
   });
 
   it("falls back to an empty facts list instead of throwing when memory_list errors, without wiping out rules", async () => {

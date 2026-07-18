@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import canonicalEntryFixture from "../../src-tauri/fixtures/prompt-entry.canonical.json";
 
 const invokeMock = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
@@ -174,7 +174,7 @@ describe("hydratePrompts", () => {
    * `prompt_entry_deserializes_canonical_fixture` Rust test reads via
    * `include_str!` — a single shared fixture, not two independently
    * hand-typed literals, is what actually pins the TS<->Rust schema against
-   * drift, since `lm-cli` reads `PromptEntry` directly without going
+   * drift, since `monkey-cli` reads `PromptEntry` directly without going
    * through this store at all. */
   it("normalizes the same canonical entry the Rust unit test pins", async () => {
     const canonicalEntry = canonicalEntryFixture;

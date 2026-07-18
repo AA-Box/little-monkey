@@ -170,7 +170,9 @@ window.addEventListener('message', function (e) {{
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
-        .build(tauri::test::mock_context(HostPageAsset(host_html.into_bytes())))
+        .build(tauri::test::mock_context(HostPageAsset(
+            host_html.into_bytes(),
+        )))
         .expect("failed to build the verification app");
 
     // The verdict arrives through `on_document_title_changed` — the opt-in
@@ -251,9 +253,16 @@ window.addEventListener('message', function (e) {{
 /// that path reports its own diagnostic and exit code inline above.
 fn evaluate_and_report(payload: &str) -> i32 {
     eprintln!("Probe result from inside the artifact:// frame: {payload}");
-    let parsed: serde_json::Value = serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
-    let internals = parsed.get("internals").and_then(|v| v.as_str()).unwrap_or("");
-    let tauri_global = parsed.get("tauriGlobal").and_then(|v| v.as_str()).unwrap_or("");
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
+    let internals = parsed
+        .get("internals")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tauri_global = parsed
+        .get("tauriGlobal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let _ = std::io::stderr().flush();
     if internals == "undefined" && tauri_global == "undefined" {
         eprintln!("PASS: window.__TAURI_INTERNALS__ and window.__TAURI__ are both undefined inside the artifact:// frame.");

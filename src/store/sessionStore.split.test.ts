@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // individual tests below can make `sessions_load` return a specific blob,
 // same pattern as `promptStore.test.ts`.
 const invokeMock = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
@@ -25,8 +25,13 @@ function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSess
     unread: false,
     archived: false,
     groupId: null,
+    modelTarget: null,
+    comparisonBranch: null,
     workspacePath: null,
     personaId: null,
+    attachedStackIds: [],
+    docChatMode: false,
+    subagentRuns: {},
     ...overrides,
   };
 }
@@ -205,5 +210,197 @@ describe("hydrateSessions persona default", () => {
     await hydrateSessions();
 
     expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.personaId).toBeNull();
+  });
+});
+
+describe("toggleAttachedStack", () => {
+  it("attaches a stack id not yet attached", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.attachedStackIds).toEqual(["stack-1"]);
+  });
+
+  it("detaches an already-attached stack id", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.attachedStackIds).toEqual([]);
+  });
+
+  it("supports multiple attached stacks at once", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    useSessionStore.getState().toggleAttachedStack("a", "stack-2");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.attachedStackIds).toEqual(["stack-1", "stack-2"]);
+  });
+
+  it("only affects the targeted session", () => {
+    useSessionStore.getState().toggleAttachedStack("a", "stack-1");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.attachedStackIds).toEqual([]);
+  });
+});
+
+describe("toggleDocChatMode", () => {
+  it("turns doc-chat mode on for a session that starts with it off", () => {
+    useSessionStore.getState().toggleDocChatMode("a");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.docChatMode).toBe(true);
+  });
+
+  it("turns it back off on a second toggle", () => {
+    useSessionStore.getState().toggleDocChatMode("a");
+    useSessionStore.getState().toggleDocChatMode("a");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.docChatMode).toBe(false);
+  });
+
+  it("only affects the targeted session", () => {
+    useSessionStore.getState().toggleDocChatMode("a");
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "b")?.docChatMode).toBe(false);
+  });
+});
+
+describe("deleteGroup", () => {
+  it("deletes a folder group and safely unfiles every session it contained", () => {
+    useSessionStore.setState((state) => ({
+      groups: [
+        { id: "folder", name: "Folder", kind: "folder", createdAt: 1 },
+        { id: "other", name: "Other", kind: "folder", createdAt: 2 },
+      ],
+      sessions: state.sessions.map((session) => ({
+        ...session,
+        groupId: session.id === "a" ? "folder" : "other",
+      })),
+    }));
+
+    useSessionStore.getState().deleteGroup("folder");
+
+    const state = useSessionStore.getState();
+    expect(state.groups.map((group) => group.id)).toEqual(["other"]);
+    expect(state.sessions.find((session) => session.id === "a")?.groupId).toBeNull();
+    expect(state.sessions.find((session) => session.id === "b")?.groupId).toBe("other");
+  });
+
+  it("never deletes comparison groups or changes their branch membership", () => {
+    useSessionStore.setState((state) => ({
+      groups: [{
+        id: "comparison",
+        name: "Comparison",
+        kind: "comparison",
+        createdAt: 1,
+        comparison: {
+          sourceSessionId: "a",
+          prompt: "Compare",
+          baseMessageCount: 0,
+          storedContent: null,
+          wireContent: null,
+          unresolvedReferences: [],
+          effort: null,
+          systemPrompt: null,
+          contextMessages: [],
+          executionPlan: null,
+          synthesis: null,
+        },
+      }],
+      sessions: state.sessions.map((session) => ({ ...session, groupId: "comparison" })),
+    }));
+
+    useSessionStore.getState().deleteGroup("comparison");
+
+    const state = useSessionStore.getState();
+    expect(state.groups).toHaveLength(1);
+    expect(state.sessions.every((session) => session.groupId === "comparison")).toBe(true);
+  });
+});
+
+describe("hydrateSessions docChatMode default", () => {
+  it("defaults docChatMode to false for a persisted session predating the field", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            personaId: null,
+            attachedStackIds: [],
+            // No `docChatMode` field at all — simulates a blob saved before
+            // this feature existed.
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.docChatMode).toBe(false);
+  });
+});
+
+describe("hydrateSessions attachedStackIds default", () => {
+  it("defaults attachedStackIds to [] for a persisted session predating the field", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            personaId: null,
+            // No `attachedStackIds` field at all — simulates a blob saved
+            // before this feature existed.
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.attachedStackIds).toEqual([]);
+  });
+
+  it("drops non-string entries from a corrupt persisted attachedStackIds array", async () => {
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old",
+            title: "Old session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            personaId: null,
+            attachedStackIds: ["stack-1", 42, null, "stack-2"],
+          },
+        ],
+        activeSessionId: "old",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "old")?.attachedStackIds).toEqual([
+      "stack-1",
+      "stack-2",
+    ]);
   });
 });

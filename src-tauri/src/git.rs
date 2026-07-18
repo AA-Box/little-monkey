@@ -151,11 +151,15 @@ pub fn git_status(state: tauri::State<'_, AppState>) -> Result<GitStatusPayload,
     }
 
     let branch_output = run_git(&root, &["branch", "--show-current"])?;
-    let branch_name = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+    let branch_name = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
     let branch = if branch_name.is_empty() {
         // Detached HEAD: `branch --show-current` prints nothing.
         let short_hash_output = run_git(&root, &["rev-parse", "--short", "HEAD"])?;
-        let short_hash = String::from_utf8_lossy(&short_hash_output.stdout).trim().to_string();
+        let short_hash = String::from_utf8_lossy(&short_hash_output.stdout)
+            .trim()
+            .to_string();
         Some(format!("detached@{}", short_hash))
     } else {
         Some(branch_name)
@@ -221,7 +225,146 @@ fn detect_worktree_name(git_dir: &str, common_dir: &str) -> Option<String> {
         return None;
     }
 
-    Path::new(git_dir).file_name().map(|n| n.to_string_lossy().to_string())
+    Path::new(git_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+}
+
+/// One changed path in the working tree, for the diff panel's file list.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChangedFile {
+    /// Repo-relative path (the new path, for renames).
+    pub path: String,
+    /// Single-letter change kind: "A"dded (incl. untracked), "M"odified,
+    /// "D"eleted, "R"enamed — condensed from porcelain's two-column code.
+    pub status: String,
+}
+
+/// Condense a porcelain v1 two-column `XY` code into the single letter the
+/// diff panel displays. Worktree column wins when it carries a change so
+/// e.g. staged-modified-then-deleted reads as deleted.
+fn condense_porcelain_code(x: char, y: char) -> String {
+    let pick = if y != ' ' && y != '?' { y } else { x };
+    match pick {
+        '?' => "A".to_string(),
+        'C' => "A".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// List every changed path (staged, unstaged, and untracked) relative to
+/// HEAD, in porcelain order. Backs the diff panel's file list.
+#[tauri::command]
+pub fn git_changed_files(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<GitChangedFile>, String> {
+    let root = workspace_root(state.inner())?;
+
+    let output = run_git(&root, &["status", "--porcelain", "-z"])?;
+    if !output.status.success() {
+        // Not a repo (or git failed): an empty list, mirroring git_status's
+        // "normal, expected state" treatment.
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    // Porcelain v1 -z: `XY path\0`, with renames/copies emitting the
+    // original path as an extra NUL-terminated entry right after.
+    let mut entries = output.stdout.split(|&b| b == 0);
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let x = entry[0] as char;
+        let y = entry[1] as char;
+        let path = String::from_utf8_lossy(&entry[3..]).to_string();
+        if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            // Consume (and drop) the rename/copy source path entry.
+            let _ = entries.next();
+        }
+        files.push(GitChangedFile {
+            path,
+            status: condense_porcelain_code(x, y),
+        });
+    }
+    Ok(files)
+}
+
+/// Both sides of a working-tree diff for one file, for the diff panel.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileDiff {
+    /// Content at HEAD ("" for untracked/added files or an unborn HEAD).
+    pub original: String,
+    /// Content on disk ("" for deleted files).
+    pub current: String,
+    /// Either side looked binary — both strings are empty then.
+    pub binary: bool,
+    /// Either side exceeded the size cap — both strings are empty then.
+    pub oversize: bool,
+}
+
+/// Per-side cap for the diff panel; beyond this the UI shows a notice
+/// instead of a diff (the LCS view would be useless at that size anyway).
+const MAX_DIFF_SIDE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Load HEAD vs working-tree content for one repo-relative path.
+#[tauri::command]
+pub fn git_file_diff(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<GitFileDiff, String> {
+    let root = workspace_root(state.inner())?;
+
+    // The path must stay inside the workspace: reject absolute paths and
+    // any traversal component. (Paths come from `git_changed_files`, but
+    // the command surface shouldn't rely on that.)
+    let rel = Path::new(&path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_)))
+    {
+        return Err("Path must be relative to the workspace root".to_string());
+    }
+
+    // `git show HEAD:<path>` needs the path in git's own notation (forward
+    // slashes, relative to repo root). Failure is a normal state: untracked
+    // or newly-added files have no HEAD side, unborn repos have no HEAD.
+    let git_path = path.replace('\\', "/");
+    let show_output = run_git(&root, &["show", &format!("HEAD:{git_path}")])?;
+    let original_bytes = if show_output.status.success() {
+        show_output.stdout
+    } else {
+        Vec::new()
+    };
+
+    let current_bytes = std::fs::read(root.join(rel)).unwrap_or_default();
+
+    if is_binary(&original_bytes) || is_binary(&current_bytes) {
+        return Ok(GitFileDiff {
+            original: String::new(),
+            current: String::new(),
+            binary: true,
+            oversize: false,
+        });
+    }
+    if original_bytes.len() > MAX_DIFF_SIDE_BYTES || current_bytes.len() > MAX_DIFF_SIDE_BYTES {
+        return Ok(GitFileDiff {
+            original: String::new(),
+            current: String::new(),
+            binary: false,
+            oversize: true,
+        });
+    }
+
+    Ok(GitFileDiff {
+        original: String::from_utf8_lossy(&original_bytes).to_string(),
+        current: String::from_utf8_lossy(&current_bytes).to_string(),
+        binary: false,
+        oversize: false,
+    })
 }
 
 /// Stage everything and commit with `message`. Mirrors the default behavior
@@ -237,7 +380,9 @@ pub fn git_commit(state: tauri::State<'_, AppState>, message: String) -> Result<
 
     let add_output = run_git(&root, &["add", "-A"])?;
     if !add_output.status.success() {
-        return Err(String::from_utf8_lossy(&add_output.stderr).trim().to_string());
+        return Err(String::from_utf8_lossy(&add_output.stderr)
+            .trim()
+            .to_string());
     }
 
     // The message is passed as a single `Command::arg`, never
@@ -253,7 +398,9 @@ pub fn git_commit(state: tauri::State<'_, AppState>, message: String) -> Result<
         .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if !commit_output.status.success() {
-        return Err(String::from_utf8_lossy(&commit_output.stderr).trim().to_string());
+        return Err(String::from_utf8_lossy(&commit_output.stderr)
+            .trim()
+            .to_string());
     }
 
     let stdout = String::from_utf8_lossy(&commit_output.stdout);
@@ -265,9 +412,248 @@ pub fn git_commit(state: tauri::State<'_, AppState>, message: String) -> Result<
     Ok(summary_line.unwrap_or_else(|| "Committed successfully".to_string()))
 }
 
+/// One changed file in a [`ReviewPayload`]: full before/after content so the
+/// frontend can render unified or split diffs (and collapse unmodified
+/// hunks) without a second round-trip per file.
+#[derive(serde::Serialize)]
+pub struct ReviewFilePayload {
+    pub path: String,
+    pub old_content: String,
+    pub new_content: String,
+    pub added: u32,
+    pub deleted: u32,
+    /// Binary or oversized files carry no content — the UI shows a stub row.
+    pub binary: bool,
+}
+
+/// Snapshot backing the Review panel: every change between the review base
+/// and the working tree, plus branch/target labels and a compare URL.
+#[derive(serde::Serialize)]
+pub struct ReviewPayload {
+    pub is_repo: bool,
+    pub branch: Option<String>,
+    /// The upstream/default target this branch is compared against in
+    /// "branch" mode (e.g. `origin/develop`), when one can be resolved.
+    pub target: Option<String>,
+    pub total_added: u32,
+    pub total_deleted: u32,
+    pub files: Vec<ReviewFilePayload>,
+    /// A web URL for opening a compare/PR page for this branch, when the
+    /// `origin` remote is a recognizable GitHub/GitLab-style HTTPS/SSH URL.
+    pub pr_url: Option<String>,
+}
+
+/// Per-file content above this size is not shipped to the frontend — the
+/// row still appears with its numstat counts, flagged like a binary.
+const MAX_REVIEW_FILE_BYTES: usize = 1024 * 1024;
+/// Hard cap on files in one review payload, keeping the IPC message sane on
+/// pathological trees.
+const MAX_REVIEW_FILES: usize = 300;
+
+/// Resolves the branch's comparison target: its configured upstream if any,
+/// otherwise the remote's default branch (`origin/HEAD`), otherwise `None`.
+fn review_target(root: &Path) -> Option<String> {
+    let upstream = run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).ok()?;
+    if upstream.status.success() {
+        let name = String::from_utf8_lossy(&upstream.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    let origin_head = run_git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).ok()?;
+    if origin_head.status.success() {
+        let name = String::from_utf8_lossy(&origin_head.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Builds a GitHub-style compare URL from `origin`'s remote URL, tolerating
+/// both HTTPS and `git@host:owner/repo.git` SSH forms. Returns `None` for
+/// anything unrecognizable rather than guessing.
+fn compare_url(remote: &str, target: &str, branch: &str) -> Option<String> {
+    let remote = remote.trim();
+    let https = if let Some(rest) = remote.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("https://{host}/{path}")
+    } else if remote.starts_with("https://") || remote.starts_with("http://") {
+        remote.to_string()
+    } else {
+        return None;
+    };
+    let base = https.trim_end_matches('/').trim_end_matches(".git");
+    // Strip the remote name off the target ("origin/develop" -> "develop").
+    let target_branch = target.split_once('/').map_or(target, |(_, b)| b);
+    Some(format!("{base}/compare/{target_branch}...{branch}?expand=1"))
+}
+
+/// Full-content review snapshot. `mode` is `"branch"` (merge-base of the
+/// upstream target vs the working tree — the "what would this PR contain"
+/// view) or `"working"` (HEAD vs the working tree — uncommitted changes
+/// only). Like [`git_status`], a direct human-initiated UI read, not an
+/// agent tool — no permission gate.
+#[tauri::command]
+pub fn git_review(state: tauri::State<'_, AppState>, mode: String) -> Result<ReviewPayload, String> {
+    let root = workspace_root(state.inner())?;
+
+    let empty = ReviewPayload {
+        is_repo: false,
+        branch: None,
+        target: None,
+        total_added: 0,
+        total_deleted: 0,
+        files: Vec::new(),
+        pr_url: None,
+    };
+
+    let is_repo_output = run_git(&root, &["rev-parse", "--is-inside-work-tree"])?;
+    if !is_repo_output.status.success()
+        || String::from_utf8_lossy(&is_repo_output.stdout).trim() != "true"
+    {
+        return Ok(empty);
+    }
+
+    let branch_output = run_git(&root, &["branch", "--show-current"])?;
+    let branch_name = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+    let branch = if branch_name.is_empty() { None } else { Some(branch_name.clone()) };
+
+    let target = review_target(&root);
+
+    const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let head_exists = run_git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?
+        .status
+        .success();
+
+    // The diff base: merge-base(target, HEAD) in branch mode (falling back
+    // to HEAD when there's no target), HEAD in working mode, and the empty
+    // tree for a repo with no commits yet in either mode.
+    let base = if !head_exists {
+        EMPTY_TREE_HASH.to_string()
+    } else if mode == "branch" {
+        match &target {
+            Some(target_ref) => {
+                let merge_base = run_git(&root, &["merge-base", target_ref, "HEAD"])?;
+                if merge_base.status.success() {
+                    String::from_utf8_lossy(&merge_base.stdout).trim().to_string()
+                } else {
+                    "HEAD".to_string()
+                }
+            }
+            None => "HEAD".to_string(),
+        }
+    } else {
+        "HEAD".to_string()
+    };
+
+    // Tracked changes (staged + unstaged) against the base, rename detection
+    // off so every entry is a plain single-path add/modify/delete.
+    let numstat = run_git(&root, &["diff", "--numstat", "--no-renames", "-z", &base])?;
+    if !numstat.status.success() {
+        return Err(String::from_utf8_lossy(&numstat.stderr).trim().to_string());
+    }
+
+    let mut files = Vec::new();
+    let mut total_added = 0u32;
+    let mut total_deleted = 0u32;
+
+    // `--numstat -z` records: "added\tdeleted\tpath\0" (binary = "-\t-\t").
+    for record in numstat.stdout.split(|&b| b == 0) {
+        if record.is_empty() || files.len() >= MAX_REVIEW_FILES {
+            continue;
+        }
+        let record = String::from_utf8_lossy(record);
+        let mut parts = record.splitn(3, '\t');
+        let (Some(added_raw), Some(deleted_raw), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let added = added_raw.parse::<u32>().unwrap_or(0);
+        let deleted = deleted_raw.parse::<u32>().unwrap_or(0);
+        let numstat_binary = added_raw == "-";
+        total_added += added;
+        total_deleted += deleted;
+
+        let old_output = run_git(&root, &["show", &format!("{base}:{path}")])?;
+        let old_bytes = if old_output.status.success() { old_output.stdout } else { Vec::new() };
+        let new_bytes = std::fs::read(root.join(path)).unwrap_or_default();
+
+        let binary = numstat_binary
+            || is_binary(&old_bytes)
+            || is_binary(&new_bytes)
+            || old_bytes.len() > MAX_REVIEW_FILE_BYTES
+            || new_bytes.len() > MAX_REVIEW_FILE_BYTES;
+
+        files.push(ReviewFilePayload {
+            path: path.to_string(),
+            old_content: if binary { String::new() } else { String::from_utf8_lossy(&old_bytes).to_string() },
+            new_content: if binary { String::new() } else { String::from_utf8_lossy(&new_bytes).to_string() },
+            added,
+            deleted,
+            binary,
+        });
+    }
+
+    // Untracked files: additions the tree diff can't see.
+    let untracked = run_git(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if untracked.status.success() {
+        for raw_path in untracked.stdout.split(|&b| b == 0) {
+            if raw_path.is_empty() || files.len() >= MAX_REVIEW_FILES {
+                continue;
+            }
+            let path = String::from_utf8_lossy(raw_path).to_string();
+            let bytes = std::fs::read(root.join(&path)).unwrap_or_default();
+            let binary = is_binary(&bytes) || bytes.len() > MAX_REVIEW_FILE_BYTES;
+            let added = if binary { 0 } else { count_lines(&bytes) };
+            total_added += added;
+            files.push(ReviewFilePayload {
+                path,
+                old_content: String::new(),
+                new_content: if binary { String::new() } else { String::from_utf8_lossy(&bytes).to_string() },
+                added,
+                deleted: 0,
+                binary,
+            });
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let pr_url = match (&target, &branch) {
+        (Some(target_ref), Some(branch_ref)) => {
+            let remote = run_git(&root, &["remote", "get-url", "origin"])?;
+            if remote.status.success() {
+                compare_url(&String::from_utf8_lossy(&remote.stdout), target_ref, branch_ref)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    Ok(ReviewPayload {
+        is_repo: true,
+        branch,
+        target,
+        total_added,
+        total_deleted,
+        files,
+        pr_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn condense_porcelain_code_prefers_worktree_column() {
+        assert_eq!(condense_porcelain_code('M', ' '), "M");
+        assert_eq!(condense_porcelain_code(' ', 'M'), "M");
+        assert_eq!(condense_porcelain_code('A', 'D'), "D");
+        assert_eq!(condense_porcelain_code('?', '?'), "A");
+        assert_eq!(condense_porcelain_code('R', ' '), "R");
+    }
 
     #[test]
     fn parse_shortstat_handles_full_line() {

@@ -20,7 +20,7 @@
  * the string, `agentLoop.ts`'s dispatch branch looks the exact
  * `{ serverId, toolName }` up via `resolveMcpToolName`, against the
  * `McpToolRegistry` `mcpToolDefs()` returns alongside the defs themselves —
- * mirrors `lm-cli`'s `merged_tool_definitions`/`McpToolRegistry`, which
+ * mirrors `monkey-cli`'s `merged_tool_definitions`/`McpToolRegistry`, which
  * returns its own resolution table as a plain local value for exactly the
  * same reason: with the split pane, two turns (in different sessions) can
  * call `mcpToolDefs()` concurrently, and a *shared* module-level table would

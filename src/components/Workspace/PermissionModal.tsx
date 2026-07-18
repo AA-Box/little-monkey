@@ -80,12 +80,24 @@ export function PermissionModal() {
   useEffect(() => {
     if (!pending) return;
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") {
+      if (
+        e.key === "Escape" &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.repeat &&
+        !e.isComposing
+      ) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
         respond(false, false);
       }
     }
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    // Capture gives a visible permission prompt first ownership of Escape;
+    // lower Settings/session-menu listeners must not react to the same key.
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [pending, respond]);
 
   // Small mount transition (opacity/scale) — duration collapses to ~0 under
@@ -111,6 +123,14 @@ export function PermissionModal() {
   // `mcp_call_tool`'s `detail` construction) — friendlier than the raw
   // `mcp:<serverId>:<toolName>` permission-request string.
   const displayTool = isMcpTool ? pending.detail.split("\n", 1)[0] : pending.tool;
+  // Read directly off the payload's own `agent_label` field — a dedicated,
+  // separately-serialized field rather than something parsed back out of
+  // `detail` (see `permissionStore.ts`'s `PermissionRequest.agent_label` doc
+  // comment for why: a subagent's model-supplied `description` must never be
+  // able to forge/corrupt the shown detail text or spoof a different
+  // attribution).
+  const subagentDescription = pending.agent_label ?? null;
+  const displayDetail = pending.detail;
 
   return (
     <div
@@ -138,11 +158,17 @@ export function PermissionModal() {
           </div>
         </div>
 
+        {subagentDescription && (
+          <p className="mt-2 text-xs font-medium text-accent">
+            {t("PermissionModal.subagentAttribution", { description: subagentDescription })}
+          </p>
+        )}
+
         <RiskAnnotation pending={pending} t={t} />
 
         <div className="mt-4">
           <div className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-surface-2 p-2.5 font-mono text-xs text-muted">
-            {pending.detail}
+            {displayDetail}
           </div>
           {!canRememberForSession && (
             <p className="mt-2 text-xs text-faint">
@@ -159,7 +185,7 @@ export function PermissionModal() {
             type="button"
             variant="primary"
             onClick={() => respond(true, false)}
-            autoFocus={!canRememberForSession}
+            autoFocus
           >
             {t("PermissionModal.allowOnceButton")}
           </Button>
@@ -169,7 +195,6 @@ export function PermissionModal() {
               variant="secondary"
               className="border-warning/40 text-warning hover:bg-warning-soft"
               onClick={() => respond(true, true)}
-              autoFocus
             >
               {t("PermissionModal.allowForSessionButton")}
             </Button>

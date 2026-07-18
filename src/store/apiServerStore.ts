@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /** Mirrors the Rust `ApiServerStatusPayload` struct (src-tauri/src/server.rs)
@@ -20,8 +20,17 @@ export interface ApiServerStatus {
 
 /** Mirrors the Rust `Scope`/`Backend` enums (src-tauri/src/server.rs)
  * exactly — `#[serde(rename_all = "snake_case")]` on already-lowercase
- * single-word variant names serializes to exactly these strings. */
-export type Scope = "chat" | "models" | "embeddings";
+ * single-word variant names serializes to exactly these strings. `knowledge`/
+ * `workflow_run`/`artifact_read` are the phase-5 scopes gating the three
+ * extended routes in `handle_extended_request` (knowledge query, read-only
+ * workflow-run status, artifact read) — see that module's doc comment for
+ * why there's deliberately no route to *submit* a run over this API.
+ * `local_app_run` (Local App Builder) is never user-selectable — it's only
+ * ever minted by `mint_local_app_token` and shows up read-only on a Local
+ * App's scoped token in the general token list, but still needs to be a
+ * valid `Scope` value so that token renders correctly instead of falling
+ * through to `t()`'s raw-key fallback. */
+export type Scope = "chat" | "models" | "embeddings" | "knowledge" | "workflow_run" | "artifact_read" | "local_app_run";
 export type Backend = "local" | "ollama" | "providers";
 
 /** Mirrors the Rust `TokenEntryView` struct — never the digest, which stays
@@ -33,6 +42,29 @@ export interface TokenEntry {
   backends: Backend[];
   created_at: number;
   last_used_at: number | null;
+  /** Epoch milliseconds after which the server rejects this token, or
+   * `null` for a token that never expires. Mirrors `TokenEntry::expires_at`. */
+  expires_at: number | null;
+}
+
+/** Mirrors the Rust `TokenAuditEntry` struct returned by
+ * `api_server_export_audit` — the union of every still-active token
+ * (`revoked_at: null`) and every revoked one, with the digest/plaintext
+ * never present in either. */
+export interface TokenAuditEntry {
+  id: string;
+  label: string;
+  scopes: Scope[];
+  backends: Backend[];
+  created_at: number;
+  last_used_at: number | null;
+  revoked_at: number | null;
+  /** Epoch milliseconds after which this token stopped authenticating, or
+   * `null` if it never expires. A row with `revoked_at: null` and an
+   * `expires_at` in the past is a lapsed-but-not-revoked token — every
+   * request against it already gets a 401, so the panel must not render it
+   * as "Active". Mirrors `TokenAuditEntry::expires_at`. */
+  expires_at: number | null;
 }
 
 /** Mirrors the Rust `ApiServerConfigView` struct — the subset of
@@ -97,9 +129,12 @@ export interface ApiServerStore {
    * gracefully restarts it with the new settings (the `apiserver://status`
    * event subscription below picks up the resulting status change live). */
   setConfig: (config: ApiServerConfig) => Promise<void>;
-  createToken: (label: string, scopes: Scope[], backends: Backend[]) => Promise<void>;
+  createToken: (label: string, scopes: Scope[], backends: Backend[], expiresAt?: number | null) => Promise<void>;
   revokeToken: (id: string) => Promise<void>;
   dismissMintedToken: () => void;
+  /** Fetches the redacted revoke-and-active audit log for export/preview in
+   * the panel — never includes the digest or plaintext. */
+  exportAudit: () => Promise<TokenAuditEntry[]>;
 }
 
 export const useApiServerStore = create<ApiServerStore>((set) => ({
@@ -133,8 +168,13 @@ export const useApiServerStore = create<ApiServerStore>((set) => ({
     set({ config: updated });
   },
 
-  createToken: async (label, scopes, backends) => {
-    const result = await invoke<MintedToken>("api_server_create_token", { label, scopes, backends });
+  createToken: async (label, scopes, backends, expiresAt = null) => {
+    const result = await invoke<MintedToken>("api_server_create_token", {
+      label,
+      scopes,
+      backends,
+      expiresAt,
+    });
     set((state) => ({ mintedToken: result, tokens: [...state.tokens, result.entry] }));
   },
 
@@ -144,14 +184,19 @@ export const useApiServerStore = create<ApiServerStore>((set) => ({
   },
 
   dismissMintedToken: () => set({ mintedToken: null }),
+
+  exportAudit: () => invoke<TokenAuditEntry[]>("api_server_export_audit"),
 }));
 
 // Keeps `status` live without polling — same event-listen pattern as
 // `modelStore.ts`'s `llama://status`/`ollama://status` subscriptions.
-void listen<ApiServerStatus>("apiserver://status", (event) => {
-  useApiServerStore.setState({ status: event.payload });
-}).catch((error) => {
-  console.error("Failed to listen for apiserver://status events", error);
-});
+// Tauri-shell only: in plain-browser dev `listen` itself throws.
+if (isTauri()) {
+  void listen<ApiServerStatus>("apiserver://status", (event) => {
+    useApiServerStore.setState({ status: event.payload });
+  }).catch((error) => {
+    console.error("Failed to listen for apiserver://status events", error);
+  });
+}
 
 export default useApiServerStore;

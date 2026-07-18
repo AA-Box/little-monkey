@@ -49,7 +49,8 @@ export async function* streamProviderChat(
   messages: ChatMessage[],
   tools: ToolDef[],
   signal?: AbortSignal,
-  effort?: string
+  effort?: string,
+  runId?: string,
 ): AsyncGenerator<StreamEvent> {
   if (signal?.aborted) return;
 
@@ -115,6 +116,7 @@ export async function* streamProviderChat(
     messages,
     tools,
     effort: effort ?? null,
+    runId: runId ?? null,
   }).catch((err: unknown) => {
     fail(err instanceof Error ? err.message : String(err));
   });

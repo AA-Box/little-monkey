@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MoreVertical, Plus } from "lucide-react";
 
-import { type ChatSession, useSessionStore } from "../../store/sessionStore";
+import { sessionDisplayTitle, type ChatSession, useSessionStore } from "../../store/sessionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 import { SessionMenu } from "./SessionMenu";
@@ -20,6 +20,8 @@ export default function ChatSessionList() {
   const newSession = useSessionStore((state) => state.newSession);
   const switchSession = useSessionStore((state) => state.switchSession);
   const renameSession = useSessionStore((state) => state.renameSession);
+  const renameRequestId = useSessionStore((state) => state.renameRequestId);
+  const clearRenameRequest = useSessionStore((state) => state.clearRenameRequest);
   const { t } = useT();
 
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
@@ -30,8 +32,12 @@ export default function ChatSessionList() {
 
   const byUpdatedDesc = (a: ChatSession, b: ChatSession) => b.updatedAt - a.updatedAt;
 
-  const active = sessions.filter((s) => !s.archived);
-  const archivedSessions = sessions.filter((s) => s.archived).sort(byUpdatedDesc);
+  // Unstarted sessions (no messages yet — see `newSession`'s reset-in-place
+  // logic) stay out of the sidebar entirely, same as Claude Desktop: a "New
+  // session" only earns a row once the user actually sends something.
+  const started = sessions.filter((s) => s.messages.length > 0);
+  const active = started.filter((s) => !s.archived);
+  const archivedSessions = started.filter((s) => s.archived).sort(byUpdatedDesc);
   const pinned = active.filter((s) => s.pinned).sort(byUpdatedDesc);
   const groupedSections = groups
     .map((group) => ({
@@ -50,6 +56,23 @@ export default function ChatSessionList() {
     if (renamingId) renameSession(renamingId, renameValue);
     setRenamingId(null);
   };
+
+  // The global "Rename" shortcut (App.tsx) sets `renameRequestId` on the
+  // store rather than reaching into this component's local rename state
+  // directly — pick it up here and hand off to the same inline input the
+  // kebab menu's "Rename" uses.
+  useEffect(() => {
+    if (!renameRequestId) return;
+    const target = sessions.find((s) => s.id === renameRequestId);
+    if (target) {
+      startRename(target);
+      // The row only exists in the DOM once its section is open — an
+      // archived active session would otherwise start renaming invisibly.
+      if (target.archived) setArchivedOpen(true);
+    }
+    clearRenameRequest();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renameRequestId]);
 
   const renderRow = (session: ChatSession) => {
     const isActive = session.id === activeSessionId;
@@ -92,7 +115,7 @@ export default function ChatSessionList() {
             {session.unread && (
               <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-accent align-middle" />
             )}
-            {session.title}
+            {sessionDisplayTitle(session)}
           </span>
         )}
 

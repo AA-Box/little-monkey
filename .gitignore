@@ -28,6 +28,9 @@ target
 src-tauri/target
 src-tauri/gen/schemas
 
+# CLI sidecar staged by scripts/stage-cli-sidecar.mjs before tauri dev/build
+src-tauri/binaries/
+
 # Downloaded GGUF model weights
 /models/
 *.gguf
@@ -43,3 +46,8 @@ src-tauri/gen/schemas
 *.njsproj
 *.sln
 *.sw?
+
+# JetBrains extension build output
+extensions/little-monkey-jetbrains/.gradle
+extensions/little-monkey-jetbrains/.intellijPlatform
+extensions/little-monkey-jetbrains/build

@@ -3,8 +3,10 @@ import { Plus, Trash2 } from "lucide-react";
 import { Button, StatusPill } from "../ui";
 import {
   MAX_CHECKPOINT_RETENTION,
+  MAX_MAX_CONCURRENT_SUBAGENTS,
   MAX_VERIFY_MAX_ROUNDS,
   MIN_CHECKPOINT_RETENTION,
+  MIN_MAX_CONCURRENT_SUBAGENTS,
   MIN_VERIFY_MAX_ROUNDS,
   useSettingsStore,
   type ContextTrimStrategy,
@@ -12,6 +14,8 @@ import {
 import { useModelStore } from "../../store/modelStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { useVerifyStore, type VerifyCommand, type VerifyCommandKind } from "../../store/verifyStore";
+import { useWebStore, type SearchProvider } from "../../store/webStore";
+import { useCliInstallStore } from "../../store/cliInstallStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
 
@@ -52,6 +56,12 @@ function Toggle({
     </label>
   );
 }
+
+const WEB_PROVIDER_OPTIONS: { value: SearchProvider; labelKey: string; descriptionKey: string }[] = [
+  { value: "duckduckgo", labelKey: "WebPanel.providerDuckduckgoLabel", descriptionKey: "WebPanel.providerDuckduckgoDescription" },
+  { value: "brave", labelKey: "WebPanel.providerBraveLabel", descriptionKey: "WebPanel.providerBraveDescription" },
+  { value: "searxng", labelKey: "WebPanel.providerSearxngLabel", descriptionKey: "WebPanel.providerSearxngDescription" },
+];
 
 const STRATEGY_OPTIONS: { value: ContextTrimStrategy; labelKey: string; descriptionKey: string }[] = [
   { value: "summarize", labelKey: "AutomationPanel.strategySummarizeLabel", descriptionKey: "AutomationPanel.strategySummarizeDescription" },
@@ -173,6 +183,355 @@ function VerifyCommandRow({ command }: { command: VerifyCommand }) {
 }
 
 /**
+ * One profile's optional model override row (slice 4): a provider+model
+ * picker that, once both are chosen, calls `onSet` immediately — no separate
+ * "apply" button, since (unlike the vision-override list below, which
+ * accumulates many entries) there is only ever one value per profile, so
+ * committing on the second selection is the least surprising behavior. Shows
+ * a "Same as parent" badge when nothing is configured for this profile —
+ * the actual default, since an absent entry in `subagentProfileModels` means
+ * exactly that (see that setting's own doc comment).
+ */
+function SubagentModelOverrideRow({
+  labelKey,
+  override,
+  connectedProviders,
+  providerModels,
+  onSet,
+  onClear,
+}: {
+  labelKey: string;
+  override: { providerId: string; model: string } | undefined;
+  connectedProviders: { id: string; label: string }[];
+  providerModels: Record<string, { id: string }[]>;
+  onSet: (providerId: string, model: string) => void;
+  onClear: () => void;
+}) {
+  const { t } = useT();
+  const [providerId, setProviderId] = useState(override?.providerId ?? "");
+  const models = providerId ? providerModels[providerId] ?? [] : [];
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-border py-2.5 first:border-t-0">
+      <span className="w-28 shrink-0 text-sm text-foreground">{t(labelKey)}</span>
+      <select
+        value={providerId}
+        onChange={(event) => setProviderId(event.target.value)}
+        className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+      >
+        <option value="">{t("AutomationPanel.providerPlaceholderOption")}</option>
+        {connectedProviders.map((provider) => (
+          <option key={provider.id} value={provider.id}>
+            {provider.label}
+          </option>
+        ))}
+      </select>
+      <select
+        value={override?.providerId === providerId ? override.model : ""}
+        onChange={(event) => {
+          if (event.target.value) onSet(providerId, event.target.value);
+        }}
+        disabled={!providerId}
+        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed"
+      >
+        <option value="">{t("AutomationPanel.modelPlaceholderOption")}</option>
+        {models.map((model) => (
+          <option key={model.id} value={model.id}>
+            {model.id}
+          </option>
+        ))}
+      </select>
+      {override ? (
+        <button type="button" onClick={onClear} className="shrink-0 cursor-pointer text-xs text-faint hover:text-danger">
+          {t("AutomationPanel.clearButton")}
+        </button>
+      ) : (
+        <StatusPill tone="neutral">{t("AutomationPanel.subagentModelOverrideDefaultBadge")}</StatusPill>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Web tools settings — folded into this panel from a standalone "Web" tab
+ * (ROADMAP.md §3.9's own decision, previously undone; see git history) so
+ * Settings stays at the roadmap's stated 9-ish-tab budget instead of growing
+ * a tab per feature. The master `webToolsEnabled` toggle (mirrors
+ * `memoryEnabled`'s "disabled = not offered to the model" treatment — the
+ * permission prompt shown on every call is the real per-call gate either
+ * way), a `search_provider` picker with each provider's own connection
+ * fields (Brave key via the OS keychain, SearXNG base URL), and the
+ * `allow_local_network` escape hatch with an explicit warning — this toggle
+ * re-opens the exact loopback targets (llama-server, Ollama) the SSRF guard
+ * in `web.rs` exists to close off. i18n keys stay under the `WebPanel.*`
+ * namespace (unchanged) since renaming them would only add translation
+ * churn for a purely internal relocation.
+ */
+function WebSettingsSection() {
+  const { t } = useT();
+  const webToolsEnabled = useSettingsStore((s) => s.webToolsEnabled);
+  const setWebToolsEnabled = useSettingsStore((s) => s.setWebToolsEnabled);
+
+  const settings = useWebStore((s) => s.settings);
+  const hasBraveKey = useWebStore((s) => s.hasBraveKey);
+  const loaded = useWebStore((s) => s.loaded);
+  const refresh = useWebStore((s) => s.refresh);
+  const setSettings = useWebStore((s) => s.setSettings);
+  const setBraveKey = useWebStore((s) => s.setBraveKey);
+  const removeBraveKey = useWebStore((s) => s.removeBraveKey);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+
+  const [braveKeyInput, setBraveKeyInput] = useState("");
+  const [savingBraveKey, setSavingBraveKey] = useState(false);
+  const [removingBraveKey, setRemovingBraveKey] = useState(false);
+  const [braveKeyError, setBraveKeyError] = useState<string | null>(null);
+
+  const [searxngUrlInput, setSearxngUrlInput] = useState(settings.searxng_base_url ?? "");
+  const [savingSearxngUrl, setSavingSearxngUrl] = useState(false);
+
+  useEffect(() => {
+    setSearxngUrlInput(settings.searxng_base_url ?? "");
+  }, [settings.searxng_base_url]);
+
+  async function handleProviderChange(provider: SearchProvider) {
+    setSettingsError(null);
+    try {
+      await setSettings({ ...settings, search_provider: provider });
+    } catch (err) {
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleSaveSearxngUrl() {
+    setSavingSearxngUrl(true);
+    setSettingsError(null);
+    try {
+      await setSettings({ ...settings, searxng_base_url: searxngUrlInput.trim() || null });
+    } catch (err) {
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingSearxngUrl(false);
+    }
+  }
+
+  async function handleAllowLocalNetworkChange(value: boolean) {
+    setSettingsError(null);
+    try {
+      await setSettings({ ...settings, allow_local_network: value });
+    } catch (err) {
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleSaveBraveKey() {
+    if (!braveKeyInput.trim()) return;
+    setSavingBraveKey(true);
+    setBraveKeyError(null);
+    try {
+      await setBraveKey(braveKeyInput.trim());
+      setBraveKeyInput("");
+    } catch (err) {
+      setBraveKeyError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingBraveKey(false);
+    }
+  }
+
+  async function handleRemoveBraveKey() {
+    setRemovingBraveKey(true);
+    setBraveKeyError(null);
+    try {
+      await removeBraveKey();
+    } catch (err) {
+      setBraveKeyError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRemovingBraveKey(false);
+    }
+  }
+
+  return (
+    <section>
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("WebPanel.providerHeading")}</h3>
+      <p className="mb-2 text-xs text-muted">{t("WebPanel.description")}</p>
+      <div className="rounded-lg border border-border bg-background px-3">
+        <Toggle
+          checked={webToolsEnabled}
+          onChange={setWebToolsEnabled}
+          label={t("WebPanel.enableToggleLabel")}
+          description={t("WebPanel.enableToggleDescription")}
+        />
+      </div>
+
+      <div className={`mt-3 flex flex-col gap-2.5 rounded-lg border border-border bg-background p-3 ${webToolsEnabled ? "" : "pointer-events-none opacity-50"}`}>
+        <div className="flex flex-col gap-2">
+          {WEB_PROVIDER_OPTIONS.map((option) => (
+            <label key={option.value} className="flex items-start gap-2">
+              <input
+                type="radio"
+                name="web-search-provider"
+                checked={settings.search_provider === option.value}
+                onChange={() => void handleProviderChange(option.value)}
+                className="mt-1"
+              />
+              <span>
+                <span className="text-sm text-foreground">{t(option.labelKey)}</span>
+                <p className="text-xs text-muted">{t(option.descriptionKey)}</p>
+              </span>
+            </label>
+          ))}
+        </div>
+
+        {settingsError && <p className="text-xs text-danger">{settingsError}</p>}
+
+        <div className="flex flex-col gap-1.5 border-t border-border pt-2.5">
+          <span className="text-sm text-foreground">{t("WebPanel.braveKeyLabel")}</span>
+          {loaded && hasBraveKey ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusPill tone="success">{t("WebPanel.braveKeySaved")}</StatusPill>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void handleRemoveBraveKey()}
+                disabled={removingBraveKey}
+                className="text-danger hover:bg-danger-soft"
+              >
+                {removingBraveKey ? t("WebPanel.braveKeyRemovingButton") : t("WebPanel.braveKeyRemoveButton")}
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={braveKeyInput}
+                onChange={(event) => setBraveKeyInput(event.target.value)}
+                placeholder={t("WebPanel.braveKeyPlaceholder")}
+                autoComplete="off"
+                className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => void handleSaveBraveKey()}
+                disabled={!braveKeyInput.trim() || savingBraveKey}
+              >
+                {savingBraveKey ? t("WebPanel.braveKeySavingButton") : t("WebPanel.braveKeySaveButton")}
+              </Button>
+            </div>
+          )}
+          {braveKeyError && <p className="text-xs text-danger">{braveKeyError}</p>}
+        </div>
+
+        <div className="flex flex-col gap-1.5 border-t border-border pt-2.5">
+          <span className="text-sm text-foreground">{t("WebPanel.searxngUrlLabel")}</span>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={searxngUrlInput}
+              onChange={(event) => setSearxngUrlInput(event.target.value)}
+              placeholder={t("WebPanel.searxngUrlPlaceholder")}
+              className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 font-mono text-sm text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            <Button variant="secondary" size="sm" onClick={() => void handleSaveSearxngUrl()} disabled={savingSearxngUrl}>
+              {savingSearxngUrl ? t("WebPanel.searxngUrlSavingButton") : t("WebPanel.searxngUrlSaveButton")}
+            </Button>
+          </div>
+          <p className="text-xs text-faint">{t("WebPanel.searxngFormatsHint")}</p>
+        </div>
+      </div>
+
+      <div className={`mt-3 ${webToolsEnabled ? "" : "pointer-events-none opacity-50"}`}>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("WebPanel.advancedHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={settings.allow_local_network}
+            onChange={(value) => void handleAllowLocalNetworkChange(value)}
+            label={t("WebPanel.allowLocalNetworkLabel")}
+            description={t("WebPanel.allowLocalNetworkDescription")}
+          />
+        </div>
+        <p className="mt-1.5 rounded-md bg-warning-soft px-2 py-1.5 text-xs text-warning">
+          {t("WebPanel.allowLocalNetworkWarning")}
+        </p>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * Controls the `monkey` terminal CLI's auto-install-onto-`PATH` behavior
+ * (cli_install.rs) — on by default. Turning it off doesn't just stop future
+ * auto-installs, it immediately uninstalls (removes the symlink/registry
+ * entry); turning it back on immediately reinstalls — see
+ * `cli_install_set_enabled`'s doc comment for why the toggle and reality are
+ * kept from ever visibly disagreeing. `status.error` surfaces a failed
+ * install/uninstall attempt (e.g. no writable PATH directory found) inline
+ * rather than only in a console log, since this runs silently at every
+ * launch otherwise and a stuck-off/stuck-on state would be invisible.
+ */
+function CliInstallSection() {
+  const { t } = useT();
+  const status = useCliInstallStore((s) => s.status);
+  const loaded = useCliInstallStore((s) => s.loaded);
+  const updating = useCliInstallStore((s) => s.updating);
+  const refresh = useCliInstallStore((s) => s.refresh);
+  const setEnabled = useCliInstallStore((s) => s.setEnabled);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const [toggleError, setToggleError] = useState<string | null>(null);
+
+  async function handleToggle(value: boolean) {
+    setToggleError(null);
+    try {
+      await setEnabled(value);
+    } catch (err) {
+      setToggleError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <section className="mt-5">
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("CliInstallSection.heading")}</h3>
+      <p className="mb-2 text-xs text-muted">{t("CliInstallSection.description")}</p>
+      <div className="rounded-lg border border-border bg-background px-3">
+        <Toggle
+          checked={status.enabled}
+          onChange={(value) => void handleToggle(value)}
+          label={t("CliInstallSection.toggleLabel")}
+          description={t("CliInstallSection.toggleDescription")}
+        />
+      </div>
+
+      {loaded && (
+        <div className="mt-2 flex items-center gap-2 text-xs">
+          {status.installed && status.install_path ? (
+            <>
+              <StatusPill tone={status.on_path ? "success" : "warning"}>
+                {status.on_path ? t("CliInstallSection.installedOnPath") : t("CliInstallSection.installedNotOnPath")}
+              </StatusPill>
+              <span className="truncate font-mono text-faint">{status.install_path}</span>
+            </>
+          ) : (
+            <StatusPill tone="neutral">
+              {status.enabled ? t("CliInstallSection.notInstalled") : t("CliInstallSection.disabled")}
+            </StatusPill>
+          )}
+          {updating && <span className="text-faint">{t("CliInstallSection.updating")}</span>}
+        </div>
+      )}
+      {(status.error || toggleError) && <p className="mt-1.5 text-xs text-danger">{status.error ?? toggleError}</p>}
+    </section>
+  );
+}
+
+/**
  * Settings tab for the client-side reliability behaviors this app ported
  * from the idea of a server-side multi-provider gateway: auto-failover,
  * vision-aware model auto-switch, adaptive context compaction, and
@@ -210,6 +569,15 @@ export function AutomationPanel() {
   const setArtifactAutoPreview = useSettingsStore((s) => s.setArtifactAutoPreview);
   const riskAnnotationsEnabled = useSettingsStore((s) => s.riskAnnotationsEnabled);
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
+  const subagentsEnabled = useSettingsStore((s) => s.subagentsEnabled);
+  const setSubagentsEnabled = useSettingsStore((s) => s.setSubagentsEnabled);
+  const skillAutoInvokeEnabled = useSettingsStore((s) => s.skillAutoInvokeEnabled);
+  const setSkillAutoInvokeEnabled = useSettingsStore((s) => s.setSkillAutoInvokeEnabled);
+  const maxConcurrentSubagents = useSettingsStore((s) => s.maxConcurrentSubagents);
+  const setMaxConcurrentSubagents = useSettingsStore((s) => s.setMaxConcurrentSubagents);
+  const subagentProfileModels = useSettingsStore((s) => s.subagentProfileModels);
+  const setSubagentProfileModel = useSettingsStore((s) => s.setSubagentProfileModel);
+  const clearSubagentProfileModel = useSettingsStore((s) => s.clearSubagentProfileModel);
 
   const providers = useModelStore((s) => s.providers);
   const providerModels = useModelStore((s) => s.providerModels);
@@ -236,7 +604,7 @@ export function AutomationPanel() {
   const overrideEntries = Object.entries(visionOverrides);
 
   return (
-    <div className="flex flex-col gap-6 p-2">
+    <div className="flex flex-col gap-6 py-2">
       <section>
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.reliabilityHeading")}</h3>
         <div className="divide-y divide-border rounded-lg border border-border bg-background px-3">
@@ -374,6 +742,63 @@ export function AutomationPanel() {
             onChange={setArtifactAutoPreview}
             label={t("AutomationPanel.artifactAutoPreviewLabel")}
             description={t("AutomationPanel.artifactAutoPreviewDescription")}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.subagentsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={subagentsEnabled}
+            onChange={setSubagentsEnabled}
+            label={t("AutomationPanel.subagentsEnabledLabel")}
+            description={t("AutomationPanel.subagentsEnabledDescription")}
+          />
+          <label className="flex items-center justify-between gap-3 border-t border-border py-2.5 text-sm">
+            <span className="flex flex-col">
+              <span className="text-foreground">{t("AutomationPanel.maxConcurrentSubagentsLabel")}</span>
+              <span className="text-xs text-muted">{t("AutomationPanel.maxConcurrentSubagentsDescription")}</span>
+            </span>
+            <input
+              type="number"
+              min={MIN_MAX_CONCURRENT_SUBAGENTS}
+              max={MAX_MAX_CONCURRENT_SUBAGENTS}
+              value={maxConcurrentSubagents}
+              onChange={(event) => setMaxConcurrentSubagents(Number(event.target.value))}
+              className="h-8 w-16 shrink-0 rounded-md border border-border bg-surface px-2 text-right text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+          </label>
+        </div>
+        <p className="mb-1 mt-3 text-xs text-muted">{t("AutomationPanel.subagentModelOverrideIntro")}</p>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <SubagentModelOverrideRow
+            labelKey="AutomationPanel.subagentModelOverrideExploreLabel"
+            override={subagentProfileModels.explore}
+            connectedProviders={connectedProviders}
+            providerModels={providerModels}
+            onSet={(providerId, model) => setSubagentProfileModel("explore", { providerId, model })}
+            onClear={() => clearSubagentProfileModel("explore")}
+          />
+          <SubagentModelOverrideRow
+            labelKey="AutomationPanel.subagentModelOverrideCodeLabel"
+            override={subagentProfileModels.code}
+            connectedProviders={connectedProviders}
+            providerModels={providerModels}
+            onSet={(providerId, model) => setSubagentProfileModel("code", { providerId, model })}
+            onClear={() => clearSubagentProfileModel("code")}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-faint">{t("AutomationPanel.skillsHeading")}</h3>
+        <div className="rounded-lg border border-border bg-background px-3">
+          <Toggle
+            checked={skillAutoInvokeEnabled}
+            onChange={setSkillAutoInvokeEnabled}
+            label={t("AutomationPanel.skillAutoInvokeEnabledLabel")}
+            description={t("AutomationPanel.skillAutoInvokeEnabledDescription")}
           />
         </div>
       </section>
@@ -517,6 +942,9 @@ export function AutomationPanel() {
           )}
         </div>
       </section>
+
+      <WebSettingsSection />
+      <CliInstallSection />
     </div>
   );
 }

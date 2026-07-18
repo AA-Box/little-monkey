@@ -5,6 +5,8 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    // `sdk/**` covers the checked-in-template client SDKs (TypeScript
+    // request-building tests only — no real network calls, no Python/shell).
+    include: ["src/**/*.test.ts", "sdk/**/*.test.ts"],
   },
 });

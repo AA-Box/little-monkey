@@ -4,6 +4,13 @@
 //! secondary), mirroring how CLAUDE.md works for this app's multi-root
 //! workspace model.
 //!
+//! Each scope also falls back to `AGENTS.md` when no `MONKEY.md` is present
+//! there, so third-party tooling that ships instructions as an `AGENTS.md`
+//! (e.g. the ponytail agent-rules plugin) is picked up without the user
+//! having to rename or duplicate the file. `MONKEY.md` always wins when both
+//! exist in the same scope. Writes (`rules_write`) are unaffected — the
+//! Settings editor always writes `MONKEY.md`.
+//!
 //! Every file is plain, user-owned markdown with no schema. A missing file
 //! is simply absent from the result — never an error, since a workspace with
 //! no rules configured yet (the common case) must not fail every turn's
@@ -14,7 +21,7 @@
 //!
 //! Follows the `checkpoints.rs`/`sessions.rs` AppHandle-free `*_impl` split:
 //! [`read_rules_impl`] takes plain paths so it's directly unit-testable and
-//! reusable from `lm-cli` (slice 5), while [`rules_read`] is the thin
+//! reusable from `monkey-cli` (slice 5), while [`rules_read`] is the thin
 //! `#[tauri::command]` wrapper that resolves the global path and the
 //! attached roots.
 
@@ -27,6 +34,11 @@ use crate::{workspace, AppState};
 /// Filename looked for at the global app-data dir and at the top of every
 /// attached workspace root.
 const RULE_FILE_NAME: &str = "MONKEY.md";
+
+/// Fallback filename checked in the same scope when [`RULE_FILE_NAME`] is
+/// absent — the de facto standard instructions filename used by other agent
+/// tooling (Codex, Cursor's AGENTS.md support, the ponytail plugin, etc).
+const AGENTS_FILE_NAME: &str = "AGENTS.md";
 
 /// Per-file character cap enforced on read — see module docs.
 const MAX_RULE_CHARS: usize = 16_000;
@@ -63,21 +75,35 @@ fn read_rule_file(path: &Path) -> Option<(String, bool)> {
     }
 }
 
+/// Reads `primary_path` (a `MONKEY.md` path); if absent, tries the sibling
+/// `AGENTS.md` in the same directory instead. Returns the path actually
+/// read alongside its (possibly truncated) content, so callers can report
+/// where the content came from.
+fn read_rule_file_with_fallback(primary_path: &Path) -> Option<(PathBuf, String, bool)> {
+    if let Some((content, truncated)) = read_rule_file(primary_path) {
+        return Some((primary_path.to_path_buf(), content, truncated));
+    }
+    let fallback_path = primary_path.with_file_name(AGENTS_FILE_NAME);
+    read_rule_file(&fallback_path)
+        .map(|(content, truncated)| (fallback_path, content, truncated))
+}
+
 /// Core logic behind [`rules_read`], parameterized by plain paths so it
 /// needs no `AppHandle`/`State` and is directly unit-testable (and reusable
-/// from `lm-cli`). `global_path` is the full path to the global MONKEY.md
+/// from `monkey-cli`). `global_path` is the full path to the global MONKEY.md
 /// (not just its directory); `roots` mirrors [`workspace::all_roots`]'s
 /// `(canonical_path, label, is_primary)` triples, primary first. Order of
 /// the returned list is global first, then roots in the order given (which
-/// `all_roots` already returns primary-first).
+/// `all_roots` already returns primary-first). Each scope falls back to a
+/// sibling `AGENTS.md` when its `MONKEY.md` is absent — see module docs.
 pub fn read_rules_impl(global_path: &Path, roots: &[(PathBuf, String, bool)]) -> Vec<RuleFile> {
     let mut files = Vec::new();
 
-    if let Some((content, truncated)) = read_rule_file(global_path) {
+    if let Some((path, content, truncated)) = read_rule_file_with_fallback(global_path) {
         files.push(RuleFile {
             scope: "global".to_string(),
             label: "global".to_string(),
-            path: global_path.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string(),
             content,
             truncated,
         });
@@ -85,11 +111,11 @@ pub fn read_rules_impl(global_path: &Path, roots: &[(PathBuf, String, bool)]) ->
 
     for (root, label, _is_primary) in roots {
         let path = root.join(RULE_FILE_NAME);
-        if let Some((content, truncated)) = read_rule_file(&path) {
+        if let Some((resolved_path, content, truncated)) = read_rule_file_with_fallback(&path) {
             files.push(RuleFile {
                 scope: "project".to_string(),
                 label: label.clone(),
-                path: path.to_string_lossy().to_string(),
+                path: resolved_path.to_string_lossy().to_string(),
                 content,
                 truncated,
             });
@@ -104,7 +130,10 @@ pub fn read_rules_impl(global_path: &Path, roots: &[(PathBuf, String, bool)]) ->
 /// because no workspace is open yet — that just means no project-scope
 /// entries (the global file, if any, still applies).
 #[tauri::command]
-pub fn rules_read(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<RuleFile>, String> {
+pub fn rules_read(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RuleFile>, String> {
     let global_dir = app
         .path()
         .app_data_dir()
@@ -134,8 +163,8 @@ fn write_rules_impl(
     let target = match scope {
         "global" => global_path.to_path_buf(),
         "project" => {
-            let root_path =
-                root_path.ok_or_else(|| "root_path is required when scope is \"project\"".to_string())?;
+            let root_path = root_path
+                .ok_or_else(|| "root_path is required when scope is \"project\"".to_string())?;
             let (resolved, _root_canon) = workspace::resolve_path_and_root(state, root_path)?;
             // `resolve_path_and_root` only guarantees the resolved path stays
             // inside an attached workspace root — it imposes no constraint on
@@ -156,14 +185,25 @@ fn write_rules_impl(
             }
             resolved
         }
-        other => return Err(format!("Unknown rules scope '{}' (expected \"global\" or \"project\")", other)),
+        other => {
+            return Err(format!(
+                "Unknown rules scope '{}' (expected \"global\" or \"project\")",
+                other
+            ))
+        }
     };
 
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent directories for '{}': {}", target.display(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create parent directories for '{}': {}",
+                target.display(),
+                e
+            )
+        })?;
     }
-    std::fs::write(&target, content).map_err(|e| format!("Failed to write '{}': {}", target.display(), e))
+    std::fs::write(&target, content)
+        .map_err(|e| format!("Failed to write '{}': {}", target.display(), e))
 }
 
 /// Save a MONKEY.md file from the Settings "Rules" editor. A direct,
@@ -184,7 +224,13 @@ pub fn rules_write(
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
     let global_path = global_dir.join(RULE_FILE_NAME);
-    write_rules_impl(state.inner(), &global_path, &scope, root_path.as_deref(), &content)
+    write_rules_impl(
+        state.inner(),
+        &global_path,
+        &scope,
+        root_path.as_deref(),
+        &content,
+    )
 }
 
 #[cfg(test)]
@@ -226,7 +272,10 @@ mod tests {
         let dir = TempDir::new();
         let global_path = dir.path.join("MONKEY.md"); // never written
         let files = read_rules_impl(&global_path, &[]);
-        assert!(files.is_empty(), "missing global file must not produce any entry, got {files:?}");
+        assert!(
+            files.is_empty(),
+            "missing global file must not produce any entry, got {files:?}"
+        );
     }
 
     #[test]
@@ -281,7 +330,11 @@ mod tests {
         ];
 
         let files = read_rules_impl(&global_path, &roots);
-        assert_eq!(files.len(), 2, "only roots with a MONKEY.md present should produce an entry: {files:?}");
+        assert_eq!(
+            files.len(),
+            2,
+            "only roots with a MONKEY.md present should produce an entry: {files:?}"
+        );
         assert_eq!(files[0].scope, "project");
         assert_eq!(files[0].label, "project");
         assert_eq!(files[0].content, "Primary rules.");
@@ -323,7 +376,10 @@ mod tests {
 
         write_rules_impl(&state, &global_path, "global", None, "Global rules.").unwrap();
 
-        assert_eq!(std::fs::read_to_string(&global_path).unwrap(), "Global rules.");
+        assert_eq!(
+            std::fs::read_to_string(&global_path).unwrap(),
+            "Global rules."
+        );
     }
 
     #[test]
@@ -332,10 +388,20 @@ mod tests {
         let ws = TempDir::new();
         let state = state_with_roots(&ws.path, &[]);
 
-        write_rules_impl(&state, &global_path, "project", Some(RULE_FILE_NAME), "Primary project rules.").unwrap();
+        write_rules_impl(
+            &state,
+            &global_path,
+            "project",
+            Some(RULE_FILE_NAME),
+            "Primary project rules.",
+        )
+        .unwrap();
 
         let written = ws.path.canonicalize().unwrap().join(RULE_FILE_NAME);
-        assert_eq!(std::fs::read_to_string(&written).unwrap(), "Primary project rules.");
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            "Primary project rules."
+        );
     }
 
     #[test]
@@ -346,10 +412,20 @@ mod tests {
         let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
 
         let root_path = format!("libs/{}", RULE_FILE_NAME);
-        write_rules_impl(&state, &global_path, "project", Some(&root_path), "Secondary rules.").unwrap();
+        write_rules_impl(
+            &state,
+            &global_path,
+            "project",
+            Some(&root_path),
+            "Secondary rules.",
+        )
+        .unwrap();
 
         let written = secondary.path.canonicalize().unwrap().join(RULE_FILE_NAME);
-        assert_eq!(std::fs::read_to_string(&written).unwrap(), "Secondary rules.");
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            "Secondary rules."
+        );
     }
 
     #[test]
@@ -359,7 +435,10 @@ mod tests {
         let state = state_with_roots(&ws.path, &[]);
 
         let err = write_rules_impl(&state, &global_path, "project", None, "content").unwrap_err();
-        assert!(err.contains("root_path"), "expected a root_path error, got: {err}");
+        assert!(
+            err.contains("root_path"),
+            "expected a root_path error, got: {err}"
+        );
     }
 
     #[test]
@@ -368,8 +447,18 @@ mod tests {
         let ws = TempDir::new();
         let state = state_with_roots(&ws.path, &[]);
 
-        let err = write_rules_impl(&state, &global_path, "project", Some("../escape/MONKEY.md"), "evil").unwrap_err();
-        assert!(err.contains("escapes"), "expected an escape error, got: {err}");
+        let err = write_rules_impl(
+            &state,
+            &global_path,
+            "project",
+            Some("../escape/MONKEY.md"),
+            "evil",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("escapes"),
+            "expected an escape error, got: {err}"
+        );
     }
 
     #[test]
@@ -380,13 +469,17 @@ mod tests {
         std::fs::write(&victim, "{\"original\": true}").unwrap();
         let state = state_with_roots(&ws.path, &[]);
 
-        let err = write_rules_impl(&state, &global_path, "project", Some("package.json"), "{}").unwrap_err();
+        let err = write_rules_impl(&state, &global_path, "project", Some("package.json"), "{}")
+            .unwrap_err();
         assert!(
             err.contains("Refusing to write") && err.contains("MONKEY.md"),
             "expected a refusal mentioning MONKEY.md, got: {err}"
         );
         // The arbitrary file must be left untouched.
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "{\"original\": true}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "{\"original\": true}"
+        );
     }
 
     #[test]
@@ -396,8 +489,64 @@ mod tests {
         let secondary = TempDir::new();
         let state = state_with_roots(&primary.path, &[(&secondary.path, "libs")]);
 
-        let err = write_rules_impl(&state, &global_path, "project", Some("libs/pre-commit"), "evil").unwrap_err();
-        assert!(err.contains("Refusing to write"), "expected a refusal, got: {err}");
+        let err = write_rules_impl(
+            &state,
+            &global_path,
+            "project",
+            Some("libs/pre-commit"),
+            "evil",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Refusing to write"),
+            "expected a refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn global_scope_falls_back_to_agents_md_when_monkey_md_absent() {
+        let dir = TempDir::new();
+        let global_path = dir.path.join("MONKEY.md"); // never written
+        std::fs::write(dir.path.join("AGENTS.md"), "Global agents rules.").unwrap();
+
+        let files = read_rules_impl(&global_path, &[]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].scope, "global");
+        assert_eq!(files[0].content, "Global agents rules.");
+        assert_eq!(files[0].path, dir.path.join("AGENTS.md").to_string_lossy());
+    }
+
+    #[test]
+    fn monkey_md_takes_precedence_over_agents_md_in_the_same_scope() {
+        let dir = TempDir::new();
+        let global_path = dir.path.join("MONKEY.md");
+        std::fs::write(&global_path, "Monkey rules.").unwrap();
+        std::fs::write(dir.path.join("AGENTS.md"), "Agents rules.").unwrap();
+
+        let files = read_rules_impl(&global_path, &[]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, "Monkey rules.");
+        assert_eq!(files[0].path, global_path.to_string_lossy());
+    }
+
+    #[test]
+    fn project_root_falls_back_to_agents_md_when_monkey_md_absent() {
+        let dir = TempDir::new();
+        let global_path = dir.path.join("MONKEY.md"); // absent — irrelevant here
+
+        let root = TempDir::new();
+        std::fs::write(root.path.join("AGENTS.md"), "Project agents rules.").unwrap();
+
+        let roots = vec![(root.path.clone(), "project".to_string(), true)];
+        let files = read_rules_impl(&global_path, &roots);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].scope, "project");
+        assert_eq!(files[0].content, "Project agents rules.");
+        assert_eq!(
+            files[0].path,
+            root.path.join("AGENTS.md").to_string_lossy()
+        );
     }
 
     #[test]
@@ -406,6 +555,9 @@ mod tests {
         let state = AppState::default();
 
         let err = write_rules_impl(&state, &global_path, "bogus", None, "content").unwrap_err();
-        assert!(err.contains("Unknown rules scope"), "expected an unknown-scope error, got: {err}");
+        assert!(
+            err.contains("Unknown rules scope"),
+            "expected an unknown-scope error, got: {err}"
+        );
     }
 }

@@ -5,11 +5,17 @@
 //! `sessions.rs`/`memory.rs`). Each server is either a `Stdio` child process
 //! (spawned via `rmcp`'s `TokioChildProcess`) or an `Http` remote endpoint
 //! (via `rmcp`'s streamable-HTTP client transport, over `reqwest`). An HTTP
-//! server's optional bearer token never lives in `mcp_servers.json` — it's
-//! saved to the OS keychain via `mcp_set_http_token`/`mcp_remove_http_token`,
-//! same `keyring::Entry::new(KEYCHAIN_SERVICE, ...)` convention as
-//! `providers.rs`, and attached as an `Authorization: Bearer <token>` header
-//! (via `StreamableHttpClientTransportConfig::auth_header`) when connecting.
+//! server's bearer token comes from one of two places, never from
+//! `mcp_servers.json` itself: either a manually pasted static token saved to
+//! the OS keychain via `mcp_set_http_token`/`mcp_remove_http_token` (same
+//! `keyring::Entry::new(KEYCHAIN_SERVICE, ...)` convention as
+//! `providers.rs`), or a generic MCP-spec OAuth 2.0 flow run via
+//! `mcp_oauth.rs`'s `mcp_oauth_connect` (RFC 8414 discovery + RFC 7591
+//! dynamic client registration + PKCE, built on `rmcp`'s
+//! `transport::auth` module) — see [`connect_impl`]'s `Http` branch for how
+//! the two are prioritized. Either way, the token is attached as an
+//! `Authorization: Bearer <token>` header (via
+//! `StreamableHttpClientTransportConfig::auth_header`) when connecting.
 //!
 //! Runtime connections live in `AppState::mcp`, a `tokio::sync::Mutex` (not
 //! `std::sync::Mutex`, unlike every other map in `AppState`) because
@@ -29,7 +35,7 @@
 //! Follows the `checkpoints.rs`/`sessions.rs`/`memory.rs`/`rules.rs`
 //! AppHandle-free `*_impl` split: config load/save and connect/call are all
 //! plain functions taking `&Path`/`&AppState`, directly unit-testable (see
-//! the bottom of this file) and reusable from `lm-cli` later, while the
+//! the bottom of this file) and reusable from `monkey-cli` later, while the
 //! `#[tauri::command]`s are thin wrappers that resolve the config path,
 //! gate permission, and emit `mcp://status` events.
 
@@ -38,7 +44,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientRequest, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+    ClientRequest, ServerResult,
 };
 use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::RoleClient;
@@ -58,7 +65,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 /// Bound on how long connecting to (spawning/dialing, handshaking, and
 /// listing tools for) a single MCP server may take before both
-/// [`mcp_connect`] and lm-cli's `connect_all` give up and report an
+/// [`mcp_connect`] and monkey-cli's `connect_all` give up and report an
 /// error/timeout — `connect_impl` itself has no internal timeout (see its
 /// own doc comment), so a server whose process spawns (or whose HTTP
 /// endpoint accepts the connection) but never completes the `initialize`
@@ -154,8 +161,12 @@ pub struct McpConfigFile {
 /// Deliberately allows `_` (unlike `checkpoints::validate_id`, which only
 /// ever sees its own generated UUIDs) since server ids are user-chosen
 /// slugs, e.g. "my_server".
-fn validate_id(id: &str) -> Result<(), String> {
-    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+pub(crate) fn validate_id(id: &str) -> Result<(), String> {
+    if !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         Ok(())
     } else {
         Err(format!(
@@ -166,7 +177,7 @@ fn validate_id(id: &str) -> Result<(), String> {
 }
 
 /// Resolves (and creates, if missing) `<app_data_dir>/mcp_servers.json`'s path.
-fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -180,7 +191,9 @@ fn config_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// never an error.
 pub fn load_config_impl(path: &Path) -> Result<McpConfigFile, String> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("Corrupt mcp_servers.json: {}", e)),
+        Ok(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("Corrupt mcp_servers.json: {}", e))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(McpConfigFile::default()),
         Err(e) => Err(format!("Failed to read mcp_servers.json: {}", e)),
     }
@@ -193,8 +206,10 @@ pub fn save_config_impl(path: &Path, config: &McpConfigFile) -> Result<(), Strin
     let payload = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize mcp_servers.json: {}", e))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &payload).map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to finalize mcp_servers.json: {}", e))?;
+    std::fs::write(&tmp, &payload)
+        .map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("Failed to finalize mcp_servers.json: {}", e))?;
     Ok(())
 }
 
@@ -224,7 +239,10 @@ pub fn add_server_impl(path: &Path, entry: McpServerEntry) -> Result<McpServerEn
 
     let mut config = load_config_impl(path)?;
     if config.servers.iter().any(|s| s.id == entry.id) {
-        return Err(format!("An MCP server with id '{}' already exists", entry.id));
+        return Err(format!(
+            "An MCP server with id '{}' already exists",
+            entry.id
+        ));
     }
 
     config.version = SCHEMA_VERSION;
@@ -327,7 +345,7 @@ pub struct McpConnection {
 /// Deliberately does NOT itself apply a timeout — a server whose process
 /// spawns (or endpoint accepts the connection) but never completes the
 /// `initialize` handshake would otherwise hang this `await` forever. See
-/// [`mcp_connect`] (and lm-cli's `connect_all`) for that, which wrap this
+/// [`mcp_connect`] (and monkey-cli's `connect_all`) for that, which wrap this
 /// call in [`CONNECT_TIMEOUT_SECS`] — the same division of labor
 /// [`call_tool_with_cancel_impl`] documents for permission/timeout/
 /// cancellation around a tool call.
@@ -338,7 +356,10 @@ pub async fn connect_impl(
     let service = match &entry.transport {
         McpTransport::Stdio { command, args, env } => {
             if command.trim().is_empty() {
-                return Err(format!("MCP server '{}' has no command configured", entry.id));
+                return Err(format!(
+                    "MCP server '{}' has no command configured",
+                    entry.id
+                ));
             }
 
             let mut command_builder = tokio::process::Command::new(command);
@@ -360,8 +381,26 @@ pub async fn connect_impl(
                 rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                     url.clone(),
                 );
-            if let Some(token) = read_http_token(&entry.id) {
-                config = config.auth_header(token);
+            // An OAuth-connected server (see `mcp_oauth::mcp_oauth_connect`)
+            // takes priority over a manually pasted static token: its
+            // presence means the user explicitly ran the OAuth flow for this
+            // server id, and `get_access_token_if_connected` auto-refreshes
+            // the token if it's expired. `Ok(None)` means no OAuth
+            // credentials are stored for this id at all — fall back to
+            // whatever static token (if any) was saved via
+            // `mcp_set_http_token`. An `Err` here (stored OAuth credentials
+            // exist but can't produce a usable token — e.g. refresh failed
+            // and re-authorization is required) is surfaced as a real
+            // connect failure rather than silently degrading to the static
+            // token, since that static token may be stale/absent precisely
+            // because OAuth was set up instead.
+            match crate::mcp_oauth::get_access_token_if_connected(state, &entry.id, url).await? {
+                Some(token) => config = config.auth_header(token),
+                None => {
+                    if let Some(token) = read_http_token(&entry.id) {
+                        config = config.auth_header(token);
+                    }
+                }
             }
 
             let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
@@ -384,7 +423,9 @@ pub async fn connect_impl(
         .map(cache_tool)
         .collect();
 
-    let instructions = service.peer_info().and_then(|info| info.instructions.clone());
+    let instructions = service
+        .peer_info()
+        .and_then(|info| info.instructions.clone());
 
     let connection = McpConnection {
         service,
@@ -495,7 +536,12 @@ async fn resolve_call_tool(
     let arguments_obj = match arguments {
         serde_json::Value::Object(map) => Some(map),
         serde_json::Value::Null => None,
-        other => return Err(format!("MCP tool arguments must be a JSON object, got: {}", other)),
+        other => {
+            return Err(format!(
+                "MCP tool arguments must be a JSON object, got: {}",
+                other
+            ))
+        }
     };
 
     let mut params = CallToolRequestParams::new(tool_name.to_string());
@@ -545,7 +591,12 @@ pub async fn call_tool_with_cancel_impl(
             PeerRequestOptions::no_options(),
         )
         .await
-        .map_err(|e| format!("MCP tool call to '{}' on '{}' failed: {}", tool_name, entry.id, e))?;
+        .map_err(|e| {
+            format!(
+                "MCP tool call to '{}' on '{}' failed: {}",
+                tool_name, entry.id, e
+            )
+        })?;
 
     // Captured before `handle` is moved into `handle.await_response()` below
     // — everything `notify_cancelled` needs to tell the server to stop this
@@ -577,7 +628,7 @@ pub async fn call_tool_with_cancel_impl(
 
 /// [`call_tool_with_cancel_impl`] with a `cancel` that never resolves — the
 /// entry point for callers that don't need real mid-call cancellation: this
-/// module's own tests (below) and lm-cli's `mcp_cli::call`, which only ever
+/// module's own tests (below) and monkey-cli's `mcp_cli::call`, which only ever
 /// wraps this in a plain `tokio::time::timeout` (see that function's own doc
 /// comment on why the CLI, unlike the GUI, has no concurrent "Stop"
 /// affordance to wire a genuine cancel signal from).
@@ -612,6 +663,12 @@ pub struct McpServerInfo {
     /// (they have no keychain entry); lets the Settings UI show a "token
     /// saved" state without ever reading the secret back out.
     pub has_http_token: bool,
+    /// Whether this server currently has OAuth-derived credentials saved
+    /// (see `mcp_oauth.rs`) — never the credentials themselves. Always
+    /// `false` for `Stdio` servers. When both this and `has_http_token` are
+    /// `true`, [`connect_impl`] prefers the OAuth-derived token (see its
+    /// `Http` branch).
+    pub has_oauth: bool,
 }
 
 fn build_info(
@@ -634,6 +691,8 @@ fn build_info(
         instructions,
         has_http_token: matches!(entry.transport, McpTransport::Http { .. })
             && read_http_token(&entry.id).is_some(),
+        has_oauth: matches!(entry.transport, McpTransport::Http { .. })
+            && crate::mcp_oauth::has_oauth_credentials(&entry.id),
     }
 }
 
@@ -762,7 +821,11 @@ pub fn mcp_update_server(
 /// Deliberately doesn't disconnect the live connection or clear the keychain
 /// token itself — those need an `AppState`/`await` and an `AppHandle`
 /// respectively, so stay in the `#[tauri::command]` wrapper.
-fn remove_server_with_state_impl(state: &AppState, path: &Path, server_id: &str) -> Result<(), String> {
+fn remove_server_with_state_impl(
+    state: &AppState,
+    path: &Path,
+    server_id: &str,
+) -> Result<(), String> {
     let _guard = state
         .mcp_config_lock
         .lock()
@@ -792,6 +855,7 @@ pub async fn mcp_remove_server(
     // server, which never has one) hits the `NoEntry` no-op path — never
     // fails the removal itself over keychain cleanup.
     let _ = remove_http_token_impl(&server_id);
+    let _ = crate::mcp_oauth::remove_oauth_credentials_impl(&server_id);
     Ok(())
 }
 
@@ -956,7 +1020,10 @@ pub async fn mcp_list_tools(
                 .collect(),
             None => connection.tools.clone(),
         };
-        out.push(McpServerTools { server_id: entry.id.clone(), tools });
+        out.push(McpServerTools {
+            server_id: entry.id.clone(),
+            tools,
+        });
     }
     Ok(out)
 }
@@ -979,6 +1046,7 @@ pub async fn mcp_call_tool(
     tool_name: String,
     arguments: serde_json::Value,
     turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<CallToolResult, String> {
     validate_id(&server_id)?;
 
@@ -1004,6 +1072,8 @@ pub async fn mcp_call_tool(
         &format!("mcp:{}:{}", server_id, tool_name),
         detail,
         turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
         None,
     )
     .await?;
@@ -1036,7 +1106,9 @@ pub async fn mcp_call_tool(
         }
     };
 
-    let outcome = call_tool_with_cancel_impl(state.inner(), &entry, &tool_name, arguments, cancel_reason).await;
+    let outcome =
+        call_tool_with_cancel_impl(state.inner(), &entry, &tool_name, arguments, cancel_reason)
+            .await;
 
     // Drop this turn's cancel channel once no other MCP/shell call for the
     // same turn still holds it — same bookkeeping as `tool_run_shell`.
@@ -1045,7 +1117,10 @@ pub async fn mcp_call_tool(
             .tool_cancel
             .lock()
             .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard.get(&cancel_key).is_some_and(|n| std::sync::Arc::strong_count(n) <= 2) {
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
             guard.remove(&cancel_key);
         }
     }
@@ -1105,7 +1180,10 @@ mod tests {
 
         add_server_impl(&path, entry.clone()).unwrap();
 
-        assert!(!path.with_extension("json.tmp").exists(), "temp file must not linger");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must not linger"
+        );
         let reloaded = load_config_impl(&path).unwrap();
         assert_eq!(reloaded.servers.len(), 1);
         assert_eq!(reloaded.servers[0], entry);
@@ -1124,7 +1202,10 @@ mod tests {
     fn add_rejects_invalid_id() {
         let path = temp_path("badid.json");
         let err = add_server_impl(&path, stdio_entry("bad id!", "echo", &[])).unwrap_err();
-        assert!(err.contains("Invalid MCP server id"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid MCP server id"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1157,7 +1238,10 @@ mod tests {
     fn update_errors_for_unknown_id() {
         let path = temp_path("update_missing.json");
         let err = update_server_impl(&path, stdio_entry("ghost", "echo", &[])).unwrap_err();
-        assert!(err.contains("Unknown MCP server"), "unexpected error: {err}");
+        assert!(
+            err.contains("Unknown MCP server"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1197,7 +1281,10 @@ mod tests {
     fn set_enabled_errors_for_unknown_id() {
         let path = temp_path("enable_missing.json");
         let err = set_enabled_impl(&path, "ghost", true).unwrap_err();
-        assert!(err.contains("Unknown MCP server"), "unexpected error: {err}");
+        assert!(
+            err.contains("Unknown MCP server"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1223,7 +1310,9 @@ mod tests {
         let entry = McpServerEntry {
             id: "http-srv".to_string(),
             label: "HTTP server".to_string(),
-            transport: McpTransport::Http { url: "   ".to_string() },
+            transport: McpTransport::Http {
+                url: "   ".to_string(),
+            },
             enabled: true,
             tool_allowlist: None,
             timeout_secs: None,
@@ -1290,14 +1379,22 @@ mod tests {
                 let path = &path;
                 let state = &state;
                 scope.spawn(move || {
-                    add_server_with_state_impl(state, path, stdio_entry(&format!("concurrent-{i}"), "echo", &[]))
-                        .unwrap();
+                    add_server_with_state_impl(
+                        state,
+                        path,
+                        stdio_entry(&format!("concurrent-{i}"), "echo", &[]),
+                    )
+                    .unwrap();
                 });
             }
         });
 
         let config = load_config_impl(&path).unwrap();
-        assert_eq!(config.servers.len(), 8, "a concurrent mcp_add_server call's entry was lost");
+        assert_eq!(
+            config.servers.len(),
+            8,
+            "a concurrent mcp_add_server call's entry was lost"
+        );
     }
 
     #[test]
@@ -1306,12 +1403,22 @@ mod tests {
         let state = AppState::default();
 
         add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v1"])).unwrap();
-        state.permissions.session_allow.lock().unwrap().insert("mcp:docs:search".to_string());
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("mcp:docs:search".to_string());
 
         update_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &["v2"])).unwrap();
 
         assert!(
-            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            !state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("mcp:docs:search"),
             "a grant approved against the old transport must not survive an update"
         );
     }
@@ -1322,19 +1429,39 @@ mod tests {
         let state = AppState::default();
 
         add_server_with_state_impl(&state, &path, stdio_entry("docs", "echo", &[])).unwrap();
-        state.permissions.session_allow.lock().unwrap().insert("mcp:docs:search".to_string());
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("mcp:docs:search".to_string());
 
         remove_server_with_state_impl(&state, &path, "docs").unwrap();
         assert!(
-            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            !state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("mcp:docs:search"),
             "removing a server must revoke its grants"
         );
 
         // Reuse the id for a genuinely different server — a leftover grant
         // must never silently apply to it.
-        add_server_with_state_impl(&state, &path, stdio_entry("docs", "curl", &["https://evil.example"])).unwrap();
+        add_server_with_state_impl(
+            &state,
+            &path,
+            stdio_entry("docs", "curl", &["https://evil.example"]),
+        )
+        .unwrap();
         assert!(
-            !state.permissions.session_allow.lock().unwrap().contains("mcp:docs:search"),
+            !state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .contains("mcp:docs:search"),
             "an id reused by a different server must not inherit the old server's grants"
         );
     }

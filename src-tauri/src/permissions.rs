@@ -12,9 +12,11 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tauri::Emitter;
 use tokio::sync::oneshot;
 
+use crate::run_protocol::{PermissionDecision, RiskLevel, RunEvent};
 use crate::AppState;
 
 /// Payload sent to the frontend over the `permission://request` event.
@@ -39,6 +41,23 @@ pub struct PermissionRequestPayload {
     /// stronger "sensitive path" warning instead of an ordinary risk badge.
     /// Always `false` when `risk_level` is `None`.
     pub risk_floored: bool,
+    /// The description of the `code`-profile subagent (p3) this call
+    /// originated from, if any — a dedicated, separately-serialized field
+    /// (NOT folded into `detail` as a parsed-out-by-regex prefix, the
+    /// pre-fix design) so the frontend never has to reparse free-text the
+    /// model itself ultimately controls (the subagent's `description` comes
+    /// straight from the model's own `task` tool-call arguments). Whatever
+    /// characters (quotes, newlines, a fake "Subagent '...':`-looking
+    /// string) the description contains, `PermissionModal.tsx` renders it
+    /// verbatim in its own attribution line and `detail` is never touched —
+    /// there is no delimiter for a crafted description to escape or forge a
+    /// decoy line ahead of. `None` for every parent-turn call and any
+    /// `explore`-profile subagent (mirrors `with_agent_label`'s old `None`
+    /// case). Purely cosmetic/informational, same as before: this field has
+    /// no path into [`compute_risk`]/`mode_short_circuit`/any auto-approval
+    /// decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
 }
 
 /// A risk annotation attached to a permission prompt — either computed
@@ -141,11 +160,19 @@ pub fn path_risk_floor(path: &Path, root: &Path) -> Option<&'static str> {
         return Some("inside .git/ — version-control metadata");
     }
 
-    if components.windows(2).any(|w| w[0] == ".github" && w[1] == "workflows") {
-        return Some("inside .github/workflows/ — CI pipeline definition, runs with repo permissions");
+    if components
+        .windows(2)
+        .any(|w| w[0] == ".github" && w[1] == "workflows")
+    {
+        return Some(
+            "inside .github/workflows/ — CI pipeline definition, runs with repo permissions",
+        );
     }
 
-    let file_name = path.file_name().and_then(|n| n.to_str())?.to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())?
+        .to_ascii_lowercase();
 
     if file_name.starts_with(".env") {
         return Some("environment/secrets file (.env*)");
@@ -199,6 +226,24 @@ pub fn compute_risk(
 
 /// Shared state tracking in-flight permission requests and tools that have
 /// been granted "allow for session" status.
+pub struct PendingPermission {
+    tool: String,
+    turn: Option<String>,
+    tool_call_id: String,
+    operation_sha256: String,
+    expires_at_ms: u64,
+    sender: oneshot::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct PendingPermissionSnapshot {
+    tool: String,
+    turn: Option<String>,
+    tool_call_id: String,
+    operation_sha256: String,
+    expires_at_ms: u64,
+}
+
 pub struct PermissionState {
     /// `id -> (tool the request was actually made for, owning turn id,
     /// response channel)`. The tool name is stored here (not just the
@@ -208,8 +253,11 @@ pub struct PermissionState {
     /// for why that distinction matters. The turn id lets Stop deny only the
     /// aborted turn's prompts — with the split pane, another turn's prompt
     /// may be pending concurrently.
-    pub pending: Mutex<HashMap<String, (String, Option<String>, oneshot::Sender<bool>)>>,
+    pub pending: Mutex<HashMap<String, PendingPermission>>,
     pub session_allow: Mutex<HashSet<String>>,
+    /// Remembered grants for a specific immutable run only. Durable turns
+    /// never consult the legacy workspace-session grant set above.
+    pub run_allow: Mutex<HashSet<(String, String)>>,
     /// Current permission mode — one of "manual"/"acceptEdits"/"plan"/"auto"/
     /// "bypass". See [`request_permission`] for what each mode does. Always
     /// boots at "manual" (see the `Default` impl below), regardless of
@@ -217,6 +265,18 @@ pub struct PermissionState {
     /// frontend is responsible for pushing a restored non-"manual" mode back
     /// to [`set_permission_mode`] itself, once, at startup.
     pub mode: Mutex<String>,
+    /// `turn_id -> mode`, consulted by [`request_permission`] (via
+    /// [`effective_mode`]) *before* falling back to the global `mode` above.
+    /// This is the turn-scoped counterpart to `pending`'s existing turn-id
+    /// keying (see that field's doc comment) — a scheduled automation run
+    /// (or any other single turn that needs its own mode) can set an
+    /// override for just its own turn id via [`set_permission_mode_for_turn`]
+    /// and clear it via [`clear_permission_mode_for_turn`] when done, without
+    /// racing a concurrent split-pane turn's global mode. Purely additive:
+    /// nothing that doesn't set an override is affected, so every existing
+    /// Plan/Act/smart-mode call site keeps using the global `mode` exactly
+    /// as before.
+    pub turn_mode_overrides: Mutex<HashMap<String, String>>,
 }
 
 impl Default for PermissionState {
@@ -224,7 +284,9 @@ impl Default for PermissionState {
         PermissionState {
             pending: Mutex::new(HashMap::new()),
             session_allow: Mutex::new(HashSet::new()),
+            run_allow: Mutex::new(HashSet::new()),
             mode: Mutex::new("manual".to_string()),
+            turn_mode_overrides: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -241,7 +303,11 @@ const NO_SESSION_REMEMBER: &[&str] = &["run_shell"];
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Every valid permission mode identifier, shared verbatim with the frontend.
-const VALID_MODES: &[&str] = &["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
+/// `pub(crate)` so `recipes.rs`'s `validate_recipe` can check a recipe's
+/// `permission_mode` field against exactly this list — one source of truth
+/// instead of a second hand-copied list that could drift.
+pub(crate) const VALID_MODES: &[&str] =
+    &["manual", "acceptEdits", "smart", "plan", "auto", "bypass"];
 
 /// Mode-based short-circuit decision for [`request_permission`]:
 /// `Some(result)` means the mode decides on its own without prompting;
@@ -264,7 +330,11 @@ const VALID_MODES: &[&str] = &["manual", "acceptEdits", "smart", "plan", "auto",
 /// filesystem or a judge call. Only `"smart"` ever looks at it; every other
 /// mode's decision is unchanged by whatever `risk` says (Phase 2's invariant
 /// that risk annotations are purely advisory outside "smart" mode).
-fn mode_short_circuit(mode: &str, tool: &str, risk: Option<&RiskAssessment>) -> Option<Result<(), String>> {
+fn mode_short_circuit(
+    mode: &str,
+    tool: &str,
+    risk: Option<&RiskAssessment>,
+) -> Option<Result<(), String>> {
     match mode {
         "bypass" => Some(Ok(())),
         "plan" => Some(Err(format!(
@@ -333,52 +403,261 @@ fn mode_short_circuit(mode: &str, tool: &str, risk: Option<&RiskAssessment>) -> 
 /// session", resolves `Ok(())` immediately without prompting; otherwise emits
 /// a `permission://request` event and awaits the user's decision (or the
 /// timeout, which counts as a denial).
+/// Resolves the mode that should govern a given permission request: a
+/// turn-scoped override (see [`PermissionState::turn_mode_overrides`]) wins
+/// when `turn` is `Some` and one was set for that exact turn id, otherwise
+/// falls back to the global `mode`. Factored out (like [`mode_short_circuit`])
+/// so it's directly testable without a Tauri `AppHandle`.
+fn effective_mode(state: &AppState, turn: Option<&str>) -> String {
+    if let Some(turn_id) = turn {
+        if let Some(overridden) = state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .get(turn_id)
+        {
+            return overridden.clone();
+        }
+    }
+    state.permissions.mode.lock().unwrap().clone()
+}
+
+fn operation_digest(run_id: &str, tool_call_id: &str, tool: &str, detail: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [run_id, tool_call_id, tool, detail, "run"] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn protocol_risk(risk: Option<&RiskAssessment>) -> Option<RiskLevel> {
+    match risk.map(|assessment| assessment.level.as_str()) {
+        Some("low") => Some(RiskLevel::Low),
+        Some("medium") => Some(RiskLevel::Medium),
+        Some("high") => Some(RiskLevel::High),
+        _ => None,
+    }
+}
+
+fn durable_run_exists<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    turn: Option<&str>,
+) -> Result<bool, String> {
+    let Some(run_id) = turn else { return Ok(false) };
+    crate::run_commands::with_ledger(app, state, |ledger| Ok(ledger.load_run(run_id)?.is_some()))
+}
+
+struct PermissionAudit<'a> {
+    run_id: &'a str,
+    request_id: &'a str,
+    tool_call_id: &'a str,
+    tool: &'a str,
+    operation_sha256: &'a str,
+    expires_at_ms: u64,
+    risk: Option<&'a RiskAssessment>,
+}
+
+fn append_permission_requested<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    audit: &PermissionAudit<'_>,
+    awaiting_human: bool,
+) -> Result<(), String> {
+    let identity = crate::run_commands::engine_identity(app, "permission-engine");
+    crate::run_commands::append_event_as(
+        app,
+        state,
+        audit.run_id.to_string(),
+        None,
+        RunEvent::PermissionRequested {
+            request_id: audit.request_id.to_string(),
+            tool_call_id: audit.tool_call_id.to_string(),
+            tool_name: audit.tool.to_string(),
+            operation_sha256: audit.operation_sha256.to_string(),
+            expires_at_ms: audit.expires_at_ms,
+            detail: format!("Approval required for {}", audit.tool),
+            risk_level: protocol_risk(audit.risk),
+            risk_reason: audit.risk.map(|assessment| {
+                if assessment.floored {
+                    assessment.reason.clone()
+                } else {
+                    "Advisory risk classification recorded; free-form classifier text was redacted"
+                        .to_string()
+                }
+            }),
+        },
+        identity.clone(),
+    )?;
+    if awaiting_human {
+        crate::run_commands::append_event_as(
+            app,
+            state,
+            audit.run_id.to_string(),
+            None,
+            RunEvent::AwaitingApproval {
+                request_id: audit.request_id.to_string(),
+                operation_sha256: audit.operation_sha256.to_string(),
+                expires_at_ms: audit.expires_at_ms,
+                reason: Some("Waiting for a local user decision".to_string()),
+            },
+            identity,
+        )?;
+    }
+    Ok(())
+}
+
+fn append_automatic_decision<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    audit: &PermissionAudit<'_>,
+    decision: PermissionDecision,
+) -> Result<(), String> {
+    let identity = crate::run_commands::engine_identity(app, "permission-policy");
+    crate::run_commands::append_event_as(
+        app,
+        state,
+        audit.run_id.to_string(),
+        None,
+        RunEvent::PermissionDecided {
+            request_id: audit.request_id.to_string(),
+            operation_sha256: audit.operation_sha256.to_string(),
+            decision,
+            decided_by: identity.clone(),
+        },
+        identity,
+    )?;
+    Ok(())
+}
+
 pub async fn request_permission<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
     tool: &str,
     detail: String,
     turn: Option<&str>,
+    tool_call_id: Option<&str>,
     risk: Option<RiskAssessment>,
+    agent_label: Option<&str>,
 ) -> Result<(), String> {
-    let mode = state.permissions.mode.lock().unwrap().clone();
+    let mode = effective_mode(state, turn);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let durable = durable_run_exists(app, state, turn)?;
+    let run_id = turn.unwrap_or_default();
+    let normalized_tool_call_id = tool_call_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tool-{}", uuid::Uuid::new_v4().simple()));
+    let operation_sha256 = operation_digest(run_id, &normalized_tool_call_id, tool, &detail);
+    let now = crate::run_commands::unix_time_ms()?;
+    let expires_at_ms = now
+        .checked_add(
+            u64::try_from(PERMISSION_TIMEOUT.as_millis())
+                .map_err(|_| "Permission timeout exceeds protocol bounds")?,
+        )
+        .ok_or_else(|| "Permission expiry exceeds protocol bounds".to_string())?;
+    let audit = PermissionAudit {
+        run_id,
+        request_id: &request_id,
+        tool_call_id: &normalized_tool_call_id,
+        tool,
+        operation_sha256: &operation_sha256,
+        expires_at_ms,
+        risk: risk.as_ref(),
+    };
 
     if let Some(decision) = mode_short_circuit(&mode, tool, risk.as_ref()) {
+        if durable {
+            append_permission_requested(app, state, &audit, false)?;
+            append_automatic_decision(
+                app,
+                state,
+                &audit,
+                if decision.is_ok() {
+                    PermissionDecision::AllowOnce
+                } else {
+                    PermissionDecision::Deny
+                },
+            )?;
+        }
         return decision;
     }
 
-    if state
-        .permissions
-        .session_allow
-        .lock()
-        .unwrap()
-        .contains(tool)
-    {
+    let remembered = if let Some(run_id) = turn {
+        state
+            .permissions
+            .run_allow
+            .lock()
+            .unwrap()
+            .contains(&(run_id.to_string(), tool.to_string()))
+    } else {
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains(tool)
+    };
+    if remembered {
+        if durable {
+            append_permission_requested(app, state, &audit, false)?;
+            append_automatic_decision(app, state, &audit, PermissionDecision::AllowForRun)?;
+        }
         return Ok(());
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel::<bool>();
 
-    state
-        .permissions
-        .pending
-        .lock()
-        .unwrap()
-        .insert(id.clone(), (tool.to_string(), turn.map(str::to_string), tx));
+    state.permissions.pending.lock().unwrap().insert(
+        request_id.clone(),
+        PendingPermission {
+            tool: tool.to_string(),
+            turn: turn.map(str::to_string),
+            tool_call_id: normalized_tool_call_id.clone(),
+            operation_sha256: operation_sha256.clone(),
+            expires_at_ms,
+            sender: tx,
+        },
+    );
+
+    if durable {
+        if let Err(error) = append_permission_requested(app, state, &audit, true) {
+            state
+                .permissions
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&request_id);
+            return Err(error);
+        }
+    }
 
     let payload = PermissionRequestPayload {
-        id: id.clone(),
+        id: request_id.clone(),
         tool: tool.to_string(),
         detail,
         risk_level: risk.as_ref().map(|r| r.level.clone()),
         risk_reason: risk.as_ref().map(|r| r.reason.clone()),
         risk_floored: risk.as_ref().map(|r| r.floored).unwrap_or(false),
+        agent_label: agent_label.map(str::to_string),
     };
 
     if app.emit("permission://request", payload).is_err() {
         // No windows to receive the event — nobody can grant permission.
-        state.permissions.pending.lock().unwrap().remove(&id);
+        state
+            .permissions
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&request_id);
+        if durable {
+            append_automatic_decision(app, state, &audit, PermissionDecision::Deny)?;
+        }
         return Err("Permission denied".to_string());
     }
 
@@ -387,7 +666,15 @@ pub async fn request_permission<R: tauri::Runtime>(
         Ok(Ok(false)) => Err("Permission denied".to_string()),
         // Timed out, or the sender was dropped without a response.
         Ok(Err(_)) | Err(_) => {
-            state.permissions.pending.lock().unwrap().remove(&id);
+            state
+                .permissions
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&request_id);
+            if durable {
+                append_automatic_decision(app, state, &audit, PermissionDecision::Expired)?;
+            }
             Err("Permission denied".to_string())
         }
     }
@@ -416,6 +703,7 @@ fn set_permission_mode_impl(state: &AppState, mode: String) -> Result<(), String
 
     if tightening {
         state.permissions.session_allow.lock().unwrap().clear();
+        state.permissions.run_allow.lock().unwrap().clear();
     }
 
     Ok(())
@@ -433,6 +721,61 @@ fn get_permission_mode_impl(state: &AppState) -> String {
     state.permissions.mode.lock().unwrap().clone()
 }
 
+/// Sets a turn-scoped mode override, consulted by [`effective_mode`] before
+/// the global mode for any [`request_permission`] call carrying this exact
+/// `turn_id`. First real consumer: a scheduled automation run applying its
+/// recipe's `permission_mode` to just its own turn, without touching (or
+/// racing) whatever mode a concurrent split-pane turn is using.
+#[tauri::command]
+pub fn set_permission_mode_for_turn(
+    state: tauri::State<'_, AppState>,
+    turn_id: String,
+    mode: String,
+) -> Result<(), String> {
+    set_permission_mode_for_turn_impl(state.inner(), turn_id, mode)
+}
+
+fn set_permission_mode_for_turn_impl(
+    state: &AppState,
+    turn_id: String,
+    mode: String,
+) -> Result<(), String> {
+    if !VALID_MODES.contains(&mode.as_str()) {
+        return Err("Unknown permission mode".to_string());
+    }
+    state
+        .permissions
+        .turn_mode_overrides
+        .lock()
+        .unwrap()
+        .insert(turn_id, mode);
+    Ok(())
+}
+
+/// Removes a turn-scoped mode override, if any — [`effective_mode`] falls
+/// back to the global mode for that turn id again immediately. Callers
+/// should always clear their override when their turn ends (success,
+/// failure, or cancellation) so the map doesn't accumulate stale entries.
+#[tauri::command]
+pub fn clear_permission_mode_for_turn(
+    state: tauri::State<'_, AppState>,
+    turn_id: String,
+) -> Result<(), String> {
+    state
+        .permissions
+        .turn_mode_overrides
+        .lock()
+        .unwrap()
+        .remove(&turn_id);
+    state
+        .permissions
+        .run_allow
+        .lock()
+        .unwrap()
+        .retain(|(run_id, _)| run_id != &turn_id);
+    Ok(())
+}
+
 /// Called by the frontend (PermissionModal) once the user makes a decision.
 ///
 /// Deliberately does *not* take a `tool` parameter from the caller: the tool
@@ -446,33 +789,129 @@ fn get_permission_mode_impl(state: &AppState) -> String {
 /// makes the persisted grant match exactly what was shown to the user.
 #[tauri::command]
 pub fn permission_respond(
+    app: tauri::AppHandle,
+    window: tauri::Window,
     state: tauri::State<'_, AppState>,
     id: String,
     allow: bool,
     remember: bool,
 ) -> Result<(), String> {
+    // Team Mode (ROADMAP.md Phase 6) gate: responding to a pending
+    // permission request (allow or deny) requires the active team member to
+    // have Approver or Owner role. A complete no-op — see
+    // `team_mode::require_approver`'s doc comment — when no team members
+    // have ever been configured, so solo users see no behavior change.
+    crate::team_mode::require_approver(&app, state.inner())?;
+
+    let pending = {
+        let guard = state.permissions.pending.lock().unwrap();
+        let pending = guard
+            .get(&id)
+            .ok_or_else(|| format!("No pending permission request with id {id}"))?;
+        PendingPermissionSnapshot {
+            tool: pending.tool.clone(),
+            turn: pending.turn.clone(),
+            tool_call_id: pending.tool_call_id.clone(),
+            operation_sha256: pending.operation_sha256.clone(),
+            expires_at_ms: pending.expires_at_ms,
+        }
+    };
+    if durable_run_exists(&app, state.inner(), pending.turn.as_deref())? {
+        let run_id = pending
+            .turn
+            .clone()
+            .expect("durable permission has a run id");
+        let approval = crate::run_commands::with_ledger(&app, state.inner(), |ledger| {
+            ledger.load_approval(&run_id, &id)?.ok_or_else(|| {
+                crate::run_ledger::LedgerError::NotFound {
+                    entity: "approval",
+                    id: id.clone(),
+                }
+            })
+        })?;
+        if approval.tool_call_id != pending.tool_call_id
+            || approval.tool_name != pending.tool
+            || approval.operation_sha256 != pending.operation_sha256
+            || approval.expires_at_ms != pending.expires_at_ms
+        {
+            return Err(
+                "Pending permission does not match its immutable ledger approval".to_string(),
+            );
+        }
+        let expired = crate::run_commands::unix_time_ms()? >= pending.expires_at_ms;
+        crate::run_commands::append_host_event(
+            &app,
+            &window,
+            state.inner(),
+            run_id,
+            None,
+            RunEvent::PermissionDecided {
+                request_id: id.clone(),
+                operation_sha256: pending.operation_sha256.clone(),
+                decision: if expired {
+                    PermissionDecision::Expired
+                } else if allow {
+                    if remember {
+                        PermissionDecision::AllowForRun
+                    } else {
+                        PermissionDecision::AllowOnce
+                    }
+                } else {
+                    PermissionDecision::Deny
+                },
+                decided_by: crate::run_commands::desktop_identity(&app, &window),
+            },
+        )?;
+        if expired {
+            return respond_impl(state.inner(), id, false, false);
+        }
+    }
     respond_impl(state.inner(), id, allow, remember)
 }
 
 /// Core logic behind [`permission_respond`], factored out so it can be
 /// exercised directly in tests without standing up a full Tauri app/window.
 fn respond_impl(state: &AppState, id: String, allow: bool, remember: bool) -> Result<(), String> {
-    let entry = state.permissions.pending.lock().unwrap().remove(&id);
+    if respond_if_pending(state, &id, allow, remember)? {
+        Ok(())
+    } else {
+        Err(format!("No pending permission request with id {id}"))
+    }
+}
 
-    let (tool, _turn, sender) = match entry {
-        Some(entry) => entry,
-        None => return Err(format!("No pending permission request with id {id}")),
+pub(crate) fn respond_if_pending(
+    state: &AppState,
+    id: &str,
+    allow: bool,
+    remember: bool,
+) -> Result<bool, String> {
+    let Some(pending) = state.permissions.pending.lock().unwrap().remove(id) else {
+        return Ok(false);
     };
 
-    if remember && allow && !NO_SESSION_REMEMBER.contains(&tool.as_str()) {
-        state.permissions.session_allow.lock().unwrap().insert(tool);
+    if remember && allow && !NO_SESSION_REMEMBER.contains(&pending.tool.as_str()) {
+        if let Some(turn) = &pending.turn {
+            state
+                .permissions
+                .run_allow
+                .lock()
+                .unwrap()
+                .insert((turn.clone(), pending.tool.clone()));
+        } else {
+            state
+                .permissions
+                .session_allow
+                .lock()
+                .unwrap()
+                .insert(pending.tool.clone());
+        }
     }
 
     // If the receiving end was already dropped (e.g. the request timed out
     // just before the user clicked), there's nothing left to notify.
-    let _ = sender.send(allow);
+    let _ = pending.sender.send(allow);
 
-    Ok(())
+    Ok(true)
 }
 
 /// Denies still-in-flight permission prompts WITHOUT touching "allow for
@@ -487,13 +926,13 @@ pub fn deny_pending(state: &AppState, turn: Option<&str>) {
     let mut guard = state.permissions.pending.lock().unwrap();
     let matching: Vec<String> = guard
         .iter()
-        .filter(|(_, (_, owner, _))| turn.is_none() || owner.as_deref() == turn)
+        .filter(|(_, pending)| turn.is_none() || pending.turn.as_deref() == turn)
         .map(|(id, _)| id.clone())
         .collect();
     let pending: Vec<oneshot::Sender<bool>> = matching
         .iter()
         .filter_map(|id| guard.remove(id))
-        .map(|(_, _, sender)| sender)
+        .map(|pending| pending.sender)
         .collect();
     drop(guard);
 
@@ -524,6 +963,12 @@ pub fn revoke_session_allow_for_mcp_server(state: &AppState, server_id: &str) {
         .lock()
         .unwrap()
         .retain(|tool| !tool.starts_with(&prefix));
+    state
+        .permissions
+        .run_allow
+        .lock()
+        .unwrap()
+        .retain(|(_, tool)| !tool.starts_with(&prefix));
 }
 
 /// Clears every "allow for session" grant and denies any still-in-flight
@@ -532,6 +977,7 @@ pub fn revoke_session_allow_for_mcp_server(state: &AppState, server_id: &str) {
 /// never silently carry over and apply to a different one.
 pub fn reset_for_new_workspace(state: &AppState) {
     state.permissions.session_allow.lock().unwrap().clear();
+    state.permissions.run_allow.lock().unwrap().clear();
     deny_pending(state, None);
 }
 
@@ -552,12 +998,17 @@ mod tests {
         turn: Option<&str>,
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel::<bool>();
-        state
-            .permissions
-            .pending
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), (tool.to_string(), turn.map(str::to_string), tx));
+        state.permissions.pending.lock().unwrap().insert(
+            id.to_string(),
+            PendingPermission {
+                tool: tool.to_string(),
+                turn: turn.map(str::to_string),
+                tool_call_id: "tool-test".to_string(),
+                operation_sha256: "0".repeat(64),
+                expires_at_ms: u64::MAX,
+                sender: tx,
+            },
+        );
         rx
     }
 
@@ -573,7 +1024,12 @@ mod tests {
         assert_eq!(rx_a.try_recv(), Ok(false));
         // …turn B's is still pending, unanswered.
         assert!(rx_b.try_recv().is_err());
-        assert!(state.permissions.pending.lock().unwrap().contains_key("req-b"));
+        assert!(state
+            .permissions
+            .pending
+            .lock()
+            .unwrap()
+            .contains_key("req-b"));
     }
 
     #[test]
@@ -639,6 +1095,42 @@ mod tests {
     }
 
     #[test]
+    fn remembered_durable_permission_is_scoped_to_its_exact_run() {
+        let state = AppState::default();
+        let _rx = insert_pending_for_turn(&state, "req-run", "write_file", Some("run-a"));
+
+        respond_impl(&state, "req-run".to_string(), true, true).unwrap();
+
+        let grants = state.permissions.run_allow.lock().unwrap();
+        assert!(grants.contains(&("run-a".to_string(), "write_file".to_string())));
+        assert!(!grants.contains(&("run-b".to_string(), "write_file".to_string())));
+        assert!(state.permissions.session_allow.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn operation_digest_binds_run_tool_call_tool_and_exact_detail() {
+        let baseline = operation_digest("run-a", "tool-a", "run_shell", "echo safe");
+        assert_eq!(baseline.len(), 64);
+        assert_ne!(
+            baseline,
+            operation_digest("run-b", "tool-a", "run_shell", "echo safe")
+        );
+        assert_ne!(
+            baseline,
+            operation_digest("run-a", "tool-b", "run_shell", "echo safe")
+        );
+        assert_ne!(
+            baseline,
+            operation_digest("run-a", "tool-a", "write_file", "echo safe")
+        );
+        assert_ne!(
+            baseline,
+            operation_digest("run-a", "tool-a", "run_shell", "echo secret")
+        );
+        assert!(!baseline.contains("echo"));
+    }
+
+    #[test]
     fn revoke_session_allow_for_mcp_server_clears_only_that_servers_grants() {
         let state = AppState::default();
         {
@@ -654,8 +1146,14 @@ mod tests {
         let allowed = state.permissions.session_allow.lock().unwrap();
         assert!(!allowed.contains("mcp:docs:search"));
         assert!(!allowed.contains("mcp:docs:write"));
-        assert!(allowed.contains("mcp:other:search"), "a different server's grant must survive");
-        assert!(allowed.contains("write_file"), "a non-MCP tool's grant must survive");
+        assert!(
+            allowed.contains("mcp:other:search"),
+            "a different server's grant must survive"
+        );
+        assert!(
+            allowed.contains("write_file"),
+            "a non-MCP tool's grant must survive"
+        );
     }
 
     #[test]
@@ -826,7 +1324,11 @@ mod tests {
         // run_shell, in any mode, no matter how confidently it (or a
         // fabricated assessment) claims "low" risk.
         assert!(mode_short_circuit("smart", "run_shell", None).is_none());
-        let low = RiskAssessment { level: "low".to_string(), reason: "looks harmless".to_string(), floored: false };
+        let low = RiskAssessment {
+            level: "low".to_string(),
+            reason: "looks harmless".to_string(),
+            floored: false,
+        };
         assert!(mode_short_circuit("smart", "run_shell", Some(&low)).is_none());
     }
 
@@ -842,15 +1344,29 @@ mod tests {
 
     #[test]
     fn smart_mode_auto_approves_write_and_edit_only_when_risk_is_low_and_unfloored() {
-        let low = RiskAssessment { level: "low".to_string(), reason: "trivial rename".to_string(), floored: false };
-        assert_eq!(mode_short_circuit("smart", "write_file", Some(&low)), Some(Ok(())));
-        assert_eq!(mode_short_circuit("smart", "edit_file", Some(&low)), Some(Ok(())));
+        let low = RiskAssessment {
+            level: "low".to_string(),
+            reason: "trivial rename".to_string(),
+            floored: false,
+        };
+        assert_eq!(
+            mode_short_circuit("smart", "write_file", Some(&low)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            mode_short_circuit("smart", "edit_file", Some(&low)),
+            Some(Ok(()))
+        );
     }
 
     #[test]
     fn smart_mode_falls_through_for_write_and_edit_when_risk_is_medium_or_high() {
         for level in ["medium", "high"] {
-            let risk = RiskAssessment { level: level.to_string(), reason: "reason".to_string(), floored: false };
+            let risk = RiskAssessment {
+                level: level.to_string(),
+                reason: "reason".to_string(),
+                floored: false,
+            };
             assert!(mode_short_circuit("smart", "write_file", Some(&risk)).is_none());
             assert!(mode_short_circuit("smart", "edit_file", Some(&risk)).is_none());
         }
@@ -873,7 +1389,11 @@ mod tests {
         // other than "high" in practice, but this pins the short-circuit
         // table's own defense-in-depth: `floored: true` always falls through
         // no matter what `level` says.
-        let floored_low = RiskAssessment { level: "low".to_string(), reason: "floored anyway".to_string(), floored: true };
+        let floored_low = RiskAssessment {
+            level: "low".to_string(),
+            reason: "floored anyway".to_string(),
+            floored: true,
+        };
         assert!(mode_short_circuit("smart", "write_file", Some(&floored_low)).is_none());
         assert!(mode_short_circuit("smart", "edit_file", Some(&floored_low)).is_none());
     }
@@ -883,15 +1403,25 @@ mod tests {
         // `remember` is not write_file/edit_file — "smart" only ever
         // auto-approves those two tools, unlike "auto"/"acceptEdits" which
         // also cover `remember`.
-        let low = RiskAssessment { level: "low".to_string(), reason: "reason".to_string(), floored: false };
+        let low = RiskAssessment {
+            level: "low".to_string(),
+            reason: "reason".to_string(),
+            floored: false,
+        };
         assert!(mode_short_circuit("smart", "remember", Some(&low)).is_none());
         assert!(mode_short_circuit("smart", "remember", None).is_none());
     }
 
     #[test]
     fn bypass_mode_short_circuits_everything() {
-        assert_eq!(mode_short_circuit("bypass", "run_shell", None), Some(Ok(())));
-        assert_eq!(mode_short_circuit("bypass", "write_file", None), Some(Ok(())));
+        assert_eq!(
+            mode_short_circuit("bypass", "run_shell", None),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            mode_short_circuit("bypass", "write_file", None),
+            Some(Ok(()))
+        );
     }
 
     #[test]
@@ -962,7 +1492,13 @@ mod tests {
     #[test]
     fn floor_flags_script_executing_manifests() {
         let root = Path::new("/ws");
-        for name in ["package.json", "package-lock.json", "Cargo.toml", "Cargo.lock", "Gemfile"] {
+        for name in [
+            "package.json",
+            "package-lock.json",
+            "Cargo.toml",
+            "Cargo.lock",
+            "Gemfile",
+        ] {
             assert!(
                 path_risk_floor(&root.join(name), root).is_some(),
                 "{name} should be floored"
@@ -984,7 +1520,9 @@ mod tests {
         assert!(path_risk_floor(&root.join("PACKAGE.JSON"), root).is_some());
         assert!(path_risk_floor(&root.join("Cargo.TOML"), root).is_some());
         assert!(path_risk_floor(&root.join(".Git").join("config"), root).is_some());
-        assert!(path_risk_floor(&root.join(".GitHub").join("Workflows").join("ci.yml"), root).is_some());
+        assert!(
+            path_risk_floor(&root.join(".GitHub").join("Workflows").join("ci.yml"), root).is_some()
+        );
     }
 
     #[test]
@@ -1022,8 +1560,12 @@ mod tests {
     fn compute_risk_falls_back_to_the_judge_when_the_path_is_not_floored() {
         let root = Path::new("/ws");
         let path = Path::new("/ws/src/main.rs");
-        let assessment = compute_risk(Some((path, root)), Some("medium".to_string()), Some("touches parsing logic".to_string()))
-            .unwrap();
+        let assessment = compute_risk(
+            Some((path, root)),
+            Some("medium".to_string()),
+            Some("touches parsing logic".to_string()),
+        )
+        .unwrap();
         assert_eq!(assessment.level, "medium");
         assert!(!assessment.floored);
         assert_eq!(assessment.reason, "touches parsing logic");
@@ -1037,15 +1579,166 @@ mod tests {
         // A malformed/out-of-enum level (should never happen once riskJudge.ts
         // has already validated it, but defensively re-checked here too) is
         // discarded rather than trusted — fails closed to "no annotation".
-        assert!(compute_risk(Some((path, root)), Some("critical".to_string()), Some("x".to_string())).is_none());
+        assert!(compute_risk(
+            Some((path, root)),
+            Some("critical".to_string()),
+            Some("x".to_string())
+        )
+        .is_none());
     }
 
     #[test]
     fn compute_risk_with_no_path_is_judge_only_never_floored() {
         // run_shell has no path to floor-check — a judge result is used
         // as-is (still purely advisory, never floored).
-        let assessment = compute_risk(None, Some("high".to_string()), Some("deletes files".to_string())).unwrap();
+        let assessment = compute_risk(
+            None,
+            Some("high".to_string()),
+            Some("deletes files".to_string()),
+        )
+        .unwrap();
         assert_eq!(assessment.level, "high");
         assert!(!assessment.floored);
+    }
+
+    // `PermissionRequestPayload.agent_label` (the fix for the review finding
+    // that flagged `tools.rs`'s old `with_agent_label` detail-prefixing as
+    // spoofable/corruptible by a crafted subagent description or command
+    // string): the subagent attribution is now carried as its OWN
+    // serialized field, entirely independent of `detail`, so there is no
+    // string for a model-supplied description/command to forge a prefix
+    // into. Pinned here as a plain serde round-trip on the payload shape
+    // itself — `request_permission`'s actual emit path is covered
+    // end-to-end via `tools.rs`'s IPC-level tests instead, since exercising
+    // the emitted event itself needs a real window/listener this module's
+    // other tests deliberately avoid setting up.
+    #[test]
+    fn permission_request_payload_serializes_agent_label_as_its_own_field_when_present() {
+        let payload = PermissionRequestPayload {
+            id: "req-1".to_string(),
+            tool: "write_file".to_string(),
+            detail: "Write 12 bytes to a.txt".to_string(),
+            risk_level: None,
+            risk_reason: None,
+            risk_floored: false,
+            agent_label: Some("fix user's login bug".to_string()),
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["agent_label"], "fix user's login bug");
+        // The detail string is untouched by the label — no "Subagent '...'"
+        // prefix baked into it, unlike the pre-fix `with_agent_label` design.
+        assert_eq!(json["detail"], "Write 12 bytes to a.txt");
+    }
+
+    #[test]
+    fn permission_request_payload_omits_agent_label_when_absent() {
+        let payload = PermissionRequestPayload {
+            id: "req-2".to_string(),
+            tool: "write_file".to_string(),
+            detail: "Write 3 bytes to b.txt".to_string(),
+            risk_level: None,
+            risk_reason: None,
+            risk_floored: false,
+            agent_label: None,
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(
+            json.get("agent_label").is_none(),
+            "agent_label should be omitted, not null, when absent"
+        );
+    }
+
+    #[test]
+    fn effective_mode_falls_back_to_the_global_mode_when_no_turn_is_given() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "acceptEdits".to_string()).unwrap();
+        assert_eq!(effective_mode(&state, None), "acceptEdits");
+    }
+
+    #[test]
+    fn effective_mode_falls_back_to_the_global_mode_when_the_turn_has_no_override() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "acceptEdits".to_string()).unwrap();
+        assert_eq!(effective_mode(&state, Some("turn-a")), "acceptEdits");
+    }
+
+    #[test]
+    fn effective_mode_prefers_a_turn_scoped_override_over_the_global_mode() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "manual".to_string()).unwrap();
+        set_permission_mode_for_turn_impl(&state, "turn-a".to_string(), "bypass".to_string())
+            .unwrap();
+
+        assert_eq!(effective_mode(&state, Some("turn-a")), "bypass");
+        // A concurrent turn with no override of its own is unaffected.
+        assert_eq!(effective_mode(&state, Some("turn-b")), "manual");
+        assert_eq!(effective_mode(&state, None), "manual");
+    }
+
+    #[test]
+    fn set_permission_mode_for_turn_impl_rejects_an_unknown_mode() {
+        let state = AppState::default();
+        let err =
+            set_permission_mode_for_turn_impl(&state, "turn-a".to_string(), "yolo".to_string())
+                .unwrap_err();
+        assert_eq!(err, "Unknown permission mode");
+        assert!(state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .get("turn-a")
+            .is_none());
+    }
+
+    #[test]
+    fn clearing_a_turns_override_falls_back_to_the_global_mode_again() {
+        let state = AppState::default();
+        set_permission_mode_impl(&state, "manual".to_string()).unwrap();
+        set_permission_mode_for_turn_impl(&state, "turn-a".to_string(), "bypass".to_string())
+            .unwrap();
+        assert_eq!(effective_mode(&state, Some("turn-a")), "bypass");
+
+        // `clear_permission_mode_for_turn`'s `#[tauri::command]` wrapper is a
+        // one-line passthrough to this same map removal — exercised directly
+        // here rather than through a mocked `tauri::State`, matching every
+        // other command in this module's test style.
+        state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .remove("turn-a");
+
+        assert_eq!(effective_mode(&state, Some("turn-a")), "manual");
+    }
+
+    #[test]
+    fn clear_permission_mode_for_turn_impl_removes_only_the_named_turns_override() {
+        let state = AppState::default();
+        state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .insert("turn-a".to_string(), "bypass".to_string());
+        state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .insert("turn-b".to_string(), "auto".to_string());
+
+        state
+            .permissions
+            .turn_mode_overrides
+            .lock()
+            .unwrap()
+            .remove("turn-a");
+
+        assert_eq!(effective_mode(&state, Some("turn-a")), "manual");
+        assert_eq!(effective_mode(&state, Some("turn-b")), "auto");
     }
 }
