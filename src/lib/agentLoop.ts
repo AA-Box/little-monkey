@@ -54,6 +54,7 @@ import {
 import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
+import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
@@ -2289,7 +2290,11 @@ async function runAgentTurnBody(
       ...(wireContent !== null
         ? history.map((message) => (message === storedUserMessage ? { ...message, content: wireContent } : message))
         : history),
-    ].map(hardenSourcesNoticeForModel);
+    ]
+      // `/btw` side-question exchanges are display-only: stored in the
+      // transcript but never part of the conversation a model sees.
+      .filter((message) => !isBtwNotice(message))
+      .map(hardenSourcesNoticeForModel);
     // Strips any image content left over from earlier turns when `target`
     // can't see images — see `stripImagesForTextOnlyTarget`'s doc comment.
     const wireHistoryFor = (t: ResolvedTarget): ChatMessage[] => stripImagesForTextOnlyTarget(fullWireHistory, t);

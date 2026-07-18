@@ -43,6 +43,7 @@ import { requestRunCancellation } from "./runProtocol";
 import { registerRunCancellation } from "./runCancellationRegistry";
 import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from "./skills";
 import { protectKnowledgeNoticeForModel, wrapUntrustedContent } from "./untrustedContent";
+import { isBtwNotice } from "./slashCommands";
 
 const COMPARE_SYSTEM_SUFFIX = [
   "",
@@ -421,7 +422,8 @@ function branchWireHistory(
   }
   return [
     { role: "system", content: metadata.systemPrompt },
-    ...cloneValue([...baseMessages]),
+    // `/btw` side-question notices are display-only — never on any wire.
+    ...cloneValue([...baseMessages]).filter((message) => !isBtwNotice(message)),
     { role: "user", content: cloneValue(metadata.wireContent) },
     ...cloneValue(metadata.contextMessages),
   ];
@@ -525,7 +527,8 @@ export async function startComparison(
 
   const wireHistory: ChatMessage[] = [
     { role: "system", content: systemPrompt },
-    ...cloneValue(baseMessages),
+    // `/btw` side-question notices are display-only — never on any wire.
+    ...cloneValue(baseMessages).filter((message) => !isBtwNotice(message)),
     { role: "user", content: cloneValue(wireContent) },
     ...cloneValue(contextMessages).map(protectKnowledgeNoticeForModel),
   ];

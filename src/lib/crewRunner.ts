@@ -46,6 +46,7 @@ import { requestRunCancellation } from "./runProtocol";
 import { registerRunCancellation } from "./runCancellationRegistry";
 import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from "./skills";
 import { protectKnowledgeNoticeForModel, protectToolResult, wrapUntrustedContent } from "./untrustedContent";
+import { isBtwNotice } from "./slashCommands";
 
 const MEMBER_SYSTEM_SUFFIX = [
   "",
@@ -1209,7 +1210,9 @@ export async function startCrew(
     throw new Error("Wait for the current response to finish before starting a Crew.");
   }
   const signature = sourceSignature(source);
-  const baseMessages = cloneValue(source.messages);
+  // `/btw` side-question notices are display-only — they never join the base
+  // history any Crew actor receives.
+  const baseMessages = cloneValue(source.messages).filter((message) => !isBtwNotice(message));
   const { textRefs, images, unresolved } = await resolveReferences(normalizedPrompt, [...attachments]);
   const historyContainsImages = baseMessages.some(
     (message) => Array.isArray(message.content) && message.content.some((part) => part.type === "image_url"),
