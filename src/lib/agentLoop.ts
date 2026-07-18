@@ -59,6 +59,7 @@ import { sessionMessages, useSessionStore } from '../store/sessionStore';
 import { effortForTarget, getActiveChatTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
+import { useTurnStatusStore } from '../store/turnStatusStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
 import { useCheckpointStore } from '../store/checkpointStore';
@@ -1474,6 +1475,7 @@ export async function runAgentTurn(
   turnControllers.set(sessionId, controller);
   registerDurableController(turnId, controller);
   useSessionStore.getState().markTurnRunning(sessionId, true);
+  useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
   try {
     const route = await daemonDesktopRoute();
@@ -1488,6 +1490,7 @@ export async function runAgentTurn(
     cancellationDisposers.delete(controller);
     externallyRequestedCancellations.delete(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
+    useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
   }
 }
@@ -2198,6 +2201,9 @@ async function runAgentTurnBody(
             true,
             undefined,
             durable.recorder?.runId,
+            // Judge calls are side-channel work, not the turn's own output —
+            // keep them out of the "✳ … N tokens" status line.
+            false,
           ),
         signal
       ),
@@ -2511,6 +2517,9 @@ async function runAgentTurnBody(
       // has since moved off of. See `SubagentContext`'s doc comment in
       // `turnEngine.ts`.
       if (signal?.aborted) return finishObservedTool(CANCELLED_TOOL_RESULT);
+      // Status-line activity label — with concurrent `task` calls the most
+      // recently started one wins, which is fine for a one-word indicator.
+      useTurnStatusStore.getState().setActivity(sessionId, toolCall.function.name);
       // `risk`/`onMutatedPath` thread THIS turn's own risk-annotation context
       // and mutated-file tracking down into a `code`-profile child's own
       // write_file/edit_file/run_shell calls — without these, a subagent's
@@ -2541,6 +2550,8 @@ async function runAgentTurnBody(
       );
       return finishObservedTool(result);
     });
+    // Control returns to the model for the next round — back to "thinking".
+    useTurnStatusStore.getState().setActivity(sessionId, '');
 
     for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex++) {
       const toolCall = toolCalls[toolCallIndex];

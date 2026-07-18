@@ -226,16 +226,20 @@ describe("sideTaskStore / selectors", () => {
     expect(archived.map((t) => t.id)).toEqual([b.id]);
   });
 
-  it("selectRunningSideTaskCount counts only queued/running tasks", () => {
+  it("selectRunningSideTaskCount counts queued/running/paused tasks, not finished ones", () => {
     const a = useSideTaskStore.getState().create({ title: "A", prompt: "a", profile: "explore", source, sessionId: "s1", modelLabel: "m" });
     const b = useSideTaskStore.getState().create({ title: "B", prompt: "b", profile: "explore", source, sessionId: "s1", modelLabel: "m" });
     const c = useSideTaskStore.getState().create({ title: "C", prompt: "c", profile: "explore", source, sessionId: "s1", modelLabel: "m" });
+    const d = useSideTaskStore.getState().create({ title: "D", prompt: "d", profile: "explore", source, sessionId: "s1", modelLabel: "m" });
     useSideTaskStore.getState().markRunning(a.id);
     useSideTaskStore.getState().markRunning(b.id);
     useSideTaskStore.getState().finish(b.id, "completed", "done", null);
+    useSideTaskStore.getState().markRunning(d.id);
+    useSideTaskStore.getState().pause(d.id);
     // c stays "queued".
 
-    expect(selectRunningSideTaskCount(useSideTaskStore.getState())).toBe(2); // a (running) + c (queued)
+    expect(selectRunningSideTaskCount(useSideTaskStore.getState())).toBe(3); // a (running) + c (queued) + d (paused)
     expect(useSideTaskStore.getState().tasks[c.id].status).toBe("queued");
+    expect(useSideTaskStore.getState().tasks[d.id].status).toBe("paused");
   });
 });

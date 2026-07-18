@@ -21,6 +21,7 @@ import {
 } from "../lib/crewTypes";
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
 import { usePromptStore } from "./promptStore";
+import type { UsageInfo } from "./usageStore";
 
 /** localStorage key sessions were persisted under BEFORE file-based
  * persistence existed — only read (once, then removed) to migrate old data.
@@ -134,6 +135,15 @@ export interface ChatSession {
    * `subagent.test.ts`'s wire-payload-isolation test.
    */
   subagentRuns: Record<string, ChatMessage[]>;
+  /** Final stats for each finished subagent run, keyed like `subagentRuns`
+   * — what the Background-tasks drawer and `SubagentRow` show after a
+   * restart, when `subagentStore`'s live copy (status/tokens/timing) is
+   * gone. Written once, by the same `setSubagentRun` call that persists the
+   * transcript. Optional: sessions persisted before this field existed
+   * simply have none, and consumers fall back to transcript-derived values
+   * exactly as they did before. Same wire-payload rule as `subagentRuns`:
+   * NEVER read when building a turn's wire history. */
+  subagentRunMeta?: Record<string, SubagentRunMeta>;
   /** Original-preserving translations produced by an explicitly selected
    * model target. Records are append/replace by source digest rather than
    * overwriting `messages`, so exporting, retrying, or switching back to the
@@ -146,6 +156,19 @@ export interface ChatSession {
   /** Optional locale currently preferred for rendering this thread. Null
    * always means the untouched original transcript/title. */
   displayTranslationLocale?: string | null;
+}
+
+/** The stats `runSubagentTask`'s live `SubagentRun` tracked, snapshotted at
+ * finish time — everything the UI shows about a historical run that the
+ * child transcript alone can't provide (tokens, timing, terminal status). */
+export interface SubagentRunMeta {
+  status: "done" | "error" | "cancelled";
+  description: string;
+  profile: "explore" | "code";
+  startedAt: number;
+  finishedAt: number;
+  toolCallCount: number;
+  usage?: UsageInfo;
 }
 
 export interface MessageTranslation {
@@ -409,12 +432,20 @@ export interface SessionStore {
    * Called by `StackPicker.tsx`'s doc-chat switch. */
   toggleDocChatMode: (sessionId: string) => void;
   /** Persists a finished subagent run's child transcript under
-   * `taskId` — see `ChatSession.subagentRuns`. Called once by
+   * `taskId` — see `ChatSession.subagentRuns` — plus its final stats when
+   * provided (see `ChatSession.subagentRunMeta`). Called once by
    * `runSubagentTask` right before it returns (success, error, or
    * cancellation alike), so the mini-transcript survives a restart even
    * though `subagentStore`'s own copy is transient. No-ops if `sessionId`
    * no longer exists (deleted mid-run). */
-  setSubagentRun: (sessionId: string, taskId: string, messages: ChatMessage[]) => void;
+  setSubagentRun: (sessionId: string, taskId: string, messages: ChatMessage[], meta?: SubagentRunMeta) => void;
+  /** Empties `sessionId`'s `subagentRunMeta` — the Background-tasks
+   * drawer's "Clear" removing restored Finished entries permanently.
+   * Deliberately leaves `subagentRuns` (the transcripts) alone: inline
+   * `SubagentRow`s in the conversation must keep their expandable
+   * mini-transcript after a clear, exactly like Claude Code's panel-clear
+   * never touches the conversation itself. */
+  clearSubagentRunMeta: (sessionId: string) => void;
   /** Persist an original-preserving translation for one transcript message.
    * A newer translation of the same source/locale replaces only that record. */
   saveMessageTranslation: (sessionId: string, translation: MessageTranslation) => void;
@@ -565,6 +596,7 @@ function createSession(): ChatSession {
     // No subagent runs yet — populated only once a `task` tool call in this
     // session actually finishes (see `setSubagentRun`).
     subagentRuns: {},
+    subagentRunMeta: {},
     messageTranslations: [],
     threadTranslations: [],
     displayTranslationLocale: null,
@@ -620,6 +652,7 @@ function cloneSessionAsFork(source: ChatSession): ChatSession {
     attachedStackIds: [...source.attachedStackIds],
     docChatMode: source.docChatMode,
     subagentRuns: cloneSubagentRuns(source.subagentRuns),
+    subagentRunMeta: source.subagentRunMeta ? structuredClone(source.subagentRunMeta) : {},
     messageTranslations: cloneMessageTranslations(source.messageTranslations),
     threadTranslations: cloneThreadTranslations(source.threadTranslations),
     displayTranslationLocale: source.displayTranslationLocale ?? null,
@@ -655,6 +688,7 @@ function cloneComparisonBranch(source: ChatSession, groupId: string, index: numb
     attachedStackIds: [...source.attachedStackIds],
     docChatMode: source.docChatMode,
     subagentRuns: cloneSubagentRuns(source.subagentRuns),
+    subagentRunMeta: source.subagentRunMeta ? structuredClone(source.subagentRunMeta) : {},
     messageTranslations: cloneMessageTranslations(source.messageTranslations),
     threadTranslations: cloneThreadTranslations(source.threadTranslations),
     displayTranslationLocale: source.displayTranslationLocale ?? null,
@@ -681,6 +715,7 @@ function clonePromotedBranch(source: ChatSession): ChatSession {
     attachedStackIds: [...source.attachedStackIds],
     docChatMode: source.docChatMode,
     subagentRuns: cloneSubagentRuns(source.subagentRuns),
+    subagentRunMeta: source.subagentRunMeta ? structuredClone(source.subagentRunMeta) : {},
     messageTranslations: cloneMessageTranslations(source.messageTranslations),
     threadTranslations: cloneThreadTranslations(source.threadTranslations),
     displayTranslationLocale: source.displayTranslationLocale ?? null,
@@ -710,6 +745,7 @@ function cloneCrewSession(source: ChatSession, run: CrewRun): ChatSession {
     attachedStackIds: [...source.attachedStackIds],
     docChatMode: source.docChatMode,
     subagentRuns: {},
+    subagentRunMeta: {},
     messageTranslations: [],
     threadTranslations: [],
     displayTranslationLocale: null,
@@ -763,6 +799,7 @@ function clonePromotedCrew(source: ChatSession, run: CrewRun): ChatSession {
     attachedStackIds: [...source.attachedStackIds],
     docChatMode: source.docChatMode,
     subagentRuns: {},
+    subagentRunMeta: {},
     messageTranslations: [],
     threadTranslations: [],
     displayTranslationLocale: null,
@@ -883,6 +920,41 @@ function normalizeSubagentRuns(raw: unknown): Record<string, ChatMessage[]> {
   for (const [taskId, value] of Object.entries(raw as Record<string, unknown>)) {
     if (!Array.isArray(value)) continue;
     result[taskId] = value.map(normalizeMessage).filter((message): message is ChatMessage => message !== null);
+  }
+  return result;
+}
+
+/** Fills in defaults for a persisted `subagentRunMeta` blob — entries whose
+ * required numeric/string fields don't hold are dropped, same defensive
+ * posture as `normalizeSubagentRuns` above. Sessions from before this field
+ * existed just yield `{}`. */
+function normalizeSubagentRunMeta(raw: unknown): Record<string, SubagentRunMeta> {
+  if (!raw || typeof raw !== "object") return {};
+  const result: Record<string, SubagentRunMeta> = {};
+  for (const [taskId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const candidate = value as Partial<SubagentRunMeta>;
+    if (candidate.status !== "done" && candidate.status !== "error" && candidate.status !== "cancelled") continue;
+    if (typeof candidate.description !== "string") continue;
+    if (!Number.isFinite(candidate.startedAt) || !Number.isFinite(candidate.finishedAt)) continue;
+    const usage = candidate.usage;
+    const usageValid =
+      usage === undefined ||
+      (typeof usage === "object" &&
+        usage !== null &&
+        Number.isFinite(usage.promptTokens) &&
+        Number.isFinite(usage.completionTokens) &&
+        Number.isFinite(usage.totalTokens));
+    if (!usageValid) continue;
+    result[taskId] = {
+      status: candidate.status,
+      description: candidate.description,
+      profile: candidate.profile === "code" ? "code" : "explore",
+      startedAt: candidate.startedAt as number,
+      finishedAt: candidate.finishedAt as number,
+      toolCallCount: Number.isFinite(candidate.toolCallCount) ? (candidate.toolCallCount as number) : 0,
+      usage,
+    };
   }
   return result;
 }
@@ -1197,6 +1269,7 @@ function normalizeSession(raw: Partial<ChatSession>, interruptRunning: boolean):
       : [],
     docChatMode: raw.docChatMode === true,
     subagentRuns: normalizeSubagentRuns(raw.subagentRuns),
+    subagentRunMeta: normalizeSubagentRunMeta(raw.subagentRunMeta),
     messageTranslations: normalizeMessageTranslations(raw.messageTranslations),
     threadTranslations: normalizeThreadTranslations(raw.threadTranslations),
     displayTranslationLocale: normalizeLocale(raw.displayTranslationLocale),
@@ -2140,13 +2213,29 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     });
   },
 
-  setSubagentRun: (sessionId, taskId, messages) => {
+  setSubagentRun: (sessionId, taskId, messages, meta) => {
     set((state) => {
       const target = state.sessions.find((s) => s.id === sessionId);
       if (!target) return state;
       const sessions = state.sessions.map((s) =>
-        s.id === sessionId ? { ...s, subagentRuns: { ...s.subagentRuns, [taskId]: messages } } : s
+        s.id === sessionId
+          ? {
+              ...s,
+              subagentRuns: { ...s.subagentRuns, [taskId]: messages },
+              ...(meta ? { subagentRunMeta: { ...s.subagentRunMeta, [taskId]: meta } } : {}),
+            }
+          : s
       );
+      persist(sessions, state.activeSessionId, state.groups);
+      return { sessions };
+    });
+  },
+
+  clearSubagentRunMeta: (sessionId) => {
+    set((state) => {
+      const target = state.sessions.find((s) => s.id === sessionId);
+      if (!target || !target.subagentRunMeta || Object.keys(target.subagentRunMeta).length === 0) return state;
+      const sessions = state.sessions.map((s) => (s.id === sessionId ? { ...s, subagentRunMeta: {} } : s));
       persist(sessions, state.activeSessionId, state.groups);
       return { sessions };
     });
