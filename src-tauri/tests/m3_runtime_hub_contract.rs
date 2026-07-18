@@ -751,6 +751,7 @@ impl M3RuntimeDriver for MockRuntimeDriver {
             can_logs: true,
             can_metrics: true,
             can_infer: true,
+            can_embed: false,
             settings: Self::setting_capabilities(),
         }
     }

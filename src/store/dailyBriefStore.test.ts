@@ -155,6 +155,7 @@ function runtimeCapability(overrides: Partial<M3RuntimeCapability["descriptor"]>
     canLogs: false,
     canMetrics: false,
     canInfer,
+    canEmbed: false,
     settings: [],
   };
 }

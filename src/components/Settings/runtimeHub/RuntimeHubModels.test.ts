@@ -31,6 +31,7 @@ describe("Runtime Hub capacity planner input", () => {
       canLogs: false,
       canMetrics: true,
       canInfer: true,
+      canEmbed: false,
       settings: [],
     };
     const model = (id: string): M3InstalledModel => ({
