@@ -102,6 +102,12 @@ export async function runRecipeNow(
   recipe: Recipe,
   paramOverrides: Record<string, string> = {},
   permissionModeOverride?: string,
+  /** Set only when this run was triggered through a published Local App's
+   * `run` route (`localAppsStore.ts`'s run-request listener) — tags the
+   * session name and notice so it's visibly distinguishable from an
+   * ordinary "Run now"/scheduled invocation, and threads through to the
+   * turn's Run Capsule via `RecipeNotice.localAppId`. */
+  localAppId?: string,
 ): Promise<RecipeRunHandle> {
   // Every error path in this function is a rejected promise, never a
   // synchronous throw — callers that don't wrap the call in try/catch (e.g.
@@ -124,7 +130,7 @@ export async function runRecipeNow(
   useSessionStore.getState().renameSession(sessionId, recipe.name);
   useSessionStore.getState().addMessage(sessionId, {
     role: "system",
-    content: formatRecipeNotice({ name: recipe.name }),
+    content: formatRecipeNotice({ name: recipe.name, ...(localAppId ? { localAppId } : {}) }),
   });
 
   // A recipe's own `system` (if any) is appended the same way every other

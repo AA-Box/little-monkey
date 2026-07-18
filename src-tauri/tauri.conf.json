@@ -37,6 +37,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/monkey-cli"]
+    "externalBin": [
+      "binaries/monkey-cli"
+    ],
+    "macOS": {
+      "files": {
+        "Resources/Assets.car": "resources/Assets.car"
+      }
+    }
   }
 }

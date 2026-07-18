@@ -15,6 +15,7 @@ import {
   type M3CatalogSourceConfig,
   type M3CatalogMatch,
   type M3CleanupReport,
+  type M3CompatibilityMatrixReport,
   type M3ComponentCatalogEntry,
   type M3ComponentUpdateCheck,
   type M3InstalledComponent,
@@ -48,7 +49,16 @@ import {
   type SettingValue,
 } from "../lib/runtimeHubClient";
 
-export type RuntimeHubSection = "overview" | "models" | "components" | "catalogs" | "runtimes" | "api" | "lan" | "quantization";
+export type RuntimeHubSection =
+  | "overview"
+  | "models"
+  | "components"
+  | "catalogs"
+  | "runtimes"
+  | "api"
+  | "compatibility"
+  | "lan"
+  | "quantization";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -85,6 +95,7 @@ interface RuntimeHubStoreState {
   catalogQuery: string;
   catalogResults: M3CatalogMatch[];
   apiResult: M3ApiDispatchResponse | null;
+  compatibilityMatrix: M3CompatibilityMatrixReport | null;
   lanPolicy: LanServerPolicy | null;
   lanTokens: ScopedToken[];
   lanAudit: SecurityAuditEvent[];
@@ -145,6 +156,7 @@ interface RuntimeHubStoreState {
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
   dispatchApi: (request: M3ApiDispatchRequest) => Promise<void>;
   cancelInference: (request: M3CancelInferenceRequest) => Promise<boolean>;
+  refreshCompatibilityMatrix: () => Promise<void>;
   refreshLan: () => Promise<void>;
   validateLanPolicy: (policy: LanServerPolicy) => Promise<void>;
   configureLan: (policy: LanServerPolicy) => Promise<void>;
@@ -308,6 +320,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     catalogQuery: "",
     catalogResults: [],
     apiResult: null,
+    compatibilityMatrix: null,
     lanPolicy: null,
     lanTokens: [],
     lanAudit: [],
@@ -799,6 +812,19 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       } catch (error) {
         fail(key, error);
         throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    refreshCompatibilityMatrix: async () => {
+      const key = "compatibility-matrix";
+      begin(key);
+      try {
+        const compatibilityMatrix = await runtimeHubClient.compatibilityMatrix();
+        set({ compatibilityMatrix });
+      } catch (error) {
+        fail(key, error);
       } finally {
         finish(key);
       }
