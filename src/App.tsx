@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FolderTree, ListTodo, PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
+import { FileDiff, FolderTree, Globe2, ListTodo, PanelRight, PanelRightClose, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { RunCenter } from "./components/Runs";
-import { BrowserWorkbench } from "./components/Browser";
+import { BrowserPane, BrowserWorkbench } from "./components/Browser";
+import { useBrowserPaneStore } from "./store/browserPaneStore";
+import { useApprovalChainStore } from "./store/approvalChainStore";
 import { IssueToPrPanel } from "./components/IssueToPr";
 import { SecurityAutofixPanel } from "./components/SecurityAutofix";
 import { TrustScorecardsPanel } from "./components/TrustScorecards";
@@ -43,8 +45,8 @@ import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
-import { useSideTaskStore } from "./store/sideTaskStore";
-import { ArtifactPane, FileTree, DiffViewer, PermissionModal, ApprovalChainModal, SessionGrantBanner } from "./components/Workspace";
+import { useSideTaskStore, selectRunningSideTaskCount } from "./store/sideTaskStore";
+import { ArtifactPane, FileTree, DiffPanel, DiffViewer, PermissionModal, ApprovalChainModal, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
 import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
@@ -160,6 +162,36 @@ function App() {
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const terminalDock = useTerminalStore((state) => state.dock);
+  const browserPaneOpen = useBrowserPaneStore((state) => state.open);
+  const setBrowserPaneOpen = useBrowserPaneStore((state) => state.setOpen);
+  const approvalChainPending = useApprovalChainStore((s) => s.pending !== null);
+  const [diffPanelOpen, setDiffPanelOpen] = useState(false);
+  /** Changed-file count behind the top-bar Diff badge; polled, best-effort. */
+  const [changedFileCount, setChangedFileCount] = useState(0);
+  const runningSideTaskCount = useSideTaskStore(selectRunningSideTaskCount);
+
+  // Top-bar Diff badge: slow poll of the changed-file count, refreshed
+  // immediately whenever the panel toggles. Badge only — the panel itself
+  // fetches its own list.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    const refresh = async () => {
+      if (!primaryRoot(useWorkspaceStore.getState().roots)) return;
+      try {
+        const files = await invoke<unknown[]>("git_changed_files");
+        if (!cancelled) setChangedFileCount(files.length);
+      } catch {
+        // Badge is cosmetic — ignore failures.
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [diffPanelOpen]);
   /** The right sidebar region shows at most ONE thing at a time (Claude-
    * Desktop-style): nothing (default), the picker menu, the workspace
    * panel, or the side-tasks drawer. A right-docked terminal overrides
@@ -1328,7 +1360,26 @@ setVisualEditModeOpen(false);
         <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-end px-2">
           <IconButton
             size="sm"
-            variant={terminalOpen ? "secondary" : "ghost"}
+            variant={diffPanelOpen ? "active" : "ghost"}
+            className="relative"
+            onClick={() => {
+              setBrowserPaneOpen(false);
+              setDiffPanelOpen((open) => !open);
+            }}
+            disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
+            aria-label={diffPanelOpen ? t("App.closeDiff") : t("App.openDiff")}
+            title={diffPanelOpen ? t("App.closeDiff") : t("App.openDiff")}
+          >
+            <FileDiff size={15} />
+            {changedFileCount > 0 && (
+              <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-none text-accent-foreground">
+                {changedFileCount > 9 ? "9+" : changedFileCount}
+              </span>
+            )}
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant={terminalOpen ? "active" : "ghost"}
             onClick={() => setTerminalOpen((open) => !open)}
             disabled={!primaryRoot(useWorkspaceStore.getState().roots)}
             aria-label={terminalOpen ? t("App.closeTerminal") : t("App.openTerminal")}
@@ -1338,7 +1389,43 @@ setVisualEditModeOpen(false);
           </IconButton>
           <IconButton
             size="sm"
-            variant={rightPanel !== "none" ? "secondary" : "ghost"}
+            variant={browserPaneOpen ? "active" : "ghost"}
+            onClick={() => {
+              setDiffPanelOpen(false);
+              setBrowserPaneOpen(!browserPaneOpen);
+            }}
+            aria-label={browserPaneOpen ? t("App.closeBrowser") : t("App.openBrowser")}
+            title={browserPaneOpen ? t("App.closeBrowser") : t("App.openBrowser")}
+          >
+            <Globe2 size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant={rightPanel === "sideTasks" ? "active" : "ghost"}
+            className="relative"
+            onClick={() => {
+              if (rightPanel === "sideTasks") {
+                setRightPanel("none");
+              } else {
+                setBrowserPaneOpen(false);
+                setDiffPanelOpen(false);
+                useSideTaskStore.getState().openDrawer();
+                setRightPanel("sideTasks");
+              }
+            }}
+            aria-label={rightPanel === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
+            title={rightPanel === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
+          >
+            <ListTodo size={15} />
+            {runningSideTaskCount > 0 && (
+              <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-none text-accent-foreground">
+                {runningSideTaskCount > 9 ? "9+" : runningSideTaskCount}
+              </span>
+            )}
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant={rightPanel !== "none" ? "active" : "ghost"}
             onClick={() => setRightPanel((panel) => (panel === "none" ? "menu" : "none"))}
             aria-label={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
             title={rightPanel !== "none" ? t("App.closeRightSidebar") : t("App.openRightSidebar")}
@@ -1531,7 +1618,13 @@ setVisualEditModeOpen(false);
           right-docked terminal (overrides everything), the picker menu, the
           side-tasks drawer, or the workspace panel. Claude-Desktop-style:
           contents swap in place, they never stack beside each other. */}
-      {terminalOpen && terminalDock === "right" ? (
+      {browserPaneOpen ? (
+        <BrowserPane
+          obscured={settingsOpen || commandPaletteOpen || permissionPending || approvalChainPending}
+        />
+      ) : diffPanelOpen ? (
+        <DiffPanel onClose={() => setDiffPanelOpen(false)} />
+      ) : terminalOpen && terminalDock === "right" ? (
         <TerminalPanel chatSessionId={activeSessionId} onClose={() => setTerminalOpen(false)} />
       ) : rightPanel === "sideTasks" ? (
         <SideTaskDrawer sessionId={activeSessionId} />

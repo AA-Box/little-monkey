@@ -1855,9 +1855,40 @@ mod tests {
 
     /// Backdates `dir`'s mtime for the abandoned-in-flight sweep test above.
     fn set_dir_mtime(dir: &Path, t: std::time::SystemTime) {
-        let file = std::fs::File::open(dir).expect("open dir for mtime update");
+        let file = open_dir_handle(dir).expect("open dir for mtime update");
         let times = std::fs::FileTimes::new().set_modified(t);
         file.set_times(times).expect("set directory mtime");
+    }
+
+    /// Opens `dir` (a directory, not a regular file) as a [`std::fs::File`]
+    /// handle suitable for [`std::fs::File::set_times`].
+    ///
+    /// Plain `File::open` works for this on Unix, where a directory can be
+    /// opened like any other path. On Windows, `CreateFileW` refuses to open
+    /// a directory at all unless `FILE_FLAG_BACKUP_SEMANTICS` is passed —
+    /// without it this fails with `ERROR_ACCESS_DENIED` (os error 5), which
+    /// is exactly the panic Windows CI hit here. Request only
+    /// attribute-level access (not a generic read/write handle): opening a
+    /// directory with `GENERIC_WRITE` is unreliable, but `FILE_WRITE_ATTRIBUTES`
+    /// is both sufficient for `set_times` and reliably grantable on a
+    /// directory (this mirrors the approach the `filetime` crate uses for
+    /// the same operation).
+    #[cfg(windows)]
+    fn open_dir_handle(dir: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+    }
+
+    #[cfg(not(windows))]
+    fn open_dir_handle(dir: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(dir)
     }
 
     #[test]

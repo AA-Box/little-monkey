@@ -3462,6 +3462,16 @@ pub struct OffloadModelProfile {
     pub estimated_vram_bytes: u64,
     pub required_accelerator: Option<AcceleratorKind>,
     pub has_vision_projector: bool,
+    /// Estimated resident memory the multimodal projector itself needs once
+    /// loaded (ROADMAP Phase 8 item 12), separate from `weights_bytes`/
+    /// `estimated_ram_bytes`/`estimated_vram_bytes` above, which describe the
+    /// base language model only. Ignored when `has_vision_projector` is
+    /// false. Zero is a legitimate value for a vision-capable model whose
+    /// projector size is not yet known, in which case this planner simply
+    /// reserves nothing extra for it (see `m3_runtime_hub::
+    /// estimated_projector_memory_bytes` for how a real figure is derived
+    /// from a catalog's declared `M3ProjectorRef`).
+    pub projector_memory_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3535,7 +3545,7 @@ impl LocalOffloadPlanner {
             &mut improvements,
         );
 
-        let available_ram_bytes = input
+        let mut available_ram_bytes = input
             .hardware
             .available_ram_bytes
             .saturating_sub(profile.recommended_ram_reserve_bytes)
@@ -3545,7 +3555,7 @@ impl LocalOffloadPlanner {
         // rather than a second, independently reserved figure. That avoids both
         // double-counting the pool and skipping the OS/other-resident reserve on
         // the accelerator side.
-        let available_vram_bytes = match accelerator {
+        let mut available_vram_bytes = match accelerator {
             AcceleratorKind::Cpu => 0,
             AcceleratorKind::Metal => available_ram_bytes,
             other => input
@@ -3558,6 +3568,37 @@ impl LocalOffloadPlanner {
                 .unwrap_or(0)
                 .saturating_sub(input.reserved.vram_bytes),
         };
+
+        // Multimodal projector memory sizing (ROADMAP Phase 8 item 12):
+        // reserve the projector's own resident footprint off the top of
+        // whichever pool it will occupy, *before* the GPU-layer fit fraction
+        // and context-tier math below so both genuinely account for it,
+        // rather than only deciding *where* the projector goes afterward.
+        // Metal keeps both pool variables equal (they represent the same
+        // unified memory); a genuinely separate accelerator only spends its
+        // own VRAM; CPU-only plans spend system RAM.
+        if input.model.has_vision_projector && input.model.projector_memory_bytes > 0 {
+            let projector_bytes = input.model.projector_memory_bytes;
+            match accelerator {
+                AcceleratorKind::Cpu => {
+                    available_ram_bytes = available_ram_bytes.saturating_sub(projector_bytes);
+                }
+                AcceleratorKind::Metal => {
+                    available_ram_bytes = available_ram_bytes.saturating_sub(projector_bytes);
+                    available_vram_bytes = available_vram_bytes.saturating_sub(projector_bytes);
+                }
+                _ => {
+                    available_vram_bytes = available_vram_bytes.saturating_sub(projector_bytes);
+                }
+            }
+            rationale.push(OffloadRationale {
+                field: "projector_memory_bytes".to_string(),
+                explanation: format!(
+                    "Reserved {} for the multimodal projector's own resident memory before sizing context and GPU layers.",
+                    format_bytes_for_rationale(projector_bytes)
+                ),
+            });
+        }
 
         let estimated_total_layers = estimate_layer_count(input.model.weights_bytes);
         let (gpu_layers, cpu_spill_layers) = if accelerator == AcceleratorKind::Cpu
@@ -3924,6 +3965,36 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
 
+    /// An absolute path valid on whichever OS this actually runs under.
+    /// `/foo` satisfies `Path::is_absolute()` on Unix but not on Windows
+    /// (which requires a drive-letter or UNC prefix) — both the executable
+    /// and per-model paths built from this are checked with exactly that,
+    /// and never touch real disk I/O, so any platform-appropriate absolute
+    /// path is equally valid here.
+    fn fixture_absolute_path(rest: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", rest.replace('/', "\\")))
+        } else {
+            PathBuf::from(format!("/{rest}"))
+        }
+    }
+
+    /// Same idea as [`fixture_absolute_path`], but rendered as the `String`
+    /// that ends up on the launched process's argv (see
+    /// `ManagedLlamaCppAdapter::load_model`, which turns a model's
+    /// `local_path` into a `-m`/`--model-draft` argument via
+    /// `Path::to_str`). Real llama-server invocations legitimately need the
+    /// OS-native separator here — unlike `tools.rs`'s glob/grep results,
+    /// this string is consumed by an actual subprocess's file open, not
+    /// shown to the model/UI — so tests must compare against this rendering
+    /// rather than a hardcoded forward-slash literal.
+    fn fixture_absolute_path_arg(rest: &str) -> String {
+        fixture_absolute_path(rest).to_string_lossy().into_owned()
+    }
+
+    const ALPHA_MODEL_PATH: &str = "models/alpha.gguf";
+    const BETA_MODEL_PATH: &str = "models/beta.gguf";
+
     #[derive(Clone)]
     enum TransportPlan {
         Response(HttpResponse),
@@ -4193,7 +4264,7 @@ mod tests {
             model_id: model_id.to_string(),
             display_name: model_id.to_string(),
             size_bytes: 8 * 1024 * 1024,
-            local_path: Some(PathBuf::from(path)),
+            local_path: Some(fixture_absolute_path(path)),
             digest: Some(format!("digest-{model_id}")),
             modified_at: None,
             capabilities: ModelCapabilities {
@@ -4219,12 +4290,12 @@ mod tests {
         ManagedLlamaCppAdapter::new(
             "llama-chat",
             "http://127.0.0.1:8090",
-            PathBuf::from("/usr/local/bin/llama-server"),
+            fixture_absolute_path("usr/local/bin/llama-server"),
             8090,
             controller,
             vec![
-                model("alpha", "/models/alpha.gguf"),
-                model("beta", "/models/beta.gguf"),
+                model("alpha", ALPHA_MODEL_PATH),
+                model("beta", BETA_MODEL_PATH),
             ],
             platform(),
         )
@@ -4712,8 +4783,14 @@ mod tests {
                 _ => None,
             })
             .expect("structured launch call");
-        assert_eq!(spec.program, PathBuf::from("/usr/local/bin/llama-server"));
-        assert_eq!(spec.args[0..2], ["-m", "/models/alpha.gguf"]);
+        assert_eq!(
+            spec.program,
+            fixture_absolute_path("usr/local/bin/llama-server")
+        );
+        assert_eq!(
+            spec.args[0..2],
+            ["-m".to_string(), fixture_absolute_path_arg(ALPHA_MODEL_PATH)]
+        );
         assert!(spec.args.windows(2).any(|pair| pair == ["-c", "8192"]));
         assert!(spec.args.windows(2).any(|pair| pair == ["-ngl", "32"]));
         assert!(spec
@@ -4855,10 +4932,14 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair == ["--cache-type-v", "q8_0"]));
+        let expected_draft_arg = [
+            "--model-draft".to_string(),
+            fixture_absolute_path_arg(BETA_MODEL_PATH),
+        ];
         assert!(spec
             .args
             .windows(2)
-            .any(|pair| pair == ["--model-draft", "/models/beta.gguf"]));
+            .any(|pair| pair == expected_draft_arg));
     }
 
     #[tokio::test]
@@ -5160,6 +5241,7 @@ mod tests {
                 estimated_vram_bytes: 0,
                 required_accelerator: None,
                 has_vision_projector: false,
+                projector_memory_bytes: 0,
             },
             reserved: zero_reserved(),
             other_resident_count: 0,
@@ -5194,6 +5276,7 @@ mod tests {
                 estimated_vram_bytes: gib(4) + gib(1) / 2,
                 required_accelerator: None,
                 has_vision_projector: true,
+                projector_memory_bytes: 0,
             },
             reserved: MemoryRequirement {
                 ram_bytes: gib(22),
@@ -5222,6 +5305,44 @@ mod tests {
     }
 
     #[test]
+    fn offload_plan_reserves_projector_memory_before_sizing_context_and_gpu_layers() {
+        // Same hardware/model shape as the metal-partial-offload case above,
+        // except this model's projector itself needs 2 GiB of resident
+        // memory. That must come off the top of the same unified pool
+        // *before* GPU-layer fit and context-tier math, producing a smaller
+        // affordable context/available-memory than the zero-projector-memory
+        // case, plus an explicit rationale entry naming the reservation.
+        let hardware = metal_hardware(40, 30, 12);
+        let input = OffloadPlanInput {
+            hardware,
+            model: OffloadModelProfile {
+                weights_bytes: gib(4),
+                estimated_ram_bytes: gib(4) + gib(1) / 2,
+                estimated_vram_bytes: gib(4) + gib(1) / 2,
+                required_accelerator: None,
+                has_vision_projector: true,
+                projector_memory_bytes: gib(2),
+            },
+            reserved: MemoryRequirement {
+                ram_bytes: gib(22),
+                vram_bytes: 0,
+            },
+            other_resident_count: 2,
+            requested_context_tokens: None,
+        };
+        let plan = LocalOffloadPlanner::plan(&input).expect("metal plan with projector memory");
+
+        assert_eq!(plan.accelerator, AcceleratorKind::Metal);
+        // Available memory drops by exactly the projector's reserved 2 GiB
+        // relative to the zero-projector-memory metal test above (gib(4)).
+        assert_eq!(plan.available_ram_bytes, gib(2));
+        assert_eq!(plan.available_vram_bytes, gib(2));
+        assert_eq!(plan.projector_placement, ProjectorPlacement::Gpu);
+        assert!(plan.rationale.iter().any(|entry| entry.field == "projector_memory_bytes"
+            && entry.explanation.contains("2.0 GB")));
+    }
+
+    #[test]
     fn offload_plan_falls_back_to_cpu_when_required_accelerator_missing() {
         let hardware = cpu_only_hardware(16, 12, 8);
         let input = OffloadPlanInput {
@@ -5232,6 +5353,7 @@ mod tests {
                 estimated_vram_bytes: gib(2) + gib(1) / 4,
                 required_accelerator: Some(AcceleratorKind::Cuda),
                 has_vision_projector: false,
+                projector_memory_bytes: 0,
             },
             reserved: zero_reserved(),
             other_resident_count: 0,
@@ -5264,6 +5386,7 @@ mod tests {
             estimated_vram_bytes: 0,
             required_accelerator: None,
             has_vision_projector: false,
+            projector_memory_bytes: 0,
         };
 
         let zero_weights = OffloadPlanInput {

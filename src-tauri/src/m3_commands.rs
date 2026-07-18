@@ -27,7 +27,7 @@ use crate::m3_runtime_hub::{
     M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest,
     M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub,
     M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
-    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
+    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest, M3VerifyProjectorRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -38,12 +38,32 @@ use crate::runtime_adapter::{
     OffloadPlanInput, ReqwestHttpTransport, RuntimeInventory, RuntimeLifecycleState, RuntimeLogTail,
     SchedulingInput, SchedulingPlan,
 };
+use crate::runtime_telemetry::{
+    RecordLoadTraceRequest, RecordRequestTraceRequest, RuntimeTelemetryState, RuntimeTraceRecord,
+    SupportBundle,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
+
+/// Bounded per-runtime max for the runtime log tails a support bundle can
+/// embed — mirrors `M3RuntimeHub::runtime_logs`'s own cap on a single
+/// request, applied per runtime so a bundle across many runtimes stays a
+/// predictable size.
+const SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME: usize = 64 * 1024;
+/// How many recent traces a support bundle embeds.
+const SUPPORT_BUNDLE_MAX_TRACES: usize = 200;
+
+fn telemetry_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
 
 pub trait M3OwnedProcessShutdown: Send + Sync {
     fn shutdown_all_blocking(&self, timeout: Duration) -> Result<usize, String>;
@@ -56,6 +76,12 @@ pub struct M3CommandState {
     /// `hub` — see `m3_runtime_hub`'s "Runtime Component Update Channels"
     /// module section for why.
     pub component_hub: Arc<M3ComponentHub>,
+    /// Runtime Telemetry and Memory Trace Viewer state: bounded trace ring
+    /// buffer plus the redaction pass used for both individual traces and
+    /// support-bundle export. Deliberately its own `Arc` (not folded into
+    /// `hub`) so it stays trivial to construct in tests that don't need the
+    /// rest of the M3 hub.
+    pub telemetry: Arc<RuntimeTelemetryState>,
     operations: Mutex<BTreeMap<String, CancellationToken>>,
     catalog_mutation: Mutex<()>,
     owned_processes: Option<Arc<dyn M3OwnedProcessShutdown>>,
@@ -66,6 +92,7 @@ impl M3CommandState {
         Self {
             hub,
             component_hub,
+            telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
             catalog_mutation: Mutex::new(()),
             owned_processes: None,
@@ -80,6 +107,7 @@ impl M3CommandState {
         Self {
             hub,
             component_hub,
+            telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
             catalog_mutation: Mutex::new(()),
             owned_processes: Some(owned_processes),
@@ -302,6 +330,22 @@ pub async fn m3_catalog_search(
     finish(&state, &operation_id, result).await
 }
 
+/// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+/// 14): the frontend calls this before a local model actually loads (see
+/// `RuntimeHubRuntimes.tsx`'s "Load model" section) so an outdated installed
+/// model shows a concrete "update to this" migration path first.
+#[tauri::command]
+pub async fn m3_model_staleness_check(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    asset_id: String,
+) -> Result<Option<crate::model_retirement::LocalModelStalenessWarning>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.hub.model_staleness_check(&asset_id, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
 #[tauri::command]
 pub async fn m3_model_download(
     state: tauri::State<'_, M3CommandState>,
@@ -336,6 +380,23 @@ pub async fn m3_model_activate_version(
 ) -> Result<M3InstalledModelView, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.activate_model_version(&request, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+/// Verifies a candidate local file against an installed model version's
+/// declared projector reference, promoting its evidence from "declared" to
+/// genuinely `Verified` (ROADMAP Phase 8 item 12). See
+/// `M3RuntimeHub::verify_projector` for why this checks a user-supplied
+/// path rather than downloading anything itself.
+#[tauri::command]
+pub async fn m3_verify_projector(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3VerifyProjectorRequest,
+) -> Result<M3InstalledModelView, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let result = state.hub.verify_projector(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
 
@@ -938,6 +999,100 @@ pub async fn m3_component_activate_version(
         .activate_component_version(&request, &context)
         .await;
     finish(&state, &operation_id, result).await
+}
+
+// -------------------------------------------------------------------------
+// Runtime Telemetry and Memory Trace Viewer
+// -------------------------------------------------------------------------
+
+/// Records a per-load trace. The caller (the Runtime Hub's load flow)
+/// already measured `startedAtMs`/`readyAtMs` around its own
+/// `m3_runtime_load_model` call and already computed an offload plan via
+/// `m3_offload_plan` before loading — this only stores what the caller
+/// already has, applying redaction to `errorMessage` before it is ever held
+/// in memory.
+#[tauri::command]
+pub fn m3_telemetry_record_load(
+    state: tauri::State<'_, M3CommandState>,
+    request: RecordLoadTraceRequest,
+) -> Result<RuntimeTraceRecord, String> {
+    state.telemetry.record_load(request)
+}
+
+/// Records a per-request trace (sampler stats actually used plus token
+/// counts/timing) — see `RecordRequestTraceRequest`'s fields for exactly why
+/// this cannot carry prompt/response text even in principle.
+#[tauri::command]
+pub fn m3_telemetry_record_request(
+    state: tauri::State<'_, M3CommandState>,
+    request: RecordRequestTraceRequest,
+) -> Result<RuntimeTraceRecord, String> {
+    state.telemetry.record_request(request)
+}
+
+#[tauri::command]
+pub fn m3_telemetry_recent_traces(
+    state: tauri::State<'_, M3CommandState>,
+    runtime_id: Option<String>,
+    limit: usize,
+) -> Result<Vec<RuntimeTraceRecord>, String> {
+    Ok(state.telemetry.recent(runtime_id.as_deref(), limit))
+}
+
+/// Assembles a redacted support bundle: recent traces (already redacted at
+/// record time) plus a fresh, bounded, redacted tail of every runtime's
+/// managed-process log (via the existing `M3RuntimeHub::runtime_logs`, the
+/// same path `m3_runtime_logs` uses) and hardware/compatibility context.
+/// Never writes to disk itself — the frontend follows this app's usual
+/// `save()`-then-`writeTextFile()` export pattern (see `RunCapsulePanel`)
+/// with the exact JSON this command returns, so the user's native "Save As"
+/// dialog is the confirmation step, matching every other export in this app.
+#[tauri::command]
+pub async fn m3_telemetry_support_bundle(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+) -> Result<SupportBundle, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let outcome = assemble_support_bundle(&app, &state, &context).await;
+    state.finish_operation(&operation_id);
+    outcome
+}
+
+async fn assemble_support_bundle(
+    app: &tauri::AppHandle,
+    state: &M3CommandState,
+    context: &M3OperationContext,
+) -> Result<SupportBundle, String> {
+    let hardware = state.hub.hardware_snapshot().ok();
+    let compatibility = state.hub.hardware_compatibility_report().ok();
+    let runtimes = state.hub.list_runtimes().unwrap_or_default();
+
+    let mut raw_logs = Vec::new();
+    for runtime in runtimes.iter().filter(|runtime| runtime.can_logs) {
+        let runtime_id = runtime.descriptor.runtime_id.clone();
+        if let Ok(tail) = state
+            .hub
+            .runtime_logs(&runtime_id, SUPPORT_BUNDLE_MAX_LOG_BYTES_PER_RUNTIME, context)
+            .await
+        {
+            raw_logs.push((runtime_id, tail.text, tail.truncated));
+        }
+    }
+
+    let traces = state.telemetry.recent(None, SUPPORT_BUNDLE_MAX_TRACES);
+
+    Ok(crate::runtime_telemetry::build_support_bundle(
+        state.telemetry.redactor(),
+        app.package_info().version.to_string(),
+        std::env::consts::OS.to_string(),
+        hardware,
+        compatibility,
+        traces,
+        raw_logs,
+        telemetry_now_ms(),
+    ))
 }
 
 // -------------------------------------------------------------------------

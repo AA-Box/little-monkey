@@ -19,6 +19,9 @@ pub mod artifact_store;
 // activation and rollback. The manager is Tauri-free so desktop, CLI, and a
 // future user-owned runner share one ownership and integrity policy.
 pub mod asset_manager;
+// Native in-app browser pane: real tabbed child webviews (Claude-Desktop-
+// style) overlaid on the main webview via the `unstable` multiwebview API.
+pub mod browser_pane;
 // Disposable Chromium/CDP verification worker with request interception,
 // explicit origin grants, DNS re-checks, quotas, and durable evidence.
 pub mod browser_worker;
@@ -91,6 +94,12 @@ pub mod quantization;
 // `runtime_adapter`'s settings/offload-planner types rather than duplicating
 // them.
 pub mod context_cache;
+// Runtime Telemetry and Memory Trace Viewer (Phase 8): bounded per-load/
+// per-request trace capture, redaction, and support-bundle assembly. Reuses
+// `runtime_adapter::OffloadPlan` and `m3_runtime_hub::M3RuntimeHub::runtime_logs`
+// rather than computing memory/offload/log data itself; Tauri-free and
+// unit-tested on its own, with thin command glue in `m3_commands`.
+pub mod runtime_telemetry;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
@@ -154,6 +163,10 @@ pub mod triage;
 mod models;
 pub mod ollama;
 pub mod providers;
+// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
+// Tauri-free static-registry + comparison logic shared by `providers.rs`'s
+// cloud-model command and `m3_runtime_hub.rs`'s local-model staleness check.
+pub mod model_retirement;
 // `pub` so a future `monkey-cli` `Stacks` subcommand (RAG design doc, slice 4)
 // can call `stacks::list_impl`/`reindex_impl`/`query_impl` directly, the
 // same AppHandle-free-core reasoning as `checkpoints`/`rules`/`memory`.
@@ -244,6 +257,14 @@ pub mod team_mode;
 // GitHub issue and carrying it through a reviewable owned-branch/PR loop on
 // top of the `m5_delivery` GitHub/worktree primitives.
 pub mod issue_to_pr;
+// Runtime PR Watcher and Capability Feed (ROADMAP.md Phase 8, last item):
+// fetches closed `ollama/ollama` PRs over the public GitHub REST API,
+// classifies which ones plausibly touch Little Monkey's own runtime surface
+// with a keyword heuristic, and persists a monthly-cadence report of newly
+// relevant upstream changes with a suggested action each. Self-contained,
+// same convention as `diagnostics`/`automations`/`privacy_firewall` above;
+// see the module doc for the on-demand-vs-scheduled scope decision.
+pub mod runtime_pr_watcher;
 // Human Approval Chains (ROADMAP.md Phase 3): multi-step approval workflows
 // (a sequence of stages, each with its own timeout/escalation) layered on top
 // of `permissions.rs`'s existing single-shot request/response system. A new,
@@ -495,6 +516,14 @@ pub struct AppState {
     /// the earlier one's change — same reasoning as `connectors_config_lock`/
     /// `memory_lock` above protect their own files.
     pub team_members_lock: std::sync::Mutex<()>,
+    /// Serializes `runtime_pr_watcher/state.json`'s load-merge-save cycle
+    /// (see `runtime_pr_watcher::check_now_core`) — same reasoning as
+    /// `team_members_lock`/`connectors_config_lock` above. Only guards the
+    /// final synchronous save, not the network fetch that precedes it (a
+    /// `std::sync::Mutex` guard can't be held across an `.await`); see that
+    /// function's doc comment for how a concurrent check is still
+    /// reconciled correctly.
+    pub runtime_pr_watcher_lock: std::sync::Mutex<()>,
 }
 
 impl Default for AppState {
@@ -532,6 +561,7 @@ impl Default for AppState {
             pending_privacy_sends: Default::default(),
             sandbox: Default::default(),
             team_members_lock: Default::default(),
+            runtime_pr_watcher_lock: Default::default(),
         }
     }
 }
@@ -630,6 +660,7 @@ pub fn run() {
         .manage(m4_state)
         .manage(native_skills_state)
         .manage(browser_state)
+        .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
         .manage(palette_state)
         .manage(desktop_control_state)
@@ -735,6 +766,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            browser_pane::browser_pane_open_tab,
+            browser_pane::browser_pane_close_tab,
+            browser_pane::browser_pane_select_tab,
+            browser_pane::browser_pane_set_bounds,
+            browser_pane::browser_pane_set_visible,
+            browser_pane::browser_pane_navigate,
+            browser_pane::browser_pane_go_back,
+            browser_pane::browser_pane_go_forward,
+            browser_pane::browser_pane_reload,
+            browser_pane::browser_pane_favicon,
             cli_install::cli_install_status,
             cli_install::cli_install_set_enabled,
             llama::llama_start,
@@ -784,6 +825,7 @@ pub fn run() {
             providers::providers_set_key,
             providers::providers_remove_key,
             providers::providers_list_models,
+            providers::providers_check_model_retirements,
             providers::providers_stream_chat,
             providers::providers_cancel_chat,
             models::models_list_curated,
@@ -887,6 +929,8 @@ pub fn run() {
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
+            git::git_changed_files,
+            git::git_file_diff,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
             mcp::mcp_update_server,
@@ -986,9 +1030,11 @@ pub fn run() {
             m3_commands::m3_chat_template_lab_report,
             m3_commands::m3_offload_plan,
             m3_commands::m3_catalog_search,
+            m3_commands::m3_model_staleness_check,
             m3_commands::m3_model_download,
             m3_commands::m3_model_update,
             m3_commands::m3_model_activate_version,
+            m3_commands::m3_verify_projector,
             m3_commands::m3_model_prune_versions,
             m3_commands::m3_model_delete,
             m3_commands::m3_cleanup_orphans,
@@ -1028,6 +1074,10 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            m3_commands::m3_telemetry_record_load,
+            m3_commands::m3_telemetry_record_request,
+            m3_commands::m3_telemetry_recent_traces,
+            m3_commands::m3_telemetry_support_bundle,
             m3_commands::agent_launcher_generate_config,
             m3_commands::agent_launcher_check_drift,
             m3_http_server::m3_http_server_start,
@@ -1204,6 +1254,8 @@ pub fn run() {
             desktop_control::desktop_control_request_action,
             desktop_control::desktop_control_respond_action,
             desktop_control::desktop_control_emergency_stop,
+            runtime_pr_watcher::runtime_pr_watcher_state,
+            runtime_pr_watcher::runtime_pr_watcher_check_now,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

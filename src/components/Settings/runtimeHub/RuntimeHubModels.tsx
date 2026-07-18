@@ -9,6 +9,7 @@ import {
   type HardwareSnapshot,
   type M3CatalogMatch,
   type M3InstalledModel,
+  type M3InstalledVersion,
   type M3ModelCapabilities,
   type M3RuntimeCapability,
   type M3SchedulingInput,
@@ -329,6 +330,83 @@ export function buildSchedulingInput(
   };
 }
 
+const PROJECTOR_VERIFICATION_TONE: Record<M3InstalledVersion["projectorVerification"], "neutral" | "success" | "warning" | "danger"> = {
+  not_required: "neutral",
+  missing_reference: "danger",
+  unverified: "warning",
+  verified: "success",
+};
+
+const PROJECTOR_VERIFICATION_LABEL: Record<M3InstalledVersion["projectorVerification"], string> = {
+  not_required: "No projector required",
+  missing_reference: "Missing projector",
+  unverified: "Projector unverified",
+  verified: "Projector verified",
+};
+
+/** Inline provenance/placement/capability evidence for one installed
+ * version's multimodal projector (ROADMAP Phase 8 item 12), plus a form to
+ * promote it from "declared" to genuinely `verified` by pointing at a local
+ * file that should match the manifest's declared digest/size. There is
+ * deliberately no download button here: `M3ProjectorRef` carries no fetch
+ * URL yet, so a user (or a future PR) supplies the bytes. */
+function ProjectorEvidence({ assetId, version }: { assetId: string; version: M3InstalledVersion }) {
+  const verifyProjector = useRuntimeHubStore((state) => state.verifyProjector);
+  const busy = useRuntimeHubStore((state) => state.busy[`verify-projector:${assetId}`]);
+  const error = useRuntimeHubStore((state) => state.errors[`verify-projector:${assetId}`]);
+  const [candidatePath, setCandidatePath] = useState("");
+  // Nothing to show for the common case: not vision-capable and no
+  // projector reference at all. A projector present despite not being
+  // "required" (an inconsistent manifest) still gets its evidence shown.
+  if (version.projectorVerification === "not_required" && !version.projector) return null;
+
+  return (
+    <div className="mt-2 rounded-md border border-border bg-surface p-2">
+      <div className="flex flex-wrap items-center gap-2">
+        {version.projectorVerification !== "not_required" && (
+          <StatusPill tone={PROJECTOR_VERIFICATION_TONE[version.projectorVerification]}>
+            {PROJECTOR_VERIFICATION_LABEL[version.projectorVerification]}
+          </StatusPill>
+        )}
+        {version.visionReady && <StatusPill tone="success">Vision ready</StatusPill>}
+        {version.projector && (
+          <span className="font-mono text-[11px] text-muted">
+            {version.projector.kind} · sha256 {version.projector.sha256.slice(0, 12)}… ·{" "}
+            {formatBytes(version.estimatedProjectorMemoryBytes ?? version.projector.sizeBytes)} estimated memory
+          </span>
+        )}
+      </div>
+      {version.projectorVerification === "missing_reference" && (
+        <p className="mt-1.5 text-[11px] leading-5 text-danger">
+          This version declares vision capability but its manifest has no associated projector reference at all.
+        </p>
+      )}
+      {version.projector && version.projectorVerification === "unverified" && (
+        <form
+          className="mt-2 flex flex-wrap items-center gap-2"
+          onSubmit={(event: FormEvent) => {
+            event.preventDefault();
+            if (!candidatePath.trim()) return;
+            void verifyProjector(assetId, version.versionKey, candidatePath.trim()).catch(() => {});
+          }}
+        >
+          <input
+            value={candidatePath}
+            onChange={(changeEvent) => setCandidatePath(changeEvent.target.value)}
+            placeholder="/path/to/projector-file"
+            aria-label={`Local projector file path to verify for ${version.revision}`}
+            className={`${CONTROL_CLASS} min-w-[16rem] flex-1 font-mono text-xs`}
+          />
+          <BusyButton type="submit" busy={busy} disabled={!candidatePath.trim()}>
+            <ShieldCheck size={14} aria-hidden="true" /> Verify projector
+          </BusyButton>
+        </form>
+      )}
+      <ErrorNotice message={error} />
+    </div>
+  );
+}
+
 function InstalledCard({ model }: { model: M3InstalledModel }) {
   const setCatalogQuery = useRuntimeHubStore((state) => state.setCatalogQuery);
   const searchCatalog = useRuntimeHubStore((state) => state.searchCatalog);
@@ -373,37 +451,37 @@ function InstalledCard({ model }: { model: M3InstalledModel }) {
           .slice()
           .sort((left, right) => right.installedAtMs - left.installedAtMs)
           .map((version) => (
-            <div key={version.versionKey} className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-surface-2 p-3">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-xs font-medium text-foreground">Revision {version.revision}</p>
-                  {version.active && <StatusPill tone="success">Active</StatusPill>}
+            <div key={version.versionKey} className="rounded-md border border-border bg-surface-2 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-xs font-medium text-foreground">Revision {version.revision}</p>
+                    {version.active && <StatusPill tone="success">Active</StatusPill>}
+                  </div>
+                  <p className="mt-1 break-all font-mono text-[11px] text-muted">
+                    {version.versionKey.slice(0, 16)}… · {formatBytes(version.sizeBytes)} · {formatDate(version.installedAtMs)}
+                  </p>
+                  <p className="mt-1 break-all text-[11px] text-muted">
+                    {[
+                      `Source ${version.sourceId}`,
+                      version.template ? `Template ${version.template}` : null,
+                      version.catalogRetrievedAtMs ? `Catalog retrieved ${formatDate(version.catalogRetrievedAtMs)}` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </p>
                 </div>
-                <p className="mt-1 break-all font-mono text-[11px] text-muted">
-                  {version.versionKey.slice(0, 16)}… · {formatBytes(version.sizeBytes)} · {formatDate(version.installedAtMs)}
-                </p>
-                <p className="mt-1 break-all text-[11px] text-muted">
-                  {[
-                    `Source ${version.sourceId}`,
-                    version.template ? `Template ${version.template}` : null,
-                    version.projector
-                      ? `Projector ${version.projector.kind} (${formatBytes(version.projector.sizeBytes)})`
-                      : null,
-                    version.catalogRetrievedAtMs ? `Catalog retrieved ${formatDate(version.catalogRetrievedAtMs)}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
+                {!version.active && (
+                  <BusyButton
+                    type="button"
+                    busy={busyState[`activate-version:${model.assetId}`]}
+                    onClick={() => void activateVersion(model.assetId, version.versionKey).catch(() => {})}
+                  >
+                    <ArchiveRestore size={15} aria-hidden="true" /> Roll back to this version
+                  </BusyButton>
+                )}
               </div>
-              {!version.active && (
-                <BusyButton
-                  type="button"
-                  busy={busyState[`activate-version:${model.assetId}`]}
-                  onClick={() => void activateVersion(model.assetId, version.versionKey).catch(() => {})}
-                >
-                  <ArchiveRestore size={15} aria-hidden="true" /> Roll back to this version
-                </BusyButton>
-              )}
+              <ProjectorEvidence assetId={model.assetId} version={version} />
             </div>
           ))}
       </div>
