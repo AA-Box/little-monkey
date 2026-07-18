@@ -418,14 +418,11 @@ export interface SideTaskDrawerProps {
    * to — passed through to `openComposer`'s default seed when the drawer's
    * own "+ New" button is used instead of a message action. */
   sessionId: string;
-  /** Forces the drawer to its full-width content layout regardless of
-   * `drawerOpen` — set by App.tsx's right-sidebar fullscreen toggle. The
-   * collapse/expand button still reflects and controls the real
-   * `drawerOpen` state underneath. */
-  fullscreen?: boolean;
   /** Renders as a fill-the-parent tab body (the right sidebar's Side-tasks
    * tab): no own width, always the open content layout, no collapse
-   * affordance — the hosting region owns sizing and visibility. */
+   * affordance — the hosting region owns sizing and visibility. The
+   * hosting region's own fullscreen toggle covers this case, so this
+   * component doesn't need one of its own. */
   embedded?: boolean;
 }
 
@@ -438,9 +435,9 @@ export interface SideTaskDrawerProps {
  * `App.tsx`'s own workspace-panel collapse idiom (`w-96` expanded / `w-12`
  * collapsed) for visual consistency with the app's other side panel.
  */
-export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDrawerProps) {
+export function SideTaskDrawer({ sessionId, embedded }: SideTaskDrawerProps) {
   const open = useSideTaskStore((state) => state.drawerOpen);
-  const visualOpen = open || Boolean(fullscreen) || Boolean(embedded);
+  const visualOpen = open || Boolean(embedded);
   const toggleDrawer = useSideTaskStore((state) => state.toggleDrawer);
   const composerOpen = useSideTaskStore((state) => state.composerOpen);
   const openComposer = useSideTaskStore((state) => state.openComposer);
@@ -528,9 +525,7 @@ export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDraw
       className={`flex h-full flex-col bg-surface ${
         embedded
           ? "min-h-0 w-full"
-          : fullscreen
-            ? "fixed inset-x-0 bottom-0 top-11 z-40 w-full border border-border"
-            : `shrink-0 border-l border-border transition-[width] duration-200 ${visualOpen ? "w-96" : "w-12"}`
+          : `shrink-0 border-l border-border transition-[width] duration-200 ${visualOpen ? "w-96" : "w-12"}`
       }`}
     >
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
