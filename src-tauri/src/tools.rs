@@ -18,6 +18,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
+use crate::workspace::display_relative_path;
 use crate::{checkpoints, memory, native_skill_commands, permissions, workspace, AppState};
 
 /// Directory names that are never descended into by [`tool_grep`] — build
@@ -61,22 +62,6 @@ const GLOB_MAX_MATCHES: usize = 300;
 /// How long [`tool_run_shell`] lets a command run before it is killed and an
 /// error is returned.
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Render a path as a `/`-separated string regardless of platform.
-///
-/// These paths are surfaced to the model and the UI as opaque reference
-/// strings (tool results, `@`-mention entries), not passed straight back to
-/// `std::fs` — so they must be stable across platforms. Joining components
-/// with a hardcoded `/` (rather than `Path::to_string_lossy`, which uses the
-/// OS-native separator) keeps them consistent with the forward-slash
-/// `label_prefix` these are concatenated with, and with what the model has
-/// already seen for other files in the same conversation on a mixed-OS team.
-fn display_relative_path(path: &std::path::Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
 
 /// Read a UTF-8 text file from the workspace.
 #[tauri::command]
