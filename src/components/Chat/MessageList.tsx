@@ -57,6 +57,8 @@ import {
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { isBtwNotice, isCommandNotice, parseBtwNotice, parseCommandNotice, type BtwNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
+import { selectTurnStatus, useTurnStatusStore, type TurnStatus } from "../../store/turnStatusStore";
+import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import { useLocalAppsStore } from "../../store/localAppsStore";
@@ -64,6 +66,7 @@ import MessageBubble, { markdownComponents, PROSE_CLASSES } from "./MessageBubbl
 import ReactMarkdown from "react-markdown";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
+import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
 
@@ -96,6 +99,7 @@ type TimelineItem =
   | { kind: "bubble"; key: string; message: ChatMessage; index: number }
   | { kind: "tool"; key: string; name: string; args: string; result?: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
+  | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
   | { kind: "notice"; key: string; text: string }
   | { kind: "command"; key: string; notice: CommandNotice }
   | { kind: "btw"; key: string; notice: BtwNotice }
@@ -147,6 +151,13 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         items.push({ kind: "typing", key: `typing-${index}` });
       }
 
+      // PARALLEL `task` calls in one round collapse into a single
+      // `SubagentGroupCard` (agent count + per-agent status dots) instead of
+      // N stacked `SubagentRow` spinners — the group item lands where the
+      // FIRST task call appeared, so its position in the round is preserved.
+      const taskCallCount = toolCalls.reduce((count, call) => (call.function.name === "task" ? count + 1 : count), 0);
+      let groupEmitted = false;
+
       for (const toolCall of toolCalls) {
         renderedCallIds.add(toolCall.id);
         // A `task` call gets its own dedicated `SubagentRow` (live status +
@@ -156,6 +167,19 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         // (see `subagent.ts`'s `RunSubagentTaskParams.toolCallId` doc
         // comment for why THIS id, not the Rust-facing turn id).
         if (toolCall.function.name === "task") {
+          if (taskCallCount >= 2) {
+            if (!groupEmitted) {
+              groupEmitted = true;
+              items.push({
+                kind: "subagentGroup",
+                key: `subagent-group-${toolCall.id}`,
+                tasks: toolCalls
+                  .filter((call) => call.function.name === "task")
+                  .map((call) => ({ taskId: call.id, args: call.function.arguments, result: resultByCallId.get(call.id) })),
+              });
+            }
+            continue;
+          }
           items.push({
             kind: "subagent",
             key: `subagent-${toolCall.id}`,
@@ -843,6 +867,56 @@ function TypingIndicator() {
   );
 }
 
+/** How long the turn must go without a sign of life (`TurnStatus.
+ * lastEventAt`) before "thinking…" escalates to "still thinking…" — purely
+ * cosmetic reassurance that a long-SILENT turn hasn't hung, same motivation
+ * as `VerifyRunningRow`'s existence. Keyed off silence, not total turn age:
+ * a healthy multi-round turn shouldn't be permanently branded stuck. */
+const STILL_THINKING_AFTER_MS = 60_000;
+
+/**
+ * The live status line for the ACTIVE turn — "✳ 1m 30s · 181.1k tokens ·
+ * thinking…" — rendered at the bottom of the transcript for the whole turn
+ * (replacing the bare `TypingIndicator`, which only ever showed while the
+ * trailing assistant message was still empty and disappeared during tool
+ * rounds). Elapsed time ticks locally once a second; tokens and the
+ * activity word come live from `turnStatusStore` (fed by `agentLoop.ts` /
+ * `attemptStream`).
+ */
+function TurnStatusLine({ status }: { status: TurnStatus }) {
+  const { t } = useT();
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setTick((value) => value + 1), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const elapsedMs = Date.now() - status.startedAt;
+  const silentMs = Date.now() - status.lastEventAt;
+  const word = status.activity
+    ? `${status.activity}…`
+    : t(silentMs >= STILL_THINKING_AFTER_MS ? "MessageList.turnStatusStillThinking" : "MessageList.turnStatusThinking");
+
+  return (
+    // Deliberately NOT a `role="status"` live region: the elapsed label
+    // changes every second and would spam screen readers.
+    <div className="flex items-center gap-2 text-xs text-faint">
+      <span className="animate-pulse text-accent" aria-hidden>
+        ✳
+      </span>
+      <span className="font-mono">{formatElapsed(elapsedMs)}</span>
+      {status.totalTokens > 0 && (
+        <>
+          <span>·</span>
+          <span className="font-mono">{t("MessageList.turnStatusTokens", { count: formatCompactTokens(status.totalTokens) })}</span>
+        </>
+      )}
+      <span>·</span>
+      <span className="truncate font-mono">{word}</span>
+    </div>
+  );
+}
+
 /**
  * Shown while a configured verification command is actually executing
  * (`sessionStore.runningVerifyLabel`, set/cleared by `runVerificationPhase`
@@ -915,9 +989,13 @@ export default function MessageList({
     stickToBottomRef.current = distanceFromBottom < 96;
   };
 
-  const items = buildTimeline(messages, messageIndexOffset);
   const showRetry = Boolean(onRetry) && !editingDisabled && canRetry(messages);
   const runningVerifyLabel = useSessionStore(selectRunningVerifyLabel(sessionId));
+  const turnStatus = useTurnStatusStore(selectTurnStatus(sessionId));
+  // While the status line is live it replaces the bouncing-dots bubble
+  // entirely — the typing item only survives for MessageList hosts whose
+  // turns never register with `turnStatusStore` (e.g. crew actor panes).
+  const items = buildTimeline(messages, messageIndexOffset).filter((item) => !(turnStatus && item.kind === "typing"));
   const session = useSessionStore((state) => state.sessions.find((candidate) => candidate.id === sessionId));
   const messageTranslations = session?.messageTranslations ?? [];
   const preferredTranslationLocale = session?.displayTranslationLocale ?? null;
@@ -956,6 +1034,9 @@ export default function MessageList({
               return (
                 <SubagentRow key={item.key} sessionId={sessionId} taskId={item.taskId} args={item.args} result={item.result} />
               );
+            }
+            if (item.kind === "subagentGroup") {
+              return <SubagentGroupCard key={item.key} sessionId={sessionId} tasks={item.tasks} />;
             }
             if (item.kind === "notice") {
               return <NoticeRow key={item.key} text={item.text} />;
@@ -999,6 +1080,9 @@ export default function MessageList({
             return <TypingIndicator key={item.key} />;
           })}
           {runningVerifyLabel && <VerifyRunningRow label={runningVerifyLabel} />}
+          {/* Hidden while the verify row shows — one live row at a time,
+              and "thinking…" would be wrong during a verify command. */}
+          {turnStatus && !runningVerifyLabel && <TurnStatusLine status={turnStatus} />}
           {showRetry && (
             <div className="flex justify-start">
               <button

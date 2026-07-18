@@ -147,13 +147,17 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
   const [open, setOpen] = useState(false);
   const live = useSubagentStore((state) => state.runs[taskId]);
   const persisted = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRuns?.[taskId]);
+  // Stats snapshotted at finish time — the tokens/count source once the
+  // transient store is gone (post-restart), see ChatSession.subagentRunMeta.
+  const persistedMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRunMeta?.[taskId]);
 
   const { description, profile } = parseTaskArgs(args);
   const status: SubagentStatus = resolveSubagentStatus(live?.status, result);
   const running = status === "running";
   const transcript = live?.liveMessages ?? persisted ?? [];
   const childToolCalls = extractChildToolCalls(transcript);
-  const toolCallCount = live?.toolCallCount ?? childToolCalls.length;
+  const toolCallCount = live?.toolCallCount ?? persistedMeta?.toolCallCount ?? childToolCalls.length;
+  const usage = live?.usage ?? persistedMeta?.usage;
 
   const tone: PillTone = status === "running" ? "warning" : status === "error" ? "danger" : status === "cancelled" ? "neutral" : "success";
 
@@ -175,9 +179,9 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
             {t(profile === "code" ? "SubagentRow.profileCode" : "SubagentRow.profileExplore")}
           </span>
           <StatusPill tone={tone}>{t(statusLabelKey(status))}</StatusPill>
-          {live?.usage && (
+          {usage && (
             <span className="shrink-0 font-mono text-[10px] text-faint">
-              {t("SubagentRow.tokenUsage", { count: formatTokenCount(live.usage.totalTokens) })}
+              {t("SubagentRow.tokenUsage", { count: formatTokenCount(usage.totalTokens) })}
             </span>
           )}
           {running && live?.lastActivity && (
@@ -195,10 +199,10 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
           <div className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
             <div className="flex items-center gap-2 text-faint">
               <span>{t("SubagentRow.toolCallCount", { count: toolCallCount })}</span>
-              {live?.usage && (
+              {usage && (
                 <>
                   <span>·</span>
-                  <span>{t("SubagentRow.tokenUsage", { count: formatTokenCount(live.usage.totalTokens) })}</span>
+                  <span>{t("SubagentRow.tokenUsage", { count: formatTokenCount(usage.totalTokens) })}</span>
                 </>
               )}
             </div>

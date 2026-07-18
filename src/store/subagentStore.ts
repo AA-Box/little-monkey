@@ -25,9 +25,22 @@ export type SubagentStatus = "running" | "done" | "error" | "cancelled";
 export interface SubagentRun {
   sessionId: string;
   taskId: string;
+  /** The run's Rust-facing `crypto.randomUUID()` turn id — what
+   * `cancelSubagentRun` (subagent.ts) is keyed by. NOT `taskId`: provider-
+   * fallback tool-call ids (`call_0`, see llamaClient.ts) can collide across
+   * two concurrent turns' subagents, and cancelling by a collided key would
+   * abort the wrong run. */
+  cancelId: string;
   description: string;
   profile: "explore" | "code";
   status: SubagentStatus;
+  /** When `start` registered this run — drives the elapsed-time column in
+   * the Background-tasks drawer and the grouped-agents card. Wall-clock
+   * only; never persisted (the whole store is transient), so restarted
+   * sessions simply show no timing, same as they show no token usage. */
+  startedAt: number;
+  /** When `finish` marked this run terminal — `undefined` while running. */
+  finishedAt?: number;
   /** Short label for the child's most recent action, e.g. `grep("resolveTarget")` — blank until the first tool call. */
   lastActivity: string;
   toolCallCount: number;
@@ -61,7 +74,7 @@ interface SubagentStoreState {
   runs: Record<string, SubagentRun>;
   /** Registers a new run as `'running'` with an empty activity log — called
    * once by `runSubagentTask` right before it starts the child's loop. */
-  start: (params: { sessionId: string; taskId: string; description: string; profile: "explore" | "code" }) => void;
+  start: (params: { sessionId: string; taskId: string; cancelId: string; description: string; profile: "explore" | "code" }) => void;
   /** Updates `lastActivity` and bumps `toolCallCount` by one — called once
    * per child tool call `runSubagentTask` is about to execute. No-ops if
    * `taskId` was never `start`-ed (defensive; should not happen). */
@@ -80,16 +93,21 @@ interface SubagentStoreState {
   /** Marks a run terminal (`'done' | 'error' | 'cancelled'`) — called once,
    * when `runSubagentTask` is about to return. */
   finish: (taskId: string, status: "done" | "error" | "cancelled") => void;
+  /** Drops every terminal run — the Background-tasks drawer's "Clear"
+   * button. Running entries are untouched; the cleared runs' transcripts
+   * remain in `ChatSession.subagentRuns`, so inline `SubagentRow`s keep
+   * working — this only empties the drawer's Finished list. */
+  clearFinished: () => void;
 }
 
 export const useSubagentStore = create<SubagentStoreState>((set) => ({
   runs: {},
 
-  start: ({ sessionId, taskId, description, profile }) => {
+  start: ({ sessionId, taskId, cancelId, description, profile }) => {
     set((state) => ({
       runs: {
         ...state.runs,
-        [taskId]: { sessionId, taskId, description, profile, status: "running", lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
+        [taskId]: { sessionId, taskId, cancelId, description, profile, status: "running", startedAt: Date.now(), lastActivity: "", toolCallCount: 0, usage: undefined, liveMessages: [] },
       },
     }));
   },
@@ -132,8 +150,14 @@ export const useSubagentStore = create<SubagentStoreState>((set) => ({
     set((state) => {
       const existing = state.runs[taskId];
       if (!existing) return state;
-      return { runs: { ...state.runs, [taskId]: { ...existing, status } } };
+      return { runs: { ...state.runs, [taskId]: { ...existing, status, finishedAt: Date.now() } } };
     });
+  },
+
+  clearFinished: () => {
+    set((state) => ({
+      runs: Object.fromEntries(Object.entries(state.runs).filter(([, run]) => run.status === "running")),
+    }));
   },
 }));
 
@@ -142,4 +166,19 @@ export const useSubagentStore = create<SubagentStoreState>((set) => ({
  * back to `ChatSession.subagentRuns` in that case. */
 export function selectSubagentRun(taskId: string) {
   return (state: SubagentStoreState): SubagentRun | undefined => state.runs[taskId];
+}
+
+/** Count of subagent runs still in flight — combined with
+ * `selectRunningSideTaskCount` to drive the chat's "N running tasks" chip
+ * and the Background-tasks drawer badge. */
+export function selectRunningSubagentCount(state: SubagentStoreState): number {
+  return Object.values(state.runs).reduce((count, run) => (run.status === "running" ? count + 1 : count), 0);
+}
+
+/** Every run this window session has seen, newest first — the
+ * Background-tasks drawer's subagent entries. Builds a fresh array per call:
+ * wrap in `useShallow` at the subscription site, same as the side-task list
+ * selectors. */
+export function selectSubagentRunList(state: SubagentStoreState): SubagentRun[] {
+  return Object.values(state.runs).sort((a, b) => b.startedAt - a.startedAt);
 }

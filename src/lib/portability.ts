@@ -613,6 +613,7 @@ function reconstructedSession(session: PortableSession, artifacts: ReadonlyMap<s
     attachedStackIds: Array.isArray(metadata.attachedStackIds) ? metadata.attachedStackIds : [],
     docChatMode: metadata.docChatMode === true,
     subagentRuns: metadata.subagentRuns && typeof metadata.subagentRuns === "object" ? metadata.subagentRuns : {},
+    subagentRunMeta: metadata.subagentRunMeta && typeof metadata.subagentRunMeta === "object" ? metadata.subagentRunMeta : {},
     messageTranslations,
     threadTranslations,
     displayTranslationLocale: typeof metadata.displayTranslationLocale === "string" ? metadata.displayTranslationLocale : null,
