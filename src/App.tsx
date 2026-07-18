@@ -46,6 +46,7 @@ import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
 import { useSideTaskStore, selectRunningSideTaskCount } from "./store/sideTaskStore";
+import { useSubagentStore, selectRunningSubagentCount } from "./store/subagentStore";
 import { ArtifactPane, FileTree, DiffPanel, DiffViewer, PermissionModal, ApprovalChainModal, ReviewPanel, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
 import { useSessionStore } from "./store/sessionStore";
@@ -173,6 +174,10 @@ function App() {
   /** Changed-file count behind the top-bar Diff badge; polled, best-effort. */
   const [changedFileCount, setChangedFileCount] = useState(0);
   const runningSideTaskCount = useSideTaskStore(selectRunningSideTaskCount);
+  const runningSubagentCount = useSubagentStore(selectRunningSubagentCount);
+  // The one number every "live background work" surface shows: the top-bar
+  // badge, and (via `RunningTasksChip`'s own subscription) the chat chip.
+  const runningBackgroundTaskCount = runningSideTaskCount + runningSubagentCount;
 
   // Top-bar Diff badge: slow poll of the changed-file count, refreshed
   // immediately whenever the panel toggles. Badge only — the panel itself
@@ -250,6 +255,15 @@ function App() {
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
     setSettingsOpen(true);
+  }, []);
+
+  // The chat's "N running tasks" chip target — same body as the shortcut
+  // action `openSideTasksPanel` and the top-bar tasks toggle's open branch.
+  const openBackgroundTasksPanel = useCallback(() => {
+    useBrowserPaneStore.getState().setOpen(false);
+    setDiffPanelOpen(false);
+    useSideTaskStore.getState().openDrawer();
+    setRightPanel("sideTasks");
   }, []);
 
   const handleManagePrompts = useCallback(() => {
@@ -1448,9 +1462,9 @@ setVisualEditModeOpen(false);
             title={rightPanel === "sideTasks" ? t("App.closeTasks") : t("App.openTasks")}
           >
             <ListTodo size={15} />
-            {runningSideTaskCount > 0 && (
+            {runningBackgroundTaskCount > 0 && (
               <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-none text-accent-foreground">
-                {runningSideTaskCount > 9 ? "9+" : runningSideTaskCount}
+                {runningBackgroundTaskCount > 9 ? "9+" : runningBackgroundTaskCount}
               </span>
             )}
           </IconButton>
@@ -1609,6 +1623,7 @@ setVisualEditModeOpen(false);
               onManagePrompts={handleManagePrompts}
               onOpenSettingsTab={openSettingsTab}
               headerActionsSlot={chatHeaderActionsEl}
+              onOpenBackgroundTasks={openBackgroundTasksPanel}
             />
           )}
         </ErrorBoundary>
@@ -1640,6 +1655,7 @@ setVisualEditModeOpen(false);
                 sessionId={splitSessionId}
                 onManagePrompts={handleManagePrompts}
                 onOpenSettingsTab={openSettingsTab}
+                onOpenBackgroundTasks={openBackgroundTasksPanel}
               />
             )}
           </ErrorBoundary>

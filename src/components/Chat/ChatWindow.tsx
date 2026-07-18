@@ -17,6 +17,7 @@ import { useWorkspaceStore } from "../../store/workspaceStore";
 import { usePromptStore } from "../../store/promptStore";
 import { useShortcutStore } from "../../store/shortcutStore";
 import MessageList from "./MessageList";
+import RunningTasksChip from "./RunningTasksChip";
 import { MentionAutocomplete } from "./MentionAutocomplete";
 import type { MentionEntry } from "./MentionAutocomplete";
 import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
@@ -257,9 +258,14 @@ interface ChatWindowProps {
    * composer footer — only the primary pane gets one; the split pane keeps
    * its footer placement. */
   headerActionsSlot?: HTMLElement | null;
+  /** Opens the Background-tasks drawer — the "N running tasks" chip's click
+   * target (see App.tsx, which reuses its own top-bar tasks-toggle open
+   * branch). Optional so hosts without the right-sidebar region (none
+   * today) simply get a non-clickable chip. */
+  onOpenBackgroundTasks?: () => void;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -1287,6 +1293,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           </div>
         </div>
       )}
+
+      <RunningTasksChip onClick={onOpenBackgroundTasks} />
 
       <div className="shrink-0 border-t border-border bg-background px-4 py-3">
         <WorkspaceBar sessionId={sessionId} />

@@ -1,9 +1,10 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   Archive,
   ArchiveRestore,
   CheckCircle2,
+  ChevronRight,
   CircleAlert,
   CircleDot,
   ExternalLink,
@@ -30,6 +31,14 @@ import {
   type SideTaskStatus,
   type SideTaskToolOutcome,
 } from "../../store/sideTaskStore";
+import {
+  selectRunningSubagentCount,
+  selectSubagentRunList,
+  useSubagentStore,
+  type SubagentRun,
+  type SubagentStatus,
+} from "../../store/subagentStore";
+import { useSessionStore } from "../../store/sessionStore";
 import { usePermissionStore } from "../../store/permissionStore";
 import {
   cancelSideTask,
@@ -39,6 +48,10 @@ import {
   resumeSideTask,
   retrySideTask,
 } from "../../lib/sideTaskRunner";
+import { cancelSubagentRun } from "../../lib/subagent";
+import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
+import { extractChildToolCalls } from "../Chat/SubagentRow";
+import { ToolCallRow } from "../Chat/MessageList";
 import { SideTaskComposer } from "./SideTaskComposer";
 
 function statusTone(status: SideTaskStatus): PillTone {
@@ -121,25 +134,147 @@ function sourceKindLabel(kind: SideTaskRecord["source"]["kind"]): string {
   }
 }
 
-function SideTaskListRow({ task, selected, onSelect }: { task: SideTaskRecord; selected: boolean; onSelect: () => void }) {
+function subagentStatusTone(status: SubagentStatus): PillTone {
+  switch (status) {
+    case "running":
+      return "warning";
+    case "done":
+      return "success";
+    case "error":
+      return "danger";
+    default:
+      return "neutral";
+  }
+}
+
+function subagentStatusLabel(status: SubagentStatus): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "done":
+      return "Completed";
+    case "error":
+      return "Failed";
+    default:
+      return "Cancelled";
+  }
+}
+
+/**
+ * Full-width card for a `task`-tool subagent run — Claude-Code-desktop-style:
+ * title with a square stop button while running, "Agent · elapsed" line,
+ * then "tokens · tool uses · View transcript". The transcript (and final
+ * report) expands inline, reusing the same `ToolCallRow` the inline
+ * `SubagentRow` uses.
+ */
+function AgentTaskCard({ run }: { run: SubagentRun }) {
+  const running = run.status === "running";
+  const [showTranscript, setShowTranscript] = useState(false);
+  // 1s tick while running so the elapsed label counts up live.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const interval = setInterval(() => setTick((value) => value + 1), 1000);
+    return () => clearInterval(interval);
+  }, [running]);
+
+  const childToolCalls = extractChildToolCalls(run.liveMessages);
+  const report = [...run.liveMessages].reverse().find((message) => message.role === "assistant" && !message.tool_calls);
+  const reportText = typeof report?.content === "string" ? report.content : null;
+
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`flex w-full cursor-pointer flex-col items-start gap-1 rounded-md border px-2.5 py-2 text-left transition-colors duration-150 ${
-        selected ? "border-accent bg-surface-2" : "border-transparent hover:bg-surface-2"
-      }`}
-    >
-      <div className="flex w-full items-center gap-1.5">
-        <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{task.title}</span>
-        <StatusPill tone={statusTone(task.status)}>{statusLabel(task.status)}</StatusPill>
+    <div className="rounded-xl border border-border bg-surface-2 p-3">
+      <div className="flex items-start gap-2">
+        <span className="min-w-0 flex-1 text-sm font-medium leading-snug text-foreground">{run.description}</span>
+        {running ? (
+          <IconButton size="sm" aria-label={`Stop "${run.description}"`} onClick={() => cancelSubagentRun(run.cancelId)}>
+            <Square size={12} />
+          </IconButton>
+        ) : (
+          run.status !== "done" && <StatusPill tone={subagentStatusTone(run.status)}>{subagentStatusLabel(run.status)}</StatusPill>
+        )}
       </div>
-      <div className="flex w-full items-center gap-1.5 text-[11px] text-faint">
-        <span className="truncate">{sourceKindLabel(task.source.kind)}</span>
-        <span>·</span>
-        <span className="truncate">{formatRelativeTime(task.updatedAt)}</span>
+      <div className="mt-1 flex items-center gap-2 text-xs">
+        <span className="text-muted">Agent</span>
+        <span className="text-faint">{formatElapsed((run.finishedAt ?? Date.now()) - run.startedAt)}</span>
+        {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
       </div>
-    </button>
+      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-faint">
+        {run.usage && <span>{formatCompactTokens(run.usage.totalTokens)} tokens</span>}
+        <span>
+          {run.toolCallCount} tool use{run.toolCallCount === 1 ? "" : "s"}
+        </span>
+        {(childToolCalls.length > 0 || reportText) && (
+          <button
+            type="button"
+            onClick={() => setShowTranscript((prev) => !prev)}
+            className="cursor-pointer text-accent hover:underline"
+          >
+            {showTranscript ? "Hide transcript" : "View transcript"}
+          </button>
+        )}
+      </div>
+      {running && run.lastActivity && (
+        <div className="mt-1 truncate font-mono text-[11px] text-faint">{run.lastActivity}</div>
+      )}
+      {showTranscript && (
+        <div className="mt-2 space-y-1.5 border-t border-border pt-2">
+          {childToolCalls.map((row) => (
+            <ToolCallRow key={row.key} name={row.name} args={row.args} result={row.result} />
+          ))}
+          {!running && reportText && (
+            <p className="whitespace-pre-wrap rounded-md border border-border bg-background p-2 text-xs text-foreground">{reportText}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Full-width card for a side task — same Claude-Code card shape as
+ * `AgentTaskCard`. The stop square cancels while active; "Details" expands
+ * the full `SideTaskDetail` (pause/resume/retry/promote/archive and the
+ * task's evidence) inline.
+ */
+function SideTaskCard({ task, expanded, onToggleDetails }: { task: SideTaskRecord; expanded: boolean; onToggleDetails: () => void }) {
+  const active = task.status === "running" || task.status === "queued" || task.status === "paused";
+  return (
+    <div className="rounded-xl border border-border bg-surface-2 p-3">
+      <div className="flex items-start gap-2">
+        <span className="min-w-0 flex-1 text-sm font-medium leading-snug text-foreground">{task.title}</span>
+        {task.status === "queued" || task.status === "paused" ? (
+          <StatusPill tone={statusTone(task.status)}>{statusLabel(task.status)}</StatusPill>
+        ) : null}
+        {active ? (
+          <IconButton size="sm" aria-label={`Stop "${task.title}"`} onClick={() => cancelSideTask(task.id)}>
+            <Square size={12} />
+          </IconButton>
+        ) : (
+          task.status !== "completed" && <StatusPill tone={statusTone(task.status)}>{statusLabel(task.status)}</StatusPill>
+        )}
+      </div>
+      <div className="mt-1 flex items-center gap-2 text-xs">
+        <span className="text-muted">Side task</span>
+        <span className="truncate text-faint">{sourceKindLabel(task.source.kind)}</span>
+        <span className="shrink-0 text-faint">{formatRelativeTime(task.updatedAt)}</span>
+        {task.status === "running" && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
+      </div>
+      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-faint">
+        {task.usage && <span>{formatCompactTokens(task.usage.totalTokens)} tokens</span>}
+        <span>
+          {task.toolEvidence.length} tool use{task.toolEvidence.length === 1 ? "" : "s"}
+        </span>
+        <button type="button" onClick={onToggleDetails} className="cursor-pointer text-accent hover:underline">
+          {expanded ? "Hide details" : "Details"}
+        </button>
+      </div>
+      {expanded && (
+        <div className="mt-2 border-t border-border pt-1">
+          <SideTaskDetail task={task} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -314,11 +449,79 @@ export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDraw
   // be cached" guard), same as the other array-selector consumers.
   const visible = useSideTaskStore(useShallow(selectVisibleSideTasks));
   const archived = useSideTaskStore(useShallow(selectArchivedSideTasks));
-  const runningCount = useSideTaskStore(selectRunningSideTaskCount);
+  const liveSubagentRuns = useSubagentStore(useShallow(selectSubagentRunList));
+  // Finished runs persisted with the ACTIVE session (see
+  // `ChatSession.subagentRunMeta`) — what keeps the Finished section
+  // populated after a restart wipes the transient store. Field-level
+  // subscriptions (not the whole session) so streaming message updates
+  // don't re-render the drawer; both references only change on
+  // `setSubagentRun`.
+  const persistedMeta = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRunMeta);
+  const persistedTranscripts = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRuns);
+  const subagentRuns = useMemo(() => {
+    const liveIds = new Set(liveSubagentRuns.map((run) => run.taskId));
+    const restored: SubagentRun[] = Object.entries(persistedMeta ?? {})
+      .filter(([taskId]) => !liveIds.has(taskId))
+      .map(([taskId, meta]) => ({
+        sessionId,
+        taskId,
+        // Empty cancelId: a restored run is terminal, Stop stays disabled
+        // and `cancelSubagentRun("")` would be a no-op regardless.
+        cancelId: "",
+        description: meta.description,
+        profile: meta.profile,
+        status: meta.status,
+        startedAt: meta.startedAt,
+        finishedAt: meta.finishedAt,
+        lastActivity: "",
+        toolCallCount: meta.toolCallCount,
+        usage: meta.usage,
+        liveMessages: persistedTranscripts?.[taskId] ?? [],
+      }));
+    return [...liveSubagentRuns, ...restored].sort((a, b) => b.startedAt - a.startedAt);
+  }, [liveSubagentRuns, persistedMeta, persistedTranscripts, sessionId]);
+  const runningCount = useSideTaskStore(selectRunningSideTaskCount) + useSubagentStore(selectRunningSubagentCount);
   const selectedTaskId = useSideTaskStore((state) => state.selectedTaskId);
-  const selectedTask = useSideTaskStore((state) => (state.selectedTaskId ? state.tasks[state.selectedTaskId] : null));
+  // Which side-task card has its Details section open. Externally-driven
+  // selection (the composer's create, retry's auto-select) opens that
+  // task's card so the caller's intent stays visible.
+  const [expandedSideTaskId, setExpandedSideTaskId] = useState<string | null>(null);
+  const [finishedOpen, setFinishedOpen] = useState(false);
+  useEffect(() => {
+    if (selectedTaskId !== null) setExpandedSideTaskId(selectedTaskId);
+  }, [selectedTaskId]);
 
   const showArchived = useMemo(() => archived.length > 0, [archived]);
+  // Running = anything that could still produce work (a paused side task
+  // resumes); Finished = terminal, kept until Clear (or archive for side
+  // tasks). Both kinds interleave newest-first, Claude-Code-panel style.
+  const runningSideTasks = visible.filter((task) => task.status === "running" || task.status === "queued" || task.status === "paused");
+  const finishedSideTasks = visible.filter((task) => task.status === "completed" || task.status === "error" || task.status === "cancelled");
+  const runningAgents = subagentRuns.filter((run) => run.status === "running");
+  const finishedAgents = subagentRuns.filter((run) => run.status !== "running");
+  const hasAnyTask = visible.length > 0 || subagentRuns.length > 0;
+  const finishedCount = finishedSideTasks.length + finishedAgents.length;
+
+  type DrawerEntry = { kind: "side"; at: number; task: SideTaskRecord } | { kind: "agent"; at: number; run: SubagentRun };
+  const byNewest = (a: DrawerEntry, b: DrawerEntry) => b.at - a.at;
+  const runningEntries: DrawerEntry[] = [
+    ...runningSideTasks.map((task): DrawerEntry => ({ kind: "side", at: task.updatedAt, task })),
+    ...runningAgents.map((run): DrawerEntry => ({ kind: "agent", at: run.startedAt, run })),
+  ].sort(byNewest);
+  const finishedEntries: DrawerEntry[] = [
+    ...finishedSideTasks.map((task): DrawerEntry => ({ kind: "side", at: task.updatedAt, task })),
+    ...finishedAgents.map((run): DrawerEntry => ({ kind: "agent", at: run.finishedAt ?? run.startedAt, run })),
+  ].sort(byNewest);
+
+  // "Clear" empties the Finished list without touching the conversation:
+  // terminal side tasks archive (recoverable), finished agent entries drop
+  // from the transient store and the session's persisted stats — their
+  // transcripts stay in `ChatSession.subagentRuns` for the inline rows.
+  const clearFinished = () => {
+    for (const task of finishedSideTasks) useSideTaskStore.getState().archive(task.id);
+    useSubagentStore.getState().clearFinished();
+    useSessionStore.getState().clearSubagentRunMeta(sessionId);
+  };
 
   return (
     <aside
@@ -333,7 +536,7 @@ export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDraw
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
         {visualOpen && (
           <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-faint">
-            Side Tasks
+            Background tasks
             {runningCount > 0 && <StatusPill tone="warning">{runningCount}</StatusPill>}
           </span>
         )}
@@ -359,7 +562,7 @@ export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDraw
             <IconButton
               size="sm"
               onClick={toggleDrawer}
-              aria-label={open ? "Collapse side tasks panel" : "Expand side tasks panel"}
+              aria-label={open ? "Collapse background tasks panel" : "Expand background tasks panel"}
             >
               {open ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
             </IconButton>
@@ -377,42 +580,71 @@ export function SideTaskDrawer({ sessionId, fullscreen, embedded }: SideTaskDraw
         <div className="flex min-h-0 flex-1 flex-col">
           {composerOpen && <SideTaskComposer />}
 
-          <div className="flex min-h-0 flex-1">
-            <div className="flex w-40 shrink-0 flex-col gap-1 overflow-y-auto border-r border-border p-2">
-              {visible.length === 0 && !composerOpen && (
-                <p className="p-2 text-xs text-faint">
-                  No side tasks yet. Start one from a chat message, or the + button above.
-                </p>
-              )}
-              {visible.map((task) => (
-                <SideTaskListRow
-                  key={task.id}
-                  task={task}
-                  selected={task.id === selectedTaskId}
-                  onSelect={() => useSideTaskStore.getState().selectTask(task.id)}
-                />
-              ))}
-              {showArchived && (
-                <>
-                  <div className="mt-2 px-1 text-[10px] font-semibold uppercase tracking-wider text-faint">Archived</div>
-                  {archived.map((task) => (
-                    <SideTaskListRow
-                      key={task.id}
-                      task={task}
-                      selected={task.id === selectedTaskId}
-                      onSelect={() => useSideTaskStore.getState().selectTask(task.id)}
-                    />
-                  ))}
-                </>
-              )}
-            </div>
+          <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3">
+            {!hasAnyTask && !composerOpen && (
+              <p className="p-2 text-xs text-faint">
+                No background tasks yet. Start a side task from a chat message or the + button above — agents the model
+                dispatches show up here too.
+              </p>
+            )}
 
-            {selectedTask ? (
-              <SideTaskDetail task={selectedTask} />
-            ) : (
-              <div className="flex flex-1 items-center justify-center p-4 text-center text-xs text-faint">
-                Select a side task to see its details.
+            {runningEntries.length > 0 && (
+              <div className="text-[11px] font-medium uppercase tracking-wider text-faint">Running</div>
+            )}
+            {runningEntries.map((entry) =>
+              entry.kind === "agent" ? (
+                <AgentTaskCard key={`agent-${entry.run.taskId}`} run={entry.run} />
+              ) : (
+                <SideTaskCard
+                  key={`side-${entry.task.id}`}
+                  task={entry.task}
+                  expanded={expandedSideTaskId === entry.task.id}
+                  onToggleDetails={() => setExpandedSideTaskId((prev) => (prev === entry.task.id ? null : entry.task.id))}
+                />
+              ),
+            )}
+
+            {finishedCount > 0 && (
+              <div className="mt-1 flex items-center justify-between">
+                <button
+                  type="button"
+                  onClick={() => setFinishedOpen((prev) => !prev)}
+                  className="flex cursor-pointer items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-faint transition-colors duration-150 hover:text-foreground"
+                >
+                  Finished
+                  <span>{finishedCount}</span>
+                  <ChevronRight size={12} className={`transition-transform duration-150 ${finishedOpen ? "rotate-90" : ""}`} />
+                </button>
+                <Button variant="ghost" size="sm" onClick={clearFinished}>
+                  Clear
+                </Button>
               </div>
+            )}
+            {finishedOpen &&
+              finishedEntries.map((entry) =>
+                entry.kind === "agent" ? (
+                  <AgentTaskCard key={`agent-${entry.run.taskId}`} run={entry.run} />
+                ) : (
+                  <SideTaskCard
+                    key={`side-${entry.task.id}`}
+                    task={entry.task}
+                    expanded={expandedSideTaskId === entry.task.id}
+                    onToggleDetails={() => setExpandedSideTaskId((prev) => (prev === entry.task.id ? null : entry.task.id))}
+                  />
+                ),
+              )}
+            {finishedOpen && showArchived && (
+              <>
+                <div className="mt-1 text-[11px] font-medium uppercase tracking-wider text-faint">Archived</div>
+                {archived.map((task) => (
+                  <SideTaskCard
+                    key={`side-${task.id}`}
+                    task={task}
+                    expanded={expandedSideTaskId === task.id}
+                    onToggleDetails={() => setExpandedSideTaskId((prev) => (prev === task.id ? null : task.id))}
+                  />
+                ))}
+              </>
             )}
           </div>
         </div>

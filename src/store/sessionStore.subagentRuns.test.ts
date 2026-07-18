@@ -7,7 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "test" }) }));
 
-import { hydrateSessions, sessionMessages, useSessionStore, type ChatSession } from "./sessionStore";
+import { hydrateSessions, sessionMessages, useSessionStore, type ChatSession, type SubagentRunMeta } from "./sessionStore";
 import type { ChatMessage } from "../lib/llamaClient";
 
 function makeSession(id: string, overrides: Partial<ChatSession> = {}): ChatSession {
@@ -132,6 +132,87 @@ describe("setSubagentRun", () => {
     const before = useSessionStore.getState().sessions;
     useSessionStore.getState().setSubagentRun("does-not-exist", "call-1", [{ role: "user", content: "x" }]);
     expect(useSessionStore.getState().sessions).toBe(before);
+  });
+
+  it("persists final run stats under subagentRunMeta when provided, leaving them untouched when omitted", () => {
+    const meta: SubagentRunMeta = {
+      status: "done",
+      description: "find every caller of X",
+      profile: "explore",
+      startedAt: 1_000,
+      finishedAt: 5_000,
+      toolCallCount: 3,
+      usage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 },
+    };
+
+    useSessionStore.getState().setSubagentRun("a", "call-1", [], meta);
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.subagentRunMeta?.["call-1"]).toEqual(meta);
+
+    // A meta-less write (defensive path: live store entry already gone)
+    // updates the transcript without clobbering existing stats.
+    useSessionStore.getState().setSubagentRun("a", "call-1", [{ role: "user", content: "x" }]);
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "a")?.subagentRunMeta?.["call-1"]).toEqual(meta);
+  });
+});
+
+describe("normalizeSession subagentRunMeta default", () => {
+  it("defaults to {} for pre-field sessions and drops malformed entries", async () => {
+    const goodMeta: SubagentRunMeta = {
+      status: "done",
+      description: "audit i18n",
+      profile: "code",
+      startedAt: 1,
+      finishedAt: 2,
+      toolCallCount: 1,
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    };
+    invokeMock.mockImplementationOnce(async () =>
+      JSON.stringify({
+        sessions: [
+          {
+            id: "old3",
+            title: "Old session 3",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+            subagentRunMeta: {
+              "call-good": goodMeta,
+              "call-bad-status": { ...goodMeta, status: "running" },
+              "call-bad-times": { ...goodMeta, startedAt: "yesterday" },
+              "call-bad-usage": { ...goodMeta, usage: { totalTokens: "many" } },
+            },
+          },
+          {
+            id: "pre-field",
+            title: "Pre-field session",
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            pinned: false,
+            unread: false,
+            archived: false,
+            groupId: null,
+            workspacePath: null,
+          },
+        ],
+        activeSessionId: "old3",
+        groups: [],
+      })
+    );
+
+    await hydrateSessions();
+
+    const session = useSessionStore.getState().sessions.find((s) => s.id === "old3");
+    expect(session?.subagentRunMeta?.["call-good"]).toEqual(goodMeta);
+    expect(session?.subagentRunMeta?.["call-bad-status"]).toBeUndefined();
+    expect(session?.subagentRunMeta?.["call-bad-times"]).toBeUndefined();
+    expect(session?.subagentRunMeta?.["call-bad-usage"]).toBeUndefined();
+    expect(useSessionStore.getState().sessions.find((s) => s.id === "pre-field")?.subagentRunMeta).toEqual({});
   });
 });
 

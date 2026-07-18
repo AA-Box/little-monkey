@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { selectSubagentRun, useSubagentStore } from "./subagentStore";
+import { selectRunningSubagentCount, selectSubagentRun, selectSubagentRunList, useSubagentStore } from "./subagentStore";
 import type { ChatMessage } from "../lib/llamaClient";
 
 beforeEach(() => {
@@ -9,23 +9,27 @@ beforeEach(() => {
 
 describe("subagentStore", () => {
   it("start registers a running run with zeroed activity", () => {
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "find X", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "find X", profile: "explore" });
 
     const run = selectSubagentRun("t1")(useSubagentStore.getState());
     expect(run).toEqual({
       sessionId: "s1",
       taskId: "t1",
+      cancelId: "uuid-t1",
       description: "find X",
       profile: "explore",
       status: "running",
+      startedAt: expect.any(Number),
       lastActivity: "",
       toolCallCount: 0,
+      usage: undefined,
       liveMessages: [],
     });
+    expect(run?.finishedAt).toBeUndefined();
   });
 
   it("recordToolCall bumps toolCallCount and updates lastActivity, reflecting a running child's progress", () => {
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "find X", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "find X", profile: "explore" });
 
     useSubagentStore.getState().recordToolCall("t1", 'grep("resolveTarget")');
     let run = selectSubagentRun("t1")(useSubagentStore.getState());
@@ -44,7 +48,7 @@ describe("subagentStore", () => {
   });
 
   it("appendMessage grows liveMessages in order without mutating the previous array", () => {
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "find X", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "find X", profile: "explore" });
 
     const m1: ChatMessage = { role: "assistant", content: "", tool_calls: [] };
     const m2: ChatMessage = { role: "tool", tool_call_id: "call-1", content: "result" };
@@ -61,7 +65,7 @@ describe("subagentStore", () => {
   });
 
   it("finish transitions status to a terminal value and leaves other fields untouched", () => {
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "find X", profile: "code" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "find X", profile: "code" });
     useSubagentStore.getState().recordToolCall("t1", "write_file(a.ts)");
 
     useSubagentStore.getState().finish("t1", "done");
@@ -70,10 +74,39 @@ describe("subagentStore", () => {
     expect(run?.status).toBe("done");
     expect(run?.toolCallCount).toBe(1);
     expect(run?.profile).toBe("code");
+    expect(run?.finishedAt).toEqual(expect.any(Number));
+  });
+
+  it("selectRunningSubagentCount counts only in-flight runs", () => {
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "one", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t2", cancelId: "uuid-t2", description: "two", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s2", taskId: "t3", cancelId: "uuid-t3", description: "three", profile: "code" });
+
+    expect(selectRunningSubagentCount(useSubagentStore.getState())).toBe(3);
+
+    useSubagentStore.getState().finish("t2", "done");
+    useSubagentStore.getState().finish("t3", "cancelled");
+    expect(selectRunningSubagentCount(useSubagentStore.getState())).toBe(1);
+  });
+
+  it("selectSubagentRunList returns runs newest-first by startedAt", () => {
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "old", cancelId: "uuid-old", description: "old", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "new", cancelId: "uuid-new", description: "new", profile: "explore" });
+    // Force distinct, ordered timestamps — two `start` calls in the same
+    // millisecond would make the sort ambiguous.
+    useSubagentStore.setState((state) => ({
+      runs: {
+        ...state.runs,
+        old: { ...state.runs.old, startedAt: 1_000 },
+        new: { ...state.runs.new, startedAt: 2_000 },
+      },
+    }));
+
+    expect(selectSubagentRunList(useSubagentStore.getState()).map((run) => run.taskId)).toEqual(["new", "old"]);
   });
 
   it("accumulateUsage sums onto a running total across multiple calls (slice 4)", () => {
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "find X", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "find X", profile: "explore" });
 
     useSubagentStore.getState().accumulateUsage("t1", { promptTokens: 100, completionTokens: 20, totalTokens: 120 });
     let run = selectSubagentRun("t1")(useSubagentStore.getState());
@@ -90,8 +123,8 @@ describe("subagentStore", () => {
   });
 
   it("tracks multiple concurrent runs independently, keyed by taskId", () => {
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", description: "task one", profile: "explore" });
-    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t2", description: "task two", profile: "code" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t1", cancelId: "uuid-t1", description: "task one", profile: "explore" });
+    useSubagentStore.getState().start({ sessionId: "s1", taskId: "t2", cancelId: "uuid-t2", description: "task two", profile: "code" });
 
     useSubagentStore.getState().recordToolCall("t1", "grep(a)");
     useSubagentStore.getState().finish("t2", "error");

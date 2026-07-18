@@ -359,12 +359,13 @@ export function selectArchivedSideTasks(state: SideTaskStoreState): SideTaskReco
   return state.order.map((id) => state.tasks[id]).filter((task): task is SideTaskRecord => Boolean(task) && task.archivedAt !== null);
 }
 
-/** Count of tasks still actively running or waiting to start — drives the
- * drawer toggle's badge so a collapsed/closed drawer still signals live
- * work. */
+/** Count of tasks that can still produce work — running, waiting to start,
+ * or paused (a paused task resumes; it is not finished). Drives the drawer
+ * toggle's badge, the drawer header pill, and the chat's "N running tasks"
+ * chip, and must agree with the drawer's own "Running" section filter. */
 export function selectRunningSideTaskCount(state: SideTaskStoreState): number {
   return state.order.reduce((count, id) => {
     const task = state.tasks[id];
-    return task && (task.status === "running" || task.status === "queued") ? count + 1 : count;
+    return task && (task.status === "running" || task.status === "queued" || task.status === "paused") ? count + 1 : count;
   }, 0);
 }
