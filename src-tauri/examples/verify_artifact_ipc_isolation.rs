@@ -28,9 +28,14 @@
 //! `sandbox="allow-scripts"` (no `allow-same-origin`), no other capability
 //! wiring. The artifact can't call back into Rust by design (that's the
 //! whole point), so it reports its findings up via `postMessage` to the
-//! host page, which sets its own window title — polled from the real main
-//! thread's event loop, no IPC involved anywhere in the reporting path
-//! either.
+//! host page, which writes them into its own `document.title` — received in
+//! Rust through the window's `on_document_title_changed` handler, no IPC
+//! involved anywhere in the reporting path either. (NOT by polling
+//! `window.title()`: Tauri never mirrors `document.title` into the native
+//! window title on its own — that mirror is exactly what the opt-in
+//! `on_document_title_changed` handler exists to let apps implement — so a
+//! native-title poll reads back the configured title forever and can never
+//! observe the page's report.)
 //!
 //! Exit codes: `0` isolation confirmed; `1` `__TAURI_INTERNALS__`/`__TAURI__`
 //! was reachable inside the artifact frame (the exact regression the design
@@ -58,9 +63,10 @@
 //! navigation/JS pass and this deterministically times out (exit code `2`) —
 //! that is a "could not obtain a verdict" result, not a "PASS", and must not
 //! be read as confirming isolation. Set `VERIFY_ARTIFACT_DEBUG=1` to print
-//! the host window's title on every poll while diagnosing that.
+//! every document-title change while diagnosing that: a `BOOT:` line means
+//! the host page's script ran but the iframe never reported; no `BOOT:` line
+//! means the host page itself never executed.
 use std::io::Write;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use little_monkey_lib::{artifacts, AppState};
@@ -132,54 +138,54 @@ fn main() {
 })();
 </script></body></html>"#;
 
+    // Publish the probe artifact BEFORE building the host document so the
+    // iframe's src can carry the real artifact URL from the very first
+    // parse. The previous shape (build the window with an `about:blank`
+    // iframe, then `window.eval` a script to point it at the artifact) raced
+    // the host page's load: fired before `index.html` finished parsing,
+    // `document.getElementById('probe')` was null, the resulting TypeError
+    // was swallowed inside the webview, and the check always timed out.
+    // `publish_impl` only needs the map, not a built app, so there's no
+    // ordering constraint forcing the old shape.
+    let state = AppState::default();
+    let id = {
+        let mut store = state.artifacts.lock().unwrap();
+        artifacts::publish_impl(&mut store, artifact_html.to_string(), "html")
+            .expect("publishing the probe artifact must succeed")
+    };
+
     let host_html = format!(
         r#"<!doctype html><html><body><iframe id="probe" sandbox="allow-scripts" src="{}"></iframe>
 <script>
+document.title = 'BOOT:host-script-ran';
 window.addEventListener('message', function (e) {{
   document.title = 'RESULT:' + e.data;
 }});
 </script></body></html>"#,
-        // The artifact isn't published until `setup`, so this placeholder is
-        // swapped in via a second window navigation once the id is known —
-        // simpler than threading the id through `Assets` construction order.
-        "about:blank"
+        artifact_url(&id)
     );
 
     let app = tauri::Builder::default()
-        .manage(AppState::default())
+        .manage(state)
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
         .build(tauri::test::mock_context(HostPageAsset(host_html.into_bytes())))
         .expect("failed to build the verification app");
 
-    {
-        let state = app.state::<AppState>();
-        let mut store = state.artifacts.lock().unwrap();
-        let id = artifacts::publish_impl(&mut store, artifact_html.to_string(), "html")
-            .expect("publishing the probe artifact must succeed");
-        drop(store);
-
-        let window = WebviewWindowBuilder::new(&app, "probe", WebviewUrl::App("index.html".into()))
-            .build()
-            .expect("failed to build the probe window");
-
-        // Now that the artifact id is known, point the iframe at it for
-        // real via a tiny in-page script (avoids rebuilding the whole host
-        // document / `Assets` impl just to splice one URL in).
-        let url = artifact_url(&id);
-        window
-            .eval(format!(
-                "document.getElementById('probe').src = {};",
-                serde_json::to_string(&url).unwrap()
-            ))
-            .expect("failed to point the iframe at the published artifact");
-    }
-
-    // Poll the host window's title from a background thread. The pass/fail
-    // verdict is computed, printed, AND turned into the actual process exit
-    // status from inside this thread via `std::process::exit` directly —
-    // deliberately NOT `AppHandle::exit(code)`. Two independent reasons:
+    // The verdict arrives through `on_document_title_changed` — the opt-in
+    // hook wry/Tauri provide precisely because `document.title` is NOT
+    // mirrored into the native window title automatically (see this file's
+    // header: polling `window.title()` observes only the configured native
+    // title, forever). The `BOOT:` title the host page sets immediately also
+    // flows through here, giving a debug-visible signal that distinguishes
+    // "host page never ran" from "iframe never reported" when diagnosing a
+    // timeout on a CI runner.
+    //
+    // The pass/fail verdict is computed, printed, AND turned into the actual
+    // process exit status from inside this handler via `std::process::exit`
+    // directly — deliberately NOT `AppHandle::exit(code)`. Two independent
+    // reasons:
     // (1) `AppHandle::exit` only *requests* a graceful shutdown by posting a
     // `RunEvent::ExitRequested`/`Exit` pair through the event loop; tao's
     // macOS backend (pinned version, confirmed by reading
@@ -195,51 +201,38 @@ window.addEventListener('message', function (e) {{
     // once torn down) — code placed after `app.run()` in `main` would
     // silently never execute there, so the diagnostic and exit both have to
     // happen from wherever the decision is actually made, which is here.
-    let app_handle = app.handle().clone();
+    let debug = std::env::var("VERIFY_ARTIFACT_DEBUG").is_ok();
+    let _window = WebviewWindowBuilder::new(&app, "probe", WebviewUrl::App("index.html".into()))
+        .on_document_title_changed(move |_window, title| {
+            if debug {
+                eprintln!("(debug) document title changed: {title:?}");
+            }
+            if let Some(payload) = title.strip_prefix("RESULT:") {
+                std::process::exit(evaluate_and_report(payload));
+            }
+        })
+        .build()
+        .expect("failed to build the probe window");
+
+    // Watchdog: if no verdict has arrived (and exited the process) within
+    // the timeout, report the inconclusive case as a failure. Overridable
+    // via VERIFY_ARTIFACT_TIMEOUT_SECS: a cold CI VM's first WebView2
+    // environment initialization (no warm user-data-dir cache) can plausibly
+    // take longer than a fixed 10s allows, which would otherwise misreport
+    // as the "no bound GUI session" inconclusive case documented in this
+    // file's header rather than a real timing issue. Default stays 10s so
+    // local/interactive runs are unaffected.
     std::thread::spawn(move || {
-        // Overridable via VERIFY_ARTIFACT_TIMEOUT_SECS: a cold CI VM's first
-        // WebView2 environment initialization (no warm user-data-dir cache)
-        // can plausibly take longer than a fixed 10s allows, which would
-        // otherwise misreport as the "no bound GUI session" inconclusive
-        // case documented in this file's header rather than a real timing
-        // issue. Default stays 10s so local/interactive runs are unaffected.
         let timeout_secs = std::env::var("VERIFY_ARTIFACT_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        loop {
-            if std::time::Instant::now() > deadline {
-                eprintln!(
-                    "FAIL: no probe result received within the timeout — the artifact frame's script may not have run at all."
-                );
-                let _ = std::io::stderr().flush();
-                std::process::exit(2);
-            }
-            let app_handle_for_check = app_handle.clone();
-            let (title_tx, title_rx) = mpsc::channel();
-            if app_handle
-                .run_on_main_thread(move || {
-                    let title = app_handle_for_check
-                        .get_webview_window("probe")
-                        .and_then(|w| w.title().ok())
-                        .unwrap_or_default();
-                    let _ = title_tx.send(title);
-                })
-                .is_ok()
-            {
-                if let Ok(title) = title_rx.recv_timeout(Duration::from_millis(500)) {
-                    if std::env::var("VERIFY_ARTIFACT_DEBUG").is_ok() {
-                        eprintln!("(debug) current window title: {title:?}");
-                    }
-                    if let Some(payload) = title.strip_prefix("RESULT:") {
-                        let exit_code = evaluate_and_report(payload);
-                        std::process::exit(exit_code);
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        std::thread::sleep(Duration::from_secs(timeout_secs));
+        eprintln!(
+            "FAIL: no probe result received within the timeout — the artifact frame's script may not have run at all."
+        );
+        let _ = std::io::stderr().flush();
+        std::process::exit(2);
     });
 
     app.run(|_, _| {});
