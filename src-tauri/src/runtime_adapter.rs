@@ -869,6 +869,27 @@ pub struct AdvancedSettingCapability {
     pub schema: SettingValueSchema,
     pub default_value: SettingValue,
     pub restart_required: bool,
+    /// Whether this control can actually be enabled right now. Every
+    /// capability declared here is one the runtime driver knows how to
+    /// accept in principle; `supported` narrows that down to what the
+    /// *current* runtime/model/hardware combination can honor. A freshly
+    /// constructed adapter's baseline `capabilities()` has no hardware or
+    /// selected-model context, so it always reports `true` here except for
+    /// controls (like the speculative-decoding draft model) that are
+    /// inherently model-relative and therefore unknown until a model is
+    /// selected. The Runtime Hub layer (`m3_runtime_hub.rs`'s
+    /// `gate_advanced_settings`) narrows this further using the Hardware
+    /// Compatibility report and the installed-model catalog before the UI
+    /// ever renders a control — see that function's doc comment for exactly
+    /// which keys it gates and why. This is advisory for the UI only: the
+    /// hub also enforces the same gates server-side (`set_runtime_config`/
+    /// `load_model`) so a control can never actually take effect just
+    /// because a client skipped the UI and submitted a value directly.
+    pub supported: bool,
+    /// Present exactly when `supported` is `false`: a short, human-readable
+    /// reason to surface directly next to the disabled control. Never leave
+    /// a control disabled with no explanation.
+    pub unsupported_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1734,6 +1755,8 @@ fn ollama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             },
             default_value: SettingValue::Integer { value: 4_096 },
             restart_required: false,
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "num_gpu".to_string(),
@@ -1746,6 +1769,8 @@ fn ollama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             },
             default_value: SettingValue::Integer { value: -1 },
             restart_required: false,
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "use_mmap".to_string(),
@@ -1754,6 +1779,8 @@ fn ollama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             schema: SettingValueSchema::Boolean,
             default_value: SettingValue::Boolean { value: true },
             restart_required: false,
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "use_mlock".to_string(),
@@ -1762,6 +1789,101 @@ fn ollama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             schema: SettingValueSchema::Boolean,
             default_value: SettingValue::Boolean { value: false },
             restart_required: false,
+            supported: true,
+            unsupported_reason: None,
+        },
+        // -- Sampler and batching controls (ROADMAP Phase 8 item 17) --
+        // Ollama forwards its `options` object straight through to the
+        // embedded llama.cpp engine (see `ollama_settings_json`, which
+        // already serializes any key/value pair generically), so these need
+        // no new wire-format work — only the capability declaration below.
+        // None of these depend on hardware or the selected model: Ollama
+        // accepts them for every model it can load, so they are never
+        // gated (`supported: true` unconditionally).
+        AdvancedSettingCapability {
+            key: "temperature".to_string(),
+            label: "Temperature".to_string(),
+            description: "Sampling temperature: higher values increase randomness.".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 2.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 0.8 },
+            restart_required: false,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "top_p".to_string(),
+            label: "Top-p".to_string(),
+            description: "Nucleus sampling probability mass cutoff.".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 0.9 },
+            restart_required: false,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "top_k".to_string(),
+            label: "Top-k".to_string(),
+            description: "Limits sampling to the k most likely next tokens.".to_string(),
+            schema: SettingValueSchema::Integer {
+                min: 0,
+                max: 1_000,
+                step: 1,
+            },
+            default_value: SettingValue::Integer { value: 40 },
+            restart_required: false,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "repeat_penalty".to_string(),
+            label: "Repeat penalty".to_string(),
+            description: "Penalizes tokens that already appeared in the context.".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 2.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 1.1 },
+            restart_required: false,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "min_p".to_string(),
+            label: "Min-p".to_string(),
+            description: "Minimum token probability, relative to the most likely token."
+                .to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 0.05 },
+            restart_required: false,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "num_batch".to_string(),
+            label: "Batch size".to_string(),
+            description: "Number of tokens Ollama processes together per batch.".to_string(),
+            schema: SettingValueSchema::Integer {
+                min: 1,
+                max: 8_192,
+                step: 1,
+            },
+            default_value: SettingValue::Integer { value: 512 },
+            restart_required: false,
+            supported: true,
+            unsupported_reason: None,
         },
     ]
 }
@@ -2218,7 +2340,47 @@ impl ManagedLlamaCppAdapter {
             });
         }
 
-        let args = llama_args(model_path, self.port, &request.settings)?;
+        // Resolve the speculative-decoding draft model (if any) to a real
+        // file path from this adapter's own configured model list — the
+        // same source of truth `model_path` above was just resolved from.
+        // Whether the requested draft model id is actually a *compatible*
+        // draft for `request.model_id` (same family, smaller, installed) is
+        // a Runtime Hub concept enforced before this call ever happens (see
+        // `M3RuntimeHub::load_model`'s draft-model gate); this only needs to
+        // turn a known model id into a path or fail clearly if it isn't one.
+        let draft_model_path = match request.settings.get("speculative_decoding_draft_model") {
+            Some(SettingValue::Text { value }) if !value.is_empty() => {
+                let draft_model = self
+                    .models
+                    .iter()
+                    .find(|candidate| candidate.model_id == *value)
+                    .ok_or_else(|| RuntimeAdapterError::ModelNotFound {
+                        runtime_id: self.descriptor.runtime_id.clone(),
+                        model_id: value.clone(),
+                    })?;
+                let path = draft_model.local_path.as_ref().ok_or_else(|| {
+                    RuntimeAdapterError::ModelPathUnavailable {
+                        runtime_id: self.descriptor.runtime_id.clone(),
+                        model_id: value.clone(),
+                    }
+                })?;
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| RuntimeAdapterError::ModelPathUnavailable {
+                        runtime_id: self.descriptor.runtime_id.clone(),
+                        model_id: value.clone(),
+                    })?;
+                Some(path.to_string())
+            }
+            _ => None,
+        };
+
+        let args = llama_args(
+            model_path,
+            self.port,
+            &request.settings,
+            draft_model_path.as_deref(),
+        )?;
         let spec = ManagedProcessSpec {
             runtime_id: self.descriptor.runtime_id.clone(),
             program: self.executable.clone(),
@@ -2479,6 +2641,8 @@ fn llama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             },
             default_value: SettingValue::Integer { value: 4_096 },
             restart_required: true,
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "gpu_layers".to_string(),
@@ -2491,6 +2655,8 @@ fn llama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             },
             default_value: SettingValue::Integer { value: -1 },
             restart_required: true,
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "threads".to_string(),
@@ -2503,11 +2669,13 @@ fn llama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             },
             default_value: SettingValue::Integer { value: 4 },
             restart_required: true,
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "flash_attention".to_string(),
             label: "Flash attention".to_string(),
-            description: "Select llama.cpp flash-attention behavior.".to_string(),
+            description: "Select llama.cpp flash-attention behavior. Needs a supported GPU backend; gated dynamically by the Runtime Hub against the Hardware Compatibility report (see `m3_runtime_hub.rs`'s `gate_advanced_settings`).".to_string(),
             schema: SettingValueSchema::Choice {
                 options: vec!["auto".to_string(), "on".to_string(), "off".to_string()],
             },
@@ -2515,6 +2683,12 @@ fn llama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
                 value: "auto".to_string(),
             },
             restart_required: true,
+            // Baseline: this adapter always knows how to pass `--flash-attn`.
+            // Whether "on" can actually be honored depends on hardware the
+            // low-level adapter has no visibility into — see the Runtime Hub
+            // gating layer, which narrows this per-machine.
+            supported: true,
+            unsupported_reason: None,
         },
         AdvancedSettingCapability {
             key: "embeddings".to_string(),
@@ -2523,6 +2697,138 @@ fn llama_setting_capabilities() -> Vec<AdvancedSettingCapability> {
             schema: SettingValueSchema::Boolean,
             default_value: SettingValue::Boolean { value: false },
             restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        // -- Sampler, batching, speculative decoding, and mixed precision
+        // controls (ROADMAP Phase 8 item 17) --
+        AdvancedSettingCapability {
+            key: "temperature".to_string(),
+            label: "Temperature".to_string(),
+            description: "Default sampling temperature (`--temp`).".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 2.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 0.8 },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "top_p".to_string(),
+            label: "Top-p".to_string(),
+            description: "Nucleus sampling probability mass cutoff (`--top-p`).".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 0.9 },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "top_k".to_string(),
+            label: "Top-k".to_string(),
+            description: "Limits sampling to the k most likely next tokens (`--top-k`)."
+                .to_string(),
+            schema: SettingValueSchema::Integer {
+                min: 0,
+                max: 1_000,
+                step: 1,
+            },
+            default_value: SettingValue::Integer { value: 40 },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "repeat_penalty".to_string(),
+            label: "Repeat penalty".to_string(),
+            description: "Penalizes tokens that already appeared in the context (`--repeat-penalty`).".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 2.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 1.1 },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "min_p".to_string(),
+            label: "Min-p".to_string(),
+            description: "Minimum token probability, relative to the most likely token (`--min-p`).".to_string(),
+            schema: SettingValueSchema::Float {
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+            },
+            default_value: SettingValue::Float { value: 0.05 },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "batch_size".to_string(),
+            label: "Batch size".to_string(),
+            description: "Logical batch size llama-server processes per step (`--batch-size`)."
+                .to_string(),
+            schema: SettingValueSchema::Integer {
+                min: 1,
+                max: 8_192,
+                step: 1,
+            },
+            default_value: SettingValue::Integer { value: 2_048 },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "mixed_precision".to_string(),
+            label: "Mixed precision (KV cache)".to_string(),
+            description: "Quantizes the K/V cache (`--cache-type-k`/`--cache-type-v`) to trade a little quality for memory; llama.cpp requires flash attention for anything below f16, so this needs a supported GPU backend too. Gated dynamically by the Runtime Hub against the Hardware Compatibility report.".to_string(),
+            schema: SettingValueSchema::Choice {
+                options: vec!["f16".to_string(), "q8_0".to_string(), "q4_0".to_string()],
+            },
+            default_value: SettingValue::Choice {
+                value: "f16".to_string(),
+            },
+            restart_required: true,
+            supported: true,
+            unsupported_reason: None,
+        },
+        AdvancedSettingCapability {
+            key: "speculative_decoding_draft_model".to_string(),
+            label: "Speculative decoding draft model".to_string(),
+            description: "Model id of a smaller, same-family installed model to use as a speculative-decoding draft (`--model-draft`). Empty disables speculative decoding.".to_string(),
+            // A fixed `Choice` schema cannot express "whichever installed
+            // models are currently a compatible draft for whichever model
+            // gets loaded" — that set only exists relative to a specific
+            // target model, which this adapter has no notion of. So this is
+            // a plain model-id string; which ids are actually valid right
+            // now is a Runtime Hub concept (`gate_advanced_settings` +
+            // `M3SettingCapabilitiesView::draft_model_candidates`) surfaced
+            // to the UI as a separate candidate list, and enforced
+            // authoritatively at load time (`M3RuntimeHub::load_model`)
+            // regardless of what the UI showed.
+            schema: SettingValueSchema::Text { max_bytes: 256 },
+            default_value: SettingValue::Text {
+                value: String::new(),
+            },
+            restart_required: true,
+            // Baseline: unknown until a target model is selected, so this
+            // control starts disabled. The Runtime Hub layer flips it to
+            // `true` once it finds at least one compatible installed draft
+            // model for the model currently being configured.
+            supported: false,
+            unsupported_reason: Some(
+                "Select a model to check for a compatible installed draft model.".to_string(),
+            ),
         },
     ]
 }
@@ -2531,6 +2837,7 @@ fn llama_args(
     model_path: &str,
     port: u16,
     settings: &BTreeMap<String, SettingValue>,
+    draft_model_path: Option<&str>,
 ) -> RuntimeAdapterResult<Vec<String>> {
     let context_size = integer_setting(settings, "context_size", 4_096)?;
     let gpu_layers = integer_setting(settings, "gpu_layers", -1)?;
@@ -2561,6 +2868,50 @@ fn llama_args(
     }
     if embeddings {
         args.push("--embeddings".to_string());
+    }
+    if settings.contains_key("temperature") {
+        args.extend([
+            "--temp".to_string(),
+            float_setting(settings, "temperature", 0.8)?.to_string(),
+        ]);
+    }
+    if settings.contains_key("top_p") {
+        args.extend([
+            "--top-p".to_string(),
+            float_setting(settings, "top_p", 0.9)?.to_string(),
+        ]);
+    }
+    if settings.contains_key("top_k") {
+        args.extend([
+            "--top-k".to_string(),
+            integer_setting(settings, "top_k", 40)?.to_string(),
+        ]);
+    }
+    if settings.contains_key("repeat_penalty") {
+        args.extend([
+            "--repeat-penalty".to_string(),
+            float_setting(settings, "repeat_penalty", 1.1)?.to_string(),
+        ]);
+    }
+    if settings.contains_key("min_p") {
+        args.extend([
+            "--min-p".to_string(),
+            float_setting(settings, "min_p", 0.05)?.to_string(),
+        ]);
+    }
+    if settings.contains_key("batch_size") {
+        args.extend([
+            "--batch-size".to_string(),
+            integer_setting(settings, "batch_size", 2_048)?.to_string(),
+        ]);
+    }
+    if settings.contains_key("mixed_precision") {
+        let cache_type = choice_setting(settings, "mixed_precision", "f16")?;
+        args.extend(["--cache-type-k".to_string(), cache_type.clone()]);
+        args.extend(["--cache-type-v".to_string(), cache_type]);
+    }
+    if let Some(draft_model_path) = draft_model_path {
+        args.extend(["--model-draft".to_string(), draft_model_path.to_string()]);
     }
     Ok(args)
 }
@@ -2607,6 +2958,21 @@ fn choice_setting(
             message: "expected a supported choice".to_string(),
         }),
         None => Ok(default.to_string()),
+    }
+}
+
+fn float_setting(
+    settings: &BTreeMap<String, SettingValue>,
+    key: &str,
+    default: f64,
+) -> RuntimeAdapterResult<f64> {
+    match settings.get(key) {
+        Some(SettingValue::Float { value }) => Ok(*value),
+        Some(_) => Err(RuntimeAdapterError::InvalidSetting {
+            key: key.to_string(),
+            message: "expected a float".to_string(),
+        }),
+        None => Ok(default),
     }
 }
 
@@ -3051,11 +3417,583 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive per-load offload planner (ROADMAP Phase 8, "Adaptive Runtime
+// Scheduler and Offload Planner").
+//
+// `LocalRuntimeScheduler` above decides *which* models can run concurrently
+// and *when* (execution waves) from whole-model memory estimates. It does not
+// decide *how* a single model load should be configured. `LocalOffloadPlanner`
+// fills that gap: given a live hardware snapshot and one model's memory
+// profile, it recommends a context window, batch size, GPU layer offload
+// count, projector placement, CPU spill, and parallelism, together with a
+// short rationale per field and concrete improvement suggestions. It is pure,
+// deterministic, and advisory only: it never starts, stops, or reconfigures a
+// runtime process.
+// ---------------------------------------------------------------------------
+
+/// Context length assumed to already be reflected in a catalog or installed
+/// model's `estimated_ram_bytes`/`estimated_vram_bytes` figures. Those figures
+/// come from whole-model measurements taken by catalog maintainers rather
+/// than GGUF/safetensors metadata this planner can read directly, so the
+/// KV-cache contribution at other context lengths is scaled from this
+/// assumed baseline.
+const OFFLOAD_BASELINE_CONTEXT_TOKENS: u32 = 4_096;
+const OFFLOAD_DEFAULT_CONTEXT_TOKENS: u32 = 8_192;
+const OFFLOAD_MIN_CONTEXT_TOKENS: u32 = 512;
+const OFFLOAD_MAX_CONTEXT_TOKENS: u32 = 131_072;
+const OFFLOAD_CONTEXT_TIERS: &[u32] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+/// Floor for estimated KV-cache bytes per token when a model's baseline
+/// footprint does not clearly separate weights from cache overhead.
+const OFFLOAD_MIN_KV_BYTES_PER_TOKEN: u64 = 8 * 1024;
+const OFFLOAD_MAX_PARALLEL_SEQUENCES: u16 = 8;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OffloadModelProfile {
+    /// Exact on-disk weight size for the selected model artifact.
+    pub weights_bytes: u64,
+    /// Estimated total footprint (weights + baseline KV/overhead) if this
+    /// model runs entirely on CPU/RAM at `OFFLOAD_BASELINE_CONTEXT_TOKENS`.
+    pub estimated_ram_bytes: u64,
+    /// Estimated total footprint if this model runs fully offloaded to an
+    /// accelerator at `OFFLOAD_BASELINE_CONTEXT_TOKENS`. Zero when the model
+    /// has no meaningful GPU/Metal offload path.
+    pub estimated_vram_bytes: u64,
+    pub required_accelerator: Option<AcceleratorKind>,
+    pub has_vision_projector: bool,
+    /// Estimated resident memory the multimodal projector itself needs once
+    /// loaded (ROADMAP Phase 8 item 12), separate from `weights_bytes`/
+    /// `estimated_ram_bytes`/`estimated_vram_bytes` above, which describe the
+    /// base language model only. Ignored when `has_vision_projector` is
+    /// false. Zero is a legitimate value for a vision-capable model whose
+    /// projector size is not yet known, in which case this planner simply
+    /// reserves nothing extra for it (see `m3_runtime_hub::
+    /// estimated_projector_memory_bytes` for how a real figure is derived
+    /// from a catalog's declared `M3ProjectorRef`).
+    pub projector_memory_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OffloadPlanInput {
+    pub hardware: HardwareSnapshot,
+    pub model: OffloadModelProfile,
+    /// Memory already committed by other models resident right now; treated
+    /// as unavailable headroom without double-subtracting it from
+    /// `hardware`'s own available counters.
+    pub reserved: MemoryRequirement,
+    pub other_resident_count: u32,
+    /// Desired context window; defaults to `OFFLOAD_DEFAULT_CONTEXT_TOKENS`
+    /// when omitted. The plan may recommend a smaller value than requested.
+    pub requested_context_tokens: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectorPlacement {
+    Gpu,
+    Cpu,
+    NotApplicable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OffloadRationale {
+    pub field: String,
+    pub explanation: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OffloadPlan {
+    pub schema_version: u32,
+    pub accelerator: AcceleratorKind,
+    pub context_tokens: u32,
+    pub requested_context_tokens: u32,
+    pub batch_size: u32,
+    pub gpu_layers: u32,
+    pub estimated_total_layers: u32,
+    pub cpu_spill_layers: u32,
+    pub projector_placement: ProjectorPlacement,
+    pub parallel_sequences: u16,
+    pub available_ram_bytes: u64,
+    pub available_vram_bytes: u64,
+    pub rationale: Vec<OffloadRationale>,
+    pub improvement_suggestions: Vec<String>,
+}
+
+pub struct LocalOffloadPlanner;
+
+impl LocalOffloadPlanner {
+    /// Simulates fit and computes a per-load offload plan before a model is
+    /// actually loaded. Pure and deterministic: identical inputs always
+    /// produce identical output, which keeps it unit-testable without any
+    /// real GPU hardware.
+    pub fn plan(input: &OffloadPlanInput) -> RuntimeAdapterResult<OffloadPlan> {
+        let profile = input.hardware.profile()?;
+        validate_offload_plan_input(input)?;
+
+        let mut rationale: Vec<OffloadRationale> = Vec::new();
+        let mut improvements: Vec<String> = Vec::new();
+
+        let accelerator = resolve_offload_accelerator(
+            &input.model,
+            &input.hardware,
+            &profile,
+            &mut rationale,
+            &mut improvements,
+        );
+
+        let mut available_ram_bytes = input
+            .hardware
+            .available_ram_bytes
+            .saturating_sub(profile.recommended_ram_reserve_bytes)
+            .saturating_sub(input.reserved.ram_bytes);
+        // Metal is unified memory: there is exactly one physical pool, so its
+        // "VRAM" budget is the same already reserve-adjusted `available_ram_bytes`
+        // rather than a second, independently reserved figure. That avoids both
+        // double-counting the pool and skipping the OS/other-resident reserve on
+        // the accelerator side.
+        let mut available_vram_bytes = match accelerator {
+            AcceleratorKind::Cpu => 0,
+            AcceleratorKind::Metal => available_ram_bytes,
+            other => input
+                .hardware
+                .platform
+                .accelerators
+                .iter()
+                .find(|entry| entry.kind == other && entry.available)
+                .and_then(|entry| entry.available_memory_bytes.or(entry.total_memory_bytes))
+                .unwrap_or(0)
+                .saturating_sub(input.reserved.vram_bytes),
+        };
+
+        // Multimodal projector memory sizing (ROADMAP Phase 8 item 12):
+        // reserve the projector's own resident footprint off the top of
+        // whichever pool it will occupy, *before* the GPU-layer fit fraction
+        // and context-tier math below so both genuinely account for it,
+        // rather than only deciding *where* the projector goes afterward.
+        // Metal keeps both pool variables equal (they represent the same
+        // unified memory); a genuinely separate accelerator only spends its
+        // own VRAM; CPU-only plans spend system RAM.
+        if input.model.has_vision_projector && input.model.projector_memory_bytes > 0 {
+            let projector_bytes = input.model.projector_memory_bytes;
+            match accelerator {
+                AcceleratorKind::Cpu => {
+                    available_ram_bytes = available_ram_bytes.saturating_sub(projector_bytes);
+                }
+                AcceleratorKind::Metal => {
+                    available_ram_bytes = available_ram_bytes.saturating_sub(projector_bytes);
+                    available_vram_bytes = available_vram_bytes.saturating_sub(projector_bytes);
+                }
+                _ => {
+                    available_vram_bytes = available_vram_bytes.saturating_sub(projector_bytes);
+                }
+            }
+            rationale.push(OffloadRationale {
+                field: "projector_memory_bytes".to_string(),
+                explanation: format!(
+                    "Reserved {} for the multimodal projector's own resident memory before sizing context and GPU layers.",
+                    format_bytes_for_rationale(projector_bytes)
+                ),
+            });
+        }
+
+        let estimated_total_layers = estimate_layer_count(input.model.weights_bytes);
+        let (gpu_layers, cpu_spill_layers) = if accelerator == AcceleratorKind::Cpu
+            || input.model.estimated_vram_bytes == 0
+        {
+            if accelerator != AcceleratorKind::Cpu {
+                rationale.push(OffloadRationale {
+                    field: "gpu_layers".to_string(),
+                    explanation:
+                        "This model has no measured accelerator footprint, so every layer runs on CPU."
+                            .to_string(),
+                });
+            } else {
+                rationale.push(OffloadRationale {
+                    field: "gpu_layers".to_string(),
+                    explanation: format!(
+                        "All {estimated_total_layers} estimated layers run on CPU because no compatible accelerator is in use for this load."
+                    ),
+                });
+            }
+            (0, estimated_total_layers)
+        } else {
+            let fit_fraction =
+                (available_vram_bytes as f64 / input.model.estimated_vram_bytes as f64).clamp(0.0, 1.0);
+            let gpu_layers = ((estimated_total_layers as f64) * fit_fraction).floor() as u32;
+            let cpu_spill_layers = estimated_total_layers.saturating_sub(gpu_layers);
+            if gpu_layers >= estimated_total_layers {
+                rationale.push(OffloadRationale {
+                    field: "gpu_layers".to_string(),
+                    explanation: format!(
+                        "All {estimated_total_layers} estimated layers fit inside the {} of available {accelerator:?} memory.",
+                        format_bytes_for_rationale(available_vram_bytes)
+                    ),
+                });
+            } else {
+                rationale.push(OffloadRationale {
+                    field: "gpu_layers".to_string(),
+                    explanation: format!(
+                        "{gpu_layers} of {estimated_total_layers} estimated layers fit inside the {} of available {accelerator:?} memory; the remaining {cpu_spill_layers} spill to CPU.",
+                        format_bytes_for_rationale(available_vram_bytes)
+                    ),
+                });
+            }
+            (gpu_layers, cpu_spill_layers)
+        };
+
+        // Metal is unified memory: `available_vram_bytes` already reflects the
+        // same physical pool as `available_ram_bytes`, so summing the two
+        // would double-count it. Only genuinely separate accelerator memory
+        // (CUDA/ROCm/Vulkan/DirectML) adds to the system RAM budget.
+        let combined_budget_bytes = match accelerator {
+            AcceleratorKind::Cpu => available_ram_bytes,
+            AcceleratorKind::Metal => available_vram_bytes,
+            _ => available_ram_bytes.saturating_add(available_vram_bytes),
+        };
+
+        let kv_bytes_per_token = estimate_kv_bytes_per_token(&input.model);
+        let requested_context_tokens = input
+            .requested_context_tokens
+            .unwrap_or(OFFLOAD_DEFAULT_CONTEXT_TOKENS)
+            .clamp(OFFLOAD_MIN_CONTEXT_TOKENS, OFFLOAD_MAX_CONTEXT_TOKENS);
+
+        let budget_after_weights = combined_budget_bytes.saturating_sub(input.model.weights_bytes);
+        let max_affordable_context = if kv_bytes_per_token == 0 {
+            OFFLOAD_MAX_CONTEXT_TOKENS
+        } else {
+            let tokens = budget_after_weights / kv_bytes_per_token;
+            u32::try_from(tokens.min(u64::from(OFFLOAD_MAX_CONTEXT_TOKENS)))
+                .unwrap_or(OFFLOAD_MAX_CONTEXT_TOKENS)
+        };
+        let context_tokens = pick_context_tier(
+            requested_context_tokens.min(max_affordable_context.max(OFFLOAD_MIN_CONTEXT_TOKENS)),
+        );
+
+        if context_tokens < requested_context_tokens {
+            rationale.push(OffloadRationale {
+                field: "context_tokens".to_string(),
+                explanation: format!(
+                    "Context reduced to {context_tokens} tokens because the {} of remaining memory after weights and other residents only covers about {max_affordable_context} tokens of cache.",
+                    format_bytes_for_rationale(combined_budget_bytes)
+                ),
+            });
+        } else {
+            rationale.push(OffloadRationale {
+                field: "context_tokens".to_string(),
+                explanation: format!(
+                    "Context set to the requested {context_tokens} tokens; estimated memory after loading remains within budget."
+                ),
+            });
+        }
+        if input.model.weights_bytes > combined_budget_bytes {
+            improvements.push(format!(
+                "Model weights alone ({}) exceed the {} of available memory for this load; free more memory or pick a smaller quantization.",
+                format_bytes_for_rationale(input.model.weights_bytes),
+                format_bytes_for_rationale(combined_budget_bytes)
+            ));
+        }
+
+        let kv_bytes_for_chosen_context = kv_bytes_per_token.saturating_mul(u64::from(context_tokens));
+        let used_bytes = input.model.weights_bytes.saturating_add(kv_bytes_for_chosen_context);
+        let leftover_bytes = combined_budget_bytes.saturating_sub(used_bytes);
+        let extra_parallel = if kv_bytes_for_chosen_context == 0 {
+            0
+        } else {
+            leftover_bytes / kv_bytes_for_chosen_context
+        };
+        let parallel_ceiling = profile.recommended_process_slots.max(1);
+        let parallel_sequences = 1u16
+            .saturating_add(
+                u16::try_from(extra_parallel.min(u64::from(OFFLOAD_MAX_PARALLEL_SEQUENCES - 1)))
+                    .unwrap_or(0),
+            )
+            .min(parallel_ceiling)
+            .min(OFFLOAD_MAX_PARALLEL_SEQUENCES);
+        rationale.push(OffloadRationale {
+            field: "parallel_sequences".to_string(),
+            explanation: if parallel_sequences > 1 {
+                format!(
+                    "{parallel_sequences} concurrent sequences fit because leftover memory after one instance still covers {} more KV cache slot(s), bounded by {parallel_ceiling} recommended process slot(s) for this hardware tier.",
+                    parallel_sequences - 1
+                )
+            } else {
+                "Only one sequence fits after the model and its context window are accounted for."
+                    .to_string()
+            },
+        });
+
+        let mut batch_size: u32 = match profile.tier {
+            HardwareTier::Constrained => 128,
+            HardwareTier::Balanced => 256,
+            HardwareTier::Performance => 512,
+        };
+        if accelerator == AcceleratorKind::Cpu {
+            batch_size = batch_size.min(256);
+        }
+        let headroom_ratio = if combined_budget_bytes == 0 {
+            0.0
+        } else {
+            leftover_bytes as f64 / combined_budget_bytes as f64
+        };
+        if headroom_ratio < 0.15 {
+            let reduced = (batch_size / 2).max(32);
+            rationale.push(OffloadRationale {
+                field: "batch_size".to_string(),
+                explanation: format!(
+                    "Batch size reduced from {batch_size} to {reduced} because less than 15% memory headroom remains after context and weights."
+                ),
+            });
+            batch_size = reduced;
+        } else {
+            rationale.push(OffloadRationale {
+                field: "batch_size".to_string(),
+                explanation: format!(
+                    "Batch size set to {batch_size} for a {:?} hardware tier with comfortable headroom.",
+                    profile.tier
+                ),
+            });
+        }
+
+        let projector_placement = if !input.model.has_vision_projector {
+            ProjectorPlacement::NotApplicable
+        } else if accelerator != AcceleratorKind::Cpu && gpu_layers > 0 {
+            rationale.push(OffloadRationale {
+                field: "projector_placement".to_string(),
+                explanation: format!(
+                    "The multimodal projector offloads to {accelerator:?} alongside the offloaded layers."
+                ),
+            });
+            ProjectorPlacement::Gpu
+        } else {
+            rationale.push(OffloadRationale {
+                field: "projector_placement".to_string(),
+                explanation:
+                    "The multimodal projector runs on CPU because no accelerator layers are offloaded for this load."
+                        .to_string(),
+            });
+            ProjectorPlacement::Cpu
+        };
+
+        if input.other_resident_count > 0 && (cpu_spill_layers > 0 || context_tokens < requested_context_tokens)
+        {
+            improvements.push(format!(
+                "Unload {} other resident model{} to free memory and raise the offload/context budget for this load.",
+                input.other_resident_count,
+                if input.other_resident_count == 1 { "" } else { "s" }
+            ));
+        }
+        if accelerator == AcceleratorKind::Cpu
+            && input.model.required_accelerator.is_none()
+            && !input
+                .hardware
+                .platform
+                .accelerators
+                .iter()
+                .any(|entry| entry.available && entry.kind != AcceleratorKind::Cpu)
+        {
+            improvements.push(
+                "No GPU or Metal acceleration was detected on this machine; check the Overview tab for detected accelerators."
+                    .to_string(),
+            );
+        }
+        if context_tokens < requested_context_tokens {
+            improvements.push(format!(
+                "Context is capped at {context_tokens} tokens (requested {requested_context_tokens}); free RAM/VRAM or reduce parallel sequences to raise it."
+            ));
+        }
+
+        Ok(OffloadPlan {
+            schema_version: RUNTIME_ADAPTER_SCHEMA_VERSION,
+            accelerator,
+            context_tokens,
+            requested_context_tokens,
+            batch_size,
+            gpu_layers,
+            estimated_total_layers,
+            cpu_spill_layers,
+            projector_placement,
+            parallel_sequences,
+            available_ram_bytes,
+            available_vram_bytes,
+            rationale,
+            improvement_suggestions: improvements,
+        })
+    }
+}
+
+fn resolve_offload_accelerator(
+    model: &OffloadModelProfile,
+    hardware: &HardwareSnapshot,
+    profile: &HardwareProfile,
+    rationale: &mut Vec<OffloadRationale>,
+    improvements: &mut Vec<String>,
+) -> AcceleratorKind {
+    if let Some(required) = model.required_accelerator {
+        if hardware.platform.supports_accelerator(required) {
+            rationale.push(OffloadRationale {
+                field: "accelerator".to_string(),
+                explanation: format!(
+                    "Using the required {required:?} accelerator, which this machine advertises as available."
+                ),
+            });
+            return required;
+        }
+        rationale.push(OffloadRationale {
+            field: "accelerator".to_string(),
+            explanation: format!(
+                "The required {required:?} accelerator is unavailable on this machine; falling back to CPU-only execution."
+            ),
+        });
+        improvements.push(format!(
+            "This model requires {required:?}; install or enable a compatible driver, or choose a CPU-friendly variant."
+        ));
+        return AcceleratorKind::Cpu;
+    }
+    if profile.preferred_accelerator != AcceleratorKind::Cpu
+        && hardware.platform.supports_accelerator(profile.preferred_accelerator)
+    {
+        rationale.push(OffloadRationale {
+            field: "accelerator".to_string(),
+            explanation: format!(
+                "Opportunistically offloading to {:?}, the preferred accelerator detected on this machine.",
+                profile.preferred_accelerator
+            ),
+        });
+        return profile.preferred_accelerator;
+    }
+    rationale.push(OffloadRationale {
+        field: "accelerator".to_string(),
+        explanation: "No GPU or Metal accelerator is available; the plan runs entirely on CPU.".to_string(),
+    });
+    AcceleratorKind::Cpu
+}
+
+/// Coarse dense-transformer layer-count estimate derived from on-disk weight
+/// size. GGUF/safetensors metadata (the real source of truth for layer
+/// count) is not read at planning time, so this only needs the right order
+/// of magnitude: it turns a VRAM-fit fraction into a friendly "N of M layers
+/// offloaded" count instead of a raw percentage.
+fn estimate_layer_count(weights_bytes: u64) -> u32 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if weights_bytes < 2 * GIB {
+        24
+    } else if weights_bytes < 5 * GIB {
+        28
+    } else if weights_bytes < 10 * GIB {
+        32
+    } else if weights_bytes < 18 * GIB {
+        40
+    } else if weights_bytes < 40 * GIB {
+        48
+    } else if weights_bytes < 80 * GIB {
+        64
+    } else if weights_bytes < 150 * GIB {
+        80
+    } else {
+        96
+    }
+}
+
+/// Estimates KV-cache growth per token by treating the gap between a
+/// model's baseline footprint (weights + KV/overhead at
+/// `OFFLOAD_BASELINE_CONTEXT_TOKENS`) and its exact on-disk weight size as
+/// the KV/overhead budget for that baseline context.
+fn estimate_kv_bytes_per_token(model: &OffloadModelProfile) -> u64 {
+    let baseline_footprint = model.estimated_vram_bytes.max(model.estimated_ram_bytes);
+    let kv_baseline = baseline_footprint.saturating_sub(model.weights_bytes);
+    if kv_baseline == 0 {
+        return OFFLOAD_MIN_KV_BYTES_PER_TOKEN;
+    }
+    (kv_baseline / u64::from(OFFLOAD_BASELINE_CONTEXT_TOKENS)).max(OFFLOAD_MIN_KV_BYTES_PER_TOKEN)
+}
+
+/// Snaps a raw token count down to the nearest common context tier so the
+/// plan reads like a runtime flag (2048, 4096, 8192, ...) instead of an
+/// arbitrary computed number.
+fn pick_context_tier(value: u32) -> u32 {
+    OFFLOAD_CONTEXT_TIERS
+        .iter()
+        .rev()
+        .find(|&&tier| tier <= value)
+        .copied()
+        .unwrap_or(OFFLOAD_MIN_CONTEXT_TOKENS)
+}
+
+fn format_bytes_for_rationale(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{value:.0} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
+fn validate_offload_plan_input(input: &OffloadPlanInput) -> RuntimeAdapterResult<()> {
+    if input.model.weights_bytes == 0 {
+        return Err(RuntimeAdapterError::InvalidOperationLimits {
+            message: "offload plan model weights must be a positive byte count".to_string(),
+        });
+    }
+    if input.reserved.ram_bytes > input.hardware.total_ram_bytes {
+        return Err(RuntimeAdapterError::InvalidOperationLimits {
+            message: "offload plan reserved RAM cannot exceed total system RAM".to_string(),
+        });
+    }
+    if let Some(context) = input.requested_context_tokens {
+        if context == 0 {
+            return Err(RuntimeAdapterError::InvalidOperationLimits {
+                message: "offload plan requested context tokens must be positive".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
+
+    /// An absolute path valid on whichever OS this actually runs under.
+    /// `/foo` satisfies `Path::is_absolute()` on Unix but not on Windows
+    /// (which requires a drive-letter or UNC prefix) — both the executable
+    /// and per-model paths built from this are checked with exactly that,
+    /// and never touch real disk I/O, so any platform-appropriate absolute
+    /// path is equally valid here.
+    fn fixture_absolute_path(rest: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", rest.replace('/', "\\")))
+        } else {
+            PathBuf::from(format!("/{rest}"))
+        }
+    }
+
+    /// Same idea as [`fixture_absolute_path`], but rendered as the `String`
+    /// that ends up on the launched process's argv (see
+    /// `ManagedLlamaCppAdapter::load_model`, which turns a model's
+    /// `local_path` into a `-m`/`--model-draft` argument via
+    /// `Path::to_str`). Real llama-server invocations legitimately need the
+    /// OS-native separator here — unlike `tools.rs`'s glob/grep results,
+    /// this string is consumed by an actual subprocess's file open, not
+    /// shown to the model/UI — so tests must compare against this rendering
+    /// rather than a hardcoded forward-slash literal.
+    fn fixture_absolute_path_arg(rest: &str) -> String {
+        fixture_absolute_path(rest).to_string_lossy().into_owned()
+    }
+
+    const ALPHA_MODEL_PATH: &str = "models/alpha.gguf";
+    const BETA_MODEL_PATH: &str = "models/beta.gguf";
 
     #[derive(Clone)]
     enum TransportPlan {
@@ -3326,7 +4264,7 @@ mod tests {
             model_id: model_id.to_string(),
             display_name: model_id.to_string(),
             size_bytes: 8 * 1024 * 1024,
-            local_path: Some(PathBuf::from(path)),
+            local_path: Some(fixture_absolute_path(path)),
             digest: Some(format!("digest-{model_id}")),
             modified_at: None,
             capabilities: ModelCapabilities {
@@ -3352,12 +4290,12 @@ mod tests {
         ManagedLlamaCppAdapter::new(
             "llama-chat",
             "http://127.0.0.1:8090",
-            PathBuf::from("/usr/local/bin/llama-server"),
+            fixture_absolute_path("usr/local/bin/llama-server"),
             8090,
             controller,
             vec![
-                model("alpha", "/models/alpha.gguf"),
-                model("beta", "/models/beta.gguf"),
+                model("alpha", ALPHA_MODEL_PATH),
+                model("beta", BETA_MODEL_PATH),
             ],
             platform(),
         )
@@ -3845,8 +4783,14 @@ mod tests {
                 _ => None,
             })
             .expect("structured launch call");
-        assert_eq!(spec.program, PathBuf::from("/usr/local/bin/llama-server"));
-        assert_eq!(spec.args[0..2], ["-m", "/models/alpha.gguf"]);
+        assert_eq!(
+            spec.program,
+            fixture_absolute_path("usr/local/bin/llama-server")
+        );
+        assert_eq!(
+            spec.args[0..2],
+            ["-m".to_string(), fixture_absolute_path_arg(ALPHA_MODEL_PATH)]
+        );
         assert!(spec.args.windows(2).any(|pair| pair == ["-c", "8192"]));
         assert!(spec.args.windows(2).any(|pair| pair == ["-ngl", "32"]));
         assert!(spec
@@ -3911,6 +4855,156 @@ mod tests {
                 actual: 65
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_llama_forwards_sampler_batch_mixed_precision_and_draft_model_args() {
+        let controller = Arc::new(MockController::default());
+        controller.push_port(Ok(None));
+        controller.push_launch(Ok(process_handle()));
+        let adapter = llama(controller.clone());
+        let mut request = load_request("alpha");
+        request
+            .settings
+            .insert("temperature".to_string(), SettingValue::Float { value: 0.5 });
+        request
+            .settings
+            .insert("top_p".to_string(), SettingValue::Float { value: 0.85 });
+        request
+            .settings
+            .insert("top_k".to_string(), SettingValue::Integer { value: 20 });
+        request.settings.insert(
+            "repeat_penalty".to_string(),
+            SettingValue::Float { value: 1.2 },
+        );
+        request
+            .settings
+            .insert("min_p".to_string(), SettingValue::Float { value: 0.02 });
+        request
+            .settings
+            .insert("batch_size".to_string(), SettingValue::Integer { value: 1_024 });
+        request.settings.insert(
+            "mixed_precision".to_string(),
+            SettingValue::Choice {
+                value: "q8_0".to_string(),
+            },
+        );
+        // "beta" is a second model already configured on this same adapter
+        // (see the `llama()` fixture) — standing in for a smaller,
+        // already-installed draft model.
+        request.settings.insert(
+            "speculative_decoding_draft_model".to_string(),
+            SettingValue::Text {
+                value: "beta".to_string(),
+            },
+        );
+
+        adapter
+            .load_model(&request, &context())
+            .await
+            .expect("load with sampler/batch/mixed-precision/draft settings");
+
+        let calls = controller.calls();
+        let spec = calls
+            .iter()
+            .find_map(|call| match call {
+                ControllerCall::Launch(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("structured launch call");
+        assert!(spec.args.windows(2).any(|pair| pair == ["--temp", "0.5"]));
+        assert!(spec.args.windows(2).any(|pair| pair == ["--top-p", "0.85"]));
+        assert!(spec.args.windows(2).any(|pair| pair == ["--top-k", "20"]));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--repeat-penalty", "1.2"]));
+        assert!(spec.args.windows(2).any(|pair| pair == ["--min-p", "0.02"]));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--batch-size", "1024"]));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--cache-type-k", "q8_0"]));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--cache-type-v", "q8_0"]));
+        let expected_draft_arg = [
+            "--model-draft".to_string(),
+            fixture_absolute_path_arg(BETA_MODEL_PATH),
+        ];
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == expected_draft_arg));
+    }
+
+    #[tokio::test]
+    async fn managed_llama_rejects_a_draft_model_id_it_does_not_know_about() {
+        let controller = Arc::new(MockController::default());
+        controller.push_port(Ok(None));
+        let adapter = llama(controller);
+        let mut request = load_request("alpha");
+        request.settings.insert(
+            "speculative_decoding_draft_model".to_string(),
+            SettingValue::Text {
+                value: "not-a-configured-model".to_string(),
+            },
+        );
+
+        let error = adapter
+            .load_model(&request, &context())
+            .await
+            .expect_err("unknown draft model id must fail before launch");
+        assert!(matches!(
+            error,
+            RuntimeAdapterError::ModelNotFound { model_id, .. } if model_id == "not-a-configured-model"
+        ));
+    }
+
+    #[test]
+    fn llama_setting_capabilities_gate_flash_attention_true_and_draft_model_false_by_default() {
+        let capabilities = llama_setting_capabilities();
+        let flash_attention = capabilities
+            .iter()
+            .find(|capability| capability.key == "flash_attention")
+            .expect("flash_attention capability declared");
+        assert!(flash_attention.supported);
+        assert!(flash_attention.unsupported_reason.is_none());
+
+        let mixed_precision = capabilities
+            .iter()
+            .find(|capability| capability.key == "mixed_precision")
+            .expect("mixed_precision capability declared");
+        assert!(mixed_precision.supported);
+
+        // Speculative decoding is relative to a target model this adapter
+        // has no notion of, so its baseline is disabled with a reason —
+        // never a silently no-op enabled control. The Runtime Hub layer
+        // (`m3_runtime_hub.rs`'s `gate_advanced_settings`) is what flips
+        // this once a compatible target/draft pair is known.
+        let draft_model = capabilities
+            .iter()
+            .find(|capability| capability.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model capability declared");
+        assert!(!draft_model.supported);
+        assert!(draft_model.unsupported_reason.is_some());
+    }
+
+    #[test]
+    fn ollama_setting_capabilities_expose_sampler_and_batch_controls_unconditionally() {
+        let capabilities = ollama_setting_capabilities();
+        for key in ["temperature", "top_p", "top_k", "repeat_penalty", "min_p", "num_batch"] {
+            let capability = capabilities
+                .iter()
+                .find(|capability| capability.key == key)
+                .unwrap_or_else(|| panic!("{key} capability declared"));
+            assert!(capability.supported, "{key} should be unconditionally supported");
+            assert!(capability.unsupported_reason.is_none());
+        }
     }
 
     #[test]
@@ -4089,6 +5183,252 @@ mod tests {
                 accelerator: AcceleratorKind::Cuda,
                 ..
             })
+        ));
+    }
+
+    fn gib(count: u64) -> u64 {
+        count * 1024 * 1024 * 1024
+    }
+
+    fn cpu_only_hardware(total_ram_gib: u64, available_ram_gib: u64, cpu_count: u32) -> HardwareSnapshot {
+        HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: gib(total_ram_gib),
+            available_ram_bytes: gib(available_ram_gib),
+            logical_cpu_count: cpu_count,
+            platform: PlatformCapabilities::from_host("linux", "x86_64", vec![cpu_capability()]),
+        }
+    }
+
+    fn metal_hardware(total_ram_gib: u64, available_ram_gib: u64, cpu_count: u32) -> HardwareSnapshot {
+        HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: gib(total_ram_gib),
+            available_ram_bytes: gib(available_ram_gib),
+            logical_cpu_count: cpu_count,
+            platform: PlatformCapabilities::from_host(
+                "macos",
+                "aarch64",
+                vec![
+                    cpu_capability(),
+                    AcceleratorCapability {
+                        kind: AcceleratorKind::Metal,
+                        available: true,
+                        device_names: vec!["Apple Silicon unified GPU".to_string()],
+                        total_memory_bytes: Some(gib(total_ram_gib)),
+                        available_memory_bytes: Some(gib(available_ram_gib)),
+                    },
+                ],
+            ),
+        }
+    }
+
+    fn zero_reserved() -> MemoryRequirement {
+        MemoryRequirement {
+            ram_bytes: 0,
+            vram_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn offload_plan_cpu_only_balanced_tier_matches_hand_computed_values() {
+        let hardware = cpu_only_hardware(16, 10, 8);
+        let input = OffloadPlanInput {
+            hardware,
+            model: OffloadModelProfile {
+                weights_bytes: gib(4),
+                estimated_ram_bytes: gib(4) + gib(1) / 2,
+                estimated_vram_bytes: 0,
+                required_accelerator: None,
+                has_vision_projector: false,
+                projector_memory_bytes: 0,
+            },
+            reserved: zero_reserved(),
+            other_resident_count: 0,
+            requested_context_tokens: None,
+        };
+        let plan = LocalOffloadPlanner::plan(&input).expect("cpu-only plan");
+
+        assert_eq!(plan.accelerator, AcceleratorKind::Cpu);
+        assert_eq!(plan.estimated_total_layers, 28);
+        assert_eq!(plan.gpu_layers, 0);
+        assert_eq!(plan.cpu_spill_layers, 28);
+        assert_eq!(plan.context_tokens, 8_192);
+        assert_eq!(plan.requested_context_tokens, 8_192);
+        assert_eq!(plan.batch_size, 256);
+        assert_eq!(plan.parallel_sequences, 2);
+        assert_eq!(plan.projector_placement, ProjectorPlacement::NotApplicable);
+        assert_eq!(plan.available_ram_bytes, gib(7));
+        assert_eq!(plan.available_vram_bytes, 0);
+        assert_eq!(plan.rationale.len(), 5);
+        assert_eq!(plan.improvement_suggestions.len(), 1);
+        assert!(plan.improvement_suggestions[0].contains("No GPU or Metal acceleration"));
+    }
+
+    #[test]
+    fn offload_plan_metal_partial_offload_reduces_context_batch_and_parallelism() {
+        let hardware = metal_hardware(40, 30, 12);
+        let input = OffloadPlanInput {
+            hardware,
+            model: OffloadModelProfile {
+                weights_bytes: gib(4),
+                estimated_ram_bytes: gib(4) + gib(1) / 2,
+                estimated_vram_bytes: gib(4) + gib(1) / 2,
+                required_accelerator: None,
+                has_vision_projector: true,
+                projector_memory_bytes: 0,
+            },
+            reserved: MemoryRequirement {
+                ram_bytes: gib(22),
+                vram_bytes: 0,
+            },
+            other_resident_count: 2,
+            requested_context_tokens: None,
+        };
+        let plan = LocalOffloadPlanner::plan(&input).expect("metal plan");
+
+        assert_eq!(plan.accelerator, AcceleratorKind::Metal);
+        assert_eq!(plan.estimated_total_layers, 28);
+        assert_eq!(plan.gpu_layers, 24);
+        assert_eq!(plan.cpu_spill_layers, 4);
+        assert_eq!(plan.context_tokens, 512);
+        assert_eq!(plan.requested_context_tokens, 8_192);
+        assert_eq!(plan.batch_size, 256);
+        assert_eq!(plan.parallel_sequences, 1);
+        assert_eq!(plan.projector_placement, ProjectorPlacement::Gpu);
+        assert_eq!(plan.available_ram_bytes, gib(4));
+        assert_eq!(plan.available_vram_bytes, gib(4));
+        assert_eq!(plan.rationale.len(), 6);
+        assert_eq!(plan.improvement_suggestions.len(), 2);
+        assert!(plan.improvement_suggestions[0].contains("Unload 2 other resident model"));
+        assert!(plan.improvement_suggestions[1].contains("capped at 512"));
+    }
+
+    #[test]
+    fn offload_plan_reserves_projector_memory_before_sizing_context_and_gpu_layers() {
+        // Same hardware/model shape as the metal-partial-offload case above,
+        // except this model's projector itself needs 2 GiB of resident
+        // memory. That must come off the top of the same unified pool
+        // *before* GPU-layer fit and context-tier math, producing a smaller
+        // affordable context/available-memory than the zero-projector-memory
+        // case, plus an explicit rationale entry naming the reservation.
+        let hardware = metal_hardware(40, 30, 12);
+        let input = OffloadPlanInput {
+            hardware,
+            model: OffloadModelProfile {
+                weights_bytes: gib(4),
+                estimated_ram_bytes: gib(4) + gib(1) / 2,
+                estimated_vram_bytes: gib(4) + gib(1) / 2,
+                required_accelerator: None,
+                has_vision_projector: true,
+                projector_memory_bytes: gib(2),
+            },
+            reserved: MemoryRequirement {
+                ram_bytes: gib(22),
+                vram_bytes: 0,
+            },
+            other_resident_count: 2,
+            requested_context_tokens: None,
+        };
+        let plan = LocalOffloadPlanner::plan(&input).expect("metal plan with projector memory");
+
+        assert_eq!(plan.accelerator, AcceleratorKind::Metal);
+        // Available memory drops by exactly the projector's reserved 2 GiB
+        // relative to the zero-projector-memory metal test above (gib(4)).
+        assert_eq!(plan.available_ram_bytes, gib(2));
+        assert_eq!(plan.available_vram_bytes, gib(2));
+        assert_eq!(plan.projector_placement, ProjectorPlacement::Gpu);
+        assert!(plan.rationale.iter().any(|entry| entry.field == "projector_memory_bytes"
+            && entry.explanation.contains("2.0 GB")));
+    }
+
+    #[test]
+    fn offload_plan_falls_back_to_cpu_when_required_accelerator_missing() {
+        let hardware = cpu_only_hardware(16, 12, 8);
+        let input = OffloadPlanInput {
+            hardware,
+            model: OffloadModelProfile {
+                weights_bytes: gib(2),
+                estimated_ram_bytes: gib(2) + gib(1) / 4,
+                estimated_vram_bytes: gib(2) + gib(1) / 4,
+                required_accelerator: Some(AcceleratorKind::Cuda),
+                has_vision_projector: false,
+                projector_memory_bytes: 0,
+            },
+            reserved: zero_reserved(),
+            other_resident_count: 0,
+            requested_context_tokens: Some(4_096),
+        };
+        let plan = LocalOffloadPlanner::plan(&input).expect("cpu fallback plan");
+
+        assert_eq!(plan.accelerator, AcceleratorKind::Cpu);
+        assert_eq!(plan.gpu_layers, 0);
+        assert!(plan
+            .rationale
+            .iter()
+            .any(|entry| entry.field == "accelerator" && entry.explanation.contains("Cuda")));
+        assert!(plan
+            .improvement_suggestions
+            .iter()
+            .any(|message| message.contains("requires Cuda")));
+        assert!(!plan
+            .improvement_suggestions
+            .iter()
+            .any(|message| message.contains("No GPU or Metal acceleration was detected")));
+    }
+
+    #[test]
+    fn offload_plan_input_validation_rejects_impossible_values() {
+        let hardware = cpu_only_hardware(16, 10, 8);
+        let base_model = OffloadModelProfile {
+            weights_bytes: gib(4),
+            estimated_ram_bytes: gib(5),
+            estimated_vram_bytes: 0,
+            required_accelerator: None,
+            has_vision_projector: false,
+            projector_memory_bytes: 0,
+        };
+
+        let zero_weights = OffloadPlanInput {
+            hardware: hardware.clone(),
+            model: OffloadModelProfile {
+                weights_bytes: 0,
+                ..base_model.clone()
+            },
+            reserved: zero_reserved(),
+            other_resident_count: 0,
+            requested_context_tokens: None,
+        };
+        assert!(matches!(
+            LocalOffloadPlanner::plan(&zero_weights),
+            Err(RuntimeAdapterError::InvalidOperationLimits { .. })
+        ));
+
+        let over_reserved = OffloadPlanInput {
+            hardware: hardware.clone(),
+            model: base_model.clone(),
+            reserved: MemoryRequirement {
+                ram_bytes: gib(17),
+                vram_bytes: 0,
+            },
+            other_resident_count: 0,
+            requested_context_tokens: None,
+        };
+        assert!(matches!(
+            LocalOffloadPlanner::plan(&over_reserved),
+            Err(RuntimeAdapterError::InvalidOperationLimits { .. })
+        ));
+
+        let zero_context = OffloadPlanInput {
+            hardware,
+            model: base_model,
+            reserved: zero_reserved(),
+            other_resident_count: 0,
+            requested_context_tokens: Some(0),
+        };
+        assert!(matches!(
+            LocalOffloadPlanner::plan(&zero_context),
+            Err(RuntimeAdapterError::InvalidOperationLimits { .. })
         ));
     }
 }

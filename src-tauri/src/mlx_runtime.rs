@@ -752,6 +752,13 @@ pub struct MlxLaunchSpec {
 pub struct MlxMessage {
     pub role: String,
     pub text: String,
+    /// Inline images attached to this turn, as `data:<mime>;base64,<data>`
+    /// URIs (ROADMAP Phase 8 item 12). Empty for every non-vision message —
+    /// the verified, separately-installed MLX service package is expected to
+    /// decode and hand these to an MLX-VLM-style vision tower/projector; this
+    /// struct only carries the bytes across the process boundary.
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2213,11 +2220,24 @@ mod tests {
         }
     }
 
+    /// An absolute path valid on whichever OS this actually runs under.
+    /// `/foo` satisfies `Path::is_absolute()` on Unix but not on Windows
+    /// (which requires a drive-letter or UNC prefix) — [`validate_model`]
+    /// checks exactly that, and this fixture never touches real disk I/O, so
+    /// any platform-appropriate absolute path is equally valid here.
+    fn fixture_absolute_path(rest: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", rest.replace('/', "\\")))
+        } else {
+            PathBuf::from(format!("/{rest}"))
+        }
+    }
+
     fn model() -> MlxModelRecord {
         MlxModelRecord {
             model_id: "mlx-community/Qwen3-4B-4bit".to_string(),
             display_name: "Qwen3 4B MLX".to_string(),
-            local_path: PathBuf::from("/private/models/qwen3"),
+            local_path: fixture_absolute_path("private/models/qwen3"),
             size_bytes: 3 << 30,
             revision: Some("abc123".to_string()),
             capabilities: MlxModelCapabilities {
@@ -2236,6 +2256,7 @@ mod tests {
             messages: vec![MlxMessage {
                 role: "user".to_string(),
                 text: "Hello".to_string(),
+                images: Vec::new(),
             }],
             tools: Vec::new(),
             max_tokens: 32,

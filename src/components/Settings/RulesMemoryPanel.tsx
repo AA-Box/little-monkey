@@ -325,6 +325,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
       <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-faint">
         {t("RulesMemoryPanel.memoryHeading")}
       </h3>
+      <p className="mb-2 text-xs text-faint">{t("RulesMemoryPanel.memoryStudioPointer")}</p>
       <Toggle
         checked={memoryEnabled}
         onChange={setMemoryEnabled}

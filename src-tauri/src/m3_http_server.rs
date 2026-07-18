@@ -39,15 +39,17 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compatibility_hub::{
+    rfc3339_from_seconds, translate_embeddings_request, translate_ollama_chat_request,
     translate_request, ApiBackend, ApiScope, CompatibilityProtocol, LanServerPolicy,
     ProtocolStreamFrame, TlsPolicy,
 };
 use crate::m3_commands::M3CommandState;
 use crate::m3_runtime_hub::{
     M3ApiCaller, M3ApiDispatchRequest, M3CancelInferenceRequest, M3DeleteModelRequest,
-    M3DownloadRequest, M3ExternalOperationAuthorization, M3HubError, M3HubResult,
-    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3ProtocolFrameSink,
-    M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3UnloadModelRequest,
+    M3DownloadRequest, M3EmbeddingDispatchRequest, M3ExternalOperationAuthorization, M3HubError,
+    M3HubResult, M3InstalledModelView, M3LoadModelRequest, M3OllamaChatDispatchRequest,
+    M3OperationContext, M3ProtocolFrameSink, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind,
+    M3UnloadModelRequest,
 };
 
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -598,12 +600,15 @@ fn is_allowed_path(path: &str) -> bool {
             | "/v1/chat/completions"
             | "/v1/responses"
             | "/v1/messages"
+            | "/v1/embeddings"
             | "/v1/models/download"
             | "/v1/models/load"
             | "/v1/models/unload"
             | "/v1/models/status"
             | "/v1/models/delete"
             | "/v1/requests/cancel"
+            | "/api/tags"
+            | "/api/chat"
     )
 }
 
@@ -1104,6 +1109,176 @@ async fn inference_response(
     )
 }
 
+/// Handles `POST /v1/embeddings`, applying the exact same model-resolution,
+/// authorization, and error-shape conventions as [`inference_response`].
+/// Never fabricates a vector: [`M3RuntimeHub::dispatch_embeddings`] rejects
+/// with a clear `unsupported` error when the resolved model's runtime does
+/// not genuinely reach an embeddings-capable backend.
+async fn embeddings_response(
+    hub: Arc<M3RuntimeHub>,
+    headers: &HeaderMap,
+    request_id: String,
+    auth: &HttpAuth,
+    body: Bytes,
+    context: &M3OperationContext,
+) -> Response<ResponseBody> {
+    let canonical = match translate_embeddings_request(&request_id, &body) {
+        Ok(request) => request,
+        Err(error) => return hub_error_response(M3HubError::from(error)),
+    };
+    let runtime = match runtime_for_model(&hub, headers, &canonical.model) {
+        Ok(runtime) => runtime,
+        Err(error) => return hub_error_response(error),
+    };
+    if let Err(error) = authorize_operation(
+        &hub,
+        auth,
+        ApiScope::Embeddings,
+        runtime.descriptor.api_backend,
+        Some(canonical.model.clone()),
+        body.len() as u64,
+        None,
+    ) {
+        return hub_error_response(error);
+    }
+    let request = M3EmbeddingDispatchRequest {
+        runtime_id: runtime.descriptor.runtime_id,
+        request_id,
+        body: body.to_vec(),
+        // The HTTP boundary already performed the exact external
+        // authorization above. Internal here prevents a second quota debit.
+        caller: M3ApiCaller::Internal,
+        now_ms: now_ms(),
+    };
+    match hub.dispatch_embeddings(&request, context).await {
+        Ok(result) => {
+            let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK);
+            json_response(status, result.body)
+        }
+        Err(error) => hub_error_response(error),
+    }
+}
+
+/// Handles the Ollama-native `POST /api/chat`, reusing the `ChatCompletions`
+/// scope (same operation as `/v1/chat/completions`, different wire format —
+/// not a new, less-guarded route class) and the same model-resolution and
+/// authorization conventions as [`inference_response`]. Always calls the
+/// backend non-streaming; see [`M3RuntimeHub::dispatch_ollama_chat`]'s doc
+/// for the documented streaming limitation.
+async fn ollama_chat_response(
+    hub: Arc<M3RuntimeHub>,
+    headers: &HeaderMap,
+    request_id: String,
+    auth: &HttpAuth,
+    body: Bytes,
+    context: &M3OperationContext,
+) -> Response<ResponseBody> {
+    let (canonical, _stream_requested) = match translate_ollama_chat_request(&request_id, &body) {
+        Ok(value) => value,
+        Err(error) => return hub_error_response(M3HubError::from(error)),
+    };
+    let runtime = match runtime_for_model(&hub, headers, &canonical.model) {
+        Ok(runtime) => runtime,
+        Err(error) => return hub_error_response(error),
+    };
+    if let Err(error) = authorize_operation(
+        &hub,
+        auth,
+        ApiScope::ChatCompletions,
+        runtime.descriptor.api_backend,
+        Some(canonical.model.clone()),
+        body.len() as u64,
+        None,
+    ) {
+        return hub_error_response(error);
+    }
+    let request = M3OllamaChatDispatchRequest {
+        runtime_id: runtime.descriptor.runtime_id,
+        request_id,
+        body: body.to_vec(),
+        caller: M3ApiCaller::Internal,
+        now_ms: now_ms(),
+    };
+    match hub.dispatch_ollama_chat(&request, context).await {
+        Ok(result) => {
+            // Ollama's own server picks `application/x-ndjson` for a
+            // streamed response and `application/json` for `stream:false`.
+            // Both bodies here are the identical single compact-JSON line —
+            // see the module doc on `/api/chat`'s streaming limitation.
+            let content_type = if result.stream_requested {
+                "application/x-ndjson"
+            } else {
+                "application/json"
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(full_body(Bytes::from(format!("{}\n", result.body))))
+                .expect("fixed ollama chat response is valid")
+        }
+        Err(error) => hub_error_response(error),
+    }
+}
+
+/// Handles the Ollama-native `GET /api/tags`, reshaping the same installed
+/// model + reconciled runtime inventory data already used by `/v1/models`
+/// into Ollama's own response shape.
+async fn ollama_tags_response(
+    hub: &M3RuntimeHub,
+    headers: &HeaderMap,
+    auth: &HttpAuth,
+    input_bytes: u64,
+    context: &M3OperationContext,
+) -> Response<ResponseBody> {
+    match discover_models(hub, headers, auth, input_bytes, context).await {
+        Ok((value, _selected_runtime)) => {
+            json_response(StatusCode::OK, ollama_tags_from_models(&value))
+        }
+        Err(error) => hub_error_response(error),
+    }
+}
+
+fn ollama_tags_from_models(list: &Value) -> Value {
+    let models = list
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let entries = models
+        .iter()
+        .map(|model| {
+            let name = model
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let size = model.get("size_bytes").and_then(Value::as_u64).unwrap_or(0);
+            let created = model.get("created").and_then(Value::as_u64).unwrap_or(0);
+            let digest = model
+                .get("asset_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            json!({
+                "name": name,
+                "model": name,
+                "modified_at": rfc3339_from_seconds(created),
+                "size": size,
+                "digest": digest,
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": "",
+                    "families": Value::Null,
+                    "parameter_size": "",
+                    "quantization_level": "",
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "models": entries })
+}
+
 async fn lifecycle_response(
     hub: &M3RuntimeHub,
     path: &str,
@@ -1415,6 +1590,17 @@ async fn handle_http_request(
                     &mut guard,
                 )
                 .await
+            }
+            (Method::POST, "/v1/embeddings") => {
+                embeddings_response(hub.clone(), &headers, request_id.clone(), &auth, body, &context)
+                    .await
+            }
+            (Method::GET, "/api/tags") => {
+                ollama_tags_response(&hub, &headers, &auth, body.len() as u64, &context).await
+            }
+            (Method::POST, "/api/chat") => {
+                ollama_chat_response(hub.clone(), &headers, request_id.clone(), &auth, body, &context)
+                    .await
             }
             (
                 Method::POST,
@@ -1743,12 +1929,15 @@ mod tests {
             "/v1/chat/completions",
             "/v1/responses",
             "/v1/messages",
+            "/v1/embeddings",
             "/v1/models/download",
             "/v1/models/load",
             "/v1/models/unload",
             "/v1/models/status",
             "/v1/models/delete",
             "/v1/requests/cancel",
+            "/api/tags",
+            "/api/chat",
         ] {
             assert!(is_allowed_path(allowed), "missing allowed route {allowed}");
         }

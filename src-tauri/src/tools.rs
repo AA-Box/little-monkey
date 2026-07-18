@@ -18,6 +18,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
+use crate::workspace::display_relative_path;
 use crate::{checkpoints, memory, native_skill_commands, permissions, workspace, AppState};
 
 /// Directory names that are never descended into by [`tool_grep`] — build
@@ -164,11 +165,12 @@ pub async fn tool_grep(
         let display_path = format!(
             "{}{}",
             label_prefix,
-            entry
-                .path()
-                .strip_prefix(&display_root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
+            display_relative_path(
+                entry
+                    .path()
+                    .strip_prefix(&display_root)
+                    .unwrap_or_else(|_| entry.path())
+            )
         );
 
         for (idx, line) in content.lines().enumerate() {
@@ -255,11 +257,12 @@ fn glob_impl(
         let display_path = format!(
             "{}{}",
             label_prefix,
-            entry
-                .path()
-                .strip_prefix(display_root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
+            display_relative_path(
+                entry
+                    .path()
+                    .strip_prefix(display_root)
+                    .unwrap_or_else(|_| entry.path())
+            )
         );
         let modified = entry
             .metadata()
@@ -714,7 +717,7 @@ pub async fn tool_remember(
         .memory_lock
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
-    memory::add_fact_impl(&path, &root, &text, "agent")
+    memory::add_fact_impl(&path, &root, &text, "agent", turn_id.as_deref())
 }
 
 /// Read one bundled file from an installed native skill's folder — the
@@ -834,11 +837,7 @@ pub fn list_workspace_paths(
                 Err(_) => continue,
             };
 
-            let relative_str = relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            let relative_str = display_relative_path(relative);
 
             // Primary-root entries stay unprefixed (no behavior change for
             // the common single-folder case); secondary-root entries are

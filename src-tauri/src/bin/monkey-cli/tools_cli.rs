@@ -119,12 +119,12 @@ pub fn glob(state: &AppState, pattern: &str, path: Option<&str>) -> Result<Vec<S
         if !matcher.is_match(scoped_relative) {
             continue;
         }
-        let display_path = entry
-            .path()
-            .strip_prefix(&workspace_root)
-            .unwrap_or_else(|_| entry.path())
-            .to_string_lossy()
-            .to_string();
+        let display_path = workspace::display_relative_path(
+            entry
+                .path()
+                .strip_prefix(&workspace_root)
+                .unwrap_or_else(|_| entry.path()),
+        );
         let modified = entry
             .metadata()
             .ok()
@@ -170,12 +170,12 @@ pub fn grep(
             Ok(content) => content,
             Err(_) => continue, // binary or unreadable — skip silently
         };
-        let display_path = entry
-            .path()
-            .strip_prefix(&search_root)
-            .unwrap_or_else(|_| entry.path())
-            .to_string_lossy()
-            .to_string();
+        let display_path = workspace::display_relative_path(
+            entry
+                .path()
+                .strip_prefix(&search_root)
+                .unwrap_or_else(|_| entry.path()),
+        );
 
         for (idx, line) in content.lines().enumerate() {
             if regex.is_match(line) {
@@ -385,7 +385,7 @@ pub async fn remember(
     let root = workspace::primary_root_canon(state)?;
     let path = memories_file_path()
         .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
-    memory::add_fact_impl(&path, &root.to_string_lossy(), text, "agent")
+    memory::add_fact_impl(&path, &root.to_string_lossy(), text, "agent", None)
 }
 
 #[cfg(test)]

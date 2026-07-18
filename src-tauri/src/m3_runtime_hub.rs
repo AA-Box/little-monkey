@@ -7,20 +7,23 @@
 //! without weakening the validation and persistence rules here.
 
 use crate::compatibility_hub::{
-    compatibility_conformance_manifest, encode_response, encode_stream_event, ApiBackend, ApiScope,
-    AuthorizationRequest, AuthorizedToken, CanonicalContent, CanonicalInferenceRequest,
-    CanonicalInferenceResponse, CanonicalMessage, CanonicalRole, CanonicalStreamEvent,
-    CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError, CompatibilityProtocol,
-    LanAccessController, LanEntropySource, LanServerPolicy, LanStateProtector, PairedToken,
-    PairingChallengeView, PairingRequest, ProtocolStreamFrame, ScopedTokenView, SecurityAuditEvent,
+    compatibility_conformance_manifest, encode_embeddings_response, encode_ollama_chat_response,
+    encode_response, encode_stream_event, request_offers_tool, translate_embeddings_request,
+    translate_ollama_chat_request, ApiBackend, ApiScope, AuthorizationRequest, AuthorizedToken,
+    CanonicalContent, CanonicalEmbeddingRequest, CanonicalEmbeddingResponse,
+    CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage, CanonicalRole,
+    CanonicalStreamEvent, CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError,
+    CompatibilityProtocol, LanAccessController, LanEntropySource, LanServerPolicy,
+    LanStateProtector, PairedToken, PairingChallengeView, PairingRequest, ProtocolStreamFrame,
+    ScopedTokenView, SecurityAuditEvent,
 };
 use crate::mlx_runtime::{
     MlxGenerationRequest, MlxGenerationSummary, MlxMessage, MlxOperationContext, MlxProcessMetrics,
     MlxRuntimeAdapter, MlxRuntimeStatus, MlxStreamEvent, MlxStreamSink, MlxToolDefinition,
 };
 use crate::runtime_adapter::{
-    validate_setting_values, AdvancedSettingCapability, HardwareProfile, HardwareSnapshot,
-    KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
+    validate_setting_values, AcceleratorKind, AdvancedSettingCapability, HardwareProfile,
+    HardwareSnapshot, KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel, RuntimeAdapter,
     RuntimeCapabilities, RuntimeInventory, RuntimeLogRequest, RuntimeLogTail,
     RuntimeOperationContext, RuntimeOperationLimits, RuntimeStatus, SettingValue, UnloadPolicy,
 };
@@ -350,6 +353,18 @@ pub struct M3ModelCapabilities {
     pub structured_output: bool,
 }
 
+/// A minimal reference to a multimodal projector asset associated with a
+/// model (e.g. a CLIP/SigLIP vision tower or an audio encoder). This only
+/// tracks provenance/identity for the manifest; the projector/vision model
+/// manager itself (download, placement, sizing) is separate Phase 8 scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3ProjectorRef {
+    pub kind: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct M3CatalogModel {
@@ -372,6 +387,19 @@ pub struct M3CatalogModel {
     pub capabilities: M3ModelCapabilities,
     pub license: M3ModelLicense,
     pub metadata: BTreeMap<String, String>,
+    /// Chat template family/name identifying how this model expects prompts
+    /// to be rendered (e.g. "chatml", "llama-3"). Absent for older manifests
+    /// and for models whose runtime handles templating internally.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// The multimodal projector associated with this model, if any.
+    #[serde(default)]
+    pub projector: Option<M3ProjectorRef>,
+    /// When this catalog entry was locally retrieved from its source,
+    /// stamped by the hub at search time (never trusted from the remote
+    /// payload). Absent for manifests installed before this field existed.
+    #[serde(default)]
+    pub catalog_retrieved_at_ms: Option<u64>,
 }
 
 impl M3CatalogModel {
@@ -453,6 +481,22 @@ impl M3CatalogModel {
             validate_identifier(key, "catalog.metadata.key")?;
             validate_text(value, "catalog.metadata.value", 64 * 1024)?;
         }
+        if let Some(template) = &self.template {
+            validate_identifier(template, "catalog.template")?;
+        }
+        if let Some(projector) = &self.projector {
+            validate_identifier(&projector.kind, "catalog.projector.kind")?;
+            validate_sha256(&projector.sha256, "catalog.projector.sha256")?;
+            if projector.size_bytes == 0 || projector.size_bytes > MAX_DOWNLOAD_BYTES {
+                return Err(invalid(
+                    "catalog.projector.sizeBytes",
+                    format!("must be between 1 and {MAX_DOWNLOAD_BYTES}"),
+                ));
+            }
+        }
+        if let Some(retrieved_at_ms) = self.catalog_retrieved_at_ms {
+            validate_timestamp(retrieved_at_ms, "catalog.catalogRetrievedAtMs")?;
+        }
         Ok(())
     }
 }
@@ -484,8 +528,159 @@ pub struct M3CatalogMatch {
     pub fit: M3HardwareFit,
 }
 
+/// Hardware Compatibility Matrix / "Driver Doctor" status for a single
+/// accelerator backend. Every backend is queried defensively: a missing tool,
+/// an absent device, or an unsupported OS/arch combination is a normal,
+/// expected outcome and must never surface as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3AcceleratorStatus {
+    /// The backend was queried directly and at least one usable device was
+    /// found.
+    Available,
+    /// The backend's tooling ran successfully but reported no device.
+    NotDetected,
+    /// A device was found, but its driver/compute capability is below the
+    /// minimum this app requires for that backend.
+    DriverTooOld,
+    /// The backend's detection tool (e.g. `nvidia-smi`, `rocm-smi`,
+    /// `vulkaninfo`) is not installed or not on `PATH`, so the backend could
+    /// not be queried at all.
+    ToolMissing,
+    /// The backend cannot run on this OS/architecture combination.
+    Unsupported,
+}
+
+/// One row of the hardware compatibility report: a single accelerator
+/// backend, what was found, and a human-readable explanation a user can act
+/// on (install a driver, update a runtime, or expect a CPU fallback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3AcceleratorCompatibility {
+    pub kind: AcceleratorKind,
+    pub status: M3AcceleratorStatus,
+    /// Short, human-readable explanation of the status (what works, what
+    /// falls back to CPU, or what needs a driver/runtime update).
+    pub summary: String,
+    pub device_names: Vec<String>,
+    pub driver_version: Option<String>,
+    pub compute_capability: Option<String>,
+    /// False when this status was inferred or assumed rather than obtained
+    /// from a direct hardware/driver query, so `status: Available` should be
+    /// read as "likely" rather than confirmed. Used for Windows DirectML
+    /// (only a display adapter's presence is confirmed, not the DirectML
+    /// runtime path itself) and for the Metal OS/arch fallback used when
+    /// `system_profiler` is unavailable.
+    pub confirmed: bool,
+}
+
+/// NVIDIA Jetson (Tegra) detection result. Jetson devices share CUDA
+/// tooling with desktop NVIDIA GPUs but have their own driver/runtime
+/// implications, so they are reported separately from the CUDA row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3JetsonInfo {
+    pub detected: bool,
+    pub model: Option<String>,
+}
+
+/// Full hardware compatibility report shown to the user before a model
+/// download, model load, or runtime install: for every accelerator backend,
+/// what will work, what falls back to CPU, and what needs a driver/runtime
+/// update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3HardwareCompatibilityReport {
+    pub captured_at_ms: u64,
+    pub os: String,
+    pub arch: String,
+    pub accelerators: Vec<M3AcceleratorCompatibility>,
+    pub jetson: M3JetsonInfo,
+    /// True when more than one GPU-capable backend/device was detected
+    /// (e.g. an integrated and a discrete adapter, or two backends both
+    /// reporting `Available`) so the UI never silently picks one.
+    pub hybrid_graphics_detected: bool,
+    /// Free-form notes: unsupported runtime combinations, mixed-vendor GPU
+    /// warnings, and other callouts that do not fit a single backend row.
+    pub notes: Vec<String>,
+}
+
+/// Derives a best-effort compatibility report purely from a [`HardwareSnapshot`]'s
+/// accelerator list. This is the default used by any [`M3HardwareProbe`] that
+/// does not override [`M3HardwareProbe::compatibility_report`]; production
+/// probes override it to add driver versions, compute capability, Jetson
+/// detection, and the `ToolMissing`/`DriverTooOld` distinctions a plain
+/// accelerator list cannot express.
+pub fn compatibility_report_from_snapshot(
+    snapshot: &HardwareSnapshot,
+) -> M3HardwareCompatibilityReport {
+    let backends = [
+        AcceleratorKind::Metal,
+        AcceleratorKind::Cuda,
+        AcceleratorKind::Rocm,
+        AcceleratorKind::Vulkan,
+        AcceleratorKind::DirectMl,
+    ];
+    let mut accelerators = Vec::with_capacity(backends.len());
+    for kind in backends {
+        let found = snapshot
+            .platform
+            .accelerators
+            .iter()
+            .find(|capability| capability.kind == kind);
+        let (status, summary, device_names) = match found {
+            Some(capability) if capability.available => (
+                M3AcceleratorStatus::Available,
+                format!("{kind:?} reported available by the hardware snapshot."),
+                capability.device_names.clone(),
+            ),
+            _ => (
+                M3AcceleratorStatus::NotDetected,
+                format!("{kind:?} was not detected on this platform; falls back to CPU."),
+                Vec::new(),
+            ),
+        };
+        accelerators.push(M3AcceleratorCompatibility {
+            kind,
+            status,
+            summary,
+            device_names,
+            driver_version: None,
+            compute_capability: None,
+            confirmed: true,
+        });
+    }
+    let available_backends = accelerators
+        .iter()
+        .filter(|entry| entry.status == M3AcceleratorStatus::Available)
+        .count();
+    M3HardwareCompatibilityReport {
+        captured_at_ms: snapshot.captured_at_ms,
+        os: snapshot.platform.os.clone(),
+        arch: snapshot.platform.arch.clone(),
+        accelerators,
+        jetson: M3JetsonInfo {
+            detected: false,
+            model: None,
+        },
+        hybrid_graphics_detected: available_backends > 1,
+        notes: Vec::new(),
+    }
+}
+
 pub trait M3HardwareProbe: Send + Sync {
     fn snapshot(&self) -> M3HubResult<HardwareSnapshot>;
+
+    /// Hardware Compatibility Matrix / "Driver Doctor" report shown to the
+    /// user before a model download, model load, or runtime install. The
+    /// default implementation derives a coarse report from [`Self::snapshot`];
+    /// production probes should override this to add real driver-version and
+    /// compute-capability detection. Implementations must never panic or
+    /// return an error merely because a GPU tool/driver is absent — that is
+    /// the normal `NotDetected`/`ToolMissing` case.
+    fn compatibility_report(&self) -> M3HubResult<M3HardwareCompatibilityReport> {
+        Ok(compatibility_report_from_snapshot(&self.snapshot()?))
+    }
 }
 
 pub trait M3CatalogSource: Send + Sync {
@@ -769,6 +964,17 @@ struct M3StoredModelVersion {
     model: M3CatalogModel,
     artifact_relative_path: String,
     installed_at_ms: u64,
+    /// The digest of this version's `model.projector` that was last locally
+    /// verified against real bytes on disk (see `M3RuntimeHub::verify_projector`).
+    /// `None` for a version with no projector, one whose projector has never
+    /// been verified, or one installed before this field existed. Compared
+    /// against `model.projector.sha256` at view time rather than trusted
+    /// blindly, so replacing the catalog's projector reference (a different
+    /// digest) without re-verifying correctly reverts to unverified.
+    #[serde(default)]
+    projector_verified_sha256: Option<String>,
+    #[serde(default)]
+    projector_verified_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +1029,81 @@ pub struct M3DownloadRequest {
     pub accepted_license_sha256: String,
 }
 
+/// Where a multimodal projector component genuinely stands relative to a
+/// model version that may declare vision/audio capability (ROADMAP Phase 8
+/// item 12: Multimodal Projector and Vision Model Manager). Mirrors the
+/// honesty bar the Chat Template Compatibility Lab applies to chat/tool/
+/// structured-output via `gate_capabilities`: a capability is never shown as
+/// ready on faith in a catalog's declared flag alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3ProjectorVerificationState {
+    /// This version's declared capabilities do not require a projector.
+    NotRequired,
+    /// Vision (or another projector-requiring capability) is declared, but
+    /// the manifest carries no projector reference at all — the "missing
+    /// projector" case this task's acceptance criterion calls out.
+    MissingReference,
+    /// A projector reference exists, but its declared digest has not been
+    /// locally verified against real bytes on disk yet.
+    Unverified,
+    /// A projector reference exists and its bytes were locally verified
+    /// (see `M3RuntimeHub::verify_projector`) against the declared
+    /// sha256/size.
+    Verified,
+}
+
+impl M3ProjectorVerificationState {
+    fn resolve(
+        requires_projector: bool,
+        projector: Option<&M3ProjectorRef>,
+        verified_sha256: Option<&str>,
+    ) -> Self {
+        if !requires_projector {
+            return Self::NotRequired;
+        }
+        match projector {
+            None => Self::MissingReference,
+            Some(reference) => {
+                if verified_sha256 == Some(reference.sha256.as_str()) {
+                    Self::Verified
+                } else {
+                    Self::Unverified
+                }
+            }
+        }
+    }
+}
+
+/// Whether this hub's own outbound request composition can carry an image
+/// content block to the given runtime kind (ROADMAP Phase 8 item 12). This
+/// gates `vision_ready` the same way the Chat Template Compatibility Lab's
+/// `gate_capabilities` gates chat/tool/structured-output: composing the
+/// correct wire shape is the bar this hub can verify from inside its own
+/// process boundary — exactly like `fixture_tool_calling` already treats a
+/// correctly composed OpenAI-wire/MLX-flattened tool call as "passing"
+/// without spinning up the external runtime process itself. Both
+/// `openai_messages` (used for the Ollama and managed llama.cpp drivers) and
+/// `canonical_message_to_mlx` (the MLX driver) compose real `image_url`/
+/// `images` wire content today, so every runtime kind currently supports
+/// this; the match stays exhaustive so a future runtime kind must
+/// deliberately opt in rather than silently inheriting `true`.
+pub fn runtime_supports_image_transport(kind: M3RuntimeKind) -> bool {
+    match kind {
+        M3RuntimeKind::Ollama | M3RuntimeKind::LlamaCpp | M3RuntimeKind::Mlx => true,
+    }
+}
+
+/// Estimated resident memory a multimodal projector consumes once loaded,
+/// treating its on-disk size as a direct stand-in for resident bytes — the
+/// same approximation this hub already applies to whole-model weights
+/// (`OffloadModelProfile::weights_bytes` in `runtime_adapter.rs`), just for
+/// the much smaller projector component. No invented activation/scratch
+/// multiplier is layered on top of it.
+pub fn estimated_projector_memory_bytes(projector: &M3ProjectorRef) -> u64 {
+    projector.size_bytes
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct M3InstalledVersionView {
@@ -834,6 +1115,28 @@ pub struct M3InstalledVersionView {
     pub installed_at_ms: u64,
     pub active: bool,
     pub license: M3ModelLicense,
+    /// Which configured catalog source this version originated from.
+    pub source_id: String,
+    /// Chat template family/name declared by the catalog entry, if any.
+    pub template: Option<String>,
+    /// The multimodal projector associated with this version, if any.
+    pub projector: Option<M3ProjectorRef>,
+    /// When the catalog entry for this version was locally retrieved, if the
+    /// installing manifest recorded it.
+    pub catalog_retrieved_at_ms: Option<u64>,
+    /// Real, computed evidence for this version's projector — never trusted
+    /// purely from the catalog's declared capability flag.
+    pub projector_verification: M3ProjectorVerificationState,
+    /// When `projector_verification` last became `Verified`, if it has been.
+    pub projector_verified_at_ms: Option<u64>,
+    /// Estimated resident memory the projector needs once loaded; present
+    /// only when this version actually declares one.
+    pub estimated_projector_memory_bytes: Option<u64>,
+    /// Whether vision is genuinely ready to use: declared true AND backed by
+    /// a verified projector AND the target runtime's own outbound wire
+    /// composition can carry an image block. Never true merely because the
+    /// catalog set `capabilities.vision = true`.
+    pub vision_ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +1221,20 @@ pub struct M3PruneModelVersionsRequest {
     pub confirmation: String,
 }
 
+/// Verifies a candidate local file against an installed model version's
+/// declared `M3ProjectorRef` digest/size (ROADMAP Phase 8 item 12). There is
+/// deliberately no network download path for the projector blob itself yet
+/// — see `M3RuntimeHub::verify_projector`'s doc comment — so this is how a
+/// user-supplied or externally-fetched projector file gets promoted from
+/// "declared" to genuinely `Verified` evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3VerifyProjectorRequest {
+    pub asset_id: String,
+    pub version_key: String,
+    pub candidate_path: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct M3SetRuntimeConfigRequest {
@@ -944,7 +1261,307 @@ pub struct M3RuntimeCapabilityView {
     pub can_logs: bool,
     pub can_metrics: bool,
     pub can_infer: bool,
+    /// Whether this runtime's transport genuinely reaches an embeddings
+    /// endpoint (Ollama's daemon today — the managed llama.cpp chat
+    /// instance and MLX do not run with embeddings support). A per-model
+    /// `capabilities.embeddings` check still gates individual requests.
+    pub can_embed: bool,
     pub settings: Vec<AdvancedSettingCapability>,
+}
+
+/// Phase 8 item 11 (OpenAI/Ollama API compatibility harness) result: one
+/// row per route × backend × (optionally) model. See
+/// [`M3RuntimeHub::compatibility_matrix`] for how rows are derived and
+/// `m3_compatibility_harness.rs` for the real HTTP-level regression tests
+/// this surfaces the current capability picture for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3CompatibilityStatus {
+    Pass,
+    Unsupported,
+    Fail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3CompatibilityMatrixRow {
+    pub method: String,
+    pub route: String,
+    pub backend: ApiBackend,
+    pub runtime_id: String,
+    pub model_id: Option<String>,
+    pub status: M3CompatibilityStatus,
+    pub reason: String,
+}
+
+impl M3CompatibilityMatrixRow {
+    fn new(
+        method: &str,
+        route: &str,
+        backend: ApiBackend,
+        runtime_id: &str,
+        model_id: Option<&str>,
+        status: M3CompatibilityStatus,
+        reason: &str,
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            route: route.to_string(),
+            backend,
+            runtime_id: runtime_id.to_string(),
+            model_id: model_id.map(str::to_string),
+            status,
+            reason: reason.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3CompatibilityMatrixReport {
+    pub generated_at_ms: u64,
+    pub rows: Vec<M3CompatibilityMatrixRow>,
+}
+
+fn capability_status(supported: bool) -> M3CompatibilityStatus {
+    if supported {
+        M3CompatibilityStatus::Pass
+    } else {
+        M3CompatibilityStatus::Unsupported
+    }
+}
+
+// -- Sampler, Batching, and Speculative Decoding Controls (ROADMAP Phase 8
+// item 17) -------------------------------------------------------------
+//
+// `AdvancedSettingCapability` (see `runtime_adapter.rs`) already tells the
+// UI which knobs a runtime driver knows how to accept at all — that part is
+// static per runtime and unaffected by which model or machine it runs on.
+// Three of the newer knobs need something the low-level adapter layer
+// deliberately has no visibility into:
+//   - `flash_attention` / `mixed_precision` (llama.cpp only) can only be
+//     honored with a real GPU backend, which is a machine-level fact from
+//     the Hardware Compatibility Matrix (`M3HardwareCompatibilityReport`),
+//     not something `runtime_adapter.rs`'s Tauri-free adapters probe for
+//     themselves (see that report's module doc comment for why hardware
+//     probing lives in `m3_production.rs`, not here or there).
+//   - `speculative_decoding_draft_model` (llama.cpp only) is inherently
+//     relative to *which model* is being configured: it needs a smaller,
+//     same-family model already installed to act as the draft. That
+//     relationship only exists at this hub layer, which is the only place
+//     that knows about every installed model at once.
+//
+// `gate_advanced_settings` narrows the static capability list down to what
+// the current runtime/model/hardware combination can actually honor right
+// now, for the UI to render. The same gates are enforced again,
+// authoritatively, server-side in `M3RuntimeHub::set_runtime_config` and
+// `M3RuntimeHub::load_model` — the UI-facing gating here is a convenience,
+// never the only line of defense.
+
+/// Coarse model-family bucket used only to decide whether one installed
+/// model could plausibly serve as a speculative-decoding draft model for
+/// another — never used for anything else. Keyed by a substring match on
+/// `model_id`/`display_name`/`variant_id`, deliberately mirroring
+/// `chat_template_lab::TemplateFamily::detect`'s coarse substring approach
+/// (see that type's doc comment for why finer-grained detection is out of
+/// scope for this codebase). `Generic` never matches another `Generic`
+/// model as a compatible pair: two models this app cannot place in a named
+/// family are not assumed related just because both are unclassified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFamily {
+    Llama,
+    Qwen,
+    Mistral,
+    Gemma,
+    Phi,
+    DeepSeek,
+    Generic,
+}
+
+impl ModelFamily {
+    pub fn detect(model_id: &str, display_name: &str, variant_id: &str) -> Self {
+        let haystack = format!("{model_id} {display_name} {variant_id}").to_lowercase();
+        if haystack.contains("deepseek") {
+            Self::DeepSeek
+        } else if haystack.contains("qwen") {
+            Self::Qwen
+        } else if haystack.contains("gemma") {
+            Self::Gemma
+        } else if haystack.contains("mistral") || haystack.contains("mixtral") {
+            Self::Mistral
+        } else if haystack.contains("phi") {
+            Self::Phi
+        } else if haystack.contains("llama") {
+            Self::Llama
+        } else {
+            Self::Generic
+        }
+    }
+}
+
+/// One installed model that could serve as a speculative-decoding draft
+/// model for the target the settings are being resolved against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3DraftModelCandidate {
+    pub model_id: String,
+    pub display_name: String,
+}
+
+/// Result of [`gate_advanced_settings`]: the runtime's declared settings,
+/// narrowed to what can actually be enabled right now, plus (for
+/// speculative decoding specifically) the installed models a `Text`-schema
+/// draft-model setting can validly reference — a fixed `Choice` schema
+/// cannot express this list since it is relative to whichever model is
+/// currently selected, not fixed at capability-declaration time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3SettingCapabilitiesView {
+    pub settings: Vec<AdvancedSettingCapability>,
+    pub draft_model_candidates: Vec<M3DraftModelCandidate>,
+}
+
+/// Whether at least one non-CPU accelerator is confirmed `Available` per the
+/// Hardware Compatibility Matrix report. Shared by both the flash-attention
+/// and mixed-precision gates: llama.cpp requires flash attention to quantize
+/// the KV cache below f16, and flash attention itself needs real GPU
+/// acceleration (see each gate's reason string for the user-facing detail).
+fn gpu_backend_available(report: &M3HardwareCompatibilityReport) -> bool {
+    report.accelerators.iter().any(|accelerator| {
+        accelerator.kind != AcceleratorKind::Cpu && accelerator.status == M3AcceleratorStatus::Available
+    })
+}
+
+/// `Some(reason)` when flash attention cannot be enabled on this machine
+/// right now, `None` when it can. Shared by the UI-facing resolver and the
+/// authoritative `set_runtime_config` enforcement so both always agree.
+fn flash_attention_block_reason(report: &M3HardwareCompatibilityReport) -> Option<String> {
+    if gpu_backend_available(report) {
+        None
+    } else {
+        Some(
+            "Flash attention needs a supported GPU backend (Metal, CUDA, ROCm, or Vulkan); \
+             this machine's Hardware Compatibility report shows CPU only."
+                .to_string(),
+        )
+    }
+}
+
+/// `Some(reason)` when quantized-KV-cache "mixed precision" cannot be
+/// enabled on this machine right now, `None` when it can.
+fn mixed_precision_block_reason(report: &M3HardwareCompatibilityReport) -> Option<String> {
+    if gpu_backend_available(report) {
+        None
+    } else {
+        Some(
+            "Quantized KV cache (mixed precision) needs a supported GPU backend and flash \
+             attention; this machine's Hardware Compatibility report shows CPU only."
+                .to_string(),
+        )
+    }
+}
+
+/// Installed models that could serve as a speculative-decoding draft model
+/// for `target`: same runtime (llama.cpp only — see the module doc comment
+/// for why), a named (non-`Generic`) family that matches `target`'s, a
+/// different asset than `target` itself, and a genuinely smaller estimated
+/// footprint (a draft model only speeds up generation if it is cheaper to
+/// run per token than the model it drafts for).
+fn compatible_draft_models<'a>(
+    target: &M3InstalledModelView,
+    installed: &'a [M3InstalledModelView],
+) -> Vec<&'a M3InstalledModelView> {
+    if target.runtime != M3RuntimeKind::LlamaCpp {
+        return Vec::new();
+    }
+    let target_family = ModelFamily::detect(&target.model_id, &target.display_name, &target.variant_id);
+    if target_family == ModelFamily::Generic {
+        return Vec::new();
+    }
+    installed
+        .iter()
+        .filter(|candidate| {
+            candidate.asset_id != target.asset_id
+                && candidate.runtime == M3RuntimeKind::LlamaCpp
+                && candidate.estimated_ram_bytes < target.estimated_ram_bytes
+                && ModelFamily::detect(&candidate.model_id, &candidate.display_name, &candidate.variant_id)
+                    == target_family
+        })
+        .collect()
+}
+
+/// Narrows a runtime's declared `AdvancedSettingCapability` list down to
+/// what the current hardware and (optionally) selected target model can
+/// actually honor. Pure and deterministic — no I/O, no clock — so it is
+/// trivially unit-testable with fixture reports/models. `target: None`
+/// covers the "no model selected yet" case: hardware-only gates
+/// (flash attention, mixed precision) still resolve correctly, while the
+/// model-relative speculative-decoding gate reports "select a model" rather
+/// than guessing.
+pub fn gate_advanced_settings(
+    capabilities: &[AdvancedSettingCapability],
+    compatibility: &M3HardwareCompatibilityReport,
+    target: Option<&M3InstalledModelView>,
+    installed: &[M3InstalledModelView],
+) -> M3SettingCapabilitiesView {
+    let mut draft_model_candidates = Vec::new();
+    let settings = capabilities
+        .iter()
+        .cloned()
+        .map(|mut capability| {
+            match capability.key.as_str() {
+                "flash_attention" => {
+                    if let Some(reason) = flash_attention_block_reason(compatibility) {
+                        capability.supported = false;
+                        capability.unsupported_reason = Some(reason);
+                    }
+                }
+                "mixed_precision" => {
+                    if let Some(reason) = mixed_precision_block_reason(compatibility) {
+                        capability.supported = false;
+                        capability.unsupported_reason = Some(reason);
+                    }
+                }
+                "speculative_decoding_draft_model" => match target {
+                    None => {
+                        capability.supported = false;
+                        capability.unsupported_reason = Some(
+                            "Select a model to check for a compatible installed draft model."
+                                .to_string(),
+                        );
+                    }
+                    Some(target_model) => {
+                        let candidates = compatible_draft_models(target_model, installed);
+                        if candidates.is_empty() {
+                            capability.supported = false;
+                            capability.unsupported_reason = Some(format!(
+                                "No compatible draft model installed. Install a smaller, \
+                                 same-family model than {} for llama.cpp to enable speculative \
+                                 decoding.",
+                                target_model.display_name
+                            ));
+                        } else {
+                            capability.supported = true;
+                            capability.unsupported_reason = None;
+                            draft_model_candidates.extend(candidates.iter().map(|candidate| {
+                                M3DraftModelCandidate {
+                                    model_id: candidate.model_id.clone(),
+                                    display_name: candidate.display_name.clone(),
+                                }
+                            }));
+                        }
+                    }
+                },
+                _ => {}
+            }
+            capability
+        })
+        .collect();
+    M3SettingCapabilitiesView {
+        settings,
+        draft_model_candidates,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -999,6 +1616,24 @@ pub trait M3InferenceEngine: Send + Sync {
         request_id: &'a str,
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool>;
+
+    /// Generates embeddings for a batch of text inputs. The default rejects
+    /// with `Unsupported` — only engines that genuinely reach a backend
+    /// capable of producing real vectors (see
+    /// `OpenAiCompatibleM3InferenceEngine` in `m3_production.rs`) override
+    /// this; nothing here ever fabricates a vector.
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            Err(M3HubError::Unsupported(format!(
+                "model {} does not have an embeddings-capable inference engine",
+                request.model
+            )))
+        })
+    }
 }
 
 pub trait M3RuntimeDriver: Send + Sync {
@@ -1052,6 +1687,25 @@ pub trait M3RuntimeDriver: Send + Sync {
         request_id: &'a str,
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool>;
+
+    /// Generates embeddings through this runtime. The default rejects with
+    /// `Unsupported` — see [`M3InferenceEngine::embed`]'s doc for why this
+    /// stays an honest rejection rather than a fabricated vector wherever a
+    /// driver does not override it (for example the managed MLX driver,
+    /// which has no embeddings support today).
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        let runtime_id = self.descriptor().runtime_id;
+        Box::pin(async move {
+            Err(M3HubError::Unsupported(format!(
+                "runtime {runtime_id} does not support embeddings generation for model {}",
+                request.model
+            )))
+        })
+    }
 }
 
 pub struct RuntimeAdapterM3Driver {
@@ -1116,6 +1770,10 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
             can_logs: source.can_tail_logs,
             can_metrics: true,
             can_infer: true,
+            // Ollama's daemon serves an OpenAI-compatible `/v1/embeddings`
+            // endpoint alongside chat; the managed llama.cpp chat instance
+            // is started without `--embeddings` and therefore cannot.
+            can_embed: self.descriptor.kind == M3RuntimeKind::Ollama,
             settings: source.settings,
         }
     }
@@ -1304,6 +1962,14 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
     ) -> M3HubFuture<'a, bool> {
         self.inference.cancel(request_id, context)
     }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        self.inference.embed(request, context)
+    }
 }
 
 pub struct MlxM3Driver {
@@ -1389,6 +2055,7 @@ impl M3RuntimeDriver for MlxM3Driver {
             can_logs: installed,
             can_metrics: installed,
             can_infer: installed,
+            can_embed: false,
             settings: Vec::new(),
         }
     }
@@ -1750,6 +2417,139 @@ impl M3RuntimeHub {
         compatibility_conformance_manifest()
     }
 
+    /// Builds a compatibility matrix — one row per advertised route, per
+    /// configured runtime, and (for capability-specific routes) per
+    /// installed model. This is deliberately capability-derived rather than
+    /// a live per-cell network probe: it reflects the same runtime/model
+    /// capability state (`can_infer`, `can_embed`,
+    /// `M3ModelCapabilities`) that already gates real requests, kept
+    /// accurate by runtime reconciliation. Regressions in the actual wire
+    /// behavior are caught by the `m3_compatibility_harness` integration
+    /// test suite, which spins up the real HTTP server and makes real
+    /// requests; this method is what the Runtime/API Hub UI renders.
+    pub fn compatibility_matrix(&self) -> M3HubResult<M3CompatibilityMatrixReport> {
+        let runtimes = self.list_runtimes()?;
+        let installed = self.list_installed_models()?;
+        let mut rows = Vec::new();
+        for runtime in &runtimes {
+            let backend = runtime.descriptor.api_backend;
+            let runtime_id = runtime.descriptor.runtime_id.clone();
+            rows.push(M3CompatibilityMatrixRow::new(
+                "GET",
+                "/v1/models",
+                backend,
+                &runtime_id,
+                None,
+                M3CompatibilityStatus::Pass,
+                "runtime is registered and discoverable",
+            ));
+            rows.push(M3CompatibilityMatrixRow::new(
+                "GET",
+                "/api/tags",
+                backend,
+                &runtime_id,
+                None,
+                M3CompatibilityStatus::Pass,
+                "native-Ollama listing reshapes the same discovery data as /v1/models",
+            ));
+            let infer_status = if runtime.can_infer {
+                (
+                    M3CompatibilityStatus::Pass,
+                    "runtime driver supports inference".to_string(),
+                )
+            } else {
+                (
+                    M3CompatibilityStatus::Unsupported,
+                    "runtime driver does not support inference".to_string(),
+                )
+            };
+            for (method, route) in [
+                ("POST", "/v1/chat/completions"),
+                ("POST", "/v1/responses"),
+                ("POST", "/v1/messages"),
+                ("POST", "/api/chat"),
+            ] {
+                rows.push(M3CompatibilityMatrixRow::new(
+                    method,
+                    route,
+                    backend,
+                    &runtime_id,
+                    None,
+                    infer_status.0,
+                    &infer_status.1,
+                ));
+            }
+            rows.push(M3CompatibilityMatrixRow::new(
+                "POST",
+                "/v1/embeddings",
+                backend,
+                &runtime_id,
+                None,
+                if runtime.can_embed {
+                    M3CompatibilityStatus::Pass
+                } else {
+                    M3CompatibilityStatus::Unsupported
+                },
+                if runtime.can_embed {
+                    "runtime driver reaches a genuine embeddings endpoint"
+                } else {
+                    "runtime driver has no embeddings-capable endpoint configured"
+                },
+            ));
+            for model in installed
+                .iter()
+                .filter(|model| model.runtime == runtime.descriptor.kind)
+            {
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/chat/completions (tool calls)",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(model.capabilities.tool_calling),
+                    if model.capabilities.tool_calling {
+                        "model advertises tool calling"
+                    } else {
+                        "model does not advertise tool calling"
+                    },
+                ));
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/chat/completions (json schema)",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(model.capabilities.structured_output),
+                    if model.capabilities.structured_output {
+                        "model advertises structured output"
+                    } else {
+                        "model does not advertise structured output"
+                    },
+                ));
+                let embeddings_ok = runtime.can_embed && model.capabilities.embeddings;
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/embeddings",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(embeddings_ok),
+                    if embeddings_ok {
+                        "model advertises embeddings on an embeddings-capable runtime"
+                    } else if !runtime.can_embed {
+                        "runtime driver has no embeddings-capable endpoint configured"
+                    } else {
+                        "model does not advertise embeddings"
+                    },
+                ));
+            }
+        }
+        Ok(M3CompatibilityMatrixReport {
+            generated_at_ms: self.clock.now_ms()?,
+            rows,
+        })
+    }
+
     pub fn hardware_snapshot(&self) -> M3HubResult<HardwareSnapshot> {
         let snapshot = self.hardware.snapshot()?;
         snapshot.profile().map_err(runtime_error)?;
@@ -1758,6 +2558,13 @@ impl M3RuntimeHub {
 
     pub fn hardware_profile(&self) -> M3HubResult<HardwareProfile> {
         self.hardware_snapshot()?.profile().map_err(runtime_error)
+    }
+
+    /// Hardware Compatibility Matrix / "Driver Doctor" report. Must be safe
+    /// to call before any model download, model load, or runtime install so
+    /// the UI can show a concrete compatibility report first.
+    pub fn hardware_compatibility_report(&self) -> M3HubResult<M3HardwareCompatibilityReport> {
+        self.hardware.compatibility_report()
     }
 
     pub fn storage_status(&self) -> M3HubResult<M3StorageStatus> {
@@ -1901,7 +2708,7 @@ impl M3RuntimeHub {
                     "source returned more entries than requested",
                 ));
             }
-            for entry in entries {
+            for mut entry in entries {
                 entry.validate()?;
                 if entry.source_id != source.source_id() {
                     return Err(invalid(
@@ -1914,6 +2721,9 @@ impl M3RuntimeHub {
                     entry.source_id, entry.model_id, entry.variant_id, entry.revision
                 );
                 if dedupe.insert(key) {
+                    // Provenance is stamped locally at retrieval time; a
+                    // remote source's own claim about this is never trusted.
+                    entry.catalog_retrieved_at_ms = Some(self.clock.now_ms()?);
                     matches.push(M3CatalogMatch {
                         fit: evaluate_hardware_fit(&entry, &hardware)?,
                         model: entry,
@@ -1935,6 +2745,56 @@ impl M3RuntimeHub {
         let _guard = lock(&self.state_lock)?;
         let state = load_hub_state(&self.state_root, &self.models_root)?;
         state_to_views(&state, &self.models_root)
+    }
+
+    /// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+    /// 14): flags an installed model as outdated when its catalog has a
+    /// different revision available *and* it has gone unrefreshed for a long
+    /// time — reusing `search_catalog` (the same mechanism the "Find
+    /// updates" button already drives) for the "different revision" half
+    /// rather than inventing a second catalog-freshness signal. Compares
+    /// only against catalog entries from the same source as the installed
+    /// active version, so an unrelated source's differently-quantized or
+    /// differently-sourced listing of the same model id is never mistaken
+    /// for "the same thing, but newer". Returns `Ok(None)` for an
+    /// up-to-date, recently-installed, or catalog-absent model — this is a
+    /// diagnostic signal, never an error.
+    pub async fn model_staleness_check(
+        &self,
+        asset_id: &str,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Option<crate::model_retirement::LocalModelStalenessWarning>> {
+        context.preflight("model staleness check")?;
+        validate_identifier(asset_id, "assetId")?;
+        let installed = self.list_installed_models()?;
+        let model = installed
+            .iter()
+            .find(|candidate| candidate.asset_id == asset_id)
+            .ok_or_else(|| M3HubError::NotFound(format!("model {asset_id}")))?;
+        let active = model
+            .versions
+            .iter()
+            .find(|version| version.version_key == model.active_version_key)
+            .ok_or_else(|| M3HubError::State("active model version is missing".to_string()))?;
+        let matches = self
+            .search_catalog(&model.model_id, self.config.max_catalog_results, context)
+            .await?;
+        let latest = matches.iter().find(|candidate| {
+            candidate.model.model_id == model.model_id
+                && candidate.model.variant_id == model.variant_id
+                && candidate.model.source_id == active.source_id
+        });
+        let now_ms = self.clock.now_ms()?;
+        Ok(latest.and_then(|candidate| {
+            crate::model_retirement::check_local_model_staleness(
+                &model.asset_id,
+                &active.revision,
+                active.installed_at_ms,
+                &candidate.model.revision,
+                &candidate.model.display_name,
+                now_ms,
+            )
+        }))
     }
 
     pub async fn download_model(
@@ -1975,87 +2835,120 @@ impl M3RuntimeHub {
             }
         }
 
-        let probe = run_bounded(
-            context,
-            "probe model download",
-            self.download.probe(&request.model.download_url, context),
-        )
-        .await?;
-        if probe.total_bytes != request.model.size_bytes {
-            return Err(invalid(
-                "download.contentLength",
-                format!(
-                    "catalog declares {} bytes but server declares {}",
-                    request.model.size_bytes, probe.total_bytes
-                ),
-            ));
-        }
         let partial_path = self
             .downloads_root
             .join(format!("{asset_key}{DOWNLOAD_SUFFIX}"));
         let resume_path = self
             .downloads_root
             .join(format!("{asset_key}{RESUME_SUFFIX}"));
-        let expected_resume = M3ResumeState {
-            schema_version: M3_HUB_SCHEMA_VERSION,
-            asset_key: asset_key.clone(),
-            version_key: version_key.clone(),
-            url: request.model.download_url.clone(),
-            expected_sha256: request.model.sha256.clone(),
-            total_bytes: request.model.size_bytes,
-            etag: probe.etag.clone(),
-        };
-        prepare_resume_files(&partial_path, &resume_path, &expected_resume, &probe)?;
-        atomic_write_private(&resume_path, &canonical_json(&expected_resume)?)?;
-        let mut offset = regular_file_len_or_zero(&partial_path)?;
-        if offset > 0 && !probe.accepts_ranges {
-            remove_owned_file(&partial_path)?;
-            offset = 0;
-        }
-        let remaining = request.model.size_bytes.saturating_sub(offset);
-        let available = self.storage_status()?.available_for_models_bytes;
-        if remaining > available {
-            return Err(M3HubError::Storage {
-                required: remaining,
-                available,
-            });
-        }
 
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut partial = options
-            .open(&partial_path)
-            .map_err(|source| io_at("open partial model", &partial_path, source))?;
-        while offset < request.model.size_bytes {
-            context.preflight("download model")?;
-            let requested = usize::try_from(
-                (request.model.size_bytes - offset).min(self.config.download_chunk_bytes as u64),
-            )
-            .map_err(|_| invalid("download.range", "size conversion overflow"))?;
-            let chunk = run_bounded(
+        // Layer reuse: if a byte-identical, independently re-verified payload
+        // is already installed under a different asset/version, materialize
+        // it locally without a network transfer instead of re-downloading
+        // content we already have. A mismatched or corrupt candidate is
+        // never trusted here (see `find_reusable_payload`), so this always
+        // falls back to a real download when reuse cannot be proven safe.
+        let reusable_payload = {
+            let _guard = lock(&self.state_lock)?;
+            let state = load_hub_state(&self.state_root, &self.models_root)?;
+            find_reusable_payload(
+                &state,
+                &self.models_root,
+                &request.model.sha256,
+                request.model.size_bytes,
+            )?
+        };
+
+        if let Some(existing_payload) = reusable_payload {
+            context.preflight("reuse verified model payload")?;
+            let available = self.storage_status()?.available_for_models_bytes;
+            if request.model.size_bytes > available {
+                return Err(M3HubError::Storage {
+                    required: request.model.size_bytes,
+                    available,
+                });
+            }
+            remove_owned_file(&partial_path)?;
+            remove_owned_file(&resume_path)?;
+            link_or_copy_owned(&existing_payload, &partial_path)?;
+        } else {
+            let probe = run_bounded(
                 context,
-                "download model range",
-                self.download.read_range(
-                    &request.model.download_url,
-                    offset,
-                    requested,
-                    probe.etag.as_deref(),
-                    context,
-                ),
+                "probe model download",
+                self.download.probe(&request.model.download_url, context),
             )
             .await?;
-            validate_download_chunk(&chunk, &probe, offset, requested)?;
-            partial
-                .write_all(&chunk.bytes)
-                .and_then(|_| partial.sync_data())
-                .map_err(|source| io_at("append partial model", &partial_path, source))?;
-            offset = offset
-                .checked_add(chunk.bytes.len() as u64)
-                .ok_or_else(|| invalid("download.offset", "overflow"))?;
+            if probe.total_bytes != request.model.size_bytes {
+                return Err(invalid(
+                    "download.contentLength",
+                    format!(
+                        "catalog declares {} bytes but server declares {}",
+                        request.model.size_bytes, probe.total_bytes
+                    ),
+                ));
+            }
+            let expected_resume = M3ResumeState {
+                schema_version: M3_HUB_SCHEMA_VERSION,
+                asset_key: asset_key.clone(),
+                version_key: version_key.clone(),
+                url: request.model.download_url.clone(),
+                expected_sha256: request.model.sha256.clone(),
+                total_bytes: request.model.size_bytes,
+                etag: probe.etag.clone(),
+            };
+            prepare_resume_files(&partial_path, &resume_path, &expected_resume, &probe)?;
+            atomic_write_private(&resume_path, &canonical_json(&expected_resume)?)?;
+            let mut offset = regular_file_len_or_zero(&partial_path)?;
+            if offset > 0 && !probe.accepts_ranges {
+                remove_owned_file(&partial_path)?;
+                offset = 0;
+            }
+            let remaining = request.model.size_bytes.saturating_sub(offset);
+            let available = self.storage_status()?.available_for_models_bytes;
+            if remaining > available {
+                return Err(M3HubError::Storage {
+                    required: remaining,
+                    available,
+                });
+            }
+
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut partial = options
+                .open(&partial_path)
+                .map_err(|source| io_at("open partial model", &partial_path, source))?;
+            while offset < request.model.size_bytes {
+                context.preflight("download model")?;
+                let requested = usize::try_from(
+                    (request.model.size_bytes - offset)
+                        .min(self.config.download_chunk_bytes as u64),
+                )
+                .map_err(|_| invalid("download.range", "size conversion overflow"))?;
+                let chunk = run_bounded(
+                    context,
+                    "download model range",
+                    self.download.read_range(
+                        &request.model.download_url,
+                        offset,
+                        requested,
+                        probe.etag.as_deref(),
+                        context,
+                    ),
+                )
+                .await?;
+                validate_download_chunk(&chunk, &probe, offset, requested)?;
+                partial
+                    .write_all(&chunk.bytes)
+                    .and_then(|_| partial.sync_data())
+                    .map_err(|source| io_at("append partial model", &partial_path, source))?;
+                offset = offset
+                    .checked_add(chunk.bytes.len() as u64)
+                    .ok_or_else(|| invalid("download.offset", "overflow"))?;
+            }
+            drop(partial);
         }
-        drop(partial);
         let actual_digest = sha256_file(&partial_path, request.model.size_bytes)?;
         if !constant_time_eq(actual_digest.as_bytes(), request.model.sha256.as_bytes()) {
             remove_owned_file(&partial_path)?;
@@ -2105,6 +2998,15 @@ impl M3RuntimeHub {
             model: request.model.clone(),
             artifact_relative_path,
             installed_at_ms,
+            // A fresh (or replaced) version always starts unverified, even
+            // when it replaces an existing entry for the same version key:
+            // that replace path only fires when the catalog re-declares
+            // non-content-addressed fields (e.g. a corrected `projector`
+            // reference) for what is otherwise byte-identical content, and a
+            // stale verification must not silently carry over to a
+            // potentially different projector declaration.
+            projector_verified_sha256: None,
+            projector_verified_at_ms: None,
         };
         match index {
             Some(index) => {
@@ -2255,6 +3157,68 @@ impl M3RuntimeHub {
             .into_iter()
             .find(|model| model.asset_id == request.asset_id)
             .ok_or_else(|| M3HubError::State("activated model vanished".to_string()))
+    }
+
+    /// Verifies a candidate local file against an installed model version's
+    /// declared projector reference (kind/sha256/size), promoting that
+    /// version's projector from merely "declared" to genuine `Verified`
+    /// evidence on success (ROADMAP Phase 8 item 12). This intentionally
+    /// does not download anything itself: unlike a model's own weights,
+    /// `M3ProjectorRef` carries no download URL — a user (or a future PR
+    /// that adds a real fetch path) supplies the file, and this is the real,
+    /// digest-checked promotion step, mirroring the same `sha256_file`/
+    /// `constant_time_eq` integrity check a model's own weights go through
+    /// in `download_model`. Never marks anything verified on a digest
+    /// mismatch — this returns `M3HubError::Integrity` instead, the same
+    /// error a corrupted model download produces.
+    pub async fn verify_projector(
+        &self,
+        request: &M3VerifyProjectorRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3InstalledModelView> {
+        validate_identifier(&request.asset_id, "assetId")?;
+        validate_sha256(&request.version_key, "versionKey")?;
+        context.preflight("verify projector")?;
+        let _mutation = self.mutation_lock.lock().await;
+        let mut state = {
+            let _guard = lock(&self.state_lock)?;
+            load_hub_state(&self.state_root, &self.models_root)?
+        };
+        let model_index = state
+            .models
+            .iter()
+            .position(|model| model.asset_id == request.asset_id)
+            .ok_or_else(|| M3HubError::NotFound(request.asset_id.clone()))?;
+        let version_index = state.models[model_index]
+            .versions
+            .iter()
+            .position(|version| version.version_key == request.version_key)
+            .ok_or_else(|| M3HubError::NotFound(request.version_key.clone()))?;
+        let projector = state.models[model_index].versions[version_index]
+            .model
+            .projector
+            .clone()
+            .ok_or_else(|| {
+                M3HubError::NotFound("this model version declares no projector".to_string())
+            })?;
+        let actual_digest = sha256_file(&request.candidate_path, projector.size_bytes)?;
+        if !constant_time_eq(actual_digest.as_bytes(), projector.sha256.as_bytes()) {
+            return Err(M3HubError::Integrity {
+                expected: projector.sha256.clone(),
+                actual: actual_digest,
+            });
+        }
+        let verified_at_ms = self.clock.now_ms()?;
+        state.models[model_index].versions[version_index].projector_verified_sha256 =
+            Some(projector.sha256.clone());
+        state.models[model_index].versions[version_index].projector_verified_at_ms =
+            Some(verified_at_ms);
+        let view = stored_model_view(&state.models[model_index], &self.models_root)?;
+        {
+            let _guard = lock(&self.state_lock)?;
+            save_next_hub_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
+        }
+        Ok(view)
     }
 
     /// Remove every inactive model version after an exact, asset-bound
@@ -2468,6 +3432,7 @@ impl M3RuntimeHub {
         let settings = self
             .runtime_config(&request.runtime_id)?
             .unwrap_or_default();
+        self.enforce_draft_model_gate(&model, &settings)?;
         runtime
             .load(
                 &model,
@@ -2477,6 +3442,51 @@ impl M3RuntimeHub {
                 context,
             )
             .await
+    }
+
+    /// Authoritative, server-side half of the speculative-decoding gate: the
+    /// UI-facing `resolve_setting_capabilities` only decides what to *show*
+    /// as enabled; this decides what actually gets to run. The persisted
+    /// runtime config is model-agnostic (one config applies to whatever
+    /// gets loaded next), so the draft-model choice can only be checked
+    /// against a *specific* target once that target is known — which is
+    /// exactly here, at load time, mirroring how `RuntimeAdapterM3Driver::load`
+    /// already does its own load-time-only "has this runtime reconciled
+    /// this model" check beyond the low-level adapter's static validation.
+    fn enforce_draft_model_gate(
+        &self,
+        model: &M3ResolvedModel,
+        settings: &BTreeMap<String, SettingValue>,
+    ) -> M3HubResult<()> {
+        let Some(SettingValue::Text { value }) = settings.get("speculative_decoding_draft_model")
+        else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            return Ok(());
+        }
+        if model.runtime != M3RuntimeKind::LlamaCpp {
+            return Err(M3HubError::Unsupported(
+                "Speculative decoding is only available for llama.cpp".to_string(),
+            ));
+        }
+        let installed = self.list_installed_models()?;
+        let target_view = installed
+            .iter()
+            .find(|entry| entry.asset_id == model.asset_id)
+            .ok_or_else(|| M3HubError::NotFound(format!("model {}", model.asset_id)))?;
+        let candidates = compatible_draft_models(target_view, &installed);
+        if candidates
+            .iter()
+            .any(|candidate| candidate.model_id == *value)
+        {
+            Ok(())
+        } else {
+            Err(M3HubError::Unsupported(format!(
+                "{value} is not a compatible installed draft model for {}",
+                target_view.display_name
+            )))
+        }
     }
 
     pub async fn unload_model(
@@ -2518,6 +3528,7 @@ impl M3RuntimeHub {
         validate_identifier(&request.runtime_id, "runtimeId")?;
         self.runtime(&request.runtime_id)?
             .validate_config(&request.values)?;
+        self.enforce_hardware_setting_gates(&request.values)?;
         let _guard = lock(&self.state_lock)?;
         let mut state = load_hub_state(&self.state_root, &self.models_root)?;
         state
@@ -2525,6 +3536,38 @@ impl M3RuntimeHub {
             .insert(request.runtime_id.clone(), request.values.clone());
         save_next_hub_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
         Ok(request.values.clone())
+    }
+
+    /// Authoritative, server-side half of the flash-attention/mixed-precision
+    /// gates: hardware support is machine-level (not model-relative), so —
+    /// unlike the draft-model gate, which can only be checked once a target
+    /// model is known at load time — this can and does run right at
+    /// config-save time. The UI-facing `resolve_setting_capabilities` shows
+    /// the same gate ahead of time so this should only ever reject a request
+    /// that bypassed the UI (a direct IPC call, a stale client).
+    fn enforce_hardware_setting_gates(
+        &self,
+        values: &BTreeMap<String, SettingValue>,
+    ) -> M3HubResult<()> {
+        let flash_wants_on =
+            matches!(values.get("flash_attention"), Some(SettingValue::Choice { value }) if value == "on");
+        let mixed_wants_non_f16 =
+            matches!(values.get("mixed_precision"), Some(SettingValue::Choice { value }) if value != "f16");
+        if !flash_wants_on && !mixed_wants_non_f16 {
+            return Ok(());
+        }
+        let compatibility = self.hardware_compatibility_report()?;
+        if flash_wants_on {
+            if let Some(reason) = flash_attention_block_reason(&compatibility) {
+                return Err(M3HubError::Unsupported(reason));
+            }
+        }
+        if mixed_wants_non_f16 {
+            if let Some(reason) = mixed_precision_block_reason(&compatibility) {
+                return Err(M3HubError::Unsupported(reason));
+            }
+        }
+        Ok(())
     }
 
     pub fn runtime_config(
@@ -2537,6 +3580,42 @@ impl M3RuntimeHub {
             .runtime_configs
             .get(runtime_id)
             .cloned())
+    }
+
+    /// UI-facing gating resolver: narrows `runtime_id`'s declared advanced
+    /// settings down to what the current hardware and (if `asset_id` is
+    /// given) selected target model can actually honor, via
+    /// [`gate_advanced_settings`]. `asset_id: None` still resolves the
+    /// hardware-only gates (flash attention, mixed precision) correctly —
+    /// only the model-relative speculative-decoding gate needs a target.
+    pub fn resolve_setting_capabilities(
+        &self,
+        runtime_id: &str,
+        asset_id: Option<&str>,
+    ) -> M3HubResult<M3SettingCapabilitiesView> {
+        validate_identifier(runtime_id, "runtimeId")?;
+        let runtime = self.runtime(runtime_id)?;
+        let capabilities = runtime.capabilities();
+        let compatibility = self.hardware_compatibility_report()?;
+        let installed = self.list_installed_models()?;
+        let target = match asset_id {
+            Some(asset_id) => {
+                validate_identifier(asset_id, "assetId")?;
+                Some(
+                    installed
+                        .iter()
+                        .find(|model| model.asset_id == asset_id)
+                        .ok_or_else(|| M3HubError::NotFound(format!("model {asset_id}")))?,
+                )
+            }
+            None => None,
+        };
+        Ok(gate_advanced_settings(
+            &capabilities.settings,
+            &compatibility,
+            target,
+            &installed,
+        ))
     }
 
     pub fn lan_policy(&self) -> M3HubResult<Option<LanServerPolicy>> {
@@ -2803,6 +3882,45 @@ pub struct M3CancelInferenceRequest {
     pub now_ms: u64,
 }
 
+/// Dispatch envelope for `POST /v1/embeddings`. Distinct from
+/// [`M3ApiDispatchRequest`] because embeddings have no
+/// [`CompatibilityProtocol`] of their own — see
+/// [`translate_embeddings_request`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3EmbeddingDispatchRequest {
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+    pub caller: M3ApiCaller,
+    pub now_ms: u64,
+}
+
+/// Dispatch envelope for the Ollama-native `POST /api/chat`. Reuses the
+/// `ChatCompletions` scope for authorization since it is the same
+/// underlying operation as `/v1/chat/completions`, just a different wire
+/// format — not a new, less-guarded route class.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3OllamaChatDispatchRequest {
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+    pub caller: M3ApiCaller,
+    pub now_ms: u64,
+}
+
+/// Result of dispatching the Ollama-native `/api/chat` endpoint: the
+/// encoded body plus whether the request asked for `stream` framing (the
+/// HTTP layer uses this only to pick a Content-Type; see
+/// [`translate_ollama_chat_request`]'s doc for the streaming limitation).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3OllamaChatDispatchResponse {
+    pub body: Value,
+    pub stream_requested: bool,
+}
+
 impl M3RuntimeHub {
     pub async fn dispatch_api(
         &self,
@@ -2823,7 +3941,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
@@ -2861,7 +3979,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
@@ -2874,6 +3992,77 @@ impl M3RuntimeHub {
         runtime.stream(&canonical, &mut encoding, context).await
     }
 
+    /// Dispatches `POST /v1/embeddings`: translates the request, resolves
+    /// the runtime, authorizes with the `Embeddings` scope, and calls the
+    /// runtime driver's `embed()` — which honestly rejects with
+    /// `Unsupported` unless it genuinely reaches a backend capable of
+    /// producing real vectors.
+    pub async fn dispatch_embeddings(
+        &self,
+        request: &M3EmbeddingDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3ApiDispatchResponse> {
+        context.preflight("dispatch embeddings request")?;
+        let canonical = translate_embeddings_request(&request.request_id, &request.body)?;
+        let runtime = self.runtime(&request.runtime_id)?;
+        self.authorize_api(
+            &request.caller,
+            ApiScope::Embeddings,
+            &runtime.descriptor(),
+            &canonical.model,
+            request.body.len() as u64,
+            request.now_ms,
+        )?;
+        let response = runtime.embed(&canonical, context).await?;
+        if response.model != canonical.model {
+            return Err(M3HubError::Runtime(
+                "embeddings driver returned a response for another model".to_string(),
+            ));
+        }
+        Ok(M3ApiDispatchResponse {
+            status: 200,
+            body: encode_embeddings_response(&response)?,
+        })
+    }
+
+    /// Dispatches the Ollama-native `POST /api/chat`: translates the
+    /// request into the same canonical inference representation used by
+    /// `/v1/chat/completions`, authorizes with the `ChatCompletions` scope
+    /// (same operation, different wire format), calls the resolved
+    /// runtime's `complete()` (always non-streaming — see
+    /// [`M3OllamaChatDispatchResponse`]'s doc), and encodes an
+    /// Ollama-native response with a real measured `total_duration`.
+    pub async fn dispatch_ollama_chat(
+        &self,
+        request: &M3OllamaChatDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3OllamaChatDispatchResponse> {
+        context.preflight("dispatch ollama-native chat request")?;
+        let (canonical, stream_requested) =
+            translate_ollama_chat_request(&request.request_id, &request.body)?;
+        let runtime = self.runtime(&request.runtime_id)?;
+        self.authorize_api(
+            &request.caller,
+            ApiScope::ChatCompletions,
+            &runtime.descriptor(),
+            &canonical.model,
+            request.body.len() as u64,
+            request.now_ms,
+        )?;
+        let started_at = std::time::Instant::now();
+        let response = runtime.complete(&canonical, context).await?;
+        let total_duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if response.model != canonical.model {
+            return Err(M3HubError::Runtime(
+                "inference driver returned a response for another model".to_string(),
+            ));
+        }
+        Ok(M3OllamaChatDispatchResponse {
+            body: encode_ollama_chat_response(&response, total_duration_ns)?,
+            stream_requested,
+        })
+    }
+
     pub async fn cancel_inference(
         &self,
         request: &M3CancelInferenceRequest,
@@ -2884,7 +4073,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &request.model_id,
             0,
@@ -2896,7 +4085,7 @@ impl M3RuntimeHub {
     fn authorize_api(
         &self,
         caller: &M3ApiCaller,
-        protocol: CompatibilityProtocol,
+        scope: ApiScope,
         runtime: &M3RuntimeDescriptor,
         model_id: &str,
         input_bytes: u64,
@@ -2910,7 +4099,7 @@ impl M3RuntimeHub {
             } => {
                 self.lan_controller()?.authorize(&AuthorizationRequest {
                     bearer_token: bearer_token.clone(),
-                    scope: protocol_scope(protocol),
+                    scope,
                     backend: runtime.api_backend,
                     model_id: Some(model_id.to_string()),
                     input_bytes,
@@ -3231,6 +4420,12 @@ impl CanonicalCollector {
                     "tool arguments must decode to an object".to_string(),
                 ));
             }
+            if !request_offers_tool(request, &tool.name) {
+                return Err(M3HubError::Runtime(format!(
+                    "stream called tool \"{}\" that was not offered in this request",
+                    tool.name
+                )));
+            }
             if ordered
                 .insert(
                     index,
@@ -3272,7 +4467,13 @@ impl CanonicalCollector {
     }
 }
 
-fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
+/// `pub(crate)` (rather than private) so both `m3_production.rs`'s tests and
+/// `chat_template_lab.rs` (ROADMAP Phase 8 item 8) can exercise the real MLX
+/// flattening path without duplicating it: `chat_template_lab.rs` reuses it
+/// directly (not mocked) to validate the MLX driver's tool-call round-trip
+/// alongside the OpenAI-compatible Ollama/llama.cpp path, and its own vision
+/// fixture (ROADMAP item 12's prior art) exercises the same function.
+pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
     let role = match message.role {
         CanonicalRole::System => "system",
         CanonicalRole::User => "user",
@@ -3280,6 +4481,11 @@ fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessag
         CanonicalRole::Tool => "tool",
     };
     let mut parts = Vec::new();
+    // Image content blocks (ROADMAP Phase 8 item 12) carry no native slot in
+    // `MlxMessage.text` — its wire type has a dedicated `images` list
+    // instead, so a data URI is appended there rather than flattened into
+    // the joined text like tool_use/tool_result JSON is.
+    let mut images = Vec::new();
     for content in &message.content {
         match content {
             CanonicalContent::Text { text } => parts.push(text.clone()),
@@ -3295,11 +4501,16 @@ fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessag
             } => parts.push(canonical_json_string(&json!({
                 "type":"tool_result","tool_use_id":tool_use_id,"content":content,"is_error":is_error
             }))?),
+            CanonicalContent::Image {
+                mime_type,
+                data_base64,
+            } => images.push(CanonicalContent::image_data_url(mime_type, data_base64)),
         }
     }
     Ok(MlxMessage {
         role: role.to_string(),
         text: parts.join("\n"),
+        images,
     })
 }
 
@@ -3331,6 +4542,14 @@ fn stored_model_view(
         .map(|version| {
             let artifact_path = models_root.join(&version.artifact_relative_path);
             ensure_descendant(models_root, &artifact_path)?;
+            let projector_verification = M3ProjectorVerificationState::resolve(
+                version.model.capabilities.vision,
+                version.model.projector.as_ref(),
+                version.projector_verified_sha256.as_deref(),
+            );
+            let vision_ready = version.model.capabilities.vision
+                && projector_verification == M3ProjectorVerificationState::Verified
+                && runtime_supports_image_transport(version.model.runtime);
             Ok(M3InstalledVersionView {
                 version_key: version.version_key.clone(),
                 revision: version.model.revision.clone(),
@@ -3340,6 +4559,18 @@ fn stored_model_view(
                 installed_at_ms: version.installed_at_ms,
                 active: version.version_key == stored.active_version_key,
                 license: version.model.license.clone(),
+                source_id: version.model.source_id.clone(),
+                template: version.model.template.clone(),
+                projector: version.model.projector.clone(),
+                catalog_retrieved_at_ms: version.model.catalog_retrieved_at_ms,
+                projector_verification,
+                projector_verified_at_ms: version.projector_verified_at_ms,
+                estimated_projector_memory_bytes: version
+                    .model
+                    .projector
+                    .as_ref()
+                    .map(estimated_projector_memory_bytes),
+                vision_ready,
             })
         })
         .collect::<M3HubResult<Vec<_>>>()?;
@@ -3876,6 +5107,50 @@ fn validate_download_chunk(
     Ok(())
 }
 
+/// Finds an already-installed payload (under any asset or version) whose
+/// digest and size match the requested download, re-hashing the on-disk
+/// candidate before trusting it. A candidate whose bytes no longer match its
+/// own manifest (e.g. bit rot) is silently skipped rather than reused, so a
+/// corrupt local copy can never poison a new install; the caller falls back
+/// to a real network download in that case.
+fn find_reusable_payload(
+    state: &M3HubState,
+    models_root: &Path,
+    sha256: &str,
+    size_bytes: u64,
+) -> M3HubResult<Option<PathBuf>> {
+    for stored in &state.models {
+        for version in &stored.versions {
+            if version.model.sha256 != sha256 || version.model.size_bytes != size_bytes {
+                continue;
+            }
+            let candidate = models_root.join(&version.artifact_relative_path);
+            let Ok(true) = inspect_optional_regular(&candidate) else {
+                continue;
+            };
+            match sha256_file(&candidate, size_bytes) {
+                Ok(digest) if constant_time_eq(digest.as_bytes(), sha256.as_bytes()) => {
+                    return Ok(Some(candidate));
+                }
+                _ => continue,
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Places verified bytes at `destination` by hard-linking `source` when
+/// possible (sharing disk space with the existing copy) and falling back to
+/// a full copy if linking is unavailable (e.g. across filesystems).
+fn link_or_copy_owned(source: &Path, destination: &Path) -> M3HubResult<()> {
+    if fs::hard_link(source, destination).is_ok() {
+        return Ok(());
+    }
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| io_at("reuse verified model payload", destination, error))
+}
+
 fn verify_stored_model(stored: &M3StoredModel, models_root: &Path) -> M3HubResult<()> {
     for version in &stored.versions {
         let directory = models_root
@@ -3985,7 +5260,7 @@ fn relative_model_payload(asset_key: &str, version_key: &str) -> String {
     format!("{asset_key}/{version_key}/{MODEL_PAYLOAD_FILE}")
 }
 
-fn sha256_file(path: &Path, expected_size: u64) -> M3HubResult<String> {
+pub(crate) fn sha256_file(path: &Path, expected_size: u64) -> M3HubResult<String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| io_at("inspect checksum input", path, source))?;
     if !metadata.file_type().is_file() || metadata.len() != expected_size {
@@ -4469,5 +5744,1977 @@ fn io_at(operation: &'static str, path: &Path, source: io::Error) -> M3HubError 
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+// =========================================================================
+// Runtime Component Update Channels (ROADMAP.md Phase 8)
+// =========================================================================
+//
+// This is a parallel, analogous system to the model manifest/blob/digest
+// store above, but for the app's own runtime components — the `llama.cpp`
+// server binary, the MLX runtime, tokenizers, converters, projector
+// runtimes, and per-accelerator support packages (Metal/CUDA/ROCm/Vulkan)
+// the app depends on to run models — rather than model weights. Models and
+// components are deliberately kept as separate systems: they have different
+// trust/licensing rules (component installs are not gated on end-user
+// license acceptance the way model weights are) and different lifecycles
+// (a component has a channel — stable, beta, or pinned — instead of a
+// hardware-fit rating).
+//
+// The implementation intentionally mirrors the model system's shape
+// wherever the concepts line up (content-addressed storage keyed by a
+// digest-derived asset/version key, resumable chunked downloads, mandatory
+// digest verification before anything is marked active, atomic state
+// publication, activate-to-roll-back) and reuses every low-level primitive
+// above it safely can: `M3DownloadTransport`/`M3Clock`, `M3ResumeState`,
+// `prepare_resume_files`/`validate_download_chunk`, the atomic/private file
+// helpers, digest verification, and the generation-based state file format
+// (`parse_state_filename`/`prune_state_generations`). It does not reuse
+// `M3RuntimeHub`'s own state or locks — components have an independent
+// storage root and mutation lock so a component install/rollback can never
+// block or be blocked by a model operation.
+//
+// There is no real upstream binary registry/CDN this app can verify and hit
+// today for these artifacts, so — mirroring the pluggable `M3CatalogSource`
+// pattern used for model catalogs — `M3ComponentSource` is a trait with a
+// local, operator-editable implementation (`StaticM3ComponentSource`) rather
+// than a hardcoded call to a registry this environment cannot confirm
+// works. See `m3_production::component_registry_entries` for how production
+// wiring loads that local registry, and the crate-level PR notes for why.
+
+pub const M3_COMPONENT_CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const M3_COMPONENT_STATE_VERSION: u32 = 1;
+const COMPONENT_PAYLOAD_FILE: &str = "component.bin";
+const COMPONENT_MANIFEST_FILE: &str = "component.json";
+/// Bounded rollback history: the active version plus at most this many
+/// additional recently-installed versions are kept on disk. This guarantees
+/// at least one prior verified version is always available to roll back to
+/// after any update, while never growing storage without bound.
+const MAX_COMPONENT_VERSIONS_KEPT: usize = 3;
+const MAX_INSTALLED_COMPONENTS: usize = 512;
+const MAX_COMPONENT_SOURCES: usize = 64;
+const MAX_COMPATIBILITY_NOTE_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3ComponentKind {
+    LlamaCppServer,
+    MlxRuntime,
+    Tokenizer,
+    Converter,
+    ProjectorRuntime,
+    MetalSupport,
+    CudaSupport,
+    RocmSupport,
+    VulkanSupport,
+}
+
+/// Stable channel never auto-upgrades: it always tracks new verified
+/// releases meant for general use. Beta tracks pre-release builds. Pinned
+/// locks a component to one specific version indefinitely — `check_updates`
+/// never reports an update for a pinned component, no matter what the
+/// registry contains, until the operator explicitly installs a different
+/// version (which re-pins to that new version).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3ComponentChannel {
+    Stable,
+    Beta,
+    Pinned,
+}
+
+/// One known, downloadable version of a runtime component, as advertised by
+/// an `M3ComponentSource`. This is the component analogue of
+/// [`M3CatalogModel`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3ComponentCatalogEntry {
+    pub schema_version: u32,
+    pub source_id: String,
+    /// Stable identity for this component across versions/channels, e.g.
+    /// `"llama-cpp-server-metal"` or `"tokenizer-bpe"`. Kept distinct from
+    /// `kind` so more than one component can share a kind (for example two
+    /// `llama_cpp_server` builds targeting different accelerators).
+    pub component_id: String,
+    pub kind: M3ComponentKind,
+    pub display_name: String,
+    pub accelerator: Option<crate::runtime_adapter::AcceleratorKind>,
+    pub version: String,
+    pub channel: M3ComponentChannel,
+    pub download_url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub published_at_ms: u64,
+    /// Short human-readable note such as "requires driver >= 550" or "known
+    /// issue on pre-Turing NVIDIA GPUs", surfaced verbatim in the UI.
+    pub compatibility_note: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl M3ComponentCatalogEntry {
+    fn asset_key(&self) -> String {
+        sha256_hex(self.component_id.as_bytes())
+    }
+
+    fn version_key(&self) -> String {
+        sha256_hex(format!("{}\n{}\n{}", self.version, self.sha256, self.download_url).as_bytes())
+    }
+
+    pub fn validate(&self) -> M3HubResult<()> {
+        if self.schema_version != M3_COMPONENT_CATALOG_SCHEMA_VERSION {
+            return Err(invalid("component.schemaVersion", "is unsupported"));
+        }
+        for (field, value) in [
+            ("sourceId", self.source_id.as_str()),
+            ("componentId", self.component_id.as_str()),
+            ("displayName", self.display_name.as_str()),
+            ("version", self.version.as_str()),
+        ] {
+            validate_identifier(value, &format!("component.{field}"))?;
+        }
+        validate_sha256(&self.sha256, "component.sha256")?;
+        if self.size_bytes == 0 || self.size_bytes > MAX_DOWNLOAD_BYTES {
+            return Err(invalid(
+                "component.sizeBytes",
+                format!("must be between 1 and {MAX_DOWNLOAD_BYTES}"),
+            ));
+        }
+        validate_download_url(&self.download_url)?;
+        validate_timestamp(self.published_at_ms, "component.publishedAtMs")?;
+        if let Some(note) = &self.compatibility_note {
+            validate_text(
+                note,
+                "component.compatibilityNote",
+                MAX_COMPATIBILITY_NOTE_BYTES,
+            )?;
+            if note.trim().is_empty() {
+                return Err(invalid(
+                    "component.compatibilityNote",
+                    "must not be blank when present",
+                ));
+            }
+        }
+        if self.metadata.len() > 256 {
+            return Err(invalid("component.metadata", "contains too many entries"));
+        }
+        for (key, value) in &self.metadata {
+            validate_identifier(key, "component.metadata.key")?;
+            validate_text(value, "component.metadata.value", 64 * 1024)?;
+        }
+        Ok(())
+    }
+}
+
+/// A pluggable source of known runtime-component versions, mirroring
+/// [`M3CatalogSource`]'s shape for model catalogs.
+pub trait M3ComponentSource: Send + Sync {
+    fn source_id(&self) -> &str;
+    fn list<'a>(
+        &'a self,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, Vec<M3ComponentCatalogEntry>>;
+}
+
+/// A local, in-process registry of known component versions. There is no
+/// real upstream binary registry/CDN this app can verify and hit today for
+/// these artifacts, so this holds whatever entries production wiring loaded
+/// from a local, operator-editable file (see
+/// `m3_production::component_registry_entries`) instead of fetching a list
+/// of versions from the network. Only the already-known `download_url` of a
+/// chosen entry is ever fetched, through the same `M3DownloadTransport` used
+/// for models.
+pub struct StaticM3ComponentSource {
+    source_id: String,
+    entries: Vec<M3ComponentCatalogEntry>,
+}
+
+impl StaticM3ComponentSource {
+    pub fn new(
+        source_id: impl Into<String>,
+        entries: Vec<M3ComponentCatalogEntry>,
+    ) -> M3HubResult<Self> {
+        let source_id = source_id.into();
+        validate_identifier(&source_id, "componentSource.sourceId")?;
+        if entries.len() > MAX_CATALOG_ENTRIES {
+            return Err(invalid(
+                "componentSource.entries",
+                format!("at most {MAX_CATALOG_ENTRIES} entries are accepted"),
+            ));
+        }
+        for entry in &entries {
+            entry.validate()?;
+            if entry.source_id != source_id {
+                return Err(invalid(
+                    "componentSource.sourceId",
+                    "entry source differs from the configured source",
+                ));
+            }
+        }
+        Ok(Self { source_id, entries })
+    }
+}
+
+impl M3ComponentSource for StaticM3ComponentSource {
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn list<'a>(
+        &'a self,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, Vec<M3ComponentCatalogEntry>> {
+        Box::pin(async move {
+            context.preflight("component registry list")?;
+            Ok(self.entries.clone())
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct M3StoredComponentVersion {
+    version_key: String,
+    entry: M3ComponentCatalogEntry,
+    artifact_relative_path: String,
+    installed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct M3StoredComponent {
+    component_id: String,
+    asset_key: String,
+    active_version_key: String,
+    versions: Vec<M3StoredComponentVersion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct M3ComponentHubState {
+    state_version: u32,
+    generation: u64,
+    updated_at_ms: u64,
+    components: Vec<M3StoredComponent>,
+}
+
+impl Default for M3ComponentHubState {
+    fn default() -> Self {
+        Self {
+            state_version: M3_COMPONENT_STATE_VERSION,
+            generation: 0,
+            updated_at_ms: 0,
+            components: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3InstallComponentRequest {
+    pub entry: M3ComponentCatalogEntry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3ActivateComponentVersionRequest {
+    pub component_id: String,
+    pub version_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3InstalledComponentVersionView {
+    pub version_key: String,
+    pub version: String,
+    pub channel: M3ComponentChannel,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub source_url: String,
+    pub artifact_path: PathBuf,
+    pub installed_at_ms: u64,
+    pub published_at_ms: u64,
+    pub active: bool,
+    pub compatibility_note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3InstalledComponentView {
+    pub component_id: String,
+    pub kind: M3ComponentKind,
+    pub display_name: String,
+    pub accelerator: Option<crate::runtime_adapter::AcceleratorKind>,
+    /// Channel of the currently active version. Determines whether
+    /// `check_updates` may ever report an update for this component.
+    pub channel: M3ComponentChannel,
+    pub active_version_key: String,
+    pub versions: Vec<M3InstalledComponentVersionView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3ComponentUpdateCheck {
+    pub component_id: String,
+    pub channel: M3ComponentChannel,
+    pub installed_version: String,
+    pub installed_published_at_ms: u64,
+    pub latest_available: Option<M3ComponentCatalogEntry>,
+    pub update_available: bool,
+}
+
+pub struct M3ComponentHubDependencies {
+    pub clock: Arc<dyn M3Clock>,
+    pub download: Arc<dyn M3DownloadTransport>,
+    pub sources: Vec<Arc<dyn M3ComponentSource>>,
+}
+
+/// Versioned-component manager: the parallel, component-focused counterpart
+/// to [`M3RuntimeHub`]'s model manifest/blob/digest store. See the module
+/// section header above for how it relates to that system.
+pub struct M3ComponentHub {
+    config: M3HubConfig,
+    root: PathBuf,
+    blobs_root: PathBuf,
+    downloads_root: PathBuf,
+    state_root: PathBuf,
+    clock: Arc<dyn M3Clock>,
+    download: Arc<dyn M3DownloadTransport>,
+    sources: RwLock<Vec<Arc<dyn M3ComponentSource>>>,
+    state_lock: Mutex<()>,
+    mutation_lock: tokio::sync::Mutex<()>,
+}
+
+impl M3ComponentHub {
+    pub fn new(
+        root: impl AsRef<Path>,
+        config: M3HubConfig,
+        dependencies: M3ComponentHubDependencies,
+    ) -> M3HubResult<Self> {
+        config.validate()?;
+        validate_component_sources(&dependencies.sources)?;
+        let root = root.as_ref().to_path_buf();
+        if !root.is_absolute() {
+            return Err(invalid("root", "must be an absolute app-private path"));
+        }
+        ensure_private_directory(&root)?;
+        let blobs_root = root.join("blobs");
+        let downloads_root = root.join("downloads");
+        let state_root = root.join("state");
+        for directory in [&blobs_root, &downloads_root, &state_root] {
+            ensure_private_directory(directory)?;
+        }
+        // Fail fast on construction if the durable store is corrupt,
+        // mirroring `M3RuntimeHub::new`'s eager validation.
+        load_component_state(&state_root, &blobs_root)?;
+        Ok(Self {
+            config,
+            root,
+            blobs_root,
+            downloads_root,
+            state_root,
+            clock: dependencies.clock,
+            download: dependencies.download,
+            sources: RwLock::new(dependencies.sources),
+            state_lock: Mutex::new(()),
+            mutation_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    pub fn config(&self) -> &M3HubConfig {
+        &self.config
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn replace_sources(&self, sources: Vec<Arc<dyn M3ComponentSource>>) -> M3HubResult<()> {
+        validate_component_sources(&sources)?;
+        *write_lock(&self.sources)? = sources;
+        Ok(())
+    }
+
+    /// Reuses the model system's `M3StorageStatus` shape: `used_bytes` and
+    /// `available_for_models_bytes` describe this hub's own component blob
+    /// storage tree, not the model store.
+    pub fn storage_status(&self) -> M3HubResult<M3StorageStatus> {
+        let blob_bytes = directory_size(&self.blobs_root)?;
+        let pending_download_bytes = directory_size(&self.downloads_root)?;
+        let used_bytes = blob_bytes.checked_add(pending_download_bytes).ok_or_else(|| {
+            M3HubError::State("managed component storage byte count overflow".to_string())
+        })?;
+        let available_for_models_bytes = self
+            .config
+            .storage_quota_bytes
+            .saturating_sub(self.config.storage_reserve_bytes)
+            .saturating_sub(used_bytes);
+        Ok(M3StorageStatus {
+            root: self.root.clone(),
+            quota_bytes: self.config.storage_quota_bytes,
+            reserve_bytes: self.config.storage_reserve_bytes,
+            used_bytes,
+            available_for_models_bytes,
+            pending_download_bytes,
+        })
+    }
+
+    pub async fn list_registry(
+        &self,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+        context.preflight("component registry list")?;
+        let sources = read_lock(&self.sources)?.clone();
+        let mut entries = Vec::new();
+        let mut dedupe = BTreeSet::new();
+        for source in &sources {
+            let listed = run_bounded(
+                context,
+                "component source list",
+                source.list(context),
+            )
+            .await?;
+            if listed.len() > MAX_CATALOG_ENTRIES {
+                return Err(invalid(
+                    "component.entries",
+                    "source returned too many entries",
+                ));
+            }
+            for entry in listed {
+                entry.validate()?;
+                if entry.source_id != source.source_id() {
+                    return Err(invalid(
+                        "component.sourceId",
+                        "source returned an entry for another source",
+                    ));
+                }
+                let key = format!(
+                    "{}\n{}\n{}",
+                    entry.component_id, entry.version, entry.sha256
+                );
+                if dedupe.insert(key) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_by(|left, right| {
+            left.component_id
+                .cmp(&right.component_id)
+                .then_with(|| right.published_at_ms.cmp(&left.published_at_ms))
+        });
+        Ok(entries)
+    }
+
+    pub fn list_installed(&self) -> M3HubResult<Vec<M3InstalledComponentView>> {
+        let _guard = lock(&self.state_lock)?;
+        let state = load_component_state(&self.state_root, &self.blobs_root)?;
+        component_state_to_views(&state, &self.blobs_root)
+    }
+
+    pub async fn check_updates(
+        &self,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Vec<M3ComponentUpdateCheck>> {
+        context.preflight("component update check")?;
+        let installed = self.list_installed()?;
+        let registry = self.list_registry(context).await?;
+        let mut checks = Vec::with_capacity(installed.len());
+        for component in &installed {
+            let active = component
+                .versions
+                .iter()
+                .find(|version| version.active)
+                .ok_or_else(|| {
+                    M3HubError::State("active component version is missing".to_string())
+                })?;
+            let latest = if component.channel == M3ComponentChannel::Pinned {
+                None
+            } else {
+                registry
+                    .iter()
+                    .filter(|entry| {
+                        entry.component_id == component.component_id
+                            && entry.channel == component.channel
+                    })
+                    .max_by_key(|entry| entry.published_at_ms)
+                    .cloned()
+            };
+            let update_available = latest
+                .as_ref()
+                .is_some_and(|entry| entry.version_key() != component.active_version_key);
+            checks.push(M3ComponentUpdateCheck {
+                component_id: component.component_id.clone(),
+                channel: component.channel,
+                installed_version: active.version.clone(),
+                installed_published_at_ms: active.published_at_ms,
+                latest_available: latest,
+                update_available,
+            });
+        }
+        Ok(checks)
+    }
+
+    /// Downloads (resumably, digest-verified), installs, and activates a
+    /// component version. Mirrors `M3RuntimeHub::download_model`'s shape:
+    /// probe, chunked range reads into a partial file, whole-file digest
+    /// verification, then an atomic stage-then-rename publish. Never trusts
+    /// an unverified download — the digest check happens before the payload
+    /// is ever moved into the content-addressed blob tree.
+    pub async fn install_component(
+        &self,
+        request: &M3InstallComponentRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3InstalledComponentView> {
+        context.preflight("install component")?;
+        request.entry.validate()?;
+        let _mutation = self.mutation_lock.lock().await;
+        let component_id = request.entry.component_id.clone();
+        let asset_key = request.entry.asset_key();
+        let version_key = request.entry.version_key();
+
+        {
+            let _guard = lock(&self.state_lock)?;
+            let state = load_component_state(&self.state_root, &self.blobs_root)?;
+            if let Some(existing) = state.components.iter().find(|component| {
+                component.component_id == component_id
+                    && component.active_version_key == version_key
+                    && component.versions.iter().any(|version| {
+                        version.version_key == version_key
+                            && version.entry.sha256 == request.entry.sha256
+                    })
+            }) {
+                verify_stored_component(existing, &self.blobs_root)?;
+                return stored_component_view(existing, &self.blobs_root);
+            }
+        }
+
+        let probe = run_bounded(
+            context,
+            "probe component download",
+            self.download.probe(&request.entry.download_url, context),
+        )
+        .await?;
+        if probe.total_bytes != request.entry.size_bytes {
+            return Err(invalid(
+                "component.download.contentLength",
+                format!(
+                    "registry declares {} bytes but server declares {}",
+                    request.entry.size_bytes, probe.total_bytes
+                ),
+            ));
+        }
+        let partial_path = self
+            .downloads_root
+            .join(format!("{asset_key}{DOWNLOAD_SUFFIX}"));
+        let resume_path = self
+            .downloads_root
+            .join(format!("{asset_key}{RESUME_SUFFIX}"));
+        let expected_resume = M3ResumeState {
+            schema_version: M3_COMPONENT_CATALOG_SCHEMA_VERSION,
+            asset_key: asset_key.clone(),
+            version_key: version_key.clone(),
+            url: request.entry.download_url.clone(),
+            expected_sha256: request.entry.sha256.clone(),
+            total_bytes: request.entry.size_bytes,
+            etag: probe.etag.clone(),
+        };
+        prepare_resume_files(&partial_path, &resume_path, &expected_resume, &probe)?;
+        atomic_write_private(&resume_path, &canonical_json(&expected_resume)?)?;
+        let mut offset = regular_file_len_or_zero(&partial_path)?;
+        if offset > 0 && !probe.accepts_ranges {
+            remove_owned_file(&partial_path)?;
+            offset = 0;
+        }
+        let remaining = request.entry.size_bytes.saturating_sub(offset);
+        let available = self.storage_status()?.available_for_models_bytes;
+        if remaining > available {
+            return Err(M3HubError::Storage {
+                required: remaining,
+                available,
+            });
+        }
+
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut partial = options
+            .open(&partial_path)
+            .map_err(|source| io_at("open partial component", &partial_path, source))?;
+        while offset < request.entry.size_bytes {
+            context.preflight("install component")?;
+            let requested = usize::try_from(
+                (request.entry.size_bytes - offset).min(self.config.download_chunk_bytes as u64),
+            )
+            .map_err(|_| invalid("component.download.range", "size conversion overflow"))?;
+            let chunk = run_bounded(
+                context,
+                "download component range",
+                self.download.read_range(
+                    &request.entry.download_url,
+                    offset,
+                    requested,
+                    probe.etag.as_deref(),
+                    context,
+                ),
+            )
+            .await?;
+            validate_download_chunk(&chunk, &probe, offset, requested)?;
+            partial
+                .write_all(&chunk.bytes)
+                .and_then(|_| partial.sync_data())
+                .map_err(|source| io_at("append partial component", &partial_path, source))?;
+            offset = offset
+                .checked_add(chunk.bytes.len() as u64)
+                .ok_or_else(|| invalid("component.download.offset", "overflow"))?;
+        }
+        drop(partial);
+        let actual_digest = sha256_file(&partial_path, request.entry.size_bytes)?;
+        if !constant_time_eq(actual_digest.as_bytes(), request.entry.sha256.as_bytes()) {
+            remove_owned_file(&partial_path)?;
+            remove_owned_file(&resume_path)?;
+            return Err(M3HubError::Integrity {
+                expected: request.entry.sha256.clone(),
+                actual: actual_digest,
+            });
+        }
+
+        let asset_root = self.blobs_root.join(&asset_key);
+        ensure_private_directory(&asset_root)?;
+        let final_root = asset_root.join(&version_key);
+        if final_root.exists() {
+            verify_component_directory(&final_root, &request.entry)?;
+            remove_owned_file(&partial_path)?;
+        } else {
+            let staging = asset_root.join(format!(".staging-{}", Uuid::new_v4()));
+            ensure_private_directory(&staging)?;
+            let staging_payload = staging.join(COMPONENT_PAYLOAD_FILE);
+            fs::rename(&partial_path, &staging_payload)
+                .map_err(|source| io_at("stage verified component", &staging_payload, source))?;
+            harden_file(&staging_payload)?;
+            let manifest_path = staging.join(COMPONENT_MANIFEST_FILE);
+            atomic_write_private(&manifest_path, &canonical_json(&request.entry)?)?;
+            sync_directory(&staging)?;
+            fs::rename(&staging, &final_root)
+                .map_err(|source| io_at("publish verified component", &final_root, source))?;
+            sync_directory(&asset_root)?;
+        }
+        remove_owned_file(&resume_path)?;
+        let artifact_relative_path = relative_component_payload(&asset_key, &version_key);
+        let installed_at_ms = self.clock.now_ms()?;
+
+        let mut state = {
+            let _guard = lock(&self.state_lock)?;
+            load_component_state(&self.state_root, &self.blobs_root)?
+        };
+        let index = state
+            .components
+            .iter()
+            .position(|component| component.component_id == component_id);
+        let stored_version = M3StoredComponentVersion {
+            version_key: version_key.clone(),
+            entry: request.entry.clone(),
+            artifact_relative_path,
+            installed_at_ms,
+        };
+        match index {
+            Some(index) => {
+                let stored = &mut state.components[index];
+                if stored.asset_key != asset_key {
+                    return Err(M3HubError::State(
+                        "component id maps to an unexpected storage key".to_string(),
+                    ));
+                }
+                if let Some(version) = stored
+                    .versions
+                    .iter_mut()
+                    .find(|version| version.version_key == version_key)
+                {
+                    *version = stored_version;
+                } else {
+                    stored.versions.push(stored_version);
+                }
+                stored.active_version_key = version_key.clone();
+            }
+            None => {
+                if state.components.len() >= MAX_INSTALLED_COMPONENTS {
+                    return Err(M3HubError::Conflict(format!(
+                        "installed component count reached {MAX_INSTALLED_COMPONENTS}"
+                    )));
+                }
+                state.components.push(M3StoredComponent {
+                    component_id: component_id.clone(),
+                    asset_key,
+                    active_version_key: version_key,
+                    versions: vec![stored_version],
+                });
+                state
+                    .components
+                    .sort_by(|left, right| left.component_id.cmp(&right.component_id));
+            }
+        }
+
+        let component_index = state
+            .components
+            .iter()
+            .position(|component| component.component_id == component_id)
+            .ok_or_else(|| M3HubError::State("installed component vanished".to_string()))?;
+        let asset_key_for_prune = state.components[component_index].asset_key.clone();
+        let prune_root = self.blobs_root.join(&asset_key_for_prune);
+        let pruned =
+            prune_excess_component_versions(&mut state.components[component_index], &self.blobs_root)?;
+        let candidate = match stored_component_view(&state.components[component_index], &self.blobs_root) {
+            Ok(view) => view,
+            Err(error) => {
+                restore_isolated_versions(&pruned, &prune_root);
+                return Err(error);
+            }
+        };
+        let saved = {
+            let _guard = lock(&self.state_lock)?;
+            save_next_component_state(&self.state_root, &mut state, self.clock.now_ms()?)
+        };
+        if let Err(error) = saved {
+            restore_isolated_versions(&pruned, &prune_root);
+            return Err(error);
+        }
+        for (isolated_path, _) in &pruned {
+            remove_owned_directory(isolated_path)?;
+        }
+        sync_directory(&prune_root)?;
+        Ok(candidate)
+    }
+
+    /// Atomically activates an already-installed, digest-verified version —
+    /// this is also how rollback works: the UI calls this with an older
+    /// installed version's key. Mirrors
+    /// `M3RuntimeHub::activate_model_version`'s verify-then-swap shape.
+    pub async fn activate_component_version(
+        &self,
+        request: &M3ActivateComponentVersionRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3InstalledComponentView> {
+        validate_identifier(&request.component_id, "componentId")?;
+        validate_sha256(&request.version_key, "versionKey")?;
+        context.preflight("activate component version")?;
+        let _mutation = self.mutation_lock.lock().await;
+        let mut state = {
+            let _guard = lock(&self.state_lock)?;
+            load_component_state(&self.state_root, &self.blobs_root)?
+        };
+        let index = state
+            .components
+            .iter()
+            .position(|component| component.component_id == request.component_id)
+            .ok_or_else(|| M3HubError::NotFound(request.component_id.clone()))?;
+        let stored = state.components[index].clone();
+        let target = stored
+            .versions
+            .iter()
+            .find(|version| version.version_key == request.version_key)
+            .ok_or_else(|| M3HubError::NotFound(request.version_key.clone()))?;
+        verify_component_directory(
+            &self
+                .blobs_root
+                .join(&stored.asset_key)
+                .join(&target.version_key),
+            &target.entry,
+        )?;
+        if stored.active_version_key == request.version_key {
+            return stored_component_view(&stored, &self.blobs_root);
+        }
+        state.components[index].active_version_key = request.version_key.clone();
+        let candidate = stored_component_view(&state.components[index], &self.blobs_root)?;
+        {
+            let _guard = lock(&self.state_lock)?;
+            save_next_component_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
+        }
+        Ok(candidate)
+    }
+}
+
+fn prune_excess_component_versions(
+    stored: &mut M3StoredComponent,
+    blobs_root: &Path,
+) -> M3HubResult<Vec<(PathBuf, PathBuf)>> {
+    if stored.versions.len() <= MAX_COMPONENT_VERSIONS_KEPT {
+        return Ok(Vec::new());
+    }
+    let asset_root = blobs_root.join(&stored.asset_key);
+    let mut ordered: Vec<(u64, String)> = stored
+        .versions
+        .iter()
+        .map(|version| (version.installed_at_ms, version.version_key.clone()))
+        .collect();
+    ordered.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    kept.insert(stored.active_version_key.clone());
+    for (_, version_key) in &ordered {
+        if kept.len() >= MAX_COMPONENT_VERSIONS_KEPT {
+            break;
+        }
+        kept.insert(version_key.clone());
+    }
+    let mut isolated = Vec::new();
+    for version in stored
+        .versions
+        .iter()
+        .filter(|version| !kept.contains(&version.version_key))
+    {
+        let source = asset_root.join(&version.version_key);
+        let destination = asset_root.join(format!(".trash-auto-{}", version.version_key));
+        if let Err(source_error) = fs::rename(&source, &destination) {
+            restore_isolated_versions(&isolated, &asset_root);
+            return Err(io_at(
+                "isolate excess component version",
+                &source,
+                source_error,
+            ));
+        }
+        isolated.push((destination, source));
+    }
+    stored
+        .versions
+        .retain(|version| kept.contains(&version.version_key));
+    Ok(isolated)
+}
+
+fn load_component_state(state_root: &Path, blobs_root: &Path) -> M3HubResult<M3ComponentHubState> {
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(state_root)
+        .map_err(|source| io_at("list M3 component state", state_root, source))?
+    {
+        let entry =
+            entry.map_err(|source| io_at("read M3 component state entry", state_root, source))?;
+        let Some((generation, digest_prefix)) = parse_state_filename(&entry.file_name()) else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|source| io_at("inspect M3 component state", &path, source))?;
+        if !metadata.file_type().is_file() {
+            return Err(M3HubError::State(
+                "component state generation is not a regular file".to_string(),
+            ));
+        }
+        candidates.push((generation, digest_prefix, path, metadata.len()));
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    let Some((filename_generation, digest_prefix, path, size)) = candidates.first() else {
+        return Ok(M3ComponentHubState::default());
+    };
+    if *size > MAX_STATE_BYTES as u64 {
+        return Err(M3HubError::State(
+            "component state generation exceeds the byte limit".to_string(),
+        ));
+    }
+    let bytes = fs::read(path).map_err(|source| io_at("read M3 component state", path, source))?;
+    let actual_digest = sha256_hex(&bytes);
+    if !actual_digest.starts_with(digest_prefix) {
+        return Err(M3HubError::State(
+            "component state filename digest does not match its bytes".to_string(),
+        ));
+    }
+    let state: M3ComponentHubState = serde_json::from_slice(&bytes)?;
+    if state.generation != *filename_generation {
+        return Err(M3HubError::State(
+            "component state filename generation does not match its payload".to_string(),
+        ));
+    }
+    validate_component_hub_state(&state, blobs_root)?;
+    Ok(state)
+}
+
+fn save_next_component_state(
+    state_root: &Path,
+    state: &mut M3ComponentHubState,
+    now_ms: u64,
+) -> M3HubResult<()> {
+    validate_timestamp(now_ms, "componentState.updatedAtMs")?;
+    state.generation = state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| M3HubError::State("component state generation overflow".to_string()))?;
+    state.updated_at_ms = now_ms;
+    validate_component_hub_state_structure(state)?;
+    let bytes = canonical_json(state)?;
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(M3HubError::State(
+            "component state exceeds the byte limit".to_string(),
+        ));
+    }
+    let digest = sha256_hex(&bytes);
+    let path = state_root.join(format!(
+        "{STATE_PREFIX}{:020}-{}{STATE_SUFFIX}",
+        state.generation,
+        &digest[..16]
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .map_err(|source| io_at("create M3 component state", &path, source))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|source| io_at("write M3 component state", &path, source))?;
+    sync_directory(state_root)?;
+    prune_state_generations(state_root, state.generation)?;
+    Ok(())
+}
+
+fn validate_component_hub_state(
+    state: &M3ComponentHubState,
+    blobs_root: &Path,
+) -> M3HubResult<()> {
+    validate_component_hub_state_structure(state)?;
+    for stored in &state.components {
+        for version in &stored.versions {
+            let artifact = blobs_root.join(&version.artifact_relative_path);
+            ensure_descendant(blobs_root, &artifact)?;
+            let metadata = fs::symlink_metadata(&artifact)
+                .map_err(|source| io_at("inspect installed component", &artifact, source))?;
+            if !metadata.file_type().is_file() || metadata.len() != version.entry.size_bytes {
+                return Err(M3HubError::State(format!(
+                    "installed component {} has missing or invalid payload metadata",
+                    stored.component_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_hub_state_structure(state: &M3ComponentHubState) -> M3HubResult<()> {
+    if state.state_version != M3_COMPONENT_STATE_VERSION {
+        return Err(M3HubError::State(
+            "unsupported M3 component state version".to_string(),
+        ));
+    }
+    if state.generation == 0 {
+        if state.updated_at_ms != 0 || !state.components.is_empty() {
+            return Err(M3HubError::State(
+                "generation zero is reserved for empty in-memory component state".to_string(),
+            ));
+        }
+    } else {
+        validate_timestamp(state.updated_at_ms, "componentState.updatedAtMs")?;
+    }
+    if state.components.len() > MAX_INSTALLED_COMPONENTS {
+        return Err(M3HubError::State(
+            "installed component count exceeds the limit".to_string(),
+        ));
+    }
+    let mut component_ids = BTreeSet::new();
+    let mut asset_keys = BTreeSet::new();
+    for stored in &state.components {
+        validate_identifier(&stored.component_id, "componentState.componentId")?;
+        validate_sha256(&stored.asset_key, "componentState.assetKey")?;
+        if stored.asset_key != sha256_hex(stored.component_id.as_bytes()) {
+            return Err(M3HubError::State(
+                "stored component asset key does not derive from its id".to_string(),
+            ));
+        }
+        if !component_ids.insert(&stored.component_id) || !asset_keys.insert(&stored.asset_key) {
+            return Err(M3HubError::State(
+                "installed component ids and keys must be unique".to_string(),
+            ));
+        }
+        if stored.versions.is_empty() || stored.versions.len() > MAX_COMPONENT_VERSIONS_KEPT {
+            return Err(M3HubError::State(
+                "installed component version count is invalid".to_string(),
+            ));
+        }
+        let mut version_keys = BTreeSet::new();
+        for version in &stored.versions {
+            version.entry.validate()?;
+            if version.entry.component_id != stored.component_id
+                || version.version_key != version.entry.version_key()
+            {
+                return Err(M3HubError::State(
+                    "installed component version identity differs from its registry record"
+                        .to_string(),
+                ));
+            }
+            validate_sha256(&version.version_key, "componentState.versionKey")?;
+            validate_timestamp(version.installed_at_ms, "componentState.installedAtMs")?;
+            if version.artifact_relative_path
+                != relative_component_payload(&stored.asset_key, &version.version_key)
+            {
+                return Err(M3HubError::State(
+                    "installed component artifact path is not canonical".to_string(),
+                ));
+            }
+            validate_relative_path(&version.artifact_relative_path)?;
+            if !version_keys.insert(&version.version_key) {
+                return Err(M3HubError::State(
+                    "installed component version keys must be unique".to_string(),
+                ));
+            }
+        }
+        if !version_keys.contains(&stored.active_version_key) {
+            return Err(M3HubError::State(
+                "active component version does not exist".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn component_state_to_views(
+    state: &M3ComponentHubState,
+    blobs_root: &Path,
+) -> M3HubResult<Vec<M3InstalledComponentView>> {
+    let mut output = state
+        .components
+        .iter()
+        .map(|component| stored_component_view(component, blobs_root))
+        .collect::<M3HubResult<Vec<_>>>()?;
+    output.sort_by(|left, right| left.component_id.cmp(&right.component_id));
+    Ok(output)
+}
+
+fn stored_component_view(
+    stored: &M3StoredComponent,
+    blobs_root: &Path,
+) -> M3HubResult<M3InstalledComponentView> {
+    let active = stored
+        .versions
+        .iter()
+        .find(|version| version.version_key == stored.active_version_key)
+        .ok_or_else(|| M3HubError::State("active component version is missing".to_string()))?;
+    let mut versions = stored
+        .versions
+        .iter()
+        .map(|version| {
+            let artifact_path = blobs_root.join(&version.artifact_relative_path);
+            ensure_descendant(blobs_root, &artifact_path)?;
+            Ok(M3InstalledComponentVersionView {
+                version_key: version.version_key.clone(),
+                version: version.entry.version.clone(),
+                channel: version.entry.channel,
+                sha256: version.entry.sha256.clone(),
+                size_bytes: version.entry.size_bytes,
+                source_url: version.entry.download_url.clone(),
+                artifact_path,
+                installed_at_ms: version.installed_at_ms,
+                published_at_ms: version.entry.published_at_ms,
+                active: version.version_key == stored.active_version_key,
+                compatibility_note: version.entry.compatibility_note.clone(),
+            })
+        })
+        .collect::<M3HubResult<Vec<_>>>()?;
+    versions.sort_by(|left, right| right.installed_at_ms.cmp(&left.installed_at_ms));
+    Ok(M3InstalledComponentView {
+        component_id: stored.component_id.clone(),
+        kind: active.entry.kind,
+        display_name: active.entry.display_name.clone(),
+        accelerator: active.entry.accelerator,
+        channel: active.entry.channel,
+        active_version_key: stored.active_version_key.clone(),
+        versions,
+    })
+}
+
+fn verify_stored_component(stored: &M3StoredComponent, blobs_root: &Path) -> M3HubResult<()> {
+    let active = stored
+        .versions
+        .iter()
+        .find(|version| version.version_key == stored.active_version_key)
+        .ok_or_else(|| M3HubError::State("active component version is missing".to_string()))?;
+    verify_component_directory(
+        &blobs_root.join(&stored.asset_key).join(&active.version_key),
+        &active.entry,
+    )
+}
+
+fn verify_component_directory(
+    directory: &Path,
+    expected: &M3ComponentCatalogEntry,
+) -> M3HubResult<()> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|source| io_at("inspect component version", directory, source))?;
+    if !metadata.file_type().is_dir() {
+        return Err(M3HubError::State(
+            "component version is not a real directory".to_string(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|source| io_at("list component version", directory, source))?
+    {
+        let entry =
+            entry.map_err(|source| io_at("read component version entry", directory, source))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| M3HubError::State("component entry name is not UTF-8".to_string()))?
+            .to_string();
+        let entry_metadata = entry
+            .metadata()
+            .map_err(|source| io_at("inspect component version entry", &entry.path(), source))?;
+        if !entry_metadata.is_file()
+            || !matches!(name.as_str(), COMPONENT_PAYLOAD_FILE | COMPONENT_MANIFEST_FILE)
+        {
+            return Err(M3HubError::State(
+                "component version contains an unexpected entry".to_string(),
+            ));
+        }
+        names.insert(name);
+    }
+    if names
+        != BTreeSet::from([
+            COMPONENT_MANIFEST_FILE.to_string(),
+            COMPONENT_PAYLOAD_FILE.to_string(),
+        ])
+    {
+        return Err(M3HubError::State(
+            "component version is missing required files".to_string(),
+        ));
+    }
+    let manifest_path = directory.join(COMPONENT_MANIFEST_FILE);
+    let manifest: M3ComponentCatalogEntry =
+        serde_json::from_slice(&read_regular_bounded(&manifest_path, MAX_STATE_BYTES)?)?;
+    if &manifest != expected {
+        return Err(M3HubError::State(
+            "component manifest differs from authenticated hub state".to_string(),
+        ));
+    }
+    let payload = directory.join(COMPONENT_PAYLOAD_FILE);
+    let digest = sha256_file(&payload, expected.size_bytes)?;
+    if !constant_time_eq(digest.as_bytes(), expected.sha256.as_bytes()) {
+        return Err(M3HubError::Integrity {
+            expected: expected.sha256.clone(),
+            actual: digest,
+        });
+    }
+    Ok(())
+}
+
+fn relative_component_payload(asset_key: &str, version_key: &str) -> String {
+    format!("{asset_key}/{version_key}/{COMPONENT_PAYLOAD_FILE}")
+}
+
+fn validate_component_sources(sources: &[Arc<dyn M3ComponentSource>]) -> M3HubResult<()> {
+    if sources.len() > MAX_COMPONENT_SOURCES {
+        return Err(invalid(
+            "componentSources",
+            format!("at most {MAX_COMPONENT_SOURCES} sources are accepted"),
+        ));
+    }
+    let mut source_ids = BTreeSet::new();
+    for source in sources {
+        validate_identifier(source.source_id(), "componentSource.sourceId")?;
+        if !source_ids.insert(source.source_id().to_string()) {
+            return Err(invalid("componentSources", "source ids must be unique"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compatibility_hub::CanonicalToolDefinition;
+
+    // ------------------------------------------------------------------
+    // Phase 8 item 10: tool-call and structured-output parser hardening.
+    //
+    // This module previously had no test coverage at all, despite owning
+    // `CanonicalCollector` (which turns a `CanonicalStreamEvent` sequence
+    // into the final `CanonicalInferenceResponse` for both `.complete()`
+    // implementations) and `MlxCanonicalSink` (which translates the MLX
+    // runtime's own event protocol into canonical events). These fixtures
+    // exercise both directly against adversarial/malformed input, the same
+    // way the m3_production.rs OpenAI-compatible-engine fixtures do.
+    // ------------------------------------------------------------------
+
+    fn request_with_tools(tools: &[&str]) -> CanonicalInferenceRequest {
+        CanonicalInferenceRequest {
+            schema_version: crate::compatibility_hub::COMPATIBILITY_SCHEMA_VERSION,
+            protocol: CompatibilityProtocol::OpenAiChatCompletions,
+            request_id: "request-mlx".to_string(),
+            model: "local-model".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::User,
+                content: vec![CanonicalContent::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
+            tools: tools
+                .iter()
+                .map(|name| CanonicalToolDefinition {
+                    name: name.to_string(),
+                    description: "test tool".to_string(),
+                    input_schema: json!({"type":"object","properties":{}}),
+                    strict: false,
+                })
+                .collect(),
+            max_output_tokens: 32,
+            temperature: None,
+            stream: true,
+            response_schema: None,
+            metadata: Value::Null,
+        }
+    }
+
+    fn started_collector(request: &CanonicalInferenceRequest) -> CanonicalCollector {
+        let mut collector = CanonicalCollector::default();
+        collector
+            .emit(CanonicalStreamEvent::ResponseStart {
+                response_id: "resp-1".to_string(),
+                model: request.model.clone(),
+                created_at_seconds: 0,
+            })
+            .expect("response start");
+        collector
+    }
+
+    fn complete_collector(
+        mut collector: CanonicalCollector,
+        request: &CanonicalInferenceRequest,
+    ) -> M3HubResult<CanonicalInferenceResponse> {
+        collector
+            .emit(CanonicalStreamEvent::ResponseCompleted {
+                response_id: "resp-1".to_string(),
+                finish_reason: "tool_calls".to_string(),
+                usage: CanonicalUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            })
+            .map_err(M3HubError::Runtime)?;
+        collector.into_response(request, 0)
+    }
+
+    /// Splits the JSON text for `value` into 3+ fragments, deliberately
+    /// cutting inside an embedded `{`/`}` pair and inside an escaped quote —
+    /// the two spots a naive brace-counting parser (instead of buffering
+    /// verbatim and parsing once complete) would get wrong. `value` must
+    /// contain a string field with a `{...}` substring and an escaped quote.
+    fn split_with_embedded_brace_and_escape(value: &Value) -> Vec<String> {
+        let text = value.to_string();
+        let mut braces = text.match_indices('{');
+        let _outer_open = braces.next().expect("outer open brace");
+        let (embedded_open, _) = braces.next().expect("embedded open brace");
+        let (embedded_close, _) = text
+            .match_indices('}')
+            .next()
+            .expect("embedded close brace");
+        let (escape_at, _) = text
+            .match_indices("\\\"")
+            .next()
+            .expect("escaped quote");
+        let mut cuts = vec![embedded_open + 1, embedded_close, escape_at + 1];
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut fragments = Vec::new();
+        let mut previous = 0;
+        for cut in cuts {
+            fragments.push(text[previous..cut].to_string());
+            previous = cut;
+        }
+        fragments.push(text[previous..].to_string());
+        fragments
+    }
+
+    /// Naive brace-counting to find where a streamed tool call's JSON ends
+    /// breaks the moment a string value contains braces. `CanonicalCollector`
+    /// never brace-counts: it concatenates every `ToolCallArgumentsDelta`
+    /// fragment verbatim and only asks `serde_json` to parse the result once
+    /// the call is over, so this must reconstruct exactly.
+    #[test]
+    fn collector_reconstructs_brace_in_string_arguments_across_fragments() {
+        let request = request_with_tools(&["search"]);
+        let arguments_value = json!({"note": "find {ignored} \"quoted\" value"});
+        let fragments = split_with_embedded_brace_and_escape(&arguments_value);
+        assert!(fragments.len() >= 3, "expected multiple fragments");
+
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("tool call start");
+        for fragment in &fragments {
+            collector
+                .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                    json_delta: fragment.clone(),
+                })
+                .expect("argument fragment");
+        }
+        collector
+            .emit(CanonicalStreamEvent::ToolCallEnd {
+                index: 0,
+                call_id: "call_1".to_string(),
+            })
+            .expect("tool call end");
+        let response = complete_collector(collector, &request).expect("response assembles");
+        assert_eq!(
+            response.content,
+            vec![CanonicalContent::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: arguments_value,
+            }]
+        );
+    }
+
+    #[test]
+    fn collector_rejects_duplicate_tool_block_index() {
+        let request = request_with_tools(&["search"]);
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("first start");
+        let result = collector.emit(CanonicalStreamEvent::ToolCallStart {
+            index: 0,
+            call_id: "call_2".to_string(),
+            name: "search".to_string(),
+        });
+        assert!(matches!(result, Err(ref message) if message.contains("duplicate")));
+    }
+
+    #[test]
+    fn collector_rejects_arguments_before_start_and_call_id_mismatch() {
+        let request = request_with_tools(&["search"]);
+        let mut collector = started_collector(&request);
+        assert!(collector
+            .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                call_id: "call_1".to_string(),
+                json_delta: "{}".to_string(),
+            })
+            .is_err());
+
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("start");
+        let mismatched = collector.emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+            index: 0,
+            call_id: "wrong-id".to_string(),
+            json_delta: "{}".to_string(),
+        });
+        assert!(matches!(mismatched, Err(ref message) if message.contains("mismatch")));
+
+        let end_mismatch = collector.emit(CanonicalStreamEvent::ToolCallEnd {
+            index: 0,
+            call_id: "wrong-id".to_string(),
+        });
+        assert!(matches!(end_mismatch, Err(ref message) if message.contains("mismatch")));
+    }
+
+    /// A tool call that started but never received `ToolCallEnd` (stream
+    /// truncated, connection dropped) must not silently resolve into a
+    /// completed response.
+    #[test]
+    fn collector_rejects_unfinished_tool_call_at_response_assembly() {
+        let request = request_with_tools(&["search"]);
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+            })
+            .expect("start");
+        collector
+            .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                call_id: "call_1".to_string(),
+                json_delta: "{\"q\": \"incomplete".to_string(),
+            })
+            .expect("delta");
+        // No `ToolCallEnd`: the stream ends here.
+        let result = complete_collector(collector, &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("unfinished")),
+            "expected an unfinished-tool-call rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn collector_rejects_arguments_that_are_not_valid_json_or_not_an_object() {
+        let request = request_with_tools(&["search"]);
+        for arguments in ["{\"unterminated", "42", "[1,2,3]", ""] {
+            let mut collector = started_collector(&request);
+            collector
+                .emit(CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                })
+                .expect("start");
+            collector
+                .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                    json_delta: arguments.to_string(),
+                })
+                .expect("delta");
+            collector
+                .emit(CanonicalStreamEvent::ToolCallEnd {
+                    index: 0,
+                    call_id: "call_1".to_string(),
+                })
+                .expect("end");
+            let result = complete_collector(collector, &request);
+            assert!(
+                result.is_err(),
+                "arguments {arguments:?} should not assemble into a response"
+            );
+        }
+    }
+
+    /// The other half of the acceptance criterion: a tool call naming
+    /// something the request never offered must never reach a caller as a
+    /// materialized `ToolUse` — the collector is the shared choke point for
+    /// both the MLX and any future collector-backed engine, so it is the
+    /// right place to enforce this regardless of which runtime produced the
+    /// stream.
+    #[test]
+    fn collector_rejects_tool_call_naming_an_unoffered_tool() {
+        let request = request_with_tools(&["weather"]);
+        let mut collector = started_collector(&request);
+        collector
+            .emit(CanonicalStreamEvent::ToolCallStart {
+                index: 0,
+                call_id: "call_1".to_string(),
+                name: "shell_exec".to_string(),
+            })
+            .expect("start");
+        collector
+            .emit(CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                call_id: "call_1".to_string(),
+                json_delta: "{\"cmd\":\"rm -rf /\"}".to_string(),
+            })
+            .expect("delta");
+        collector
+            .emit(CanonicalStreamEvent::ToolCallEnd {
+                index: 0,
+                call_id: "call_1".to_string(),
+            })
+            .expect("end");
+        let result = complete_collector(collector, &request);
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
+            "expected an unoffered-tool rejection, got {result:?}"
+        );
+    }
+
+    /// Full MLX-runtime pipeline: raw `MlxStreamEvent`s (as the MLX sidecar
+    /// process would emit, one JSON object per line) run through
+    /// `MlxCanonicalSink` and land in a `CanonicalCollector`, mirroring what
+    /// `MlxRuntimeAdapter::stream`/`complete` do in production.
+    fn run_mlx_pipeline(
+        request: &CanonicalInferenceRequest,
+        events: Vec<MlxStreamEvent>,
+    ) -> M3HubResult<CanonicalInferenceResponse> {
+        let mut collector = started_collector(request);
+        {
+            let mut sink = MlxCanonicalSink::new(&mut collector, "resp-1".to_string());
+            for event in events {
+                sink.emit(event).map_err(M3HubError::Runtime)?;
+            }
+        }
+        collector.into_response(request, 0)
+    }
+
+    #[test]
+    fn mlx_pipeline_reconstructs_brace_in_string_arguments() {
+        let request = request_with_tools(&["search"]);
+        let arguments_value = json!({"note": "a {braced} \"quoted\" value"});
+        let fragments = split_with_embedded_brace_and_escape(&arguments_value);
+        assert!(fragments.len() >= 3, "expected multiple fragments");
+
+        let mut events = vec![MlxStreamEvent::ToolCallStart {
+            call_id: "call_1".to_string(),
+            name: "search".to_string(),
+        }];
+        events.extend(
+            fragments
+                .into_iter()
+                .map(|fragment| MlxStreamEvent::ToolCallArgumentsDelta {
+                    call_id: "call_1".to_string(),
+                    json: fragment,
+                }),
+        );
+        events.push(MlxStreamEvent::ToolCallEnd {
+            call_id: "call_1".to_string(),
+        });
+        events.push(MlxStreamEvent::Completed {
+            input_tokens: 3,
+            output_tokens: 5,
+        });
+        let response =
+            run_mlx_pipeline(&request, events).expect("mlx pipeline assembles a response");
+        assert_eq!(
+            response.content,
+            vec![CanonicalContent::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: arguments_value,
+            }]
+        );
+        assert_eq!(response.finish_reason, "tool_use");
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_duplicate_tool_call_id() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                },
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("duplicate")),
+            "expected a duplicate-id rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_arguments_before_start() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![MlxStreamEvent::ToolCallArgumentsDelta {
+                call_id: "call_1".to_string(),
+                json: "{}".to_string(),
+            }],
+        );
+        assert!(matches!(result, Err(M3HubError::Runtime(_))));
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_end_for_unknown_tool_call() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![MlxStreamEvent::ToolCallEnd {
+                call_id: "call_1".to_string(),
+            }],
+        );
+        assert!(matches!(result, Err(M3HubError::Runtime(_))));
+    }
+
+    /// The MLX sidecar process crashing or its stream being cut mid-call
+    /// (started, never ended) must not silently complete as if nothing
+    /// happened.
+    #[test]
+    fn mlx_pipeline_rejects_completed_with_unfinished_tool_call() {
+        let request = request_with_tools(&["search"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                },
+                MlxStreamEvent::ToolCallArgumentsDelta {
+                    call_id: "call_1".to_string(),
+                    json: "{\"q\":\"incomplete".to_string(),
+                },
+                MlxStreamEvent::Completed {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("unfinished")),
+            "expected an unfinished-tool-call rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mlx_pipeline_rejects_tool_call_naming_an_unoffered_tool() {
+        let request = request_with_tools(&["weather"]);
+        let result = run_mlx_pipeline(
+            &request,
+            vec![
+                MlxStreamEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    name: "shell_exec".to_string(),
+                },
+                MlxStreamEvent::ToolCallArgumentsDelta {
+                    call_id: "call_1".to_string(),
+                    json: "{\"cmd\":\"rm -rf /\"}".to_string(),
+                },
+                MlxStreamEvent::ToolCallEnd {
+                    call_id: "call_1".to_string(),
+                },
+                MlxStreamEvent::Completed {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
+            "expected an unoffered-tool rejection, got {result:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ROADMAP Phase 8 item 17: Sampler, Batching, and Speculative Decoding
+    // Controls. Pure unit coverage for `ModelFamily::detect`,
+    // `compatible_draft_models`, and `gate_advanced_settings` — the
+    // end-to-end `set_runtime_config`/`load_model`/
+    // `resolve_setting_capabilities` enforcement paths are covered by
+    // `tests/m3_runtime_hub_contract.rs` against a real `M3RuntimeHub`.
+    // ------------------------------------------------------------------
+
+    fn installed_model_view(
+        asset_id: &str,
+        model_id: &str,
+        display_name: &str,
+        runtime: M3RuntimeKind,
+        estimated_ram_bytes: u64,
+    ) -> M3InstalledModelView {
+        M3InstalledModelView {
+            asset_id: asset_id.to_string(),
+            model_id: model_id.to_string(),
+            display_name: display_name.to_string(),
+            runtime,
+            variant_id: "q4_k_m".to_string(),
+            capabilities: M3ModelCapabilities {
+                chat: true,
+                embeddings: false,
+                tool_calling: false,
+                vision: false,
+                structured_output: false,
+            },
+            estimated_ram_bytes,
+            estimated_vram_bytes: 0,
+            required_accelerator: None,
+            active_version_key: "version-1".to_string(),
+            versions: Vec::new(),
+        }
+    }
+
+    fn cpu_only_compatibility_report() -> M3HardwareCompatibilityReport {
+        compatibility_report_from_snapshot(&HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            available_ram_bytes: 8 * 1024 * 1024 * 1024,
+            logical_cpu_count: 8,
+            platform: crate::runtime_adapter::PlatformCapabilities::from_host(
+                "linux",
+                "x86_64",
+                Vec::new(),
+            ),
+        })
+    }
+
+    fn cuda_compatibility_report() -> M3HardwareCompatibilityReport {
+        compatibility_report_from_snapshot(&HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            available_ram_bytes: 8 * 1024 * 1024 * 1024,
+            logical_cpu_count: 8,
+            platform: crate::runtime_adapter::PlatformCapabilities::from_host(
+                "linux",
+                "x86_64",
+                vec![crate::runtime_adapter::AcceleratorCapability {
+                    kind: AcceleratorKind::Cuda,
+                    available: true,
+                    device_names: vec!["Test GPU".to_string()],
+                    total_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+                    available_memory_bytes: Some(20 * 1024 * 1024 * 1024),
+                }],
+            ),
+        })
+    }
+
+    /// Minimal capability fixture covering only the three keys
+    /// `gate_advanced_settings` actually gates — deliberately not a copy of
+    /// the real (private) `llama_setting_capabilities()`, so these tests
+    /// exercise the gating function's contract rather than duplicating that
+    /// module's own declaration.
+    fn llama_capabilities_fixture() -> Vec<AdvancedSettingCapability> {
+        vec![
+            AdvancedSettingCapability {
+                key: "flash_attention".to_string(),
+                label: "Flash attention".to_string(),
+                description: "Flash attention behavior".to_string(),
+                schema: crate::runtime_adapter::SettingValueSchema::Choice {
+                    options: vec!["auto".to_string(), "on".to_string(), "off".to_string()],
+                },
+                default_value: SettingValue::Choice {
+                    value: "auto".to_string(),
+                },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "mixed_precision".to_string(),
+                label: "Mixed precision (KV cache)".to_string(),
+                description: "KV cache quantization".to_string(),
+                schema: crate::runtime_adapter::SettingValueSchema::Choice {
+                    options: vec!["f16".to_string(), "q8_0".to_string(), "q4_0".to_string()],
+                },
+                default_value: SettingValue::Choice {
+                    value: "f16".to_string(),
+                },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "speculative_decoding_draft_model".to_string(),
+                label: "Speculative decoding draft model".to_string(),
+                description: "Draft model id for speculative decoding".to_string(),
+                schema: crate::runtime_adapter::SettingValueSchema::Text { max_bytes: 256 },
+                default_value: SettingValue::Text {
+                    value: String::new(),
+                },
+                restart_required: true,
+                supported: false,
+                unsupported_reason: Some(
+                    "Select a model to check for a compatible installed draft model.".to_string(),
+                ),
+            },
+        ]
+    }
+
+    #[test]
+    fn model_family_detect_buckets_known_names_and_falls_back_to_generic() {
+        assert_eq!(
+            ModelFamily::detect("llama-3-8b-instruct", "Llama 3 8B Instruct", "q4_k_m"),
+            ModelFamily::Llama
+        );
+        assert_eq!(
+            ModelFamily::detect("qwen2-7b-instruct", "Qwen2 7B Instruct", "q4_k_m"),
+            ModelFamily::Qwen
+        );
+        assert_eq!(
+            ModelFamily::detect("mixtral-8x7b", "Mixtral 8x7B", "q4_k_m"),
+            ModelFamily::Mistral
+        );
+        assert_eq!(
+            ModelFamily::detect("gemma-2-9b", "Gemma 2 9B", "q4_k_m"),
+            ModelFamily::Gemma
+        );
+        assert_eq!(
+            ModelFamily::detect("phi-3.5-mini", "Phi 3.5 Mini", "q4_k_m"),
+            ModelFamily::Phi
+        );
+        assert_eq!(
+            ModelFamily::detect("deepseek-r1-distill", "DeepSeek R1 Distill", "q4_k_m"),
+            ModelFamily::DeepSeek
+        );
+        assert_eq!(
+            ModelFamily::detect("custom-corp-model", "Custom Corp Model", "q4_k_m"),
+            ModelFamily::Generic
+        );
+    }
+
+    #[test]
+    fn compatible_draft_models_requires_llama_cpp_named_family_match_and_smaller_footprint() {
+        let target = installed_model_view(
+            "llama_cpp:llama-3-8b-instruct:q4_k_m",
+            "llama-3-8b-instruct",
+            "Llama 3 8B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            8_000_000_000,
+        );
+        let smaller_same_family = installed_model_view(
+            "llama_cpp:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        );
+        let larger_same_family = installed_model_view(
+            "llama_cpp:llama-3-70b-instruct:q4_k_m",
+            "llama-3-70b-instruct",
+            "Llama 3 70B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            70_000_000_000,
+        );
+        let smaller_different_family = installed_model_view(
+            "llama_cpp:mistral-7b-instruct:q4_k_m",
+            "mistral-7b-instruct",
+            "Mistral 7B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            4_000_000_000,
+        );
+        let smaller_same_family_wrong_runtime = installed_model_view(
+            "ollama:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct (Ollama)",
+            M3RuntimeKind::Ollama,
+            1_000_000_000,
+        );
+        let installed = vec![
+            target.clone(),
+            smaller_same_family.clone(),
+            larger_same_family,
+            smaller_different_family,
+            smaller_same_family_wrong_runtime,
+        ];
+
+        let candidates = compatible_draft_models(&target, &installed);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].asset_id, smaller_same_family.asset_id);
+
+        // A target whose own model_id/display_name never matched a named
+        // family never gets a draft — two "generic" models are not assumed
+        // related just because both are unclassified.
+        let generic_target = installed_model_view(
+            "llama_cpp:custom-corp-model:q4_k_m",
+            "custom-corp-model",
+            "Custom Corp Model",
+            M3RuntimeKind::LlamaCpp,
+            8_000_000_000,
+        );
+        let generic_smaller = installed_model_view(
+            "llama_cpp:another-custom-model:q4_k_m",
+            "another-custom-model",
+            "Another Custom Model",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        );
+        assert!(compatible_draft_models(&generic_target, &[generic_target.clone(), generic_smaller]).is_empty());
+
+        // A non-llama.cpp target never gets a draft at all, regardless of
+        // family/size — speculative decoding is only wired for llama.cpp.
+        let ollama_target = installed_model_view(
+            "ollama:llama-3-8b-instruct:q4_k_m",
+            "llama-3-8b-instruct",
+            "Llama 3 8B Instruct",
+            M3RuntimeKind::Ollama,
+            8_000_000_000,
+        );
+        assert!(compatible_draft_models(&ollama_target, &installed_smaller_llama_cpp_fixture()).is_empty());
+    }
+
+    /// A single smaller, same-family, llama.cpp-runtime model — used only to
+    /// prove a non-llama.cpp target still gets no draft candidates even when
+    /// a plausible one exists for a different runtime.
+    fn installed_smaller_llama_cpp_fixture() -> Vec<M3InstalledModelView> {
+        vec![installed_model_view(
+            "llama_cpp:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        )]
+    }
+
+    #[test]
+    fn gate_advanced_settings_flips_flash_attention_and_mixed_precision_with_the_hardware_report() {
+        let capabilities = llama_capabilities_fixture();
+        let cpu_result = gate_advanced_settings(&capabilities, &cpu_only_compatibility_report(), None, &[]);
+        let flash_attention = cpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "flash_attention")
+            .expect("flash_attention present");
+        assert!(!flash_attention.supported);
+        assert!(flash_attention.unsupported_reason.is_some());
+        let mixed_precision = cpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "mixed_precision")
+            .expect("mixed_precision present");
+        assert!(!mixed_precision.supported);
+
+        let gpu_result = gate_advanced_settings(&capabilities, &cuda_compatibility_report(), None, &[]);
+        let flash_attention = gpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "flash_attention")
+            .expect("flash_attention present");
+        assert!(flash_attention.supported);
+        assert!(flash_attention.unsupported_reason.is_none());
+        let mixed_precision = gpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "mixed_precision")
+            .expect("mixed_precision present");
+        assert!(mixed_precision.supported);
+    }
+
+    #[test]
+    fn gate_advanced_settings_reports_the_speculative_decoding_reason_with_and_without_a_target() {
+        let capabilities = llama_capabilities_fixture();
+        let report = cpu_only_compatibility_report();
+
+        let no_target = gate_advanced_settings(&capabilities, &report, None, &[]);
+        let draft_setting = no_target
+            .settings
+            .iter()
+            .find(|setting| setting.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model present");
+        assert!(!draft_setting.supported);
+        assert_eq!(
+            draft_setting.unsupported_reason.as_deref(),
+            Some("Select a model to check for a compatible installed draft model.")
+        );
+        assert!(no_target.draft_model_candidates.is_empty());
+
+        let target = installed_model_view(
+            "llama_cpp:llama-3-8b-instruct:q4_k_m",
+            "llama-3-8b-instruct",
+            "Llama 3 8B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            8_000_000_000,
+        );
+        let no_draft_installed = gate_advanced_settings(&capabilities, &report, Some(&target), &[target.clone()]);
+        let draft_setting = no_draft_installed
+            .settings
+            .iter()
+            .find(|setting| setting.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model present");
+        assert!(!draft_setting.supported);
+        assert!(draft_setting
+            .unsupported_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(&target.display_name)));
+        assert!(no_draft_installed.draft_model_candidates.is_empty());
+
+        let draft = installed_model_view(
+            "llama_cpp:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        );
+        let installed = vec![target.clone(), draft.clone()];
+        let with_draft = gate_advanced_settings(&capabilities, &report, Some(&target), &installed);
+        let draft_setting = with_draft
+            .settings
+            .iter()
+            .find(|setting| setting.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model present");
+        assert!(draft_setting.supported);
+        assert!(draft_setting.unsupported_reason.is_none());
+        assert_eq!(with_draft.draft_model_candidates.len(), 1);
+        assert_eq!(with_draft.draft_model_candidates[0].model_id, draft.model_id);
     }
 }

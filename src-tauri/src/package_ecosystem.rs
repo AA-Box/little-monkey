@@ -368,6 +368,30 @@ pub struct PackagePermission {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum VulnerabilitySeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Manifest-declared security notice. There is no live CVE/vulnerability feed
+/// in this app: publishers declare these notices as part of the signed
+/// manifest, and this struct carries exactly what was declared and verified
+/// through the same trust chain as the rest of the manifest — nothing here
+/// is fetched, inferred, or refreshed from a live external source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct VulnerabilityNotice {
+    pub notice_id: String,
+    pub severity: VulnerabilitySeverity,
+    pub summary: String,
+    pub affected_versions: BTreeSet<SemanticVersion>,
+    pub advisory_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Compatibility {
@@ -419,6 +443,15 @@ pub struct PackageManifest {
     pub ui_resources: Vec<UiResourceDeclaration>,
     pub model_requirements: Vec<ModelRequirement>,
     pub permissions: BTreeSet<PackagePermission>,
+    /// Publisher-declared, manifest-signed security notices. Absent from
+    /// older/imported manifests that predate this field, hence the field
+    /// default so existing bundles keep deserializing unchanged. Also
+    /// skipped when empty on serialization, so a manifest that declares no
+    /// notices produces the exact same signing payload bytes as it did
+    /// before this field existed — already-issued signatures (including the
+    /// bundled first-party release catalog) stay valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vulnerability_notices: Vec<VulnerabilityNotice>,
     pub compatibility: Compatibility,
     pub file_checksums: BTreeMap<String, String>,
     pub provenance: PackageProvenance,
@@ -513,6 +546,14 @@ impl PackageManifest {
                     permission.kind
                 )));
             }
+        }
+        if self.vulnerability_notices.len() > 64 {
+            return Err(PackageError::LimitExceeded(
+                "manifest declares too many vulnerability notices".to_string(),
+            ));
+        }
+        for notice in &self.vulnerability_notices {
+            validate_vulnerability_notice(notice)?;
         }
         validate_compatibility(&self.compatibility)?;
         validate_provenance(&self.provenance)?;
@@ -792,6 +833,30 @@ fn validate_permission(permission: &PackagePermission) -> PackageResult<()> {
         return Err(PackageError::InvalidManifest(
             "network permission scope must be a canonical HTTPS origin".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_vulnerability_notice(notice: &VulnerabilityNotice) -> PackageResult<()> {
+    validate_id("vulnerability notice id", &notice.notice_id)?;
+    if notice.summary.trim().is_empty()
+        || notice.summary.len() > 2_048
+        || notice.affected_versions.is_empty()
+    {
+        return Err(PackageError::InvalidManifest(format!(
+            "invalid vulnerability notice: {}",
+            notice.notice_id
+        )));
+    }
+    if let Some(advisory_url) = &notice.advisory_url {
+        let url = Url::parse(advisory_url).map_err(|error| {
+            PackageError::InvalidManifest(format!("invalid advisory URL: {error}"))
+        })?;
+        if url.scheme() != "https" {
+            return Err(PackageError::InvalidManifest(
+                "advisory URL must be HTTPS".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1670,6 +1735,21 @@ pub struct InstalledPackageState {
     pub revoked: bool,
     pub tombstoned: bool,
     pub approved_permissions: BTreeSet<PackagePermission>,
+    /// Local-only install counter: incremented once per successful
+    /// `PackageStore::install` call for this package_id, including
+    /// reinstalls after an uninstall. There is no hosted telemetry backend
+    /// in this app — this number is never transmitted anywhere and reflects
+    /// only this device's own install history. Field-defaulted so state
+    /// files written before this counter existed keep deserializing.
+    #[serde(default)]
+    pub local_install_count: u64,
+    /// Locally user-set flag marking this package (in practice, a
+    /// `PackageKind::Collection`) as approved by the team. This is a plain
+    /// boolean toggle with no role/permission check of its own, kept fully
+    /// independent so a separate "Team Mode" feature — present or not in
+    /// this build — never has a hard dependency on this field.
+    #[serde(default)]
+    pub team_approved: bool,
 }
 
 impl InstalledPackageState {
@@ -1736,6 +1816,48 @@ impl PortablePackageExport {
     }
 }
 
+/// One user-added registry source: the roadmap's "private/team catalog".
+/// Only the audit-facing location (URL or local path) is stored here — the
+/// actual snapshot bytes always come from an explicit caller argument and
+/// must pass through [`verify_registry_snapshot`] (the same Ed25519 chain
+/// used by the built-in first-party registry) before any package from it is
+/// considered verified.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdditionalRegistrySource {
+    pub source_id: String,
+    pub display_name: String,
+    pub location: String,
+    pub added_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdditionalRegistryRecord {
+    pub source: AdditionalRegistrySource,
+    pub verified: Option<VerifiedRegistryState>,
+    pub last_verification_error: Option<String>,
+}
+
+const ADDITIONAL_REGISTRIES_SCHEMA_VERSION: u32 = 1;
+const REGISTRIES_FILE: &str = "registries.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AdditionalRegistryFile {
+    schema_version: u32,
+    sources: BTreeMap<String, AdditionalRegistryRecord>,
+}
+
+impl Default for AdditionalRegistryFile {
+    fn default() -> Self {
+        Self {
+            schema_version: ADDITIONAL_REGISTRIES_SCHEMA_VERSION,
+            sources: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PackageStore {
     root: PathBuf,
@@ -1771,10 +1893,8 @@ impl PackageStore {
     pub fn install(&self, package: &VerifiedPackage) -> PackageResult<InstalledPackageState> {
         let _guard = self.lock()?;
         let package_id = &package.manifest().package_id;
-        if self
-            .load_state_unlocked(package_id)?
-            .is_some_and(|state| !state.tombstoned)
-        {
+        let previous = self.load_state_unlocked(package_id)?;
+        if previous.as_ref().is_some_and(|state| !state.tombstoned) {
             return Err(PackageError::Conflict(format!(
                 "{package_id} is already installed"
             )));
@@ -1786,6 +1906,10 @@ impl PackageStore {
             bundle_sha256: package.bundle_sha256.clone(),
             trust: package.trust.clone(),
         };
+        let local_install_count = previous
+            .as_ref()
+            .map_or(1, |state| state.local_install_count.saturating_add(1));
+        let team_approved = previous.as_ref().is_some_and(|state| state.team_approved);
         let state = InstalledPackageState {
             schema_version: PACKAGE_STATE_VERSION,
             sequence: self.next_sequence_unlocked(package_id)?,
@@ -1798,6 +1922,8 @@ impl PackageStore {
             revoked: false,
             tombstoned: false,
             approved_permissions: package.manifest().permissions.clone(),
+            local_install_count,
+            team_approved,
         };
         self.write_state_unlocked(&state)?;
         Ok(state)
@@ -1877,6 +2003,23 @@ impl PackageStore {
                 ));
             }
             state.enabled = enabled;
+            Ok(())
+        })
+    }
+
+    /// Sets the local "team approved" toggle. This never checks a role or
+    /// permission of its own: it is a plain, locally-observed flag intended
+    /// for `PackageKind::Collection` packages, and the caller (the M4
+    /// package service) is responsible for deciding which kinds it applies
+    /// to. Kept independent from `enabled`/`revoked` so a future Team Mode
+    /// feature can read it without this store depending on that feature.
+    pub fn set_team_approved(
+        &self,
+        package_id: &str,
+        team_approved: bool,
+    ) -> PackageResult<InstalledPackageState> {
+        self.mutate_state(package_id, |state| {
+            state.team_approved = team_approved;
             Ok(())
         })
     }
@@ -2043,6 +2186,117 @@ impl PackageStore {
                 .map(|(path, bytes)| (path, encode_hex(&bytes)))
                 .collect(),
         })
+    }
+
+    /// Lists every user-added registry source, verified or not.
+    pub fn list_registry_sources(&self) -> PackageResult<Vec<AdditionalRegistryRecord>> {
+        let _guard = self.lock()?;
+        Ok(self
+            .load_registry_file_unlocked()?
+            .sources
+            .into_values()
+            .collect())
+    }
+
+    /// Registers a new registry source. This only records where the source
+    /// claims to be from; no packages from it are trusted until a caller
+    /// separately supplies a snapshot to [`Self::record_registry_verification`]
+    /// (via the same Ed25519 verification chain as the built-in registry).
+    pub fn add_registry_source(
+        &self,
+        source: AdditionalRegistrySource,
+    ) -> PackageResult<AdditionalRegistryRecord> {
+        validate_id("registry source id", &source.source_id)?;
+        if source.display_name.trim().is_empty() || source.display_name.len() > 200 {
+            return Err(PackageError::InvalidManifest(
+                "registry source display name must be a bounded non-empty string".to_string(),
+            ));
+        }
+        if source.location.is_empty() || source.location.len() > 2_048 {
+            return Err(PackageError::InvalidManifest(
+                "registry source location must be a bounded non-empty string".to_string(),
+            ));
+        }
+        let _guard = self.lock()?;
+        let mut file = self.load_registry_file_unlocked()?;
+        if file.sources.contains_key(&source.source_id) {
+            return Err(PackageError::Conflict(format!(
+                "registry source {} already exists",
+                source.source_id
+            )));
+        }
+        let record = AdditionalRegistryRecord {
+            source: source.clone(),
+            verified: None,
+            last_verification_error: None,
+        };
+        file.sources.insert(source.source_id, record.clone());
+        self.write_registry_file_unlocked(&file)?;
+        Ok(record)
+    }
+
+    pub fn remove_registry_source(&self, source_id: &str) -> PackageResult<bool> {
+        let _guard = self.lock()?;
+        let mut file = self.load_registry_file_unlocked()?;
+        let removed = file.sources.remove(source_id).is_some();
+        if removed {
+            self.write_registry_file_unlocked(&file)?;
+        }
+        Ok(removed)
+    }
+
+    /// Persists the outcome of verifying a registry source's snapshot
+    /// through [`verify_registry_snapshot`]. On verification failure the
+    /// previous verified state (if any) is retained so a source that was
+    /// trustworthy once does not silently lose its last-known-good snapshot
+    /// just because a later fetch/paste failed to verify.
+    pub fn record_registry_verification(
+        &self,
+        source_id: &str,
+        verified: Option<VerifiedRegistryState>,
+        error: Option<String>,
+    ) -> PackageResult<AdditionalRegistryRecord> {
+        let _guard = self.lock()?;
+        let mut file = self.load_registry_file_unlocked()?;
+        let record = file.sources.get_mut(source_id).ok_or_else(|| {
+            PackageError::NotInstalled(format!("registry source {source_id} is not registered"))
+        })?;
+        if let Some(verified) = verified {
+            record.verified = Some(verified);
+        }
+        record.last_verification_error = error;
+        let updated = record.clone();
+        self.write_registry_file_unlocked(&file)?;
+        Ok(updated)
+    }
+
+    fn load_registry_file_unlocked(&self) -> PackageResult<AdditionalRegistryFile> {
+        let path = self.root.join(REGISTRIES_FILE);
+        if !path.exists() {
+            return Ok(AdditionalRegistryFile::default());
+        }
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(PackageError::Io(
+                "registries file cannot be a symlink".to_string(),
+            ));
+        }
+        let file: AdditionalRegistryFile = serde_json::from_slice(&fs::read(&path)?)?;
+        if file.schema_version != ADDITIONAL_REGISTRIES_SCHEMA_VERSION {
+            return Err(PackageError::Conflict(
+                "unsupported registries file schema version".to_string(),
+            ));
+        }
+        Ok(file)
+    }
+
+    fn write_registry_file_unlocked(&self, file: &AdditionalRegistryFile) -> PackageResult<()> {
+        let path = self.root.join(REGISTRIES_FILE);
+        let temporary = self
+            .root
+            .join(format!("{REGISTRIES_FILE}.{}.tmp", Uuid::new_v4().simple()));
+        fs::write(&temporary, serde_json::to_vec(file)?)?;
+        fs::rename(&temporary, &path)?;
+        sync_directory(&self.root)
     }
 
     fn mutate_state<F>(&self, package_id: &str, mutation: F) -> PackageResult<InstalledPackageState>
@@ -2420,11 +2674,26 @@ fn fixture_compatibility() -> Compatibility {
     }
 }
 
+/// Builds an absolute-path *string* valid on whichever OS this actually runs
+/// under. This value is a pure identity/provenance string — checked only by
+/// [`validate_provenance`]'s `Path::is_absolute()` call, never touched by
+/// real disk I/O — but `/foo` satisfies `is_absolute()` on Unix and not on
+/// Windows (which requires a drive-letter or UNC prefix), so a hardcoded
+/// `/`-rooted fixture fails Windows-only validation that has nothing to do
+/// with what these fixtures exist to exercise.
+fn fixture_absolute_path(rest: &str) -> String {
+    if cfg!(windows) {
+        format!(r"C:\{}", rest.replace('/', "\\"))
+    } else {
+        format!("/{rest}")
+    }
+}
+
 fn fixture_provenance(slug: &str) -> PackageProvenance {
     PackageProvenance {
         publisher: "Little Monkey".to_string(),
         source: InstallSource::LocalFolder {
-            canonical_path: format!("/first-party-fixtures/{slug}"),
+            canonical_path: fixture_absolute_path(&format!("first-party-fixtures/{slug}")),
         },
         source_revision: "checked-in-fixture-v1".to_string(),
         build_reproducible: true,
@@ -2458,6 +2727,7 @@ fn skill_fixture(slug: &str, display_name: &str, instructions: &str) -> FirstPar
             local_compatible: true,
         }],
         permissions: BTreeSet::new(),
+        vulnerability_notices: Vec::new(),
         compatibility: fixture_compatibility(),
         file_checksums: BTreeMap::from([(path.clone(), digest)]),
         provenance: fixture_provenance(slug),
@@ -2917,6 +3187,155 @@ mod tests {
             Some(SemanticVersion::new(1, 1, 0))
         );
     }
+
+    #[test]
+    fn local_install_count_survives_uninstall_and_reinstall_and_team_approved_toggles() {
+        let bundle = first_party_package_fixtures().remove(0).bundle;
+        let directory = TestDirectory::new("install-count");
+        let store = PackageStore::new(&directory.0).expect("store");
+        let package_id = bundle.manifest.package_id.clone();
+
+        let first_install = store.install(&verify_local(&bundle)).expect("install");
+        assert_eq!(first_install.local_install_count, 1);
+        assert!(!first_install.team_approved);
+
+        let approved = store
+            .set_team_approved(&package_id, true)
+            .expect("mark team approved");
+        assert!(approved.team_approved);
+
+        store.uninstall(&package_id).expect("uninstall");
+        let second_install = store.install(&verify_local(&bundle)).expect("reinstall");
+        assert_eq!(second_install.local_install_count, 2);
+        // Reinstalling produces a fresh, non-tombstoned state; the local
+        // install counter is the only piece of history that is intentionally
+        // preserved across an uninstall/reinstall cycle.
+        assert!(second_install.team_approved);
+    }
+
+    #[test]
+    fn vulnerability_notices_are_validated_and_surfaced_on_the_manifest() {
+        let mut bundle = first_party_package_fixtures().remove(0).bundle;
+        bundle.manifest.vulnerability_notices.push(VulnerabilityNotice {
+            notice_id: "notice-1".to_string(),
+            severity: VulnerabilitySeverity::High,
+            summary: "Sample dependency has a known issue".to_string(),
+            affected_versions: BTreeSet::from([SemanticVersion::new(1, 0, 0)]),
+            advisory_url: Some("https://example.com/advisories/1".to_string()),
+        });
+        bundle.manifest.validate(&PackageLimits::default()).expect("valid notice");
+        let verified = verify_local(&bundle);
+        assert_eq!(verified.manifest().vulnerability_notices.len(), 1);
+
+        let mut empty_summary = bundle.clone();
+        empty_summary.manifest.vulnerability_notices[0].summary = "   ".to_string();
+        assert!(matches!(
+            empty_summary.manifest.validate(&PackageLimits::default()),
+            Err(PackageError::InvalidManifest(_))
+        ));
+
+        let mut insecure_advisory = bundle.clone();
+        insecure_advisory.manifest.vulnerability_notices[0].advisory_url =
+            Some("http://example.com/advisories/1".to_string());
+        assert!(matches!(
+            insecure_advisory.manifest.validate(&PackageLimits::default()),
+            Err(PackageError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn additional_registry_sources_require_the_existing_verification_chain() {
+        let directory = TestDirectory::new("registry-sources");
+        let store = PackageStore::new(&directory.0).expect("store");
+        assert!(store.list_registry_sources().expect("empty list").is_empty());
+
+        let source = AdditionalRegistrySource {
+            source_id: "team-catalog".to_string(),
+            display_name: "Team Catalog".to_string(),
+            location: "https://team.example.com/registry.json".to_string(),
+            added_unix_ms: 1_000,
+        };
+        let record = store
+            .add_registry_source(source.clone())
+            .expect("add source");
+        assert!(record.verified.is_none());
+
+        assert!(matches!(
+            store.add_registry_source(source.clone()),
+            Err(PackageError::Conflict(_))
+        ));
+
+        let bundle = first_party_package_fixtures().remove(0).bundle;
+        let bundle_digest = bundle
+            .validate(&PackageLimits::default())
+            .expect("bundle digest");
+        let manifest_digest = sha256(&serde_json::to_vec(&bundle.manifest).expect("manifest"));
+        let mut snapshot = RegistrySnapshot {
+            schema_version: REGISTRY_SNAPSHOT_VERSION,
+            registry_id: "team-catalog".to_string(),
+            sequence: 1,
+            generated_unix_ms: 900,
+            refresh_after_unix_ms: 950,
+            expires_unix_ms: 2_000,
+            packages: BTreeMap::from([(
+                bundle.manifest.package_id.clone(),
+                vec![RegistryPackageVersion {
+                    version: bundle.manifest.version,
+                    bundle_sha256: bundle_digest,
+                    manifest_sha256: manifest_digest,
+                }],
+            )]),
+            revocations: Vec::new(),
+            signature: RegistrySignature {
+                trust_root_id: "littlemonkey-root".to_string(),
+                key_id: "release-1".to_string(),
+                algorithm: "fixture-sha256".to_string(),
+                signature_hex: String::new(),
+            },
+        };
+        sign_registry(&mut snapshot);
+
+        // Tampering with the signature must fail verification, and a failed
+        // verification must never mark the source as trusted.
+        let mut tampered = snapshot.clone();
+        tampered.signature.signature_hex = "00".repeat(32);
+        let tampered_result =
+            verify_registry_snapshot(&tampered, &trust_store(), None, &DigestVerifier, 1_000);
+        assert!(tampered_result.is_err());
+        store
+            .record_registry_verification(
+                &source.source_id,
+                None,
+                Some(tampered_result.unwrap_err().to_string()),
+            )
+            .expect("record failed verification");
+        let after_failed = store
+            .list_registry_sources()
+            .expect("list after failed verification");
+        assert_eq!(after_failed.len(), 1);
+        assert!(after_failed[0].verified.is_none());
+        assert!(after_failed[0].last_verification_error.is_some());
+
+        let verified = verify_registry_snapshot(&snapshot, &trust_store(), None, &DigestVerifier, 1_000)
+            .expect("verify team-catalog snapshot through the existing Ed25519 chain");
+        let updated = store
+            .record_registry_verification(&source.source_id, Some(verified), None)
+            .expect("record success");
+        assert!(updated.verified.is_some());
+        assert!(updated.last_verification_error.is_none());
+        assert_eq!(
+            updated.verified.as_ref().unwrap().snapshot().registry_id,
+            "team-catalog"
+        );
+
+        assert!(store
+            .remove_registry_source(&source.source_id)
+            .expect("remove"));
+        assert!(store.list_registry_sources().expect("empty again").is_empty());
+        assert!(!store
+            .remove_registry_source(&source.source_id)
+            .expect("remove missing is a no-op"));
+    }
 }
 
 fn connector_fixture(slug: &str, kind: ConnectorKind, origin: &str) -> FirstPartyPackageFixture {
@@ -2962,6 +3381,7 @@ fn connector_fixture(slug: &str, kind: ConnectorKind, origin: &str) -> FirstPart
         ui_resources: Vec::new(),
         model_requirements: Vec::new(),
         permissions: [permission].into_iter().collect(),
+        vulnerability_notices: Vec::new(),
         compatibility: fixture_compatibility(),
         file_checksums: BTreeMap::from([(path.clone(), digest)]),
         provenance: fixture_provenance(slug),

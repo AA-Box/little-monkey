@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   client: {
     hardwareSnapshot: vi.fn(),
     hardwareProfile: vi.fn(),
+    hardwareCompatibilityReport: vi.fn(),
     storageStatus: vi.fn(),
     installedModels: vi.fn(),
     catalogSources: vi.fn(),
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     runtimes: vi.fn(),
     refreshRuntimes: vi.fn(),
     schedulePlan: vi.fn(),
+    chatTemplateLabReport: vi.fn(),
     catalogSearch: vi.fn(),
     modelDownload: vi.fn(),
     modelUpdate: vi.fn(),
@@ -28,6 +30,9 @@ const mocks = vi.hoisted(() => ({
     runtimeMetrics: vi.fn(),
     runtimeSetConfig: vi.fn(),
     runtimeConfig: vi.fn(),
+    contextCacheState: vi.fn(),
+    contextEffectiveSize: vi.fn(),
+    classifyContextFailure: vi.fn(),
     apiDispatch: vi.fn(),
     apiCancelInference: vi.fn(),
     lanValidatePolicy: vi.fn(),
@@ -43,6 +48,16 @@ const mocks = vi.hoisted(() => ({
     httpServerStop: vi.fn(),
     httpServerStatus: vi.fn(),
     httpServerStoreTlsIdentity: vi.fn(),
+    telemetryRecordLoad: vi.fn(),
+    telemetryRecordRequest: vi.fn(),
+    telemetryRecentTraces: vi.fn(),
+    telemetrySupportBundle: vi.fn(),
+    quantizationBackends: vi.fn(),
+    quantizationQuantTypes: vi.fn(),
+    quantizationConvertPath: vi.fn(),
+    quantizationConvertInstalledModel: vi.fn(),
+    runtimePrWatcherState: vi.fn(),
+    runtimePrWatcherCheckNow: vi.fn(),
   },
 }));
 
@@ -75,6 +90,25 @@ const storage = {
   availableForModelsBytes: 890,
   pendingDownloadBytes: 0,
 };
+const compatibilityReport = {
+  capturedAtMs: 1,
+  os: "macos",
+  arch: "aarch64",
+  accelerators: [
+    {
+      kind: "metal",
+      status: "available",
+      summary: "Metal is available.",
+      deviceNames: ["Apple Silicon unified GPU"],
+      driverVersion: null,
+      computeCapability: null,
+      confirmed: true,
+    },
+  ],
+  jetson: { detected: false, model: null },
+  hybridGraphicsDetected: false,
+  notes: [],
+};
 const capability = {
   descriptor: { runtimeId: "ollama", kind: "ollama", label: "Ollama", managed: false, apiBackend: "ollama" },
   canLoad: true,
@@ -82,6 +116,7 @@ const capability = {
   canLogs: true,
   canMetrics: true,
   canInfer: true,
+  canEmbed: false,
   settings: [],
 };
 const policy = {
@@ -105,6 +140,7 @@ beforeEach(() => {
     section: "overview",
     hardware: null,
     profile: null,
+    compatibilityReport: null,
     storage: null,
     installedModels: [],
     catalogSources: [],
@@ -125,6 +161,11 @@ beforeEach(() => {
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
+    quantizationBackends: [],
+    quantizationQuantTypes: [],
+    quantizationReports: [],
+    prWatcherState: null,
+    prWatcherLastResult: null,
     loaded: false,
   });
 });
@@ -133,6 +174,7 @@ describe("runtimeHubStore", () => {
   it("loads hardware, profile, storage, installed models, runtimes, and disabled LAN state", async () => {
     mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
     mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.hardwareCompatibilityReport.mockResolvedValue(compatibilityReport);
     mocks.client.storageStatus.mockResolvedValue(storage);
     mocks.client.installedModels.mockResolvedValue([]);
     mocks.client.refreshRuntimes.mockResolvedValue([capability]);
@@ -147,9 +189,28 @@ describe("runtimeHubStore", () => {
     expect(state.profile).toEqual(profile);
     expect(state.storage).toEqual(storage);
     expect(state.runtimes).toEqual([capability]);
+    expect(state.compatibilityReport).toEqual(compatibilityReport);
     expect(state.loaded).toBe(true);
     expect(mocks.client.lanTokens).not.toHaveBeenCalled();
     expect(state.busy).toEqual({});
+  });
+
+  it("does not block the rest of the overview refresh when the compatibility report fails", async () => {
+    mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
+    mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.hardwareCompatibilityReport.mockRejectedValue(new Error("driver doctor offline"));
+    mocks.client.storageStatus.mockResolvedValue(storage);
+    mocks.client.installedModels.mockResolvedValue([]);
+    mocks.client.refreshRuntimes.mockResolvedValue([capability]);
+    mocks.client.catalogSources.mockResolvedValue([]);
+
+    await useRuntimeHubStore.getState().refreshOverview();
+
+    const state = useRuntimeHubStore.getState();
+    expect(state.hardware).toEqual(hardware);
+    expect(state.loaded).toBe(true);
+    expect(state.compatibilityReport).toBeNull();
+    expect(state.errors.compatibility).toContain("driver doctor offline");
   });
 
   it("tracks a cancellable catalog operation and stores exact results", async () => {
@@ -172,23 +233,71 @@ describe("runtimeHubStore", () => {
     expect(mocks.client.cancelOperation).toHaveBeenCalledWith("catalog-live");
   });
 
+  it("fetches and caches a chat template lab report keyed by the raw template string", async () => {
+    const gemmaReport = {
+      templateFamily: "gemma",
+      results: [{ area: "system_prompt", passed: false, detail: "gemma has no system role" }],
+    };
+    mocks.client.chatTemplateLabReport.mockResolvedValue(gemmaReport);
+
+    await useRuntimeHubStore.getState().fetchChatTemplateLabReport("gemma-2-9b-it");
+
+    expect(mocks.client.chatTemplateLabReport).toHaveBeenCalledWith("gemma-2-9b-it");
+    expect(useRuntimeHubStore.getState().chatTemplateLabReports["gemma-2-9b-it"]).toEqual(gemmaReport);
+
+    const genericReport = { templateFamily: "generic", results: [] };
+    mocks.client.chatTemplateLabReport.mockResolvedValue(genericReport);
+    await useRuntimeHubStore.getState().fetchChatTemplateLabReport(null);
+    expect(mocks.client.chatTemplateLabReport).toHaveBeenCalledWith(null);
+    expect(useRuntimeHubStore.getState().chatTemplateLabReports[""]).toEqual(genericReport);
+  });
+
   it("collects status, inventory, logs, and metrics only through capability-backed runtime calls", async () => {
     useRuntimeHubStore.setState({ runtimes: [capability] as never });
     const status = { runtimeType: "adapter", status: { state: "ready" }, running_models: [] };
     const inventory = { schema_version: 1, runtime_id: "ollama", models: [], captured_at_ms: 1 };
     const logs = { text: "ready", truncated: false };
     const metrics = { runtimeType: "adapter", status: { state: "ready" }, running_models: [] };
+    const contextCache = {
+      runtimeId: "ollama",
+      runtimeKind: "ollama",
+      configured: { tokens: 4_096, source: "runtime_default", settingKey: "num_ctx" },
+      reportedContextTokens: null,
+      contextTokensInUse: null,
+      contextHeadroomTokens: null,
+      contextShiftDetected: null,
+      totalSlots: null,
+      notes: [],
+      sampledAtMs: 1,
+    };
     mocks.client.runtimeStatus.mockResolvedValue(status);
     mocks.client.runtimeInventory.mockResolvedValue(inventory);
     mocks.client.runtimeLogs.mockResolvedValue(logs);
     mocks.client.runtimeMetrics.mockResolvedValue(metrics);
     mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue(contextCache);
 
     await useRuntimeHubStore.getState().refreshRuntime("ollama");
 
-    expect(useRuntimeHubStore.getState().runtimeDetails.ollama).toMatchObject({ status, inventory, logs, metrics });
+    expect(useRuntimeHubStore.getState().runtimeDetails.ollama).toMatchObject({ status, inventory, logs, metrics, contextCache });
     expect(mocks.client.runtimeStatus).toHaveBeenCalledWith(expect.objectContaining({ runtimeId: "ollama" }));
     expect(mocks.client.runtimeLogs).toHaveBeenCalledWith(expect.objectContaining({ maxBytes: 128 * 1024 }));
+    expect(mocks.client.contextCacheState).toHaveBeenCalledWith(expect.objectContaining({ runtimeId: "ollama" }));
+  });
+
+  it("does not let a context-cache-state failure block the rest of the runtime refresh", async () => {
+    useRuntimeHubStore.setState({ runtimes: [capability] as never });
+    mocks.client.runtimeStatus.mockResolvedValue({ runtimeType: "adapter", status: { state: "ready" }, running_models: [] });
+    mocks.client.runtimeInventory.mockResolvedValue({ schema_version: 1, runtime_id: "ollama", models: [], captured_at_ms: 1 });
+    mocks.client.runtimeLogs.mockResolvedValue({ text: "", truncated: false });
+    mocks.client.runtimeMetrics.mockResolvedValue({ runtimeType: "adapter", status: { state: "ready" }, running_models: [] });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockRejectedValue(new Error("context cache unavailable"));
+
+    await useRuntimeHubStore.getState().refreshRuntime("ollama");
+
+    expect(useRuntimeHubStore.getState().runtimeDetails.ollama.contextCache).toBeUndefined();
+    expect(useRuntimeHubStore.getState().errors["runtime:ollama"]).toBeUndefined();
   });
 
   it("validates and persists LAN policy before refreshing scoped tokens and audit events", async () => {
@@ -242,5 +351,106 @@ describe("runtimeHubStore", () => {
     expect(useRuntimeHubStore.getState().apiResult).toEqual({ status: 200, body: { id: "response" } });
     expect(mocks.client.apiDispatch).toHaveBeenCalledWith(expect.objectContaining({ request }));
     expect(mocks.client.apiCancelInference).toHaveBeenCalledWith(expect.objectContaining({ request: expect.objectContaining({ modelId: "qwen" }) }));
+  });
+
+  it("loads quantization backends and quant types together", async () => {
+    const backends = [{ id: "llama-quantize", available: true }, { id: "passthrough-copy", available: true }];
+    const quantTypes = [{ id: "Q4_K_M", cliName: "Q4_K_M", note: "Balanced default." }];
+    mocks.client.quantizationBackends.mockResolvedValue(backends);
+    mocks.client.quantizationQuantTypes.mockResolvedValue(quantTypes);
+
+    await useRuntimeHubStore.getState().refreshQuantization();
+
+    expect(useRuntimeHubStore.getState().quantizationBackends).toEqual(backends);
+    expect(useRuntimeHubStore.getState().quantizationQuantTypes).toEqual(quantTypes);
+  });
+
+  it("prepends a new report from converting an arbitrary path", async () => {
+    const report = { conversionId: "conv-1", quantChoice: "Q4_K_M" };
+    mocks.client.quantizationConvertPath.mockResolvedValue(report);
+
+    await useRuntimeHubStore.getState().convertPathQuantization("/models/model.gguf", "Q4_K_M", false);
+
+    expect(mocks.client.quantizationConvertPath).toHaveBeenCalledWith({
+      sourcePath: "/models/model.gguf",
+      quantChoice: "Q4_K_M",
+      allowRequantize: false,
+    });
+    expect(useRuntimeHubStore.getState().quantizationReports).toEqual([report]);
+  });
+
+  it("prepends a new report from converting an installed model and surfaces failures", async () => {
+    const report = { conversionId: "conv-2", quantChoice: "Q6_K" };
+    mocks.client.quantizationConvertInstalledModel.mockResolvedValueOnce(report);
+    await useRuntimeHubStore.getState().convertInstalledModelQuantization("ollama:qwen:q4", null, "Q6_K", true);
+    expect(mocks.client.quantizationConvertInstalledModel).toHaveBeenCalledWith({
+      assetId: "ollama:qwen:q4",
+      versionKey: null,
+      quantChoice: "Q6_K",
+      allowRequantize: true,
+    });
+    expect(useRuntimeHubStore.getState().quantizationReports).toEqual([report]);
+
+    mocks.client.quantizationConvertInstalledModel.mockRejectedValueOnce(new Error("no backend"));
+    await expect(
+      useRuntimeHubStore.getState().convertInstalledModelQuantization("ollama:qwen:q4", null, "Q6_K", true),
+    ).rejects.toThrow("no backend");
+    expect(useRuntimeHubStore.getState().errors["quantization-convert"]).toContain("no backend");
+  });
+
+  it("loads the persisted runtime PR watcher state without triggering a network check", async () => {
+    const state = {
+      schemaVersion: 1,
+      sourceRepo: "ollama/ollama",
+      lastCheckedAtMs: 1_000,
+      lastCheckError: null,
+      lastSeenPrNumber: 20,
+      relevantPrs: [],
+    };
+    mocks.client.runtimePrWatcherState.mockResolvedValue(state);
+
+    await useRuntimeHubStore.getState().refreshPrWatcher();
+
+    expect(useRuntimeHubStore.getState().prWatcherState).toEqual(state);
+    expect(mocks.client.runtimePrWatcherCheckNow).not.toHaveBeenCalled();
+  });
+
+  it("checks now and stores both the updated state and the latest result", async () => {
+    const entry = {
+      number: 22,
+      title: "add /api/embed endpoint",
+      url: "https://github.com/ollama/ollama/pull/22",
+      merged: true,
+      topic: "api_routes",
+      suggestedAction: "Review whether Little Monkey's API compatibility harness still matches this route.",
+    };
+    const result = {
+      state: {
+        schemaVersion: 1,
+        sourceRepo: "ollama/ollama",
+        lastCheckedAtMs: 2_000,
+        lastCheckError: null,
+        lastSeenPrNumber: 22,
+        relevantPrs: [entry],
+      },
+      newlyRelevant: [entry],
+      scannedCount: 30,
+    };
+    mocks.client.runtimePrWatcherCheckNow.mockResolvedValue(result);
+
+    await useRuntimeHubStore.getState().checkPrWatcherNow();
+
+    expect(useRuntimeHubStore.getState().prWatcherState).toEqual(result.state);
+    expect(useRuntimeHubStore.getState().prWatcherLastResult).toEqual(result);
+  });
+
+  it("surfaces a check-now failure (e.g. GitHub rate limiting) as an error without crashing", async () => {
+    mocks.client.runtimePrWatcherCheckNow.mockRejectedValueOnce(
+      new Error("GitHub's public API rate limit was hit while checking for upstream changes. Wait a while and try again."),
+    );
+
+    await expect(useRuntimeHubStore.getState().checkPrWatcherNow()).rejects.toThrow("rate limit");
+
+    expect(useRuntimeHubStore.getState().errors["pr-watcher-check"]).toContain("rate limit");
   });
 });
