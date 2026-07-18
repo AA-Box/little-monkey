@@ -51,12 +51,10 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          # Not 9: pnpm-workspace.yaml has no `packages:` field, which makes
-          # pnpm 9's install/store-path commands fail with "packages field
-          # missing or empty" (reproduced locally; fixed in pnpm 10+).
-          # Pre-existing repo config gap, out of scope for this workflow —
-          # release.yml pins the same v9 and will hit this identically.
-          version: 10
+          # Same pin as ci.yml/release.yml (pnpm-workspace.yaml gained the
+          # `packages:` field pnpm 9 requires, so the old need to jump to 10
+          # here is gone).
+          version: 9
 
       - uses: actions/setup-node@v4
         with:
@@ -77,6 +75,9 @@ jobs:
       - name: Build frontend (generate_context! needs dist/ to exist)
         run: pnpm build
 
+      - name: Stage CLI sidecar placeholder (tauri-build resolves externalBin paths)
+        run: pnpm stage:cli:placeholder
+
       - name: Run artifact IPC isolation check
         run: cargo run --manifest-path src-tauri/Cargo.toml --example verify_artifact_ipc_isolation --target ${{ matrix.target }}
         shell: bash
@@ -86,11 +87,7 @@ jobs:
           # usable GUI session entirely.
           VERIFY_ARTIFACT_TIMEOUT_SECS: "60"
           VERIFY_ARTIFACT_DEBUG: "1"
-          # Prior run: binary starts fine, no crash, but the artifact
-          # iframe's script never posts its result back even after 60s —
-          # consistent with the webview creating but never actually
-          # painting/executing JS, a well-known symptom of no GPU/ANGLE
-          # renderer being available on virtualized CI VMs. This is the
-          # documented WebView2 escape hatch for that:
+          # Belt-and-braces for virtualized CI VMs with no GPU/ANGLE
+          # renderer — the documented WebView2 escape hatch:
           # https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags
           WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--disable-gpu"
