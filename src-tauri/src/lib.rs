@@ -254,6 +254,14 @@ pub mod team_mode;
 // GitHub issue and carrying it through a reviewable owned-branch/PR loop on
 // top of the `m5_delivery` GitHub/worktree primitives.
 pub mod issue_to_pr;
+// Runtime PR Watcher and Capability Feed (ROADMAP.md Phase 8, last item):
+// fetches closed `ollama/ollama` PRs over the public GitHub REST API,
+// classifies which ones plausibly touch Little Monkey's own runtime surface
+// with a keyword heuristic, and persists a monthly-cadence report of newly
+// relevant upstream changes with a suggested action each. Self-contained,
+// same convention as `diagnostics`/`automations`/`privacy_firewall` above;
+// see the module doc for the on-demand-vs-scheduled scope decision.
+pub mod runtime_pr_watcher;
 // Human Approval Chains (ROADMAP.md Phase 3): multi-step approval workflows
 // (a sequence of stages, each with its own timeout/escalation) layered on top
 // of `permissions.rs`'s existing single-shot request/response system. A new,
@@ -505,6 +513,14 @@ pub struct AppState {
     /// the earlier one's change — same reasoning as `connectors_config_lock`/
     /// `memory_lock` above protect their own files.
     pub team_members_lock: std::sync::Mutex<()>,
+    /// Serializes `runtime_pr_watcher/state.json`'s load-merge-save cycle
+    /// (see `runtime_pr_watcher::check_now_core`) — same reasoning as
+    /// `team_members_lock`/`connectors_config_lock` above. Only guards the
+    /// final synchronous save, not the network fetch that precedes it (a
+    /// `std::sync::Mutex` guard can't be held across an `.await`); see that
+    /// function's doc comment for how a concurrent check is still
+    /// reconciled correctly.
+    pub runtime_pr_watcher_lock: std::sync::Mutex<()>,
 }
 
 impl Default for AppState {
@@ -542,6 +558,7 @@ impl Default for AppState {
             pending_privacy_sends: Default::default(),
             sandbox: Default::default(),
             team_members_lock: Default::default(),
+            runtime_pr_watcher_lock: Default::default(),
         }
     }
 }
@@ -1221,6 +1238,8 @@ pub fn run() {
             desktop_control::desktop_control_request_action,
             desktop_control::desktop_control_respond_action,
             desktop_control::desktop_control_emergency_stop,
+            runtime_pr_watcher::runtime_pr_watcher_state,
+            runtime_pr_watcher::runtime_pr_watcher_check_now,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

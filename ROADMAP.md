@@ -987,15 +987,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Device-specific profiles explain supported models, expected speed, and required runtime components.
 
-### 18. Runtime PR Watcher and Capability Feed
-
-**Status:** Planned
-
-- Track upstream Ollama, llama.cpp, MLX, GGUF, tokenizer, and model-family changes.
-- Turn relevant upstream changes into local compatibility warnings, tests, and roadmap suggestions.
-
-**Acceptance:** A monthly runtime report lists newly relevant upstream changes and recommended Little Monkey actions.
-
 ## Phase 9: Release Hardening
 
 **Status:** Planned
