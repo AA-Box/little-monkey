@@ -62,6 +62,22 @@ const GLOB_MAX_MATCHES: usize = 300;
 /// error is returned.
 const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Render a path as a `/`-separated string regardless of platform.
+///
+/// These paths are surfaced to the model and the UI as opaque reference
+/// strings (tool results, `@`-mention entries), not passed straight back to
+/// `std::fs` — so they must be stable across platforms. Joining components
+/// with a hardcoded `/` (rather than `Path::to_string_lossy`, which uses the
+/// OS-native separator) keeps them consistent with the forward-slash
+/// `label_prefix` these are concatenated with, and with what the model has
+/// already seen for other files in the same conversation on a mixed-OS team.
+fn display_relative_path(path: &std::path::Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Read a UTF-8 text file from the workspace.
 #[tauri::command]
 pub async fn tool_read_file(
@@ -164,11 +180,12 @@ pub async fn tool_grep(
         let display_path = format!(
             "{}{}",
             label_prefix,
-            entry
-                .path()
-                .strip_prefix(&display_root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
+            display_relative_path(
+                entry
+                    .path()
+                    .strip_prefix(&display_root)
+                    .unwrap_or_else(|_| entry.path())
+            )
         );
 
         for (idx, line) in content.lines().enumerate() {
@@ -255,11 +272,12 @@ fn glob_impl(
         let display_path = format!(
             "{}{}",
             label_prefix,
-            entry
-                .path()
-                .strip_prefix(display_root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
+            display_relative_path(
+                entry
+                    .path()
+                    .strip_prefix(display_root)
+                    .unwrap_or_else(|_| entry.path())
+            )
         );
         let modified = entry
             .metadata()
@@ -834,11 +852,7 @@ pub fn list_workspace_paths(
                 Err(_) => continue,
             };
 
-            let relative_str = relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            let relative_str = display_relative_path(relative);
 
             // Primary-root entries stay unprefixed (no behavior change for
             // the common single-folder case); secondary-root entries are
