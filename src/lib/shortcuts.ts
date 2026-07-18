@@ -120,6 +120,13 @@ export const SHORTCUTS = [
     bindings: [{ key: "t", code: "KeyT", primary: true }],
   },
   {
+    id: "openBrowserTab",
+    scope: "global",
+    labelKey: "App.rightPanelSideBrowser",
+    descriptionKey: "KeyboardShortcutsPanel.openBrowserTabDescription",
+    bindings: [{ key: "t", code: "KeyT", primary: true, alt: true }],
+  },
+  {
     id: "openFiles",
     scope: "global",
     labelKey: "App.rightPanelWorkspace",
