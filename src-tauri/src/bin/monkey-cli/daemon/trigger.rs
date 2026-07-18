@@ -557,8 +557,7 @@ pub fn verify_generic_signature(
     payload: &[u8],
     signature: &str,
 ) -> bool {
-    let mut message = format!("{timestamp_ms}\n{nonce}\n").into_bytes();
-    message.extend_from_slice(payload);
+    let message = canonical_generic_signature_message(timestamp_ms, nonce, payload);
     verify_hmac_hex(secret, &message, signature)
 }
 
@@ -805,10 +804,6 @@ fn accept_generated(
     }
 }
 
-pub fn filesystem_fingerprint(path: &Path, recursive: bool) -> Result<String, String> {
-    filesystem_fingerprint_filtered(path, recursive, None)
-}
-
 pub fn filesystem_fingerprint_filtered(
     path: &Path,
     recursive: bool,
@@ -897,6 +892,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Sender-side twin of `verify_hmac_hex`; production only verifies, so this
+/// exists for tests that need to mint valid signatures.
+#[cfg(test)]
 pub fn signature_hex(secret: &[u8], message: &[u8]) -> String {
     hmac_sha256(secret, message)
         .iter()
