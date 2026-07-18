@@ -58,6 +58,7 @@ import {
   parseBuiltInSlashCommand,
   type BuiltInSlashCommandName,
 } from "../../lib/slashCommands";
+import { runSideQuestion, stopSideQuestion } from "../../lib/sideQuestion";
 import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
 import { mcpToolDefs } from "../../lib/mcpTools";
 import { useSettingsStore } from "../../store/settingsStore";
@@ -676,12 +677,23 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     };
     if (command === "stop") {
       requireNoArguments();
+      const stoppedSideQuestion = stopSideQuestion(sessionId);
       if (!useSessionStore.getState().runningTurns[sessionId]) {
-        appendCommandNotice(command, "No model turn is currently running.");
+        appendCommandNotice(
+          command,
+          stoppedSideQuestion ? "Cancelled the running side question." : "No model turn is currently running.",
+        );
         return;
       }
       stopTurn(sessionId);
       appendCommandNotice(command, "Cancellation requested. The run will finish only after the active model/tool acknowledges cancellation.");
+      return;
+    }
+    if (command === "btw") {
+      if (!commandArguments) {
+        throw new Error("Use /btw question — the answer is shown here but never added to the conversation.");
+      }
+      await runSideQuestion(sessionId, commandArguments);
       return;
     }
     if (command === "new") {
