@@ -8,6 +8,7 @@ export type ApiScope =
   | "chat_completions"
   | "responses"
   | "messages"
+  | "embeddings"
   | "model_discover"
   | "model_download"
   | "model_load"
@@ -427,6 +428,29 @@ export interface AdvancedSettingCapability {
   schema: SettingValueSchema;
   default_value: SettingValue;
   restart_required: boolean;
+  /** Whether this control can actually be enabled for the current
+   * runtime/model/hardware combination — see `runtime_adapter.rs`'s
+   * `AdvancedSettingCapability` doc comment. When `false`, disable the
+   * control in the UI and show `unsupported_reason`. */
+  supported: boolean;
+  unsupported_reason: string | null;
+}
+
+/** One installed model that could serve as a speculative-decoding draft
+ * model for the target model settings were resolved against. See
+ * `m3_runtime_hub.rs`'s `M3DraftModelCandidate`. */
+export interface M3DraftModelCandidate {
+  modelId: string;
+  displayName: string;
+}
+
+/** Result of `m3_resolve_setting_capabilities`: `runtime.settings` narrowed
+ * to what the current hardware/model can actually honor, plus (for
+ * speculative decoding) the installed models that are valid draft-model
+ * choices right now. See `m3_runtime_hub.rs`'s `gate_advanced_settings`. */
+export interface M3SettingCapabilitiesView {
+  settings: AdvancedSettingCapability[];
+  draftModelCandidates: M3DraftModelCandidate[];
 }
 
 export interface M3RuntimeDescriptor {
@@ -444,7 +468,30 @@ export interface M3RuntimeCapability {
   canLogs: boolean;
   canMetrics: boolean;
   canInfer: boolean;
+  /** Whether this runtime's transport genuinely reaches an embeddings
+   * endpoint (Ollama's daemon today). See the Compatibility tab. */
+  canEmbed: boolean;
   settings: AdvancedSettingCapability[];
+}
+
+/** Phase 8 item 11: OpenAI/Ollama API compatibility matrix — one row per
+ * route x backend x (optionally) model, derived from real runtime/model
+ * capability state. See `RuntimeHubCompatibilityMatrix.tsx`. */
+export type M3CompatibilityStatus = "pass" | "unsupported" | "fail";
+
+export interface M3CompatibilityMatrixRow {
+  method: string;
+  route: string;
+  backend: ApiBackend;
+  runtimeId: string;
+  modelId: string | null;
+  status: M3CompatibilityStatus;
+  reason: string;
+}
+
+export interface M3CompatibilityMatrixReport {
+  generatedAtMs: number;
+  rows: M3CompatibilityMatrixRow[];
 }
 
 export interface RuntimeDescriptor {
@@ -872,6 +919,8 @@ export const runtimeHubClient = {
   runtimes: () => invoke<M3RuntimeCapability[]>("m3_runtimes"),
   refreshRuntimes: (args: OperationArgs) =>
     invoke<M3RuntimeCapability[]>("m3_refresh_runtimes", args),
+  resolveSettingCapabilities: (args: { runtimeId: string; assetId: string | null }) =>
+    invoke<M3SettingCapabilitiesView>("m3_resolve_setting_capabilities", args),
   schedulePlan: (input: M3SchedulingInput) =>
     invoke<M3SchedulingPlan>("m3_schedule_plan", { input }),
   chatTemplateLabReport: (template: string | null) =>
@@ -919,6 +968,7 @@ export const runtimeHubClient = {
     invoke<M3ApiDispatchResponse>("m3_api_dispatch", args),
   apiCancelInference: (args: OperationArgs & { request: M3CancelInferenceRequest }) =>
     invoke<boolean>("m3_api_cancel_inference", args),
+  compatibilityMatrix: () => invoke<M3CompatibilityMatrixReport>("m3_compatibility_matrix"),
   lanValidatePolicy: (policy: LanServerPolicy) => invoke<void>("m3_lan_validate_policy", { policy }),
   lanConfigure: (policy: LanServerPolicy) => invoke<LanServerPolicy>("m3_lan_configure", { policy }),
   lanDisable: (confirmation: string) => invoke<boolean>("m3_lan_disable", { confirmation }),

@@ -18,12 +18,12 @@ use crate::m3_production::M3CatalogSourceConfig;
 use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiDispatchRequest,
     M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch, M3CleanupReport,
-    M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck, M3DeleteModelRequest,
-    M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError, M3InstallComponentRequest,
-    M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest, M3OperationContext,
-    M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind,
-    M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3StorageStatus,
-    M3UnloadModelRequest,
+    M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub, M3ComponentUpdateCheck,
+    M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport, M3HubError,
+    M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView, M3LoadModelRequest,
+    M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView, M3RuntimeHub,
+    M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView, M3SetRuntimeConfigRequest,
+    M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
 };
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -243,6 +243,25 @@ pub async fn m3_refresh_runtimes(
 #[tauri::command]
 pub fn m3_schedule_plan(input: SchedulingInput) -> Result<SchedulingPlan, String> {
     LocalRuntimeScheduler::plan(&input).map_err(|error| error.to_string())
+}
+
+/// Sampler/Batching/Speculative Decoding Controls (ROADMAP Phase 8 item 17):
+/// narrows `runtime_id`'s declared advanced settings down to what the
+/// current hardware and (if `asset_id` is given) selected model can
+/// actually honor — see `m3_runtime_hub.rs`'s `gate_advanced_settings` for
+/// the gating rules. `asset_id: None` still resolves the hardware-only
+/// gates (flash attention, mixed precision); only the speculative-decoding
+/// draft-model gate needs a target model.
+#[tauri::command]
+pub fn m3_resolve_setting_capabilities(
+    state: tauri::State<'_, M3CommandState>,
+    runtime_id: String,
+    asset_id: Option<String>,
+) -> Result<M3SettingCapabilitiesView, String> {
+    state
+        .hub
+        .resolve_setting_capabilities(&runtime_id, asset_id.as_deref())
+        .map_err(command_error)
 }
 
 /// Chat Template and Renderer Compatibility Lab report for one coarse
@@ -609,6 +628,18 @@ pub async fn m3_api_cancel_inference(
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.cancel_inference(&request, &context).await;
     finish(&state, &operation_id, result).await
+}
+
+/// Phase 8 item 11 acceptance criterion: "shown in Runtime/API Hub". Builds
+/// the per-route × backend × model compatibility matrix from real,
+/// currently-registered runtime/model capability state — see
+/// `M3RuntimeHub::compatibility_matrix`'s doc for why this is
+/// capability-derived rather than a live per-cell network probe.
+#[tauri::command]
+pub fn m3_compatibility_matrix(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<M3CompatibilityMatrixReport, String> {
+    state.hub.compatibility_matrix().map_err(command_error)
 }
 
 #[tauri::command]

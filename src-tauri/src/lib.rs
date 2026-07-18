@@ -128,6 +128,13 @@ mod git;
 // this module's Tauri-command surface stays desktop-app-only).
 pub mod llama;
 pub mod mcp;
+// Generic MCP-spec OAuth 2.0 (RFC 8414 discovery, RFC 7591 dynamic client
+// registration, PKCE authorization-code flow) for HTTP MCP servers — an
+// additional, alternative way to obtain `mcp.rs`'s `McpTransport::Http`
+// bearer token besides the manual `mcp_set_http_token` paste-a-token path.
+// Kept as its own module (rather than growing `mcp.rs` further) since it's
+// the one place a future `rmcp` OAuth API change would need editing.
+pub mod mcp_oauth;
 // Connector Catalog: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/S3
 // connections, verified live before saving, secrets in the OS keychain only.
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
@@ -239,6 +246,13 @@ pub mod issue_to_pr;
 // same convention as `diagnostics`/`automations`/`privacy_firewall` above;
 // see the module doc for the on-demand-vs-scheduled scope decision.
 pub mod runtime_pr_watcher;
+// Human Approval Chains (ROADMAP.md Phase 3): multi-step approval workflows
+// (a sequence of stages, each with its own timeout/escalation) layered on top
+// of `permissions.rs`'s existing single-shot request/response system. A new,
+// independent state machine — see the module doc for why it isn't an
+// extension of `PermissionState`.
+pub mod approval_chains;
+pub mod local_apps;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -365,6 +379,31 @@ pub struct AppState {
     /// the connection itself, so this lock is never held across a
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
+    /// Per-server cancellation signal for an in-flight `mcp_oauth_connect`
+    /// (see `mcp_oauth.rs`) — keyed by server id, mirroring `tool_cancel`'s
+    /// shape. `mcp_oauth_cancel` looks up the entry and calls
+    /// `notify_waiters()`; the connect command races its own flow against
+    /// `notified()` in a `tokio::select!` and removes its entry when done
+    /// (success, failure, or cancellation), so this map only ever holds
+    /// entries for genuinely in-flight connect attempts.
+    pub mcp_oauth_cancel:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// Per-server async lock serializing OAuth access-token retrieval/refresh
+    /// (see `mcp_oauth::get_access_token_if_connected`) — keyed by server id.
+    /// `connect_impl`'s `Http` branch calls that function on every
+    /// `mcp_connect`, and nothing else serializes concurrent connects for the
+    /// same server id; without this, two overlapping connects (e.g. a
+    /// double-click on Reconnect, or an auto-reconnect racing a manual one)
+    /// can both read the same still-current refresh token and POST it to the
+    /// token endpoint concurrently. For an authorization server that rotates
+    /// refresh tokens on use, the second request is rejected and that connect
+    /// fails with a misleading "authorization expired/revoked" error even
+    /// though the other attempt just saved valid, fresh credentials. A plain
+    /// `std::sync::Mutex` guarding the *map* (never held across an `.await`);
+    /// each server id's own `tokio::sync::Mutex` is what's actually held
+    /// across the refresh call.
+    pub mcp_oauth_refresh_locks:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Serializes `web_settings.json` writes (see `web.rs::web_set_settings`)
     /// — same reasoning as `mcp_config_lock` protects `mcp_servers.json`.
     /// `web_set_settings` is a synchronous command (Tauri can dispatch two
@@ -424,6 +463,13 @@ pub struct AppState {
     pub index_cancels: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
     >,
+    /// In-flight Human Approval Chain stages (ROADMAP.md, Phase 3) — see
+    /// `approval_chains.rs`'s module doc. A separate state machine from
+    /// `permissions` above, not an extension of it.
+    pub approval_chains: approval_chains::ApprovalChainState,
+    /// Serializes `local_apps.json` read-modify-write cycles (publish/
+    /// unpublish) — same reasoning as `api_server_config_lock`.
+    pub local_apps_config_lock: std::sync::Mutex<()>,
     /// Serializes `privacy_firewall/<workspace>.json` read-modify-write
     /// cycles (see `privacy_firewall::privacy_firewall_save_policy`) — same
     /// reasoning as `mcp_config_lock`/`web_settings_lock` above: a
@@ -480,6 +526,8 @@ impl Default for AppState {
             triage_state_lock: Default::default(),
             file_write_lock: Default::default(),
             mcp: Default::default(),
+            mcp_oauth_cancel: Default::default(),
+            mcp_oauth_refresh_locks: Default::default(),
             web_settings_lock: Default::default(),
             api_server: Default::default(),
             api_server_config_lock: Default::default(),
@@ -488,6 +536,8 @@ impl Default for AppState {
             run_ledger: Default::default(),
             stack_cache: Default::default(),
             index_cancels: Default::default(),
+            approval_chains: Default::default(),
+            local_apps_config_lock: Default::default(),
             privacy_firewall_lock: Default::default(),
             pending_privacy_sends: Default::default(),
             sandbox: Default::default(),
@@ -712,6 +762,7 @@ pub fn run() {
             server::api_server_create_token,
             server::api_server_revoke_token,
             server::api_server_list_tokens,
+            server::api_server_export_audit,
             ollama::ollama_status,
             ollama::ollama_start,
             ollama::ollama_list_models,
@@ -858,6 +909,9 @@ pub fn run() {
             mcp::mcp_remove_http_token,
             mcp::mcp_list_tools,
             mcp::mcp_call_tool,
+            mcp_oauth::mcp_oauth_connect,
+            mcp_oauth::mcp_oauth_cancel,
+            mcp_oauth::mcp_oauth_disconnect,
             system::reveal_in_finder,
             system::open_in_terminal,
             system::open_in_editor,
@@ -938,6 +992,7 @@ pub fn run() {
             m3_commands::m3_catalog_replace_sources,
             m3_commands::m3_runtimes,
             m3_commands::m3_refresh_runtimes,
+            m3_commands::m3_resolve_setting_capabilities,
             m3_commands::m3_schedule_plan,
             m3_commands::m3_chat_template_lab_report,
             m3_commands::m3_offload_plan,
@@ -962,6 +1017,7 @@ pub fn run() {
             m3_commands::m3_runtime_config,
             m3_commands::m3_api_dispatch,
             m3_commands::m3_api_cancel_inference,
+            m3_commands::m3_compatibility_matrix,
             m3_commands::m3_lan_validate_policy,
             m3_commands::m3_lan_configure,
             m3_commands::m3_lan_disable,
@@ -1114,6 +1170,15 @@ pub fn run() {
             issue_to_pr::issue_to_pr_cancel,
             issue_to_pr::issue_to_pr_advance,
             issue_to_pr::issue_to_pr_run_checks,
+            approval_chains::approval_chains_list_templates,
+            approval_chains::approval_chains_start,
+            approval_chains::approval_chain_respond,
+            approval_chains::approval_chains_get,
+            approval_chains::approval_chains_history,
+            local_apps::local_apps_publish,
+            local_apps::local_apps_list,
+            local_apps::local_apps_unpublish,
+            local_apps::local_apps_open,
             m7_companion::m7_overlay_show,
             m7_companion::m7_overlay_hide,
             m7_companion::m7_overlay_submit,

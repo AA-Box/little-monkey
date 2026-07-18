@@ -978,15 +978,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
 
-### 11. OpenAI and Ollama API Compatibility Harness
-
-**Status:** Planned
-
-- Test `/v1/models`, chat/completions, embeddings, streaming/SSE, JSON schema, tool calls, model tags, and Ollama-native endpoints.
-- Keep a compatibility matrix per backend and model.
-
-**Acceptance:** API compatibility regressions are caught before release and shown in Runtime/API Hub.
-
 ### 12. Multimodal Projector and Vision Model Manager
 
 **Status:** Planned
@@ -1031,15 +1022,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 - Prefer safe fallbacks over failed loads.
 
 **Acceptance:** Device-specific profiles explain supported models, expected speed, and required runtime components.
-
-### 17. Sampler, Batching, and Speculative Decoding Controls
-
-**Status:** Research
-
-- Expose supported sampler options, batching, speculative decoding, flash attention, mixed precision, and model-family tuning.
-- Gate advanced controls behind model/runtime support checks.
-
-**Acceptance:** Advanced performance controls cannot be enabled when the selected model/runtime cannot honor them.
 
 ## Phase 9: Release Hardening
 

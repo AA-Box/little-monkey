@@ -15,6 +15,7 @@ import {
   type M3CatalogSourceConfig,
   type M3CatalogMatch,
   type M3CleanupReport,
+  type M3CompatibilityMatrixReport,
   type M3ComponentCatalogEntry,
   type M3ComponentUpdateCheck,
   type M3InstalledComponent,
@@ -27,6 +28,7 @@ import {
   type M3RuntimeStatusView,
   type M3SchedulingInput,
   type M3SchedulingPlan,
+  type M3SettingCapabilitiesView,
   type M3StorageStatus,
   type M3UnloadModelRequest,
   type ContextCacheView,
@@ -56,6 +58,7 @@ export type RuntimeHubSection =
   | "catalogs"
   | "runtimes"
   | "api"
+  | "compatibility"
   | "lan"
   | "quantization"
   | "upstream-watcher";
@@ -95,6 +98,7 @@ interface RuntimeHubStoreState {
   catalogQuery: string;
   catalogResults: M3CatalogMatch[];
   apiResult: M3ApiDispatchResponse | null;
+  compatibilityMatrix: M3CompatibilityMatrixReport | null;
   lanPolicy: LanServerPolicy | null;
   lanTokens: ScopedToken[];
   lanAudit: SecurityAuditEvent[];
@@ -123,6 +127,11 @@ interface RuntimeHubStoreState {
    * `prWatcherState.relevantPrs` (which accumulates across every check) so
    * the UI can show "N new since last check" for just this run. */
   prWatcherLastResult: RuntimePrWatcherCheckResult | null;
+  /** Keyed by runtimeId: the Sampler/Batching/Speculative Decoding gating
+   * result last resolved for that runtime (see `resolveSettingCapabilities`
+   * below). Absent until first resolved; the UI falls back to the
+   * runtime's raw, ungated `settings` list until then. */
+  settingCapabilities: Record<string, M3SettingCapabilitiesView>;
   loaded: boolean;
 
   setSection: (section: RuntimeHubSection) => void;
@@ -147,6 +156,7 @@ interface RuntimeHubStoreState {
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
+  resolveSettingCapabilities: (runtimeId: string, assetId: string | null) => Promise<void>;
   cancelOperation: (key: string) => Promise<boolean>;
   refreshRuntime: (runtimeId: string) => Promise<void>;
   resolveEffectiveContext: (input: EffectiveContextInput) => Promise<EffectiveContextResolution>;
@@ -156,6 +166,7 @@ interface RuntimeHubStoreState {
   setRuntimeConfig: (runtimeId: string, values: Record<string, SettingValue>) => Promise<void>;
   dispatchApi: (request: M3ApiDispatchRequest) => Promise<void>;
   cancelInference: (request: M3CancelInferenceRequest) => Promise<boolean>;
+  refreshCompatibilityMatrix: () => Promise<void>;
   refreshLan: () => Promise<void>;
   validateLanPolicy: (policy: LanServerPolicy) => Promise<void>;
   configureLan: (policy: LanServerPolicy) => Promise<void>;
@@ -321,6 +332,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     catalogQuery: "",
     catalogResults: [],
     apiResult: null,
+    compatibilityMatrix: null,
     lanPolicy: null,
     lanTokens: [],
     lanAudit: [],
@@ -340,6 +352,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     offloadPlans: {},
     prWatcherState: null,
     prWatcherLastResult: null,
+    settingCapabilities: {},
     loaded: false,
 
     setSection: (section) => set({ section }),
@@ -632,6 +645,21 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       }
     },
 
+    resolveSettingCapabilities: async (runtimeId, assetId) => {
+      const key = `settings-gate:${runtimeId}`;
+      begin(key);
+      try {
+        const resolved = await runtimeHubClient.resolveSettingCapabilities({ runtimeId, assetId });
+        set((state) => ({ settingCapabilities: { ...state.settingCapabilities, [runtimeId]: resolved } }));
+      } catch (error) {
+        set((state) => ({ settingCapabilities: omitKey(state.settingCapabilities, runtimeId) }));
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
     cancelOperation: async (key) => {
       const operationId = get().activeOperations[key];
       if (!operationId) return false;
@@ -798,6 +826,19 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       } catch (error) {
         fail(key, error);
         throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    refreshCompatibilityMatrix: async () => {
+      const key = "compatibility-matrix";
+      begin(key);
+      try {
+        const compatibilityMatrix = await runtimeHubClient.compatibilityMatrix();
+        set({ compatibilityMatrix });
+      } catch (error) {
+        fail(key, error);
       } finally {
         finish(key);
       }

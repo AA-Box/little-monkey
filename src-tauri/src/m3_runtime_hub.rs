@@ -7,8 +7,10 @@
 //! without weakening the validation and persistence rules here.
 
 use crate::compatibility_hub::{
-    compatibility_conformance_manifest, encode_response, encode_stream_event, request_offers_tool,
-    ApiBackend, ApiScope, AuthorizationRequest, AuthorizedToken, CanonicalContent,
+    compatibility_conformance_manifest, encode_embeddings_response, encode_ollama_chat_response,
+    encode_response, encode_stream_event, request_offers_tool, translate_embeddings_request,
+    translate_ollama_chat_request, ApiBackend, ApiScope, AuthorizationRequest, AuthorizedToken,
+    CanonicalContent, CanonicalEmbeddingRequest, CanonicalEmbeddingResponse,
     CanonicalInferenceRequest, CanonicalInferenceResponse, CanonicalMessage, CanonicalRole,
     CanonicalStreamEvent, CanonicalUsage, CompatibilityConformanceManifest, CompatibilityError,
     CompatibilityProtocol, LanAccessController, LanEntropySource, LanServerPolicy,
@@ -1146,7 +1148,307 @@ pub struct M3RuntimeCapabilityView {
     pub can_logs: bool,
     pub can_metrics: bool,
     pub can_infer: bool,
+    /// Whether this runtime's transport genuinely reaches an embeddings
+    /// endpoint (Ollama's daemon today — the managed llama.cpp chat
+    /// instance and MLX do not run with embeddings support). A per-model
+    /// `capabilities.embeddings` check still gates individual requests.
+    pub can_embed: bool,
     pub settings: Vec<AdvancedSettingCapability>,
+}
+
+/// Phase 8 item 11 (OpenAI/Ollama API compatibility harness) result: one
+/// row per route × backend × (optionally) model. See
+/// [`M3RuntimeHub::compatibility_matrix`] for how rows are derived and
+/// `m3_compatibility_harness.rs` for the real HTTP-level regression tests
+/// this surfaces the current capability picture for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3CompatibilityStatus {
+    Pass,
+    Unsupported,
+    Fail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3CompatibilityMatrixRow {
+    pub method: String,
+    pub route: String,
+    pub backend: ApiBackend,
+    pub runtime_id: String,
+    pub model_id: Option<String>,
+    pub status: M3CompatibilityStatus,
+    pub reason: String,
+}
+
+impl M3CompatibilityMatrixRow {
+    fn new(
+        method: &str,
+        route: &str,
+        backend: ApiBackend,
+        runtime_id: &str,
+        model_id: Option<&str>,
+        status: M3CompatibilityStatus,
+        reason: &str,
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            route: route.to_string(),
+            backend,
+            runtime_id: runtime_id.to_string(),
+            model_id: model_id.map(str::to_string),
+            status,
+            reason: reason.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3CompatibilityMatrixReport {
+    pub generated_at_ms: u64,
+    pub rows: Vec<M3CompatibilityMatrixRow>,
+}
+
+fn capability_status(supported: bool) -> M3CompatibilityStatus {
+    if supported {
+        M3CompatibilityStatus::Pass
+    } else {
+        M3CompatibilityStatus::Unsupported
+    }
+}
+
+// -- Sampler, Batching, and Speculative Decoding Controls (ROADMAP Phase 8
+// item 17) -------------------------------------------------------------
+//
+// `AdvancedSettingCapability` (see `runtime_adapter.rs`) already tells the
+// UI which knobs a runtime driver knows how to accept at all — that part is
+// static per runtime and unaffected by which model or machine it runs on.
+// Three of the newer knobs need something the low-level adapter layer
+// deliberately has no visibility into:
+//   - `flash_attention` / `mixed_precision` (llama.cpp only) can only be
+//     honored with a real GPU backend, which is a machine-level fact from
+//     the Hardware Compatibility Matrix (`M3HardwareCompatibilityReport`),
+//     not something `runtime_adapter.rs`'s Tauri-free adapters probe for
+//     themselves (see that report's module doc comment for why hardware
+//     probing lives in `m3_production.rs`, not here or there).
+//   - `speculative_decoding_draft_model` (llama.cpp only) is inherently
+//     relative to *which model* is being configured: it needs a smaller,
+//     same-family model already installed to act as the draft. That
+//     relationship only exists at this hub layer, which is the only place
+//     that knows about every installed model at once.
+//
+// `gate_advanced_settings` narrows the static capability list down to what
+// the current runtime/model/hardware combination can actually honor right
+// now, for the UI to render. The same gates are enforced again,
+// authoritatively, server-side in `M3RuntimeHub::set_runtime_config` and
+// `M3RuntimeHub::load_model` — the UI-facing gating here is a convenience,
+// never the only line of defense.
+
+/// Coarse model-family bucket used only to decide whether one installed
+/// model could plausibly serve as a speculative-decoding draft model for
+/// another — never used for anything else. Keyed by a substring match on
+/// `model_id`/`display_name`/`variant_id`, deliberately mirroring
+/// `chat_template_lab::TemplateFamily::detect`'s coarse substring approach
+/// (see that type's doc comment for why finer-grained detection is out of
+/// scope for this codebase). `Generic` never matches another `Generic`
+/// model as a compatible pair: two models this app cannot place in a named
+/// family are not assumed related just because both are unclassified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFamily {
+    Llama,
+    Qwen,
+    Mistral,
+    Gemma,
+    Phi,
+    DeepSeek,
+    Generic,
+}
+
+impl ModelFamily {
+    pub fn detect(model_id: &str, display_name: &str, variant_id: &str) -> Self {
+        let haystack = format!("{model_id} {display_name} {variant_id}").to_lowercase();
+        if haystack.contains("deepseek") {
+            Self::DeepSeek
+        } else if haystack.contains("qwen") {
+            Self::Qwen
+        } else if haystack.contains("gemma") {
+            Self::Gemma
+        } else if haystack.contains("mistral") || haystack.contains("mixtral") {
+            Self::Mistral
+        } else if haystack.contains("phi") {
+            Self::Phi
+        } else if haystack.contains("llama") {
+            Self::Llama
+        } else {
+            Self::Generic
+        }
+    }
+}
+
+/// One installed model that could serve as a speculative-decoding draft
+/// model for the target the settings are being resolved against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3DraftModelCandidate {
+    pub model_id: String,
+    pub display_name: String,
+}
+
+/// Result of [`gate_advanced_settings`]: the runtime's declared settings,
+/// narrowed to what can actually be enabled right now, plus (for
+/// speculative decoding specifically) the installed models a `Text`-schema
+/// draft-model setting can validly reference — a fixed `Choice` schema
+/// cannot express this list since it is relative to whichever model is
+/// currently selected, not fixed at capability-declaration time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3SettingCapabilitiesView {
+    pub settings: Vec<AdvancedSettingCapability>,
+    pub draft_model_candidates: Vec<M3DraftModelCandidate>,
+}
+
+/// Whether at least one non-CPU accelerator is confirmed `Available` per the
+/// Hardware Compatibility Matrix report. Shared by both the flash-attention
+/// and mixed-precision gates: llama.cpp requires flash attention to quantize
+/// the KV cache below f16, and flash attention itself needs real GPU
+/// acceleration (see each gate's reason string for the user-facing detail).
+fn gpu_backend_available(report: &M3HardwareCompatibilityReport) -> bool {
+    report.accelerators.iter().any(|accelerator| {
+        accelerator.kind != AcceleratorKind::Cpu && accelerator.status == M3AcceleratorStatus::Available
+    })
+}
+
+/// `Some(reason)` when flash attention cannot be enabled on this machine
+/// right now, `None` when it can. Shared by the UI-facing resolver and the
+/// authoritative `set_runtime_config` enforcement so both always agree.
+fn flash_attention_block_reason(report: &M3HardwareCompatibilityReport) -> Option<String> {
+    if gpu_backend_available(report) {
+        None
+    } else {
+        Some(
+            "Flash attention needs a supported GPU backend (Metal, CUDA, ROCm, or Vulkan); \
+             this machine's Hardware Compatibility report shows CPU only."
+                .to_string(),
+        )
+    }
+}
+
+/// `Some(reason)` when quantized-KV-cache "mixed precision" cannot be
+/// enabled on this machine right now, `None` when it can.
+fn mixed_precision_block_reason(report: &M3HardwareCompatibilityReport) -> Option<String> {
+    if gpu_backend_available(report) {
+        None
+    } else {
+        Some(
+            "Quantized KV cache (mixed precision) needs a supported GPU backend and flash \
+             attention; this machine's Hardware Compatibility report shows CPU only."
+                .to_string(),
+        )
+    }
+}
+
+/// Installed models that could serve as a speculative-decoding draft model
+/// for `target`: same runtime (llama.cpp only — see the module doc comment
+/// for why), a named (non-`Generic`) family that matches `target`'s, a
+/// different asset than `target` itself, and a genuinely smaller estimated
+/// footprint (a draft model only speeds up generation if it is cheaper to
+/// run per token than the model it drafts for).
+fn compatible_draft_models<'a>(
+    target: &M3InstalledModelView,
+    installed: &'a [M3InstalledModelView],
+) -> Vec<&'a M3InstalledModelView> {
+    if target.runtime != M3RuntimeKind::LlamaCpp {
+        return Vec::new();
+    }
+    let target_family = ModelFamily::detect(&target.model_id, &target.display_name, &target.variant_id);
+    if target_family == ModelFamily::Generic {
+        return Vec::new();
+    }
+    installed
+        .iter()
+        .filter(|candidate| {
+            candidate.asset_id != target.asset_id
+                && candidate.runtime == M3RuntimeKind::LlamaCpp
+                && candidate.estimated_ram_bytes < target.estimated_ram_bytes
+                && ModelFamily::detect(&candidate.model_id, &candidate.display_name, &candidate.variant_id)
+                    == target_family
+        })
+        .collect()
+}
+
+/// Narrows a runtime's declared `AdvancedSettingCapability` list down to
+/// what the current hardware and (optionally) selected target model can
+/// actually honor. Pure and deterministic — no I/O, no clock — so it is
+/// trivially unit-testable with fixture reports/models. `target: None`
+/// covers the "no model selected yet" case: hardware-only gates
+/// (flash attention, mixed precision) still resolve correctly, while the
+/// model-relative speculative-decoding gate reports "select a model" rather
+/// than guessing.
+pub fn gate_advanced_settings(
+    capabilities: &[AdvancedSettingCapability],
+    compatibility: &M3HardwareCompatibilityReport,
+    target: Option<&M3InstalledModelView>,
+    installed: &[M3InstalledModelView],
+) -> M3SettingCapabilitiesView {
+    let mut draft_model_candidates = Vec::new();
+    let settings = capabilities
+        .iter()
+        .cloned()
+        .map(|mut capability| {
+            match capability.key.as_str() {
+                "flash_attention" => {
+                    if let Some(reason) = flash_attention_block_reason(compatibility) {
+                        capability.supported = false;
+                        capability.unsupported_reason = Some(reason);
+                    }
+                }
+                "mixed_precision" => {
+                    if let Some(reason) = mixed_precision_block_reason(compatibility) {
+                        capability.supported = false;
+                        capability.unsupported_reason = Some(reason);
+                    }
+                }
+                "speculative_decoding_draft_model" => match target {
+                    None => {
+                        capability.supported = false;
+                        capability.unsupported_reason = Some(
+                            "Select a model to check for a compatible installed draft model."
+                                .to_string(),
+                        );
+                    }
+                    Some(target_model) => {
+                        let candidates = compatible_draft_models(target_model, installed);
+                        if candidates.is_empty() {
+                            capability.supported = false;
+                            capability.unsupported_reason = Some(format!(
+                                "No compatible draft model installed. Install a smaller, \
+                                 same-family model than {} for llama.cpp to enable speculative \
+                                 decoding.",
+                                target_model.display_name
+                            ));
+                        } else {
+                            capability.supported = true;
+                            capability.unsupported_reason = None;
+                            draft_model_candidates.extend(candidates.iter().map(|candidate| {
+                                M3DraftModelCandidate {
+                                    model_id: candidate.model_id.clone(),
+                                    display_name: candidate.display_name.clone(),
+                                }
+                            }));
+                        }
+                    }
+                },
+                _ => {}
+            }
+            capability
+        })
+        .collect();
+    M3SettingCapabilitiesView {
+        settings,
+        draft_model_candidates,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1201,6 +1503,24 @@ pub trait M3InferenceEngine: Send + Sync {
         request_id: &'a str,
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool>;
+
+    /// Generates embeddings for a batch of text inputs. The default rejects
+    /// with `Unsupported` — only engines that genuinely reach a backend
+    /// capable of producing real vectors (see
+    /// `OpenAiCompatibleM3InferenceEngine` in `m3_production.rs`) override
+    /// this; nothing here ever fabricates a vector.
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        Box::pin(async move {
+            Err(M3HubError::Unsupported(format!(
+                "model {} does not have an embeddings-capable inference engine",
+                request.model
+            )))
+        })
+    }
 }
 
 pub trait M3RuntimeDriver: Send + Sync {
@@ -1254,6 +1574,25 @@ pub trait M3RuntimeDriver: Send + Sync {
         request_id: &'a str,
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, bool>;
+
+    /// Generates embeddings through this runtime. The default rejects with
+    /// `Unsupported` — see [`M3InferenceEngine::embed`]'s doc for why this
+    /// stays an honest rejection rather than a fabricated vector wherever a
+    /// driver does not override it (for example the managed MLX driver,
+    /// which has no embeddings support today).
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        _context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        let runtime_id = self.descriptor().runtime_id;
+        Box::pin(async move {
+            Err(M3HubError::Unsupported(format!(
+                "runtime {runtime_id} does not support embeddings generation for model {}",
+                request.model
+            )))
+        })
+    }
 }
 
 pub struct RuntimeAdapterM3Driver {
@@ -1318,6 +1657,10 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
             can_logs: source.can_tail_logs,
             can_metrics: true,
             can_infer: true,
+            // Ollama's daemon serves an OpenAI-compatible `/v1/embeddings`
+            // endpoint alongside chat; the managed llama.cpp chat instance
+            // is started without `--embeddings` and therefore cannot.
+            can_embed: self.descriptor.kind == M3RuntimeKind::Ollama,
             settings: source.settings,
         }
     }
@@ -1506,6 +1849,14 @@ impl M3RuntimeDriver for RuntimeAdapterM3Driver {
     ) -> M3HubFuture<'a, bool> {
         self.inference.cancel(request_id, context)
     }
+
+    fn embed<'a>(
+        &'a self,
+        request: &'a CanonicalEmbeddingRequest,
+        context: &'a M3OperationContext,
+    ) -> M3HubFuture<'a, CanonicalEmbeddingResponse> {
+        self.inference.embed(request, context)
+    }
 }
 
 pub struct MlxM3Driver {
@@ -1591,6 +1942,7 @@ impl M3RuntimeDriver for MlxM3Driver {
             can_logs: installed,
             can_metrics: installed,
             can_infer: installed,
+            can_embed: false,
             settings: Vec::new(),
         }
     }
@@ -1950,6 +2302,139 @@ impl M3RuntimeHub {
 
     pub fn conformance_manifest(&self) -> CompatibilityConformanceManifest {
         compatibility_conformance_manifest()
+    }
+
+    /// Builds a compatibility matrix — one row per advertised route, per
+    /// configured runtime, and (for capability-specific routes) per
+    /// installed model. This is deliberately capability-derived rather than
+    /// a live per-cell network probe: it reflects the same runtime/model
+    /// capability state (`can_infer`, `can_embed`,
+    /// `M3ModelCapabilities`) that already gates real requests, kept
+    /// accurate by runtime reconciliation. Regressions in the actual wire
+    /// behavior are caught by the `m3_compatibility_harness` integration
+    /// test suite, which spins up the real HTTP server and makes real
+    /// requests; this method is what the Runtime/API Hub UI renders.
+    pub fn compatibility_matrix(&self) -> M3HubResult<M3CompatibilityMatrixReport> {
+        let runtimes = self.list_runtimes()?;
+        let installed = self.list_installed_models()?;
+        let mut rows = Vec::new();
+        for runtime in &runtimes {
+            let backend = runtime.descriptor.api_backend;
+            let runtime_id = runtime.descriptor.runtime_id.clone();
+            rows.push(M3CompatibilityMatrixRow::new(
+                "GET",
+                "/v1/models",
+                backend,
+                &runtime_id,
+                None,
+                M3CompatibilityStatus::Pass,
+                "runtime is registered and discoverable",
+            ));
+            rows.push(M3CompatibilityMatrixRow::new(
+                "GET",
+                "/api/tags",
+                backend,
+                &runtime_id,
+                None,
+                M3CompatibilityStatus::Pass,
+                "native-Ollama listing reshapes the same discovery data as /v1/models",
+            ));
+            let infer_status = if runtime.can_infer {
+                (
+                    M3CompatibilityStatus::Pass,
+                    "runtime driver supports inference".to_string(),
+                )
+            } else {
+                (
+                    M3CompatibilityStatus::Unsupported,
+                    "runtime driver does not support inference".to_string(),
+                )
+            };
+            for (method, route) in [
+                ("POST", "/v1/chat/completions"),
+                ("POST", "/v1/responses"),
+                ("POST", "/v1/messages"),
+                ("POST", "/api/chat"),
+            ] {
+                rows.push(M3CompatibilityMatrixRow::new(
+                    method,
+                    route,
+                    backend,
+                    &runtime_id,
+                    None,
+                    infer_status.0,
+                    &infer_status.1,
+                ));
+            }
+            rows.push(M3CompatibilityMatrixRow::new(
+                "POST",
+                "/v1/embeddings",
+                backend,
+                &runtime_id,
+                None,
+                if runtime.can_embed {
+                    M3CompatibilityStatus::Pass
+                } else {
+                    M3CompatibilityStatus::Unsupported
+                },
+                if runtime.can_embed {
+                    "runtime driver reaches a genuine embeddings endpoint"
+                } else {
+                    "runtime driver has no embeddings-capable endpoint configured"
+                },
+            ));
+            for model in installed
+                .iter()
+                .filter(|model| model.runtime == runtime.descriptor.kind)
+            {
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/chat/completions (tool calls)",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(model.capabilities.tool_calling),
+                    if model.capabilities.tool_calling {
+                        "model advertises tool calling"
+                    } else {
+                        "model does not advertise tool calling"
+                    },
+                ));
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/chat/completions (json schema)",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(model.capabilities.structured_output),
+                    if model.capabilities.structured_output {
+                        "model advertises structured output"
+                    } else {
+                        "model does not advertise structured output"
+                    },
+                ));
+                let embeddings_ok = runtime.can_embed && model.capabilities.embeddings;
+                rows.push(M3CompatibilityMatrixRow::new(
+                    "POST",
+                    "/v1/embeddings",
+                    backend,
+                    &runtime_id,
+                    Some(&model.model_id),
+                    capability_status(embeddings_ok),
+                    if embeddings_ok {
+                        "model advertises embeddings on an embeddings-capable runtime"
+                    } else if !runtime.can_embed {
+                        "runtime driver has no embeddings-capable endpoint configured"
+                    } else {
+                        "model does not advertise embeddings"
+                    },
+                ));
+            }
+        }
+        Ok(M3CompatibilityMatrixReport {
+            generated_at_ms: self.clock.now_ms()?,
+            rows,
+        })
     }
 
     pub fn hardware_snapshot(&self) -> M3HubResult<HardwareSnapshot> {
@@ -2713,6 +3198,7 @@ impl M3RuntimeHub {
         let settings = self
             .runtime_config(&request.runtime_id)?
             .unwrap_or_default();
+        self.enforce_draft_model_gate(&model, &settings)?;
         runtime
             .load(
                 &model,
@@ -2722,6 +3208,51 @@ impl M3RuntimeHub {
                 context,
             )
             .await
+    }
+
+    /// Authoritative, server-side half of the speculative-decoding gate: the
+    /// UI-facing `resolve_setting_capabilities` only decides what to *show*
+    /// as enabled; this decides what actually gets to run. The persisted
+    /// runtime config is model-agnostic (one config applies to whatever
+    /// gets loaded next), so the draft-model choice can only be checked
+    /// against a *specific* target once that target is known — which is
+    /// exactly here, at load time, mirroring how `RuntimeAdapterM3Driver::load`
+    /// already does its own load-time-only "has this runtime reconciled
+    /// this model" check beyond the low-level adapter's static validation.
+    fn enforce_draft_model_gate(
+        &self,
+        model: &M3ResolvedModel,
+        settings: &BTreeMap<String, SettingValue>,
+    ) -> M3HubResult<()> {
+        let Some(SettingValue::Text { value }) = settings.get("speculative_decoding_draft_model")
+        else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            return Ok(());
+        }
+        if model.runtime != M3RuntimeKind::LlamaCpp {
+            return Err(M3HubError::Unsupported(
+                "Speculative decoding is only available for llama.cpp".to_string(),
+            ));
+        }
+        let installed = self.list_installed_models()?;
+        let target_view = installed
+            .iter()
+            .find(|entry| entry.asset_id == model.asset_id)
+            .ok_or_else(|| M3HubError::NotFound(format!("model {}", model.asset_id)))?;
+        let candidates = compatible_draft_models(target_view, &installed);
+        if candidates
+            .iter()
+            .any(|candidate| candidate.model_id == *value)
+        {
+            Ok(())
+        } else {
+            Err(M3HubError::Unsupported(format!(
+                "{value} is not a compatible installed draft model for {}",
+                target_view.display_name
+            )))
+        }
     }
 
     pub async fn unload_model(
@@ -2763,6 +3294,7 @@ impl M3RuntimeHub {
         validate_identifier(&request.runtime_id, "runtimeId")?;
         self.runtime(&request.runtime_id)?
             .validate_config(&request.values)?;
+        self.enforce_hardware_setting_gates(&request.values)?;
         let _guard = lock(&self.state_lock)?;
         let mut state = load_hub_state(&self.state_root, &self.models_root)?;
         state
@@ -2770,6 +3302,38 @@ impl M3RuntimeHub {
             .insert(request.runtime_id.clone(), request.values.clone());
         save_next_hub_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
         Ok(request.values.clone())
+    }
+
+    /// Authoritative, server-side half of the flash-attention/mixed-precision
+    /// gates: hardware support is machine-level (not model-relative), so —
+    /// unlike the draft-model gate, which can only be checked once a target
+    /// model is known at load time — this can and does run right at
+    /// config-save time. The UI-facing `resolve_setting_capabilities` shows
+    /// the same gate ahead of time so this should only ever reject a request
+    /// that bypassed the UI (a direct IPC call, a stale client).
+    fn enforce_hardware_setting_gates(
+        &self,
+        values: &BTreeMap<String, SettingValue>,
+    ) -> M3HubResult<()> {
+        let flash_wants_on =
+            matches!(values.get("flash_attention"), Some(SettingValue::Choice { value }) if value == "on");
+        let mixed_wants_non_f16 =
+            matches!(values.get("mixed_precision"), Some(SettingValue::Choice { value }) if value != "f16");
+        if !flash_wants_on && !mixed_wants_non_f16 {
+            return Ok(());
+        }
+        let compatibility = self.hardware_compatibility_report()?;
+        if flash_wants_on {
+            if let Some(reason) = flash_attention_block_reason(&compatibility) {
+                return Err(M3HubError::Unsupported(reason));
+            }
+        }
+        if mixed_wants_non_f16 {
+            if let Some(reason) = mixed_precision_block_reason(&compatibility) {
+                return Err(M3HubError::Unsupported(reason));
+            }
+        }
+        Ok(())
     }
 
     pub fn runtime_config(
@@ -2782,6 +3346,42 @@ impl M3RuntimeHub {
             .runtime_configs
             .get(runtime_id)
             .cloned())
+    }
+
+    /// UI-facing gating resolver: narrows `runtime_id`'s declared advanced
+    /// settings down to what the current hardware and (if `asset_id` is
+    /// given) selected target model can actually honor, via
+    /// [`gate_advanced_settings`]. `asset_id: None` still resolves the
+    /// hardware-only gates (flash attention, mixed precision) correctly —
+    /// only the model-relative speculative-decoding gate needs a target.
+    pub fn resolve_setting_capabilities(
+        &self,
+        runtime_id: &str,
+        asset_id: Option<&str>,
+    ) -> M3HubResult<M3SettingCapabilitiesView> {
+        validate_identifier(runtime_id, "runtimeId")?;
+        let runtime = self.runtime(runtime_id)?;
+        let capabilities = runtime.capabilities();
+        let compatibility = self.hardware_compatibility_report()?;
+        let installed = self.list_installed_models()?;
+        let target = match asset_id {
+            Some(asset_id) => {
+                validate_identifier(asset_id, "assetId")?;
+                Some(
+                    installed
+                        .iter()
+                        .find(|model| model.asset_id == asset_id)
+                        .ok_or_else(|| M3HubError::NotFound(format!("model {asset_id}")))?,
+                )
+            }
+            None => None,
+        };
+        Ok(gate_advanced_settings(
+            &capabilities.settings,
+            &compatibility,
+            target,
+            &installed,
+        ))
     }
 
     pub fn lan_policy(&self) -> M3HubResult<Option<LanServerPolicy>> {
@@ -3048,6 +3648,45 @@ pub struct M3CancelInferenceRequest {
     pub now_ms: u64,
 }
 
+/// Dispatch envelope for `POST /v1/embeddings`. Distinct from
+/// [`M3ApiDispatchRequest`] because embeddings have no
+/// [`CompatibilityProtocol`] of their own — see
+/// [`translate_embeddings_request`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3EmbeddingDispatchRequest {
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+    pub caller: M3ApiCaller,
+    pub now_ms: u64,
+}
+
+/// Dispatch envelope for the Ollama-native `POST /api/chat`. Reuses the
+/// `ChatCompletions` scope for authorization since it is the same
+/// underlying operation as `/v1/chat/completions`, just a different wire
+/// format — not a new, less-guarded route class.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3OllamaChatDispatchRequest {
+    pub runtime_id: String,
+    pub request_id: String,
+    pub body: Vec<u8>,
+    pub caller: M3ApiCaller,
+    pub now_ms: u64,
+}
+
+/// Result of dispatching the Ollama-native `/api/chat` endpoint: the
+/// encoded body plus whether the request asked for `stream` framing (the
+/// HTTP layer uses this only to pick a Content-Type; see
+/// [`translate_ollama_chat_request`]'s doc for the streaming limitation).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3OllamaChatDispatchResponse {
+    pub body: Value,
+    pub stream_requested: bool,
+}
+
 impl M3RuntimeHub {
     pub async fn dispatch_api(
         &self,
@@ -3068,7 +3707,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
@@ -3106,7 +3745,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &canonical.model,
             request.body.len() as u64,
@@ -3119,6 +3758,77 @@ impl M3RuntimeHub {
         runtime.stream(&canonical, &mut encoding, context).await
     }
 
+    /// Dispatches `POST /v1/embeddings`: translates the request, resolves
+    /// the runtime, authorizes with the `Embeddings` scope, and calls the
+    /// runtime driver's `embed()` — which honestly rejects with
+    /// `Unsupported` unless it genuinely reaches a backend capable of
+    /// producing real vectors.
+    pub async fn dispatch_embeddings(
+        &self,
+        request: &M3EmbeddingDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3ApiDispatchResponse> {
+        context.preflight("dispatch embeddings request")?;
+        let canonical = translate_embeddings_request(&request.request_id, &request.body)?;
+        let runtime = self.runtime(&request.runtime_id)?;
+        self.authorize_api(
+            &request.caller,
+            ApiScope::Embeddings,
+            &runtime.descriptor(),
+            &canonical.model,
+            request.body.len() as u64,
+            request.now_ms,
+        )?;
+        let response = runtime.embed(&canonical, context).await?;
+        if response.model != canonical.model {
+            return Err(M3HubError::Runtime(
+                "embeddings driver returned a response for another model".to_string(),
+            ));
+        }
+        Ok(M3ApiDispatchResponse {
+            status: 200,
+            body: encode_embeddings_response(&response)?,
+        })
+    }
+
+    /// Dispatches the Ollama-native `POST /api/chat`: translates the
+    /// request into the same canonical inference representation used by
+    /// `/v1/chat/completions`, authorizes with the `ChatCompletions` scope
+    /// (same operation, different wire format), calls the resolved
+    /// runtime's `complete()` (always non-streaming — see
+    /// [`M3OllamaChatDispatchResponse`]'s doc), and encodes an
+    /// Ollama-native response with a real measured `total_duration`.
+    pub async fn dispatch_ollama_chat(
+        &self,
+        request: &M3OllamaChatDispatchRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3OllamaChatDispatchResponse> {
+        context.preflight("dispatch ollama-native chat request")?;
+        let (canonical, stream_requested) =
+            translate_ollama_chat_request(&request.request_id, &request.body)?;
+        let runtime = self.runtime(&request.runtime_id)?;
+        self.authorize_api(
+            &request.caller,
+            ApiScope::ChatCompletions,
+            &runtime.descriptor(),
+            &canonical.model,
+            request.body.len() as u64,
+            request.now_ms,
+        )?;
+        let started_at = std::time::Instant::now();
+        let response = runtime.complete(&canonical, context).await?;
+        let total_duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if response.model != canonical.model {
+            return Err(M3HubError::Runtime(
+                "inference driver returned a response for another model".to_string(),
+            ));
+        }
+        Ok(M3OllamaChatDispatchResponse {
+            body: encode_ollama_chat_response(&response, total_duration_ns)?,
+            stream_requested,
+        })
+    }
+
     pub async fn cancel_inference(
         &self,
         request: &M3CancelInferenceRequest,
@@ -3129,7 +3839,7 @@ impl M3RuntimeHub {
         let runtime = self.runtime(&request.runtime_id)?;
         self.authorize_api(
             &request.caller,
-            request.protocol,
+            protocol_scope(request.protocol),
             &runtime.descriptor(),
             &request.model_id,
             0,
@@ -3141,7 +3851,7 @@ impl M3RuntimeHub {
     fn authorize_api(
         &self,
         caller: &M3ApiCaller,
-        protocol: CompatibilityProtocol,
+        scope: ApiScope,
         runtime: &M3RuntimeDescriptor,
         model_id: &str,
         input_bytes: u64,
@@ -3155,7 +3865,7 @@ impl M3RuntimeHub {
             } => {
                 self.lan_controller()?.authorize(&AuthorizationRequest {
                     bearer_token: bearer_token.clone(),
-                    scope: protocol_scope(protocol),
+                    scope,
                     backend: runtime.api_backend,
                     model_id: Some(model_id.to_string()),
                     input_bytes,
@@ -6403,5 +7113,345 @@ mod tests {
             matches!(result, Err(M3HubError::Runtime(ref message)) if message.contains("shell_exec") && message.contains("not offered")),
             "expected an unoffered-tool rejection, got {result:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ROADMAP Phase 8 item 17: Sampler, Batching, and Speculative Decoding
+    // Controls. Pure unit coverage for `ModelFamily::detect`,
+    // `compatible_draft_models`, and `gate_advanced_settings` — the
+    // end-to-end `set_runtime_config`/`load_model`/
+    // `resolve_setting_capabilities` enforcement paths are covered by
+    // `tests/m3_runtime_hub_contract.rs` against a real `M3RuntimeHub`.
+    // ------------------------------------------------------------------
+
+    fn installed_model_view(
+        asset_id: &str,
+        model_id: &str,
+        display_name: &str,
+        runtime: M3RuntimeKind,
+        estimated_ram_bytes: u64,
+    ) -> M3InstalledModelView {
+        M3InstalledModelView {
+            asset_id: asset_id.to_string(),
+            model_id: model_id.to_string(),
+            display_name: display_name.to_string(),
+            runtime,
+            variant_id: "q4_k_m".to_string(),
+            capabilities: M3ModelCapabilities {
+                chat: true,
+                embeddings: false,
+                tool_calling: false,
+                vision: false,
+                structured_output: false,
+            },
+            estimated_ram_bytes,
+            estimated_vram_bytes: 0,
+            required_accelerator: None,
+            active_version_key: "version-1".to_string(),
+            versions: Vec::new(),
+        }
+    }
+
+    fn cpu_only_compatibility_report() -> M3HardwareCompatibilityReport {
+        compatibility_report_from_snapshot(&HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            available_ram_bytes: 8 * 1024 * 1024 * 1024,
+            logical_cpu_count: 8,
+            platform: crate::runtime_adapter::PlatformCapabilities::from_host(
+                "linux",
+                "x86_64",
+                Vec::new(),
+            ),
+        })
+    }
+
+    fn cuda_compatibility_report() -> M3HardwareCompatibilityReport {
+        compatibility_report_from_snapshot(&HardwareSnapshot {
+            captured_at_ms: 1,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            available_ram_bytes: 8 * 1024 * 1024 * 1024,
+            logical_cpu_count: 8,
+            platform: crate::runtime_adapter::PlatformCapabilities::from_host(
+                "linux",
+                "x86_64",
+                vec![crate::runtime_adapter::AcceleratorCapability {
+                    kind: AcceleratorKind::Cuda,
+                    available: true,
+                    device_names: vec!["Test GPU".to_string()],
+                    total_memory_bytes: Some(24 * 1024 * 1024 * 1024),
+                    available_memory_bytes: Some(20 * 1024 * 1024 * 1024),
+                }],
+            ),
+        })
+    }
+
+    /// Minimal capability fixture covering only the three keys
+    /// `gate_advanced_settings` actually gates — deliberately not a copy of
+    /// the real (private) `llama_setting_capabilities()`, so these tests
+    /// exercise the gating function's contract rather than duplicating that
+    /// module's own declaration.
+    fn llama_capabilities_fixture() -> Vec<AdvancedSettingCapability> {
+        vec![
+            AdvancedSettingCapability {
+                key: "flash_attention".to_string(),
+                label: "Flash attention".to_string(),
+                description: "Flash attention behavior".to_string(),
+                schema: crate::runtime_adapter::SettingValueSchema::Choice {
+                    options: vec!["auto".to_string(), "on".to_string(), "off".to_string()],
+                },
+                default_value: SettingValue::Choice {
+                    value: "auto".to_string(),
+                },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "mixed_precision".to_string(),
+                label: "Mixed precision (KV cache)".to_string(),
+                description: "KV cache quantization".to_string(),
+                schema: crate::runtime_adapter::SettingValueSchema::Choice {
+                    options: vec!["f16".to_string(), "q8_0".to_string(), "q4_0".to_string()],
+                },
+                default_value: SettingValue::Choice {
+                    value: "f16".to_string(),
+                },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "speculative_decoding_draft_model".to_string(),
+                label: "Speculative decoding draft model".to_string(),
+                description: "Draft model id for speculative decoding".to_string(),
+                schema: crate::runtime_adapter::SettingValueSchema::Text { max_bytes: 256 },
+                default_value: SettingValue::Text {
+                    value: String::new(),
+                },
+                restart_required: true,
+                supported: false,
+                unsupported_reason: Some(
+                    "Select a model to check for a compatible installed draft model.".to_string(),
+                ),
+            },
+        ]
+    }
+
+    #[test]
+    fn model_family_detect_buckets_known_names_and_falls_back_to_generic() {
+        assert_eq!(
+            ModelFamily::detect("llama-3-8b-instruct", "Llama 3 8B Instruct", "q4_k_m"),
+            ModelFamily::Llama
+        );
+        assert_eq!(
+            ModelFamily::detect("qwen2-7b-instruct", "Qwen2 7B Instruct", "q4_k_m"),
+            ModelFamily::Qwen
+        );
+        assert_eq!(
+            ModelFamily::detect("mixtral-8x7b", "Mixtral 8x7B", "q4_k_m"),
+            ModelFamily::Mistral
+        );
+        assert_eq!(
+            ModelFamily::detect("gemma-2-9b", "Gemma 2 9B", "q4_k_m"),
+            ModelFamily::Gemma
+        );
+        assert_eq!(
+            ModelFamily::detect("phi-3.5-mini", "Phi 3.5 Mini", "q4_k_m"),
+            ModelFamily::Phi
+        );
+        assert_eq!(
+            ModelFamily::detect("deepseek-r1-distill", "DeepSeek R1 Distill", "q4_k_m"),
+            ModelFamily::DeepSeek
+        );
+        assert_eq!(
+            ModelFamily::detect("custom-corp-model", "Custom Corp Model", "q4_k_m"),
+            ModelFamily::Generic
+        );
+    }
+
+    #[test]
+    fn compatible_draft_models_requires_llama_cpp_named_family_match_and_smaller_footprint() {
+        let target = installed_model_view(
+            "llama_cpp:llama-3-8b-instruct:q4_k_m",
+            "llama-3-8b-instruct",
+            "Llama 3 8B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            8_000_000_000,
+        );
+        let smaller_same_family = installed_model_view(
+            "llama_cpp:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        );
+        let larger_same_family = installed_model_view(
+            "llama_cpp:llama-3-70b-instruct:q4_k_m",
+            "llama-3-70b-instruct",
+            "Llama 3 70B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            70_000_000_000,
+        );
+        let smaller_different_family = installed_model_view(
+            "llama_cpp:mistral-7b-instruct:q4_k_m",
+            "mistral-7b-instruct",
+            "Mistral 7B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            4_000_000_000,
+        );
+        let smaller_same_family_wrong_runtime = installed_model_view(
+            "ollama:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct (Ollama)",
+            M3RuntimeKind::Ollama,
+            1_000_000_000,
+        );
+        let installed = vec![
+            target.clone(),
+            smaller_same_family.clone(),
+            larger_same_family,
+            smaller_different_family,
+            smaller_same_family_wrong_runtime,
+        ];
+
+        let candidates = compatible_draft_models(&target, &installed);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].asset_id, smaller_same_family.asset_id);
+
+        // A target whose own model_id/display_name never matched a named
+        // family never gets a draft — two "generic" models are not assumed
+        // related just because both are unclassified.
+        let generic_target = installed_model_view(
+            "llama_cpp:custom-corp-model:q4_k_m",
+            "custom-corp-model",
+            "Custom Corp Model",
+            M3RuntimeKind::LlamaCpp,
+            8_000_000_000,
+        );
+        let generic_smaller = installed_model_view(
+            "llama_cpp:another-custom-model:q4_k_m",
+            "another-custom-model",
+            "Another Custom Model",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        );
+        assert!(compatible_draft_models(&generic_target, &[generic_target.clone(), generic_smaller]).is_empty());
+
+        // A non-llama.cpp target never gets a draft at all, regardless of
+        // family/size — speculative decoding is only wired for llama.cpp.
+        let ollama_target = installed_model_view(
+            "ollama:llama-3-8b-instruct:q4_k_m",
+            "llama-3-8b-instruct",
+            "Llama 3 8B Instruct",
+            M3RuntimeKind::Ollama,
+            8_000_000_000,
+        );
+        assert!(compatible_draft_models(&ollama_target, &installed_smaller_llama_cpp_fixture()).is_empty());
+    }
+
+    /// A single smaller, same-family, llama.cpp-runtime model — used only to
+    /// prove a non-llama.cpp target still gets no draft candidates even when
+    /// a plausible one exists for a different runtime.
+    fn installed_smaller_llama_cpp_fixture() -> Vec<M3InstalledModelView> {
+        vec![installed_model_view(
+            "llama_cpp:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        )]
+    }
+
+    #[test]
+    fn gate_advanced_settings_flips_flash_attention_and_mixed_precision_with_the_hardware_report() {
+        let capabilities = llama_capabilities_fixture();
+        let cpu_result = gate_advanced_settings(&capabilities, &cpu_only_compatibility_report(), None, &[]);
+        let flash_attention = cpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "flash_attention")
+            .expect("flash_attention present");
+        assert!(!flash_attention.supported);
+        assert!(flash_attention.unsupported_reason.is_some());
+        let mixed_precision = cpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "mixed_precision")
+            .expect("mixed_precision present");
+        assert!(!mixed_precision.supported);
+
+        let gpu_result = gate_advanced_settings(&capabilities, &cuda_compatibility_report(), None, &[]);
+        let flash_attention = gpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "flash_attention")
+            .expect("flash_attention present");
+        assert!(flash_attention.supported);
+        assert!(flash_attention.unsupported_reason.is_none());
+        let mixed_precision = gpu_result
+            .settings
+            .iter()
+            .find(|setting| setting.key == "mixed_precision")
+            .expect("mixed_precision present");
+        assert!(mixed_precision.supported);
+    }
+
+    #[test]
+    fn gate_advanced_settings_reports_the_speculative_decoding_reason_with_and_without_a_target() {
+        let capabilities = llama_capabilities_fixture();
+        let report = cpu_only_compatibility_report();
+
+        let no_target = gate_advanced_settings(&capabilities, &report, None, &[]);
+        let draft_setting = no_target
+            .settings
+            .iter()
+            .find(|setting| setting.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model present");
+        assert!(!draft_setting.supported);
+        assert_eq!(
+            draft_setting.unsupported_reason.as_deref(),
+            Some("Select a model to check for a compatible installed draft model.")
+        );
+        assert!(no_target.draft_model_candidates.is_empty());
+
+        let target = installed_model_view(
+            "llama_cpp:llama-3-8b-instruct:q4_k_m",
+            "llama-3-8b-instruct",
+            "Llama 3 8B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            8_000_000_000,
+        );
+        let no_draft_installed = gate_advanced_settings(&capabilities, &report, Some(&target), &[target.clone()]);
+        let draft_setting = no_draft_installed
+            .settings
+            .iter()
+            .find(|setting| setting.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model present");
+        assert!(!draft_setting.supported);
+        assert!(draft_setting
+            .unsupported_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(&target.display_name)));
+        assert!(no_draft_installed.draft_model_candidates.is_empty());
+
+        let draft = installed_model_view(
+            "llama_cpp:llama-3-1b-instruct:q4_k_m",
+            "llama-3-1b-instruct",
+            "Llama 3 1B Instruct",
+            M3RuntimeKind::LlamaCpp,
+            1_000_000_000,
+        );
+        let installed = vec![target.clone(), draft.clone()];
+        let with_draft = gate_advanced_settings(&capabilities, &report, Some(&target), &installed);
+        let draft_setting = with_draft
+            .settings
+            .iter()
+            .find(|setting| setting.key == "speculative_decoding_draft_model")
+            .expect("speculative_decoding_draft_model present");
+        assert!(draft_setting.supported);
+        assert!(draft_setting.unsupported_reason.is_none());
+        assert_eq!(with_draft.draft_model_candidates.len(), 1);
+        assert_eq!(with_draft.draft_model_candidates[0].model_id, draft.model_id);
     }
 }

@@ -7,6 +7,7 @@ import type {
   EffectiveContextResolution,
   HardwareSnapshot,
   KeepAlive,
+  M3DraftModelCandidate,
   M3InstalledModel,
   M3RuntimeCapability,
   M3RuntimeKind,
@@ -292,45 +293,97 @@ function EffectiveContextPanel({
   );
 }
 
+/** Builds a `Field`'s hint text: the capability's description, a restart
+ * note, and — when this control can't actually be enabled right now — the
+ * reason why, so a disabled control is never left unexplained. */
+export function settingHint(capability: AdvancedSettingCapability, extra?: string): string {
+  const restartNote = capability.restart_required ? " Restart required." : "";
+  const unsupportedNote =
+    !capability.supported && capability.unsupported_reason ? ` ${capability.unsupported_reason}` : "";
+  return `${capability.description}${extra ?? ""}${restartNote}${unsupportedNote}`;
+}
+
 function SettingControl({
   capability,
   value,
   onChange,
+  draftModelCandidates,
 }: {
   capability: AdvancedSettingCapability;
   value: SettingValue;
   onChange: (value: SettingValue) => void;
+  draftModelCandidates?: M3DraftModelCandidate[];
 }) {
   const schema = capability.schema;
+  const disabled = !capability.supported;
+  const label = disabled ? (
+    <span className="inline-flex items-center gap-1.5">
+      {capability.label}
+      <StatusPill tone="neutral">Unavailable</StatusPill>
+    </span>
+  ) : (
+    capability.label
+  );
   if (schema.type === "boolean" && value.type === "boolean") {
     return (
       <Toggle
         checked={value.value}
         onChange={(next) => onChange({ type: "boolean", value: next })}
         label={capability.label}
-        description={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}
+        description={settingHint(capability)}
+        disabled={disabled}
       />
     );
   }
   if (schema.type === "choice" && value.type === "choice") {
     return (
-      <Field label={capability.label} hint={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}>
-        <select value={value.value} onChange={(event) => onChange({ type: "choice", value: event.target.value })} className={CONTROL_CLASS}>
+      <Field label={label} hint={settingHint(capability)}>
+        <select
+          value={value.value}
+          onChange={(event) => onChange({ type: "choice", value: event.target.value })}
+          className={CONTROL_CLASS}
+          disabled={disabled}
+        >
           {schema.options.map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </Field>
+    );
+  }
+  if (schema.type === "text" && value.type === "text" && capability.key === "speculative_decoding_draft_model") {
+    const candidates = draftModelCandidates ?? [];
+    return (
+      <Field label={label} hint={settingHint(capability)}>
+        <select
+          value={value.value}
+          onChange={(event) => onChange({ type: "text", value: event.target.value })}
+          className={CONTROL_CLASS}
+          disabled={disabled || candidates.length === 0}
+        >
+          <option value="">None (disabled)</option>
+          {candidates.map((candidate) => (
+            <option key={candidate.modelId} value={candidate.modelId}>
+              {candidate.displayName}
+            </option>
+          ))}
         </select>
       </Field>
     );
   }
   if (schema.type === "text" && value.type === "text") {
     return (
-      <Field label={capability.label} hint={`${capability.description} Up to ${schema.max_bytes} bytes.${capability.restart_required ? " Restart required." : ""}`}>
-        <input value={value.value} onChange={(event) => onChange({ type: "text", value: event.target.value })} className={CONTROL_CLASS} />
+      <Field label={label} hint={settingHint(capability, ` Up to ${schema.max_bytes} bytes.`)}>
+        <input
+          value={value.value}
+          onChange={(event) => onChange({ type: "text", value: event.target.value })}
+          className={CONTROL_CLASS}
+          disabled={disabled}
+        />
       </Field>
     );
   }
   if (schema.type === "integer" && value.type === "integer") {
     return (
-      <Field label={capability.label} hint={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}>
+      <Field label={label} hint={settingHint(capability)}>
         <input
           type="number"
           min={schema.min}
@@ -339,13 +392,14 @@ function SettingControl({
           value={value.value}
           onChange={(event) => onChange({ type: "integer", value: Number(event.target.value) })}
           className={CONTROL_CLASS}
+          disabled={disabled}
         />
       </Field>
     );
   }
   if (schema.type === "float" && value.type === "float") {
     return (
-      <Field label={capability.label} hint={`${capability.description}${capability.restart_required ? " Restart required." : ""}`}>
+      <Field label={label} hint={settingHint(capability)}>
         <input
           type="number"
           min={schema.min}
@@ -354,13 +408,14 @@ function SettingControl({
           value={value.value}
           onChange={(event) => onChange({ type: "float", value: Number(event.target.value) })}
           className={CONTROL_CLASS}
+          disabled={disabled}
         />
       </Field>
     );
   }
   if (schema.type === "duration_ms" && value.type === "duration_ms") {
     return (
-      <Field label={capability.label} hint={`${capability.description} Milliseconds.${capability.restart_required ? " Restart required." : ""}`}>
+      <Field label={label} hint={settingHint(capability, " Milliseconds.")}>
         <input
           type="number"
           min={schema.min}
@@ -369,6 +424,7 @@ function SettingControl({
           value={value.value}
           onChange={(event) => onChange({ type: "duration_ms", value: Number(event.target.value) })}
           className={CONTROL_CLASS}
+          disabled={disabled}
         />
       </Field>
     );
@@ -394,6 +450,8 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const offloadBusy = busy[`offload-plan:${runtimeId}`];
   const offloadError = errors[`offload-plan:${runtimeId}`];
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
+  const settingCapabilities = useRuntimeHubStore((state) => state.settingCapabilities[runtimeId]);
+  const resolveSettingCapabilities = useRuntimeHubStore((state) => state.resolveSettingCapabilities);
 
   const compatibleModels = installedModels.filter((model) => model.runtime === runtime.descriptor.kind);
   const [assetId, setAssetId] = useState(compatibleModels[0]?.assetId ?? "");
@@ -423,6 +481,18 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
     const input = buildOffloadPlanInput(hardware, selectedModel, allRuntimes, runtimeDetails);
     void previewOffloadPlan(runtimeId, input).catch(() => {});
   }, [hardware, selectedModel, allRuntimes, runtimeDetails, runtimeId, previewOffloadPlan]);
+
+  // Sampler/Batching/Speculative Decoding Controls (ROADMAP Phase 8 item
+  // 17): re-resolve which advanced settings can actually be enabled
+  // whenever the runtime or selected model changes. Runs even with no model
+  // selected (`selectedModel?.assetId ?? null`) so hardware-only gates
+  // (flash attention, mixed precision) are visible immediately.
+  useEffect(() => {
+    void resolveSettingCapabilities(runtimeId, selectedModel?.assetId ?? null).catch(() => {});
+  }, [runtimeId, selectedModel?.assetId, resolveSettingCapabilities]);
+
+  const gatedSettings = settingCapabilities?.settings ?? runtime.settings;
+  const draftModelCandidates = settingCapabilities?.draftModelCandidates ?? [];
 
   const state = statusState(detail);
   const resident = runningModels(detail);
@@ -606,12 +676,13 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
       {showSettings && runtime.settings.length > 0 && (
         <section className="mt-4 rounded-lg border border-border bg-surface p-4" aria-label={`Advanced settings for ${runtime.descriptor.label}`}>
           <div className="grid gap-4 sm:grid-cols-2">
-            {runtime.settings.map((capability) => (
+            {gatedSettings.map((capability) => (
               <SettingControl
                 key={capability.key}
                 capability={capability}
                 value={settings[capability.key] ?? capability.default_value}
                 onChange={(value) => setSettings((current) => ({ ...current, [capability.key]: value }))}
+                draftModelCandidates={draftModelCandidates}
               />
             ))}
           </div>
