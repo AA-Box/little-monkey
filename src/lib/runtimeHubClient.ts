@@ -784,6 +784,47 @@ export interface M3HttpServerStatus {
   lastError: string | null;
 }
 
+// Local Agent Integration Launcher: generates config for external agent
+// tools/editors (Continue.dev, aider, generic OpenAI-SDK-compatible CLIs)
+// pointed at this app's real M3 HTTP server endpoint, and detects drift in a
+// previously-generated or pasted config. See `src-tauri/src/agent_launcher.rs`.
+export type AgentTool = "continue_dev" | "aider" | "openai_env";
+
+export interface AgentEndpointInfo {
+  baseUrl: string;
+  loopbackOnly: boolean;
+  authRequired: boolean;
+  tls: boolean;
+}
+
+export type AgentWarningKind =
+  | "context_length"
+  | "telemetry"
+  | "auth"
+  | "auth_drift"
+  | "model_missing"
+  | "endpoint_drift";
+
+export interface AgentConfigWarning {
+  kind: AgentWarningKind;
+  message: string;
+}
+
+export interface GeneratedAgentConfig {
+  tool: AgentTool;
+  filename: string;
+  content: string;
+  warnings: AgentConfigWarning[];
+}
+
+export interface AgentConfigDriftReport {
+  tool: AgentTool;
+  parsedModelId: string | null;
+  parsedBaseUrl: string | null;
+  parsedContextTokens: number | null;
+  findings: AgentConfigWarning[];
+}
+
 // --- Model Conversion and Quantization Workbench (ROADMAP.md Phase 8) ---
 
 export interface BackendDescriptor {
@@ -991,4 +1032,8 @@ export const runtimeHubClient = {
   componentActivateVersion: (
     args: OperationArgs & { request: { componentId: string; versionKey: string } },
   ) => invoke<M3InstalledComponent>("m3_component_activate_version", args),
+  agentLauncherGenerateConfig: (tool: AgentTool, modelId: string, authToken: string | null) =>
+    invoke<GeneratedAgentConfig>("agent_launcher_generate_config", { tool, modelId, authToken }),
+  agentLauncherCheckDrift: (tool: AgentTool, pastedConfig: string) =>
+    invoke<AgentConfigDriftReport>("agent_launcher_check_drift", { tool, pastedConfig }),
 };

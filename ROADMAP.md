@@ -987,15 +987,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Multimodal models load with explicit projector provenance, placement, and capability evidence.
 
-### 13. Local Agent Integration Launcher
-
-**Status:** Planned
-
-- Generate safe local provider configuration for external agent tools and editors that can use Ollama/OpenAI-compatible endpoints.
-- Detect config drift, stale model choices, unsupported context length, and telemetry-sensitive defaults.
-
-**Acceptance:** User can connect external tools to Little Monkey's local endpoint without hand-editing fragile config files.
-
 ### 15. Runtime Telemetry and Memory Trace Viewer
 
 **Status:** Planned
