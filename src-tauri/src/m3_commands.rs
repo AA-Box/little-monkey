@@ -5,6 +5,10 @@
 //! HTTP/SSE uses `M3RuntimeHub::dispatch_api_stream` directly from the server;
 //! the IPC command intentionally handles only non-streaming requests.
 
+use crate::agent_launcher::{
+    self, AgentConfigDriftReport, AgentTool, DriftCheckInput, GenerateAgentConfigRequest,
+    GeneratedAgentConfig,
+};
 use crate::chat_template_lab::{run_chat_template_lab, ChatTemplateLabReport, TemplateFamily};
 use crate::compatibility_hub::{
     LanServerPolicy, PairedToken, PairingChallengeView, PairingRequest, ScopedTokenView,
@@ -1056,4 +1060,113 @@ async fn assemble_support_bundle(
         raw_logs,
         telemetry_now_ms(),
     ))
+}
+
+// -------------------------------------------------------------------------
+// Local Agent Integration Launcher
+// -------------------------------------------------------------------------
+
+/// The effective context-window size (in tokens) the hub currently serves
+/// for every installed model's runtime, keyed by model id. Shared by both
+/// commands below so config generation and drift checks reuse the exact
+/// same resolution the user would see in the Runtime Hub's own settings.
+fn effective_context_by_model(
+    hub: &M3RuntimeHub,
+    installed: &[M3InstalledModelView],
+) -> Result<BTreeMap<String, u64>, String> {
+    let runtimes = hub.list_runtimes().map_err(command_error)?;
+    let mut context_by_model = BTreeMap::new();
+    for model in installed {
+        let capability = runtimes
+            .iter()
+            .find(|runtime| runtime.descriptor.kind == model.runtime);
+        let stored = capability
+            .map(|capability| hub.runtime_config(&capability.descriptor.runtime_id))
+            .transpose()
+            .map_err(command_error)?
+            .flatten();
+        if let Some(tokens) =
+            agent_launcher::effective_context_tokens(capability, stored.as_ref(), model.runtime)
+        {
+            context_by_model.insert(model.model_id.clone(), tokens);
+        }
+    }
+    Ok(context_by_model)
+}
+
+/// Generates a real, working external-tool config snippet pointed at this
+/// app's actual M3 HTTP server endpoint, a currently-installed model, and
+/// (if supplied) a real paired bearer token. Fails with a clear message if
+/// the LAN/API listener has never been configured or the model is not
+/// installed, rather than silently falling back to placeholder values.
+#[tauri::command]
+pub fn agent_launcher_generate_config(
+    state: tauri::State<'_, M3CommandState>,
+    tool: AgentTool,
+    model_id: String,
+    auth_token: Option<String>,
+) -> Result<GeneratedAgentConfig, String> {
+    let hub = &state.hub;
+    let policy = hub
+        .lan_policy()
+        .map_err(command_error)?
+        .ok_or_else(|| {
+            "Configure and start the LAN/API listener (Settings > Runtime Hub > LAN) before generating external tool configuration".to_string()
+        })?;
+    let installed = hub.list_installed_models().map_err(command_error)?;
+    let model = installed
+        .iter()
+        .find(|installed_model| installed_model.model_id == model_id)
+        .ok_or_else(|| format!("Model '{model_id}' is not currently installed"))?;
+    let runtimes = hub.list_runtimes().map_err(command_error)?;
+    let capability = runtimes
+        .iter()
+        .find(|runtime| runtime.descriptor.kind == model.runtime);
+    let stored_config = capability
+        .map(|capability| hub.runtime_config(&capability.descriptor.runtime_id))
+        .transpose()
+        .map_err(command_error)?
+        .flatten();
+
+    let request = GenerateAgentConfigRequest {
+        tool,
+        endpoint: agent_launcher::resolve_endpoint(&policy),
+        model_id: model.model_id.clone(),
+        effective_context_tokens: agent_launcher::effective_context_tokens(
+            capability,
+            stored_config.as_ref(),
+            model.runtime,
+        ),
+        auth_token,
+    };
+    Ok(agent_launcher::generate_config(&request))
+}
+
+/// Checks a previously-generated or user-pasted external-tool config against
+/// this app's current real state (installed models, server endpoint,
+/// authentication requirement, and effective context sizes) for drift.
+#[tauri::command]
+pub fn agent_launcher_check_drift(
+    state: tauri::State<'_, M3CommandState>,
+    tool: AgentTool,
+    pasted_config: String,
+) -> Result<AgentConfigDriftReport, String> {
+    let hub = &state.hub;
+    let policy = hub.lan_policy().map_err(command_error)?;
+    let installed = hub.list_installed_models().map_err(command_error)?;
+    let effective_context_by_model = effective_context_by_model(hub, &installed)?;
+    let input = DriftCheckInput {
+        tool,
+        pasted_config,
+        current_endpoint: policy.as_ref().map(agent_launcher::resolve_endpoint),
+        installed_model_ids: installed
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect(),
+        effective_context_by_model,
+        auth_currently_required: policy
+            .map(|policy| policy.require_authentication)
+            .unwrap_or(false),
+    };
+    agent_launcher::detect_drift(&input).map_err(|error| error.to_string())
 }

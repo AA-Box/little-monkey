@@ -3,6 +3,9 @@ import {
   createM3OperationId,
   runtimeHubClient,
   sha256Text,
+  type AgentConfigDriftReport,
+  type AgentTool,
+  type GeneratedAgentConfig,
   type BackendDescriptor,
   type ConversionReport,
   type ChatTemplateLabReport,
@@ -66,7 +69,8 @@ export type RuntimeHubSection =
   | "compatibility"
   | "lan"
   | "quantization"
-  | "telemetry";
+  | "telemetry"
+  | "agents";
 
 export interface RuntimeDetail {
   status?: M3RuntimeStatusView;
@@ -110,6 +114,8 @@ interface RuntimeHubStoreState {
   httpServerStatus: M3HttpServerStatus | null;
   pairingChallenge: PairingChallenge | null;
   pairedToken: PairedToken | null;
+  agentGeneratedConfig: GeneratedAgentConfig | null;
+  agentDriftReport: AgentConfigDriftReport | null;
   busy: Record<string, boolean>;
   errors: Record<string, string>;
   activeOperations: Record<string, string>;
@@ -180,6 +186,10 @@ interface RuntimeHubStoreState {
   refreshTraces: (runtimeId?: string | null) => Promise<void>;
   exportSupportBundle: () => Promise<SupportBundle>;
   clearSupportBundle: () => void;
+  generateAgentConfig: (tool: AgentTool, modelId: string, authToken: string | null) => Promise<void>;
+  clearAgentConfig: () => void;
+  checkAgentConfigDrift: (tool: AgentTool, pastedConfig: string) => Promise<void>;
+  clearAgentDriftReport: () => void;
   refreshQuantization: () => Promise<void>;
   convertPathQuantization: (sourcePath: string, quantChoice: string, allowRequantize: boolean) => Promise<void>;
   convertInstalledModelQuantization: (
@@ -340,6 +350,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     httpServerStatus: null,
     pairingChallenge: null,
     pairedToken: null,
+    agentGeneratedConfig: null,
+    agentDriftReport: null,
     busy: {},
     errors: {},
     activeOperations: {},
@@ -360,6 +372,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     setCatalogQuery: (catalogQuery) => set({ catalogQuery }),
     clearError: (key) => set((state) => ({ errors: omitKey(state.errors, key) })),
     dismissPairedToken: () => set({ pairedToken: null }),
+    clearAgentConfig: () => set({ agentGeneratedConfig: null }),
+    clearAgentDriftReport: () => set({ agentDriftReport: null }),
 
     refresh: async () => {
       await Promise.all([get().refreshOverview(), get().refreshLan(), get().refreshComponents()]);
@@ -1096,6 +1110,23 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
 
     clearSupportBundle: () => set({ supportBundle: null }),
 
+    generateAgentConfig: async (tool, modelId, authToken) => {
+      const key = "agent-launcher-generate";
+      begin(key);
+      try {
+        const agentGeneratedConfig = await runtimeHubClient.agentLauncherGenerateConfig(
+          tool,
+          modelId,
+          authToken,
+        );
+        set({ agentGeneratedConfig });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
     refreshQuantization: async () => {
       const key = "quantization-refresh";
       begin(key);
@@ -1105,6 +1136,20 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           runtimeHubClient.quantizationQuantTypes(),
         ]);
         set({ quantizationBackends, quantizationQuantTypes });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    checkAgentConfigDrift: async (tool, pastedConfig) => {
+      const key = "agent-launcher-drift";
+      begin(key);
+      try {
+        const agentDriftReport = await runtimeHubClient.agentLauncherCheckDrift(tool, pastedConfig);
+        set({ agentDriftReport });
       } catch (error) {
         fail(key, error);
         throw error;
