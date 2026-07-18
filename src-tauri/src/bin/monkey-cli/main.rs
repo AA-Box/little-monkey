@@ -3,7 +3,8 @@
 //! a shell instead of a WebView. Supports both a one-shot invocation
 //! (`monkey MODEL "prompt"`) and an interactive REPL (`monkey MODEL`, no prompt), plus
 //! Ollama-CLI-style model management subcommands (`monkey list/pull/run/...`)
-//! spoken directly to the daemon's HTTP API.
+//! spoken directly to the daemon's HTTP API. A bare `monkey` prints the
+//! subcommand overview (see [`is_bare_invocation`]).
 
 mod acp;
 mod agent;
@@ -947,6 +948,20 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// A bare `monkey` with no subcommand, no positional model/prompt, and no
+/// target flag names nothing to run, so it prints the subcommand overview
+/// instead of attempting Ollama default-model discovery (which surfaced as
+/// a confusing connection error whenever Ollama wasn't running).
+fn is_bare_invocation(cli: &Cli) -> bool {
+    cli.cmd.is_none()
+        && cli.model_or_prompt.is_none()
+        && cli.prompt.is_none()
+        && cli.provider.is_none()
+        && cli.model.is_none()
+        && cli.ollama.is_none()
+        && cli.local_url.is_none()
+}
+
 /// `--no-mcp` short-circuits to no servers at all; otherwise loads
 /// `mcp_servers.json` (the same hardcoded-identifier app-data path
 /// `mcp_cli.rs` resolves) and connects every `enabled: true` entry,
@@ -964,6 +979,14 @@ async fn resolve_mcp_entries(cli: &Cli, state: &AppState) -> Vec<McpServerEntry>
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    if is_bare_invocation(&cli) {
+        use clap::CommandFactory;
+        // Ignore write failures (e.g. stdout piped into a closed `head`).
+        let _ = Cli::command().print_help();
+        return;
+    }
+
     let client = reqwest::Client::new();
 
     if let Some(cmd) = &cli.cmd {
@@ -1369,6 +1392,26 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("Usage: monkey "), "{help}");
         assert!(!help.contains("Usage: monkey-cli"), "{help}");
+    }
+
+    #[test]
+    fn bare_invocation_prints_help_instead_of_discovering_a_target() {
+        let cli = Cli::try_parse_from(["monkey"]).expect("bare invocation");
+        assert!(is_bare_invocation(&cli));
+        let help = Cli::command().render_help().to_string();
+        for subcommand in ["list", "pull", "run", "workflow", "skills", "security"] {
+            assert!(
+                help.contains(&format!("\n  {subcommand} ")),
+                "help missing subcommand '{subcommand}':\n{help}"
+            );
+        }
+
+        let repl = Cli::try_parse_from(["monkey", "llama3.2"]).unwrap();
+        assert!(!is_bare_invocation(&repl));
+        let subcommand = Cli::try_parse_from(["monkey", "list"]).unwrap();
+        assert!(!is_bare_invocation(&subcommand));
+        let legacy = Cli::try_parse_from(["monkey", "--ollama", "llama3.2"]).unwrap();
+        assert!(!is_bare_invocation(&legacy));
     }
 
     #[test]
