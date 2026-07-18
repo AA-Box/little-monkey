@@ -15,9 +15,9 @@ export interface DiffViewerProps {
   className?: string;
 }
 
-type DiffLineType = "unchanged" | "added" | "removed";
+export type DiffLineType = "unchanged" | "added" | "removed";
 
-interface DiffLine {
+export interface DiffLine {
   type: DiffLineType;
   oldLineNo: number | null;
   newLineNo: number | null;
@@ -110,7 +110,7 @@ function naiveDiff(a: string[], b: string[]): DiffLine[] {
   return result;
 }
 
-function computeDiff(oldText: string, newText: string): DiffLine[] {
+export function computeDiff(oldText: string, newText: string): DiffLine[] {
   const a = splitLines(oldText);
   const b = splitLines(newText);
   if (a.length * b.length > LCS_CELL_BUDGET) {
