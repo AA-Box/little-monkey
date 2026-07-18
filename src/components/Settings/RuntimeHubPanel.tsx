@@ -1,5 +1,5 @@
 import { useEffect, type KeyboardEvent } from "react";
-import { Activity, BookOpen, Boxes, Cpu, FlaskConical, GitPullRequestArrow, Network, PackageCheck, RefreshCw, ServerCog, ShieldCheck, type LucideIcon } from "lucide-react";
+import { Activity, BookOpen, Boxes, Cpu, FlaskConical, GitPullRequestArrow, Network, PackageCheck, Plug, RefreshCw, ServerCog, ShieldCheck, type LucideIcon } from "lucide-react";
 import { useRuntimeHubStore, type RuntimeHubSection } from "../../store/runtimeHubStore";
 import { BusyButton, ErrorNotice } from "./runtimeHub/RuntimeHubShared";
 import { RuntimeHubOverview } from "./runtimeHub/RuntimeHubOverview";
@@ -10,6 +10,7 @@ import { RuntimeHubRuntimes } from "./runtimeHub/RuntimeHubRuntimes";
 import { RuntimeHubApi } from "./runtimeHub/RuntimeHubApi";
 import { RuntimeHubCompatibilityMatrix } from "./runtimeHub/RuntimeHubCompatibilityMatrix";
 import { RuntimeHubLan } from "./runtimeHub/RuntimeHubLan";
+import { RuntimeHubAgents } from "./runtimeHub/RuntimeHubAgents";
 import { RuntimeHubQuantization } from "./runtimeHub/RuntimeHubQuantization";
 import { RuntimeHubUpstreamWatcher } from "./runtimeHub/RuntimeHubUpstreamWatcher";
 
@@ -23,6 +24,7 @@ const SECTIONS: Array<{ id: RuntimeHubSection; label: string; icon: LucideIcon }
   { id: "api", label: "API", icon: ServerCog },
   { id: "compatibility", label: "Compatibility", icon: ShieldCheck },
   { id: "lan", label: "LAN", icon: Network },
+  { id: "agents", label: "Agents", icon: Plug },
   { id: "upstream-watcher", label: "Upstream Watcher", icon: GitPullRequestArrow },
 ];
 
@@ -113,6 +115,7 @@ export function RuntimeHubPanel() {
           {section === "api" && <RuntimeHubApi />}
           {section === "compatibility" && <RuntimeHubCompatibilityMatrix />}
           {section === "lan" && <RuntimeHubLan />}
+          {section === "agents" && <RuntimeHubAgents />}
           {section === "upstream-watcher" && <RuntimeHubUpstreamWatcher />}
         </>
       )}

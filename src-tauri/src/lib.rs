@@ -75,6 +75,12 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+// Local Agent Integration Launcher (ROADMAP.md, Phase 8, item 13): generates
+// safe external-tool (Continue.dev/aider/OpenAI-SDK-compatible) config
+// pointed at the M3 HTTP server's real endpoint, and detects drift in a
+// previously-generated or pasted config. Tauri-free; command glue lives in
+// `m3_commands.rs` alongside the rest of the M3 command surface.
+pub mod agent_launcher;
 // Model Conversion and Quantization Workbench (ROADMAP.md Phase 8): Tauri-free
 // GGUF/safetensors source detection, license risk surfacing, and pluggable
 // quantization backends (a real `llama-quantize` shell-out plus an honest
@@ -1039,6 +1045,8 @@ pub fn run() {
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
             m3_commands::m3_component_activate_version,
+            m3_commands::agent_launcher_generate_config,
+            m3_commands::agent_launcher_check_drift,
             m3_http_server::m3_http_server_start,
             m3_http_server::m3_http_server_stop,
             m3_http_server::m3_http_server_status,
