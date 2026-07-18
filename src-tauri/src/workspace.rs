@@ -245,6 +245,24 @@ fn resolve_against_root(root_canon: &Path, raw: &str) -> Result<PathBuf, String>
     Ok(resolved)
 }
 
+/// Render a workspace-relative path as a `/`-separated string regardless of
+/// platform.
+///
+/// These strings are surfaced to the model and the UI as opaque reference
+/// strings (glob/grep tool results, `@`-mention entries) — every consumer
+/// feeds them back through [`resolve_path_and_root`], which accepts `/` on
+/// all platforms, rather than to `std::fs` directly. Joining components with
+/// a hardcoded `/` (instead of `Path::to_string_lossy`, which uses the
+/// OS-native separator) keeps them consistent with the forward-slash
+/// `"<label>/"` prefixes they are concatenated with, and identical across
+/// desktop and CLI clients on every OS.
+pub fn display_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Resolve `path` (as given by the model) against the correct attached
 /// root: a path prefixed with `"<label>/"` for a currently-attached
 /// secondary folder resolves against that root; anything else (plain

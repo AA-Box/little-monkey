@@ -4366,10 +4366,10 @@ GPU1:
 
     #[test]
     fn build_compatibility_report_is_sane_with_no_gpu_tooling_present() {
-        // This is the acceptance-critical test: on a plain macOS dev machine
-        // with no CUDA/ROCm/Vulkan installed, the full report must build
-        // without panicking or erroring, and every non-Metal/non-macOS
-        // backend must cleanly resolve to NotDetected/ToolMissing/Unsupported
+        // This is the acceptance-critical test: on a plain dev machine or CI
+        // runner with no CUDA/ROCm/Vulkan installed, the full report must
+        // build without panicking or erroring, and every non-Metal backend
+        // must cleanly resolve to a well-formed, non-overclaiming status
         // rather than crashing.
         let snapshot = SystemM3HardwareProbe.snapshot().expect("hardware snapshot");
         let report = build_compatibility_report(&snapshot);
@@ -4386,14 +4386,42 @@ GPU1:
                     ));
                 }
                 AcceleratorKind::DirectMl => {
-                    assert_eq!(entry.status, M3AcceleratorStatus::Unsupported);
+                    // Off Windows, `directml_compatibility` always reports
+                    // `Unsupported` (see that function's early return). On
+                    // Windows, `Win32_VideoController` almost always reports
+                    // *some* display adapter — even a bare CI VM has a basic
+                    // one — so `Available` is the expected, correct outcome
+                    // there, not a bug: see `directml_compatibility`'s
+                    // `ToolMissing`/`NotDetected` arms are still reachable if
+                    // PowerShell/WMI itself is unavailable or reports no
+                    // device, so allow those too. What must never happen,
+                    // on any OS, is claiming `Available` without the
+                    // "unconfirmed" contract documented on
+                    // `M3AcceleratorCompatibility::confirmed` — only a
+                    // display adapter's presence is confirmed there, never
+                    // the DirectML runtime path itself.
+                    assert!(matches!(
+                        entry.status,
+                        M3AcceleratorStatus::Available
+                            | M3AcceleratorStatus::ToolMissing
+                            | M3AcceleratorStatus::NotDetected
+                            | M3AcceleratorStatus::Unsupported
+                    ));
+                    if entry.status == M3AcceleratorStatus::Available {
+                        assert!(
+                            !entry.confirmed,
+                            "DirectML must never claim to be confirmed available: only a display \
+                             adapter's presence can be checked, not the DirectML runtime path itself"
+                        );
+                        assert!(!entry.device_names.is_empty());
+                    }
                 }
                 AcceleratorKind::Cpu => unreachable!("CPU is not part of the compatibility matrix"),
             }
         }
         assert!(!report.jetson.detected);
         // `os` mirrors `std::env::consts::OS` (see `PlatformCapabilities::current`),
-        // not a hardcoded platform — this test runs on Linux CI as well as macOS.
+        // not a hardcoded platform — this test runs on Linux and Windows CI too.
         assert_eq!(report.os, std::env::consts::OS);
     }
 

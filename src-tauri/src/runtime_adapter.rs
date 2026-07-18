@@ -3965,6 +3965,36 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
 
+    /// An absolute path valid on whichever OS this actually runs under.
+    /// `/foo` satisfies `Path::is_absolute()` on Unix but not on Windows
+    /// (which requires a drive-letter or UNC prefix) — both the executable
+    /// and per-model paths built from this are checked with exactly that,
+    /// and never touch real disk I/O, so any platform-appropriate absolute
+    /// path is equally valid here.
+    fn fixture_absolute_path(rest: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", rest.replace('/', "\\")))
+        } else {
+            PathBuf::from(format!("/{rest}"))
+        }
+    }
+
+    /// Same idea as [`fixture_absolute_path`], but rendered as the `String`
+    /// that ends up on the launched process's argv (see
+    /// `ManagedLlamaCppAdapter::load_model`, which turns a model's
+    /// `local_path` into a `-m`/`--model-draft` argument via
+    /// `Path::to_str`). Real llama-server invocations legitimately need the
+    /// OS-native separator here — unlike `tools.rs`'s glob/grep results,
+    /// this string is consumed by an actual subprocess's file open, not
+    /// shown to the model/UI — so tests must compare against this rendering
+    /// rather than a hardcoded forward-slash literal.
+    fn fixture_absolute_path_arg(rest: &str) -> String {
+        fixture_absolute_path(rest).to_string_lossy().into_owned()
+    }
+
+    const ALPHA_MODEL_PATH: &str = "models/alpha.gguf";
+    const BETA_MODEL_PATH: &str = "models/beta.gguf";
+
     #[derive(Clone)]
     enum TransportPlan {
         Response(HttpResponse),
@@ -4234,7 +4264,7 @@ mod tests {
             model_id: model_id.to_string(),
             display_name: model_id.to_string(),
             size_bytes: 8 * 1024 * 1024,
-            local_path: Some(PathBuf::from(path)),
+            local_path: Some(fixture_absolute_path(path)),
             digest: Some(format!("digest-{model_id}")),
             modified_at: None,
             capabilities: ModelCapabilities {
@@ -4260,12 +4290,12 @@ mod tests {
         ManagedLlamaCppAdapter::new(
             "llama-chat",
             "http://127.0.0.1:8090",
-            PathBuf::from("/usr/local/bin/llama-server"),
+            fixture_absolute_path("usr/local/bin/llama-server"),
             8090,
             controller,
             vec![
-                model("alpha", "/models/alpha.gguf"),
-                model("beta", "/models/beta.gguf"),
+                model("alpha", ALPHA_MODEL_PATH),
+                model("beta", BETA_MODEL_PATH),
             ],
             platform(),
         )
@@ -4753,8 +4783,14 @@ mod tests {
                 _ => None,
             })
             .expect("structured launch call");
-        assert_eq!(spec.program, PathBuf::from("/usr/local/bin/llama-server"));
-        assert_eq!(spec.args[0..2], ["-m", "/models/alpha.gguf"]);
+        assert_eq!(
+            spec.program,
+            fixture_absolute_path("usr/local/bin/llama-server")
+        );
+        assert_eq!(
+            spec.args[0..2],
+            ["-m".to_string(), fixture_absolute_path_arg(ALPHA_MODEL_PATH)]
+        );
         assert!(spec.args.windows(2).any(|pair| pair == ["-c", "8192"]));
         assert!(spec.args.windows(2).any(|pair| pair == ["-ngl", "32"]));
         assert!(spec
@@ -4896,10 +4932,14 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair == ["--cache-type-v", "q8_0"]));
+        let expected_draft_arg = [
+            "--model-draft".to_string(),
+            fixture_absolute_path_arg(BETA_MODEL_PATH),
+        ];
         assert!(spec
             .args
             .windows(2)
-            .any(|pair| pair == ["--model-draft", "/models/beta.gguf"]));
+            .any(|pair| pair == expected_draft_arg));
     }
 
     #[tokio::test]

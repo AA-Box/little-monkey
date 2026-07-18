@@ -2674,11 +2674,26 @@ fn fixture_compatibility() -> Compatibility {
     }
 }
 
+/// Builds an absolute-path *string* valid on whichever OS this actually runs
+/// under. This value is a pure identity/provenance string — checked only by
+/// [`validate_provenance`]'s `Path::is_absolute()` call, never touched by
+/// real disk I/O — but `/foo` satisfies `is_absolute()` on Unix and not on
+/// Windows (which requires a drive-letter or UNC prefix), so a hardcoded
+/// `/`-rooted fixture fails Windows-only validation that has nothing to do
+/// with what these fixtures exist to exercise.
+fn fixture_absolute_path(rest: &str) -> String {
+    if cfg!(windows) {
+        format!(r"C:\{}", rest.replace('/', "\\"))
+    } else {
+        format!("/{rest}")
+    }
+}
+
 fn fixture_provenance(slug: &str) -> PackageProvenance {
     PackageProvenance {
         publisher: "Little Monkey".to_string(),
         source: InstallSource::LocalFolder {
-            canonical_path: format!("/first-party-fixtures/{slug}"),
+            canonical_path: fixture_absolute_path(&format!("first-party-fixtures/{slug}")),
         },
         source_revision: "checked-in-fixture-v1".to_string(),
         build_reproducible: true,

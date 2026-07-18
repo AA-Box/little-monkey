@@ -1,0 +1,14 @@
+# Check out every text file with LF line endings on all platforms (the
+# repository already stores all text content as LF — verified with
+# `git ls-files --eol`: 836 i/lf, 0 i/crlf).
+#
+# This is not cosmetic: `src-tauri/src/bin/monkey-cli/daemon/remote/web.rs`
+# embeds the remote-controller UI assets at compile time via `include_str!`,
+# so the served bytes of app.js/app.css/index.html are whatever line endings
+# git happened to check out on the *build* machine. GitHub's Windows runners
+# ship with `core.autocrlf=true`, which silently turned those assets (and
+# every multi-line string test assertion about them) into CRLF on Windows
+# builds only. Pinning eol=lf makes builds byte-identical across platforms.
+#
+# `text=auto` leaves binary files (git auto-detection) untouched.
+* text=auto eol=lf

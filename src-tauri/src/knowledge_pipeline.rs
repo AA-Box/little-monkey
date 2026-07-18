@@ -3704,7 +3704,18 @@ fn diagnostic_hash(
 }
 
 fn sync_file(path: &Path) -> PipelineResult<()> {
-    File::open(path)?.sync_all()?;
+    // A read-only `File::open` handle is enough for `sync_all` on Unix
+    // (fsync only needs a valid fd, regardless of access mode), but on
+    // Windows `FlushFileBuffers` requires the handle to have been opened
+    // with write access — a read-only handle fails with `ERROR_ACCESS_DENIED`
+    // (os error 5). Open for read+write (matching `write_new_synced`
+    // above, and `HybridIndex::create`'s own already-closed-for-write
+    // connection) so this works identically on both.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
     Ok(())
 }
 
