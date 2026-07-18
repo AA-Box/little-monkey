@@ -987,7 +987,6 @@ export const hi: Record<string, string> = {
   "CheckpointTimeline.minutesAgo": "{{count}} मिनट पहले",
   "CheckpointTimeline.hoursAgo": "{{count}} घंटे पहले",
   "CheckpointTimeline.daysAgo": "{{count}} दिन पहले",
-  "EffortSelector.levelDefault": "डिफ़ॉल्ट",
   "EffortSelector.levelLow": "कम",
   "EffortSelector.levelMedium": "मध्यम",
   "EffortSelector.levelHigh": "उच्च",

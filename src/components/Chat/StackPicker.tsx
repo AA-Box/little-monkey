@@ -10,6 +10,10 @@ interface StackPickerProps {
   /** The session this pill controls — each `ChatWindow` pane owns one, so
    * the primary and split panes can each attach different stacks. */
   sessionId: string;
+  /** Which way the dropdown opens relative to the trigger. "up" suits the
+   * composer-footer placement (default); "down" the title-bar placement,
+   * where an upward panel would clip past the window's top edge. */
+  placement?: "up" | "down";
 }
 
 const EMPTY_STACK_IDS: string[] = [];
@@ -23,7 +27,7 @@ const EMPTY_STACK_IDS: string[] = [];
  * makes `agentLoop.ts` offer the model the `search_docs` tool this turn (see
  * `tools.ts`'s `buildTools`) — this pill is the only way a user does that.
  */
-export function StackPicker({ sessionId }: StackPickerProps) {
+export function StackPicker({ sessionId, placement = "up" }: StackPickerProps) {
   // `useShallow` avoids the same fresh-array-reference infinite-render trap
   // documented on `PersonaSelector`'s `selectPersonas` usage.
   const stacks = useStackStore(useShallow((state) => state.stacks));
@@ -77,7 +81,11 @@ export function StackPicker({ sessionId }: StackPickerProps) {
       </button>
 
       {open && (
-        <div className="absolute bottom-full left-0 z-20 mb-1 w-64 rounded-lg border border-border bg-background py-1 shadow-lg">
+        <div
+          className={`absolute left-0 z-20 w-64 rounded-lg border border-border bg-background py-1 shadow-lg ${
+            placement === "up" ? "bottom-full mb-1" : "top-full mt-1"
+          }`}
+        >
           {stacks.length === 0 ? (
             <p className="px-3 py-2 text-xs text-faint">{t("StackPicker.emptyState")}</p>
           ) : (

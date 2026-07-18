@@ -209,3 +209,61 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* EffortSelector's reasoning-effort slider: a single static gray-to-accent
+ * gradient with a grain texture across the whole track (not the native
+ * two-tone filled/unfilled look), and a plain circular thumb — Tailwind v4
+ * has no default range-input reset (no @tailwindcss/forms in this project),
+ * and multi-layer gradient+blend backgrounds are unwieldy as Tailwind
+ * arbitrary-variant classNames, so this lives here instead. Uses the same
+ * `--c-muted`/`--c-accent` custom properties `@theme` wires to `bg-muted`/
+ * `bg-accent` elsewhere, so it stays correct across light/dark mode and
+ * every user-selectable accent preset without any JS involved. */
+.effort-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 17px;
+  background: transparent;
+  cursor: pointer;
+}
+.effort-range:focus { outline: none; }
+.effort-range::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 9999px;
+  background-image:
+    linear-gradient(to right, var(--c-muted), var(--c-accent)),
+    radial-gradient(circle, rgba(255, 255, 255, 0.4) 1px, transparent 1.3px);
+  background-size: 100% 100%, 3px 3px;
+  background-blend-mode: normal, overlay;
+}
+.effort-range::-moz-range-track {
+  height: 5px;
+  border-radius: 9999px;
+  background-image:
+    linear-gradient(to right, var(--c-muted), var(--c-accent)),
+    radial-gradient(circle, rgba(255, 255, 255, 0.4) 1px, transparent 1.3px);
+  background-size: 100% 100%, 3px 3px;
+  background-blend-mode: normal, overlay;
+}
+.effort-range::-moz-range-progress { background: transparent; }
+.effort-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 17px;
+  height: 17px;
+  border-radius: 9999px;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.15);
+  margin-top: -6px;
+}
+.effort-range::-moz-range-thumb {
+  width: 17px;
+  height: 17px;
+  border-radius: 9999px;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+.effort-range:disabled { cursor: not-allowed; opacity: 0.5; }
