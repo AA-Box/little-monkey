@@ -161,6 +161,10 @@ function App() {
   const [crossRepoPlannerOpen, setCrossRepoPlannerOpen] = useState(false);
   const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  // Title-bar slot the primary ChatWindow portals its Compare/Crew pickers
+  // into — callback-ref state (not a plain ref) so ChatWindow re-renders
+  // once the element mounts and the portal can attach.
+  const [chatHeaderActionsEl, setChatHeaderActionsEl] = useState<HTMLDivElement | null>(null);
   const terminalDock = useTerminalStore((state) => state.dock);
   const browserPaneOpen = useBrowserPaneStore((state) => state.open);
   const setBrowserPaneOpen = useBrowserPaneStore((state) => state.setOpen);
@@ -1358,6 +1362,10 @@ setVisualEditModeOpen(false);
       {/* Center: chat, with a drag-region strip standing in for the title bar */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-end px-2">
+          {/* Portal target for ChatWindow's Compare/Crew pickers — hugs the
+              strip's left edge (right of the session sidebar); empty when
+              another view is shown. */}
+          <div ref={setChatHeaderActionsEl} className="mr-auto flex items-center gap-1.5" />
           <IconButton
             size="sm"
             variant={diffPanelOpen ? "active" : "ghost"}
@@ -1577,6 +1585,7 @@ setVisualEditModeOpen(false);
               sessionId={activeSessionId}
               onManagePrompts={handleManagePrompts}
               onOpenSettingsTab={openSettingsTab}
+              headerActionsSlot={chatHeaderActionsEl}
             />
           )}
         </ErrorBoundary>
