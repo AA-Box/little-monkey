@@ -10,6 +10,7 @@ import {
   Command,
   ClipboardCheck,
   Compass,
+  FileDiff,
   Database,
   GitPullRequest,
   Globe,
@@ -60,8 +61,10 @@ interface AppMenuProps {
   onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
+  onOpenDbAdminGuardrails: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenApiContractDiffLab: () => void;
   onOpenGoldenDatasetBuilder: () => void;
   onOpenDataNotebook: () => void;
   onOpenSyntheticMonitoring: () => void;
@@ -120,8 +123,10 @@ export function AppMenu({
   onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
+  onOpenDbAdminGuardrails,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenApiContractDiffLab,
   onOpenGoldenDatasetBuilder,
   onOpenDataNotebook,
   onOpenSyntheticMonitoring,
@@ -289,6 +294,14 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<FileDiff size={14} className="text-faint" />}
+            label={t("AppMenu.apiContractDiffLab")}
+            onClick={() => {
+              closeAll();
+              onOpenApiContractDiffLab();
+            }}
+          />
+          <MenuRow
             icon={<Plug size={14} className="text-faint" />}
             label={t("AppMenu.connectorBuilder")}
             onClick={() => {
@@ -414,6 +427,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenDebate();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dbAdminGuardrails")}
+            onClick={() => {
+              closeAll();
+              onOpenDbAdminGuardrails();
             }}
           />
           <MenuRow

@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::desktop::DesktopControlRuntime;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use http_body_util::{BodyExt, Full, Limited};
@@ -104,7 +106,10 @@ pub fn configure_host(
     Ok(config)
 }
 
-pub async fn spawn_if_configured(paths: DaemonPaths) -> Result<bool, String> {
+pub async fn spawn_if_configured(
+    paths: DaemonPaths,
+    desktop: Arc<DesktopControlRuntime>,
+) -> Result<bool, String> {
     let Some(config) = load_host_config(&paths)? else {
         return Ok(false);
     };
@@ -113,7 +118,7 @@ pub async fn spawn_if_configured(paths: DaemonPaths) -> Result<bool, String> {
     }
     let listener = bind(&config).await?;
     let acceptor = acceptor(&config)?;
-    let api = RemoteApi::production(paths, config.clone())?;
+    let api = RemoteApi::production(paths, config.clone(), desktop)?;
     tokio::spawn(async move {
         if let Err(error) = serve_bound(listener, acceptor, api).await {
             eprintln!("remote runner listener stopped: {error}");
@@ -122,7 +127,7 @@ pub async fn spawn_if_configured(paths: DaemonPaths) -> Result<bool, String> {
     Ok(true)
 }
 
-pub async fn serve(paths: DaemonPaths) -> Result<(), String> {
+pub async fn serve(paths: DaemonPaths, desktop: Arc<DesktopControlRuntime>) -> Result<(), String> {
     let config =
         load_host_config(&paths)?.ok_or_else(|| "Remote host is not configured".to_string())?;
     if !config.enabled {
@@ -130,7 +135,7 @@ pub async fn serve(paths: DaemonPaths) -> Result<(), String> {
     }
     let listener = bind(&config).await?;
     let acceptor = acceptor(&config)?;
-    let api = RemoteApi::production(paths, config)?;
+    let api = RemoteApi::production(paths, config, desktop)?;
     serve_bound(listener, acceptor, api).await
 }
 

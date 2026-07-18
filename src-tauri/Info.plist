@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>Little Monkey records audio only while you visibly hold the companion microphone control, to transcribe that explicit recording.</string>
-  <key>NSScreenCaptureUsageDescription</key>
-  <string>Little Monkey captures only the screen region you explicitly select for companion context.</string>
-</dict>
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Little Monkey records audio only while you visibly hold the companion microphone control, to transcribe that explicit recording.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Little Monkey captures only the screen region you explicitly select for companion context.</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+  </dict>
 </plist>

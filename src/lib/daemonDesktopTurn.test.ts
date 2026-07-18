@@ -82,6 +82,7 @@ describe("daemon desktop turn snapshot", () => {
         tools: [],
         instructions: null,
         hasHttpToken: false,
+        hasOauth: false,
       }],
       attachedStackIds: ["stack-one"],
       attachedStackNames: ["Docs"],

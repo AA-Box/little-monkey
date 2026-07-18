@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   Archive,
   ArchiveRestore,
@@ -298,8 +299,8 @@ export function SideTaskDrawer({ sessionId }: SideTaskDrawerProps) {
   const toggleDrawer = useSideTaskStore((state) => state.toggleDrawer);
   const composerOpen = useSideTaskStore((state) => state.composerOpen);
   const openComposer = useSideTaskStore((state) => state.openComposer);
-  const visible = useSideTaskStore(selectVisibleSideTasks);
-  const archived = useSideTaskStore(selectArchivedSideTasks);
+  const visible = useSideTaskStore(useShallow(selectVisibleSideTasks));
+  const archived = useSideTaskStore(useShallow(selectArchivedSideTasks));
   const runningCount = useSideTaskStore(selectRunningSideTaskCount);
   const selectedTaskId = useSideTaskStore((state) => state.selectedTaskId);
   const selectedTask = useSideTaskStore((state) => (state.selectedTaskId ? state.tasks[state.selectedTaskId] : null));
