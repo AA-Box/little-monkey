@@ -27,6 +27,7 @@ import {
   formatDate,
   JsonView,
   labelize,
+  ModelRetirementWarningBanner,
   SectionHeading,
   Toggle,
 } from "./RuntimeHubShared";
@@ -477,6 +478,8 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const offloadBusy = busy[`offload-plan:${runtimeId}`];
   const offloadError = errors[`offload-plan:${runtimeId}`];
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
+  const modelStalenessWarnings = useRuntimeHubStore((state) => state.modelStalenessWarnings);
+  const checkModelStaleness = useRuntimeHubStore((state) => state.checkModelStaleness);
   const settingCapabilities = useRuntimeHubStore((state) => state.settingCapabilities[runtimeId]);
   const resolveSettingCapabilities = useRuntimeHubStore((state) => state.resolveSettingCapabilities);
 
@@ -508,6 +511,14 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
     const input = buildOffloadPlanInput(hardware, selectedModel, allRuntimes, runtimeDetails);
     void previewOffloadPlan(runtimeId, input).catch(() => {});
   }, [hardware, selectedModel, allRuntimes, runtimeDetails, runtimeId, previewOffloadPlan]);
+
+  // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+  // 14): check before a load actually starts, same trigger point as the
+  // offload-plan preview above.
+  useEffect(() => {
+    if (!selectedModel) return;
+    void checkModelStaleness(selectedModel.assetId).catch(() => {});
+  }, [selectedModel, checkModelStaleness]);
 
   // Sampler/Batching/Speculative Decoding Controls (ROADMAP Phase 8 item
   // 17): re-resolve which advanced settings can actually be enabled
@@ -584,8 +595,10 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
       {runtime.canLoad && (
         <section className="mt-5 border-t border-border pt-4" aria-label={`Load a model in ${runtime.descriptor.label}`}>
           <SectionHeading title="Load model" description="Only verified models compatible with this runtime are listed." />
-          <div className="mt-3">
+          <div className="mt-3 flex flex-col gap-3">
             <CompatibilityWarningBanner report={compatibilityReport} />
+            <ModelRetirementWarningBanner warning={selectedModel ? modelStalenessWarnings[selectedModel.assetId] : undefined} />
+            <ErrorNotice message={selectedModel ? errors[`model-staleness:${selectedModel.assetId}`] : undefined} />
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Field label="Installed model">

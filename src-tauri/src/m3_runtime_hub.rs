@@ -2747,6 +2747,56 @@ impl M3RuntimeHub {
         state_to_views(&state, &self.models_root)
     }
 
+    /// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item
+    /// 14): flags an installed model as outdated when its catalog has a
+    /// different revision available *and* it has gone unrefreshed for a long
+    /// time — reusing `search_catalog` (the same mechanism the "Find
+    /// updates" button already drives) for the "different revision" half
+    /// rather than inventing a second catalog-freshness signal. Compares
+    /// only against catalog entries from the same source as the installed
+    /// active version, so an unrelated source's differently-quantized or
+    /// differently-sourced listing of the same model id is never mistaken
+    /// for "the same thing, but newer". Returns `Ok(None)` for an
+    /// up-to-date, recently-installed, or catalog-absent model — this is a
+    /// diagnostic signal, never an error.
+    pub async fn model_staleness_check(
+        &self,
+        asset_id: &str,
+        context: &M3OperationContext,
+    ) -> M3HubResult<Option<crate::model_retirement::LocalModelStalenessWarning>> {
+        context.preflight("model staleness check")?;
+        validate_identifier(asset_id, "assetId")?;
+        let installed = self.list_installed_models()?;
+        let model = installed
+            .iter()
+            .find(|candidate| candidate.asset_id == asset_id)
+            .ok_or_else(|| M3HubError::NotFound(format!("model {asset_id}")))?;
+        let active = model
+            .versions
+            .iter()
+            .find(|version| version.version_key == model.active_version_key)
+            .ok_or_else(|| M3HubError::State("active model version is missing".to_string()))?;
+        let matches = self
+            .search_catalog(&model.model_id, self.config.max_catalog_results, context)
+            .await?;
+        let latest = matches.iter().find(|candidate| {
+            candidate.model.model_id == model.model_id
+                && candidate.model.variant_id == model.variant_id
+                && candidate.model.source_id == active.source_id
+        });
+        let now_ms = self.clock.now_ms()?;
+        Ok(latest.and_then(|candidate| {
+            crate::model_retirement::check_local_model_staleness(
+                &model.asset_id,
+                &active.revision,
+                active.installed_at_ms,
+                &candidate.model.revision,
+                &candidate.model.display_name,
+                now_ms,
+            )
+        }))
+    }
+
     pub async fn download_model(
         &self,
         request: &M3DownloadRequest,

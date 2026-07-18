@@ -978,15 +978,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
 
-### 14. Model Retirement and Compatibility Warnings
-
-**Status:** Planned
-
-- Warn about retired cloud models, outdated local models, unsupported model families, and old agent model defaults.
-- Suggest replacements based on hardware, workflow, and privacy policy.
-
-**Acceptance:** Deprecated or unsafe model choices show a clear migration path before a run starts.
-
 ### 16. Edge Device Runtime Profiles
 
 **Status:** Research
