@@ -21,39 +21,47 @@
 //! the design doc's phase-2 gate asked for.
 //!
 //! WHAT IT CHECKS: builds a real (non-mock) Tauri app with the exact same
-//! `artifact://` protocol handler `lib.rs` registers, publishes a tiny
-//! artifact whose inline `<script>` probes `typeof window.__TAURI_INTERNALS__`
-//! / `typeof window.__TAURI__` / `window.origin`, and loads it through the
-//! exact consuming iframe shape `ArtifactPane.tsx` uses:
-//! `sandbox="allow-scripts"` (no `allow-same-origin`), no other capability
-//! wiring. The artifact can't call back into Rust by design (that's the
-//! whole point), so it reports its findings up via `postMessage` to the
-//! host page, which writes them into its own `document.title` — received in
-//! Rust through the window's `on_document_title_changed` handler, no IPC
-//! involved anywhere in the reporting path either. (NOT by polling
-//! `window.title()`: Tauri never mirrors `document.title` into the native
-//! window title on its own — that mirror is exactly what the opt-in
-//! `on_document_title_changed` handler exists to let apps implement — so a
-//! native-title poll reads back the configured title forever and can never
+//! `artifact://` protocol handler `lib.rs` registers PLUS a canary command
+//! ([`verify_canary_command`]) standing in for the privileged commands the
+//! real app grants its trusted windows. It publishes a tiny artifact whose
+//! inline `<script>` doesn't merely *observe* the Tauri bridge — it tries to
+//! USE it, calling the canary command through `__TAURI_INTERNALS__.invoke`.
+//! The artifact is loaded exactly as `ArtifactPane.tsx` now loads it: the
+//! host page fetches the published document from `artifact://` and re-serves
+//! it to a `sandbox="allow-scripts"` (no `allow-same-origin`) iframe from a
+//! `blob:` URL. The probe reports its outcome up via `postMessage` → the host
+//! page's `document.title` → Rust's `on_document_title_changed` handler (no
+//! IPC in the reporting path). The VERDICT, though, is not the report: it is
+//! whether the canary command actually ran ([`CANARY_FIRED`]). A frame that
+//! can run a command has escaped the sandbox; one that cannot, has not —
+//! regardless of whether the bridge OBJECT happens to be visible to it.
+//!
+//! (The title relay is used because Tauri never mirrors `document.title` into
+//! the native window title on its own — that mirror is exactly what the opt-in
+//! `on_document_title_changed` handler lets apps implement — so a
+//! `window.title()` poll would read the configured title forever and never
 //! observe the page's report.)
 //!
-//! Exit codes: `0` isolation confirmed; `1` `__TAURI_INTERNALS__`/`__TAURI__`
-//! was reachable inside the artifact frame (the exact regression the design
-//! doc's risk section warns about); `2` no result was received before the
-//! timeout (treated as a failure, not a pass — see `main`'s timeout branch).
+//! Exit codes: `0` the frame could NOT invoke a command (isolation holds);
+//! `1` the frame DID get `verify_canary_command` to run (sandbox escape —
+//! the exact regression this gate exists to catch); `2` no result was
+//! received before the timeout (treated as a failure, not a pass — see
+//! `main`'s timeout branch).
 //!
-//! KNOWN LIMITATION (found while writing this check — see the code review
-//! this addresses): Tauri's own `is_local_url` treats ANY response served by
-//! ANY registered custom URI scheme protocol as a "local" origin *on Windows
-//! specifically* (custom protocols there share the `http://<scheme>.localhost`
-//! address space), and `wry`'s WebView2 backend adds initialization scripts
-//! to every subframe regardless of the `for_main_frame_only` flag Tauri sets
-//! for its own IPC bridge script (its Windows-specific doc comment says so
-//! explicitly). Combined, this means this exact check needs to actually be
-//! RUN ON WINDOWS to mean anything for that platform — a pass on macOS/Linux
-//! does not establish it also passes on Windows, unlike most of this app's
-//! other cross-platform Rust code. Flagged separately as a follow-up; this
-//! tool is what to run, on each OS, to find out.
+//! WHY `blob:` AND WHY WINDOWS IS THE CASE THAT MATTERS: on Windows, `wry`'s
+//! WebView2 backend injects Tauri's IPC bridge (invoke key included) into
+//! EVERY subframe regardless of the `for_main_frame_only` flag Tauri sets
+//! (its own Windows-specific doc comment says so), and Tauri's `is_local_url`
+//! treats any registered custom-protocol response (`http://artifact.localhost`
+//! there) as a trusted *local* origin. An artifact frame pointed straight at
+//! `artifact://` therefore CAN invoke privileged commands on Windows — an
+//! earlier version of this check, which only asserted the bridge object was
+//! absent, correctly caught exactly that. The fix (see `ArtifactPane.tsx` and
+//! `artifacts.rs`) re-serves the document from a `blob:` URL, a *remote*
+//! origin Tauri's ACL grants nothing, so the bridge is inert even where the
+//! Windows leak still plants it. This check loads via `blob:` to verify that
+//! fix on the platform it matters for; a pass on macOS/Linux (where the leak
+//! never existed) does not by itself establish the Windows property.
 //!
 //! REQUIRES A REAL, BOUND GUI SESSION: this creates an actual native window
 //! and webview, which on macOS needs a logged-in Aqua/WindowServer session
@@ -67,10 +75,29 @@
 //! the host page's script ran but the iframe never reported; no `BOOT:` line
 //! means the host page itself never executed.
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use little_monkey_lib::{artifacts, AppState};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+/// Flipped to `true` iff the [`verify_canary_command`] below is ever actually
+/// executed — i.e. iff the sandboxed artifact frame managed to get a Tauri
+/// command to run. That is the real sandbox-escape this check exists to
+/// detect, so this atomic (not the mere presence of the bridge object) is the
+/// authoritative pass/fail signal — see `evaluate_and_report`.
+static CANARY_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// A stand-in for any privileged command the real app exposes to its trusted
+/// windows. It does nothing but record that it ran: if the untrusted artifact
+/// frame can reach it, an attacker-authored artifact could reach the real
+/// `shell`/`fs`/`dialog` commands `capabilities/default.json` grants the main
+/// window just the same. Registered via `invoke_handler` below.
+#[tauri::command]
+fn verify_canary_command() -> Result<(), String> {
+    CANARY_FIRED.store(true, Ordering::SeqCst);
+    Ok(())
+}
 
 /// Serves exactly one path ("" / the window's start URL) with our inline host
 /// document — just enough `Assets` impl to avoid depending on the real
@@ -117,36 +144,48 @@ fn main() {
     eprintln!("verify_artifact_ipc_isolation: starting");
     let _ = std::io::stderr().flush();
     // The artifact's own content: exactly what a malicious/compromised model
-    // could emit in an HTML fence. No `try/catch` needed around the
-    // typeof checks themselves (`typeof` never throws for an undeclared
-    // identifier), but the surrounding IIFE is wrapped anyway so a failure
-    // anywhere in this probe still reports SOMETHING rather than leaving the
-    // host waiting for a message that never arrives.
+    // could emit in an HTML fence. It doesn't merely *observe* the bridge —
+    // it actively tries to USE it, calling `verify_canary_command` through
+    // whatever `__TAURI_INTERNALS__.invoke` the frame can see. If that command
+    // ever runs (see `CANARY_FIRED`), the sandbox has been escaped. The whole
+    // body is wrapped so any failure still reports SOMETHING rather than
+    // leaving the host waiting for a message that never arrives; a 3s internal
+    // deadline guarantees a report even if the invoke promise never settles.
     let artifact_html = r#"<!doctype html><html><body><script>
 (function () {
-  var result;
-  try {
-    result = JSON.stringify({
-      internals: typeof window.__TAURI_INTERNALS__,
-      tauriGlobal: typeof window.__TAURI__,
-      origin: window.origin
-    });
-  } catch (e) {
-    result = JSON.stringify({ error: String(e) });
+  function report(o) { window.parent.postMessage(JSON.stringify(o), '*'); }
+  var base = {
+    internals: typeof window.__TAURI_INTERNALS__,
+    tauriGlobal: typeof window.__TAURI__,
+    href: location.href
+  };
+  var internals = window.__TAURI_INTERNALS__;
+  if (!internals || typeof internals.invoke !== 'function') {
+    base.outcome = 'no-bridge';
+    report(base);
+    return;
   }
-  window.parent.postMessage(result, '*');
+  var done = false;
+  function finish(outcome) {
+    if (done) return;
+    done = true;
+    base.outcome = outcome;
+    report(base);
+  }
+  try {
+    internals.invoke('verify_canary_command', {})
+      .then(function () { finish('invoke-resolved'); })
+      .catch(function (e) { finish('invoke-rejected:' + String(e)); });
+  } catch (e) {
+    finish('invoke-threw:' + String(e));
+  }
+  setTimeout(function () { finish('invoke-timeout'); }, 3000);
 })();
 </script></body></html>"#;
 
     // Publish the probe artifact BEFORE building the host document so the
-    // iframe's src can carry the real artifact URL from the very first
-    // parse. The previous shape (build the window with an `about:blank`
-    // iframe, then `window.eval` a script to point it at the artifact) raced
-    // the host page's load: fired before `index.html` finished parsing,
-    // `document.getElementById('probe')` was null, the resulting TypeError
-    // was swallowed inside the webview, and the check always timed out.
-    // `publish_impl` only needs the map, not a built app, so there's no
-    // ordering constraint forcing the old shape.
+    // host page's fetch can carry the real artifact URL from the very first
+    // parse. `publish_impl` only needs the map, not a built app.
     let state = AppState::default();
     let id = {
         let mut store = state.artifacts.lock().unwrap();
@@ -154,19 +193,38 @@ fn main() {
             .expect("publishing the probe artifact must succeed")
     };
 
+    // The host page loads the artifact EXACTLY as `ArtifactPane.tsx` now does:
+    // it fetches the published document from the `artifact://` protocol and
+    // re-serves it to a `sandbox="allow-scripts"` iframe from a `blob:` object
+    // URL — not by pointing the iframe straight at `artifact://`. That blob
+    // origin is what makes the frame *remote* to Tauri's ACL (see this file's
+    // header), so the check exercises the real app's isolation, not a shape
+    // the app no longer uses.
     let host_html = format!(
-        r#"<!doctype html><html><body><iframe id="probe" sandbox="allow-scripts" src="{}"></iframe>
+        r#"<!doctype html><html><body><iframe id="probe" sandbox="allow-scripts"></iframe>
 <script>
 document.title = 'BOOT:host-script-ran';
 window.addEventListener('message', function (e) {{
   document.title = 'RESULT:' + e.data;
 }});
+(function () {{
+  fetch({artifact_url})
+    .then(function (r) {{ return r.text(); }})
+    .then(function (html) {{
+      var url = URL.createObjectURL(new Blob([html], {{ type: 'text/html' }}));
+      document.getElementById('probe').src = url;
+    }})
+    .catch(function (e) {{
+      document.title = 'RESULT:' + JSON.stringify({{ outcome: 'host-fetch-error:' + String(e) }});
+    }});
+}})();
 </script></body></html>"#,
-        artifact_url(&id)
+        artifact_url = serde_json::to_string(&artifact_url(&id)).unwrap()
     );
 
     let app = tauri::Builder::default()
         .manage(state)
+        .invoke_handler(tauri::generate_handler![verify_canary_command])
         .register_uri_scheme_protocol("artifact", |ctx, request| {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
@@ -247,30 +305,34 @@ window.addEventListener('message', function (e) {{
     std::process::exit(2);
 }
 
-/// Parses the artifact frame's `postMessage` payload, prints a PASS/FAIL
-/// diagnostic to stderr, and returns the process exit code that decision
-/// maps to (`0` isolated, `1` leaked). Never called for the timeout case —
-/// that path reports its own diagnostic and exit code inline above.
+/// Prints the artifact frame's `postMessage` diagnostics, then returns the
+/// process exit code based on the AUTHORITATIVE signal — whether the frame's
+/// invoke actually executed `verify_canary_command` ([`CANARY_FIRED`]). The
+/// payload's `outcome`/`internals` fields are printed for diagnosis only:
+/// on Windows the bridge OBJECT is expected to be present in the subframe
+/// (the WebView2 leak this file documents), so its mere presence is not a
+/// failure — only a command actually *running* is. Never called for the
+/// timeout case — that path reports its own diagnostic and exit code inline.
 fn evaluate_and_report(payload: &str) -> i32 {
-    eprintln!("Probe result from inside the artifact:// frame: {payload}");
-    let parsed: serde_json::Value =
-        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
-    let internals = parsed
-        .get("internals")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let tauri_global = parsed
-        .get("tauriGlobal")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    eprintln!("Probe result from inside the artifact frame: {payload}");
+
+    // Small grace so a command that WOULD run has certainly finished before
+    // we read the flag: the probe already awaits its invoke (up to its own
+    // 3s deadline) before reporting, and `verify_canary_command` is a trivial
+    // synchronous handler, so anything that was going to fire has by now —
+    // this is belt-and-braces against a late main-thread dispatch.
+    std::thread::sleep(Duration::from_millis(250));
+    let escaped = CANARY_FIRED.load(Ordering::SeqCst);
     let _ = std::io::stderr().flush();
-    if internals == "undefined" && tauri_global == "undefined" {
-        eprintln!("PASS: window.__TAURI_INTERNALS__ and window.__TAURI__ are both undefined inside the artifact:// frame.");
+    if !escaped {
+        eprintln!(
+            "PASS: the sandboxed artifact frame could not invoke a command (verify_canary_command never ran)."
+        );
         let _ = std::io::stderr().flush();
         0
     } else {
         eprintln!(
-            "FAIL: the Tauri IPC bridge is reachable inside the artifact:// frame (internals={internals:?}, tauriGlobal={tauri_global:?}) — this is a sandbox-escape/IPC-leakage regression."
+            "FAIL: the sandboxed artifact frame INVOKED a Tauri command (verify_canary_command ran) — this is a sandbox-escape/IPC-leakage regression."
         );
         let _ = std::io::stderr().flush();
         1
