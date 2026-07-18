@@ -7,8 +7,12 @@
 //! configuration. It never deletes files, follows symlinks, rewrites a
 //! workspace, rotates credentials, or enables a capability.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -21,6 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
+#[cfg(unix)]
 use walkdir::WalkDir;
 
 pub const SECURITY_AUDIT_SCHEMA_VERSION: u32 = 1;
