@@ -964,6 +964,17 @@ struct M3StoredModelVersion {
     model: M3CatalogModel,
     artifact_relative_path: String,
     installed_at_ms: u64,
+    /// The digest of this version's `model.projector` that was last locally
+    /// verified against real bytes on disk (see `M3RuntimeHub::verify_projector`).
+    /// `None` for a version with no projector, one whose projector has never
+    /// been verified, or one installed before this field existed. Compared
+    /// against `model.projector.sha256` at view time rather than trusted
+    /// blindly, so replacing the catalog's projector reference (a different
+    /// digest) without re-verifying correctly reverts to unverified.
+    #[serde(default)]
+    projector_verified_sha256: Option<String>,
+    #[serde(default)]
+    projector_verified_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1018,6 +1029,81 @@ pub struct M3DownloadRequest {
     pub accepted_license_sha256: String,
 }
 
+/// Where a multimodal projector component genuinely stands relative to a
+/// model version that may declare vision/audio capability (ROADMAP Phase 8
+/// item 12: Multimodal Projector and Vision Model Manager). Mirrors the
+/// honesty bar the Chat Template Compatibility Lab applies to chat/tool/
+/// structured-output via `gate_capabilities`: a capability is never shown as
+/// ready on faith in a catalog's declared flag alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M3ProjectorVerificationState {
+    /// This version's declared capabilities do not require a projector.
+    NotRequired,
+    /// Vision (or another projector-requiring capability) is declared, but
+    /// the manifest carries no projector reference at all — the "missing
+    /// projector" case this task's acceptance criterion calls out.
+    MissingReference,
+    /// A projector reference exists, but its declared digest has not been
+    /// locally verified against real bytes on disk yet.
+    Unverified,
+    /// A projector reference exists and its bytes were locally verified
+    /// (see `M3RuntimeHub::verify_projector`) against the declared
+    /// sha256/size.
+    Verified,
+}
+
+impl M3ProjectorVerificationState {
+    fn resolve(
+        requires_projector: bool,
+        projector: Option<&M3ProjectorRef>,
+        verified_sha256: Option<&str>,
+    ) -> Self {
+        if !requires_projector {
+            return Self::NotRequired;
+        }
+        match projector {
+            None => Self::MissingReference,
+            Some(reference) => {
+                if verified_sha256 == Some(reference.sha256.as_str()) {
+                    Self::Verified
+                } else {
+                    Self::Unverified
+                }
+            }
+        }
+    }
+}
+
+/// Whether this hub's own outbound request composition can carry an image
+/// content block to the given runtime kind (ROADMAP Phase 8 item 12). This
+/// gates `vision_ready` the same way the Chat Template Compatibility Lab's
+/// `gate_capabilities` gates chat/tool/structured-output: composing the
+/// correct wire shape is the bar this hub can verify from inside its own
+/// process boundary — exactly like `fixture_tool_calling` already treats a
+/// correctly composed OpenAI-wire/MLX-flattened tool call as "passing"
+/// without spinning up the external runtime process itself. Both
+/// `openai_messages` (used for the Ollama and managed llama.cpp drivers) and
+/// `canonical_message_to_mlx` (the MLX driver) compose real `image_url`/
+/// `images` wire content today, so every runtime kind currently supports
+/// this; the match stays exhaustive so a future runtime kind must
+/// deliberately opt in rather than silently inheriting `true`.
+pub fn runtime_supports_image_transport(kind: M3RuntimeKind) -> bool {
+    match kind {
+        M3RuntimeKind::Ollama | M3RuntimeKind::LlamaCpp | M3RuntimeKind::Mlx => true,
+    }
+}
+
+/// Estimated resident memory a multimodal projector consumes once loaded,
+/// treating its on-disk size as a direct stand-in for resident bytes — the
+/// same approximation this hub already applies to whole-model weights
+/// (`OffloadModelProfile::weights_bytes` in `runtime_adapter.rs`), just for
+/// the much smaller projector component. No invented activation/scratch
+/// multiplier is layered on top of it.
+pub fn estimated_projector_memory_bytes(projector: &M3ProjectorRef) -> u64 {
+    projector.size_bytes
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct M3InstalledVersionView {
@@ -1038,6 +1124,19 @@ pub struct M3InstalledVersionView {
     /// When the catalog entry for this version was locally retrieved, if the
     /// installing manifest recorded it.
     pub catalog_retrieved_at_ms: Option<u64>,
+    /// Real, computed evidence for this version's projector — never trusted
+    /// purely from the catalog's declared capability flag.
+    pub projector_verification: M3ProjectorVerificationState,
+    /// When `projector_verification` last became `Verified`, if it has been.
+    pub projector_verified_at_ms: Option<u64>,
+    /// Estimated resident memory the projector needs once loaded; present
+    /// only when this version actually declares one.
+    pub estimated_projector_memory_bytes: Option<u64>,
+    /// Whether vision is genuinely ready to use: declared true AND backed by
+    /// a verified projector AND the target runtime's own outbound wire
+    /// composition can carry an image block. Never true merely because the
+    /// catalog set `capabilities.vision = true`.
+    pub vision_ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1120,6 +1219,20 @@ pub struct M3ActivateModelVersionRequest {
 pub struct M3PruneModelVersionsRequest {
     pub asset_id: String,
     pub confirmation: String,
+}
+
+/// Verifies a candidate local file against an installed model version's
+/// declared `M3ProjectorRef` digest/size (ROADMAP Phase 8 item 12). There is
+/// deliberately no network download path for the projector blob itself yet
+/// — see `M3RuntimeHub::verify_projector`'s doc comment — so this is how a
+/// user-supplied or externally-fetched projector file gets promoted from
+/// "declared" to genuinely `Verified` evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3VerifyProjectorRequest {
+    pub asset_id: String,
+    pub version_key: String,
+    pub candidate_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2885,6 +2998,15 @@ impl M3RuntimeHub {
             model: request.model.clone(),
             artifact_relative_path,
             installed_at_ms,
+            // A fresh (or replaced) version always starts unverified, even
+            // when it replaces an existing entry for the same version key:
+            // that replace path only fires when the catalog re-declares
+            // non-content-addressed fields (e.g. a corrected `projector`
+            // reference) for what is otherwise byte-identical content, and a
+            // stale verification must not silently carry over to a
+            // potentially different projector declaration.
+            projector_verified_sha256: None,
+            projector_verified_at_ms: None,
         };
         match index {
             Some(index) => {
@@ -3035,6 +3157,68 @@ impl M3RuntimeHub {
             .into_iter()
             .find(|model| model.asset_id == request.asset_id)
             .ok_or_else(|| M3HubError::State("activated model vanished".to_string()))
+    }
+
+    /// Verifies a candidate local file against an installed model version's
+    /// declared projector reference (kind/sha256/size), promoting that
+    /// version's projector from merely "declared" to genuine `Verified`
+    /// evidence on success (ROADMAP Phase 8 item 12). This intentionally
+    /// does not download anything itself: unlike a model's own weights,
+    /// `M3ProjectorRef` carries no download URL — a user (or a future PR
+    /// that adds a real fetch path) supplies the file, and this is the real,
+    /// digest-checked promotion step, mirroring the same `sha256_file`/
+    /// `constant_time_eq` integrity check a model's own weights go through
+    /// in `download_model`. Never marks anything verified on a digest
+    /// mismatch — this returns `M3HubError::Integrity` instead, the same
+    /// error a corrupted model download produces.
+    pub async fn verify_projector(
+        &self,
+        request: &M3VerifyProjectorRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3InstalledModelView> {
+        validate_identifier(&request.asset_id, "assetId")?;
+        validate_sha256(&request.version_key, "versionKey")?;
+        context.preflight("verify projector")?;
+        let _mutation = self.mutation_lock.lock().await;
+        let mut state = {
+            let _guard = lock(&self.state_lock)?;
+            load_hub_state(&self.state_root, &self.models_root)?
+        };
+        let model_index = state
+            .models
+            .iter()
+            .position(|model| model.asset_id == request.asset_id)
+            .ok_or_else(|| M3HubError::NotFound(request.asset_id.clone()))?;
+        let version_index = state.models[model_index]
+            .versions
+            .iter()
+            .position(|version| version.version_key == request.version_key)
+            .ok_or_else(|| M3HubError::NotFound(request.version_key.clone()))?;
+        let projector = state.models[model_index].versions[version_index]
+            .model
+            .projector
+            .clone()
+            .ok_or_else(|| {
+                M3HubError::NotFound("this model version declares no projector".to_string())
+            })?;
+        let actual_digest = sha256_file(&request.candidate_path, projector.size_bytes)?;
+        if !constant_time_eq(actual_digest.as_bytes(), projector.sha256.as_bytes()) {
+            return Err(M3HubError::Integrity {
+                expected: projector.sha256.clone(),
+                actual: actual_digest,
+            });
+        }
+        let verified_at_ms = self.clock.now_ms()?;
+        state.models[model_index].versions[version_index].projector_verified_sha256 =
+            Some(projector.sha256.clone());
+        state.models[model_index].versions[version_index].projector_verified_at_ms =
+            Some(verified_at_ms);
+        let view = stored_model_view(&state.models[model_index], &self.models_root)?;
+        {
+            let _guard = lock(&self.state_lock)?;
+            save_next_hub_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
+        }
+        Ok(view)
     }
 
     /// Remove every inactive model version after an exact, asset-bound
@@ -4283,9 +4467,12 @@ impl CanonicalCollector {
     }
 }
 
-/// `pub(crate)`: reused directly (not mocked) by `chat_template_lab.rs` to
-/// validate the MLX driver's tool-call round-trip alongside the OpenAI-
-/// compatible Ollama/llama.cpp path.
+/// `pub(crate)` (rather than private) so both `m3_production.rs`'s tests and
+/// `chat_template_lab.rs` (ROADMAP Phase 8 item 8) can exercise the real MLX
+/// flattening path without duplicating it: `chat_template_lab.rs` reuses it
+/// directly (not mocked) to validate the MLX driver's tool-call round-trip
+/// alongside the OpenAI-compatible Ollama/llama.cpp path, and its own vision
+/// fixture (ROADMAP item 12's prior art) exercises the same function.
 pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResult<MlxMessage> {
     let role = match message.role {
         CanonicalRole::System => "system",
@@ -4294,6 +4481,11 @@ pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResul
         CanonicalRole::Tool => "tool",
     };
     let mut parts = Vec::new();
+    // Image content blocks (ROADMAP Phase 8 item 12) carry no native slot in
+    // `MlxMessage.text` — its wire type has a dedicated `images` list
+    // instead, so a data URI is appended there rather than flattened into
+    // the joined text like tool_use/tool_result JSON is.
+    let mut images = Vec::new();
     for content in &message.content {
         match content {
             CanonicalContent::Text { text } => parts.push(text.clone()),
@@ -4309,11 +4501,16 @@ pub(crate) fn canonical_message_to_mlx(message: &CanonicalMessage) -> M3HubResul
             } => parts.push(canonical_json_string(&json!({
                 "type":"tool_result","tool_use_id":tool_use_id,"content":content,"is_error":is_error
             }))?),
+            CanonicalContent::Image {
+                mime_type,
+                data_base64,
+            } => images.push(CanonicalContent::image_data_url(mime_type, data_base64)),
         }
     }
     Ok(MlxMessage {
         role: role.to_string(),
         text: parts.join("\n"),
+        images,
     })
 }
 
@@ -4345,6 +4542,14 @@ fn stored_model_view(
         .map(|version| {
             let artifact_path = models_root.join(&version.artifact_relative_path);
             ensure_descendant(models_root, &artifact_path)?;
+            let projector_verification = M3ProjectorVerificationState::resolve(
+                version.model.capabilities.vision,
+                version.model.projector.as_ref(),
+                version.projector_verified_sha256.as_deref(),
+            );
+            let vision_ready = version.model.capabilities.vision
+                && projector_verification == M3ProjectorVerificationState::Verified
+                && runtime_supports_image_transport(version.model.runtime);
             Ok(M3InstalledVersionView {
                 version_key: version.version_key.clone(),
                 revision: version.model.revision.clone(),
@@ -4358,6 +4563,14 @@ fn stored_model_view(
                 template: version.model.template.clone(),
                 projector: version.model.projector.clone(),
                 catalog_retrieved_at_ms: version.model.catalog_retrieved_at_ms,
+                projector_verification,
+                projector_verified_at_ms: version.projector_verified_at_ms,
+                estimated_projector_memory_bytes: version
+                    .model
+                    .projector
+                    .as_ref()
+                    .map(estimated_projector_memory_bytes),
+                vision_ready,
             })
         })
         .collect::<M3HubResult<Vec<_>>>()?;

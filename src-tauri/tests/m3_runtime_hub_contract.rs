@@ -1878,6 +1878,142 @@ async fn search_stamps_provenance_and_installed_view_surfaces_template_projector
     assert_eq!(active.catalog_retrieved_at_ms, Some(retrieved_at));
 }
 
+/// ROADMAP Phase 8 item 12 (Multimodal Projector and Vision Model Manager):
+/// a model declared vision-capable is only ever shown `vision_ready` once a
+/// real, digest-verified projector backs it — never merely because the
+/// catalog set `capabilities.vision = true`. This exercises every state:
+/// missing reference, declared-but-unverified, a failed verification
+/// (digest mismatch), and a real successful verification.
+#[tokio::test]
+async fn vision_capable_model_surfaces_missing_and_verified_projector_evidence() {
+    let directory = TestDirectory::new("projector-evidence");
+    let bytes = payload(4_096, 21);
+    let mut model = catalog_model(&bytes, "rev-vision");
+    model.capabilities.vision = true;
+    model.projector = None; // declared vision-capable, but no projector reference at all yet
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-vision"));
+    let hub = make_hub(
+        &directory.0,
+        download.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let context = M3OperationContext::new(10_000);
+
+    let request = M3DownloadRequest {
+        accepted_license_sha256: model.license.declaration_sha256(),
+        model: model.clone(),
+    };
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("install vision-capable model without a projector reference yet");
+    let active = installed.versions.iter().find(|version| version.active).expect("active version");
+    assert_eq!(active.projector_verification, M3ProjectorVerificationState::MissingReference);
+    assert!(!active.vision_ready, "vision must never be ready with no projector reference at all");
+    assert_eq!(active.estimated_projector_memory_bytes, None);
+
+    // Now the catalog ships a new revision that declares a real projector
+    // reference — still unverified until real bytes are checked. A distinct
+    // revision/byte payload (rather than re-declaring the exact same
+    // version) is used deliberately so this goes through the full
+    // download+state-mutation path instead of `download_model`'s
+    // identical-version fast path (keyed only on asset/version/sha256,
+    // which would otherwise return the earlier stored entry unchanged).
+    let v2_bytes = payload(4_096, 22);
+    let projector_bytes = payload(2_048, 77);
+    let mut with_projector = catalog_model(&v2_bytes, "rev-vision-v2");
+    with_projector.capabilities.vision = true;
+    with_projector.projector = Some(M3ProjectorRef {
+        kind: "clip".to_string(),
+        sha256: sha256(&projector_bytes),
+        size_bytes: projector_bytes.len() as u64,
+    });
+    download.set_payload(v2_bytes.clone(), "etag-vision-v2");
+    let request = M3DownloadRequest {
+        accepted_license_sha256: with_projector.license.declaration_sha256(),
+        model: with_projector.clone(),
+    };
+    let installed = hub
+        .download_model(&request, &context)
+        .await
+        .expect("install a new revision that declares a projector reference");
+    let active = installed.versions.iter().find(|version| version.active).expect("active version");
+    assert_eq!(active.projector_verification, M3ProjectorVerificationState::Unverified);
+    assert!(!active.vision_ready, "an unverified projector must never be shown vision-ready");
+    assert_eq!(
+        active.estimated_projector_memory_bytes,
+        Some(projector_bytes.len() as u64)
+    );
+
+    // A digest mismatch is rejected outright and never marks anything verified.
+    let projector_file = directory.0.join("wrong-projector.bin");
+    fs::write(&projector_file, payload(2_048, 99)).expect("write wrong candidate projector");
+    let mismatch = hub
+        .verify_projector(
+            &M3VerifyProjectorRequest {
+                asset_id: installed.asset_id.clone(),
+                version_key: active.version_key.clone(),
+                candidate_path: projector_file,
+            },
+            &context,
+        )
+        .await;
+    assert!(matches!(mismatch, Err(M3HubError::Integrity { .. })));
+
+    // The real bytes verify successfully and promote this version to
+    // genuinely vision-ready (LlamaCpp is one of the runtime kinds whose
+    // outbound wire composition carries an image block today).
+    let projector_file = directory.0.join("real-projector.bin");
+    fs::write(&projector_file, &projector_bytes).expect("write real candidate projector");
+    let verified = hub
+        .verify_projector(
+            &M3VerifyProjectorRequest {
+                asset_id: installed.asset_id.clone(),
+                version_key: active.version_key.clone(),
+                candidate_path: projector_file,
+            },
+            &context,
+        )
+        .await
+        .expect("verify real projector bytes");
+    let active = verified.versions.iter().find(|version| version.active).expect("active version");
+    assert_eq!(active.projector_verification, M3ProjectorVerificationState::Verified);
+    assert!(active.projector_verified_at_ms.is_some());
+    assert!(active.vision_ready, "a verified projector on a transport-capable runtime must be vision-ready");
+
+    // Verifying a model version with no projector reference at all is a
+    // clear NotFound, not a silent no-op or a false success.
+    let mut no_projector_model = catalog_model(&payload(4_096, 5), "rev-no-projector");
+    no_projector_model.capabilities.vision = false;
+    let request = M3DownloadRequest {
+        accepted_license_sha256: no_projector_model.license.declaration_sha256(),
+        model: no_projector_model.clone(),
+    };
+    let other_directory = TestDirectory::new("no-projector");
+    let other_download = Arc::new(MutableDownload::new(payload(4_096, 5), "etag-no-projector"));
+    let other_hub = make_hub(&other_directory.0, other_download, Vec::new(), Vec::new(), None, None);
+    let other_installed = other_hub
+        .download_model(&request, &context)
+        .await
+        .expect("install a non-vision model");
+    let other_active = other_installed.versions.iter().find(|version| version.active).expect("active");
+    assert_eq!(other_active.projector_verification, M3ProjectorVerificationState::NotRequired);
+    let missing_projector = other_hub
+        .verify_projector(
+            &M3VerifyProjectorRequest {
+                asset_id: other_installed.asset_id.clone(),
+                version_key: other_active.version_key.clone(),
+                candidate_path: directory.0.join("irrelevant.bin"),
+            },
+            &context,
+        )
+        .await;
+    assert!(matches!(missing_projector, Err(M3HubError::NotFound(_))));
+}
+
 #[tokio::test]
 async fn identical_payload_across_assets_is_reused_without_a_network_transfer_and_survives_donor_deletion(
 ) {
