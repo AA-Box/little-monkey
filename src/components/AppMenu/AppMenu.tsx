@@ -10,6 +10,8 @@ import {
   Command,
   ClipboardCheck,
   Compass,
+  FileDiff,
+  Database,
   GitPullRequest,
   Globe,
   HelpCircle,
@@ -18,6 +20,7 @@ import {
   Inbox,
   Network,
   Newspaper,
+  Plug,
   Radar,
   Search,
   ServerCog,
@@ -25,6 +28,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
+  Table2,
   Telescope,
   Wand2,
   Workflow,
@@ -47,15 +51,22 @@ interface AppMenuProps {
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
   onOpenMcpGenerator: () => void;
+  onOpenConnectorBuilder: () => void;
+  onOpenMigrationAgent: () => void;
   onOpenSideTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
+  onOpenSpreadsheetCopilot: () => void;
   onOpenTerminal: () => void;
   onOpenRedTeamLab: () => void;
   onOpenEvidenceBoard: () => void;
   onOpenDebate: () => void;
+  onOpenDbAdminGuardrails: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenApiContractDiffLab: () => void;
+  onOpenGoldenDatasetBuilder: () => void;
+  onOpenDataNotebook: () => void;
   onOpenSyntheticMonitoring: () => void;
   onOpenCrossRepoIntelligence: () => void;
   onOpenWorkCanvas: () => void;
@@ -102,15 +113,22 @@ export function AppMenu({
   onOpenTrustScorecards,
   onOpenSopCompiler,
   onOpenMcpGenerator,
+  onOpenConnectorBuilder,
+  onOpenMigrationAgent,
   onOpenSideTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
+  onOpenSpreadsheetCopilot,
   onOpenTerminal,
   onOpenRedTeamLab,
   onOpenEvidenceBoard,
   onOpenDebate,
+  onOpenDbAdminGuardrails,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenApiContractDiffLab,
+  onOpenGoldenDatasetBuilder,
+  onOpenDataNotebook,
   onOpenSyntheticMonitoring,
   onOpenCrossRepoIntelligence,
   onOpenWorkCanvas,
@@ -276,6 +294,30 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<FileDiff size={14} className="text-faint" />}
+            label={t("AppMenu.apiContractDiffLab")}
+            onClick={() => {
+              closeAll();
+              onOpenApiContractDiffLab();
+            }}
+          />
+          <MenuRow
+            icon={<Plug size={14} className="text-faint" />}
+            label={t("AppMenu.connectorBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenConnectorBuilder();
+            }}
+          />
+          <MenuRow
+            icon={<GitBranch size={14} className="text-faint" />}
+            label={t("AppMenu.migrationAgent")}
+            onClick={() => {
+              closeAll();
+              onOpenMigrationAgent();
+            }}
+          />
+          <MenuRow
             icon={<ListTodo size={14} className="text-faint" />}
             label={t("AppMenu.sideTasks")}
             onClick={() => {
@@ -324,11 +366,35 @@ export function AppMenu({
             }}
           />
           <MenuRow
+            icon={<Table2 size={14} className="text-faint" />}
+            label={t("AppMenu.spreadsheetCopilot")}
+            onClick={() => {
+              closeAll();
+              onOpenSpreadsheetCopilot();
+            }}
+          />
+          <MenuRow
             icon={<ClipboardCheck size={14} className="text-faint" />}
             label={t("AppMenu.evidenceBoard")}
             onClick={() => {
               closeAll();
               onOpenEvidenceBoard();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.goldenDatasetBuilder")}
+            onClick={() => {
+              closeAll();
+              onOpenGoldenDatasetBuilder();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dataNotebook")}
+            onClick={() => {
+              closeAll();
+              onOpenDataNotebook();
             }}
           />
           <MenuRow
@@ -361,6 +427,14 @@ export function AppMenu({
             onClick={() => {
               closeAll();
               onOpenDebate();
+            }}
+          />
+          <MenuRow
+            icon={<Database size={14} className="text-faint" />}
+            label={t("AppMenu.dbAdminGuardrails")}
+            onClick={() => {
+              closeAll();
+              onOpenDbAdminGuardrails();
             }}
           />
           <MenuRow

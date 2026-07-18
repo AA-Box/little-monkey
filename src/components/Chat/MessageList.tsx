@@ -59,6 +59,7 @@ import { isCommandNotice, parseCommandNotice, type CommandNotice } from "../../l
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
+import { useLocalAppsStore } from "../../store/localAppsStore";
 import MessageBubble from "./MessageBubble";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
@@ -668,11 +669,20 @@ const MemoryRow = memo(function MemoryRow({
  * which recipe. */
 const RecipeRow = memo(function RecipeRow({ notice }: { notice: RecipeNotice }) {
   const { t } = useT();
+  // Only known once `localAppsStore` has been refreshed at least once
+  // (App.tsx's boot effect) — falls back to the plain notice below when the
+  // app was since unpublished or the list hasn't loaded yet.
+  const localApp = useLocalAppsStore((s) =>
+    notice.localAppId ? s.apps.find((a) => a.id === notice.localAppId) : undefined,
+  );
+  const label = localApp
+    ? t("MessageList.recipeStartedFromLocalApp", { name: notice.name, appName: localApp.name })
+    : t("MessageList.recipeStarted", { name: notice.name });
   return (
     <div className="flex justify-center">
       <div className="flex max-w-[85%] items-center gap-2 rounded-md bg-surface-2 px-3 py-1.5 text-center text-xs text-faint">
         <ListChecks size={12} className="shrink-0" />
-        <span>{t("MessageList.recipeStarted", { name: notice.name })}</span>
+        <span>{label}</span>
       </div>
     </div>
   );
