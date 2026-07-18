@@ -1694,6 +1694,12 @@ fn ollama_response_content(content: &[CanonicalContent]) -> CompatibilityResult<
                     "tool results cannot be assistant output",
                 ))
             }
+            CanonicalContent::Image { .. } => {
+                return Err(invalid(
+                    "response.content",
+                    "image content cannot be assistant output",
+                ))
+            }
         }
     }
     Ok((text.join(""), tool_calls))
