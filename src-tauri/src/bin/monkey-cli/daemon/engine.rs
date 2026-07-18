@@ -3,7 +3,9 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use little_monkey_lib::run_protocol::{
     ClientIdentity, ClientKind, PermissionDecision, RepositoryPolicy, RunEvent, RunStatus,

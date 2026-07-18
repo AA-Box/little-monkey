@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;

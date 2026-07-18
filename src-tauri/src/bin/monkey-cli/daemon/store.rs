@@ -842,6 +842,10 @@ impl DaemonStore {
 pub struct PendingDelivery {
     pub trigger_id: String,
     pub delivery_id: String,
+    /// Dedup key already consumed by `reserve_delivery_payload`; kept so the
+    /// struct mirrors the full `daemon_delivery_payloads` row, but nothing
+    /// reads it after acceptance.
+    #[allow(dead_code)]
     pub nonce: Option<String>,
     pub payload_json: String,
     pub received_at_ms: u64,

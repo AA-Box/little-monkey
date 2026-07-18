@@ -1233,6 +1233,8 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                             "id": trigger.trigger_id,
                             "kind": trigger.kind,
                             "enabled": trigger.enabled,
+                            "created_at_ms": trigger.created_at_ms,
+                            "updated_at_ms": trigger.updated_at_ms,
                             "next_fire_at_ms": trigger.next_fire_at_ms,
                             "last_delivery_at_ms": trigger.last_delivery_at_ms,
                             "config": serde_json::from_slice::<serde_json::Value>(&trigger.config_json)
