@@ -24,6 +24,10 @@ export interface CrewPickerProps {
   value: string | null;
   onChange: (crewId: string | null) => void;
   disabled?: boolean;
+  /** Which way the panel opens relative to the trigger. "up" suits the
+   * composer-footer placement (default); "down" the title-bar placement,
+   * where an upward panel would clip past the window's top edge. */
+  placement?: "up" | "down";
 }
 
 interface EditorState {
@@ -57,7 +61,7 @@ function actorDraft(
   };
 }
 
-export function CrewPicker({ value, onChange, disabled = false }: CrewPickerProps) {
+export function CrewPicker({ value, onChange, disabled = false, placement = "up" }: CrewPickerProps) {
   const { t } = useT();
   const panelId = useId();
   const titleId = useId();
@@ -348,7 +352,9 @@ export function CrewPicker({ value, onChange, disabled = false }: CrewPickerProp
           id={panelId}
           role="dialog"
           aria-labelledby={titleId}
-          className="absolute bottom-full left-0 z-40 mb-2 flex max-h-[min(42rem,80vh)] w-[32rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl"
+          className={`absolute z-40 flex max-h-[min(42rem,80vh)] w-[32rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl ${
+            placement === "up" ? "bottom-full left-0 mb-2" : "top-full left-0 mt-2"
+          }`}
         >
           <header className="border-b border-border px-3.5 py-3">
             <h2 id={titleId} className="text-sm font-semibold text-foreground">{t("CrewPicker.title")}</h2>
