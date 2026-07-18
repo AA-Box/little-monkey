@@ -978,15 +978,6 @@ This phase comes from a live sweep of `ollama/ollama` closed PRs on July 15, 202
 
 **Acceptance:** Long-context failures explain whether the limit was prompt, cache, memory, runtime, or model metadata.
 
-### 13. Local Agent Integration Launcher
-
-**Status:** Planned
-
-- Generate safe local provider configuration for external agent tools and editors that can use Ollama/OpenAI-compatible endpoints.
-- Detect config drift, stale model choices, unsupported context length, and telemetry-sensitive defaults.
-
-**Acceptance:** User can connect external tools to Little Monkey's local endpoint without hand-editing fragile config files.
-
 ### 14. Model Retirement and Compatibility Warnings
 
 **Status:** Planned
