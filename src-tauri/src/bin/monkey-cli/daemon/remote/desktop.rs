@@ -45,7 +45,10 @@ const CAPTURE_INTERVAL_MS: u64 = 30_000;
 /// ...or after this many actions, whichever comes first.
 const CAPTURE_EVERY_N_ACTIONS: u32 = 10;
 /// Bounded wait for the local operator to answer the consent dialog. A
-/// timeout counts as a denial — silence is never consent.
+/// timeout counts as a denial — silence is never consent. Referenced by the
+/// macOS `osascript` and Linux `zenity` prompts; Windows' `MessageBoxW` has
+/// no timeout parameter and blocks until answered.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CONSENT_TIMEOUT_SECONDS: u64 = 60;
 
 /// Consent-dialog titles and the two "allow" button labels, shared by every
