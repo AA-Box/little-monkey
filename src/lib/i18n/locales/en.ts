@@ -1180,7 +1180,7 @@ export const en: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "Bearer token (optional)",
   "AddMcpServerForm.tokenPlaceholder": "Paste a bearer token…",
   "AddMcpServerForm.tokenHelpText": "Stored in your OS keychain — never written to mcp_servers.json.",
-  "AddMcpServerForm.timeoutLabel": "Timeout in seconds (optional, default 60)",
+  "AddMcpServerForm.timeoutLabel": "Timeout in seconds (optional)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "Stdio servers run as a child process on your machine; HTTP servers connect to a remote endpoint.",
   "AddMcpServerForm.addButton": "Add server",
