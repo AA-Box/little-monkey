@@ -53,9 +53,12 @@ function descriptionKeyFor(value: SliderValue): string {
 }
 
 interface EffortSelectorProps {
-  /** Whether this turn's send will run Ultracode's auto multi-model
-   * comparison + synthesis instead of a normal single-model turn — lifted
-   * to `ChatWindow` since it's a send-path decision, not per-model state. */
+  /** Whether sends in this chat run as Ultracode turns: same model, but the
+   * agent loop layers a standing multi-agent-orchestration section into the
+   * system prompt and force-offers the `task` tool (see `agentLoop.ts`'s
+   * `runAgentTurnBody` and `systemPrompt.ts`'s ULTRACODE_SYSTEM_SECTION) —
+   * lifted to `ChatWindow` since it's a send-path decision, not per-model
+   * state. */
   ultracodeActive: boolean;
   onUltracodeChange: (active: boolean) => void;
   disabled?: boolean;

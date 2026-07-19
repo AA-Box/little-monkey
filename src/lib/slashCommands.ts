@@ -31,7 +31,7 @@ export const BUILT_IN_SLASH_COMMANDS: readonly BuiltInSlashCommand[] = [
   { command: "stop", name: "Stop", description: "Cancel the active turn.", usage: "/stop" },
   { command: "usage", name: "Usage", description: "Show real token usage reported for this chat.", usage: "/usage" },
   { command: "learn", name: "Learn skill", description: "Create a quarantined skill proposal for review.", usage: "/learn command | instructions" },
-  { command: "btw", name: "Side question", description: "Ask a quick side question without adding to the conversation.", usage: "/btw question" },
+  { command: "btw", name: "Side question", description: "Open the Side Chat panel to ask a quick question without adding to the conversation.", usage: "/btw [question]" },
 ] as const;
 
 const BUILT_IN_BY_NAME = new Map(BUILT_IN_SLASH_COMMANDS.map((entry) => [entry.command, entry]));

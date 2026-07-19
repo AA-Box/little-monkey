@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSubagentSystemPrompt, buildSystemPrompt, composeSystemPrompt, detectOsLabel, resolvePersona, type McpServerPromptInfo } from './systemPrompt';
+import { buildSubagentSystemPrompt, buildSystemPrompt, composeSystemPrompt, detectOsLabel, resolvePersona, ULTRACODE_SYSTEM_SECTION, type McpServerPromptInfo } from './systemPrompt';
 import type { MemoryFact, RuleFile } from '../store/rulesStore';
 import type { PromptEntry } from '../store/promptStore';
 
@@ -304,6 +304,22 @@ describe('buildSubagentSystemPrompt', () => {
     const prompt = buildSubagentSystemPrompt([primary], 'macOS', 'explore', 'd');
     expect(prompt).toContain('final report');
     expect(prompt).toContain('do not ask questions');
+  });
+});
+
+describe('ULTRACODE_SYSTEM_SECTION', () => {
+  it('directs orchestration through the task tool on the same model — never a multi-model fan-out', () => {
+    expect(ULTRACODE_SYSTEM_SECTION).toContain('`task` tool');
+    expect(ULTRACODE_SYSTEM_SECTION).toContain('parallel');
+    expect(ULTRACODE_SYSTEM_SECTION).toContain('Adversarially verify');
+    // The old Ultracode ran the prompt across several different models via
+    // the Compare pipeline; the section must never resurrect that framing.
+    expect(ULTRACODE_SYSTEM_SECTION.toLowerCase()).not.toContain('models');
+  });
+
+  it('names both subagent profiles so the model picks the right one per subtask', () => {
+    expect(ULTRACODE_SYSTEM_SECTION).toContain('`explore`');
+    expect(ULTRACODE_SYSTEM_SECTION).toContain('`code`');
   });
 });
 
