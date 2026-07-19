@@ -1445,7 +1445,7 @@ export const ko: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "베어러 토큰(선택 사항)",
   "AddMcpServerForm.tokenPlaceholder": "베어러 토큰 붙여넣기…",
   "AddMcpServerForm.tokenHelpText": "OS 키체인에 저장됩니다 — mcp_servers.json에는 기록되지 않습니다.",
-  "AddMcpServerForm.timeoutLabel": "제한 시간(초, 선택 사항, 기본값 60)",
+  "AddMcpServerForm.timeoutLabel": "제한 시간(초, 선택 사항)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "stdio 서버는 사용자 컴퓨터에서 자식 프로세스로 실행됩니다. HTTP 서버는 원격 엔드포인트에 연결됩니다.",
   "AddMcpServerForm.addButton": "서버 추가",

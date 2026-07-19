@@ -1446,7 +1446,7 @@ export const fr: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "Jeton porteur (facultatif)",
   "AddMcpServerForm.tokenPlaceholder": "Collez un jeton porteur…",
   "AddMcpServerForm.tokenHelpText": "Stocké dans le trousseau de votre système d'exploitation — jamais écrit dans mcp_servers.json.",
-  "AddMcpServerForm.timeoutLabel": "Délai en secondes (facultatif, 60 par défaut)",
+  "AddMcpServerForm.timeoutLabel": "Délai en secondes (facultatif)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "Les serveurs stdio s'exécutent comme un processus enfant sur votre machine ; les serveurs HTTP se connectent à un point de terminaison distant.",
   "AddMcpServerForm.addButton": "Ajouter le serveur",

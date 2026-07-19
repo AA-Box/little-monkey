@@ -1446,7 +1446,7 @@ export const pt: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "Token de portador (opcional)",
   "AddMcpServerForm.tokenPlaceholder": "Cole um token de portador…",
   "AddMcpServerForm.tokenHelpText": "Armazenado no chaveiro do seu sistema operacional — nunca gravado em mcp_servers.json.",
-  "AddMcpServerForm.timeoutLabel": "Tempo limite em segundos (opcional, padrão 60)",
+  "AddMcpServerForm.timeoutLabel": "Tempo limite em segundos (opcional)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "Servidores stdio são executados como um processo filho na sua máquina; servidores HTTP se conectam a um endpoint remoto.",
   "AddMcpServerForm.addButton": "Adicionar servidor",

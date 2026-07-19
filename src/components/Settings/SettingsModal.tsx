@@ -178,7 +178,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
   const refreshProviders = useModelStore((s) => s.refreshProviders);
   const providers = useModelStore((s) => s.providers);
 
-  const [tab, setTab] = useState<SettingsTab>("local");
+  const [tab, setTab] = useState<SettingsTab>("appearance");
   const [query, setQuery] = useState("");
   const { t } = useT();
   const dialogRef = useRef<HTMLDivElement>(null);
