@@ -1047,14 +1047,6 @@ pub fn portable_export_bundle(
 }
 
 #[tauri::command]
-pub fn portable_preflight_bundle(path: String) -> Result<ImportPreflightReport, String> {
-    let bytes = read_bundle_bytes(Path::new(&path))?;
-    preflight_portable_bundle(&bytes, &ImportLimits::default())
-        .map(|(_, report)| report)
-        .map_err(command_error)
-}
-
-#[tauri::command]
 pub fn portable_read_bundle(path: String) -> Result<PortableReadOutcome, String> {
     read_outcome(&read_bundle_bytes(Path::new(&path))?)
 }
@@ -1796,11 +1788,6 @@ fn load_webdav_password(config: &WebDavBackupConfig) -> Result<String, String> {
         .map_err(|error| format!("Failed to read WebDAV password from keychain: {error}"))
 }
 
-#[tauri::command]
-pub fn portable_webdav_config_get(app: tauri::AppHandle) -> Result<WebDavBackupConfig, String> {
-    load_webdav_config(&app)
-}
-
 pub fn stage_webdav_snapshot_at(
     app_data: &Path,
     request: PortableBundleRequest,
@@ -2018,20 +2005,6 @@ async fn put_webdav(
         validate_etag(etag)?;
     }
     Ok((response.status(), etag))
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum WebDavUploadResponse {
-    Uploaded {
-        remote_path: String,
-        etag: String,
-    },
-    ConflictCopy {
-        remote_path: String,
-        etag: String,
-        conflicting_etag: Option<String>,
-    },
 }
 
 fn conflict_remote_path(
@@ -2625,91 +2598,6 @@ pub async fn portable_webdav_test(app: tauri::AppHandle) -> Result<(), String> {
         return Err(format!("WebDAV server returned HTTP {}", response.status()));
     }
     Ok(())
-}
-
-#[tauri::command]
-pub async fn portable_webdav_upload_snapshot(
-    app: tauri::AppHandle,
-    path: String,
-) -> Result<WebDavUploadResponse, String> {
-    let app_data = app.path().app_data_dir().map_err(command_error)?;
-    let mut claim = match acquire_backup_claim(
-        &app_data,
-        &format!("desktop-direct-upload-{}", Uuid::new_v4()),
-        now_ms()?,
-    )? {
-        BackupClaimOutcome::Busy(info) => {
-            return Err(format!(
-                "WebDAV backup is already active in {} until {}",
-                info.owner, info.expires_at_ms
-            ))
-        }
-        BackupClaimOutcome::Acquired(claim) => claim,
-    };
-    let mut config = validate_stored_config(load_webdav_config(&app)?)?;
-    if !config.enabled {
-        return Err("WebDAV backup is disabled".to_string());
-    }
-    let max = ImportLimits::default().max_archive_bytes.saturating_mul(2);
-    let bytes = read_regular_bounded(Path::new(&path), max)?;
-    let crypto = KeychainAes256Gcm::load_or_create()?;
-    open_encrypted_snapshot(&bytes, &ImportLimits::default(), &crypto).map_err(command_error)?;
-    let password = load_webdav_password(&config)?;
-    let client = webdav_client()?;
-    let timestamp = now_ms()?;
-    config.last_attempt_ms = Some(timestamp);
-    let (status, etag) = put_webdav(
-        &client,
-        &config,
-        &password,
-        &config.remote_path,
-        &bytes,
-        config.known_etag.as_deref(),
-    )
-    .await?;
-    let outcome = if status.is_success() {
-        let etag = etag.ok_or_else(|| {
-            "WebDAV upload succeeded without an ETag; safe conflict detection is unavailable"
-                .to_string()
-        })?;
-        config.known_etag = Some(etag.clone());
-        WebDavUploadResponse::Uploaded {
-            remote_path: config.remote_path.clone(),
-            etag,
-        }
-    } else if status == reqwest::StatusCode::PRECONDITION_FAILED {
-        let conflict =
-            conflict_remote_path(&config.remote_path, &config.device_id, timestamp, &bytes)?;
-        let (copy_status, copy_etag) =
-            put_webdav(&client, &config, &password, &conflict, &bytes, None).await?;
-        if !copy_status.is_success() {
-            return Err(format!(
-                "WebDAV conflict-copy upload returned HTTP {copy_status}"
-            ));
-        }
-        let copy_etag = copy_etag
-            .ok_or_else(|| "WebDAV conflict copy succeeded without an ETag".to_string())?;
-        WebDavUploadResponse::ConflictCopy {
-            remote_path: conflict,
-            etag: copy_etag,
-            conflicting_etag: etag,
-        }
-    } else {
-        return Err(format!("WebDAV upload returned HTTP {status}"));
-    };
-    config.last_success_ms = Some(timestamp);
-    config.next_due_ms =
-        Some(timestamp.saturating_add(config.interval_minutes.saturating_mul(60_000)));
-    config.last_uploaded_sha256 = Some(sha256_hex(&bytes));
-    config.last_uploaded_remote_path = Some(match &outcome {
-        WebDavUploadResponse::Uploaded { remote_path, .. }
-        | WebDavUploadResponse::ConflictCopy { remote_path, .. } => remote_path.clone(),
-    });
-    config.last_error = None;
-    config.consecutive_failures = 0;
-    save_config_file(&app, &config)?;
-    claim.release()?;
-    Ok(outcome)
 }
 
 #[derive(Clone, Debug, Serialize)]

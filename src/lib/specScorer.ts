@@ -24,6 +24,7 @@
  * concrete questions to answer first — see `IssueToPrPanel.tsx`.
  */
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 /** The six dimensions the roadmap item names verbatim, in the fixed order
  * the rubric prompt and the panel's breakdown list both render in. */
@@ -117,25 +118,12 @@ function clampScore(value: unknown): number | null {
  * string}` — extra prose, unparseable JSON, a missing dimension — returns
  * `null`. Fails closed exactly like `riskJudge.ts`'s `parseJudgeResponse`:
  * `null` means "no score available", never a fabricated/partial one. Tries
- * the raw trimmed content first, then falls back to the first `{...}` span
- * found in it (small local models sometimes wrap otherwise valid JSON in a
- * sentence or code fence).
+ * the raw trimmed content first, then complete embedded JSON objects (small
+ * local models sometimes wrap otherwise valid JSON in prose or a code fence).
  */
 export function parseSpecScoreResponse(content: string): SpecScore | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-
-    const rawDimensions = (parsed as { dimensions?: unknown }).dimensions;
+  for (const parsed of parseModelJsonCandidates(content, 'object')) {
+    const rawDimensions = parsed.dimensions;
     if (!rawDimensions || typeof rawDimensions !== 'object') continue;
 
     const dimensions = {} as Record<SpecDimension, number>;
@@ -150,7 +138,7 @@ export function parseSpecScoreResponse(content: string): SpecScore | null {
     }
     if (!allDimensionsValid) continue;
 
-    const rawMissingInfo = (parsed as { missingInfo?: unknown }).missingInfo;
+    const rawMissingInfo = parsed.missingInfo;
     const missingInfo = Array.isArray(rawMissingInfo)
       ? rawMissingInfo
           .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
@@ -158,7 +146,7 @@ export function parseSpecScoreResponse(content: string): SpecScore | null {
           .slice(0, MAX_MISSING_INFO_ITEMS)
       : [];
 
-    const rawSummary = (parsed as { summary?: unknown }).summary;
+    const rawSummary = parsed.summary;
     const summary = typeof rawSummary === 'string' ? rawSummary.trim() : '';
 
     const overall = Math.round(

@@ -63,10 +63,9 @@ function formatDate(ms: number): string {
 
 /**
  * Settings surface for Human Approval Chains (ROADMAP.md, Phase 3): shows
- * the built-in chain templates, lets the user run one as a manual test (the
- * reachable entry point for this stage — no other shipped feature calls
- * `run_approval_chain` yet, see `approval_chains.rs`'s module doc), and
- * displays the full audit history of past chain runs.
+ * the built-in chain templates, lets the user run one as a manual test, and
+ * displays the full audit history of past chain runs. Production workflow
+ * approvals use the same chain state machine.
  */
 export function ApprovalChainsPanel() {
   const { t } = useT();

@@ -90,6 +90,7 @@ describe("apiContractDiffStore", () => {
       changes: [],
       mocks: [],
       testStub: "",
+      contractTests: null,
       hasRun: false,
       diffError: null,
       drafting: false,
@@ -146,7 +147,7 @@ describe("apiContractDiffStore", () => {
     expect(useApiContractDiffStore.getState().changes).toHaveLength(0);
   });
 
-  it("runs a diff, generates mocks and a test stub once both specs are loaded", async () => {
+  it("runs a diff, generates mocks, and executes generated contract tests", async () => {
     dialogOpenMock.mockResolvedValueOnce("/Users/me/old.json").mockResolvedValueOnce("/Users/me/new.json");
     statMock.mockResolvedValue({ size: 10 });
     readTextFileMock.mockResolvedValueOnce(OLD_SPEC).mockResolvedValueOnce(NEW_SPEC);
@@ -160,6 +161,9 @@ describe("apiContractDiffStore", () => {
     expect(state.changes.some((c) => c.severity === "breaking")).toBe(true);
     expect(state.mocks.length).toBeGreaterThan(0);
     expect(state.testStub).toContain("vitest");
+    expect(state.testStub).not.toContain("TODO");
+    expect(state.contractTests?.results.length).toBeGreaterThan(0);
+    expect(state.contractTests?.clean).toBe(true);
     expect(state.hasRun).toBe(true);
   });
 
@@ -177,6 +181,7 @@ describe("apiContractDiffStore", () => {
     await useApiContractDiffStore.getState().loadFile("new");
 
     expect(useApiContractDiffStore.getState().changes).toHaveLength(0);
+    expect(useApiContractDiffStore.getState().contractTests).toBeNull();
   });
 
   it("refuses to draft impact notes without ever calling the model when there are no breaking changes", async () => {
@@ -236,5 +241,6 @@ describe("apiContractDiffStore", () => {
     expect(state.oldSpec).toBeNull();
     expect(state.newSpec).toBeNull();
     expect(state.changes).toHaveLength(0);
+    expect(state.contractTests).toBeNull();
   });
 });

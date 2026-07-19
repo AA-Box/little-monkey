@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const hi: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const hi: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "इस बिल्ड में कोई Slack कनेक्टर नहीं जोड़ा गया है — केवल मैन्युअल रूप से पेस्ट किए गए ट्रांसक्रिप्ट के लिए पर्सोना बनाता है।",
   "Onboarding.templateModelEvaluationName": "मॉडल मूल्यांकन",
   "Onboarding.templateModelEvaluationDescription": "आपके दिए गए प्रॉम्प्ट पर उम्मीदवार मॉडलों के आउटपुट की तुलना करता है।",
-  "Onboarding.templateModelEvaluationCaveat": "अभी तक कोई स्वचालित इवैल-सूट सिस्टम मौजूद नहीं है — केवल एक बार की मैन्युअल तुलनाओं के लिए पर्सोना बनाता है।",
+  "Onboarding.templateModelEvaluationCaveat": "तुलना के लिए पर्सोना बनाता है; स्वचालित रिग्रेशन सुइट और रिलीज़ गेट के लिए Workflow & Agent Test Harness का उपयोग करें।",
   "Onboarding.templateBrowserQaName": "ब्राउज़र QA",
   "Onboarding.templateBrowserQaDescription": "ब्राउज़र टूल का उपयोग करके किसी वेब फ़्लो से गुज़रता है और जो टूटा उसकी रिपोर्ट करता है।",
   "Onboarding.templateBrowserQaCaveat": "केवल पर्सोना बनाता है — रिकॉर्ड किए गए फ़्लो के लिए इसे Browser Workbench के साथ जोड़ें।",
@@ -1003,6 +1019,9 @@ export const hi: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "अटैच किया गया",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "पूर्वावलोकन",
+  "WorkspaceImage.loading": "इमेज लोड हो रही है…",
+  "WorkspaceImage.error": "इमेज उपलब्ध नहीं है: {{error}}",
+  "WorkspaceImage.generatedAlt": "जनरेट की गई इमेज",
   "MessageList.argumentsLabel": "आर्गुमेंट्स",
   "MessageList.resultLabel": "परिणाम",
   "MessageList.regenerateButton": "फिर से बनाएँ",

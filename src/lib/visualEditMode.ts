@@ -29,6 +29,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { resolveTarget } from './agentLoop';
 import { attemptStream } from './turnEngine';
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 /** The user-selected element, in the same shape `browserVerification.ts`'s
  * `BrowserAnnotation` already carries — callers pass `annotation.selector`,
@@ -206,30 +207,16 @@ export interface RawVisualEditProposal {
   summary: string;
 }
 
-/** Parses the model's response, tolerating an accidental ```json fence
- * despite the system prompt's instructions not to use one — matches the
- * lenient-but-still-strict-JSON posture other single-shot parsers in this
- * codebase (e.g. `riskJudge.ts`'s `parseJudgeResponse`) already use. */
+/** Parses the model response through the shared bounded, string-aware JSON
+ * extractor, then applies this feature's own strict schema validation. */
 export function parseProposalResponse(raw: string): RawVisualEditProposal | null {
-  const trimmed = raw.trim();
-  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const jsonText = fencedMatch ? fencedMatch[1].trim() : trimmed;
-
-  const start = jsonText.indexOf('{');
-  const end = jsonText.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-
-  try {
-    const parsed: unknown = JSON.parse(jsonText.slice(start, end + 1));
-    if (typeof parsed !== 'object' || parsed === null) return null;
-    const obj = parsed as Record<string, unknown>;
+  for (const obj of parseModelJsonCandidates(raw, 'object')) {
     const targetFile = typeof obj.targetFile === 'string' ? obj.targetFile : null;
     const newContent = typeof obj.newContent === 'string' ? obj.newContent : null;
     const summary = typeof obj.summary === 'string' ? obj.summary : '';
     return { targetFile, newContent, summary };
-  } catch {
-    return null;
   }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

@@ -489,5 +489,6 @@ describe("runSecurityAutofixAgent", () => {
 
     expect(result).toEqual({ outcome: "completed", summary: "Done.", durableRunId: null });
     expect(mocks.executeToolCall).toHaveBeenCalledTimes(1);
+    expect(mocks.executeToolCall.mock.calls[0][8]).toBe("security-autofix");
   });
 });

@@ -63,6 +63,7 @@ import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import { useLocalAppsStore } from "../../store/localAppsStore";
 import MessageBubble from "./MessageBubble";
+import GeneratedImageCard from "./GeneratedImageCard";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
@@ -92,11 +93,14 @@ export interface MessageListProps {
    * the affordance (e.g. inside a subagent's own mini-transcript, which
    * never renders through this list at all). */
   onStartSideTask?: (index: number) => void;
+  /** Prepares a generated PNG as an image attachment in the composer so the
+   * user can describe an edit before sending another turn. */
+  onEditGeneratedImage?: (path: string, prompt: string, artifactId?: string) => void | Promise<void>;
 }
 
 type TimelineItem =
   | { kind: "bubble"; key: string; message: ChatMessage; index: number }
-  | { kind: "tool"; key: string; name: string; args: string; result?: string }
+  | { kind: "tool"; key: string; name: string; args: string; result?: string; prompt: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
   | { kind: "notice"; key: string; text: string }
@@ -131,10 +135,12 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
 
   const renderedCallIds = new Set<string>();
   const items: TimelineItem[] = [];
+  let latestUserPrompt = "";
 
   messages.forEach((msg, index) => {
     const messageIndex = index + messageIndexOffset;
     if (msg.role === "user") {
+      latestUserPrompt = textContent(msg.content);
       items.push({ kind: "bubble", key: `msg-${messageIndex}`, message: msg, index: messageIndex });
       return;
     }
@@ -193,6 +199,7 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
           name: toolCall.function.name,
           args: toolCall.function.arguments,
           result: resultByCallId.get(toolCall.id),
+          prompt: latestUserPrompt,
         });
       }
       return;
@@ -208,6 +215,7 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         name: "tool",
         args: "",
         result: textContent(msg.content),
+        prompt: latestUserPrompt,
       });
     }
 
@@ -322,6 +330,22 @@ function toolIcon(name: string): LucideIcon {
   // since the server/tool half varies, so it's matched by prefix instead.
   if (name.startsWith("mcp__")) return Plug;
   return TOOL_ICONS[name] ?? Wrench;
+}
+
+/** Extracts a tool call's suggested filename for the `generate_image`
+ * inline preview — same defensive shape as `agentLoop.ts`'s
+ * `toolCallPathArg`, kept as its own tiny copy for the same reason
+ * `resultLooksLikeError` is (a one-line structural check isn't worth
+ * coupling the modules over). */
+function argsImageFilename(args: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(args || "{}");
+    const value = parsed as { filename?: unknown; path?: unknown } | null;
+    const filename = typeof value?.filename === "string" ? value.filename : value?.path;
+    return typeof filename === "string" && filename.trim() ? filename : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Memoized like `MessageBubble`: props are plain strings (stable for every
@@ -936,6 +960,7 @@ export default function MessageList({
   onRetry,
   messageIndexOffset = 0,
   onStartSideTask,
+  onEditGeneratedImage,
 }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -994,6 +1019,21 @@ export default function MessageList({
               );
             }
             if (item.kind === "tool") {
+              if (item.name === "generate_image") {
+                const path = argsImageFilename(item.args);
+                if (path) {
+                  return (
+                    <GeneratedImageCard
+                      key={item.key}
+                      path={path}
+                      prompt={item.prompt}
+                      result={item.result}
+                      failed={item.result !== undefined && resultLooksLikeError(item.result)}
+                      onEdit={onEditGeneratedImage}
+                    />
+                  );
+                }
+              }
               return <ToolCallRow key={item.key} name={item.name} args={item.args} result={item.result} />;
             }
             if (item.kind === "subagent") {
