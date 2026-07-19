@@ -13,7 +13,12 @@ import {
 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
-import { validateServerSpec, type McpParamType, type McpSourceKind } from "../../lib/mcpGenerator";
+import {
+  validateServerSpec,
+  type GeneratedArtifactProbeReport,
+  type McpParamType,
+  type McpSourceKind,
+} from "../../lib/mcpGenerator";
 import { useMcpGeneratorStore } from "../../store/mcpGeneratorStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 
@@ -254,7 +259,7 @@ export function McpGeneratorPanel({ onClose }: McpGeneratorPanelProps) {
                   >
                     <div className="flex items-center justify-between gap-2">
                       <p className="truncate text-xs font-medium text-foreground">{entry.spec.name}</p>
-                      {readyPill(entry.ready, entry.simulation !== null, t)}
+                      {readyPill(entry.ready, entry.simulation !== null, entry.artifactProbe)}
                     </div>
                     <p className="mt-0.5 truncate text-[11px] text-muted">
                       {t("McpGenerator.toolCount", { count: entry.spec.tools.length })}
@@ -277,14 +282,17 @@ export function McpGeneratorPanel({ onClose }: McpGeneratorPanelProps) {
                   <h3 className="text-sm font-semibold text-foreground">{selected.spec.name}</h3>
                   <p className="mt-1 text-[11px] text-muted">{selected.spec.description}</p>
                 </div>
-                {readyPill(selected.ready, selected.simulation !== null, t)}
+                {readyPill(selected.ready, selected.simulation !== null, selected.artifactProbe)}
               </div>
 
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button
                   size="sm"
                   disabled={store.simulating}
-                  onClick={() => store.runSimulator(selected.id)}
+                  onClick={() => {
+                    setLocalError(null);
+                    void store.runSimulator(selected.id).catch((error) => setLocalError(errorText(error)));
+                  }}
                 >
                   {store.simulating ? <Loader2 className="animate-spin" size={13} /> : <FlaskConical size={13} />}
                   {t("McpGenerator.runSimulatorButton")}
@@ -318,6 +326,23 @@ export function McpGeneratorPanel({ onClose }: McpGeneratorPanelProps) {
                   <AlertTriangle size={13} className="mt-0.5 shrink-0" />
                   {t("McpGenerator.notSimulatorCleanWarning")}
                 </p>
+              )}
+
+              {selected.artifactProbe && (
+                <div
+                  className={`mt-2 rounded-md border p-2.5 text-[11px] ${
+                    selected.artifactProbe.clean
+                      ? "border-success/40 bg-success-soft text-success"
+                      : "border-danger/40 bg-danger/10 text-danger"
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 font-medium">
+                    {selected.artifactProbe.clean ? <CheckCircle2 size={13} /> : <XCircle size={13} />}
+                    Generated artifact: {selected.artifactProbe.typechecked ? "typechecked" : "typecheck failed"}
+                    {selected.artifactProbe.executed ? ` · executed ${selected.artifactProbe.probedToolCount} tool(s)` : " · runtime probe failed"}
+                  </div>
+                  <p className="mt-1 whitespace-pre-wrap opacity-90">{selected.artifactProbe.summary}</p>
+                </div>
               )}
               {!selected.simulation && (
                 <p className="mt-2 flex items-start gap-1.5 rounded-md border border-warning/40 bg-warning/5 p-2.5 text-[11px] text-warning">
@@ -390,13 +415,15 @@ export function McpGeneratorPanel({ onClose }: McpGeneratorPanelProps) {
   );
 }
 
-function readyPill(ready: boolean, simulated: boolean, t: (key: string) => string) {
-  const tone: PillTone = ready ? "success" : simulated ? "danger" : "warning";
+function readyPill(ready: boolean, simulated: boolean, artifactProbe: GeneratedArtifactProbeReport | null) {
+  const tone: PillTone = ready ? "success" : simulated || artifactProbe ? "danger" : "warning";
   const label = ready
-    ? t("McpGenerator.statusReady")
-    : simulated
-      ? t("McpGenerator.statusNotClean")
-      : t("McpGenerator.statusNotSimulated");
+    ? "Ready"
+    : artifactProbe && !artifactProbe.clean
+      ? "Artifact failed"
+      : simulated
+        ? "Verification incomplete"
+        : "Not verified";
   return <StatusPill tone={tone}>{label}</StatusPill>;
 }
 

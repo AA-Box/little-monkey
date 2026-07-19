@@ -80,7 +80,7 @@ export const onboardingLocale: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "No Slack connector is wired in this build — seeds a persona for pasted-in transcripts only.",
   "Onboarding.templateModelEvaluationName": "Model evaluation",
   "Onboarding.templateModelEvaluationDescription": "Compares candidate model outputs on a prompt you provide.",
-  "Onboarding.templateModelEvaluationCaveat": "No automated eval-suite system ships yet — seeds a persona for one-off manual comparisons only.",
+  "Onboarding.templateModelEvaluationCaveat": "Seeds a comparison persona; use Workflow & Agent Test Harness for automated regression suites and release gates.",
   "Onboarding.templateBrowserQaName": "Browser QA",
   "Onboarding.templateBrowserQaDescription": "Walks through a web flow using the browser tools and reports what broke.",
   "Onboarding.templateBrowserQaCaveat": "Seeds a persona only — pair it with the Browser Workbench for recorded flows.",

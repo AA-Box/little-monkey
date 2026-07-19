@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const pt: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const pt: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "Esta versão não tem um conector do Slack integrado — cria apenas uma persona para transcrições coladas manualmente.",
   "Onboarding.templateModelEvaluationName": "Avaliação de modelos",
   "Onboarding.templateModelEvaluationDescription": "Compara as respostas de modelos candidatos para um prompt que você fornecer.",
-  "Onboarding.templateModelEvaluationCaveat": "Ainda não existe um sistema automatizado de suítes de avaliação — cria apenas uma persona para comparações manuais pontuais.",
+  "Onboarding.templateModelEvaluationCaveat": "Cria uma persona de comparação; use o Workflow & Agent Test Harness para suítes de regressão automatizadas e gates de lançamento.",
   "Onboarding.templateBrowserQaName": "QA de navegador",
   "Onboarding.templateBrowserQaDescription": "Percorre um fluxo web usando as ferramentas do navegador e relata o que quebrou.",
   "Onboarding.templateBrowserQaCaveat": "Cria apenas uma persona — combine-a com o Browser Workbench para fluxos gravados.",
@@ -1004,6 +1020,9 @@ export const pt: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Anexado",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Visualização",
+  "WorkspaceImage.loading": "Carregando imagem…",
+  "WorkspaceImage.error": "Imagem indisponível: {{error}}",
+  "WorkspaceImage.generatedAlt": "Imagem gerada",
   "MessageList.argumentsLabel": "Argumentos",
   "MessageList.resultLabel": "Resultado",
   "MessageList.regenerateButton": "Regenerar",

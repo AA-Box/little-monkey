@@ -7,6 +7,7 @@ import {
   buildChatApprovalInboxItems,
   buildRunInboxItem,
   buildRunInboxItems,
+  buildSideTaskInboxItem,
   buildSideTaskInboxItems,
   connectorIdFromToolName,
   costBucketOf,
@@ -16,6 +17,7 @@ import {
   mergeInboxItems,
   needsApprovalCount,
   runStatusToInboxStatus,
+  sideTaskStatusToInboxStatus,
   sortInboxItems,
   EMPTY_INBOX_FILTERS,
   type InboxItem,
@@ -32,6 +34,7 @@ import type {
 } from "./runProtocol";
 import type { AutomationEntry } from "../store/automationsStore";
 import type { PermissionRequest } from "../store/permissionStore";
+import type { SideTaskRecord, SideTaskStatus } from "../store/sideTaskStore";
 
 const CAPABILITY_UNKNOWN = { state: "unknown" as const, evidence: "n/a" };
 const CAPABILITIES: ModelCapabilitiesSnapshotWire = {
@@ -191,11 +194,11 @@ describe("deriveRunEnrichment", () => {
     const events: RunEventEnvelopeWire[] = [
       envelope({ type: "tool_proposed", payload: { tool_call_id: "t1", tool_name: "mcp__github__search_issues", arguments: { value: {}, redaction: "not_needed" }, arguments_sha256: "abc", mutation: false } }),
       envelope({ type: "tool_started", payload: { tool_call_id: "t1" } }),
-      envelope({ type: "tool_finished", payload: { tool_call_id: "t1", outcome: "succeeded", output_excerpt: null, output_sha256: "def", duration_ms: 120 } }),
+      envelope({ type: "tool_finished", payload: { tool_call_id: "t1", outcome: "succeeded", output_excerpt: "two matching issues", output_sha256: "def", duration_ms: 120 } }),
     ];
     const enrichment = deriveRunEnrichment(events, ["github"]);
     expect(enrichment.toolCalls).toHaveLength(1);
-    expect(enrichment.toolCalls[0]).toMatchObject({ toolCallId: "t1", started: true, outcome: "succeeded", durationMs: 120, connectorId: "github" });
+    expect(enrichment.toolCalls[0]).toMatchObject({ toolCallId: "t1", started: true, outcome: "succeeded", outputExcerpt: "two matching issues", durationMs: 120, connectorId: "github" });
     expect(enrichment.connectors).toEqual(["github"]);
   });
 
@@ -363,9 +366,69 @@ describe("buildChatApprovalInboxItem / buildChatApprovalInboxItems", () => {
   });
 });
 
-describe("buildSideTaskInboxItems", () => {
-  it("is an empty plug-in slot until the Side Tasks store exists", () => {
-    expect(buildSideTaskInboxItems()).toEqual([]);
+function makeSideTask(status: SideTaskStatus, overrides: Partial<SideTaskRecord> = {}): SideTaskRecord {
+  return {
+    id: `task-${status}`,
+    turnId: `turn-${status}`,
+    retryOf: null,
+    title: "Investigate auth",
+    prompt: "Investigate auth",
+    profile: "explore",
+    status,
+    source: { kind: "terminal_output", label: "Terminal evidence · app", excerpt: "failure" },
+    sessionId: "session-1",
+    modelLabel: "local · qwen",
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    startedAt: status === "queued" ? null : 1_100,
+    finishedAt: ["completed", "error", "cancelled"].includes(status) ? 2_000 : null,
+    messages: [{ role: "user", content: "Investigate auth" }],
+    toolEvidence: [],
+    artifacts: [],
+    usage: null,
+    error: status === "error" ? "failed" : null,
+    finalReport: status === "completed" ? "done" : null,
+    promotedAt: null,
+    archivedAt: null,
+    ...overrides,
+  };
+}
+
+describe("buildSideTaskInboxItem / buildSideTaskInboxItems", () => {
+  it("maps every live side-task status and lets archive override it", () => {
+    const cases: Array<[SideTaskStatus, InboxItem["status"]]> = [
+      ["queued", "waiting"],
+      ["running", "active"],
+      ["paused", "waiting"],
+      ["completed", "completed"],
+      ["error", "failed"],
+      ["cancelled", "cancelled"],
+    ];
+    for (const [status, expected] of cases) {
+      expect(sideTaskStatusToInboxStatus(makeSideTask(status))).toBe(expected);
+    }
+    expect(sideTaskStatusToInboxStatus(makeSideTask("completed", { archivedAt: 3_000 }))).toBe("archived");
+  });
+
+  it("preserves source, model, identity, timestamps, and archive state", () => {
+    const task = makeSideTask("completed", { archivedAt: 3_000 });
+    const item = buildSideTaskInboxItem(task);
+    expect(item).toMatchObject({
+      id: "side-task:task-completed",
+      sideTaskId: "task-completed",
+      sourceKind: "side_task",
+      sourceTrigger: "terminal_output",
+      status: "archived",
+      model: "local · qwen",
+      createdAtMs: 1_000,
+      updatedAtMs: 2_000,
+      archivedAtMs: 3_000,
+    });
+  });
+
+  it("maps a whole store snapshot without losing insertion order", () => {
+    const tasks = [makeSideTask("running"), makeSideTask("error")];
+    expect(buildSideTaskInboxItems(tasks).map((item) => item.sideTaskId)).toEqual(["task-running", "task-error"]);
   });
 });
 
@@ -375,7 +438,7 @@ describe("mergeInboxItems / sortInboxItems", () => {
       id, sourceKind: "run", status, title: id, subtitle: "", createdAtMs: updatedAtMs, updatedAtMs,
       workspaceId: null, workspaceLabel: null, sourceTrigger: "interactive", submittedBy: "desktop",
       model: null, connectors: null, costMicros: null, riskLevel: null, needsApproval: false,
-      runId: id, automationEntryId: null, approvalRequestId: null, archivedAtMs: null, daemonManaged: false, nextRunAtMs: null,
+      runId: id, automationEntryId: null, approvalRequestId: null, sideTaskId: null, archivedAtMs: null, daemonManaged: false, nextRunAtMs: null,
     });
     const items = mergeInboxItems(
       [base("completed-old", "completed", 100), base("archived", "archived", 900)],
@@ -394,7 +457,7 @@ describe("mergeInboxItems / sortInboxItems", () => {
       id, sourceKind: "run", status: "active", title: id, subtitle: "", createdAtMs: updatedAtMs, updatedAtMs,
       workspaceId: null, workspaceLabel: null, sourceTrigger: "interactive", submittedBy: "desktop",
       model: null, connectors: null, costMicros: null, riskLevel: null, needsApproval: false,
-      runId: id, automationEntryId: null, approvalRequestId: null, archivedAtMs: null, daemonManaged: false, nextRunAtMs: null,
+      runId: id, automationEntryId: null, approvalRequestId: null, sideTaskId: null, archivedAtMs: null, daemonManaged: false, nextRunAtMs: null,
     });
     const sorted = sortInboxItems([base("older", 100), base("newer", 200)]);
     expect(sorted.map((i) => i.id)).toEqual(["newer", "older"]);

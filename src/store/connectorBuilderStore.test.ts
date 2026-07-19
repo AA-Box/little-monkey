@@ -26,8 +26,7 @@ vi.mock("@tauri-apps/plugin-fs", () => ({
   stat: (...args: unknown[]) => statMock(...args),
 }));
 
-import { useConnectorBuilderStore } from "./connectorBuilderStore";
-import { useMcpStore } from "./mcpStore";
+import { CONNECTOR_BRIDGE_REQUIRED, useConnectorBuilderStore } from "./connectorBuilderStore";
 
 const VALID_SPEC = JSON.stringify({
   openapi: "3.0.0",
@@ -56,11 +55,11 @@ function resetState() {
     simulation: null,
     simulating: false,
     ready: false,
+    availabilityBlockReason: null,
     registering: false,
     registeredServerId: null,
     error: null,
   });
-  useMcpStore.setState({ servers: [] });
 }
 
 beforeEach(() => {
@@ -119,84 +118,32 @@ describe("connectorBuilderStore.generate", () => {
   });
 });
 
-describe("connectorBuilderStore.runSimulator + registerWithMcp gating", () => {
-  it("gates ready strictly on simulation.clean, and blocks registration until then", async () => {
+describe("connectorBuilderStore.runSimulator + registration gating", () => {
+  it("keeps availability blocked after a clean spec simulation because no executable bridge exists", async () => {
     useConnectorBuilderStore.getState().setSpecText(VALID_SPEC);
     resolveTargetMock.mockResolvedValue({ kind: "local" });
     attemptStreamMock.mockResolvedValue({ content: "summary", toolCalls: [], streamError: null });
     await useConnectorBuilderStore.getState().generate();
 
     expect(useConnectorBuilderStore.getState().ready).toBe(false);
-    await expect(useConnectorBuilderStore.getState().registerWithMcp()).rejects.toThrow(/simulator/i);
+    await expect(useConnectorBuilderStore.getState().registerWithMcp()).rejects.toThrow(/REST API, not an MCP server/i);
     expect(invokeMock).not.toHaveBeenCalled();
 
     useConnectorBuilderStore.getState().runSimulator();
     const afterSim = useConnectorBuilderStore.getState();
     expect(afterSim.simulation?.clean).toBe(true);
-    expect(afterSim.ready).toBe(true);
+    expect(afterSim.ready).toBe(false);
+    expect(afterSim.availabilityBlockReason).toBe(CONNECTOR_BRIDGE_REQUIRED);
   });
 
-  it("registers a clean connector via the existing mcpStore.addServer path", async () => {
+  it("never registers a bare REST base URL as an MCP HTTP server", async () => {
     useConnectorBuilderStore.getState().setSpecText(VALID_SPEC);
     attemptStreamMock.mockResolvedValue({ content: "summary", toolCalls: [], streamError: null });
     await useConnectorBuilderStore.getState().generate();
     useConnectorBuilderStore.getState().runSimulator();
-    expect(useConnectorBuilderStore.getState().ready).toBe(true);
-
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "mcp_add_server") return Promise.resolve();
-      if (cmd === "mcp_list_servers") return Promise.resolve([]);
-      return Promise.resolve();
-    });
-
-    const id = await useConnectorBuilderStore.getState().registerWithMcp();
-
-    expect(id).toBe("widgets-api");
-    expect(invokeMock).toHaveBeenCalledWith(
-      "mcp_add_server",
-      expect.objectContaining({
-        entry: expect.objectContaining({
-          id: "widgets-api",
-          transport: { type: "http", url: "https://api.widgets.example.com" },
-          enabled: true,
-        }),
-      }),
-    );
-    expect(useConnectorBuilderStore.getState().registeredServerId).toBe("widgets-api");
-  });
-
-  it("de-dupes the registered id against already-configured servers", async () => {
-    useMcpStore.setState({
-      servers: [
-        {
-          id: "widgets-api",
-          label: "existing",
-          transport: { type: "http", url: "https://existing.example.com" },
-          enabled: true,
-          toolAllowlist: null,
-          timeoutSecs: null,
-          status: "disconnected",
-          error: null,
-          tools: [],
-          instructions: null,
-          hasHttpToken: false,
-          hasOauth: false,
-        },
-      ],
-    });
-    useConnectorBuilderStore.getState().setSpecText(VALID_SPEC);
-    attemptStreamMock.mockResolvedValue({ content: "summary", toolCalls: [], streamError: null });
-    await useConnectorBuilderStore.getState().generate();
-    useConnectorBuilderStore.getState().runSimulator();
-
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "mcp_add_server") return Promise.resolve();
-      if (cmd === "mcp_list_servers") return Promise.resolve([]);
-      return Promise.resolve();
-    });
-
-    const id = await useConnectorBuilderStore.getState().registerWithMcp();
-    expect(id).toBe("widgets-api-2");
+    await expect(useConnectorBuilderStore.getState().registerWithMcp()).rejects.toThrow(/REST API, not an MCP server/i);
+    expect(invokeMock).not.toHaveBeenCalledWith("mcp_add_server", expect.anything());
+    expect(useConnectorBuilderStore.getState().registeredServerId).toBeNull();
   });
 });
 
@@ -250,6 +197,7 @@ describe("connectorBuilderStore.reset", () => {
     expect(state.definition).toBeNull();
     expect(state.simulation).toBeNull();
     expect(state.ready).toBe(false);
+    expect(state.availabilityBlockReason).toBeNull();
     expect(state.registeredServerId).toBeNull();
   });
 });

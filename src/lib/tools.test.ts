@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTools, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, toolsForProfile, TOOLS } from "./tools";
+import { buildTools, GENERATE_IMAGE_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, toolsForProfile, TOOLS } from "./tools";
 
 describe("buildTools", () => {
   it("returns the base TOOLS list unchanged when no stacks are attached", () => {
@@ -70,6 +70,30 @@ describe("toolsForProfile", () => {
       "run_shell",
       "write_file",
     ]);
+  });
+});
+
+describe("GENERATE_IMAGE_TOOL", () => {
+  it("is kept out of the base TOOLS array (appended by agentLoop.ts's runAgentTurnBody — see its doc comment on the wire-shape/monkey-cli asymmetry)", () => {
+    expect(TOOLS).not.toContain(GENERATE_IMAGE_TOOL);
+    expect(TOOLS.some((tool) => tool.function.name === "generate_image")).toBe(false);
+  });
+
+  it("is never offered to subagent profiles", () => {
+    for (const profile of ["explore", "code"] as const) {
+      expect(toolsForProfile(profile).some((tool) => tool.function.name === "generate_image")).toBe(false);
+    }
+  });
+
+  it("requires both a suggested filename and svg", () => {
+    const params = GENERATE_IMAGE_TOOL.function.parameters as { required: string[] };
+    expect(params.required).toEqual(["filename", "svg"]);
+  });
+
+  it("tells the model that filenames are timestamped automatically", () => {
+    const description = GENERATE_IMAGE_TOOL.function.description.toLowerCase();
+    expect(description).toContain("timestamp");
+    expect(description).toContain("never retry");
   });
 });
 

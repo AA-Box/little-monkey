@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const ko: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const ko: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "이 빌드에는 Slack 커넥터가 연결되어 있지 않습니다. 직접 붙여넣은 대화 기록용 페르소나만 생성됩니다.",
   "Onboarding.templateModelEvaluationName": "모델 평가",
   "Onboarding.templateModelEvaluationDescription": "제공한 프롬프트에 대해 후보 모델들의 출력을 비교합니다.",
-  "Onboarding.templateModelEvaluationCaveat": "자동화된 평가 스위트 시스템은 아직 제공되지 않습니다. 일회성 수동 비교용 페르소나만 생성됩니다.",
+  "Onboarding.templateModelEvaluationCaveat": "비교용 페르소나를 만듭니다. 자동 회귀 스위트와 릴리스 게이트에는 Workflow & Agent Test Harness를 사용하세요.",
   "Onboarding.templateBrowserQaName": "브라우저 QA",
   "Onboarding.templateBrowserQaDescription": "브라우저 도구를 사용해 웹 플로를 단계별로 진행하며 무엇이 깨졌는지 보고합니다.",
   "Onboarding.templateBrowserQaCaveat": "페르소나만 생성됩니다. 녹화된 플로에는 Browser Workbench와 함께 사용하세요.",
@@ -1003,6 +1019,9 @@ export const ko: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "첨부됨",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "미리보기",
+  "WorkspaceImage.loading": "이미지 로드 중…",
+  "WorkspaceImage.error": "이미지를 사용할 수 없습니다: {{error}}",
+  "WorkspaceImage.generatedAlt": "생성된 이미지",
   "MessageList.argumentsLabel": "인수",
   "MessageList.resultLabel": "결과",
   "MessageList.regenerateButton": "다시 생성",

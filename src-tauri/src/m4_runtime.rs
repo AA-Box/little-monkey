@@ -800,6 +800,7 @@ impl WorkflowHumanApprovalBroker for InMemoryWorkflowApprovalBroker {
         run_id: &str,
         node_id: &str,
         approval_policy_id: &str,
+        summary: &str,
         summary_sha256: &str,
     ) -> Result<WorkflowHumanApprovalChallenge, String> {
         let now = system_now_unix_ms();
@@ -828,6 +829,7 @@ impl WorkflowHumanApprovalBroker for InMemoryWorkflowApprovalBroker {
             run_id: run_id.to_string(),
             node_id: node_id.to_string(),
             approval_policy_id: approval_policy_id.to_string(),
+            summary: summary.to_string(),
             summary_sha256: summary_sha256.to_string(),
         };
         records.insert(
@@ -839,6 +841,13 @@ impl WorkflowHumanApprovalBroker for InMemoryWorkflowApprovalBroker {
             },
         );
         Ok(challenge)
+    }
+
+    fn get(&self, challenge_id: &str) -> Result<Option<WorkflowHumanApprovalChallenge>, String> {
+        let now = system_now_unix_ms();
+        let mut records = lock(&self.records, "workflow approval broker")?;
+        Self::purge_expired(&mut records, now);
+        Ok(records.get(challenge_id).map(|record| record.challenge.clone()))
     }
 
     fn decide(&self, challenge_id: &str, approved: bool) -> Result<(), String> {
@@ -2565,9 +2574,16 @@ mod tests {
                 "run-1",
                 "approval-1",
                 "explicit-user",
+                "Allow mutation?",
                 &sha256_hex(b"Allow mutation?"),
             )
             .expect("prepare workflow approval");
+        let loaded = broker
+            .get(&first.challenge_id)
+            .expect("read workflow approval")
+            .expect("workflow approval exists");
+        assert_eq!(loaded.summary, "Allow mutation?");
+        assert_eq!(loaded.summary_sha256, sha256_hex(b"Allow mutation?"));
         broker
             .decide(&first.challenge_id, false)
             .expect("deny workflow approval");
@@ -2577,6 +2593,7 @@ mod tests {
                 "run-1",
                 "approval-1",
                 "explicit-user",
+                "Allow mutation?",
                 &sha256_hex(b"Allow mutation?"),
             )
             .is_ok());

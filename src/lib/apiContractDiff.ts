@@ -647,8 +647,8 @@ export function diffApiDocuments(oldDoc: ApiDocument, newDoc: ApiDocument): ApiC
   return changes;
 }
 
-export function isReleaseReady(changes: ApiChange[]): boolean {
-  return changes.every((change) => change.severity !== 'breaking');
+export function isReleaseReady(changes: ApiChange[], contractTests?: ContractTestReport | null): boolean {
+  return Boolean(contractTests?.clean) && changes.every((change) => change.severity !== 'breaking');
 }
 
 export function breakingChangeCount(changes: ApiChange[]): number {
@@ -721,65 +721,181 @@ export function generateMockResponses(doc: ApiDocument): MockExample[] {
 }
 
 // ---------------------------------------------------------------------------
-// Contract-test-stub generation
+// Executable generated contract tests
 // ---------------------------------------------------------------------------
 
-function requiredFieldNames(schema: ApiSchema | undefined, schemas: Record<string, ApiSchema>): string[] {
+export type ContractTestKind = 'request' | 'response';
+
+export interface ContractTestResult {
+  id: string;
+  label: string;
+  kind: ContractTestKind;
+  passed: boolean;
+  errors: string[];
+}
+
+export interface ContractTestReport {
+  generatedAt: number;
+  results: ContractTestResult[];
+  passCount: number;
+  failCount: number;
+  /** Empty suites are not evidence and therefore never count as clean. */
+  clean: boolean;
+}
+
+interface GeneratedContractCase {
+  id: string;
+  label: string;
+  kind: ContractTestKind;
+  schema: ApiSchema;
+  sample: JsonValue;
+}
+
+function generatedContractCases(doc: ApiDocument): GeneratedContractCase[] {
+  const cases: GeneratedContractCase[] = [];
+  for (const operation of doc.operations) {
+    const operationLabel = `${operation.method} ${operation.path}`;
+    if (operation.requestBodySchema) {
+      cases.push({
+        id: `${operationLabel}:request`,
+        label: `${operationLabel} request body`,
+        kind: 'request',
+        schema: operation.requestBodySchema,
+        sample: generateMockValue(operation.requestBodySchema, doc.schemas),
+      });
+    }
+    for (const response of operation.responses) {
+      if (!response.schema) continue;
+      cases.push({
+        id: `${operationLabel}:response:${response.status}`,
+        label: `${operationLabel} response ${response.status}`,
+        kind: 'response',
+        schema: response.schema,
+        sample: generateMockValue(response.schema, doc.schemas),
+      });
+    }
+  }
+  return cases;
+}
+
+/** Recursively executes the JSON-schema subset supported by this lab against
+ * a concrete value. This is shared by the in-app run and mirrored in the
+ * exported Vitest artifact, so readiness comes from executed cases rather
+ * than a mutable checkbox or unfilled TODO. */
+export function validateContractValue(
+  value: JsonValue,
+  schema: ApiSchema | undefined,
+  schemas: Record<string, ApiSchema>,
+  path = '$',
+  depth = 0,
+): string[] {
+  if (depth > 12) return [`${path}: schema recursion exceeded the safety limit.`];
   const resolved = resolveSchema(schema, schemas);
-  if (!resolved?.required) return [];
-  return resolved.required;
+  if (!resolved) return [];
+  if (value === null) return resolved.nullable ? [] : [`${path}: expected ${resolved.type ?? 'a value'}, got null.`];
+  if (resolved.enum && !resolved.enum.some((candidate) => Object.is(candidate, value))) {
+    return [`${path}: value is not one of the declared enum members.`];
+  }
+  if (resolved.type === 'string' && typeof value !== 'string') return [`${path}: expected string.`];
+  if (resolved.type === 'integer' && (typeof value !== 'number' || !Number.isInteger(value))) return [`${path}: expected integer.`];
+  if (resolved.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) return [`${path}: expected finite number.`];
+  if (resolved.type === 'boolean' && typeof value !== 'boolean') return [`${path}: expected boolean.`];
+  if (resolved.type === 'array' || resolved.items) {
+    if (!Array.isArray(value)) return [`${path}: expected array.`];
+    return value.flatMap((item, index) => validateContractValue(item, resolved.items, schemas, `${path}[${index}]`, depth + 1));
+  }
+  if (resolved.type === 'object' || resolved.properties) {
+    if (!isPlainObject(value)) return [`${path}: expected object.`];
+    const errors: string[] = [];
+    for (const field of resolved.required ?? []) {
+      if (!Object.prototype.hasOwnProperty.call(value, field)) errors.push(`${path}.${field}: required field is missing.`);
+    }
+    for (const [field, childSchema] of Object.entries(resolved.properties ?? {})) {
+      if (Object.prototype.hasOwnProperty.call(value, field)) {
+        errors.push(...validateContractValue(value[field], childSchema, schemas, `${path}.${field}`, depth + 1));
+      }
+    }
+    return errors;
+  }
+  return [];
+}
+
+export function runGeneratedContractTests(doc: ApiDocument): ContractTestReport {
+  const results = generatedContractCases(doc).map((testCase): ContractTestResult => {
+    const errors = validateContractValue(testCase.sample, testCase.schema, doc.schemas);
+    return { id: testCase.id, label: testCase.label, kind: testCase.kind, passed: errors.length === 0, errors };
+  });
+  const passCount = results.filter((result) => result.passed).length;
+  const failCount = results.length - passCount;
+  return {
+    generatedAt: Date.now(),
+    results,
+    passCount,
+    failCount,
+    clean: results.length > 0 && failCount === 0,
+  };
 }
 
 /**
- * Renders a single vitest test-file skeleton (this repo's own test style —
- * `describe`/`it`/`expect`) asserting that the NEW document's required
- * request/response fields are present on a payload the caller supplies —
- * a starting skeleton for a real contract test, not a runnable end-to-end
- * check against a live server.
+ * Renders a complete, runnable Vitest artifact with concrete generated
+ * request/response examples. It contains no TODO payloads: every case calls
+ * an embedded recursive validator and fails when its example violates the
+ * new contract.
  */
 export function generateContractTestStub(doc: ApiDocument): string {
+  const cases = generatedContractCases(doc);
   const lines: string[] = [
     '/**',
-    ` * Contract-test skeleton generated by the API Contract Diff and Mock Lab`,
-    ` * for "${doc.title}" v${doc.version}. Fill in \`samplePayload\` for each`,
-    ' * operation with a real (or recorded) request/response, then run this',
-    ' * alongside the rest of the suite: `pnpm exec vitest run <this file>`.',
+    ` * Executable contract tests generated by the API Contract Diff and Mock Lab`,
+    ` * for "${doc.title}" v${doc.version}.`,
+    ' * Run with: `pnpm exec vitest run <this file>`.',
     ' */',
     "import { describe, expect, it } from 'vitest';",
     '',
+    `const schemas = ${JSON.stringify(doc.schemas, null, 2)} as Record<string, any>;`,
+    `const cases = ${JSON.stringify(cases, null, 2)} as Array<{ label: string; schema: any; sample: unknown }>;`,
+    '',
+    'function resolve(schema: any, depth = 0): any {',
+    '  if (!schema || depth > 12) return schema;',
+    "  return schema.ref && schemas[schema.ref] ? resolve(schemas[schema.ref], depth + 1) : schema;",
+    '}',
+    '',
+    "function validate(value: unknown, input: any, path = '$', depth = 0): string[] {",
+    "  if (depth > 12) return [path + ': schema recursion exceeded'];",
+    '  const schema = resolve(input);',
+    '  if (!schema) return [];',
+    "  if (value === null) return schema.nullable ? [] : [path + ': unexpected null'];",
+    "  if (schema.enum && !schema.enum.some((item: unknown) => Object.is(item, value))) return [path + ': enum mismatch'];",
+    "  if (schema.type === 'string' && typeof value !== 'string') return [path + ': expected string'];",
+    "  if (schema.type === 'integer' && (typeof value !== 'number' || !Number.isInteger(value))) return [path + ': expected integer'];",
+    "  if (schema.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) return [path + ': expected number'];",
+    "  if (schema.type === 'boolean' && typeof value !== 'boolean') return [path + ': expected boolean'];",
+    "  if (schema.type === 'array' || schema.items) {",
+    "    if (!Array.isArray(value)) return [path + ': expected array'];",
+    "    return value.flatMap((item, index) => validate(item, schema.items, path + '[' + index + ']', depth + 1));",
+    '  }',
+    "  if (schema.type === 'object' || schema.properties) {",
+    "    if (!value || typeof value !== 'object' || Array.isArray(value)) return [path + ': expected object'];",
+    '    const record = value as Record<string, unknown>;',
+    '    const errors: string[] = [];',
+    "    for (const field of schema.required || []) if (!Object.prototype.hasOwnProperty.call(record, field)) errors.push(path + '.' + field + ': missing');",
+    "    for (const [field, child] of Object.entries(schema.properties || {})) if (Object.prototype.hasOwnProperty.call(record, field)) errors.push(...validate(record[field], child, path + '.' + field, depth + 1));",
+    '    return errors;',
+    '  }',
+    '  return [];',
+    '}',
+    '',
+    `describe(${JSON.stringify(`${doc.title} v${doc.version} generated contract`)}, () => {`,
+    '  if (cases.length === 0) {',
+    "    it('contains at least one schema-backed executable case', () => { expect(cases.length).toBeGreaterThan(0); });",
+    '  }',
+    '  for (const testCase of cases) {',
+    '    it(testCase.label, () => {',
+    '      expect(validate(testCase.sample, testCase.schema)).toEqual([]);',
+    '    });',
+    '  }',
+    '});',
   ];
-  for (const operation of doc.operations) {
-    const label = `${operation.method} ${operation.path}`;
-    const requestRequired = requiredFieldNames(operation.requestBodySchema, doc.schemas);
-    const okResponse = operation.responses.find((r) => r.status.startsWith('2'));
-    const responseRequired = okResponse ? requiredFieldNames(okResponse.schema, doc.schemas) : [];
-    if (requestRequired.length === 0 && responseRequired.length === 0) continue;
-    lines.push(`describe(${JSON.stringify(label)}, () => {`);
-    if (requestRequired.length > 0) {
-      lines.push('  it("request body carries every required field", () => {');
-      lines.push('    const samplePayload: Record<string, unknown> = {}; // TODO: fill in a real request payload');
-      lines.push(`    const required = ${JSON.stringify(requestRequired)};`);
-      lines.push('    for (const field of required) {');
-      lines.push('      expect(Object.prototype.hasOwnProperty.call(samplePayload, field)).toBe(true);');
-      lines.push('    }');
-      lines.push('  });');
-      lines.push('');
-    }
-    if (okResponse && responseRequired.length > 0) {
-      lines.push(`  it(${JSON.stringify(`response ${okResponse.status} carries every required field`)}, () => {`);
-      lines.push('    const sampleResponse: Record<string, unknown> = {}; // TODO: fill in a real recorded response');
-      lines.push(`    const required = ${JSON.stringify(responseRequired)};`);
-      lines.push('    for (const field of required) {');
-      lines.push('      expect(Object.prototype.hasOwnProperty.call(sampleResponse, field)).toBe(true);');
-      lines.push('    }');
-      lines.push('  });');
-    }
-    lines.push('});');
-    lines.push('');
-  }
-  if (lines.length <= 8) {
-    lines.push('// No operation in this document declares required request/response fields to assert.');
-  }
   return lines.join('\n');
 }
 

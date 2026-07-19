@@ -7,23 +7,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::m4_services::{
     plugin_workflow_id, plugin_workflow_marker, plugin_workflow_prefix,
     ActivePluginRuntimeSnapshot, ActiveSkillDescriptor, ApprovedInstallPreview, M4ServiceError,
     McpAppService, McpOAuthServerRegistration, OpenedMcpUiSession, PackageCatalogEntry,
     PackageInstallAuthorization, PackageRegistryService, PluginRuntimeDescriptor,
-    RegistryRefreshResult, UiActionApprovalChallenge, WorkflowHumanApprovalChallenge,
-    WorkflowService,
+    UiActionApprovalChallenge, WorkflowHumanApprovalChallenge, WorkflowService,
 };
 use crate::mcp_app_core::{
-    AuthorizedBridgeAction, McpContentLimits, McpStructuredResult, McpToolDescriptor,
-    McpUiManifest, OAuthAuthorizationPlan, OAuthCallback, OAuthTokenMetadata, RoutedTool,
-    SecretMaterial, ToolRoutingPolicy, UiBridgeRequest,
+    AuthorizedBridgeAction, McpUiManifest, OAuthAuthorizationPlan, OAuthCallback,
+    OAuthTokenMetadata, SecretMaterial, UiBridgeRequest,
 };
 use crate::package_ecosystem::{
-    AdditionalRegistryRecord, InstalledPackageState, PackageBundle, PermissionApproval,
-    PortablePackageExport, RegistrySnapshot, SemanticVersion,
+    AdditionalRegistryRecord, InstalledPackageState, PermissionApproval, PortablePackageExport,
+    RegistrySnapshot, SemanticVersion,
 };
 use crate::workflow_core::{
     LegacyRecipeV1, NodeRunRecord, ReconciliationDecision, ReplayPlan, WorkflowDefinition,
@@ -178,32 +177,6 @@ pub fn m4_packages_seed_first_party(
     state
         .packages
         .seed_first_party(now_unix_ms)
-        .map_err(command_error)
-}
-
-#[tauri::command]
-pub fn m4_packages_refresh_registry(
-    state: tauri::State<'_, M4CommandState>,
-    snapshot: RegistrySnapshot,
-    now_unix_ms: u64,
-) -> Result<RegistryRefreshResult, String> {
-    state
-        .packages
-        .refresh_registry(snapshot, now_unix_ms)
-        .map_err(command_error)
-}
-
-#[tauri::command]
-pub fn m4_packages_import(
-    window: tauri::Window,
-    state: tauri::State<'_, M4CommandState>,
-    bundle: PackageBundle,
-    now_unix_ms: u64,
-) -> Result<PackageCatalogEntry, String> {
-    require_main_window(&window)?;
-    state
-        .packages
-        .import_bundle(bundle, now_unix_ms)
         .map_err(command_error)
 }
 
@@ -656,31 +629,6 @@ pub fn m4_mcp_ui_close(
 }
 
 #[tauri::command]
-pub fn m4_mcp_content_text_fallback(
-    state: tauri::State<'_, M4CommandState>,
-    result: McpStructuredResult,
-    limits: McpContentLimits,
-) -> Result<String, String> {
-    state
-        .mcp_apps
-        .content_text_fallback(&result, &limits)
-        .map_err(command_error)
-}
-
-#[tauri::command]
-pub fn m4_mcp_route_tools(
-    state: tauri::State<'_, M4CommandState>,
-    query: String,
-    catalog: Vec<McpToolDescriptor>,
-    policy: ToolRoutingPolicy,
-) -> Result<Vec<RoutedTool>, String> {
-    state
-        .mcp_apps
-        .route_tools(&query, &catalog, &policy, None)
-        .map_err(command_error)
-}
-
-#[tauri::command]
 pub fn m4_workflows_list(
     state: tauri::State<'_, M4CommandState>,
 ) -> Result<Vec<WorkflowDefinition>, String> {
@@ -786,15 +734,59 @@ pub fn m4_workflows_prepare_approval(
 }
 
 #[tauri::command]
-pub fn m4_workflows_decide_approval(
+pub async fn m4_workflows_decide_approval(
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, crate::AppState>,
     state: tauri::State<'_, M4CommandState>,
     challenge_id: String,
     approved: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if !approved {
+        state
+            .workflows
+            .decide_human_approval(&challenge_id, false)
+            .map_err(command_error)?;
+        return Ok(false);
+    }
+
+    let challenge = state
+        .workflows
+        .human_approval_challenge(&challenge_id)
+        .map_err(command_error)?;
+    let template = crate::approval_chains::built_in_templates()
+        .into_iter()
+        .find(|candidate| candidate.id == "review_then_approve")
+        .ok_or_else(|| "review_then_approve approval template is unavailable".to_string())?;
+    let detail = format!(
+        "Workflow: {}\nRun: {}\nNode: {}\nPolicy: {}\n\n{}",
+        challenge.workflow_id,
+        challenge.run_id,
+        challenge.node_id,
+        challenge.approval_policy_id,
+        challenge.summary
+    );
+    let digest_payload = serde_json::to_vec(&(
+        &challenge.workflow_id,
+        &challenge.run_id,
+        &challenge.node_id,
+        &challenge.approval_policy_id,
+        &challenge.summary_sha256,
+    ))
+    .map_err(|error| format!("encode workflow approval digest: {error}"))?;
+    let operation_digest = format!("{:x}", Sha256::digest(digest_payload));
+    let chain_approved = crate::approval_chains::run_approval_chain(
+        &app,
+        app_state.inner(),
+        &template,
+        operation_digest,
+        detail,
+    )
+    .await?;
     state
         .workflows
-        .decide_human_approval(&challenge_id, approved)
-        .map_err(command_error)
+        .decide_human_approval(&challenge_id, chain_approved)
+        .map_err(command_error)?;
+    Ok(chain_approved)
 }
 
 #[derive(Debug, Clone, Serialize)]

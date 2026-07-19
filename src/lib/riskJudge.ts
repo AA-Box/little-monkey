@@ -27,6 +27,7 @@
  * `turnEngine.ts`'s `RiskAnnotationContext` down into `executeToolCall`.
  */
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 export interface RiskClassification {
   level: 'low' | 'medium' | 'high';
@@ -104,26 +105,14 @@ function buildJudgeMessages(tool: string, args: Record<string, unknown>, workspa
  * Fails closed: `null` is treated as "unknown" everywhere it's consumed,
  * which is the SAME outcome as risk annotations being off entirely (a normal
  * permission prompt with no badge), never silently treated as "low risk".
- * Tries the raw trimmed content first, then falls back to the first
- * `{...}` span found in it (small local models sometimes wrap otherwise
- * valid JSON in a sentence or code fence) — still strict about the shape
- * once parsed, never about surrounding prose.
+ * Tries the raw trimmed content first, then complete embedded JSON objects
+ * (small local models sometimes wrap otherwise valid JSON in a sentence or
+ * code fence) — still strict about the shape once parsed.
  */
 export function parseJudgeResponse(content: string): RiskClassification | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const level = (parsed as { level?: unknown }).level;
-    const reason = (parsed as { reason?: unknown }).reason;
+  for (const parsed of parseModelJsonCandidates(content, 'object')) {
+    const level = parsed.level;
+    const reason = parsed.reason;
     if ((level === 'low' || level === 'medium' || level === 'high') && typeof reason === 'string' && reason.trim().length > 0) {
       return { level, reason: reason.trim() };
     }

@@ -801,10 +801,6 @@ export async function openEncryptedSnapshot(path: string): Promise<PortableReadO
   return invoke("portable_snapshot_open", { path });
 }
 
-export async function getWebDavConfig(): Promise<WebDavBackupConfig> {
-  return invoke("portable_webdav_config_get");
-}
-
 export async function getWebDavBackupStatus(): Promise<WebDavBackupStatus> {
   return invoke("portable_webdav_status_get");
 }
@@ -830,10 +826,6 @@ export async function saveWebDavConfig(request: {
 
 export async function testWebDav(): Promise<void> {
   await invoke("portable_webdav_test");
-}
-
-export async function uploadSnapshotToWebDav(path: string): Promise<{ status: string; remotePath: string; etag: string }> {
-  return invoke("portable_webdav_upload_snapshot", { path });
 }
 
 export async function downloadSnapshotFromWebDav(): Promise<

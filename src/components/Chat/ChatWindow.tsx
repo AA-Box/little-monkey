@@ -54,6 +54,7 @@ import {
 import { useEcosystemStore } from "../../store/ecosystemStore";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
 import { companionClient } from "../../lib/companionClient";
+import { loadGeneratedImage, loadWorkspaceImage } from "../../lib/imageGeneration";
 import {
   BUILT_IN_SLASH_COMMANDS,
   formatCommandNotice,
@@ -716,6 +717,32 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setAttachments((prev) => prev.filter((a) => a.path !== path));
   }, []);
 
+  const handleEditGeneratedImage = useCallback(async (path: string, _prompt: string, artifactId?: string) => {
+    setError(null);
+    try {
+      const dataUrl = artifactId ? await loadGeneratedImage(artifactId) : await loadWorkspaceImage(path);
+      if (!dataUrl) throw new Error(t("GeneratedImage.desktopOnly"));
+      const name = path.split(/[\\/]/).filter(Boolean).pop() || "generated-image.png";
+      setInput(t("GeneratedImage.editPrompt"));
+      setAttachments((current) => [
+        ...current.filter((attachment) => !attachment.path.startsWith("generated://")),
+        {
+          path: `generated://${artifactId ?? path}`,
+          isDir: false,
+          kind: "image",
+          dataUrl,
+          label: name,
+        },
+      ]);
+      requestAnimationFrame(() => {
+        resizeTextarea();
+        textareaRef.current?.focus();
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }, [resizeTextarea, t]);
+
   const sendTurn = useCallback((
     text: string,
     pendingAttachments: AttachmentRef[],
@@ -1352,6 +1379,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         editingDisabled={sending}
         onRetry={handleRetry}
         onStartSideTask={handleStartSideTask}
+        onEditGeneratedImage={handleEditGeneratedImage}
       />
 
       {error && (

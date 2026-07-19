@@ -24,12 +24,12 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function statusPill(ready: boolean, simulated: boolean, t: (key: string) => string) {
-  const tone: PillTone = ready ? "success" : simulated ? "danger" : "warning";
+function statusPill(ready: boolean, bridgeBlocked: boolean, t: (key: string) => string) {
+  const tone: PillTone = ready ? "success" : "warning";
   const label = ready
     ? t("ConnectorBuilder.statusReady")
-    : simulated
-      ? t("ConnectorBuilder.statusNotClean")
+    : bridgeBlocked
+      ? "Bridge required"
       : t("ConnectorBuilder.statusNotSimulated");
   return <StatusPill tone={tone}>{label}</StatusPill>;
 }
@@ -107,7 +107,7 @@ export function ConnectorBuilderPanel({ onClose }: ConnectorBuilderPanelProps) {
             <div className="rounded-lg border border-border bg-surface p-3">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="truncate text-xs font-semibold text-foreground">{definition.server.name}</h3>
-                {statusPill(store.ready, simulated, t)}
+                {statusPill(store.ready, Boolean(store.availabilityBlockReason), t)}
               </div>
               <p className="mt-1 text-[11px] text-muted">{definition.server.description}</p>
 
@@ -149,7 +149,7 @@ export function ConnectorBuilderPanel({ onClose }: ConnectorBuilderPanelProps) {
                   size="sm"
                   variant="primary"
                   disabled={!store.ready || store.registering}
-                  title={store.ready ? undefined : t("ConnectorBuilder.registerBlockedHint")}
+                  title={store.ready ? undefined : store.availabilityBlockReason ?? t("ConnectorBuilder.registerBlockedHint")}
                   onClick={() => {
                     setLocalError(null);
                     void store.registerWithMcp().catch((error) => setLocalError(errorText(error)));
@@ -166,13 +166,13 @@ export function ConnectorBuilderPanel({ onClose }: ConnectorBuilderPanelProps) {
                 </p>
               )}
 
-              {!store.ready && simulated && (
-                <p className="mt-2 flex items-start gap-1.5 rounded-md border border-danger/40 bg-danger/10 p-2.5 text-[11px] text-danger">
+              {store.availabilityBlockReason && (
+                <p className="mt-2 flex items-start gap-1.5 rounded-md border border-warning/40 bg-warning/5 p-2.5 text-[11px] text-warning">
                   <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-                  {t("ConnectorBuilder.notSimulatorCleanWarning")}
+                  {store.availabilityBlockReason}
                 </p>
               )}
-              {!simulated && (
+              {!simulated && !store.availabilityBlockReason && (
                 <p className="mt-2 flex items-start gap-1.5 rounded-md border border-warning/40 bg-warning/5 p-2.5 text-[11px] text-warning">
                   <AlertTriangle size={13} className="mt-0.5 shrink-0" />
                   {t("ConnectorBuilder.notSimulatedYetWarning")}
