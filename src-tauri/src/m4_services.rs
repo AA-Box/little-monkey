@@ -1753,6 +1753,9 @@ pub struct WorkflowHumanApprovalChallenge {
     pub run_id: String,
     pub node_id: String,
     pub approval_policy_id: String,
+    /// Bounded evidence shown to the person deciding. The digest remains the
+    /// authoritative executor binding.
+    pub summary: String,
     pub summary_sha256: String,
 }
 
@@ -1766,8 +1769,10 @@ pub trait WorkflowHumanApprovalBroker: Send + Sync {
         run_id: &str,
         node_id: &str,
         approval_policy_id: &str,
+        summary: &str,
         summary_sha256: &str,
     ) -> Result<WorkflowHumanApprovalChallenge, String>;
+    fn get(&self, challenge_id: &str) -> Result<Option<WorkflowHumanApprovalChallenge>, String>;
     fn decide(&self, challenge_id: &str, approved: bool) -> Result<(), String>;
     fn consume(
         &self,
@@ -1931,9 +1936,28 @@ impl WorkflowService {
                 run_id,
                 node_id,
                 policy,
+                summary,
                 &sha256(summary.as_bytes()),
             )
             .map_err(M4ServiceError::Dependency)
+    }
+
+    pub fn human_approval_challenge(
+        &self,
+        challenge_id: &str,
+    ) -> Result<WorkflowHumanApprovalChallenge, M4ServiceError> {
+        self.approval_broker
+            .as_ref()
+            .ok_or_else(|| {
+                M4ServiceError::Dependency("workflow approval broker is not configured".to_string())
+            })?
+            .get(challenge_id)
+            .map_err(M4ServiceError::Dependency)?
+            .ok_or_else(|| {
+                M4ServiceError::NotFound(format!(
+                    "workflow approval challenge {challenge_id} is unknown or expired"
+                ))
+            })
     }
 
     pub fn decide_human_approval(

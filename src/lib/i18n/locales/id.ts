@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const id: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const id: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "Belum ada konektor Slack di build ini — hanya membuat persona untuk transkrip yang ditempel manual.",
   "Onboarding.templateModelEvaluationName": "Evaluasi model",
   "Onboarding.templateModelEvaluationDescription": "Membandingkan output model kandidat untuk prompt yang Anda berikan.",
-  "Onboarding.templateModelEvaluationCaveat": "Belum ada sistem suite evaluasi otomatis — hanya membuat persona untuk perbandingan manual sesekali.",
+  "Onboarding.templateModelEvaluationCaveat": "Membuat persona perbandingan; gunakan Workflow & Agent Test Harness untuk suite regresi otomatis dan gerbang rilis.",
   "Onboarding.templateBrowserQaName": "QA browser",
   "Onboarding.templateBrowserQaDescription": "Menelusuri alur web menggunakan alat browser dan melaporkan apa yang gagal.",
   "Onboarding.templateBrowserQaCaveat": "Hanya membuat persona — padukan dengan Browser Workbench untuk alur yang direkam.",
@@ -1004,6 +1020,9 @@ export const id: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Terlampir",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Pratinjau",
+  "WorkspaceImage.loading": "Gambar sedang dimuat…",
+  "WorkspaceImage.error": "Gambar tidak tersedia: {{error}}",
+  "WorkspaceImage.generatedAlt": "Gambar yang dihasilkan",
   "MessageList.argumentsLabel": "Argumen",
   "MessageList.resultLabel": "Hasil",
   "MessageList.regenerateButton": "Buat ulang",

@@ -23,32 +23,14 @@
  * sandboxing (a path outside that root is rejected) is enforced by Rust
  * regardless of what the model does.
  */
-import { effortForTarget } from '../store/modelStore';
-import { useWorkspaceStore } from '../store/workspaceStore';
-import { usePermissionStore } from '../store/permissionStore';
-import { resolveTarget, snapshotForResolvedTarget } from './agentLoop';
-import { beginDurableRun, type DurableRunRecorder } from './durableRun';
-import type { ChatMessage } from './llamaClient';
-import type { McpToolRegistry } from './mcpTools';
-import { toolsForProfile } from './tools';
-import {
-  attemptStream,
-  executeToolCall,
-  isToolCallAllowed,
-  stringifyToolError,
-  CANCELLED_TOOL_RESULT,
-} from './turnEngine';
-import { protectToolResult, wrapUntrustedContent } from './untrustedContent';
+import { runHeadlessAgent } from './headlessAgentRunner';
+import { wrapUntrustedContent } from './untrustedContent';
 
 /** Hard cap on model/tool round trips — generous relative to
  * `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS` (15) since a full issue
  * implementation (read around, edit, run tests, fix, re-run) is a much
  * larger task than a single delegated subtask. */
 export const MAX_ISSUE_TO_PR_ITERATIONS = 40;
-
-function emptyMcpRegistry(): McpToolRegistry {
-  return new Map();
-}
 
 export interface RunIssueToPrAgentParams {
   /** Reused as both the headless loop's own `turnId` (scoping Rust-side
@@ -102,11 +84,6 @@ function buildSystemPrompt(params: RunIssueToPrAgentParams): string {
 export async function runIssueToPrAgent(
   params: RunIssueToPrAgentParams,
 ): Promise<IssueToPrAgentResult> {
-  const { runId, signal } = params;
-  const target = await resolveTarget();
-  const effort = effortForTarget(target);
-  const tools = toolsForProfile('code');
-  const mcpRegistry = emptyMcpRegistry();
   const systemPrompt = buildSystemPrompt(params);
 
   // The issue's title/body came from a GitHub API fetch, not the user typing
@@ -124,109 +101,17 @@ export async function runIssueToPrAgent(
     wrapUntrustedContent(`GitHub issue #${params.issueNumber} (${params.repositorySlug})`, issueContent),
   ].join('\n');
 
-  let messages: ChatMessage[] = [{ role: 'user', content: userMessage }];
-
-  const targetSnapshot = snapshotForResolvedTarget(target);
-  const recorder: DurableRunRecorder | null = targetSnapshot
-    ? await beginDurableRun({
-        runId,
-        kind: 'background',
-        task: `Issue-to-PR #${params.issueNumber}: ${params.issueTitle}`,
-        instructions: `Owned branch ${params.branch} in ${params.repositorySlug}`,
-        target: targetSnapshot,
-        roots: useWorkspaceStore.getState().roots,
-        permissionMode: usePermissionStore.getState().mode,
-        allowNetwork: false,
-        allowExternalMutations: false,
-      }).catch(() => null)
-    : null;
-
-  const finish = async (
-    outcome: IssueToPrAgentResult['outcome'],
-    summary: string,
-  ): Promise<IssueToPrAgentResult> => {
-    if (recorder) {
-      if (outcome === 'completed') await recorder.complete(summary).catch(() => {});
-      else if (outcome === 'cancelled') await recorder.cancel(summary).catch(() => {});
-      else await recorder.fail(summary).catch(() => {});
-    }
-    return { outcome, summary, durableRunId: recorder?.runId ?? null };
-  };
-
-  try {
-    for (let iteration = 0; iteration < MAX_ISSUE_TO_PR_ITERATIONS; iteration++) {
-      if (signal.aborted) return finish('cancelled', 'Cancelled by the user.');
-
-      const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
-      const attempt = await attemptStream(target, wireHistory, tools, signal, effort, runId);
-
-      if (attempt.usage) {
-        recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
-      }
-      if (attempt.streamError !== null) return finish('error', attempt.streamError);
-
-      if (attempt.toolCalls.length === 0) {
-        const finalMessage: ChatMessage = { role: 'assistant', content: attempt.content };
-        messages = [...messages, finalMessage];
-        if (attempt.content) recorder?.recordModelOutput(`${runId}:${iteration}`, attempt.content);
-        return finish('completed', attempt.content.trim() || 'Agent finished with no summary.');
-      }
-
-      const assistantMessage: ChatMessage = {
-        role: 'assistant',
-        content: attempt.content,
-        tool_calls: attempt.toolCalls,
-      };
-      messages = [...messages, assistantMessage];
-      if (attempt.content) recorder?.recordModelOutput(`${runId}:${iteration}`, attempt.content);
-
-      for (const toolCall of attempt.toolCalls) {
-        const aborted = signal.aborted;
-        const allowed = isToolCallAllowed(toolCall, tools);
-        if (!aborted) {
-          params.onToolActivity?.(toolCall.function.name);
-          await recorder
-            ?.recordToolProposed(toolCall.id, toolCall.function.name, toolCall.function.arguments ?? '')
-            .catch(() => {});
-          recorder?.recordToolStarted(toolCall.id);
-        }
-        const started = Date.now();
-        const resultContent = aborted
-          ? CANCELLED_TOOL_RESULT
-          : !allowed
-            ? stringifyToolError(
-                new Error(`Tool "${toolCall.function.name}" was not offered to this run.`),
-              )
-            : await executeToolCall(
-                toolCall,
-                null,
-                runId,
-                mcpRegistry,
-                signal,
-                undefined,
-                undefined,
-                undefined,
-                'issue-to-pr',
-              );
-        if (!aborted) {
-          await recorder?.recordToolFinished(toolCall.id, resultContent, Date.now() - started).catch(() => {});
-        }
-        const toolMessage: ChatMessage = {
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: allowed ? protectToolResult(toolCall.function.name, resultContent, false) : resultContent,
-        };
-        messages = [...messages, toolMessage];
-      }
-
-      if (signal.aborted) return finish('cancelled', 'Cancelled by the user.');
-    }
-
-    return finish(
-      'error',
-      `Stopped after reaching the safety limit of ${MAX_ISSUE_TO_PR_ITERATIONS} tool-calling iterations without a final answer.`,
-    );
-  } catch (err) {
-    return finish('error', err instanceof Error ? err.message : String(err));
-  }
+  return runHeadlessAgent({
+    runId: params.runId,
+    signal: params.signal,
+    systemPrompt,
+    userMessage,
+    maxIterations: MAX_ISSUE_TO_PR_ITERATIONS,
+    executionSource: 'issue-to-pr',
+    durableRun: {
+      task: `Issue-to-PR #${params.issueNumber}: ${params.issueTitle}`,
+      instructions: `Owned branch ${params.branch} in ${params.repositorySlug}`,
+    },
+    onToolActivity: params.onToolActivity,
+  });
 }

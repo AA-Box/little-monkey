@@ -1,8 +1,9 @@
-import { useEffect } from "react";
-import { AlertTriangle, CheckCircle2, Clock, RefreshCw, Server, X, Zap } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, CheckCircle2, Clock, Plug, Plus, RefreshCw, Server, Trash2, X, Zap } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
-import { useDailyBriefStore } from "../../store/dailyBriefStore";
+import { isReadOnlyBriefTool, useDailyBriefStore } from "../../store/dailyBriefStore";
+import { useMcpStore } from "../../store/mcpStore";
 import { IconButton, StatusPill, type PillTone } from "../ui";
 import type { SettingsTab } from "../Settings";
 import type { RiskLevel, RunStatus } from "../../lib/runProtocol";
@@ -117,6 +118,59 @@ export function DailyBriefPanel({ onClose, onOpenRunCenter, onOpenAgentInbox, on
   const { t } = useT();
   const brief = useDailyBriefStore((state) => state);
   const refresh = useDailyBriefStore((state) => state.refresh);
+  const saveConnectorSource = useDailyBriefStore((state) => state.saveConnectorSource);
+  const removeConnectorSource = useDailyBriefStore((state) => state.removeConnectorSource);
+  const setConnectorSourceEnabled = useDailyBriefStore((state) => state.setConnectorSourceEnabled);
+  const servers = useMcpStore((state) => state.servers);
+  const [sourceServerId, setSourceServerId] = useState("");
+  const [sourceToolName, setSourceToolName] = useState("");
+  const [sourceLabel, setSourceLabel] = useState("");
+  const [sourceArguments, setSourceArguments] = useState("{}");
+  const [sourceError, setSourceError] = useState<string | null>(null);
+
+  const availableSources = useMemo(() => servers
+    .filter((server) => server.enabled && server.status === "connected")
+    .flatMap((server) => server.tools
+      .filter((tool) => isReadOnlyBriefTool(tool.name))
+      .filter((tool) => !server.toolAllowlist || server.toolAllowlist.includes(tool.name))
+      .map((tool) => ({ serverId: server.id, serverLabel: server.label, toolName: tool.name }))), [servers]);
+
+  useEffect(() => {
+    if (availableSources.length === 0) {
+      setSourceServerId("");
+      setSourceToolName("");
+      return;
+    }
+    if (!availableSources.some((source) => source.serverId === sourceServerId && source.toolName === sourceToolName)) {
+      setSourceServerId(availableSources[0].serverId);
+      setSourceToolName(availableSources[0].toolName);
+    }
+  }, [availableSources, sourceServerId, sourceToolName]);
+
+  function addConnectorSource() {
+    setSourceError(null);
+    try {
+      const args: unknown = JSON.parse(sourceArguments);
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        throw new Error(t("DailyBriefPanel.connectors.argumentsObjectError"));
+      }
+      const selected = availableSources.find((source) =>
+        source.serverId === sourceServerId && source.toolName === sourceToolName
+      );
+      if (!selected) throw new Error(t("DailyBriefPanel.connectors.noReadTool"));
+      saveConnectorSource({
+        serverId: selected.serverId,
+        toolName: selected.toolName,
+        label: sourceLabel.trim() || `${selected.serverLabel} · ${selected.toolName}`,
+        arguments: args as Record<string, unknown>,
+        enabled: true,
+      });
+      setSourceLabel("");
+      setSourceArguments("{}");
+    } catch (error) {
+      setSourceError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   useEffect(() => {
     void refresh();
@@ -259,14 +313,80 @@ export function DailyBriefPanel({ onClose, onOpenRunCenter, onOpenAgentInbox, on
             >
               {brief.connectorHighlights.map((item) => (
                 <Row
-                  key={item.connectorId}
+                  key={item.id}
                   title={item.label}
-                  subtitle={item.summary}
+                  subtitle={`${item.summary} · ${item.connectorId}/${item.toolName} · ${new Date(item.fetchedAtMs).toLocaleTimeString()}`}
+                  tone={item.status === "ok" ? "success" : "danger"}
                   action={{ label: t("DailyBriefPanel.connectors.open"), onClick: () => onOpenSettingsTab("mcp") }}
                 />
               ))}
             </Section>
           )}
+
+          <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="daily-brief-connector-sources-title">
+            <div className="flex items-center gap-2">
+              <Plug size={16} className="text-muted" aria-hidden="true" />
+              <div>
+                <h2 id="daily-brief-connector-sources-title" className="text-sm font-semibold text-foreground">
+                  {t("DailyBriefPanel.connectors.sourcesTitle")}
+                </h2>
+                <p className="mt-0.5 text-xs text-muted">{t("DailyBriefPanel.connectors.sourcesDescription")}</p>
+              </div>
+            </div>
+
+            {brief.connectorSources.length > 0 && (
+              <ul className="mt-3 space-y-2">
+                {brief.connectorSources.map((source) => (
+                  <li key={source.id} className="flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-2">
+                    <label className="flex min-w-0 flex-1 items-center gap-2 text-xs text-foreground">
+                      <input
+                        type="checkbox"
+                        checked={source.enabled}
+                        onChange={(event) => setConnectorSourceEnabled(source.id, event.target.checked)}
+                        className="h-4 w-4 accent-[var(--color-accent)]"
+                      />
+                      <span className="min-w-0"><span className="block truncate font-medium">{source.label}</span><span className="block truncate font-mono text-[10px] text-faint">{source.serverId}/{source.toolName}</span></span>
+                    </label>
+                    <button type="button" onClick={() => removeConnectorSource(source.id)} aria-label={t("DailyBriefPanel.connectors.removeSource")} className="rounded p-1 text-faint hover:bg-surface-2 hover:text-danger">
+                      <Trash2 size={14} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <label className="text-xs text-muted">
+                {t("DailyBriefPanel.connectors.readTool")}
+                <select
+                  value={`${sourceServerId}\u0000${sourceToolName}`}
+                  onChange={(event) => {
+                    const [serverId, toolName] = event.target.value.split("\u0000");
+                    setSourceServerId(serverId ?? "");
+                    setSourceToolName(toolName ?? "");
+                  }}
+                  className="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2 text-xs text-foreground"
+                  disabled={availableSources.length === 0}
+                >
+                  {availableSources.length === 0
+                    ? <option value="">{t("DailyBriefPanel.connectors.noReadTool")}</option>
+                    : availableSources.map((source) => <option key={`${source.serverId}:${source.toolName}`} value={`${source.serverId}\u0000${source.toolName}`}>{source.serverLabel} · {source.toolName}</option>)}
+                </select>
+              </label>
+              <label className="text-xs text-muted">
+                {t("DailyBriefPanel.connectors.sourceLabel")}
+                <input value={sourceLabel} onChange={(event) => setSourceLabel(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2 text-xs text-foreground" />
+              </label>
+              <label className="text-xs text-muted sm:col-span-2">
+                {t("DailyBriefPanel.connectors.arguments")}
+                <textarea value={sourceArguments} onChange={(event) => setSourceArguments(event.target.value)} className="mt-1 min-h-20 w-full rounded-md border border-border bg-surface p-2 font-mono text-xs text-foreground" />
+              </label>
+            </div>
+            {sourceError && <p role="alert" className="mt-2 text-xs text-danger">{sourceError}</p>}
+            <button type="button" onClick={addConnectorSource} disabled={availableSources.length === 0} className="mt-2 inline-flex min-h-9 items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-accent-foreground disabled:opacity-50">
+              <Plus size={13} /> {t("DailyBriefPanel.connectors.addSource")}
+            </button>
+          </section>
 
           {brief.runtimeHealth.hasData && (
             <section className="rounded-lg border border-border bg-background p-4" aria-label={t("DailyBriefPanel.runtime.title")}>

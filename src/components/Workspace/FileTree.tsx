@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronRight, FileText, Folder, FolderOpen, RefreshCw } from "lucide-react";
+import { ChevronRight, FileText, Folder, FolderOpen, ListTodo, RefreshCw } from "lucide-react";
 import { IconButton } from "../ui";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
+import { useSessionStore } from "../../store/sessionStore";
+import { buildSelectedFilesSideTaskSeed, useSideTaskStore } from "../../store/sideTaskStore";
 import { useT } from "../../lib/i18n";
 
 /** Shape returned per-entry by the Rust `tool_list_dir` command. */
@@ -183,6 +185,7 @@ function TreeNode({
 
 export function FileTree({ className = "", onSelectFile }: FileTreeProps) {
   const primary = useWorkspaceStore((s) => primaryRoot(s.roots));
+  const activeChatSessionId = useSessionStore((state) => state.activeSessionId);
   const [rootLabel, setRootLabel] = useState<string | null>(null);
   const [rootEntries, setRootEntries] = useState<DirEntry[] | null>(null);
   const [rootError, setRootError] = useState<string | null>(null);
@@ -242,6 +245,14 @@ export function FileTree({ className = "", onSelectFile }: FileTreeProps) {
     }
   }
 
+  function startSideTaskFromSelection(): void {
+    if (!selectedPath || previewContent === null || previewLoading || previewError) return;
+    useSideTaskStore.getState().openComposer(buildSelectedFilesSideTaskSeed({
+      sessionId: activeChatSessionId,
+      files: [{ path: selectedPath, content: previewContent }],
+    }));
+  }
+
   return (
     <div className={`flex h-full min-h-0 flex-col ${className}`}>
       <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
@@ -286,17 +297,29 @@ export function FileTree({ className = "", onSelectFile }: FileTreeProps) {
         <div className="max-h-72 shrink-0 overflow-auto border-t border-border bg-surface-2">
           <div className="sticky top-0 flex items-center justify-between border-b border-border bg-surface-2 px-3 py-1.5">
             <span className="truncate font-mono text-[11px] text-muted">{selectedPath}</span>
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedPath(null);
-                setPreviewContent(null);
-                setPreviewError(null);
-              }}
-              className="ml-2 shrink-0 cursor-pointer rounded px-1.5 py-0.5 text-xs text-faint transition-colors hover:bg-surface hover:text-foreground"
-            >
-              {t("FileTree.closeButton")}
-            </button>
+            <div className="ml-2 flex shrink-0 items-center gap-1">
+              <IconButton
+                size="sm"
+                variant="ghost"
+                onClick={startSideTaskFromSelection}
+                disabled={previewContent === null || previewLoading || Boolean(previewError)}
+                aria-label="Start side task from selected file"
+                title="Start side task from selected file"
+              >
+                <ListTodo size={13} />
+              </IconButton>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedPath(null);
+                  setPreviewContent(null);
+                  setPreviewError(null);
+                }}
+                className="shrink-0 cursor-pointer rounded px-1.5 py-0.5 text-xs text-faint transition-colors hover:bg-surface hover:text-foreground"
+              >
+                {t("FileTree.closeButton")}
+              </button>
+            </div>
           </div>
           <div className="p-3">
             {previewLoading && <p className="text-xs text-faint">{t("FileTree.loadingPreview")}</p>}

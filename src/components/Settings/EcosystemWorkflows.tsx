@@ -452,9 +452,9 @@ export function EcosystemWorkflowDesigner() {
     const challenge = approvalChallenges[nodeId];
     if (!challenge) return;
     try {
-      await ecosystemClient.decideWorkflowApproval(challenge.challenge_id, approved);
+      const chainApproved = await ecosystemClient.decideWorkflowApproval(challenge.challenge_id, approved);
       setApprovalChallenges((current) => { const next = { ...current }; delete next[nodeId]; return next; });
-      setApprovedNodes((current) => { const next = new Set(current); if (approved) next.add(nodeId); else next.delete(nodeId); return next; });
+      setApprovedNodes((current) => { const next = new Set(current); if (chainApproved) next.add(nodeId); else next.delete(nodeId); return next; });
     } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
   }
 

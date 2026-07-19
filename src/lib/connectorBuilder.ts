@@ -20,23 +20,19 @@
  * Every structural field (tool names, param types, `requiresAuth`, auth
  * type, rate-limit hint) is derived DETERMINISTICALLY from the parsed spec —
  * never from a model call — because these are exactly the fields
- * `mcpSimulator.ts`'s fixtures are generated against and gate registration
- * on; a hallucinated schema there would silently invalidate the simulator's
- * guarantees. The one place this module calls a model at all is
+ * `mcpSimulator.ts`'s fixtures are generated against; a hallucinated schema
+ * there would silently invalidate the simulator's guarantees. The one place
+ * this module calls a model at all is
  * `draftConnectorSummary`, an optional, best-effort, one-shot plain-text
  * call (the same `resolveTarget()` + `attemptStream()` pattern
  * `mcpGenerator.ts` and `sopCompilerStore.ts` both already use) that writes
  * nothing back into the typed spec — it only produces a short human-readable
  * paragraph the panel shows alongside the deterministic definition.
  *
- * Scope cut (follow-up, not silently expanded): registering a connector adds
- * a real `McpServerEntry` to `mcp_servers.json` via the existing
- * `useMcpStore().addServer` path (see `connectorBuilderStore.ts`), exactly
- * like a hand-configured server — but actually *connecting* it still
- * requires the target URL to speak the MCP protocol itself. A bare REST API
- * described by an OpenAPI doc does not; a real HTTP-to-MCP bridge that
- * executes each generated tool as a REST call against the described API is
- * out of scope for this MVP and is a natural next step.
+ * A bare REST API described by OpenAPI is not an MCP transport. The store
+ * therefore refuses registration until a future generated REST-to-MCP bridge
+ * artifact can be compiled and executed successfully; it never registers the
+ * REST base URL as a pretend MCP HTTP endpoint.
  */
 import { attemptStream, type ResolvedTarget } from './turnEngine';
 import { resolveTarget } from './agentLoop';
@@ -668,7 +664,7 @@ const MAX_SUMMARY_CHARS = 2000;
 /** Runs the one-shot, no-tools "describe this connector" call and returns
  * the model's plain-text paragraph. Best-effort from the caller's
  * perspective (see `connectorBuilderStore.ts`'s `draftSummary` — a failure
- * here never blocks generation, simulation, or registration). */
+ * here never blocks deterministic generation or schema simulation). */
 export async function draftConnectorSummary(
   definition: ConnectorDefinition,
   target: ResolvedTarget,

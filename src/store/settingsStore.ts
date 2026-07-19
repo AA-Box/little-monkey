@@ -1,17 +1,19 @@
 import { create } from "zustand";
 import {
   DEFAULT_APPEARANCE_SETTINGS,
-  applyAppearance,
   getStoredThemePreference,
-  isAccentColor,
-  isMotionPreference,
-  isTextScale,
   isThemePreference,
-  type AccentColor,
-  type MotionPreference,
-  type TextScale,
-  type ThemePreference,
+  normalizeAppearanceSettings,
+  type AppearanceSettings,
 } from "../lib/theme";
+import {
+  APPEARANCE_PROFILE_VERSION,
+  sanitizeAppearanceWorkspaceOverrides,
+  validateAppearanceOverride,
+  validateAppearanceSettings,
+  type AppearanceWorkspaceOverride,
+  type AppearanceWorkspaceOverrides,
+} from "../lib/appearanceProfiles";
 
 /** localStorage key the full settings blob is persisted under after every mutation.
  * Exported so tests can clear it and re-import the module to genuinely
@@ -31,16 +33,12 @@ export interface ProviderRateLimit {
 }
 
 export interface SettingsState {
-  /** UI theme choice. `system` follows the OS preference; the resolved value is applied to `data-theme`. */
-  themePreference: ThemePreference;
-  /** App accent color applied via root CSS variables. */
-  accentColor: AccentColor;
-  /** Global interface text scale applied to the root font-size. */
-  textScale: TextScale;
-  /** Motion preference for app transitions and animations. */
-  motionPreference: MotionPreference;
-  /** Strengthens borders and secondary text for easier scanning. */
-  highContrastEnabled: boolean;
+  /** Version of the nested appearance persistence shape. */
+  appearanceProfileVersion: typeof APPEARANCE_PROFILE_VERSION;
+  /** Local, per-device appearance defaults. Workspace values inherit from this object. */
+  deviceAppearance: AppearanceSettings;
+  /** Sparse appearance overrides keyed by the primary workspace's canonical path. */
+  appearanceWorkspaceOverrides: AppearanceWorkspaceOverrides;
   /** Retry the next configured cloud provider when one errors before any content streams back. */
   autoFailoverEnabled: boolean;
   /** Auto-switch to a vision-capable model when an image is attached and the active one can't see. */
@@ -155,11 +153,9 @@ export interface SettingsState {
   setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
   clearSubagentProfileModel: (profile: 'explore' | 'code') => void;
   setDesktopControlEnabled: (value: boolean) => void;
-  setThemePreference: (value: ThemePreference) => void;
-  setAccentColor: (value: AccentColor) => void;
-  setTextScale: (value: TextScale) => void;
-  setMotionPreference: (value: MotionPreference) => void;
-  setHighContrastEnabled: (value: boolean) => void;
+  setDeviceAppearance: (value: AppearanceSettings) => void;
+  setWorkspaceAppearanceOverride: (workspaceKey: string, value: AppearanceWorkspaceOverride) => void;
+  clearWorkspaceAppearanceOverride: (workspaceKey: string) => void;
 }
 
 /** A single per-profile subagent model override — see `subagentProfileModels`'s own doc comment. */
@@ -202,11 +198,9 @@ export const MIN_MAX_CONCURRENT_SUBAGENTS = 1;
 export const MAX_MAX_CONCURRENT_SUBAGENTS = 4;
 
 interface PersistedShape {
-  themePreference: ThemePreference;
-  accentColor: AccentColor;
-  textScale: TextScale;
-  motionPreference: MotionPreference;
-  highContrastEnabled: boolean;
+  appearanceProfileVersion: typeof APPEARANCE_PROFILE_VERSION;
+  deviceAppearance: AppearanceSettings;
+  appearanceWorkspaceOverrides: AppearanceWorkspaceOverrides;
   autoFailoverEnabled: boolean;
   autoVisionSwitchEnabled: boolean;
   contextTrimEnabled: boolean;
@@ -233,8 +227,12 @@ interface PersistedShape {
 
 function defaults(): PersistedShape {
   return {
-    ...DEFAULT_APPEARANCE_SETTINGS,
-    themePreference: getStoredThemePreference(),
+    appearanceProfileVersion: APPEARANCE_PROFILE_VERSION,
+    deviceAppearance: {
+      ...DEFAULT_APPEARANCE_SETTINGS,
+      themePreference: getStoredThemePreference(),
+    },
+    appearanceWorkspaceOverrides: {},
     autoFailoverEnabled: true,
     autoVisionSwitchEnabled: true,
     contextTrimEnabled: true,
@@ -292,21 +290,36 @@ function sanitizeProviderModelFilters(raw: unknown): Record<string, ProviderMode
   return out;
 }
 
+type PersistedInput = Partial<PersistedShape> & Record<string, unknown>;
+
+/** Reads the current nested shape or migrates the original five flat fields. */
+function hydrateDeviceAppearance(parsed: PersistedInput, fallback: AppearanceSettings): AppearanceSettings {
+  const candidate = parsed.deviceAppearance && typeof parsed.deviceAppearance === "object"
+    ? parsed.deviceAppearance as unknown as Record<string, unknown>
+    : parsed;
+  const normalized = normalizeAppearanceSettings({ ...fallback, ...candidate });
+  return {
+    ...normalized,
+    // The standalone theme key predates the settings blob and is still the
+    // correct fallback when a persisted candidate omits or corrupts theme.
+    themePreference: isThemePreference(candidate.themePreference)
+      ? candidate.themePreference
+      : fallback.themePreference,
+  };
+}
+
 /** Loads the persisted settings blob, falling back to defaults for anything absent, corrupt, or malformed. */
 function hydrate(): PersistedShape {
   const fallback = defaults();
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<PersistedShape> | null;
+    const parsed = JSON.parse(raw) as PersistedInput | null;
     if (!parsed || typeof parsed !== "object") return fallback;
     return {
-      themePreference: isThemePreference(parsed.themePreference) ? parsed.themePreference : fallback.themePreference,
-      accentColor: isAccentColor(parsed.accentColor) ? parsed.accentColor : fallback.accentColor,
-      textScale: isTextScale(parsed.textScale) ? parsed.textScale : fallback.textScale,
-      motionPreference: isMotionPreference(parsed.motionPreference) ? parsed.motionPreference : fallback.motionPreference,
-      highContrastEnabled:
-        typeof parsed.highContrastEnabled === "boolean" ? parsed.highContrastEnabled : fallback.highContrastEnabled,
+      appearanceProfileVersion: APPEARANCE_PROFILE_VERSION,
+      deviceAppearance: hydrateDeviceAppearance(parsed, fallback.deviceAppearance),
+      appearanceWorkspaceOverrides: sanitizeAppearanceWorkspaceOverrides(parsed.appearanceWorkspaceOverrides),
       autoFailoverEnabled: typeof parsed.autoFailoverEnabled === "boolean" ? parsed.autoFailoverEnabled : fallback.autoFailoverEnabled,
       autoVisionSwitchEnabled:
         typeof parsed.autoVisionSwitchEnabled === "boolean" ? parsed.autoVisionSwitchEnabled : fallback.autoVisionSwitchEnabled,
@@ -374,46 +387,32 @@ function persist(state: PersistedShape): void {
 
 const initial = hydrate();
 
-function applyCurrentAppearance(state: SettingsState): void {
-  applyAppearance({
-    themePreference: state.themePreference,
-    accentColor: state.accentColor,
-    textScale: state.textScale,
-    motionPreference: state.motionPreference,
-    highContrastEnabled: state.highContrastEnabled,
-  });
-}
-
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   ...initial,
 
-  setThemePreference: (value) => {
-    set({ themePreference: value });
-    applyCurrentAppearance(get());
+  setDeviceAppearance: (value) => {
+    set({ deviceAppearance: validateAppearanceSettings(value) });
     persist({ ...get() });
   },
 
-  setAccentColor: (value) => {
-    set({ accentColor: value });
-    applyCurrentAppearance(get());
+  setWorkspaceAppearanceOverride: (workspaceKey, value) => {
+    if (!workspaceKey || workspaceKey.length > 4096) return;
+    const appearanceOverride = validateAppearanceOverride(value);
+    set((state) => ({
+      appearanceWorkspaceOverrides: {
+        ...state.appearanceWorkspaceOverrides,
+        [workspaceKey]: appearanceOverride,
+      },
+    }));
     persist({ ...get() });
   },
 
-  setTextScale: (value) => {
-    set({ textScale: value });
-    applyCurrentAppearance(get());
-    persist({ ...get() });
-  },
-
-  setMotionPreference: (value) => {
-    set({ motionPreference: value });
-    applyCurrentAppearance(get());
-    persist({ ...get() });
-  },
-
-  setHighContrastEnabled: (value) => {
-    set({ highContrastEnabled: value });
-    applyCurrentAppearance(get());
+  clearWorkspaceAppearanceOverride: (workspaceKey) => {
+    if (!workspaceKey || !Object.prototype.hasOwnProperty.call(get().appearanceWorkspaceOverrides, workspaceKey)) return;
+    set((state) => {
+      const { [workspaceKey]: _discard, ...rest } = state.appearanceWorkspaceOverrides;
+      return { appearanceWorkspaceOverrides: rest };
+    });
     persist({ ...get() });
   },
 

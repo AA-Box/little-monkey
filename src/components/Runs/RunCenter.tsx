@@ -34,6 +34,7 @@ import { useT } from "../../lib/i18n";
 import { initializeRunStore, useRunStore } from "../../store/runStore";
 import { Button, IconButton, StatusPill, Tabs, type PillTone } from "../ui";
 import { RunCapsulePanel } from "./RunCapsulePanel";
+import { startRunCapsuleReplay } from "../../lib/runCapsuleReplay";
 
 interface RunCenterProps {
   onClose: () => void;
@@ -242,16 +243,21 @@ export function RunCenter({ onClose }: RunCenterProps) {
   }
 
   async function replaySafeCapsule() {
-    if (!selectedRunId || !daemonManaged) {
+    if (!selectedRunId || !selectedRun) {
       throw new Error(t("RunCapsule.replayEngineUnavailable"));
     }
     setActionBusy("capsule-replay");
     try {
-      // Never acknowledge side effects from the capsule surface. The daemon
-      // independently rechecks its durable mutation markers and refuses a
-      // retry if the frontend's conservative classifier missed a boundary.
-      await daemonRetry(selectedRunId, false);
-      await refresh();
+      if (daemonManaged) {
+        // Never acknowledge side effects from the capsule surface. The daemon
+        // independently rechecks its durable mutation markers and refuses a
+        // retry if the frontend's conservative classifier missed a boundary.
+        await daemonRetry(selectedRunId, false);
+        await refresh();
+      } else {
+        const replay = await startRunCapsuleReplay(selectedRun);
+        void replay.done.finally(() => void refresh());
+      }
     } finally {
       setActionBusy(null);
     }
@@ -422,7 +428,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
                   run={selectedRun}
                   events={events}
                   runs={runs}
-                  daemonManaged={daemonManaged}
+                  replayEngineAvailable
                   actionBusy={actionBusy !== null}
                   onReplay={replaySafeCapsule}
                 />

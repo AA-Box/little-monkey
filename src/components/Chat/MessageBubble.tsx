@@ -5,6 +5,8 @@ import { Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
+import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
+import WorkspaceImagePreview from "./WorkspaceImagePreview";
 import { useArtifactStore } from "../../store/artifactStore";
 import { useT } from "../../lib/i18n";
 import {
@@ -139,6 +141,21 @@ function buildAssistantMarkdownComponents(
 
   return {
     ...markdownComponents,
+    // Workspace-relative image references (`![chart](out/chart.png)`) can't
+    // load through a plain `<img>` — the webview has no filesystem origin to
+    // resolve them against — so they're rendered via `WorkspaceImagePreview`,
+    // which reads the file through the sandboxed `workspace_read_image`
+    // command into a data URL. This is how an image produced by a plotting
+    // script (or by the legacy workspace-writing image tool) previews inline
+    // when the model references it in prose. Absolute/URL/data srcs
+    // keep the default `<img>` untouched.
+    img: ({ src, alt }) => {
+      const srcString = typeof src === "string" ? src : undefined;
+      if (isWorkspaceImageSrc(srcString)) {
+        return <WorkspaceImagePreview path={srcString} alt={alt} />;
+      }
+      return <img src={srcString} alt={alt} />;
+    },
     pre: ({ children }) => {
       const onlyChild = Children.count(children) === 1 ? Children.only(children) : null;
       const codeProps = isValidElement(onlyChild)

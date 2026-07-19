@@ -9,6 +9,8 @@ import {
   parseClientImpactResponse,
   parseOpenApiDocument,
   parseYamlOrJson,
+  runGeneratedContractTests,
+  validateContractValue,
   type ApiContractDiffCallResult,
 } from "./apiContractDiff";
 
@@ -277,9 +279,11 @@ describe("diffApiDocuments", () => {
 
   it("computes an accurate breaking count and release-ready verdict", () => {
     const count = breakingChangeCount(changes);
+    const contractTests = runGeneratedContractTests(newDoc);
     expect(count).toBeGreaterThan(0);
-    expect(isReleaseReady(changes)).toBe(false);
-    expect(isReleaseReady(changes.filter((c) => c.severity === "non-breaking"))).toBe(true);
+    expect(isReleaseReady(changes, contractTests)).toBe(false);
+    expect(isReleaseReady(changes.filter((c) => c.severity === "non-breaking"), contractTests)).toBe(true);
+    expect(isReleaseReady([])).toBe(false);
   });
 
   it("returns no changes at all for a document diffed against itself", () => {
@@ -303,12 +307,30 @@ describe("generateMockResponses", () => {
 });
 
 describe("generateContractTestStub", () => {
-  it("renders a vitest skeleton asserting required request/response fields", () => {
+  it("renders complete runnable vitest cases with concrete request/response samples", () => {
     const doc = parseOpenApiDocument(NEW_JSON, "new.json");
     const stub = generateContractTestStub(doc);
     expect(stub).toContain("import { describe, expect, it } from 'vitest';");
     expect(stub).toContain("POST /widgets");
-    expect(stub).toContain('["name","sku"]');
+    expect(stub).toContain('"name": "string"');
+    expect(stub).not.toMatch(/TODO|samplePayload:\s*Record<string, unknown>\s*=\s*\{\}/);
+  });
+
+  it("executes every generated schema-backed case and requires a non-empty clean report", () => {
+    const doc = parseOpenApiDocument(NEW_JSON, "new.json");
+    const report = runGeneratedContractTests(doc);
+    expect(report.results.length).toBeGreaterThan(0);
+    expect(report.failCount).toBe(0);
+    expect(report.clean).toBe(true);
+  });
+
+  it("reports concrete schema violations instead of trusting a release-ready boolean", () => {
+    const errors = validateContractValue(
+      { name: "widget" },
+      { type: "object", properties: { name: { type: "string" }, sku: { type: "string" } }, required: ["name", "sku"] },
+      {},
+    );
+    expect(errors).toEqual(expect.arrayContaining([expect.stringMatching(/sku.*missing/i)]));
   });
 });
 
