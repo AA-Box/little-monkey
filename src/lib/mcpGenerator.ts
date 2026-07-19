@@ -352,13 +352,15 @@ fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 
 fs.writeFileSync(path.join(packageRoot, 'types.js'), "export const ListToolsRequestSchema='list-tools'; export const CallToolRequestSchema='call-tool'; export class McpError extends Error {} export const ErrorCode={InvalidParams:-32602,MethodNotFound:-32601};\n");
 fs.writeFileSync(path.join(packageRoot, 'server', 'stdio.js'), "export class StdioServerTransport {}\n");
 fs.writeFileSync(path.join(packageRoot, 'server', 'index.js'), serverStub);
-const typecheck = cp.spawnSync('tsc', ['--pretty', 'false', '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', 'server.mcp.ts', 'probe-globals.d.ts'], { cwd: probeRoot, encoding: 'utf8', timeout: 20000 });
+const typecheck = cp.spawnSync('tsc', ['--pretty', 'false', '--strict', '--skipLibCheck', '--target', 'ES2022', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', '--outDir', '.', 'server.mcp.ts', 'probe-globals.d.ts'], { cwd: probeRoot, encoding: 'utf8', timeout: 20000 });
 if (typecheck.error || typecheck.status !== 0) {
   process.stderr.write('TYPECHECK_FAILED\n' + (typecheck.error?.message || '') + (typecheck.stdout || '') + (typecheck.stderr || ''));
   process.exit(20);
 }
 console.log('LITTLE_MONKEY_MCP_TYPECHECK_OK');
-const runtime = cp.spawnSync(process.execPath, ['server.mcp.ts'], { cwd: probeRoot, encoding: 'utf8', timeout: 15000, env: { ...process.env, LITTLE_MONKEY_PROBE_SPEC: spec64 } });
+// Run the compiled JS rather than the .ts source: native TS execution support
+// varies by Node version (stable only on Node 23.6+), but CI/local both ship tsc.
+const runtime = cp.spawnSync(process.execPath, ['server.mcp.js'], { cwd: probeRoot, encoding: 'utf8', timeout: 15000, env: { ...process.env, LITTLE_MONKEY_PROBE_SPEC: spec64 } });
 process.stdout.write(runtime.stdout || '');
 process.stderr.write(runtime.stderr || '');
 if (runtime.error || runtime.status !== 0 || !(runtime.stdout || '').includes('${PROBE_OK_PREFIX}')) process.exit(21);
