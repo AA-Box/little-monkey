@@ -38,6 +38,7 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { compareLabLocale } from "./compareLab";
 
 export const en: Record<string, string> = {
   ...syntheticMonitoringLocale,
@@ -80,6 +81,7 @@ export const en: Record<string, string> = {
   ...crossRepoChangePlannerLocale,
   ...visualEditModeLocale,
   ...localAppsLocale,
+  ...compareLabLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Background Tasks",
