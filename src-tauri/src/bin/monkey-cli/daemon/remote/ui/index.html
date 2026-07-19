@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="dark light">
+    <meta name="theme-color" content="#0f172a">
+    <meta name="description" content="Securely inspect and control scoped Little Monkey runs on your own runner.">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
+    <title>Little Monkey Remote</title>
+    <link rel="manifest" href="/v1/remote/ui/manifest.webmanifest">
+    <link rel="icon" href="/v1/remote/ui/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/v1/remote/ui/app.css">
+    <script type="module" src="/v1/remote/ui/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to run controls</a>
+    <header class="topbar">
+      <div class="brand" aria-label="Little Monkey Remote">
+        <span class="brand-mark" aria-hidden="true">LM</span>
+        <span>
+          <strong>Little Monkey</strong>
+          <small>Remote runner</small>
+        </span>
+      </div>
+      <div class="connection" aria-live="polite">
+        <span id="connectionDot" class="connection-dot" aria-hidden="true"></span>
+        <span id="connectionText">Not paired</span>
+      </div>
+    </header>
+
+    <main id="main" class="page-shell">
+      <section id="pairingView" class="pairing-layout" aria-labelledby="pairingTitle">
+        <article class="hero-card">
+          <p class="eyebrow">Private by design</p>
+          <h1 id="pairingTitle">Control your runner, not your credentials.</h1>
+          <p class="hero-copy">
+            Pair this browser with a one-time invitation. Inference, provider keys, tools,
+            and workspace access stay on the runner.
+          </p>
+          <ul class="trust-list">
+            <li>Every command is HMAC-signed and replay protected.</li>
+            <li>The invitation freezes exact run, workspace, and action scopes.</li>
+            <li>The device key is stored as a non-exportable browser key.</li>
+          </ul>
+        </article>
+
+        <form id="pairingForm" class="panel pairing-card">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">One-time setup</p>
+              <h2>Pair this browser</h2>
+            </div>
+            <span class="step-pill">1 of 1</span>
+          </div>
+          <label for="deviceName">Device name</label>
+          <input id="deviceName" name="deviceName" autocomplete="nickname" maxlength="80" required placeholder="Ahmad's phone">
+
+          <label for="invitationFile">Pairing invitation</label>
+          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json" required>
+          <p class="field-help">Choose the protected JSON created by <code>remote pair-create</code>.</p>
+
+          <div id="invitationPreview" class="preview-card" hidden>
+            <dl>
+              <div><dt>Runner</dt><dd id="previewRunner">—</dd></div>
+              <div><dt>Expires</dt><dd id="previewExpiry">—</dd></div>
+              <div><dt>Actions</dt><dd id="previewActions">—</dd></div>
+              <div><dt>Certificate pin</dt><dd id="previewPin" class="mono wrap">—</dd></div>
+            </dl>
+          </div>
+
+          <button id="pairButton" class="button primary" type="submit">Pair securely</button>
+          <p class="security-note">
+            The web controller requires a browser-trusted HTTPS certificate. Use the native
+            CLI controller when exact certificate pin enforcement is required.
+          </p>
+        </form>
+      </section>
+
+      <section id="dashboardView" hidden>
+        <div class="dashboard-toolbar">
+          <div>
+            <p class="eyebrow">Scoped controller</p>
+            <h1>Runner activity</h1>
+            <p id="runnerIdentity" class="muted mono"></p>
+          </div>
+          <div class="toolbar-actions">
+            <button id="refreshButton" class="button secondary" type="button">Refresh</button>
+            <button id="killButton" class="button danger" type="button" hidden>Emergency stop</button>
+            <button id="forgetButton" class="button ghost" type="button">Forget browser</button>
+          </div>
+        </div>
+
+        <div class="workspace-grid">
+          <aside class="panel run-sidebar" aria-labelledby="runsTitle">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Visible scope</p>
+                <h2 id="runsTitle">Runs</h2>
+              </div>
+              <span id="runCount" class="count-pill">0</span>
+            </div>
+            <label class="search-label" for="runSearch">Filter runs</label>
+            <input id="runSearch" type="search" placeholder="Run, model, status" autocomplete="off">
+            <div id="runsList" class="runs-list" aria-live="polite"></div>
+            <p id="emptyRuns" class="empty-state">No scoped runs are visible yet.</p>
+          </aside>
+
+          <section class="detail-stack" aria-label="Selected run">
+            <article id="runPlaceholder" class="panel placeholder-card">
+              <span class="placeholder-mark" aria-hidden="true">LM</span>
+              <h2>Select a run</h2>
+              <p>Choose a scoped run to inspect its durable status, events, approvals, and artifacts.</p>
+            </article>
+
+            <div id="runDetail" hidden>
+              <article class="panel run-overview">
+                <div class="overview-header">
+                  <div>
+                    <p class="eyebrow">Durable run</p>
+                    <h2 id="detailRunId" class="mono wrap"></h2>
+                  </div>
+                  <span id="detailStatus" class="status-badge">Unknown</span>
+                </div>
+                <dl id="runFacts" class="facts-grid"></dl>
+                <div class="run-actions">
+                  <button id="cancelButton" class="button danger" type="button" hidden>Cancel run</button>
+                  <button id="reloadRunButton" class="button secondary" type="button">Reload details</button>
+                </div>
+              </article>
+
+              <article id="approvalsPanel" class="panel" hidden>
+                <div class="panel-heading compact">
+                  <div>
+                    <p class="eyebrow">Digest bound</p>
+                    <h2>Pending approvals</h2>
+                  </div>
+                  <span id="approvalCount" class="count-pill">0</span>
+                </div>
+                <div id="approvalsList" class="approvals-list"></div>
+              </article>
+
+              <article id="eventsPanel" class="panel">
+                <div class="panel-heading compact">
+                  <div>
+                    <p class="eyebrow">Replay cursor</p>
+                    <h2>Event timeline</h2>
+                  </div>
+                  <button id="eventsButton" class="button ghost compact-button" type="button">Check now</button>
+                </div>
+                <ol id="eventsList" class="events-list" aria-live="polite"></ol>
+                <p id="emptyEvents" class="empty-state">No durable events recorded.</p>
+              </article>
+
+              <article id="artifactPanel" class="panel" hidden>
+                <div class="panel-heading compact">
+                  <div>
+                    <p class="eyebrow">Verified handoff</p>
+                    <h2>Fetch artifact</h2>
+                  </div>
+                </div>
+                <form id="artifactForm" class="inline-form">
+                  <label for="artifactId">Artifact ID</label>
+                  <div class="input-action">
+                    <input id="artifactId" class="mono" required maxlength="160" placeholder="artifact-…">
+                    <button class="button secondary" type="submit">Verify and save</button>
+                  </div>
+                </form>
+              </article>
+
+              <details class="panel technical-details">
+                <summary>Run specification</summary>
+                <pre id="specJson" tabindex="0"></pre>
+              </details>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <dialog id="cancelDialog" aria-labelledby="cancelTitle">
+      <form id="cancelForm" method="dialog">
+        <p class="eyebrow">Explicit action</p>
+        <h2 id="cancelTitle">Cancel this run?</h2>
+        <p>Connection loss never cancels work. This sends one replay-safe cancellation request.</p>
+        <label for="cancelReason">Reason (optional)</label>
+        <textarea id="cancelReason" maxlength="500" rows="3" placeholder="Cancelled from remote controller"></textarea>
+        <div class="dialog-actions">
+          <button class="button ghost" value="close" type="submit">Keep running</button>
+          <button id="confirmCancelButton" class="button danger" value="confirm" type="submit">Request cancellation</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

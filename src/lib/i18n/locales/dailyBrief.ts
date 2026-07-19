@@ -1,0 +1,52 @@
+/**
+ * Daily Brief and Command Center (ROADMAP.md Phase 6) — English source of
+ * truth for the `DailyBriefPanel.*` / `AppMenu.dailyBrief` key namespace.
+ * Copied and spread into every other locale file, then every key below is
+ * overridden there with a real translation (see de.ts/fr.ts/etc.) — mirrors
+ * the structure every other feature locale slice in this directory uses.
+ */
+export const dailyBriefLocale: Record<string, string> = {
+  "AppMenu.dailyBrief": "Daily Brief",
+  "DailyBriefPanel.title": "Daily Brief",
+  "DailyBriefPanel.subtitle": "What needs you, what's running, and what's stale — before you dive in",
+  "DailyBriefPanel.close": "Close Daily Brief",
+  "DailyBriefPanel.refresh": "Refresh",
+  "DailyBriefPanel.generatedAt": "Updated {{time}}",
+  "DailyBriefPanel.loadError": "Some data may be out of date: {{error}}",
+  "DailyBriefPanel.runStatus.queued": "queued",
+  "DailyBriefPanel.runStatus.running": "running",
+  "DailyBriefPanel.runStatus.waiting_for_permission": "waiting for approval",
+  "DailyBriefPanel.runStatus.paused": "paused",
+  "DailyBriefPanel.runStatus.cancelling": "cancelling",
+  "DailyBriefPanel.runStatus.succeeded": "succeeded",
+  "DailyBriefPanel.runStatus.failed": "failed",
+  "DailyBriefPanel.runStatus.cancelled": "cancelled",
+  "DailyBriefPanel.runStatus.needs_reconciliation": "needs reconciliation",
+  "DailyBriefPanel.pendingApprovals.title": "Pending approvals",
+  "DailyBriefPanel.pendingApprovals.empty": "Nothing is waiting on you.",
+  "DailyBriefPanel.pendingApprovals.openInbox": "Respond in Agent Inbox",
+  "DailyBriefPanel.running.title": "Running agents & tasks",
+  "DailyBriefPanel.running.empty": "Nothing is currently running.",
+  "DailyBriefPanel.running.open": "Open in Run Center",
+  "DailyBriefPanel.failedJobs.title": "Failed scheduled jobs",
+  "DailyBriefPanel.failedJobs.empty": "No scheduled job has failed recently.",
+  "DailyBriefPanel.failedJobs.open": "Open in Settings › Automation",
+  "DailyBriefPanel.failedJobs.lastRun": "Last run {{time}} · {{status}}",
+  "DailyBriefPanel.failedJobs.status.error": "failed",
+  "DailyBriefPanel.failedJobs.status.denied": "denied",
+  "DailyBriefPanel.completed.title": "Recently completed",
+  "DailyBriefPanel.completed.empty": "Nothing has completed recently.",
+  "DailyBriefPanel.completed.open": "Open in Run Center",
+  "DailyBriefPanel.stale.title": "Stale tasks",
+  "DailyBriefPanel.stale.empty": "Nothing has gone stale.",
+  "DailyBriefPanel.stale.description": "No update in over {{hours}}h",
+  "DailyBriefPanel.stale.open": "Open in Run Center",
+  "DailyBriefPanel.connectors.title": "Connector highlights",
+  "DailyBriefPanel.connectors.empty": "No connector highlights are available yet.",
+  "DailyBriefPanel.connectors.open": "Open in Settings › MCP",
+  "DailyBriefPanel.runtime.title": "Homelab & runtime health",
+  "DailyBriefPanel.runtime.summary": "{{ready}} of {{total}} runtime driver(s) ready for inference",
+  "DailyBriefPanel.runtime.storage": "{{used}} used of {{quota}} model storage",
+  "DailyBriefPanel.runtime.open": "Open in Settings › Runtime Hub",
+  "DailyBriefPanel.runtime.error": "Runtime Hub overview failed to refresh: {{error}}",
+};

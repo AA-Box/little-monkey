@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window and secondary session windows opened via the session menu's \"Open in > Split view/New window\" (see system::open_session_window)",
+  "windows": ["main", "session-*"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "opener:default",
+    "shell:default",
+    "dialog:default",
+    "fs:default",
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$TEMP/**" }]
+    },
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$TEMP/**" }]
+    }
+  ]
+}

@@ -1,0 +1,232 @@
+{
+  "desktop": [
+    {
+      "schema_version": 1,
+      "event_id": "desktop-event-1",
+      "run_id": "desktop-fixture-run",
+      "sequence": 1,
+      "occurred_at_ms": 1000,
+      "actor_id": "fixture-actor",
+      "emitter": {
+        "client_id": "little-monkey-desktop",
+        "instance_id": "main-window",
+        "kind": "desktop",
+        "version": "fixture"
+      },
+      "event": { "type": "queued", "payload": { "queue": null } }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "desktop-event-2",
+      "run_id": "desktop-fixture-run",
+      "sequence": 2,
+      "occurred_at_ms": 1001,
+      "actor_id": "fixture-actor",
+      "emitter": {
+        "client_id": "little-monkey-desktop",
+        "instance_id": "main-window",
+        "kind": "desktop",
+        "version": "fixture"
+      },
+      "event": { "type": "started", "payload": { "engine_id": "desktop-engine" } }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "desktop-event-3",
+      "run_id": "desktop-fixture-run",
+      "sequence": 3,
+      "occurred_at_ms": 1002,
+      "actor_id": "fixture-actor",
+      "emitter": {
+        "client_id": "little-monkey-desktop",
+        "instance_id": "main-window",
+        "kind": "desktop",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "model_delta",
+        "payload": { "message_id": "desktop-message", "channel": "assistant", "text": "Hel" }
+      }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "desktop-event-4",
+      "run_id": "desktop-fixture-run",
+      "sequence": 4,
+      "occurred_at_ms": 1003,
+      "actor_id": "fixture-actor",
+      "emitter": {
+        "client_id": "little-monkey-desktop",
+        "instance_id": "main-window",
+        "kind": "desktop",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "model_delta",
+        "payload": { "message_id": "desktop-message", "channel": "assistant", "text": "lo" }
+      }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "desktop-event-5",
+      "run_id": "desktop-fixture-run",
+      "sequence": 5,
+      "occurred_at_ms": 1004,
+      "actor_id": "fixture-actor",
+      "emitter": {
+        "client_id": "little-monkey-desktop",
+        "instance_id": "main-window",
+        "kind": "desktop",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "usage_recorded",
+        "payload": {
+          "usage": {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "cached_input_tokens": 0,
+            "model_calls": 1,
+            "tool_calls": 0,
+            "cost_micros": null
+          }
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "desktop-event-6",
+      "run_id": "desktop-fixture-run",
+      "sequence": 6,
+      "occurred_at_ms": 1005,
+      "actor_id": "fixture-actor",
+      "emitter": {
+        "client_id": "little-monkey-desktop",
+        "instance_id": "main-window",
+        "kind": "desktop",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "completed",
+        "payload": {
+          "summary": "Desktop summary",
+          "result_artifact_ids": [],
+          "usage": {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "cached_input_tokens": 0,
+            "model_calls": 1,
+            "tool_calls": 0,
+            "cost_micros": null
+          }
+        }
+      }
+    }
+  ],
+  "cli": [
+    {
+      "schema_version": 1,
+      "event_id": "cli-event-1",
+      "run_id": "cli-fixture-run",
+      "sequence": 1,
+      "occurred_at_ms": 9000,
+      "actor_id": "recipe-fixture",
+      "emitter": {
+        "client_id": "monkey-cli",
+        "instance_id": "cli-fixture",
+        "kind": "cli",
+        "version": "fixture"
+      },
+      "event": { "type": "queued", "payload": { "queue": "cli-task" } }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "cli-event-2",
+      "run_id": "cli-fixture-run",
+      "sequence": 2,
+      "occurred_at_ms": 9001,
+      "actor_id": "recipe-fixture",
+      "emitter": {
+        "client_id": "monkey-cli",
+        "instance_id": "cli-fixture",
+        "kind": "cli",
+        "version": "fixture"
+      },
+      "event": { "type": "started", "payload": { "engine_id": "monkey-cli-task" } }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "cli-event-3",
+      "run_id": "cli-fixture-run",
+      "sequence": 3,
+      "occurred_at_ms": 9002,
+      "actor_id": "recipe-fixture",
+      "emitter": {
+        "client_id": "monkey-cli",
+        "instance_id": "cli-fixture",
+        "kind": "cli",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "model_delta",
+        "payload": { "message_id": "assistant-round-1", "channel": "assistant", "text": "Hello" }
+      }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "cli-event-4",
+      "run_id": "cli-fixture-run",
+      "sequence": 4,
+      "occurred_at_ms": 9003,
+      "actor_id": "recipe-fixture",
+      "emitter": {
+        "client_id": "monkey-cli",
+        "instance_id": "cli-fixture",
+        "kind": "cli",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "usage_recorded",
+        "payload": {
+          "usage": {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "cached_input_tokens": 0,
+            "model_calls": 1,
+            "tool_calls": 0,
+            "cost_micros": null
+          }
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "cli-event-5",
+      "run_id": "cli-fixture-run",
+      "sequence": 5,
+      "occurred_at_ms": 9004,
+      "actor_id": "recipe-fixture",
+      "emitter": {
+        "client_id": "monkey-cli",
+        "instance_id": "cli-fixture",
+        "kind": "cli",
+        "version": "fixture"
+      },
+      "event": {
+        "type": "completed",
+        "payload": {
+          "summary": "CLI summary",
+          "result_artifact_ids": [],
+          "usage": {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "cached_input_tokens": 0,
+            "model_calls": 1,
+            "tool_calls": 0,
+            "cost_micros": null
+          }
+        }
+      }
+    }
+  ]
+}

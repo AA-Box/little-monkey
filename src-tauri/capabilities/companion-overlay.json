@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "companion-overlay",
+  "description": "Reduced capability set for the explicit-consent companion overlay. It has no shell, filesystem, dialog, opener, or global-shortcut plugin access.",
+  "windows": ["companion-overlay"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}

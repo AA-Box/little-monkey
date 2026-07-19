@@ -1,0 +1,1 @@
+export { SyntheticMonitoringPanel } from "./SyntheticMonitoringPanel";

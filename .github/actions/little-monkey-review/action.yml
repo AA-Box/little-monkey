@@ -1,0 +1,62 @@
+name: Little Monkey local PR review
+description: Review a pull-request diff with user-owned Ollama compute on a self-hosted runner and update one deduplicated report comment.
+
+inputs:
+  model:
+    description: Ollama model available on the self-hosted runner.
+    required: true
+  ollama-url:
+    description: Loopback Ollama origin. Non-loopback hosts are refused.
+    required: false
+    default: http://127.0.0.1:11434
+  repository:
+    description: Exact owner/name repository. Defaults to the workflow repository.
+    required: false
+    default: ""
+  pr-number:
+    description: Pull request number. Defaults to the pull_request event.
+    required: false
+    default: ""
+  publish:
+    description: Whether to create/update the single report comment.
+    required: false
+    default: "true"
+  fail-on-blocking:
+    description: Fail the step after publishing when blocking findings exist.
+    required: false
+    default: "true"
+  max-diff-bytes:
+    description: Hard pull-request diff limit.
+    required: false
+    default: "8388608"
+
+outputs:
+  report-digest:
+    description: SHA-256 digest of the exact validated report.
+    value: ${{ steps.review.outputs.report-digest }}
+  report-path:
+    description: Private JSON report path on the self-hosted runner.
+    value: ${{ steps.review.outputs.report-path }}
+  audit-path:
+    description: Append-only JSONL audit path on the self-hosted runner.
+    value: ${{ steps.review.outputs.audit-path }}
+  comment-id:
+    description: Created or updated GitHub issue-comment database id.
+    value: ${{ steps.review.outputs.comment-id }}
+
+runs:
+  using: composite
+  steps:
+    - id: review
+      shell: bash
+      env:
+        RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        LM_REVIEW_MODEL: ${{ inputs.model }}
+        LM_OLLAMA_URL: ${{ inputs.ollama-url }}
+        LM_REPOSITORY: ${{ inputs.repository }}
+        LM_PR_NUMBER: ${{ inputs.pr-number }}
+        LM_PUBLISH: ${{ inputs.publish }}
+        LM_FAIL_ON_BLOCKING: ${{ inputs.fail-on-blocking }}
+        LM_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
+        GH_TOKEN: ${{ github.token }}
+      run: node "${{ github.action_path }}/review.mjs"

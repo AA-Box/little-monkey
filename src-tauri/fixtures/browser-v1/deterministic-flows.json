@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "flows": [
+    { "id": "form-basic", "text": "Ada", "scrollY": 100 },
+    { "id": "form-spaces", "text": "Grace Hopper", "scrollY": 180 },
+    { "id": "form-unicode", "text": "Linus λ", "scrollY": 260 },
+    { "id": "form-punctuation", "text": "hello-world_42", "scrollY": 340 },
+    { "id": "form-numeric", "text": "8675309", "scrollY": 420 },
+    { "id": "form-short", "text": "x", "scrollY": 500 },
+    { "id": "form-long", "text": "deterministic browser evidence", "scrollY": 580 },
+    { "id": "form-email-shape", "text": "user@example.test", "scrollY": 660 },
+    { "id": "form-quoted", "text": "say 'hello'", "scrollY": 740 },
+    { "id": "form-final", "text": "Little Monkey", "scrollY": 820 }
+  ]
+}
