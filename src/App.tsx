@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FileDiff, FolderTree, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, PanelRightClose, Plus, SquareTerminal, X } from "lucide-react";
+import { FileDiff, FolderTree, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import { ChatSessionList, ChatWindow, CompareView, CrewView, PrivacyFirewallGate } from "./components/Chat";
 import { AppMenu } from "./components/AppMenu";
@@ -1791,22 +1791,24 @@ setVisualEditModeOpen(false);
           )}
 
           {rightTabs.length === 0 ? (
-            <div className="flex flex-1 flex-col justify-center gap-1 p-3">
-              {RIGHT_TAB_KINDS.map((kind) => (
-                <button
-                  key={kind}
-                  type="button"
-                  disabled={(kind === "terminal" || kind === "review") && !primaryRoot(useWorkspaceStore.getState().roots)}
-                  onClick={() => openRightTab(kind)}
-                  className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
-                >
-                  <RightTabIcon kind={kind} size={16} />
-                  <span className="min-w-0 flex-1 truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
-                  <kbd className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-faint">
-                    {shortcutLabel(RIGHT_TAB_SHORTCUT_IDS[kind])}
-                  </kbd>
-                </button>
-              ))}
+            <div className="flex flex-1 flex-col items-center justify-center gap-1 p-3">
+              <div className="flex w-full max-w-[272px] flex-col gap-1">
+                {RIGHT_TAB_KINDS.map((kind) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    disabled={(kind === "terminal" || kind === "review") && !primaryRoot(useWorkspaceStore.getState().roots)}
+                    onClick={() => openRightTab(kind)}
+                    className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+                  >
+                    <RightTabIcon kind={kind} size={16} />
+                    <span className="min-w-0 flex-1 truncate">{t(RIGHT_TAB_LABEL_KEYS[kind])}</span>
+                    <kbd className="ml-3 shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-faint">
+                      {shortcutLabel(RIGHT_TAB_SHORTCUT_IDS[kind])}
+                    </kbd>
+                  </button>
+                ))}
+              </div>
             </div>
           ) : (
             <>
@@ -1879,7 +1881,7 @@ setVisualEditModeOpen(false);
                 {rightTabs.map((kind) => (
                   <div key={kind} className={`absolute inset-0 ${kind === activeRightTab ? "flex flex-col" : "hidden"}`}>
                     {kind === "review" ? (
-                      <ReviewPanel />
+                      <ReviewPanel onClose={() => closeRightTab("review")} />
                     ) : kind === "terminal" ? (
                       <TerminalPanel
                         chatSessionId={activeSessionId}
@@ -1895,10 +1897,14 @@ setVisualEditModeOpen(false);
                         compact
                       />
                     ) : kind === "sideTasks" ? (
-                      <SideTaskDrawer sessionId={activeSessionId} embedded />
+                      <SideTaskDrawer
+                        sessionId={activeSessionId}
+                        embedded
+                        onClose={() => closeRightTab("sideTasks")}
+                      />
                     ) : (
                       <div className={`flex h-full flex-col ${workspacePanelOpen ? "w-full" : "w-12"}`}>
-                        <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
+                        <div className="flex h-9 shrink-0 items-center justify-between gap-1 border-b border-border px-3">
                           {workspacePanelOpen && (
                             <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">
                               {t("App.workspacePanelTitle")}
@@ -1906,11 +1912,12 @@ setVisualEditModeOpen(false);
                           )}
                           <IconButton
                             size="sm"
-                            onClick={() => setWorkspacePanelOpen((prev) => !prev)}
-                            aria-label={workspacePanelOpen ? t("App.collapseWorkspacePanel") : t("App.expandWorkspacePanel")}
+                            onClick={() => closeRightTab("files")}
+                            aria-label={t("App.closeRightTab")}
+                            title={t("App.closeRightTab")}
                             className="ml-auto"
                           >
-                            {workspacePanelOpen ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
+                            <X size={16} />
                           </IconButton>
                         </div>
 

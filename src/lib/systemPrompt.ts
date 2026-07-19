@@ -489,3 +489,23 @@ export function buildSubagentSystemPrompt(
     'Complete the task, then reply with a final report of what you found or did. Your reply is returned to the coordinating agent, not shown directly to the user — do not ask questions; if you get blocked, report what you found and why you stopped, then stop.',
   ].join('\n');
 }
+
+/**
+ * The system-prompt section appended for an Ultracode turn (see
+ * `agentLoop.ts`'s `runAgentTurnBody`): a standing opt-in for multi-agent
+ * orchestration on the SAME model — the Claude Code "ultracode" semantics.
+ * Ultracode never fans the prompt out across different models; it tells this
+ * one model to decompose substantive work into `task`-tool subagent runs and
+ * to adversarially verify its own conclusions. The `task` tool is
+ * force-offered for Ultracode turns even when `settingsStore.subagentsEnabled`
+ * is off — selecting Ultracode IS the user's explicit opt-in to subagents for
+ * that turn (see `runAgentTurnBody`'s `toolsForSettings` call).
+ */
+export const ULTRACODE_SYSTEM_SECTION = [
+  '## Ultracode',
+  'Ultracode is on for this turn: the user has explicitly opted into multi-agent orchestration and maximum thoroughness. Producing the most exhaustive, correct answer takes priority over token cost.',
+  "- For every substantive task, decompose the work and delegate scoped subtasks via the `task` tool. Issue multiple `task` calls in the same turn so they run in parallel — use `explore`-profile subagents for research and investigation fan-out, and `code`-profile subagents for independent, disjoint implementation subtasks.",
+  '- Adversarially verify: before committing to a nontrivial finding or change, spawn independent subagents to try to refute it or to check it from a different angle (correctness, edge cases, callers you may have missed), and reconcile disagreements yourself.',
+  '- After the fan-out, ask what is still missing — an unexplored area, an unverified claim — and run another round if the answer is not "nothing".',
+  '- Work solo only on conversational replies or trivial mechanical edits.',
+].join('\n');

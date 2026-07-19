@@ -18,6 +18,7 @@ import {
   RotateCcw,
   Square,
   Upload,
+  X,
   XCircle,
 } from "lucide-react";
 
@@ -424,6 +425,10 @@ export interface SideTaskDrawerProps {
    * hosting region's own fullscreen toggle covers this case, so this
    * component doesn't need one of its own. */
   embedded?: boolean;
+  /** Closes the hosting tab. Only meaningful (and only rendered) when
+   * `embedded` — the standalone drawer closes via its own collapse toggle
+   * instead. */
+  onClose?: () => void;
 }
 
 /**
@@ -435,7 +440,7 @@ export interface SideTaskDrawerProps {
  * `App.tsx`'s own workspace-panel collapse idiom (`w-96` expanded / `w-12`
  * collapsed) for visual consistency with the app's other side panel.
  */
-export function SideTaskDrawer({ sessionId, embedded }: SideTaskDrawerProps) {
+export function SideTaskDrawer({ sessionId, embedded, onClose }: SideTaskDrawerProps) {
   const open = useSideTaskStore((state) => state.drawerOpen);
   const visualOpen = open || Boolean(embedded);
   const toggleDrawer = useSideTaskStore((state) => state.toggleDrawer);
@@ -560,6 +565,11 @@ export function SideTaskDrawer({ sessionId, embedded }: SideTaskDrawerProps) {
               aria-label={open ? "Collapse background tasks panel" : "Expand background tasks panel"}
             >
               {open ? <PanelRightClose size={16} /> : <PanelRight size={16} />}
+            </IconButton>
+          )}
+          {embedded && onClose && (
+            <IconButton size="sm" onClick={onClose} aria-label="Close background tasks panel">
+              <X size={16} />
             </IconButton>
           )}
         </div>
