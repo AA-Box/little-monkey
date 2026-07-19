@@ -1445,7 +1445,7 @@ export const hi: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "बियरर टोकन (वैकल्पिक)",
   "AddMcpServerForm.tokenPlaceholder": "बियरर टोकन पेस्ट करें…",
   "AddMcpServerForm.tokenHelpText": "आपके OS की कीचेन में सहेजा जाता है — mcp_servers.json में कभी नहीं लिखा जाता।",
-  "AddMcpServerForm.timeoutLabel": "टाइमआउट सेकंड में (वैकल्पिक, डिफ़ॉल्ट 60)",
+  "AddMcpServerForm.timeoutLabel": "टाइमआउट सेकंड में (वैकल्पिक)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "Stdio सर्वर आपकी मशीन पर चाइल्ड प्रोसेस के रूप में चलते हैं; HTTP सर्वर एक रिमोट एंडपॉइंट से कनेक्ट होते हैं।",
   "AddMcpServerForm.addButton": "सर्वर जोड़ें",
