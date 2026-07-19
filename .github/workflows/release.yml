@@ -58,6 +58,10 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      - name: Compile macOS Liquid icon (Assets.car)
+        if: startsWith(matrix.platform, 'macos')
+        run: pnpm icon:mac-liquid
+
       - name: Build and stage monkey-cli sidecar
         run: pnpm stage:cli
         env:
