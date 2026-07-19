@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "corpus_id": "little-monkey:knowledge-v2:retrieval-v1",
+  "minimum_hybrid_improvement_micros": 100000,
+  "chunks": [
+    {
+      "label": "rust-borrow-answer",
+      "text": "Rust error E0502 means an immutable borrow is still active when a mutable borrow begins. Shorten the immutable borrow scope before mutating.",
+      "vector": [0.0, 1.0]
+    },
+    {
+      "label": "rust-vector-decoy",
+      "text": "Garden irrigation schedules depend on soil drainage, shade, and seasonal rainfall.",
+      "vector": [1.0, 0.0]
+    },
+    {
+      "label": "sqlite-fts-answer",
+      "text": "SQLite FTS5 exposes BM25 lexical ranking. Reciprocal rank fusion can combine BM25 candidates with vector similarity.",
+      "vector": [0.0, 1.0]
+    },
+    {
+      "label": "sqlite-vector-decoy",
+      "text": "Mountain hiking plans should account for trail elevation, daylight, and changing weather.",
+      "vector": [1.0, 0.0]
+    },
+    {
+      "label": "ocr-citation-answer",
+      "text": "Low confidence OCR from a scanned PDF must retain its page citation and be visibly marked as inexact source text.",
+      "vector": [0.0, 1.0]
+    },
+    {
+      "label": "ocr-vector-decoy",
+      "text": "Sourdough fermentation time changes with starter strength and room temperature.",
+      "vector": [1.0, 0.0]
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "rust-e0502",
+      "query": "How do I fix Rust E0502 immutable and mutable borrow?",
+      "query_vector": [1.0, 0.0],
+      "relevant": { "rust-borrow-answer": 3 },
+      "k": 3
+    },
+    {
+      "case_id": "sqlite-hybrid",
+      "query": "How does SQLite FTS5 BM25 combine with vector retrieval?",
+      "query_vector": [1.0, 0.0],
+      "relevant": { "sqlite-fts-answer": 3 },
+      "k": 3
+    },
+    {
+      "case_id": "ocr-page-confidence",
+      "query": "Should low confidence OCR keep the scanned PDF page citation?",
+      "query_vector": [1.0, 0.0],
+      "relevant": { "ocr-citation-answer": 3 },
+      "k": 3
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "corpus_id": "little-monkey-ocr-acceptance-v1",
+  "minimum_character_accuracy_micros": 900000,
+  "low_confidence_threshold_micros": 800000,
+  "live_image": {
+    "media_type": "image/png",
+    "requested_page": 4,
+    "expected_text": "LITTLE MONKEY OCR 123",
+    "base64_fixture": "ocr-live-image-v1.b64",
+    "sha256": "8110c35a0e7fe12d6db8169cd8c333ffb5879af3fd03d8e9d9d86d437f54b49c"
+  },
+  "cases": [
+    {
+      "case_id": "invoice-total-page-3",
+      "asset_id": "ocr:maintained-invoice",
+      "requested_page": 3,
+      "expected_page": 3,
+      "expected_text": "Invoice total 1,250.00 SEK",
+      "expected_low_confidence": false,
+      "tsv": "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t1\t1\t1\t1\t1\t20\t40\t95\t24\t96.0\tInvoice\n5\t1\t1\t1\t1\t2\t125\t40\t54\t24\t95.0\ttotal\n5\t1\t1\t1\t1\t3\t190\t40\t104\t24\t94.0\t1,250.00\n5\t1\t1\t1\t1\t4\t306\t40\t48\t24\t93.0\tSEK\n"
+    },
+    {
+      "case_id": "review-reference-page-11",
+      "asset_id": "ocr:maintained-review",
+      "requested_page": 11,
+      "expected_page": 11,
+      "expected_text": "Review required: reference AB-2048",
+      "expected_low_confidence": true,
+      "tsv": "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t1\t2\t1\t1\t1\t22\t72\t84\t22\t78.0\tReview\n5\t1\t2\t1\t1\t2\t114\t72\t112\t22\t72.0\trequired:\n5\t1\t2\t1\t1\t3\t238\t72\t108\t22\t68.0\treference\n5\t1\t2\t1\t1\t4\t358\t72\t82\t22\t55.0\tAB-2O48\n"
+    },
+    {
+      "case_id": "relative-page-offset",
+      "asset_id": "ocr:maintained-offset",
+      "requested_page": 6,
+      "expected_page": 7,
+      "expected_text": "Approved on page seven",
+      "expected_low_confidence": false,
+      "tsv": "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t2\t1\t1\t1\t1\t18\t32\t106\t21\t91.0\tApproved\n5\t2\t1\t1\t1\t2\t136\t32\t27\t21\t92.0\ton\n5\t2\t1\t1\t1\t3\t175\t32\t48\t21\t90.0\tpage\n5\t2\t1\t1\t1\t4\t235\t32\t60\t21\t89.0\tseven\n"
+    }
+  ]
+}

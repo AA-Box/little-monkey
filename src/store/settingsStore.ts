@@ -1,0 +1,581 @@
+import { create } from "zustand";
+import {
+  DEFAULT_APPEARANCE_SETTINGS,
+  applyAppearance,
+  getStoredThemePreference,
+  isAccentColor,
+  isMotionPreference,
+  isTextScale,
+  isThemePreference,
+  type AccentColor,
+  type MotionPreference,
+  type TextScale,
+  type ThemePreference,
+} from "../lib/theme";
+
+/** localStorage key the full settings blob is persisted under after every mutation.
+ * Exported so tests can clear it and re-import the module to genuinely
+ * exercise `hydrate()`'s default-fallback path, rather than asserting
+ * against a store state a test set up by hand. */
+export const STORAGE_KEY = "little-monkey-automation-settings";
+
+/** How aggressively to reclaim context-window space once `contextTrimThreshold` is crossed. */
+export type ContextTrimStrategy = "trim" | "summarize";
+
+/** A user-entered (never assumed) request-rate ceiling for one provider, used only to warn — see `rateLimitTracker.ts`. */
+export interface ProviderRateLimit {
+  /** Requests per minute the user wants to be warned when approaching. */
+  rpm?: number;
+  /** Requests per day the user wants to be warned when approaching. */
+  rpd?: number;
+}
+
+export interface SettingsState {
+  /** UI theme choice. `system` follows the OS preference; the resolved value is applied to `data-theme`. */
+  themePreference: ThemePreference;
+  /** App accent color applied via root CSS variables. */
+  accentColor: AccentColor;
+  /** Global interface text scale applied to the root font-size. */
+  textScale: TextScale;
+  /** Motion preference for app transitions and animations. */
+  motionPreference: MotionPreference;
+  /** Strengthens borders and secondary text for easier scanning. */
+  highContrastEnabled: boolean;
+  /** Retry the next configured cloud provider when one errors before any content streams back. */
+  autoFailoverEnabled: boolean;
+  /** Auto-switch to a vision-capable model when an image is attached and the active one can't see. */
+  autoVisionSwitchEnabled: boolean;
+  /** Automatically compact conversation history once it crosses `contextTrimThreshold`. */
+  contextTrimEnabled: boolean;
+  /** Percent of the active model's context window that triggers a compaction (0-100). */
+  contextTrimThreshold: number;
+  /** "trim" drops the oldest messages instantly; "summarize" spends one extra model call to compact them into a note. */
+  contextTrimStrategy: ContextTrimStrategy;
+  /** Show a warning when a provider's tracked request rate approaches a user-entered cap. */
+  rateLimitWarningsEnabled: boolean;
+  /** Provider id -> user-entered rate ceiling. Empty/absent means "no cap configured, never warn for this provider". */
+  providerRateLimits: Record<string, ProviderRateLimit>;
+  /** "providerId:modelId" -> manual correction of the built-in vision-capability heuristic (see `visionModels.ts`). */
+  visionOverrides: Record<string, boolean>;
+  /** Provider id -> user-curated model allowlist for that provider's model list (e.g. the OpenRouter tab's picker). Absent/`showAll: true` means unfiltered. */
+  providerModelFilters: Record<string, ProviderModelFilter>;
+  /** How many finished checkpoints (see checkpoints.rs) to keep on disk before the oldest are pruned — passed as `checkpoint_begin`'s `max_keep` param. Range 5-100, default 20 (mirrors the backend's own `MAX_CHECKPOINTS` fallback). */
+  checkpointRetention: number;
+  /** Whether the `remember` tool is offered to the model this turn (see `agentLoop.ts`'s `TOOLS` filter). Default true. Turning this off is not amnesia: rules and previously-saved facts are still injected into every system prompt regardless — it only stops the agent from saving *new* facts on its own. Facts remain manually addable/editable/deletable in the Rules tab either way. */
+  memoryEnabled: boolean;
+  /** Whether the `web_fetch`/`web_search` tools are offered to the model this turn (see `agentLoop.ts`'s `toolsForSettings` filter). Default true — DuckDuckGo search needs no key, so web research works out of the box, and the permission prompt shown for every call is the real gate. Turning this off makes both tools invisible to the model (not merely denied), mirroring `memoryEnabled`'s "disabled = not offered" treatment of `remember`. */
+  webToolsEnabled: boolean;
+  /** Whether `runAgentTurnBody` auto-runs the current workspace's enabled verification commands (see `src-tauri/src/verify.rs`) after a turn that wrote files. Default false — running arbitrary configured shell automatically should be opt-in, mirroring `memoryEnabled`'s posture. This slice is report-only: results are appended as `[Verify]` notices, nothing is fed back to the model yet (that's a later slice's `verifyMaxRounds`). */
+  verifyEnabled: boolean;
+  /** How many times `runAgentTurnBody` will feed a failed verification command's output back to the model as a fix instruction and let the loop continue, before leaving the failure notice as-is. Range 0-3 (mirrors Aider's `max_reflections=3`); default 1. 0 means report-only — the same behavior as before this setting existed. */
+  verifyMaxRounds: number;
+  /** Whether `write_file`/`edit_file`/`run_shell` calls get an LLM-judged risk classification (low/medium/high + a short reason) attached to their permission prompt — see `riskJudge.ts`'s `classifyToolCall` and `agentLoop.ts`'s `runAgentTurnBody`. Default false: it costs one extra model call per mutating tool call. Purely advisory in every mode as of Phase 2 (docs/roadmap/p2-plan-act-safety.md) — turning this on changes what the permission prompt *shows*, never what gets auto-approved. */
+  riskAnnotationsEnabled: boolean;
+  /** Whether HTML artifacts render via the tier-2 `artifact://` protocol (`sandbox="allow-scripts"`, no `allow-same-origin` — an opaque, no-IPC, no-network origin; see `src-tauri/src/artifacts.rs`) so inline `<script>` tags actually run. Default true. When false, every artifact — including HTML with inline scripts — renders via tier-1 only (`<iframe sandbox="" srcdoc>`), where scripts are inert by construction; see `ArtifactPane.tsx`. */
+  artifactScriptsEnabled: boolean;
+  /** Whether `runTurnGuarded` (see `agentLoop.ts`) auto-opens the newest previewable artifact from a just-finished turn in `ArtifactPane`. Default false, mirroring `verifyEnabled`'s "automatically doing something on the user's behalf should be opt-in" posture — a user who didn't ask for a preview shouldn't have the workspace panel commandeered out from under them. Only artifacts produced by the turn that just completed are considered, never ones already sitting earlier in the transcript. */
+  artifactAutoPreview: boolean;
+  /** Whether the `task` tool (subagent delegation — see `subagent.ts`'s
+   * `runSubagentTask`) is offered to the model this turn (see
+   * `agentLoop.ts`'s `toolsForSettings` filter). Default false: a weak local
+   * model may misuse or loop on it, so this ships default-off exactly like
+   * `verifyEnabled` — "automatically doing something on the model's own
+   * initiative should be opt-in". Turning it off makes `task` invisible to
+   * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
+   * not offered" treatment of `remember`. */
+  subagentsEnabled: boolean;
+  /** Whether the model can invoke an installed skill on its own initiative
+   * (see `tools.ts`'s `SKILL_INVOKE_TOOL` and `agentLoop.ts`'s
+   * `toolsForSettings` filter), in addition to a user explicitly typing
+   * `/command`. Default false, same posture as `subagentsEnabled` —
+   * "automatically doing something on the model's own initiative should be
+   * opt-in". Turning it off makes both the `skill` tool AND the "## Available
+   * skills" catalog invisible to the model (not merely denied), mirroring
+   * `memoryEnabled`'s "disabled = not offered" treatment of `remember`;
+   * explicit `/command` invocation is unaffected either way. */
+  skillAutoInvokeEnabled: boolean;
+  /** How many `task` tool calls in the same round trip `runToolCallsForRound`
+   * (see `agentLoop.ts`) will run concurrently via its bounded promise pool —
+   * every other tool call in the round stays sequential regardless of this
+   * value (see that function's own doc comment). Range 1-4, default 2:
+   * mirrors `verifyMaxRounds`'s small-integer-range pattern. A value of 1
+   * behaves like slice 1/2 (subagents never overlap); permission-prompt
+   * storms from several concurrent `code`-profile subagents in manual mode
+   * are the reason this stays capped at 4 rather than "however many the
+   * model asks for" — see the design doc's "Permission-prompt storms" risk. */
+  maxConcurrentSubagents: number;
+  /** Optional per-profile provider-model override for subagent runs (slice
+   * 4) — resolved in `subagent.ts`'s `runSubagentTask`, which uses it INSTEAD
+   * of the parent turn's own resolved target for that one profile, e.g.
+   * running every `explore` subagent on a cheap/fast model while the parent
+   * conversation stays on something stronger. Keyed by profile; a profile
+   * absent from this map (the default, empty map) means "same target as the
+   * parent turn", exactly like slices 1-3 behaved before this setting
+   * existed. Deliberately provider-only (never `'local'`/`'ollama'`, unlike
+   * `ResolvedTarget` generally) — restricting the override to provider
+   * targets keeps the settings-panel picker to the same
+   * provider-then-model dropdown pair `visionOverrides` already uses,
+   * rather than a three-way target-kind picker for a minor v1 win (see the
+   * design doc's "keep this genuinely optional... don't force a UI" note). */
+  subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  /** Whether the Safe Desktop Control settings panel (see
+   * `src-tauri/src/desktop_control.rs` and `docs/safe-desktop-control-design.md`)
+   * is reachable at all. Default false — same "disabled = not offered"
+   * posture as `subagentsEnabled`/`skillAutoInvokeEnabled`: this is a
+   * research spike that can move the real mouse/keyboard on macOS, so it
+   * stays off until a user deliberately opts in, in addition to every
+   * backend-side gate (never-bypass, allowlist, per-action approval,
+   * emergency stop) already enforced regardless of this setting. */
+  desktopControlEnabled: boolean;
+
+  setAutoFailoverEnabled: (value: boolean) => void;
+  setAutoVisionSwitchEnabled: (value: boolean) => void;
+  setContextTrimEnabled: (value: boolean) => void;
+  setContextTrimThreshold: (value: number) => void;
+  setContextTrimStrategy: (value: ContextTrimStrategy) => void;
+  setRateLimitWarningsEnabled: (value: boolean) => void;
+  setProviderRateLimit: (providerId: string, limit: ProviderRateLimit) => void;
+  clearProviderRateLimit: (providerId: string) => void;
+  setVisionOverride: (key: string, value: boolean) => void;
+  clearVisionOverride: (key: string) => void;
+  setProviderModelShowAll: (providerId: string, showAll: boolean) => void;
+  toggleProviderModelSelected: (providerId: string, modelId: string) => void;
+  clearProviderModelSelection: (providerId: string) => void;
+  setCheckpointRetention: (value: number) => void;
+  setMemoryEnabled: (value: boolean) => void;
+  setWebToolsEnabled: (value: boolean) => void;
+  setVerifyEnabled: (value: boolean) => void;
+  setVerifyMaxRounds: (value: number) => void;
+  setRiskAnnotationsEnabled: (value: boolean) => void;
+  setArtifactScriptsEnabled: (value: boolean) => void;
+  setArtifactAutoPreview: (value: boolean) => void;
+  setSubagentsEnabled: (value: boolean) => void;
+  setSkillAutoInvokeEnabled: (value: boolean) => void;
+  setMaxConcurrentSubagents: (value: number) => void;
+  setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
+  clearSubagentProfileModel: (profile: 'explore' | 'code') => void;
+  setDesktopControlEnabled: (value: boolean) => void;
+  setThemePreference: (value: ThemePreference) => void;
+  setAccentColor: (value: AccentColor) => void;
+  setTextScale: (value: TextScale) => void;
+  setMotionPreference: (value: MotionPreference) => void;
+  setHighContrastEnabled: (value: boolean) => void;
+}
+
+/** A single per-profile subagent model override — see `subagentProfileModels`'s own doc comment. */
+export interface SubagentModelOverride {
+  providerId: string;
+  model: string;
+}
+
+/** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
+export interface ProviderModelFilter {
+  /** When true, every model for this provider is shown regardless of `selectedModelIds` — lets a user keep favorites checked while still browsing the full list. */
+  showAll: boolean;
+  /** Model ids the user has explicitly checked. Ignored while `showAll` is true, and also ignored (i.e. treated as "show everything") when empty, so a freshly-connected provider isn't curated down to nothing before the user has picked anything. */
+  selectedModelIds: string[];
+}
+
+/**
+ * Stable "no curation yet" fallback — must be a module-level constant, not a
+ * fresh object literal inlined in a selector, for the same reason
+ * `ProviderCard.tsx`'s `EMPTY_MODELS` is: a new object every render makes
+ * Zustand see a "changed" snapshot on every render and spin into an infinite
+ * re-render loop.
+ */
+export const DEFAULT_PROVIDER_MODEL_FILTER: ProviderModelFilter = { showAll: true, selectedModelIds: [] };
+
+const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
+/** Mirrors `MAX_CHECKPOINTS` in src-tauri/src/checkpoints.rs — the backend's
+ * own fallback when no `max_keep` is supplied, kept in sync here so the
+ * setting's default matches pre-existing behavior. */
+const DEFAULT_CHECKPOINT_RETENTION = 20;
+export const MIN_CHECKPOINT_RETENTION = 5;
+export const MAX_CHECKPOINT_RETENTION = 100;
+/** Mirrors Aider's `max_reflections=3` — see `verifyMaxRounds`'s doc comment. */
+const DEFAULT_VERIFY_MAX_ROUNDS = 1;
+export const MIN_VERIFY_MAX_ROUNDS = 0;
+export const MAX_VERIFY_MAX_ROUNDS = 3;
+/** See `maxConcurrentSubagents`'s own doc comment for why this range. */
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2;
+export const MIN_MAX_CONCURRENT_SUBAGENTS = 1;
+export const MAX_MAX_CONCURRENT_SUBAGENTS = 4;
+
+interface PersistedShape {
+  themePreference: ThemePreference;
+  accentColor: AccentColor;
+  textScale: TextScale;
+  motionPreference: MotionPreference;
+  highContrastEnabled: boolean;
+  autoFailoverEnabled: boolean;
+  autoVisionSwitchEnabled: boolean;
+  contextTrimEnabled: boolean;
+  contextTrimThreshold: number;
+  contextTrimStrategy: ContextTrimStrategy;
+  rateLimitWarningsEnabled: boolean;
+  providerRateLimits: Record<string, ProviderRateLimit>;
+  visionOverrides: Record<string, boolean>;
+  providerModelFilters: Record<string, ProviderModelFilter>;
+  checkpointRetention: number;
+  memoryEnabled: boolean;
+  webToolsEnabled: boolean;
+  verifyEnabled: boolean;
+  verifyMaxRounds: number;
+  riskAnnotationsEnabled: boolean;
+  artifactScriptsEnabled: boolean;
+  artifactAutoPreview: boolean;
+  subagentsEnabled: boolean;
+  skillAutoInvokeEnabled: boolean;
+  maxConcurrentSubagents: number;
+  subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
+  desktopControlEnabled: boolean;
+}
+
+function defaults(): PersistedShape {
+  return {
+    ...DEFAULT_APPEARANCE_SETTINGS,
+    themePreference: getStoredThemePreference(),
+    autoFailoverEnabled: true,
+    autoVisionSwitchEnabled: true,
+    contextTrimEnabled: true,
+    contextTrimThreshold: DEFAULT_CONTEXT_TRIM_THRESHOLD,
+    contextTrimStrategy: "summarize",
+    rateLimitWarningsEnabled: true,
+    providerRateLimits: {},
+    visionOverrides: {},
+    providerModelFilters: {},
+    checkpointRetention: DEFAULT_CHECKPOINT_RETENTION,
+    memoryEnabled: true,
+    webToolsEnabled: true,
+    verifyEnabled: false,
+    verifyMaxRounds: DEFAULT_VERIFY_MAX_ROUNDS,
+    riskAnnotationsEnabled: false,
+    artifactScriptsEnabled: true,
+    artifactAutoPreview: false,
+    subagentsEnabled: false,
+    skillAutoInvokeEnabled: false,
+    maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+    subagentProfileModels: {},
+    desktopControlEnabled: false,
+  };
+}
+
+/** Defensive per-entry validation for a persisted `subagentProfileModels` blob — same posture as `sanitizeProviderModelFilters` just above: one malformed/hand-edited entry must not corrupt the rest or crash hydration. */
+function sanitizeSubagentProfileModels(raw: unknown): Partial<Record<'explore' | 'code', SubagentModelOverride>> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Partial<Record<'explore' | 'code', SubagentModelOverride>> = {};
+  for (const profile of ['explore', 'code'] as const) {
+    const entry = (raw as Record<string, unknown>)[profile];
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as Partial<SubagentModelOverride>;
+    if (typeof candidate.providerId === "string" && candidate.providerId && typeof candidate.model === "string" && candidate.model) {
+      out[profile] = { providerId: candidate.providerId, model: candidate.model };
+    }
+  }
+  return out;
+}
+
+/** Defensive per-entry validation for a persisted `providerModelFilters` blob — one malformed entry (e.g. hand-edited localStorage) must not corrupt the rest. */
+function sanitizeProviderModelFilters(raw: unknown): Record<string, ProviderModelFilter> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, ProviderModelFilter> = {};
+  for (const [providerId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Partial<ProviderModelFilter>;
+    out[providerId] = {
+      showAll: typeof entry.showAll === "boolean" ? entry.showAll : true,
+      selectedModelIds: Array.isArray(entry.selectedModelIds)
+        ? entry.selectedModelIds.filter((id): id is string => typeof id === "string")
+        : [],
+    };
+  }
+  return out;
+}
+
+/** Loads the persisted settings blob, falling back to defaults for anything absent, corrupt, or malformed. */
+function hydrate(): PersistedShape {
+  const fallback = defaults();
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<PersistedShape> | null;
+    if (!parsed || typeof parsed !== "object") return fallback;
+    return {
+      themePreference: isThemePreference(parsed.themePreference) ? parsed.themePreference : fallback.themePreference,
+      accentColor: isAccentColor(parsed.accentColor) ? parsed.accentColor : fallback.accentColor,
+      textScale: isTextScale(parsed.textScale) ? parsed.textScale : fallback.textScale,
+      motionPreference: isMotionPreference(parsed.motionPreference) ? parsed.motionPreference : fallback.motionPreference,
+      highContrastEnabled:
+        typeof parsed.highContrastEnabled === "boolean" ? parsed.highContrastEnabled : fallback.highContrastEnabled,
+      autoFailoverEnabled: typeof parsed.autoFailoverEnabled === "boolean" ? parsed.autoFailoverEnabled : fallback.autoFailoverEnabled,
+      autoVisionSwitchEnabled:
+        typeof parsed.autoVisionSwitchEnabled === "boolean" ? parsed.autoVisionSwitchEnabled : fallback.autoVisionSwitchEnabled,
+      contextTrimEnabled: typeof parsed.contextTrimEnabled === "boolean" ? parsed.contextTrimEnabled : fallback.contextTrimEnabled,
+      contextTrimThreshold:
+        typeof parsed.contextTrimThreshold === "number" && parsed.contextTrimThreshold > 0 && parsed.contextTrimThreshold <= 100
+          ? parsed.contextTrimThreshold
+          : fallback.contextTrimThreshold,
+      contextTrimStrategy: parsed.contextTrimStrategy === "trim" || parsed.contextTrimStrategy === "summarize"
+        ? parsed.contextTrimStrategy
+        : fallback.contextTrimStrategy,
+      rateLimitWarningsEnabled:
+        typeof parsed.rateLimitWarningsEnabled === "boolean" ? parsed.rateLimitWarningsEnabled : fallback.rateLimitWarningsEnabled,
+      providerRateLimits:
+        parsed.providerRateLimits && typeof parsed.providerRateLimits === "object" ? parsed.providerRateLimits : fallback.providerRateLimits,
+      visionOverrides: parsed.visionOverrides && typeof parsed.visionOverrides === "object" ? parsed.visionOverrides : fallback.visionOverrides,
+      providerModelFilters: sanitizeProviderModelFilters(parsed.providerModelFilters),
+      checkpointRetention:
+        typeof parsed.checkpointRetention === "number" &&
+        parsed.checkpointRetention >= MIN_CHECKPOINT_RETENTION &&
+        parsed.checkpointRetention <= MAX_CHECKPOINT_RETENTION
+          ? Math.round(parsed.checkpointRetention)
+          : fallback.checkpointRetention,
+      memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
+      webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
+      verifyEnabled: typeof parsed.verifyEnabled === "boolean" ? parsed.verifyEnabled : fallback.verifyEnabled,
+      verifyMaxRounds:
+        typeof parsed.verifyMaxRounds === "number" &&
+        parsed.verifyMaxRounds >= MIN_VERIFY_MAX_ROUNDS &&
+        parsed.verifyMaxRounds <= MAX_VERIFY_MAX_ROUNDS
+          ? Math.round(parsed.verifyMaxRounds)
+          : fallback.verifyMaxRounds,
+      riskAnnotationsEnabled:
+        typeof parsed.riskAnnotationsEnabled === "boolean" ? parsed.riskAnnotationsEnabled : fallback.riskAnnotationsEnabled,
+      artifactScriptsEnabled:
+        typeof parsed.artifactScriptsEnabled === "boolean" ? parsed.artifactScriptsEnabled : fallback.artifactScriptsEnabled,
+      artifactAutoPreview:
+        typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
+      subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      skillAutoInvokeEnabled:
+        typeof parsed.skillAutoInvokeEnabled === "boolean" ? parsed.skillAutoInvokeEnabled : fallback.skillAutoInvokeEnabled,
+      maxConcurrentSubagents:
+        typeof parsed.maxConcurrentSubagents === "number" &&
+        parsed.maxConcurrentSubagents >= MIN_MAX_CONCURRENT_SUBAGENTS &&
+        parsed.maxConcurrentSubagents <= MAX_MAX_CONCURRENT_SUBAGENTS
+          ? Math.round(parsed.maxConcurrentSubagents)
+          : fallback.maxConcurrentSubagents,
+      subagentProfileModels: sanitizeSubagentProfileModels(parsed.subagentProfileModels),
+      desktopControlEnabled:
+        typeof parsed.desktopControlEnabled === "boolean" ? parsed.desktopControlEnabled : fallback.desktopControlEnabled,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/** Best-effort persist — a quota error or serialization issue must never throw into the caller. */
+function persist(state: PersistedShape): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore — persistence is best-effort.
+  }
+}
+
+const initial = hydrate();
+
+function applyCurrentAppearance(state: SettingsState): void {
+  applyAppearance({
+    themePreference: state.themePreference,
+    accentColor: state.accentColor,
+    textScale: state.textScale,
+    motionPreference: state.motionPreference,
+    highContrastEnabled: state.highContrastEnabled,
+  });
+}
+
+export const useSettingsStore = create<SettingsState>((set, get) => ({
+  ...initial,
+
+  setThemePreference: (value) => {
+    set({ themePreference: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setAccentColor: (value) => {
+    set({ accentColor: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setTextScale: (value) => {
+    set({ textScale: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setMotionPreference: (value) => {
+    set({ motionPreference: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setHighContrastEnabled: (value) => {
+    set({ highContrastEnabled: value });
+    applyCurrentAppearance(get());
+    persist({ ...get() });
+  },
+
+  setAutoFailoverEnabled: (value) => {
+    set({ autoFailoverEnabled: value });
+    persist({ ...get() });
+  },
+
+  setAutoVisionSwitchEnabled: (value) => {
+    set({ autoVisionSwitchEnabled: value });
+    persist({ ...get() });
+  },
+
+  setContextTrimEnabled: (value) => {
+    set({ contextTrimEnabled: value });
+    persist({ ...get() });
+  },
+
+  setContextTrimThreshold: (value) => {
+    const clamped = Math.min(100, Math.max(1, Math.round(value)));
+    set({ contextTrimThreshold: clamped });
+    persist({ ...get() });
+  },
+
+  setContextTrimStrategy: (value) => {
+    set({ contextTrimStrategy: value });
+    persist({ ...get() });
+  },
+
+  setRateLimitWarningsEnabled: (value) => {
+    set({ rateLimitWarningsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setProviderRateLimit: (providerId, limit) => {
+    set((state) => ({ providerRateLimits: { ...state.providerRateLimits, [providerId]: limit } }));
+    persist({ ...get() });
+  },
+
+  clearProviderRateLimit: (providerId) => {
+    set((state) => {
+      const { [providerId]: _discard, ...rest } = state.providerRateLimits;
+      return { providerRateLimits: rest };
+    });
+    persist({ ...get() });
+  },
+
+  setVisionOverride: (key, value) => {
+    set((state) => ({ visionOverrides: { ...state.visionOverrides, [key]: value } }));
+    persist({ ...get() });
+  },
+
+  clearVisionOverride: (key) => {
+    set((state) => {
+      const { [key]: _discard, ...rest } = state.visionOverrides;
+      return { visionOverrides: rest };
+    });
+    persist({ ...get() });
+  },
+
+  setProviderModelShowAll: (providerId, showAll) => {
+    set((state) => {
+      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, showAll } } };
+    });
+    persist({ ...get() });
+  },
+
+  toggleProviderModelSelected: (providerId, modelId) => {
+    set((state) => {
+      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+      const selectedModelIds = existing.selectedModelIds.includes(modelId)
+        ? existing.selectedModelIds.filter((id) => id !== modelId)
+        : [...existing.selectedModelIds, modelId];
+      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds } } };
+    });
+    persist({ ...get() });
+  },
+
+  clearProviderModelSelection: (providerId) => {
+    set((state) => {
+      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
+      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds: [] } } };
+    });
+    persist({ ...get() });
+  },
+
+  setCheckpointRetention: (value) => {
+    const clamped = Math.min(MAX_CHECKPOINT_RETENTION, Math.max(MIN_CHECKPOINT_RETENTION, Math.round(value)));
+    set({ checkpointRetention: clamped });
+    persist({ ...get() });
+  },
+
+  setMemoryEnabled: (value) => {
+    set({ memoryEnabled: value });
+    persist({ ...get() });
+  },
+
+  setWebToolsEnabled: (value) => {
+    set({ webToolsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setVerifyEnabled: (value) => {
+    set({ verifyEnabled: value });
+    persist({ ...get() });
+  },
+
+  setVerifyMaxRounds: (value) => {
+    const clamped = Math.min(MAX_VERIFY_MAX_ROUNDS, Math.max(MIN_VERIFY_MAX_ROUNDS, Math.round(value)));
+    set({ verifyMaxRounds: clamped });
+    persist({ ...get() });
+  },
+
+  setRiskAnnotationsEnabled: (value) => {
+    set({ riskAnnotationsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setArtifactScriptsEnabled: (value) => {
+    set({ artifactScriptsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setArtifactAutoPreview: (value) => {
+    set({ artifactAutoPreview: value });
+    persist({ ...get() });
+  },
+
+  setSubagentsEnabled: (value) => {
+    set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+
+  setSkillAutoInvokeEnabled: (value) => {
+    set({ skillAutoInvokeEnabled: value });
+    persist({ ...get() });
+  },
+
+  setMaxConcurrentSubagents: (value) => {
+    const clamped = Math.min(MAX_MAX_CONCURRENT_SUBAGENTS, Math.max(MIN_MAX_CONCURRENT_SUBAGENTS, Math.round(value)));
+    set({ maxConcurrentSubagents: clamped });
+    persist({ ...get() });
+  },
+
+  setSubagentProfileModel: (profile, override) => {
+    set((state) => ({ subagentProfileModels: { ...state.subagentProfileModels, [profile]: override } }));
+    persist({ ...get() });
+  },
+
+  clearSubagentProfileModel: (profile) => {
+    set((state) => {
+      const { [profile]: _discard, ...rest } = state.subagentProfileModels;
+      return { subagentProfileModels: rest };
+    });
+    persist({ ...get() });
+  },
+
+  setDesktopControlEnabled: (value) => {
+    set({ desktopControlEnabled: value });
+    persist({ ...get() });
+  },
+}));
+
+export default useSettingsStore;

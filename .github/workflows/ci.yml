@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+
+jobs:
+  frontend:
+    # TS/JS checks are platform-independent — one OS is enough, no reason to
+    # triplicate tsc/vitest/i18n-lint across the Rust test matrix below.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Frontend tests
+        run: pnpm test
+
+      - name: i18n key-lint
+        run: pnpm i18n:lint
+
+  rust-tests:
+    # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
+    # code — a single-OS CI job would silently never compile the arms that
+    # don't match its own target at all (cfg-gated blocks that don't match
+    # the runner's target are stripped before the compiler looks at them).
+    # Mirrors release.yml's platform set (minus the ARM runners, which only
+    # matter for release artifacts, not for compiling/testing).
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Windows leg was temporarily pinned to windows-2022 while
+        # chasing a STATUS_ENTRYPOINT_NOT_FOUND crash in `cargo test`; the
+        # actual root cause turned out to be image-independent (the Windows
+        # app manifest was only being embedded into [[bin]] targets, never
+        # into test binaries — fixed in src-tauri/build.rs), so the pin's
+        # rationale is gone and windows-latest is fine again.
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      # Keep target/ small enough for the 14 GB hosted-runner disk
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring
+
+      - name: Start a D-Bus Secret Service for keychain-backed tests
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          mkdir -p ~/.cache
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --replace --components=secrets)"
+          echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.os }}
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Rust tests
+        run: pnpm test:rust
