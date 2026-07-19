@@ -419,6 +419,18 @@ function App() {
     openRightTab("sideTasks");
   }, [openRightTab]);
 
+  // Staging a composer seed (a message bubble's "Start side task" fork
+  // button, a work-canvas node's delegate action) must also surface the
+  // panel that hosts the composer: the store only flags its own drawerOpen,
+  // but the right sidebar renders from App-local tab state, so without this
+  // bridge the seed would sit staged in a hidden tab. `openComposer` stages
+  // a fresh seed object on every call, so this fires per click even when a
+  // previous seed was never consumed.
+  const sideTaskComposerSeed = useSideTaskStore((state) => state.composerSeed);
+  useEffect(() => {
+    if (sideTaskComposerSeed) openBackgroundTasksPanel();
+  }, [sideTaskComposerSeed, openBackgroundTasksPanel]);
+
   const handleManagePrompts = useCallback(() => {
     openSettingsTab("prompts");
   }, [openSettingsTab]);
