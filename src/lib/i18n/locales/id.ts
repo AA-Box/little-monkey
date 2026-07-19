@@ -1446,7 +1446,7 @@ export const id: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "Token bearer (opsional)",
   "AddMcpServerForm.tokenPlaceholder": "Tempel token bearer…",
   "AddMcpServerForm.tokenHelpText": "Disimpan di gantungan kunci OS Anda — tidak pernah ditulis ke mcp_servers.json.",
-  "AddMcpServerForm.timeoutLabel": "Batas waktu dalam detik (opsional, default 60)",
+  "AddMcpServerForm.timeoutLabel": "Batas waktu dalam detik (opsional)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "Server stdio berjalan sebagai proses turunan di mesin Anda; server HTTP terhubung ke endpoint jarak jauh.",
   "AddMcpServerForm.addButton": "Tambah server",

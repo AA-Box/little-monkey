@@ -232,7 +232,7 @@ export function AddMcpServerForm({ draft, draftVersion = 0 }: AddMcpServerFormPr
               value={argsText}
               onChange={(event) => setArgsText(event.target.value)}
               placeholder={t("AddMcpServerForm.argsPlaceholder")}
-              rows={2}
+              rows={11}
               spellCheck={false}
               className="w-full resize-y rounded-md border border-border bg-surface px-2.5 py-1.5 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
             />

@@ -1445,7 +1445,7 @@ export const ja: Record<string, string> = {
   "AddMcpServerForm.tokenLabel": "ベアラートークン(任意)",
   "AddMcpServerForm.tokenPlaceholder": "ベアラートークンを貼り付け…",
   "AddMcpServerForm.tokenHelpText": "OSのキーチェーンに保存されます — mcp_servers.jsonには書き込まれません。",
-  "AddMcpServerForm.timeoutLabel": "タイムアウト(秒、任意、デフォルト60)",
+  "AddMcpServerForm.timeoutLabel": "タイムアウト(秒、任意)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
   "AddMcpServerForm.helpText": "stdioサーバーはお使いのマシン上で子プロセスとして実行されます。HTTPサーバーはリモートエンドポイントに接続します。",
   "AddMcpServerForm.addButton": "サーバーを追加",

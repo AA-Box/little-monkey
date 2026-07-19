@@ -587,10 +587,9 @@ export function SideTaskDrawer({ sessionId, embedded, onClose }: SideTaskDrawerP
 
           <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3">
             {!hasAnyTask && !composerOpen && (
-              <p className="p-2 text-xs text-faint">
-                No background tasks yet. Start a side task from a chat message or the + button above — agents the model
-                dispatches show up here too.
-              </p>
+              <div className="flex flex-1 flex-col items-center justify-center py-12 text-center">
+                <p className="text-xs text-faint">Background work appears here</p>
+              </div>
             )}
 
             {runningEntries.length > 0 && (
