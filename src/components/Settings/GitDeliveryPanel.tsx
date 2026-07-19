@@ -157,7 +157,6 @@ export function GitDeliveryPanel() {
         <div className="rounded-lg border border-dashed border-border p-8 text-center">
           <GitBranch className="mx-auto text-faint" size={24} />
           <p className="mt-2 text-xs text-muted">Git delivery is unavailable in the browser.</p>
-          <p className="mt-1 text-[11px] text-faint">Launch Little Monkey as a desktop app (<code>pnpm tauri dev</code> or the installed build) to manage worktrees, pushes, and PR reviews.</p>
         </div>
       </section>
     );
