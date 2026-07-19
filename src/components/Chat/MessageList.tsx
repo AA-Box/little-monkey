@@ -55,15 +55,14 @@ import {
   type VerifyNotice,
 } from "../../lib/agentLoop";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
-import { isBtwNotice, isCommandNotice, parseBtwNotice, parseCommandNotice, type BtwNotice, type CommandNotice } from "../../lib/slashCommands";
+import { isBtwNotice, isCommandNotice, parseCommandNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
 import { selectTurnStatus, useTurnStatusStore, type TurnStatus } from "../../store/turnStatusStore";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
 import { useCheckpointStore } from "../../store/checkpointStore";
 import { useRulesStore } from "../../store/rulesStore";
 import { useLocalAppsStore } from "../../store/localAppsStore";
-import MessageBubble, { markdownComponents, PROSE_CLASSES } from "./MessageBubble";
-import ReactMarkdown from "react-markdown";
+import MessageBubble from "./MessageBubble";
 import PlanCard from "./PlanCard";
 import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
@@ -102,7 +101,6 @@ type TimelineItem =
   | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
   | { kind: "notice"; key: string; text: string }
   | { kind: "command"; key: string; notice: CommandNotice }
-  | { kind: "btw"; key: string; notice: BtwNotice }
   | { kind: "checkpoint"; key: string; notice: CheckpointNotice; messageIndex: number }
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
@@ -260,11 +258,7 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         }
         return;
       }
-      if (isBtwNotice(msg)) {
-        const notice = parseBtwNotice(msg);
-        if (notice) items.push({ kind: "btw", key: `btw-${index}`, notice });
-        return;
-      }
+      if (isBtwNotice(msg)) return; // rendered in the floating Side Chat panel instead (SideChatPanel.tsx)
       if (isCommandNotice(msg)) {
         const notice = parseCommandNotice(msg);
         if (notice) items.push({ kind: "command", key: `command-${index}`, notice });
@@ -390,34 +384,6 @@ const NoticeRow = memo(function NoticeRow({ text }: { text: string }) {
   return (
     <div className="flex justify-center">
       <div className="max-w-[85%] rounded-md bg-surface-2 px-3 py-1 text-center text-xs text-faint">{text}</div>
-    </div>
-  );
-});
-
-/**
- * Renders a `/btw` side-question exchange — Claude-Desktop-style: the question
- * and its Markdown answer appear inline in the transcript, visually set apart
- * from the conversation proper (dashed border, "aside" label), because the
- * exchange is display-only and never sent to a model on later turns (see
- * `isBtwNotice` filtering in the wire builders).
- */
-const BtwRow = memo(function BtwRow({ notice }: { notice: BtwNotice }) {
-  return (
-    <div className="flex justify-start">
-      <div className={`max-w-[85%] overflow-hidden rounded-md border border-dashed px-3 py-2 ${
-        notice.ok ? "border-border bg-surface-2/50" : "border-danger bg-danger-soft"
-      }`}>
-        <div className="mb-1 flex items-baseline gap-2">
-          <span className="font-mono text-[11px] font-semibold text-faint">/btw</span>
-          <span className="text-xs font-medium text-muted">{notice.question}</span>
-        </div>
-        {notice.answer ? (
-          <div className={`${PROSE_CLASSES} text-xs`}>
-            <ReactMarkdown components={markdownComponents}>{notice.answer}</ReactMarkdown>
-          </div>
-        ) : null}
-        {!notice.done && <div className="mt-1 text-xs text-faint animate-pulse">…</div>}
-      </div>
     </div>
   );
 });
@@ -1043,9 +1009,6 @@ export default function MessageList({
             }
             if (item.kind === "command") {
               return <CommandRow key={item.key} notice={item.notice} />;
-            }
-            if (item.kind === "btw") {
-              return <BtwRow key={item.key} notice={item.notice} />;
             }
             if (item.kind === "checkpoint") {
               return (
