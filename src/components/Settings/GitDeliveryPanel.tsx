@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useState } from "react";
 import {
   Archive,
@@ -101,6 +102,7 @@ export function GitDeliveryPanel() {
   const createErrors = useMemo(() => validateCreateRequest(createRequest), [createRequest]);
 
   useEffect(() => {
+    if (!isTauri()) return;
     run(refreshRoots());
     run(store.refresh());
     run(store.refreshAuth());
@@ -147,6 +149,19 @@ export function GitDeliveryPanel() {
   }
 
   const diff = store.inspection?.diffs[diffKind];
+
+  if (!isTauri()) {
+    return (
+      <section className="flex min-h-0 flex-col gap-4" aria-labelledby="git-delivery-title">
+        <h3 id="git-delivery-title" className="text-sm font-semibold text-foreground">Git delivery and local PR review</h3>
+        <div className="rounded-lg border border-dashed border-border p-8 text-center">
+          <GitBranch className="mx-auto text-faint" size={24} />
+          <p className="mt-2 text-xs text-muted">Git delivery is unavailable in the browser.</p>
+          <p className="mt-1 text-[11px] text-faint">Launch Little Monkey as a desktop app (<code>pnpm tauri dev</code> or the installed build) to manage worktrees, pushes, and PR reviews.</p>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="flex min-h-0 flex-col gap-4" aria-labelledby="git-delivery-title">
