@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Rows3,
   Search,
+  X,
 } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
@@ -240,7 +241,7 @@ function FileDiff({ file, layout, expanded, onToggle, t }: {
  * unmodified runs, unified/split layouts, a filterable file list, and a
  * compare-URL "Create PR" hand-off. Read-only over `git_review`.
  */
-export function ReviewPanel() {
+export function ReviewPanel({ onClose }: { onClose?: () => void }) {
   const { t } = useT();
   const [review, setReview] = useState<ReviewPayload | null>(null);
   const [loading, setLoading] = useState(false);
@@ -388,6 +389,11 @@ export function ReviewPanel() {
         >
           {layout === "unified" ? <Columns2 size={14} /> : <Rows3 size={14} />}
         </IconButton>
+        {onClose && (
+          <IconButton size="sm" variant="ghost" onClick={onClose} aria-label={t("App.closeRightTab")} title={t("App.closeRightTab")}>
+            <X size={14} />
+          </IconButton>
+        )}
         <IconButton
           size="sm"
           variant={filesPaneOpen ? "secondary" : "ghost"}

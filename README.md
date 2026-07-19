@@ -10,12 +10,22 @@ The current working tree includes the shipped foundations described below. Some 
 
 - Chat with managed `llama.cpp`, Ollama, MLX, or configured cloud/BYOK providers, with capability-aware routing, provider failover, context compaction, usage accounting, and rate-limit warnings.
 - Compare one frozen prompt across two-to-four explicit local, Ollama, or provider targets with independent streaming, stop, retry, timing, usage, persistence, and response promotion. Compare runs default to no tools and keep their target snapshots even if global model settings change.
+- Pick a 6th "Ultracode" stop on the per-turn reasoning-effort slider (Default/Light/Medium/High/Extra/Max/Ultracode). Ultracode is frontend-only state — it never touches the Rust-validated effort-level wire type — and auto-fans that one turn across up to four available models through the same Compare pipeline, then auto-fires a synthesis pass once the branches settle, landing in the normal Compare/Synthesis view.
 - Run saved Crew chats with a coordinator and bounded parallel persona members. Member transcripts remain isolated, coordinator synthesis is explicit, actor usage is attributed, and cancel-all reaches outstanding members.
+- Ask a one-off `/btw` side question against the current transcript without adding it to the conversation. The exchange renders as a distinct aside notice, records no session usage, and every wire builder (agent loop, Compare, Crew) strips it before building later turns, so neither the question nor its answer ever reaches a model again.
 - Keep multiple sessions, forks, groups, and a two-pane split view with independent streams.
 - Attach files, folders, and images; reference workspace paths with `@`; select personas and knowledge stacks; and invoke skills with `/`.
 - Search active and archived chats, messages, tool output, artifacts, and durable runs with date, model, persona, and workspace filters.
 - Export a session as Markdown, JSON, or Word (`.docx`), translate individual messages or a whole thread while retaining the original, and create versioned portable backups.
 - Create encrypted local snapshots with retention, preflight imports before changing live state, and use encrypted WebDAV backup with conflict copies and launch-time catch-up. Reliable unattended backup moves through the installed daemon.
+
+### Workspace: files, review, terminal, and browser
+
+- Work across five right-sidebar tabs — workspace files, code review, terminal, in-app browser, and background tasks — opened as chips that all stay mounted, so switching tabs never loses state. A region-wide fullscreen toggle and one shared, drag-resizable, persisted width apply to the whole tab strip, and each tab has its own keyboard shortcut.
+- Review changes in a git-backed panel (real `git` porcelain output) listing every changed file with a per-file diff view, PR-aware.
+- Run a real terminal: keystrokes go straight to the PTY through an embedded xterm.js emulator, so the actual shell supplies its own prompt, colors, line editing, history, and completions instead of a simulated line-output view. A session auto-starts per workspace, and the panel supports dock-right, drag-to-resize, and fullscreen.
+- Browse the web from an in-app tabbed browser pane — real child webviews with a tab strip, favicons/loading state, a smart address bar (URL/localhost/search), back/forward/reload, and `window.open` reopened as a new tab. Only `http:`/`https:`/`about:` load, and remote pages get no Tauri IPC surface. This is a general browsing pane for the user, separate from the disposable, artifact-recording session under **Settings → Browser Verification** used for agent-driven testing.
+- Track live background work — side tasks and `task`-tool subagents — from a "N running tasks" pill above the composer that opens a Background Tasks panel: Running and collapsed "Finished N" sections, a per-card stop control, token/tool-use counts, and an inline transcript view. A live elapsed/tokens/thinking-or-tool status line follows the active turn, and two or more parallel subagent calls in one turn collapse into a single group card with per-agent status dots; each subagent run cancels independently without stopping the parent turn.
 
 ### Agent tools and safety
 
@@ -102,6 +112,7 @@ Review the requested scope. Report evidence, severity, and a concrete fix.
 - Queue immutable recipe/workflow runs with idempotency keys, budgets, approval waits, pause/resume, attach/detach, cancellation, retry, crash recovery, orphan detection, owned worktrees, and a durable global kill switch.
 - Configure persistent cron, filesystem, signed webhook, and GitHub triggers with replay protection and deduplication.
 - Pair a user-owned remote runner over direct/Tailscale/SSH-forwarded HTTPS with pinned TLS, mutually scoped credentials, rotation/revocation, replay protection, and audit history. A responsive controller can view events, inspect bounded artifacts, approve digest-bound requests, cancel runs, or engage the kill switch only when its invitation grants that exact action. Inference, tools, workspaces, and provider keys remain on the runner; Little Monkey operates no relay.
+- Grant a paired controller a scoped Control Desktop action — real mouse/keyboard input on macOS, Windows, and Linux/X11 (Linux/Wayland fails closed with an explicit unsupported message). Every action is gated by local consent: per-action approval by default, or batch mode only when both the remote request and the local operator agree. A cross-process session lock stops the local app and the daemon from ever driving input at once, periodic screenshots are recorded to the run ledger, and revoking a device or engaging the kill switch force-stops its live session immediately.
 
 ### Multimodal desktop companion
 
@@ -125,6 +136,7 @@ The chat composer autocompletes built-ins, saved prompt/persona commands, native
 | `/compact` | Compact older completed turns. |
 | `/stop` | Cancel the active turn. |
 | `/usage` | Show reported token usage for the chat. |
+| `/btw question` | Ask a quick side question that never joins the conversation. |
 | `/learn command \| instructions` | Create a quarantined skill proposal for review. |
 | `/<installed-skill> [request]` | Freeze and apply an installed skill to this turn. Up to five may be stacked. |
 
@@ -315,6 +327,7 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - Hardware-fit estimates and runtime controls are implemented, but the roadmap's plus-or-minus-15% memory matrix, clean-machine lifecycle checks, and MLX release gate still need maintained physical reference hardware.
 - VS Code completion requires a real installed Ollama model that advertises `insert`; the latency/compile gate cannot be claimed on a machine without one.
 - Browser verification uses disposable profiles. Persistent authenticated profiles, file transfer, clipboard, browser extensions, and general host-computer control remain intentionally out of scope.
+- The Windows and Linux/X11 Control Desktop input backends compile and their pure helper logic (Wayland detection, consent-dialog parsing, UTF-16 handling) is tested, but neither has had a full runtime pass on real Windows or Linux hardware yet — that verification remains a release gate, not a completed claim. The in-app browser pane also relies on Tauri's unstable multiwebview API.
 - GitHub delivery needs local `git` plus authenticated `gh`; hosted Actions need user-supplied provider credentials, while Ollama review needs a user-owned self-hosted runner.
 - The local OCR, speech, meeting, and image paths require configured binaries/models/endpoints. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no Little Monkey relay, account service, RBAC/SSO plane, or hosted GPU.
@@ -322,7 +335,7 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 
 ## Project layout
 
-- `src/` — React UI, Zustand stores, chat/Compare/Crew flows, portability/search, durable run clients, skills/slash commands, and Settings panels.
+- `src/` — React UI, Zustand stores, chat/Compare/Crew flows, the workspace sidebar (files, review, terminal, in-app browser, background tasks), portability/search, durable run clients, skills/slash commands, and Settings panels.
 - `src-tauri/src/` — Rust model/runtime, permission, workspace, run ledger, assets, Knowledge 2.0, packages/workflows, browser, Git delivery, daemon bridge, companion, and Security Doctor services exposed through Tauri commands.
 - `src-tauri/src/bin/monkey-cli/` — terminal chat/REPL, ACP, model management, workflows, skills/plugins/security, daemon, remote-controller, stacks, tasks, and shared headless tooling.
 - `extensions/little-monkey-vscode/` and `extensions/little-monkey-jetbrains/` — thin IDE clients.

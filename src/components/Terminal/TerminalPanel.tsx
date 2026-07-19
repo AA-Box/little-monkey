@@ -331,15 +331,17 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
             </IconButton>
           </>
         )}
-        <IconButton
-          size="sm"
-          variant="ghost"
-          onClick={() => setDock(dock === "bottom" ? "right" : "bottom")}
-          aria-label={t(dock === "bottom" ? "TerminalPanel.dockRight" : "TerminalPanel.dockBottom")}
-          title={t(dock === "bottom" ? "TerminalPanel.dockRight" : "TerminalPanel.dockBottom")}
-        >
-          {dock === "bottom" ? <PanelRight size={14} /> : <PanelBottom size={14} />}
-        </IconButton>
+        {!embedded && (
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={() => setDock(dock === "bottom" ? "right" : "bottom")}
+            aria-label={t(dock === "bottom" ? "TerminalPanel.dockRight" : "TerminalPanel.dockBottom")}
+            title={t(dock === "bottom" ? "TerminalPanel.dockRight" : "TerminalPanel.dockBottom")}
+          >
+            {dock === "bottom" ? <PanelRight size={14} /> : <PanelBottom size={14} />}
+          </IconButton>
+        )}
         {!hideFullscreenButton && (
           <IconButton
             size="sm"

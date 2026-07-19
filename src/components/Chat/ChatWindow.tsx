@@ -9,7 +9,6 @@ import { compactSessionNow, runAgentTurn, stopTurn } from "../../lib/agentLoop";
 import type { AttachmentRef } from "../../lib/agentLoop";
 import { startComparison } from "../../lib/compareRunner";
 import { startCrew } from "../../lib/crewRunner";
-import { startUltracode } from "../../lib/ultracodeRunner";
 import type { ModelTargetSnapshot } from "../../lib/modelTargets";
 import { isImagePath, readImageAsDataUrl } from "../../lib/imageAttachment";
 import { textContent } from "../../lib/llamaClient";
@@ -62,6 +61,8 @@ import {
   type BuiltInSlashCommandName,
 } from "../../lib/slashCommands";
 import { runSideQuestion, stopSideQuestion } from "../../lib/sideQuestion";
+import { useSideChatStore } from "../../store/sideChatStore";
+import SideChatPanel from "./SideChatPanel";
 import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
 import { mcpToolDefs } from "../../lib/mcpTools";
 import { useSettingsStore } from "../../store/settingsStore";
@@ -158,6 +159,50 @@ function findSlashRange(text: string, cursor: number): { start: number; query: s
   if (/\s/.test(query)) return null; // whitespace between "/" and cursor — the leading token ended
 
   return { start, query };
+}
+
+/**
+ * Splits the composer text into segments so recognized leading slash-command
+ * tokens can be tinted in the input. Mirrors the send-path parsers exactly:
+ * a built-in only counts as the whole first token (`parseBuiltInSlashCommand`)
+ * while installed skills may stack (`parseSkillTurn`). Unknown leading
+ * "/text" stays untinted — it is probably a path — so the tint doubles as
+ * feedback that the token actually resolved. Returns `null` when nothing
+ * highlights so the textarea can skip the overlay entirely.
+ */
+function splitCommandSegments(
+  text: string,
+  skillCommands: ReadonlySet<string>,
+): { text: string; command: boolean }[] | null {
+  const first = text.search(/\S/);
+  if (first === -1 || text[first] !== "/") return null;
+
+  const spans: { start: number; end: number }[] = [];
+  if (parseBuiltInSlashCommand(text)) {
+    const rel = text.slice(first).search(/\s/);
+    spans.push({ start: first, end: rel < 0 ? text.length : first + rel });
+  } else {
+    let cursor = first;
+    while (text[cursor] === "/") {
+      const rel = text.slice(cursor).search(/\s/);
+      const end = rel < 0 ? text.length : cursor + rel;
+      if (!skillCommands.has(text.slice(cursor + 1, end).toLowerCase())) break;
+      spans.push({ start: cursor, end });
+      cursor = end;
+      while (cursor < text.length && /\s/.test(text[cursor])) cursor += 1;
+    }
+  }
+  if (spans.length === 0) return null;
+
+  const segments: { text: string; command: boolean }[] = [];
+  let pos = 0;
+  for (const span of spans) {
+    if (span.start > pos) segments.push({ text: text.slice(pos, span.start), command: false });
+    segments.push({ text: text.slice(span.start, span.end), command: true });
+    pos = span.end;
+  }
+  if (pos < text.length) segments.push({ text: text.slice(pos), command: false });
+  return segments;
 }
 
 /**
@@ -284,7 +329,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [compareTargets, setCompareTargets] = useState<ModelTargetSnapshot[]>([]);
   const [startingCrew, setStartingCrew] = useState(false);
   const [crewId, setCrewId] = useState<string | null>(null);
-  const [startingUltracode, setStartingUltracode] = useState(false);
   const [ultracodeMode, setUltracodeMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
@@ -439,6 +483,25 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       return [];
     }
   }, [input, availableSkills]);
+  const skillCommandSet = useMemo(
+    () => new Set(availableSkills.map((skill) => skill.command.toLowerCase())),
+    [availableSkills],
+  );
+  // When set, the textarea renders its own text transparent and this overlay
+  // paints the same text on top with recognized command tokens in accent.
+  const commandSegments = useMemo(
+    () => splitCommandSegments(input, skillCommandSet),
+    [input, skillCommandSet],
+  );
+  const commandOverlayRef = useRef<HTMLDivElement>(null);
+  const syncCommandOverlayScroll = useCallback(() => {
+    const overlay = commandOverlayRef.current;
+    const el = textareaRef.current;
+    if (overlay && el) overlay.scrollTop = el.scrollTop;
+  }, []);
+  useEffect(() => {
+    syncCommandOverlayScroll();
+  }, [input, commandSegments, syncCommandOverlayScroll]);
   const activePackageRuleCount = useMemo(
     () => activePluginSnapshots.reduce(
       (total, snapshot) => total + (snapshot.manifest.kind === "assistant"
@@ -657,6 +720,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     text: string,
     pendingAttachments: AttachmentRef[],
     skillInvocations: SkillInvocationSnapshot[] = [],
+    // Ultracode (see `EffortSelector.tsx`): the SAME single-model turn, with
+    // the agent loop layering its multi-agent-orchestration system section on
+    // top and force-offering the `task` tool — never a multi-model fan-out.
+    ultracode = false,
   ) => {
     setError(null);
 
@@ -667,7 +734,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // draws `skillInvocations` from) lets the turn's `skill` tool auto-invoke
     // any skill not already explicitly invoked above — see
     // `settingsStore.skillAutoInvokeEnabled`.
-    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills)
+    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
       .catch((err: unknown) => {
         setError(err instanceof Error ? err.message : String(err));
       })
@@ -705,9 +772,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       return;
     }
     if (command === "btw") {
-      if (!commandArguments) {
-        throw new Error("Use /btw question — the answer is shown here but never added to the conversation.");
-      }
+      useSideChatStore.getState().open(sessionId);
+      if (!commandArguments) return;
       await runSideQuestion(sessionId, commandArguments);
       return;
     }
@@ -847,7 +913,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       });
       return;
     }
-    if (sending || startingComparison || startingCrew || startingUltracode || preparingTurnRef.current) return;
+    if (sending || startingComparison || startingCrew || preparingTurnRef.current) return;
 
     preparingTurnRef.current = true;
     setPreparingTurn(true);
@@ -864,22 +930,6 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setPreparingTurn(false);
 
     const pendingAttachments = attachments;
-    if (ultracodeMode) {
-      setError(null);
-      setStartingUltracode(true);
-      try {
-        await startUltracode(sessionId, text, pendingAttachments, skillInvocations);
-        setInput("");
-        setAttachments([]);
-        requestAnimationFrame(resizeTextarea);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setStartingUltracode(false);
-        textareaRef.current?.focus();
-      }
-      return;
-    }
     if (crewId) {
       setError(null);
       setStartingCrew(true);
@@ -916,8 +966,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setInput("");
     setAttachments([]);
     requestAnimationFrame(resizeTextarea);
-    sendTurn(text, pendingAttachments, skillInvocations);
-  }, [input, sending, startingComparison, startingCrew, startingUltracode, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice]);
+    // Ultracode rides the normal single-turn path — the flag only changes
+    // what the agent loop layers into the system prompt and tool list.
+    sendTurn(text, pendingAttachments, skillInvocations, ultracodeMode);
+  }, [input, sending, startingComparison, startingCrew, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice]);
 
   const handleStop = useCallback(() => {
     stopTurn(sessionId);
@@ -1008,7 +1060,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           throw new Error("This chat started another turn while plugin instructions were being verified.");
         }
         useSessionStore.getState().truncateFromIndex(sessionId, lastUserIndex);
-        sendTurn(text, imageAttachments, skillInvocations);
+        // Ultracode is sticky for the chat (see EffortSelector), so a retry
+        // keeps it — same flag the original send carried.
+        sendTurn(text, imageAttachments, skillInvocations, ultracodeMode);
       })
       .catch((turnError: unknown) => {
         setError(turnError instanceof Error ? turnError.message : String(turnError));
@@ -1017,7 +1071,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         preparingTurnRef.current = false;
         setPreparingTurn(false);
       });
-  }, [sending, prepareTurnInstructions, sendTurn, sessionId]);
+  }, [sending, prepareTurnInstructions, sendTurn, sessionId, ultracodeMode]);
 
   const closeMentionPopup = useCallback(() => {
     setMentionQuery(null);
@@ -1266,7 +1320,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             setUltracodeMode(false);
           }
         }}
-        disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
+        disabled={sending || preparingTurn || startingComparison || startingCrew}
         placement={headerActionsSlot ? "down" : "up"}
       />
       <CrewPicker
@@ -1278,7 +1332,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             setUltracodeMode(false);
           }
         }}
-        disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
+        disabled={sending || preparingTurn || startingComparison || startingCrew}
         placement={headerActionsSlot ? "down" : "up"}
       />
     </>
@@ -1306,8 +1360,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
             <span className="min-w-0 break-words">{error}</span>
             <button
               type="button"
-              onClick={compareTargets.length >= 2 || crewId || ultracodeMode ? handleSend : handleRetry}
-              disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
+              onClick={compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
+              disabled={sending || preparingTurn || startingComparison || startingCrew}
               className="shrink-0 cursor-pointer rounded-md border border-danger px-2 py-0.5 text-xs transition-colors hover:bg-danger hover:text-danger-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               {t("ChatWindow.retryButton")}
@@ -1326,7 +1380,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
       <RunningTasksChip onClick={onOpenBackgroundTasks} />
 
-      <div className="shrink-0 border-t border-border bg-background px-4 py-3">
+      <div className="relative shrink-0 border-t border-border bg-background px-4 py-3">
+        <SideChatPanel sessionId={sessionId} />
         <WorkspaceBar sessionId={sessionId} />
         <div className="relative mx-auto max-w-3xl">
           {mentionQuery !== null && (
@@ -1387,20 +1442,42 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
               </div>
             )}
             <div className="flex items-end gap-2">
-              <textarea
-                ref={textareaRef}
-                value={input}
-                onChange={handleInput}
-                onKeyDown={handleKeyDown}
-                placeholder={t("ChatWindow.inputPlaceholder")}
-                rows={1}
-                disabled={preparingTurn || startingComparison || startingCrew || startingUltracode}
-                className="max-h-48 min-h-[2.25rem] flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-relaxed text-foreground outline-none placeholder:text-faint"
-              />
+              <div className="relative min-w-0 flex-1">
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={handleInput}
+                  onKeyDown={handleKeyDown}
+                  onScroll={syncCommandOverlayScroll}
+                  placeholder={t("ChatWindow.inputPlaceholder")}
+                  rows={1}
+                  disabled={preparingTurn || startingComparison || startingCrew}
+                  className={`max-h-48 min-h-[2.25rem] w-full resize-none bg-transparent py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-faint ${
+                    commandSegments ? "text-transparent caret-foreground" : "text-foreground"
+                  }`}
+                />
+                {commandSegments && (
+                  <div
+                    ref={commandOverlayRef}
+                    aria-hidden
+                    className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words py-1.5 text-[15px] leading-relaxed text-foreground"
+                  >
+                    {commandSegments.map((segment, index) =>
+                      segment.command ? (
+                        <span key={index} className="text-accent">
+                          {segment.text}
+                        </span>
+                      ) : (
+                        <span key={index}>{segment.text}</span>
+                      ),
+                    )}
+                  </div>
+                )}
+              </div>
               <button
                 type="button"
                 onClick={sending ? handleStop : handleSend}
-                disabled={preparingTurn || startingComparison || startingCrew || startingUltracode || (!sending && !input.trim())}
+                disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
                 aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
                 className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
@@ -1428,7 +1505,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   setCrewId(null);
                 }
               }}
-              disabled={sending || preparingTurn || startingComparison || startingCrew || startingUltracode}
+              disabled={sending || preparingTurn || startingComparison || startingCrew}
             />
             <CheckpointTimeline sessionId={sessionId} />
             <ContextUsageIndicator sessionId={sessionId} />

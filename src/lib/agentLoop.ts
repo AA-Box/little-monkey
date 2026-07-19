@@ -51,7 +51,7 @@ import {
   type DirEntry,
   type ResolvedTextReference,
 } from './mentions';
-import { currentSystemPrompt, type AttachedStackPromptInfo } from './systemPrompt';
+import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
 import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
@@ -1458,6 +1458,14 @@ export async function runAgentTurn(
   // Default `[]` mirrors `skillInvocations`'s own default, so every other
   // caller (`PlanCard.tsx`, `recipeRunner.ts`) is unaffected.
   availableSkills: SlashSkill[] = [],
+  // Ultracode (the Effort slider's trailing stop, see `EffortSelector.tsx`):
+  // same model, same single turn, but the system prompt gains
+  // `ULTRACODE_SYSTEM_SECTION` and the `task` tool is force-offered — a
+  // standing opt-in for multi-agent orchestration, mirroring Claude Code's
+  // "ultracode" keyword. In-process loop only; the daemon path composes its
+  // own Rust-side prompt/tools and isn't part of this feature yet, same
+  // stance as `availableSkills` above.
+  ultracode = false,
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1482,7 +1490,7 @@ export async function runAgentTurn(
     if (route === 'daemon') {
       await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
     } else {
-      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, availableSkills);
+      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, availableSkills, ultracode);
     }
   } finally {
     turnControllers.delete(sessionId);
@@ -1759,6 +1767,7 @@ async function runTurnGuarded(
   turnId: string,
   skillInvocations: SkillInvocationSnapshot[],
   availableSkills: SlashSkill[] = [],
+  ultracode = false,
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -1802,6 +1811,7 @@ async function runTurnGuarded(
       signal,
       skillInvocations,
       availableSkills,
+      ultracode,
     );
     maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
   } catch (error) {
@@ -1865,6 +1875,7 @@ async function runAgentTurnBody(
   signal?: AbortSignal,
   skillInvocations: SkillInvocationSnapshot[] = [],
   availableSkills: SlashSkill[] = [],
+  ultracode = false,
 ): Promise<void> {
   // Every transcript mutation this turn makes is pinned to the session the
   // turn was submitted from — the user may be running another turn in the
@@ -2137,7 +2148,10 @@ async function runAgentTurnBody(
     toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
     settings.memoryEnabled,
     settings.webToolsEnabled,
-    settings.subagentsEnabled,
+    // Ultracode force-offers the `task` tool even when the subagents toggle
+    // is off: selecting Ultracode is itself the user's explicit opt-in to
+    // multi-agent orchestration for this turn (see ULTRACODE_SYSTEM_SECTION).
+    settings.subagentsEnabled || ultracode,
     skillToolEnabled,
     readSkillResourceToolEnabled,
   );
@@ -2278,6 +2292,7 @@ async function runAgentTurnBody(
           currentSystemPrompt(personaId, attachedStacksForPrompt, docChatMode),
           skillInvocations,
         ),
+        ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
       ]
         .filter(Boolean)
