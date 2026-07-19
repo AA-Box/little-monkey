@@ -7,6 +7,7 @@ import {
   Box,
   Maximize2,
   Minimize2,
+  ListTodo,
   PanelBottom,
   PanelRight,
   Paperclip,
@@ -19,6 +20,7 @@ import {
 
 import { useT } from "../../lib/i18n";
 import { useTerminalStore, buildTerminalEvidence } from "../../store/terminalStore";
+import { buildTerminalOutputSideTaskSeed, useSideTaskStore } from "../../store/sideTaskStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { Button, IconButton } from "../ui";
 import { SandboxPanel } from "./SandboxPanel";
@@ -255,6 +257,19 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
     window.setTimeout(() => setAttachedNotice(false), 2500);
   }, [chatSessionId, evidencePreview, queueEvidence]);
 
+  const startSideTaskFromEvidence = useCallback(() => {
+    if (!evidencePreview) return;
+    const seed = buildTerminalOutputSideTaskSeed({
+      sessionId: chatSessionId,
+      label: evidencePreview.label,
+      path: evidencePreview.path,
+      content: evidencePreview.content,
+      truncated: evidencePreview.truncated,
+    });
+    setEvidencePreview(null);
+    useSideTaskStore.getState().openComposer(seed);
+  }, [chatSessionId, evidencePreview]);
+
   return (
     <section
       className={`flex flex-col overflow-hidden border-border bg-background ${
@@ -474,6 +489,9 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
             </pre>
             <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-end">
               <Button variant="ghost" onClick={() => setEvidencePreview(null)}>{t("TerminalPanel.cancel")}</Button>
+              <Button variant="secondary" onClick={startSideTaskFromEvidence}>
+                <ListTodo size={13} /> Start side task
+              </Button>
               <Button variant="primary" onClick={confirmEvidence}><Paperclip size={13} /> {t("TerminalPanel.confirmAttach")}</Button>
             </div>
           </div>

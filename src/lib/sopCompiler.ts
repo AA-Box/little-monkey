@@ -21,6 +21,7 @@
  * does for its own one-shot summary call.
  */
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 /** Caps how much of a pasted/imported SOP is sent to the model in one turn —
  * generous for a runbook/checklist, but bounded so a huge training doc can't
@@ -137,27 +138,13 @@ function asRiskLevel(value: unknown): PolicyGateRisk {
 
 /**
  * Strict parse of the compiler's reply, mirroring `riskJudge.ts`'s
- * `parseJudgeResponse`: tries the raw trimmed content first, then falls back
- * to the first `{...}` span (small local models sometimes wrap otherwise
- * valid JSON in a sentence or code fence). Returns `null` on anything
- * malformed — callers must fail closed (surface an error), never fabricate a
- * draft from a bad response.
+ * `parseJudgeResponse`: tries raw content, then complete embedded JSON objects
+ * in surrounding prose or a code fence. Returns `null` on anything malformed
+ * or truncated — callers must fail closed (surface an error), never fabricate
+ * a draft from a bad response.
  */
 export function parseSopCompilerResponse(content: string): CompiledWorkflowDraft | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const record = parsed as Record<string, unknown>;
-
+  for (const record of parseModelJsonCandidates(content, 'object')) {
     const name = asNonEmptyString(record.name);
     const summary = asNonEmptyString(record.summary);
     if (!name || !summary) continue;

@@ -14,10 +14,9 @@
  * interactive chat turns, daemon/background runs, workflow runs, browser
  * runs, crew/comparison runs, and anything tagged `kind: "scheduled"`),
  * cron automations (`automationsStore.ts`), and the live chat-turn
- * permission queue (`permissionStore.ts`). Side tasks
- * (ROADMAP.md "Side Tasks", also Phase 1/Next) have no store yet on this
- * branch — `buildSideTaskInboxItems` is the plug-in slot: it returns `[]`
- * today and documents the shape a future side-task store should hand back.
+ * permission queue (`permissionStore.ts`), and the live Side Tasks store.
+ * The builders remain store-free: `AgentInbox.tsx` subscribes to each store
+ * and passes immutable snapshots into these pure normalization functions.
  */
 import type {
   ClientKind,
@@ -31,6 +30,7 @@ import type {
 } from "./runProtocol";
 import type { AutomationEntry, AutomationRunStatus } from "../store/automationsStore";
 import type { PermissionRequest } from "../store/permissionStore";
+import type { SideTaskRecord, SideTaskStatus } from "../store/sideTaskStore";
 
 // ---------------------------------------------------------------------------
 // Core item shape
@@ -56,6 +56,10 @@ export interface ToolCallSummary {
   connectorId: string | null;
   started: boolean;
   outcome: "succeeded" | "failed" | "denied" | "cancelled" | null;
+  /** Bounded, ledger-sanitized output captured by `tool_finished`. Kept so
+   * an MCP result can be explicitly promoted into a side-task composer
+   * without re-running the connector. */
+  outputExcerpt: string | null;
   durationMs: number | null;
   occurredAtMs: number;
 }
@@ -147,6 +151,7 @@ export interface InboxItem {
   runId: string | null;
   automationEntryId: string | null;
   approvalRequestId: string | null;
+  sideTaskId: string | null;
   archivedAtMs: number | null;
   daemonManaged: boolean;
   /** Next cron occurrence, epoch ms — only ever set for `sourceKind ===
@@ -247,6 +252,7 @@ export function deriveRunEnrichment(
           connectorId,
           started: false,
           outcome: null,
+          outputExcerpt: null,
           durationMs: null,
           occurredAtMs: envelope.occurred_at_ms,
         });
@@ -262,6 +268,7 @@ export function deriveRunEnrichment(
         const existing = toolCallsById.get(event.payload.tool_call_id);
         if (existing) {
           existing.outcome = event.payload.outcome;
+          existing.outputExcerpt = event.payload.output_excerpt;
           existing.durationMs = event.payload.duration_ms;
         }
         break;
@@ -407,6 +414,7 @@ export function buildRunInboxItem(
     runId: run.spec.run_id,
     automationEntryId: null,
     approvalRequestId: enrichment?.pendingApproval?.requestId ?? null,
+    sideTaskId: null,
     archivedAtMs: run.archivedAtMs,
     daemonManaged: daemonManagedRunIds.includes(run.spec.run_id),
     nextRunAtMs: null,
@@ -451,6 +459,7 @@ export function buildAutomationInboxItem(entry: AutomationEntry, nextRunAtMs: nu
     runId: null,
     automationEntryId: entry.id,
     approvalRequestId: null,
+    sideTaskId: null,
     archivedAtMs: null,
     daemonManaged: false,
     nextRunAtMs,
@@ -493,6 +502,7 @@ export function buildChatApprovalInboxItem(request: PermissionRequest, knownServ
     runId: null,
     automationEntryId: null,
     approvalRequestId: request.id,
+    sideTaskId: null,
     archivedAtMs: null,
     daemonManaged: false,
     nextRunAtMs: null,
@@ -503,16 +513,55 @@ export function buildChatApprovalInboxItems(queue: readonly PermissionRequest[],
   return queue.map((request) => buildChatApprovalInboxItem(request, knownServerIds));
 }
 
-/**
- * Plug-in slot for ROADMAP.md's "Side Tasks" item, which has no store on
- * this branch yet (its feature branch hasn't merged into develop). Once it
- * ships, replace this stub's body with a call into that store's list of
- * tasks, mapped into `InboxItem`s the same way the builders above do — the
- * rest of the Inbox (filtering, sorting, actions) needs no changes since it
- * already treats `"side_task"` as a first-class `InboxSourceKind`.
- */
-export function buildSideTaskInboxItems(): InboxItem[] {
-  return [];
+const SIDE_TASK_STATUS_TO_INBOX: Record<SideTaskStatus, InboxStatus> = {
+  queued: "waiting",
+  running: "active",
+  paused: "waiting",
+  completed: "completed",
+  error: "failed",
+  cancelled: "cancelled",
+};
+
+export function sideTaskStatusToInboxStatus(task: Pick<SideTaskRecord, "status" | "archivedAt">): InboxStatus {
+  return task.archivedAt !== null ? "archived" : SIDE_TASK_STATUS_TO_INBOX[task.status];
+}
+
+export function buildSideTaskInboxItem(task: SideTaskRecord): InboxItem {
+  const subtitle = [task.source.label, task.profile === "code" ? "file editing" : "read-only", task.modelLabel]
+    .filter((part) => part.trim().length > 0)
+    .join(" · ");
+  return {
+    id: `side-task:${task.id}`,
+    sourceKind: "side_task",
+    status: sideTaskStatusToInboxStatus(task),
+    title: task.title,
+    subtitle,
+    createdAtMs: task.createdAt,
+    updatedAtMs: task.updatedAt,
+    workspaceId: null,
+    workspaceLabel: null,
+    sourceTrigger: task.source.kind,
+    submittedBy: "desktop",
+    model: task.modelLabel,
+    connectors: [],
+    costMicros: null,
+    riskLevel: null,
+    needsApproval: false,
+    runId: null,
+    automationEntryId: null,
+    approvalRequestId: null,
+    sideTaskId: task.id,
+    archivedAtMs: task.archivedAt,
+    daemonManaged: false,
+    nextRunAtMs: null,
+  };
+}
+
+/** Maps a live Side Tasks snapshot into the same status/filter/action model
+ * as durable runs. Ordering stays owned by the store and is subsequently
+ * normalized with all other sources by `sortInboxItems`. */
+export function buildSideTaskInboxItems(tasks: readonly SideTaskRecord[]): InboxItem[] {
+  return tasks.map(buildSideTaskInboxItem);
 }
 
 // ---------------------------------------------------------------------------

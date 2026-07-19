@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// `runMigrationSliceAgent` drives its own model->tools->model loop via
-// `turnEngine.ts`'s `attemptStream`/`executeToolCall` — mocked here so these
-// tests can pin the LOOP's own behavior (termination, iteration cap,
-// cancellation) without needing a real streaming provider, exactly the same
-// posture `subagent.test.ts` uses for `runSubagentTask`.
+// `runMigrationSliceAgent` delegates to the shared headless
+// model->tools->model loop, which reaches `turnEngine.ts`'s
+// `attemptStream`/`executeToolCall`. Mock those primitives here so the public
+// migration entry point still pins termination, iteration-cap, and
+// cancellation behavior without needing a real streaming provider.
 const mocks = vi.hoisted(() => ({
   resolveTarget: vi.fn(),
+  snapshotForResolvedTarget: vi.fn(),
   effortForTarget: vi.fn(),
   attemptStream: vi.fn(),
   executeToolCall: vi.fn(),
@@ -22,6 +23,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("./agentLoop", () => ({
   resolveTarget: (...args: unknown[]) => mocks.resolveTarget(...args),
+  snapshotForResolvedTarget: (...args: unknown[]) => mocks.snapshotForResolvedTarget(...args),
 }));
 
 vi.mock("../store/modelStore", async (importOriginal) => ({
@@ -77,10 +79,12 @@ function toolCall(name: string, id = "call-1"): ToolCall {
 
 beforeEach(() => {
   mocks.resolveTarget.mockReset();
+  mocks.snapshotForResolvedTarget.mockReset();
   mocks.effortForTarget.mockReset();
   mocks.attemptStream.mockReset();
   mocks.executeToolCall.mockReset();
   mocks.resolveTarget.mockResolvedValue(fakeTarget);
+  mocks.snapshotForResolvedTarget.mockReturnValue(null);
   mocks.effortForTarget.mockReturnValue(undefined);
 });
 
@@ -127,6 +131,7 @@ describe("runMigrationSliceAgent / termination", () => {
 
     expect(result.outcome).toBe("completed");
     expect(mocks.executeToolCall).toHaveBeenCalledTimes(1);
+    expect(mocks.executeToolCall.mock.calls[0][8]).toBe("migration-agent");
     expect(mocks.attemptStream).toHaveBeenCalledTimes(2);
   });
 

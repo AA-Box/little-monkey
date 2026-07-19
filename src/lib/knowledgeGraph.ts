@@ -18,6 +18,7 @@
  * "evidence behind the answer" the acceptance criterion asks for.
  */
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 export type GraphNodeKind = 'person' | 'file' | 'decision' | 'term' | 'other';
 export type GraphRelation = 'mentions' | 'relates_to' | 'depends_on' | 'owns' | 'conflicts_with';
@@ -189,24 +190,13 @@ interface RawExtraction {
  * failing the whole batch, except when the top-level shape itself is wrong,
  * which returns `null` (fails that batch closed — see `buildKnowledgeGraph`,
  * which records it as a batch error and moves on rather than aborting the
- * whole build). Tries the raw trimmed content first, then the first `{...}`
- * span found in it, exactly like `riskJudge.ts`'s `parseJudgeResponse`.
+ * whole build). JSON transport is shared with `riskJudge.ts`: raw replies,
+ * fenced JSON, and complete objects in surrounding prose are accepted.
  */
 export function parseExtractionResponse(content: string): RawExtraction | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const rawNodes = (parsed as { nodes?: unknown }).nodes;
-    const rawEdges = (parsed as { edges?: unknown }).edges;
+  for (const parsed of parseModelJsonCandidates(content, 'object')) {
+    const rawNodes = parsed.nodes;
+    const rawEdges = parsed.edges;
     if (!Array.isArray(rawNodes) || !Array.isArray(rawEdges)) continue;
 
     const nodes: RawExtractedNode[] = [];

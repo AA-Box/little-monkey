@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const de: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const de: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "In diesem Build ist kein Slack-Connector eingebunden – legt nur eine Persona für eingefügte Protokolle an.",
   "Onboarding.templateModelEvaluationName": "Modellbewertung",
   "Onboarding.templateModelEvaluationDescription": "Vergleicht Modellantworten zu einem von dir vorgegebenen Prompt.",
-  "Onboarding.templateModelEvaluationCaveat": "Es gibt noch kein automatisiertes Eval-System – legt nur eine Persona für einmalige manuelle Vergleiche an.",
+  "Onboarding.templateModelEvaluationCaveat": "Erstellt eine Vergleichs-Persona; automatisierte Regressionstests und Release-Gates sind im Workflow- & Agent-Test-Harness verfügbar.",
   "Onboarding.templateBrowserQaName": "Browser-QA",
   "Onboarding.templateBrowserQaDescription": "Geht einen Web-Ablauf mit den Browser-Werkzeugen durch und meldet, was fehlschlägt.",
   "Onboarding.templateBrowserQaCaveat": "Legt nur eine Persona an – kombiniere sie mit der Browser Workbench für aufgezeichnete Abläufe.",
@@ -1004,6 +1020,9 @@ export const de: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Angehängt",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Vorschau",
+  "WorkspaceImage.loading": "Bild wird geladen…",
+  "WorkspaceImage.error": "Bild nicht verfügbar: {{error}}",
+  "WorkspaceImage.generatedAlt": "Generiertes Bild",
   "MessageList.argumentsLabel": "Argumente",
   "MessageList.resultLabel": "Ergebnis",
   "MessageList.regenerateButton": "Neu generieren",

@@ -25,6 +25,7 @@
  * back to disk.
  */
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 /** Caps how much of a table's data is sent to the model in one turn — a
  * bounded sample (header + first N rows) is enough for it to infer a
@@ -421,27 +422,14 @@ function asOperationKind(value: unknown): SpreadsheetOperationKind | null {
 /**
  * Strict parse + validation of the copilot's reply against the table it was
  * asked about, mirroring `sopCompiler.ts`'s `parseSopCompilerResponse`: tries
- * the raw trimmed content first, then falls back to the first `{...}` span.
+ * the raw trimmed content first, then complete embedded JSON objects.
  * Returns `null` on anything malformed, on an empty/invalid `writes` list, or
  * when every cited read range fails validation — callers must fail closed
  * (surface an error to the user), never fabricate a proposal from a bad
  * response or apply writes that don't parse as real cell refs.
  */
 export function parseSpreadsheetCopilotResponse(content: string, table: SpreadsheetTable): SpreadsheetOperationProposal | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const record = parsed as Record<string, unknown>;
-
+  for (const record of parseModelJsonCandidates(content, 'object')) {
     const kind = asOperationKind(record.kind);
     const title = asNonEmptyString(record.title);
     if (!kind || !title) continue;

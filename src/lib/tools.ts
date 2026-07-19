@@ -476,6 +476,58 @@ export const READ_SKILL_RESOURCE_TOOL: ToolDef = {
   },
 };
 
+/**
+ * The `generate_image` tool: the model supplies SVG markup plus a
+ * suggested `.png` base filename; the webview rasterizes the SVG to
+ * real PNG bytes (`imageGeneration.ts::rasterizeSvgToPng` — a canvas only
+ * exists in the webview, which is why this can't be an ordinary
+ * `tool_generate_image`-only tool) and the Rust half
+ * (`src-tauri/src/tools.rs::tool_generate_image`) persists them in private,
+ * app-owned durable artifact storage. No workspace or edit permission is
+ * required. The app adds a timestamp and uniqueness suffix to every filename;
+ * the user picks a filesystem destination only when downloading.
+ * The chat renders the stored image inline (see `MessageList.tsx`'s
+ * `generate_image` handling), which is the whole point of the tool: give a
+ * text-only local model a reliable way to produce a real image the user can
+ * see and keep.
+ *
+ * Deliberately kept OUT of the base `TOOLS` array: `TOOLS` mirrors the Rust/
+ * monkey-cli registries 1:1 with plain pass-through dispatch, while this
+ * tool's wire shape differs between what the model sends (`svg`) and what
+ * the Rust command receives (`content_base64` + `width`/`height`, injected by
+ * `turnEngine.ts`'s interception branch after rasterization) — and monkey-cli
+ * has no webview to rasterize in at all, so it never offers this tool. It's
+ * appended to the per-turn list by `agentLoop.ts`'s `runAgentTurnBody`
+ * (desktop chat only), the same composition chain every other conditional
+ * tool goes through; `toolsForProfile`'s name allow-lists never include it,
+ * so subagents don't get it either.
+ */
+export const GENERATE_IMAGE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'generate_image',
+    description:
+      'Generate a PNG image from SVG markup you write and show it to the user in the chat. Provide complete, well-formed SVG (with width/height or a viewBox) — it is rendered exactly as written and stored privately by the app. The app automatically adds a timestamp and uniqueness suffix to the filename, so never retry with a different name because of an overwrite. No workspace folder or edit permission is required.',
+    parameters: {
+      type: 'object',
+      properties: {
+        filename: {
+          type: 'string',
+          description:
+            "Suggested base filename for Download, ending in .png, e.g. 'chart.png'. The app automatically appends a timestamp and unique suffix; this is not written to the workspace automatically.",
+        },
+        svg: {
+          type: 'string',
+          description:
+            'The complete SVG document to rasterize, starting with an <svg> root element. Scripts and external references are not executed or fetched.',
+        },
+      },
+      required: ['filename', 'svg'],
+      additionalProperties: false,
+    },
+  },
+};
+
 export const PRESENT_PLAN_TOOL: ToolDef = {
   type: 'function',
   function: {

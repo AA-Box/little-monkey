@@ -1642,22 +1642,6 @@ pub fn stacks_create(
 }
 
 #[tauri::command]
-pub fn stacks_import_definitions(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    stacks: Vec<KnowledgeStack>,
-    replace: bool,
-) -> Result<Vec<KnowledgeStack>, String> {
-    let imported = import_definitions_impl(&stacks_base_dir(&app)?, stacks, replace)?;
-    state
-        .stack_cache
-        .lock()
-        .map_err(|_| "Stack-cache lock poisoned".to_string())?
-        .clear();
-    Ok(imported)
-}
-
-#[tauri::command]
 pub fn stacks_delete(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
