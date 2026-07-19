@@ -33,10 +33,10 @@
  *    primitive — the SAME one `issue_to_pr.rs` builds on — attaches it as a
  *    secondary workspace root via the existing `add_secondary_workspace_root`
  *    command, then drives a real headless agent turn against it with
- *    `runSecurityAutofixAgent` below, structurally identical to
- *    `issueToPrRunner.ts`'s `runIssueToPrAgent` (same
- *    `attemptStream`/`executeToolCall`/`toolsForProfile('code')`/
- *    `beginDurableRun` primitives, same permission-gated tool dispatch).
+ *    `runSecurityAutofixAgent` below. It shares `headlessAgentRunner.ts` with
+ *    `issueToPrRunner.ts` and `migrationAgentRunner.ts`, so all three use the
+ *    same permission-gated tool dispatch, cancellation, and Run Capsule
+ *    recording path.
  *
  * Pushing the branch and opening a PR are explicitly OUT of scope here — the
  * resulting branch is left for the user to inspect and push through the
@@ -59,21 +59,12 @@ import {
 } from './gitDelivery';
 import { effortForTarget } from '../store/modelStore';
 import { primaryRoot, useWorkspaceStore, type WorkspaceRootInfo } from '../store/workspaceStore';
-import { usePermissionStore } from '../store/permissionStore';
-import { resolveTarget, snapshotForResolvedTarget } from './agentLoop';
-import { beginDurableRun, type DurableRunRecorder } from './durableRun';
+import { resolveTarget } from './agentLoop';
+import { runHeadlessAgent } from './headlessAgentRunner';
 import type { ChatMessage, ToolCall } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
-import { toolsForProfile } from './tools';
-import {
-  attemptStream,
-  executeToolCall,
-  isToolCallAllowed,
-  stringifyToolError,
-  CANCELLED_TOOL_RESULT,
-  type ResolvedTarget,
-} from './turnEngine';
-import { protectToolResult } from './untrustedContent';
+import { parseModelJsonCandidates } from './modelJson';
+import { attemptStream, executeToolCall } from './turnEngine';
 
 // ---------------------------------------------------------------------
 // Types
@@ -469,19 +460,8 @@ export function buildProposalPrompt(finding: SecurityFinding): ChatMessage[] {
 export function parseProposalResponse(
   content: string,
 ): { exploitabilityNote: string; proposedFix: string; testPlan: string } | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const { exploitabilityNote, proposedFix, testPlan } = parsed as Record<string, unknown>;
+  for (const parsed of parseModelJsonCandidates(content, 'object')) {
+    const { exploitabilityNote, proposedFix, testPlan } = parsed;
     if (
       typeof exploitabilityNote === 'string' && exploitabilityNote.trim() &&
       typeof proposedFix === 'string' && proposedFix.trim() &&
@@ -640,8 +620,7 @@ export async function createIsolatedBranchForFinding(
 }
 
 // ---------------------------------------------------------------------
-// Apply the fix — a real headless agent turn in the owned worktree,
-// structurally identical to issueToPrRunner.ts's runIssueToPrAgent
+// Apply the fix — a real shared headless agent turn in the owned worktree
 // ---------------------------------------------------------------------
 
 export const MAX_SECURITY_AUTOFIX_ITERATIONS = 40;
@@ -687,125 +666,27 @@ function buildAutofixSystemPrompt(params: RunSecurityAutofixAgentParams): string
 }
 
 /**
- * Runs the model->tools->model loop to completion, structurally identical to
- * `issueToPrRunner.ts`'s `runIssueToPrAgent` (same iteration cap shape, same
- * cancellation-via-signal, same Run Capsule recording via `beginDurableRun`)
- * — just built around one security finding + its approved proposal instead
- * of a GitHub issue. Never throws; every outcome is reported through the
- * returned `SecurityAutofixAgentResult`.
+ * Runs the shared model->tools->model loop to completion around one security
+ * finding and its approved proposal. Never throws; every outcome is reported
+ * through the returned `SecurityAutofixAgentResult`.
  */
 export async function runSecurityAutofixAgent(
   params: RunSecurityAutofixAgentParams,
 ): Promise<SecurityAutofixAgentResult> {
-  const { runId, signal } = params;
-  const target: ResolvedTarget = await resolveTarget();
-  const effort = effortForTarget(target);
-  const tools = toolsForProfile('code');
-  const mcpRegistry = emptyMcpRegistry();
   const systemPrompt = buildAutofixSystemPrompt(params);
 
   const userMessage = `Apply the approved fix for finding "${params.finding.title}" (${params.finding.kind}, severity ${params.finding.severity}) as described in the system prompt.`;
-  let messages: ChatMessage[] = [{ role: 'user', content: userMessage }];
-
-  const targetSnapshot = snapshotForResolvedTarget(target);
-  const recorder: DurableRunRecorder | null = targetSnapshot
-    ? await beginDurableRun({
-        runId,
-        kind: 'background',
-        task: `Security autofix: ${params.finding.title}`,
-        instructions: `Owned branch ${params.branch}`,
-        target: targetSnapshot,
-        roots: useWorkspaceStore.getState().roots,
-        permissionMode: usePermissionStore.getState().mode,
-        allowNetwork: false,
-        allowExternalMutations: false,
-      }).catch(() => null)
-    : null;
-
-  const finish = async (
-    outcome: SecurityAutofixAgentResult['outcome'],
-    summary: string,
-  ): Promise<SecurityAutofixAgentResult> => {
-    if (recorder) {
-      if (outcome === 'completed') await recorder.complete(summary).catch(() => {});
-      else if (outcome === 'cancelled') await recorder.cancel(summary).catch(() => {});
-      else await recorder.fail(summary).catch(() => {});
-    }
-    return { outcome, summary, durableRunId: recorder?.runId ?? null };
-  };
-
-  try {
-    for (let iteration = 0; iteration < MAX_SECURITY_AUTOFIX_ITERATIONS; iteration++) {
-      if (signal.aborted) return finish('cancelled', 'Cancelled by the user.');
-
-      const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
-      const attempt = await attemptStream(target, wireHistory, tools, signal, effort, runId);
-
-      if (attempt.usage) {
-        recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
-      }
-      if (attempt.streamError !== null) return finish('error', attempt.streamError);
-
-      if (attempt.toolCalls.length === 0) {
-        const finalMessage: ChatMessage = { role: 'assistant', content: attempt.content };
-        messages = [...messages, finalMessage];
-        if (attempt.content) recorder?.recordModelOutput(`${runId}:${iteration}`, attempt.content);
-        return finish('completed', attempt.content.trim() || 'Agent finished with no summary.');
-      }
-
-      const assistantMessage: ChatMessage = {
-        role: 'assistant',
-        content: attempt.content,
-        tool_calls: attempt.toolCalls,
-      };
-      messages = [...messages, assistantMessage];
-      if (attempt.content) recorder?.recordModelOutput(`${runId}:${iteration}`, attempt.content);
-
-      for (const toolCall of attempt.toolCalls) {
-        const aborted = signal.aborted;
-        const allowed = isToolCallAllowed(toolCall, tools);
-        if (!aborted) {
-          params.onToolActivity?.(toolCall.function.name);
-          await recorder
-            ?.recordToolProposed(toolCall.id, toolCall.function.name, toolCall.function.arguments ?? '')
-            .catch(() => {});
-          recorder?.recordToolStarted(toolCall.id);
-        }
-        const started = Date.now();
-        const resultContent = aborted
-          ? CANCELLED_TOOL_RESULT
-          : !allowed
-            ? stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered to this run.`))
-            : await executeToolCall(
-                toolCall,
-                null,
-                runId,
-                mcpRegistry,
-                signal,
-                undefined,
-                undefined,
-                undefined,
-                'security-autofix',
-              );
-        if (!aborted) {
-          await recorder?.recordToolFinished(toolCall.id, resultContent, Date.now() - started).catch(() => {});
-        }
-        const toolMessage: ChatMessage = {
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: allowed ? protectToolResult(toolCall.function.name, resultContent, false) : resultContent,
-        };
-        messages = [...messages, toolMessage];
-      }
-
-      if (signal.aborted) return finish('cancelled', 'Cancelled by the user.');
-    }
-
-    return finish(
-      'error',
-      `Stopped after reaching the safety limit of ${MAX_SECURITY_AUTOFIX_ITERATIONS} tool-calling iterations without a final answer.`,
-    );
-  } catch (err) {
-    return finish('error', err instanceof Error ? err.message : String(err));
-  }
+  return runHeadlessAgent({
+    runId: params.runId,
+    signal: params.signal,
+    systemPrompt,
+    userMessage,
+    maxIterations: MAX_SECURITY_AUTOFIX_ITERATIONS,
+    executionSource: 'security-autofix',
+    durableRun: {
+      task: `Security autofix: ${params.finding.title}`,
+      instructions: `Owned branch ${params.branch}`,
+    },
+    onToolActivity: params.onToolActivity,
+  });
 }

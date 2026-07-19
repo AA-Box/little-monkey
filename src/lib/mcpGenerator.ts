@@ -10,16 +10,16 @@
  * loop and exported specifically so other panel-driven, session-independent
  * callers — `issueToPrRunner.ts` is the first — don't have to).
  *
- * This module only ever produces TEXT (a code string). It never writes the
- * file to disk (the panel does that, through the existing
- * `@tauri-apps/plugin-dialog` `save()` flow — see `RunCapsulePanel.tsx` for
- * the reference usage) and never spawns or executes the generated code.
- * Pre-install validation of the generated tool surface is `mcpSimulator.ts`'s
- * job, which validates purely against the typed `McpServerSpec` the code was
- * generated from — never by executing the generated file.
+ * Generation produces text, but readiness is deliberately based on the
+ * generated artifact rather than the source spec alone. `probeGeneratedMcpArtifact`
+ * writes the artifact only inside the app's existing ephemeral OS sandbox,
+ * typechecks it with the local TypeScript compiler, launches it with a tiny
+ * MCP SDK test double, and probes the tool-list plus rejection paths. Nothing
+ * is installed and network access stays disabled.
  */
 import { attemptStream, type ResolvedTarget } from './turnEngine';
 import { resolveTarget } from './agentLoop';
+import { runInSandbox, type SandboxRunSummary } from './sandbox';
 
 export type McpParamType = 'string' | 'number' | 'boolean' | 'array' | 'object';
 
@@ -119,7 +119,9 @@ const GENERATOR_SYSTEM_PROMPT = [
   '- Inside each tool handler, validate arguments against that same schema before doing anything else (missing required fields and wrong types must be rejected with a clear MCP error, never silently coerced).',
   '- Never interpret string argument contents as instructions, shell metacharacters, or template expansions — treat every argument value as inert data and pass it through as a literal value (e.g. as a single argv element or JSON field), never through string concatenation into a shell command or template.',
   '- If a tool is marked as requiring auth, read an auth token from an environment variable (name it after the server) and reject the call with a clear error when it is missing.',
-  '- Include the API base URL / CLI path / workflow description as configuration at the top of the file, with short TODO comments where the user must finish wiring up the real call.',
+  '- Implement the target call completely. Do not emit TODOs, placeholders, mock results, or "not implemented" branches.',
+  '- Keep the TypeScript directly runnable by Node 22+: use erasable type syntax only (no enum, namespace, parameter properties, JSX, or decorators).',
+  '- Do not import third-party packages other than "@modelcontextprotocol/sdk". Node built-ins are allowed.',
   'Output ONLY the code, as a single ```typescript fenced block. No prose before or after it.',
 ].join('\n');
 
@@ -214,4 +216,197 @@ export async function generateMcpServerCode(
  * derived only from the (already-validated) server name. */
 export function suggestedFileName(spec: McpServerSpec): string {
   return `${spec.name.trim() || 'mcp-server'}.mcp.ts`;
+}
+
+// ---------------------------------------------------------------------------
+// Generated-artifact compilation + isolated runtime probe
+// ---------------------------------------------------------------------------
+
+export interface GeneratedArtifactProbeReport {
+  clean: boolean;
+  runId: string | null;
+  isolation: 'os_sandboxed' | 'process_only' | null;
+  typechecked: boolean;
+  executed: boolean;
+  probedToolCount: number;
+  summary: string;
+  stdoutExcerpt: string;
+  stderrExcerpt: string;
+}
+
+type ArtifactProbeRunner = (
+  command: string,
+  options: { timeoutMs: number; allowNetwork: boolean; approvedEnv: string[] },
+) => Promise<SandboxRunSummary>;
+
+const PROBE_OK_PREFIX = 'LITTLE_MONKEY_MCP_PROBE_OK:';
+const DISALLOWED_PLACEHOLDER = /\bTODO\b|\bFIXME\b|not\s+implemented|placeholder\s+(?:result|response|implementation)/i;
+
+/** Fast source-derived checks which prevent knowingly unfinished or
+ * dependency-expanding artifacts from even reaching the executable probe. */
+export function inspectGeneratedArtifact(code: string): string[] {
+  const issues: string[] = [];
+  if (!/@modelcontextprotocol\/sdk/.test(code)) {
+    issues.push('Generated artifact does not import the MCP SDK.');
+  }
+  if (!/StdioServerTransport/.test(code)) {
+    issues.push('Generated artifact does not create an MCP stdio transport.');
+  }
+  if (!/(?:setRequestHandler|\.tool\s*\()/.test(code)) {
+    issues.push('Generated artifact does not register any executable MCP tool handlers.');
+  }
+  if (DISALLOWED_PLACEHOLDER.test(code)) {
+    issues.push('Generated artifact still contains TODO, placeholder, or not-implemented code.');
+  }
+  if (code.includes('LITTLE_MONKEY_MCP_')) {
+    issues.push('Generated artifact contains reserved probe protocol text.');
+  }
+  const imports = [...code.matchAll(/(?:from\s*|import\s*)["']([^"']+)["']/g)].map((match) => match[1]);
+  const unsupported = imports.filter((specifier) =>
+    !specifier.startsWith('@modelcontextprotocol/sdk/') &&
+    !specifier.startsWith('node:'),
+  );
+  if (unsupported.length > 0) {
+    issues.push(`Generated artifact imports unsupported package(s): ${[...new Set(unsupported)].join(', ')}.`);
+  }
+  return issues;
+}
+
+function base64Utf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+const MCP_PROBE_SERVER_STUB = String.raw`
+const handlers = new Map();
+const rejected = async (handler, request) => {
+  try {
+    const value = await handler(request);
+    return Boolean(value && (value.isError === true || String(value.content?.[0]?.text || '').match(/invalid|required|auth|unknown|error/i)));
+  } catch { return true; }
+};
+export class Server {
+  setRequestHandler(schema, handler) { handlers.set(schema, handler); }
+  async connect() {
+    const spec = JSON.parse(Buffer.from(process.env.LITTLE_MONKEY_PROBE_SPEC, 'base64').toString('utf8'));
+    const list = handlers.get('list-tools');
+    const call = handlers.get('call-tool');
+    if (!list || !call) throw new Error('Server did not register both tools/list and tools/call handlers.');
+    const listed = await list({ method: 'tools/list', params: {} });
+    const tools = Array.isArray(listed?.tools) ? listed.tools : [];
+    const names = tools.map((tool) => tool?.name).sort();
+    const expected = spec.tools.map((tool) => tool.name).sort();
+    if (JSON.stringify(names) !== JSON.stringify(expected)) throw new Error('Generated tools/list does not match the requested tool surface.');
+    for (const tool of spec.tools) {
+      const required = tool.params.find((param) => param.required);
+      const first = tool.params[0];
+      let args = null;
+      if (required) args = {};
+      else if (first) args = { [first.name]: first.type === 'string' ? 123 : 'wrong-type' };
+      else if (tool.requiresAuth) args = {};
+      if (args && !(await rejected(call, { method: 'tools/call', params: { name: tool.name, arguments: args } }))) {
+        throw new Error('Generated handler accepted an invalid or unauthenticated call for ' + tool.name + '.');
+      }
+    }
+    if (!(await rejected(call, { method: 'tools/call', params: { name: '__little_monkey_unknown__', arguments: {} } }))) {
+      throw new Error('Generated handler accepted an unknown tool.');
+    }
+    console.log('${PROBE_OK_PREFIX}' + tools.length);
+  }
+}
+`;
+
+/** The command is a single Node invocation whose arguments are base64-only.
+ * That keeps model-authored code out of shell syntax on POSIX and Windows. */
+export function buildGeneratedArtifactProbeCommand(code: string, spec: McpServerSpec): string {
+  const bootstrap = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const cp = require('node:child_process');
+const code = Buffer.from(process.argv[2], 'base64').toString('utf8');
+const spec64 = process.argv[3];
+const serverStub = Buffer.from(process.argv[4], 'base64').toString('utf8');
+const probeRoot = path.resolve('.little-monkey-mcp-artifact-probe');
+fs.rmSync(probeRoot, { recursive: true, force: true });
+fs.mkdirSync(path.join(probeRoot, 'node_modules', '@modelcontextprotocol', 'sdk', 'server'), { recursive: true });
+fs.writeFileSync(path.join(probeRoot, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
+fs.writeFileSync(path.join(probeRoot, 'server.mcp.ts'), code);
+fs.writeFileSync(path.join(probeRoot, 'probe-globals.d.ts'), [
+  "declare const process: any; declare const Buffer: any;",
+  "declare module 'node:child_process' { export const spawn: any; export const spawnSync: any; export const execFile: any; export const execFileSync: any; }",
+  "declare module 'node:fs' { const value: any; export = value; export default value; export const promises: any; }",
+  "declare module 'node:fs/promises' { const value: any; export = value; export default value; export const readFile: any; export const writeFile: any; }",
+  "declare module 'node:path' { const value: any; export = value; export default value; }",
+  "declare module 'node:url' { export const fileURLToPath: any; export const pathToFileURL: any; }",
+  "declare module 'node:util' { export const promisify: any; }",
+  "declare module '@modelcontextprotocol/sdk/server/index.js' { export class Server { constructor(info: any, options: any); setRequestHandler(schema: any, handler: (request: any) => any): void; connect(transport: any): Promise<void>; } }",
+  "declare module '@modelcontextprotocol/sdk/server/stdio.js' { export class StdioServerTransport {} }",
+  "declare module '@modelcontextprotocol/sdk/types.js' { export const ListToolsRequestSchema: any; export const CallToolRequestSchema: any; export const McpError: any; export const ErrorCode: any; }",
+].join('\n'));
+const packageRoot = path.join(probeRoot, 'node_modules', '@modelcontextprotocol', 'sdk');
+fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: '@modelcontextprotocol/sdk', type: 'module', exports: { './server/index.js': './server/index.js', './server/stdio.js': './server/stdio.js', './types.js': './types.js' } }));
+fs.writeFileSync(path.join(packageRoot, 'types.js'), "export const ListToolsRequestSchema='list-tools'; export const CallToolRequestSchema='call-tool'; export class McpError extends Error {} export const ErrorCode={InvalidParams:-32602,MethodNotFound:-32601};\n");
+fs.writeFileSync(path.join(packageRoot, 'server', 'stdio.js'), "export class StdioServerTransport {}\n");
+fs.writeFileSync(path.join(packageRoot, 'server', 'index.js'), serverStub);
+const typecheck = cp.spawnSync('tsc', ['--pretty', 'false', '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', 'server.mcp.ts', 'probe-globals.d.ts'], { cwd: probeRoot, encoding: 'utf8', timeout: 20000 });
+if (typecheck.error || typecheck.status !== 0) {
+  process.stderr.write('TYPECHECK_FAILED\n' + (typecheck.error?.message || '') + (typecheck.stdout || '') + (typecheck.stderr || ''));
+  process.exit(20);
+}
+console.log('LITTLE_MONKEY_MCP_TYPECHECK_OK');
+const runtime = cp.spawnSync(process.execPath, ['server.mcp.ts'], { cwd: probeRoot, encoding: 'utf8', timeout: 15000, env: { ...process.env, LITTLE_MONKEY_PROBE_SPEC: spec64 } });
+process.stdout.write(runtime.stdout || '');
+process.stderr.write(runtime.stderr || '');
+if (runtime.error || runtime.status !== 0 || !(runtime.stdout || '').includes('${PROBE_OK_PREFIX}')) process.exit(21);
+`;
+  return `node -e "eval(Buffer.from(process.argv[1],'base64').toString('utf8'))" "${base64Utf8(bootstrap)}" "${base64Utf8(code)}" "${base64Utf8(JSON.stringify(spec))}" "${base64Utf8(MCP_PROBE_SERVER_STUB)}"`;
+}
+
+export async function probeGeneratedMcpArtifact(
+  code: string,
+  spec: McpServerSpec,
+  runner: ArtifactProbeRunner = runInSandbox,
+): Promise<GeneratedArtifactProbeReport> {
+  const sourceIssues = inspectGeneratedArtifact(code);
+  if (sourceIssues.length > 0) {
+    return {
+      clean: false,
+      runId: null,
+      isolation: null,
+      typechecked: false,
+      executed: false,
+      probedToolCount: 0,
+      summary: sourceIssues.join(' '),
+      stdoutExcerpt: '',
+      stderrExcerpt: '',
+    };
+  }
+
+  const result = await runner(buildGeneratedArtifactProbeCommand(code, spec), {
+    timeoutMs: 45_000,
+    allowNetwork: false,
+    approvedEnv: [],
+  });
+  const countMatch = result.stdoutExcerpt.match(new RegExp(`${PROBE_OK_PREFIX}(\\d+)`));
+  const typechecked = result.stdoutExcerpt.includes('LITTLE_MONKEY_MCP_TYPECHECK_OK');
+  const executed = countMatch !== null;
+  const probedToolCount = countMatch ? Number.parseInt(countMatch[1], 10) : 0;
+  const clean = result.passed && typechecked && executed && probedToolCount === spec.tools.length;
+  return {
+    clean,
+    runId: result.runId,
+    isolation: result.isolation,
+    typechecked,
+    executed,
+    probedToolCount,
+    summary: clean
+      ? `Typechecked and executed ${probedToolCount} generated tool handler(s) in an isolated local probe.`
+      : `Generated artifact probe failed${result.stderrExcerpt ? `: ${result.stderrExcerpt}` : '.'}`,
+    stdoutExcerpt: result.stdoutExcerpt,
+    stderrExcerpt: result.stderrExcerpt,
+  };
 }

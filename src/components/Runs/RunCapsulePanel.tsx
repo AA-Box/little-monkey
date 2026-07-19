@@ -36,7 +36,7 @@ interface RunCapsulePanelProps {
   run: RunRecord;
   events: RunEventEnvelopeWire[];
   runs: RunRecord[];
-  daemonManaged: boolean;
+  replayEngineAvailable: boolean;
   actionBusy: boolean;
   onReplay: () => Promise<void>;
 }
@@ -102,7 +102,7 @@ function EmptyEvidence({ children }: { children: ReactNode }) {
   return <p className="text-xs leading-relaxed text-faint">{children}</p>;
 }
 
-export function RunCapsulePanel({ run, events, runs, daemonManaged, actionBusy, onReplay }: RunCapsulePanelProps) {
+export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, actionBusy, onReplay }: RunCapsulePanelProps) {
   const { t } = useT();
   const capsule = useMemo(() => buildRunCapsule(run, events), [events, run]);
   const [compareRunId, setCompareRunId] = useState("");
@@ -146,10 +146,10 @@ export function RunCapsulePanel({ run, events, runs, daemonManaged, actionBusy, 
     [capsule, compareCapsule],
   );
   const browserEvidence = capsuleHasBrowserEvidence(capsule);
-  const safeReplayAvailable = capsule.replay.safeFromStart && daemonManaged;
+  const safeReplayAvailable = capsule.replay.safeFromStart && replayEngineAvailable;
   const replayUnavailableReason = !capsule.replay.safeFromStart
     ? t("RunCapsule.replayUnsafe")
-    : !daemonManaged
+    : !replayEngineAvailable
       ? t("RunCapsule.replayEngineUnavailable")
       : null;
   const peerRuns = runs.filter((entry) => entry.spec.run_id !== run.spec.run_id);
