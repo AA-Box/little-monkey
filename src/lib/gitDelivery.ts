@@ -1,4 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke, isTauri } from "@tauri-apps/api/core";
+
+// Browser mode has no `window.__TAURI_INTERNALS__`; calling the raw invoke
+// there crashes with "Cannot read properties of undefined (reading 'invoke')".
+const invoke = <T>(command: string, args?: Record<string, unknown>): Promise<T> =>
+  isTauri()
+    ? tauriInvoke<T>(command, args)
+    : Promise.reject(new Error("Git delivery is unavailable in the browser. Launch Little Monkey as a desktop app (pnpm tauri dev)."));
 
 export interface DeliveryPolicy {
   allowedRemotes: string[];
