@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Little Monkey Remote">
+  <rect width="128" height="128" rx="28" fill="#0f172a"/>
+  <path d="M28 32h18v48h28v16H28V32Zm52 0h20v64H80V32Z" fill="#f8fafc"/>
+  <circle cx="91" cy="34" r="11" fill="#22c55e"/>
+</svg>

@@ -1,0 +1,222 @@
+[package]
+name = "little-monkey"
+version = "1.0.0"
+description = "Little Monkey — a local model runner with agentic file/shell tools"
+authors = ["you"]
+license = "MIT"
+edition = "2021"
+default-run = "little-monkey"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "little_monkey_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# "unstable" enables the multiwebview API (Window::add_child + Manager::
+# get_window), the mechanism behind browser_pane.rs's real in-app browser
+# tabs — each tab is a native child webview overlaid on the main webview.
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-fs = "2.5.1"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-window-state = "2"
+tokio = { version = "1.52.3", features = ["full"] }
+# "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
+# `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
+# to POST the DuckDuckGo query as `application/x-www-form-urlencoded`.
+# "query" added in phase 3 for the same reason: `RequestBuilder::query` (used
+# by the Brave/SearXNG branches to attach `?q=&count=`/`?q=&format=json`) is
+# also feature-gated in reqwest 0.13, separately from "form".
+reqwest = { version = "0.13.4", features = ["json", "stream", "form", "query", "multipart"] }
+futures-util = "0.3.32"
+uuid = { version = "1.23.4", features = ["v4"] }
+regex = "1.12.4"
+walkdir = "2.5.0"
+globset = "0.4"
+dirs = "6.0.0"
+# Platform keystore features are required: without them keyring v3 falls back
+# to its in-memory mock store, where every `Entry::new` is an independent
+# credential — keys "save" but can never be read back (has_key stays false).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+rustyline = "17"
+# mcp_oauth.rs: implementing rmcp's `transport::auth::CredentialStore`/
+# `StateStore` traits (both `#[async_trait]`-defined) requires applying the
+# same macro to the `impl` block. Already an indirect dependency via rmcp
+# itself (whose `auth` feature needs it); made direct so this crate's own
+# code can name the macro. Version-matched to rmcp's own requirement so only
+# one copy resolves.
+async-trait = "0.1.89"
+# "auth" (+ its required "reqwest" feature, for the rustls-backed
+# `ReqwestClient`/TLS provider `oauth2`'s HTTP calls need) enables rmcp's
+# `transport::auth` module — generic MCP-spec OAuth 2.0 client support (RFC
+# 8414 discovery, RFC 7591 dynamic client registration, PKCE authorization
+# code flow, token refresh) used by `mcp_oauth.rs`. See that module's doc
+# comment for how it composes with the existing manual-bearer-token path.
+rmcp = { version = "2.2.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "reqwest"] }
+# Only needed by the `mcp_test_server` bin (src/bin/mcp_test_server.rs), a
+# trivial stdio MCP server used solely by mcp.rs's unit tests — its
+# `#[tool_router]`-annotated methods need `JsonSchema` derives, and that
+# derive macro resolves the `schemars` crate path directly (not via rmcp's
+# re-export), so it must be a direct dependency here too. Version-matched to
+# rmcp's own `schemars = "1.0"` requirement so only one copy resolves.
+schemars = "1"
+# Only needed by the `mcp_test_server` bin, same reasoning as `schemars`
+# above: its `wait_for_cancel` test tool (used by mcp.rs's cancellation-
+# propagation test) takes a `tokio_util::sync::CancellationToken` argument,
+# rmcp's own server-side extractor type for "cancelled when this request's
+# `notifications/cancelled` arrives" — rmcp depends on tokio-util itself but
+# doesn't re-export it. Version-matched to the copy already in Cargo.lock via
+# rmcp's own dependency so only one copy resolves.
+tokio-util = "0.7"
+# web.rs: HTML->Markdown conversion for tool_web_fetch (turndown.js-style,
+# html5ever-based). The design doc named ~0.2; 0.5 is current on crates.io as
+# of implementation time — API used here (the free `convert` fn) is stable
+# across that range.
+htmd = "0.5"
+# web.rs: explicit dependency (was already a transitive reqwest dep) so
+# `validate_fetch_url`'s SSRF guard can parse/inspect the URL's host without
+# relying on reqwest's internals.
+url = "2"
+# web.rs: CSS-selector HTML parsing for the DuckDuckGo results page
+# (tool_web_search, phase 2). The design doc named ~0.24; 0.27 is current on
+# crates.io as of implementation time — the `Html::parse_document` /
+# `Selector::parse` / `ElementRef::text`/`.attr()` API used here is stable
+# across that range. Default features (html5ever-based parsing) are enough;
+# no need for the `serde` cargo feature since results are re-serialized into
+# our own `SearchResult` struct.
+scraper = "0.27"
+# web.rs: Mozilla-readability-style article extraction, run on HTML pages
+# before htmd conversion (tool_web_fetch, phase 5 polish — see
+# `extract_readable_content`). The design doc named ~0.6 (dated 2026-07-10);
+# 0.18.0 is current on crates.io as of implementation time — a much larger
+# jump than htmd/scraper's own doc-vs-actual deltas, but the API surface used
+# here (`Readability::new(html, document_url, config) -> Result<Self, _>`,
+# `.parse() -> Result<Article, _>`, `Article::{title, content, length}`)
+# matches the design doc's description; verified against docs.rs at
+# implementation time rather than assumed from the stale version number.
+dom_smoothie = "0.18.0"
+# server.rs (local OpenAI-compatible API server, phase 1): the design doc
+# named hyper/hyper-util/http-body-util/sha2/rand as already-transitive deps
+# (pulled in via reqwest/tauri/keyring) as of its 2026-07-10 Cargo.lock
+# snapshot — verified still true for hyper/hyper-util/http-body-util/sha2 via
+# `cargo tree -i` against the *current* lockfile (versions below match
+# exactly). `rand` is the one exception: `cargo tree -i rand`/`-i quinn-proto`
+# print nothing against this lockfile — `rand 0.10.2` is listed in Cargo.lock
+# only as reqwest's optional (never-enabled) `http3`/quinn dependency chain,
+# not as a package actually compiled into this build. Adding it here as a
+# direct dependency (pinned to the exact version already recorded in
+# Cargo.lock) is therefore a small real addition to the build graph, not the
+# "zero new downloads" the design doc claimed — the only such deviation among
+# the five crates it named.
+hyper = { version = "1.10.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.3"
+sha2 = "0.10.9"
+rand = "0.10.2"
+# connectors.rs: hand-rolled AWS Signature Version 4 for `connectors_add_s3`'s
+# bucket-existence verification `HEAD` call — no AWS SDK dependency, just the
+# one keyed-hash primitive SigV4 needs on top of the `sha2` already above.
+hmac = "0.12"
+# knowledge_service.rs: real filesystem watcher backing the `WatchedFolder`
+# Knowledge Sync connector (distinct from the manual, pull-only
+# `LocalFolder`). Small, no GPU/OS-input-hook surface — just OS filesystem
+# change notifications.
+notify = "8"
+# portability_commands.rs: AES-256-GCM authenticated snapshot encryption.
+# ring 0.17.14 is already in the locked/compiled dependency graph through
+# rustls; making it direct lets the backup layer use its audited AEAD API
+# without a second crypto implementation or another downloaded crate.
+ring = "0.17.14"
+# daemon/remote: the optional user-owned remote runner terminates TLS itself
+# when exposed directly. These exact versions are already present through
+# reqwest, so this only makes the server-side API available to the binary.
+tokio-rustls = "0.26.4"
+rustls = "0.23.41"
+# knowledge_adapters.rs: bounded, inert Office Open XML extraction. These are
+# already locked transitively in this workspace; making them direct lets the
+# app decode ZIP/Deflate containers and stream XML without executing macros,
+# formulas, scripts, or external relationships.
+flate2 = "1.1.9"
+quick-xml = "0.41.0"
+crc32fast = "1.5.0"
+# stacks.rs (RAG design doc, slice 4): pure-Rust PDF text extraction for
+# Knowledge Stacks sources. `optional = true` + the `pdf-extraction` feature
+# below (default-on) so PDF support is a build-time toggle, not a hard
+# dependency baked unconditionally into every build — a build run with
+# `--no-default-features` (or a future leaner CLI-only profile) simply skips
+# `.pdf` sources at index time, the same as any other unsupported extension.
+# 0.12.0 verified current on crates.io (`cargo add pdf-extract --dry-run`) at
+# implementation time; the design doc didn't pin a version.
+pdf-extract = { version = "0.12", optional = true }
+# recipes.rs: YAML recipe parsing (docs/roadmap/p3-scheduled-automation.md).
+# serde_yaml has been deprecated since March 2024 (see
+# https://users.rust-lang.org/t/serde-yaml-deprecation-alternatives/108868);
+# serde-saphyr is the maintained, pure-Rust successor for typed
+# `from_str::<T>` deserialization, exactly this use case. 0.0.29 verified
+# current on crates.io (`cargo add serde-saphyr --dry-run`) at implementation
+# time.
+serde-saphyr = "0.0.29"
+# automations.rs: cron expression validation/next-run computation for the
+# in-app scheduler (design doc slice 3). Actively maintained, POSIX weekday
+# numbering, timezone-aware, seconds-optional — preferred over the older
+# `cron` crate, which uses Quartz (1-7 = Sun-Sat shifted) weekday numbering
+# that would silently mismatch user expectations. 3.0.1 verified current on
+# crates.io (`cargo add croner --dry-run`) at implementation time. Kept
+# Rust-side only (no frontend cron dependency) so `cron_validate`/`cron_next`
+# are the only new date-parsing surface this feature adds.
+croner = "3.0.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+# system.rs: cross-platform physical-memory snapshot used only to decide
+# whether multiple local comparison branches should launch concurrently or
+# be queued. The crate exposes byte counts on macOS, Windows, and Linux.
+system-memory = "0.1.7"
+# run_ledger.rs / storage.rs: one bundled, cross-platform SQLite engine for
+# ordered run events, approvals, migrations, FTS5 history, and verified
+# backup/restore. Bundling avoids depending on whatever SQLite version happens
+# to be installed on a user's machine; backup/limits support bounded portable
+# snapshots and hostile-input guardrails.
+rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
+# terminal.rs: one cross-platform pseudoterminal implementation for the
+# in-app terminal. The frontend intentionally stays a thin line-oriented
+# terminal surface; process ownership, output bounds, cancellation, and
+# workspace validation all remain in Rust.
+portable-pty = "0.9.0"
+enigo = "0.6.1"
+
+# cli_install.rs (Windows only — macOS/Linux use a plain symlink via
+# `std::os::unix::fs::symlink`, no extra dependency needed): adds the CLI
+# shim directory to `HKCU\Environment\Path` on first launch, user-scope
+# only, no admin elevation. 0.56 verified current on crates.io at
+# implementation time.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+# cli_install.rs: broadcasts WM_SETTINGCHANGE after the PATH registry write
+# so already-open shells/Explorer notice without a logoff — the same
+# notification Windows installers send. Only the two Win32 feature modules
+# actually used (SendMessageTimeoutW plus the HWND/WPARAM/LPARAM/LRESULT
+# type aliases it needs) are enabled. 0.61 verified current on crates.io at
+# implementation time.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+default = ["pdf-extraction"]
+pdf-extraction = ["dep:pdf-extract"]
+
+[dev-dependencies]
+# The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
+# command-macro argument-key matching can be exercised in unit tests.
+tauri = { version = "2", features = ["test"] }

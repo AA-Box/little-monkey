@@ -1,0 +1,269 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+:root {
+  color-scheme: light;
+  --c-background: #ffffff;
+  --c-foreground: #18181b;
+  --c-surface: #fafafa;
+  --c-surface-2: #f4f4f5;
+  --c-border: #e4e4e7;
+  --c-border-strong: #d4d4d8;
+  --c-muted: #52525b;
+  --c-faint: #71717a;
+  --c-accent: #4f46e5;
+  --c-accent-hover: #4338ca;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #eef2ff;
+  --c-danger: #dc2626;
+  --c-danger-hover: #b91c1c;
+  --c-danger-foreground: #ffffff;
+  --c-danger-soft: #fef2f2;
+  --c-success: #16a34a;
+  --c-success-soft: #f0fdf4;
+  --c-warning: #d97706;
+  --c-warning-soft: #fffbeb;
+  --app-font-scale: 1;
+  font-size: calc(16px * var(--app-font-scale));
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --c-background: #131316;
+  --c-foreground: #f4f4f5;
+  --c-surface: #1a1a1e;
+  --c-surface-2: #222227;
+  --c-border: #2c2c33;
+  --c-border-strong: #3d3d46;
+  --c-muted: #a1a1aa;
+  --c-faint: #85858f;
+  --c-accent: #818cf8;
+  --c-accent-hover: #a5b4fc;
+  --c-accent-foreground: #111827;
+  --c-accent-soft: rgba(129, 140, 248, 0.18);
+  --c-danger: #f87171;
+  --c-danger-hover: #fca5a5;
+  --c-danger-foreground: #131316;
+  --c-danger-soft: rgba(248, 113, 113, 0.14);
+  --c-success: #4ade80;
+  --c-success-soft: rgba(74, 222, 128, 0.14);
+  --c-warning: #fbbf24;
+  --c-warning-soft: rgba(251, 191, 36, 0.15);
+}
+
+:root[data-text-scale="small"] {
+  --app-font-scale: 0.94;
+}
+
+:root[data-text-scale="medium"] {
+  --app-font-scale: 1;
+}
+
+:root[data-text-scale="large"] {
+  --app-font-scale: 1.07;
+}
+
+:root[data-accent="indigo"] {
+  --c-accent: #4f46e5;
+  --c-accent-hover: #4338ca;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #eef2ff;
+}
+
+:root[data-theme="dark"][data-accent="indigo"] {
+  --c-accent: #818cf8;
+  --c-accent-hover: #a5b4fc;
+  --c-accent-foreground: #111827;
+  --c-accent-soft: rgba(129, 140, 248, 0.18);
+}
+
+:root[data-accent="blue"] {
+  --c-accent: #2563eb;
+  --c-accent-hover: #1d4ed8;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #dbeafe;
+}
+
+:root[data-theme="dark"][data-accent="blue"] {
+  --c-accent: #60a5fa;
+  --c-accent-hover: #93c5fd;
+  --c-accent-foreground: #0f172a;
+  --c-accent-soft: rgba(96, 165, 250, 0.18);
+}
+
+:root[data-accent="teal"] {
+  --c-accent: #0f766e;
+  --c-accent-hover: #0d9488;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #ccfbf1;
+}
+
+:root[data-theme="dark"][data-accent="teal"] {
+  --c-accent: #2dd4bf;
+  --c-accent-hover: #5eead4;
+  --c-accent-foreground: #10201d;
+  --c-accent-soft: rgba(45, 212, 191, 0.16);
+}
+
+:root[data-accent="rose"] {
+  --c-accent: #e11d48;
+  --c-accent-hover: #be123c;
+  --c-accent-foreground: #ffffff;
+  --c-accent-soft: #ffe4e6;
+}
+
+:root[data-theme="dark"][data-accent="rose"] {
+  --c-accent: #fb7185;
+  --c-accent-hover: #fda4af;
+  --c-accent-foreground: #261015;
+  --c-accent-soft: rgba(251, 113, 133, 0.16);
+}
+
+:root[data-accent="amber"] {
+  --c-accent: #d97706;
+  --c-accent-hover: #b45309;
+  --c-accent-foreground: #18181b;
+  --c-accent-soft: #fef3c7;
+}
+
+:root[data-theme="dark"][data-accent="amber"] {
+  --c-accent: #fbbf24;
+  --c-accent-hover: #fcd34d;
+  --c-accent-foreground: #131316;
+  --c-accent-soft: rgba(251, 191, 36, 0.16);
+}
+
+:root[data-contrast="high"] {
+  --c-border: #b8b8c2;
+  --c-border-strong: #8b8b99;
+  --c-muted: #3f3f46;
+  --c-faint: #52525b;
+}
+
+:root[data-theme="dark"][data-contrast="high"] {
+  --c-border: #52525d;
+  --c-border-strong: #6e6e7a;
+  --c-muted: #d4d4d8;
+  --c-faint: #b0b0ba;
+}
+
+@theme {
+  --color-background: var(--c-background);
+  --color-foreground: var(--c-foreground);
+  --color-surface: var(--c-surface);
+  --color-surface-2: var(--c-surface-2);
+  --color-border: var(--c-border);
+  --color-border-strong: var(--c-border-strong);
+  --color-muted: var(--c-muted);
+  --color-faint: var(--c-faint);
+  --color-accent: var(--c-accent);
+  --color-accent-hover: var(--c-accent-hover);
+  --color-accent-foreground: var(--c-accent-foreground);
+  --color-accent-soft: var(--c-accent-soft);
+  --color-danger: var(--c-danger);
+  --color-danger-hover: var(--c-danger-hover);
+  --color-danger-foreground: var(--c-danger-foreground);
+  --color-danger-soft: var(--c-danger-soft);
+  --color-success: var(--c-success);
+  --color-success-soft: var(--c-success-soft);
+  --color-warning: var(--c-warning);
+  --color-warning-soft: var(--c-warning-soft);
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --animate-fade-in: fade-in 0.15s ease-out;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+html, body, #root { height: 100%; }
+
+html {
+  background-color: var(--color-background);
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background-color: var(--color-accent-soft); }
+
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after {
+  animation-duration: 0.01ms !important;
+  transition-duration: 0.01ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* EffortSelector's reasoning-effort slider: a single static gray-to-accent
+ * gradient with a grain texture across the whole track (not the native
+ * two-tone filled/unfilled look), and a plain circular thumb — Tailwind v4
+ * has no default range-input reset (no @tailwindcss/forms in this project),
+ * and multi-layer gradient+blend backgrounds are unwieldy as Tailwind
+ * arbitrary-variant classNames, so this lives here instead. Uses the same
+ * `--c-muted`/`--c-accent` custom properties `@theme` wires to `bg-muted`/
+ * `bg-accent` elsewhere, so it stays correct across light/dark mode and
+ * every user-selectable accent preset without any JS involved. */
+.effort-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 17px;
+  background: transparent;
+  cursor: pointer;
+}
+.effort-range:focus { outline: none; }
+.effort-range::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 9999px;
+  background-image:
+    linear-gradient(to right, var(--c-muted), var(--c-accent)),
+    radial-gradient(circle, rgba(255, 255, 255, 0.4) 1px, transparent 1.3px);
+  background-size: 100% 100%, 3px 3px;
+  background-blend-mode: normal, overlay;
+}
+.effort-range::-moz-range-track {
+  height: 5px;
+  border-radius: 9999px;
+  background-image:
+    linear-gradient(to right, var(--c-muted), var(--c-accent)),
+    radial-gradient(circle, rgba(255, 255, 255, 0.4) 1px, transparent 1.3px);
+  background-size: 100% 100%, 3px 3px;
+  background-blend-mode: normal, overlay;
+}
+.effort-range::-moz-range-progress { background: transparent; }
+.effort-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 17px;
+  height: 17px;
+  border-radius: 9999px;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.15);
+  margin-top: -6px;
+}
+.effort-range::-moz-range-thumb {
+  width: 17px;
+  height: 17px;
+  border-radius: 9999px;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+.effort-range:disabled { cursor: not-allowed; opacity: 0.5; }
