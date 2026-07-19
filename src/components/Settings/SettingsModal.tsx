@@ -8,6 +8,7 @@ import {
   Brain,
   Cloud,
   Cpu,
+  FlaskConical,
   Keyboard,
   HardDrive,
   Gauge,
@@ -66,6 +67,7 @@ import { DesktopControlPanel } from "./DesktopControlPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { AppearancePanel } from "./AppearancePanel";
 import { TeamModePanel } from "./TeamModePanel";
+import { CompareLabPanel } from "./CompareLabPanel";
 import { ModelManager } from "../Models";
 import { OllamaPanel } from "../Ollama";
 import { useT } from "../../lib/i18n";
@@ -83,7 +85,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -116,11 +118,12 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   localapps: AppWindow,
   desktopcontrol: MousePointerClick,
   team: Users,
+  comparelab: FlaskConical,
 };
 
 const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "privacy", "diagnostics", "approvalchains", "team", "companion", "desktopcontrol", "shortcuts", "usage", "portability"] },
-  { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers"] },
+  { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "mcp", "connectors", "prompts", "apiserver"] },
 ];
@@ -156,6 +159,7 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   localapps: "SettingsModal.tabLocalApps",
   desktopcontrol: "SettingsModal.tabDesktopControl",
   team: "SettingsModal.tabTeamMode",
+  comparelab: "SettingsModal.tabCompareLab",
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -397,6 +401,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "appearance" && <AppearancePanel />}
               {tab === "desktopcontrol" && <DesktopControlPanel />}
               {tab === "team" && <TeamModePanel />}
+              {tab === "comparelab" && <CompareLabPanel />}
             </div>
           </div>
         </div>
