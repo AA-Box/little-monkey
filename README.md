@@ -341,6 +341,3 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - `extensions/little-monkey-vscode/` and `extensions/little-monkey-jetbrains/` — thin IDE clients.
 - `.github/actions/little-monkey-review/` — reusable PR-review action implementation and contract test.
 - `src-tauri/fixtures/` — deterministic browser and knowledge acceptance fixtures.
-- `graphify-out/` — generated architecture graph and wiki; run `graphify update .` after code changes.
-- [ROADMAP.md](ROADMAP.md) — future product phases, scoped acceptance boundaries, research items, and explicit non-goals.
-- [roadmap_audit_report.md](roadmap_audit_report.md) — preserved historical audit followed by a current working-tree closeout.

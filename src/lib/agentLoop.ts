@@ -26,7 +26,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -76,6 +76,7 @@ import {
   type ModelTargetSnapshot,
 } from './modelTargets';
 import { beginDurableRun, type DurableRunRecorder } from './durableRun';
+import { daemonCancel } from './daemonClient';
 import { requestRunCancellation } from './runProtocol';
 import { registerRunCancellation } from './runCancellationRegistry';
 import {
@@ -1671,7 +1672,7 @@ async function runDaemonAgentTurn(
   });
   const queued = await submitDaemonDesktopTurn(turnId, recipe);
   if (signal.aborted) {
-    await import('./daemonClient').then(({ daemonCancel }) => daemonCancel(queued.run_id, 'Stopped before attach'));
+    await daemonCancel(queued.run_id, 'Stopped before attach');
   }
 
   if (unresolved.length > 0) {
@@ -2144,8 +2145,13 @@ async function runAgentTurnBody(
   const skillToolEnabled =
     settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
+  // `GENERATE_IMAGE_TOOL` is appended here (desktop chat's composition chain
+  // only) rather than living in the base `TOOLS` array — see its doc comment
+  // in tools.ts for why (webview-rasterized wire shape; monkey-cli can't
+  // offer it). The result lives in private app storage, not the workspace,
+  // so it has no edit-permission or selected-folder dependency.
   const baseToolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...buildTools(attachedStackNames), ...mcpDefs], mode),
+    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs], mode),
     settings.memoryEnabled,
     settings.webToolsEnabled,
     // Ultracode force-offers the `task` tool even when the subagents toggle

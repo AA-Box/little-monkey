@@ -534,6 +534,7 @@ export interface WorkflowHumanApprovalChallenge {
   run_id: string;
   node_id: string;
   approval_policy_id: string;
+  summary: string;
   summary_sha256: string;
 }
 
@@ -674,7 +675,7 @@ export const ecosystemClient = {
       summary,
     }),
   decideWorkflowApproval: (challengeId: string, approved: boolean) =>
-    invoke<void>("m4_workflows_decide_approval", { challengeId, approved }),
+    invoke<boolean>("m4_workflows_decide_approval", { challengeId, approved }),
   replayWorkflow: (
     workflowId: string,
     sourceRunId: string,

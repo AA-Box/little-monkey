@@ -324,7 +324,7 @@ pub struct McpConnection {
     pub service: RunningService<RoleClient, ()>,
     /// The server's full, unfiltered tool list — allowlist filtering (see
     /// `McpServerEntry::tool_allowlist`) is applied by callers
-    /// ([`mcp_list_tools`], [`call_tool_impl`]), not baked in here, so
+    /// (`mcp_list_servers`' frontend projection and [`call_tool_impl`]), not baked in here, so
     /// `mcp_list_servers`/the Settings tool-allowlist checkboxes can still
     /// show the full set of what a server offers.
     pub tools: Vec<CachedMcpTool>,
@@ -972,60 +972,6 @@ pub fn mcp_set_http_token(server_id: String, token: String) -> Result<(), String
 pub fn mcp_remove_http_token(server_id: String) -> Result<(), String> {
     validate_id(&server_id)?;
     remove_http_token_impl(&server_id)
-}
-
-/// One connected server's (allowlist-filtered) cached tools — what the
-/// frontend actually merges into the model's tool set (phase 2), as
-/// distinct from `mcp_list_servers`' unfiltered tool list (used to render
-/// the Settings allowlist checkboxes).
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpServerTools {
-    pub server_id: String,
-    pub tools: Vec<CachedMcpTool>,
-}
-
-/// List cached tools for one connected server (`server_id = Some(..)`) or
-/// every connected, enabled server (`None`) — called by the frontend before
-/// each turn to build the merged tool set. Cheap: reads the in-memory cache
-/// populated by `mcp_connect`, never re-queries the server.
-#[tauri::command(rename_all = "snake_case")]
-pub async fn mcp_list_tools(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    server_id: Option<String>,
-) -> Result<Vec<McpServerTools>, String> {
-    let config = load_config_impl(&config_file_path(&app)?)?;
-    let guard = state.mcp.lock().await;
-
-    let mut out = Vec::new();
-    for entry in &config.servers {
-        if !entry.enabled {
-            continue;
-        }
-        if let Some(ref wanted) = server_id {
-            if wanted != &entry.id {
-                continue;
-            }
-        }
-        let Some(connection) = guard.get(&entry.id) else {
-            continue;
-        };
-        let tools = match &entry.tool_allowlist {
-            Some(allow) => connection
-                .tools
-                .iter()
-                .filter(|t| allow.iter().any(|a| a == &t.name))
-                .cloned()
-                .collect(),
-            None => connection.tools.clone(),
-        };
-        out.push(McpServerTools {
-            server_id: entry.id.clone(),
-            tools,
-        });
-    }
-    Ok(out)
 }
 
 /// Call a tool on a connected MCP server. Permission-gated

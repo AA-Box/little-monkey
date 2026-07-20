@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { THEME_STORAGE_KEY } from "../lib/theme";
+import { DEFAULT_APPEARANCE_SETTINGS, THEME_STORAGE_KEY } from "../lib/theme";
 import { STORAGE_KEY, useSettingsStore } from "./settingsStore";
 
 describe("settingsStore.checkpointRetention", () => {
@@ -571,11 +571,9 @@ describe("settingsStore.subagentProfileModels", () => {
 describe("settingsStore.appearance", () => {
   beforeEach(() => {
     useSettingsStore.setState({
-      themePreference: "system",
-      accentColor: "default",
-      textScale: "medium",
-      motionPreference: "system",
-      highContrastEnabled: false,
+      appearanceProfileVersion: 1,
+      deviceAppearance: { ...DEFAULT_APPEARANCE_SETTINGS },
+      appearanceWorkspaceOverrides: {},
     });
   });
 
@@ -586,48 +584,77 @@ describe("settingsStore.appearance", () => {
     }
     vi.resetModules();
     const fresh = await import("./settingsStore");
-    expect(fresh.useSettingsStore.getState()).toMatchObject({
+    expect(fresh.useSettingsStore.getState().deviceAppearance).toEqual({
       themePreference: "system",
       accentColor: "default",
       textScale: "medium",
+      codeFontSize: 14,
+      uiDensity: "comfortable",
+      sidebarLayout: "standard",
+      chatBubbleStyle: "bubbles",
       motionPreference: "system",
       highContrastEnabled: false,
+      focusVisibility: "standard",
     });
   });
 
-  it("updates every appearance field through its setter", () => {
+  it("updates the complete device profile atomically", () => {
     const settings = useSettingsStore.getState();
-    settings.setThemePreference("dark");
-    settings.setAccentColor("teal");
-    settings.setTextScale("large");
-    settings.setMotionPreference("reduced");
-    settings.setHighContrastEnabled(true);
-
-    expect(useSettingsStore.getState()).toMatchObject({
+    settings.setDeviceAppearance({
       themePreference: "dark",
       accentColor: "teal",
       textScale: "large",
+      codeFontSize: 16,
+      uiDensity: "spacious",
+      sidebarLayout: "wide",
+      chatBubbleStyle: "flat",
       motionPreference: "reduced",
       highContrastEnabled: true,
+      focusVisibility: "enhanced",
+    });
+
+    expect(useSettingsStore.getState().deviceAppearance).toEqual({
+      themePreference: "dark",
+      accentColor: "teal",
+      textScale: "large",
+      codeFontSize: 16,
+      uiDensity: "spacious",
+      sidebarLayout: "wide",
+      chatBubbleStyle: "flat",
+      motionPreference: "reduced",
+      highContrastEnabled: true,
+      focusVisibility: "enhanced",
     });
   });
 
   it("persists appearance across a hydrate() reload", async () => {
     if (typeof localStorage === "undefined") return;
-    useSettingsStore.getState().setThemePreference("dark");
-    useSettingsStore.getState().setAccentColor("rose");
-    useSettingsStore.getState().setTextScale("small");
-    useSettingsStore.getState().setMotionPreference("reduced");
-    useSettingsStore.getState().setHighContrastEnabled(true);
-
-    vi.resetModules();
-    const fresh = await import("./settingsStore");
-    expect(fresh.useSettingsStore.getState()).toMatchObject({
+    useSettingsStore.getState().setDeviceAppearance({
       themePreference: "dark",
       accentColor: "rose",
       textScale: "small",
+      codeFontSize: 12,
+      uiDensity: "compact",
+      sidebarLayout: "compact",
+      chatBubbleStyle: "compact",
       motionPreference: "reduced",
       highContrastEnabled: true,
+      focusVisibility: "enhanced",
+    });
+
+    vi.resetModules();
+    const fresh = await import("./settingsStore");
+    expect(fresh.useSettingsStore.getState().deviceAppearance).toEqual({
+      themePreference: "dark",
+      accentColor: "rose",
+      textScale: "small",
+      codeFontSize: 12,
+      uiDensity: "compact",
+      sidebarLayout: "compact",
+      chatBubbleStyle: "compact",
+      motionPreference: "reduced",
+      highContrastEnabled: true,
+      focusVisibility: "enhanced",
     });
     localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem(THEME_STORAGE_KEY);
@@ -649,12 +676,17 @@ describe("settingsStore.appearance", () => {
 
     vi.resetModules();
     const fresh = await import("./settingsStore");
-    expect(fresh.useSettingsStore.getState()).toMatchObject({
+    expect(fresh.useSettingsStore.getState().deviceAppearance).toEqual({
       themePreference: "system",
       accentColor: "default",
       textScale: "medium",
+      codeFontSize: 14,
+      uiDensity: "comfortable",
+      sidebarLayout: "standard",
+      chatBubbleStyle: "bubbles",
       motionPreference: "system",
       highContrastEnabled: false,
+      focusVisibility: "standard",
     });
     localStorage.removeItem(STORAGE_KEY);
   });
@@ -666,7 +698,7 @@ describe("settingsStore.appearance", () => {
 
     vi.resetModules();
     const fresh = await import("./settingsStore");
-    expect(fresh.useSettingsStore.getState().themePreference).toBe("dark");
+    expect(fresh.useSettingsStore.getState().deviceAppearance.themePreference).toBe("dark");
     localStorage.removeItem(THEME_STORAGE_KEY);
   });
 });

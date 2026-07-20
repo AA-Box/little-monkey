@@ -26,6 +26,7 @@
  */
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
 import type { ChatMessage } from './llamaClient';
+import { parseModelJsonCandidates } from './modelJson';
 
 // ---------------------------------------------------------------------------
 // Engine bootstrap
@@ -360,23 +361,11 @@ function asNonEmptyString(value: unknown): string | null {
 
 /** Strict parse of the proposal reply, mirroring `sopCompiler.ts`'s
  * `parseSopCompilerResponse`: tries the raw trimmed content first, then
- * falls back to the first `{...}` span (small local models sometimes wrap
- * otherwise valid JSON in a sentence or code fence). Returns `null` on
- * anything malformed. */
+ * complete embedded JSON objects (small local models sometimes wrap otherwise
+ * valid JSON in a sentence or code fence). Returns `null` on malformed or
+ * truncated output. */
 export function parseProposalResponse(content: string): SqlProposal | null {
-  const candidates = [content.trim()];
-  const embedded = content.match(/\{[\s\S]*\}/);
-  if (embedded) candidates.push(embedded[0]);
-
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const record = parsed as Record<string, unknown>;
+  for (const record of parseModelJsonCandidates(content, 'object')) {
     const sql = asNonEmptyString(record.sql);
     const explanation = asNonEmptyString(record.explanation) ?? '';
     if (!sql) continue;

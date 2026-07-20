@@ -11,6 +11,7 @@ import {
   GitCompare,
   Globe2,
   Loader2,
+  ListTodo,
   Monitor,
   MousePointerClick,
   Paperclip,
@@ -57,6 +58,7 @@ import {
   type RecordedElementInfo,
 } from "../../lib/workflowRecorder";
 import { useBrowserWorkbenchStore } from "../../store/browserWorkbenchStore";
+import { buildBrowserEvidenceSideTaskSeed, useSideTaskStore } from "../../store/sideTaskStore";
 import { Button, IconButton, Tabs } from "../ui";
 import { WorkflowDraftReview } from "./WorkflowDraftReview";
 import { WorkflowLibrary } from "./WorkflowLibrary";
@@ -433,9 +435,9 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
     applyEvidence(result.evidence);
   }
 
-  async function handleAttach() {
-    if (!chatSessionId || !session || !evidence) return;
-    const result = await perform("attach", async () => {
+  async function prepareEvidenceForConversation(actionName: string) {
+    if (!session || !evidence) return null;
+    const result = await perform(actionName, async () => {
       const [consoleExcerpt, networkExcerpt, screenshot] = await Promise.all([
         artifactText(evidence.console?.id),
         artifactText(evidence.network?.id),
@@ -450,14 +452,32 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
         } : null,
       };
     });
-    if (!result) return;
-    queueForChat(chatSessionId, {
+    if (!result) return null;
+    return {
       id: crypto.randomUUID(),
       summary: buildBrowserEvidenceSummary({ url: session.currentUrl || url, viewport: session.viewport, evidence, annotation, inspection, consoleExcerpt: result.consoleExcerpt, networkExcerpt: result.networkExcerpt }),
       screenshot: result.screenshot,
-    });
+    };
+  }
+
+  async function handleAttach() {
+    if (!chatSessionId) return;
+    const result = await prepareEvidenceForConversation("attach");
+    if (!result) return;
+    queueForChat(chatSessionId, result);
     setNotice("Evidence staged in chat for review before sending.");
     onClose?.();
+  }
+
+  async function handleStartSideTask() {
+    if (!chatSessionId || !session) return;
+    const result = await prepareEvidenceForConversation("side task");
+    if (!result) return;
+    useSideTaskStore.getState().openComposer(buildBrowserEvidenceSideTaskSeed({
+      sessionId: chatSessionId,
+      label: `Browser evidence · ${session.currentUrl || url}`,
+      summary: result.summary,
+    }));
   }
 
   async function handleCopyReport() {
@@ -520,7 +540,7 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
             </div>
 
             <div className="space-y-3">
-              <div className="rounded-xl border border-border bg-surface p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Latest evidence</h3><p className="mt-1 text-[11px] text-faint">Screenshot, DOM, accessibility tree, console, network, and performance are content-addressed and bounded.</p></div><div className="flex gap-2"><Button size="sm" disabled={!evidence || busy !== null} onClick={() => void handleCopyReport()}><Copy size={13} />PR report</Button>{chatSessionId && <Button size="sm" variant="primary" disabled={!evidence || busy !== null} onClick={() => void handleAttach()}><Paperclip size={13} />Attach to chat</Button>}</div></div><div className="mt-3 flex flex-wrap gap-1.5"><ArtifactPill label="Shot" id={evidence?.screenshot?.id} /><ArtifactPill label="DOM" id={evidence?.dom?.id} /><ArtifactPill label="AX" id={evidence?.accessibility?.id} /><ArtifactPill label="Console" id={evidence?.console?.id} /><ArtifactPill label="Network" id={evidence?.network?.id} /><ArtifactPill label="Perf" id={evidence?.performance?.id} /></div>{annotation && <div className="mt-3 rounded-md border border-accent/30 bg-accent-soft p-2 text-xs"><p className="font-medium">{annotation.selector} · {annotation.tag}{annotation.role ? ` · ${annotation.role}` : ""}</p><p className="mt-1 line-clamp-3 text-muted">{annotation.ariaLabel || annotation.text || "No accessible label or text"}</p></div>}{screenshotUrl ? <img src={screenshotUrl} alt="Latest isolated browser screenshot" className="mt-3 max-h-[52vh] w-full rounded-lg border border-border bg-black/80 object-contain" /> : <div className="mt-3 flex min-h-56 items-center justify-center rounded-lg border border-dashed border-border text-xs text-faint">Capture evidence to preview the page.</div>}</div>
+              <div className="rounded-xl border border-border bg-surface p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Latest evidence</h3><p className="mt-1 text-[11px] text-faint">Screenshot, DOM, accessibility tree, console, network, and performance are content-addressed and bounded.</p></div><div className="flex flex-wrap gap-2"><Button size="sm" disabled={!evidence || busy !== null} onClick={() => void handleCopyReport()}><Copy size={13} />PR report</Button>{chatSessionId && <Button size="sm" disabled={!evidence || busy !== null} onClick={() => void handleStartSideTask()}><ListTodo size={13} />Side task</Button>}{chatSessionId && <Button size="sm" variant="primary" disabled={!evidence || busy !== null} onClick={() => void handleAttach()}><Paperclip size={13} />Attach to chat</Button>}</div></div><div className="mt-3 flex flex-wrap gap-1.5"><ArtifactPill label="Shot" id={evidence?.screenshot?.id} /><ArtifactPill label="DOM" id={evidence?.dom?.id} /><ArtifactPill label="AX" id={evidence?.accessibility?.id} /><ArtifactPill label="Console" id={evidence?.console?.id} /><ArtifactPill label="Network" id={evidence?.network?.id} /><ArtifactPill label="Perf" id={evidence?.performance?.id} /></div>{annotation && <div className="mt-3 rounded-md border border-accent/30 bg-accent-soft p-2 text-xs"><p className="font-medium">{annotation.selector} · {annotation.tag}{annotation.role ? ` · ${annotation.role}` : ""}</p><p className="mt-1 line-clamp-3 text-muted">{annotation.ariaLabel || annotation.text || "No accessible label or text"}</p></div>}{screenshotUrl ? <img src={screenshotUrl} alt="Latest isolated browser screenshot" className="mt-3 max-h-[52vh] w-full rounded-lg border border-border bg-black/80 object-contain" /> : <div className="mt-3 flex min-h-56 items-center justify-center rounded-lg border border-dashed border-border text-xs text-faint">Capture evidence to preview the page.</div>}</div>
               <div className="rounded-xl border border-border bg-surface p-3"><div className="mb-3 flex items-center gap-2"><GitCompare size={14} className="text-accent" /><h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Screenshot diff</h3><span className="ml-auto text-[11px] text-faint">{snapshots.length} saved</span></div><SnapshotDiff snapshots={snapshots} /></div>
             </div>
           </div>

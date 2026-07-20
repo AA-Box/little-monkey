@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useReducer, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FileDiff, FolderTree, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
@@ -11,6 +11,9 @@ import { BrowserPane, BrowserWorkbench } from "./components/Browser";
 import { useBrowserPaneStore } from "./store/browserPaneStore";
 import { useApprovalChainStore } from "./store/approvalChainStore";
 import { IssueToPrPanel } from "./components/IssueToPr";
+import { ProductionDebuggingPanel } from "./components/ProductionDebugging";
+import { IncidentCommanderPanel } from "./components/IncidentCommander";
+import { DesignToAppPanel } from "./components/DesignToApp";
 import { SecurityAutofixPanel } from "./components/SecurityAutofix";
 import { TrustScorecardsPanel } from "./components/TrustScorecards";
 import { SopCompilerPanel } from "./components/SopCompiler";
@@ -41,11 +44,16 @@ import { useTerminalStore } from "./store/terminalStore";
 import { DebatePanel } from "./components/Debate";
 import { DatabaseAdminGuardrailsPanel } from "./components/DatabaseAdminGuardrails";
 import { ApiContractDiffLabPanel } from "./components/ApiContractDiffLab";
+import { EvalHarnessPanel } from "./components/EvalHarness";
 import { SettingsModal } from "./components/Settings";
 import type { SettingsTab } from "./components/Settings";
 import { OnboardingWizard } from "./components/Onboarding";
 import { useRunStore } from "./store/runStore";
-import { useSideTaskStore, selectRunningSideTaskCount } from "./store/sideTaskStore";
+import {
+  SIDE_TASK_PANEL_OPEN_REQUEST_EVENT,
+  selectRunningSideTaskCount,
+  useSideTaskStore,
+} from "./store/sideTaskStore";
 import { useSubagentStore, selectRunningSubagentCount } from "./store/subagentStore";
 import { ArtifactPane, FileTree, DiffPanel, DiffViewer, PermissionModal, ApprovalChainModal, ReviewPanel, SessionGrantBanner } from "./components/Workspace";
 import { IconButton, Button } from "./components/ui";
@@ -75,6 +83,7 @@ import { onRunCancellationRequested } from "./lib/runProtocol";
 import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
 import { paletteClient } from "./lib/paletteClient";
+import { featurePanelReducer, type FeaturePanelId } from "./lib/appShellPanels";
 
 /** A file currently previewed in the Workspace panel, with a baseline snapshot
  * (captured the moment it was opened) so edits made by the agent afterwards
@@ -182,35 +191,43 @@ function App() {
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [runCenterOpen, setRunCenterOpen] = useState(false);
-  const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState(false);
-  const [issueToPrOpen, setIssueToPrOpen] = useState(false);
-  const [securityAutofixOpen, setSecurityAutofixOpen] = useState(false);
-  const [trustScorecardsOpen, setTrustScorecardsOpen] = useState(false);
-  const [sopCompilerOpen, setSopCompilerOpen] = useState(false);
-  const [mcpGeneratorOpen, setMcpGeneratorOpen] = useState(false);
-  const [connectorBuilderOpen, setConnectorBuilderOpen] = useState(false);
-  const [migrationAgentOpen, setMigrationAgentOpen] = useState(false);
-  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [activeFeaturePanel, dispatchFeaturePanel] = useReducer(featurePanelReducer, null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const [agentInboxOpen, setAgentInboxOpen] = useState(false);
-  const [redTeamLabOpen, setRedTeamLabOpen] = useState(false);
-  const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
-  const [spreadsheetCopilotOpen, setSpreadsheetCopilotOpen] = useState(false);
-  const [evidenceBoardOpen, setEvidenceBoardOpen] = useState(false);
-  const [goldenDatasetBuilderOpen, setGoldenDatasetBuilderOpen] = useState(false);
-  const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
-  const [dataNotebookOpen, setDataNotebookOpen] = useState(false);
-  const [syntheticMonitoringOpen, setSyntheticMonitoringOpen] = useState(false);
-  const [crossRepoIntelligenceOpen, setCrossRepoIntelligenceOpen] = useState(false);
-  const [workCanvasOpen, setWorkCanvasOpen] = useState(false);
-  const [pmCopilotOpen, setPmCopilotOpen] = useState(false);
-  const [deepResearchOpen, setDeepResearchOpen] = useState(false);
-  const [briefStudioOpen, setBriefStudioOpen] = useState(false);
-  const [crossRepoPlannerOpen, setCrossRepoPlannerOpen] = useState(false);
-  const [visualEditModeOpen, setVisualEditModeOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const settingsOpen = activeFeaturePanel === "settings";
+  const runCenterOpen = activeFeaturePanel === "run-center";
+  const browserWorkbenchOpen = activeFeaturePanel === "browser-workbench";
+  const designToAppOpen = activeFeaturePanel === "design-to-app";
+  const issueToPrOpen = activeFeaturePanel === "issue-to-pr";
+  const productionDebuggingOpen = activeFeaturePanel === "production-debugging";
+  const incidentCommanderOpen = activeFeaturePanel === "incident-commander";
+  const securityAutofixOpen = activeFeaturePanel === "security-autofix";
+  const trustScorecardsOpen = activeFeaturePanel === "trust-scorecards";
+  const sopCompilerOpen = activeFeaturePanel === "sop-compiler";
+  const mcpGeneratorOpen = activeFeaturePanel === "mcp-generator";
+  const connectorBuilderOpen = activeFeaturePanel === "connector-builder";
+  const migrationAgentOpen = activeFeaturePanel === "migration-agent";
+  const globalSearchOpen = activeFeaturePanel === "global-search";
+  const agentInboxOpen = activeFeaturePanel === "agent-inbox";
+  const redTeamLabOpen = activeFeaturePanel === "red-team-lab";
+  const knowledgeGraphOpen = activeFeaturePanel === "knowledge-graph";
+  const spreadsheetCopilotOpen = activeFeaturePanel === "spreadsheet-copilot";
+  const evidenceBoardOpen = activeFeaturePanel === "evidence-board";
+  const goldenDatasetBuilderOpen = activeFeaturePanel === "golden-dataset-builder";
+  const dailyBriefOpen = activeFeaturePanel === "daily-brief";
+  const dataNotebookOpen = activeFeaturePanel === "data-notebook";
+  const syntheticMonitoringOpen = activeFeaturePanel === "synthetic-monitoring";
+  const crossRepoIntelligenceOpen = activeFeaturePanel === "cross-repo-intelligence";
+  const workCanvasOpen = activeFeaturePanel === "work-canvas";
+  const pmCopilotOpen = activeFeaturePanel === "pm-copilot";
+  const deepResearchOpen = activeFeaturePanel === "deep-research";
+  const briefStudioOpen = activeFeaturePanel === "brief-studio";
+  const crossRepoPlannerOpen = activeFeaturePanel === "cross-repo-planner";
+  const visualEditModeOpen = activeFeaturePanel === "visual-edit-mode";
+  const debateOpen = activeFeaturePanel === "debate";
+  const dbAdminGuardrailsOpen = activeFeaturePanel === "db-admin-guardrails";
+  const apiContractDiffLabOpen = activeFeaturePanel === "api-contract-diff-lab";
+  const workflowTestHarnessOpen = activeFeaturePanel === "workflow-test-harness";
   // Title-bar slot the primary ChatWindow portals its Compare/Crew pickers
   // into — callback-ref state (not a plain ref) so ChatWindow re-renders
   // once the element mounts and the portal can attach.
@@ -292,6 +309,15 @@ function App() {
     }
   }, []);
 
+  // Source-aware side-task actions can originate anywhere in the app. Their
+  // store emits a typed, payload-free request; the shell owns revealing the
+  // actual right-sidebar tab without coupling feature code to this layout.
+  useEffect(() => {
+    const revealSideTasks = () => openRightTab("sideTasks");
+    window.addEventListener(SIDE_TASK_PANEL_OPEN_REQUEST_EVENT, revealSideTasks);
+    return () => window.removeEventListener(SIDE_TASK_PANEL_OPEN_REQUEST_EVENT, revealSideTasks);
+  }, [openRightTab]);
+
   // Dock moves migrate the terminal between its two homes: re-docked to the
   // bottom (via the panel's dock button) it leaves the tab strip; re-docked
   // to the right (same button on the bottom panel) it must gain a sidebar
@@ -360,11 +386,8 @@ function App() {
       shortcutDisplayLabel(id, detectShortcutPlatform(), shortcutOverrides),
     [shortcutOverrides],
   );
-  const [debateOpen, setDebateOpen] = useState(false);
-  const [dbAdminGuardrailsOpen, setDbAdminGuardrailsOpen] = useState(false);
-  const [apiContractDiffLabOpen, setApiContractDiffLabOpen] = useState(false);
-  // Tab Settings should jump to the moment it opens — set alongside
-  // `settingsOpen` by anything that deep-links into a specific tab (right
+  // Tab Settings should jump to the moment it opens — set alongside the
+  // active feature panel by anything that deep-links into a specific tab (right
   // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
   // for the normal "open on whatever tab was last active" path (AppMenu).
   // Reset back to `undefined` on close (see the `SettingsModal` below) so a
@@ -375,41 +398,30 @@ function App() {
   // even while Settings is already open and the user has navigated away.
   const [settingsTabRequest, setSettingsTabRequest] = useState(0);
 
-  const openSettingsTab = useCallback((tab: SettingsTab) => {
-    setRunCenterOpen(false);
-    setBrowserWorkbenchOpen(false);
-    setIssueToPrOpen(false);
-    setSecurityAutofixOpen(false);
-    setTrustScorecardsOpen(false);
-    setSopCompilerOpen(false);
-    setMcpGeneratorOpen(false);
-    setConnectorBuilderOpen(false);
-    setMigrationAgentOpen(false);
-    setGlobalSearchOpen(false);
+  const activateFeaturePanel = useCallback((panel: FeaturePanelId) => {
     setCommandPaletteOpen(false);
-    setAgentInboxOpen(false);
-    setRedTeamLabOpen(false);
-    setKnowledgeGraphOpen(false);
-    setSpreadsheetCopilotOpen(false);
-    setEvidenceBoardOpen(false);
-    setGoldenDatasetBuilderOpen(false);
-    setDebateOpen(false);
-    setDbAdminGuardrailsOpen(false);
-    setDailyBriefOpen(false);
-    setApiContractDiffLabOpen(false);
-    setDataNotebookOpen(false);
-    setSyntheticMonitoringOpen(false);
-    setCrossRepoIntelligenceOpen(false);
-    setWorkCanvasOpen(false);
-    setPmCopilotOpen(false);
-    setDeepResearchOpen(false);
-    setBriefStudioOpen(false);
-    setCrossRepoPlannerOpen(false);
-    setVisualEditModeOpen(false);
+    dispatchFeaturePanel({ type: "open", panel });
+  }, []);
+
+  /** Normal navigation forgets a one-off Settings deep link before opening. */
+  const openFeaturePanel = useCallback((panel: FeaturePanelId) => {
+    setSettingsInitialTab(undefined);
+    activateFeaturePanel(panel);
+  }, [activateFeaturePanel]);
+
+  const closeFeaturePanel = useCallback((panel: FeaturePanelId) => {
+    dispatchFeaturePanel({ type: "close", panel });
+  }, []);
+
+  const resetFeaturePanels = useCallback(() => {
+    dispatchFeaturePanel({ type: "reset" });
+  }, []);
+
+  const openSettingsTab = useCallback((tab: SettingsTab) => {
     setSettingsInitialTab(tab);
     setSettingsTabRequest((request) => request + 1);
-    setSettingsOpen(true);
-  }, []);
+    activateFeaturePanel("settings");
+  }, [activateFeaturePanel]);
 
   // The chat's "N running tasks" chip target — same body as the shortcut
   // action `openSideTasksPanel` and the top-bar tasks toggle's open branch.
@@ -418,6 +430,18 @@ function App() {
     setDiffPanelOpen(false);
     openRightTab("sideTasks");
   }, [openRightTab]);
+
+  // Staging a composer seed (a message bubble's "Start side task" fork
+  // button, a work-canvas node's delegate action) must also surface the
+  // panel that hosts the composer: the store only flags its own drawerOpen,
+  // but the right sidebar renders from App-local tab state, so without this
+  // bridge the seed would sit staged in a hidden tab. `openComposer` stages
+  // a fresh seed object on every call, so this fires per click even when a
+  // previous seed was never consumed.
+  const sideTaskComposerSeed = useSideTaskStore((state) => state.composerSeed);
+  useEffect(() => {
+    if (sideTaskComposerSeed) openBackgroundTasksPanel();
+  }, [sideTaskComposerSeed, openBackgroundTasksPanel]);
 
   const handleManagePrompts = useCallback(() => {
     openSettingsTab("prompts");
@@ -429,13 +453,12 @@ function App() {
   // `src-tauri/src/command_palette.rs`, which shows/focuses this window and
   // emits `palette://open` for the listener further down).
   const openCommandPalette = useCallback(() => {
-    setSettingsOpen(false);
-    setRunCenterOpen(false);
-    setBrowserWorkbenchOpen(false);
-    setGlobalSearchOpen(false);
+    // Settings is the only feature surface above the palette in the z-stack;
+    // dismiss it so the globally invoked palette cannot open invisibly.
+    closeFeaturePanel("settings");
     setSettingsInitialTab(undefined);
     setCommandPaletteOpen(true);
-  }, []);
+  }, [closeFeaturePanel]);
 
   // App-wide accelerators. The same definitions are rendered by the
   // Keyboard Shortcuts Settings panel, so a displayed binding always has a
@@ -467,64 +490,11 @@ function App() {
 
       const actions: Record<ShortcutIdForScope<"global">, () => void> = {
         newSession: () => {
-          setRunCenterOpen(false);
-          setBrowserWorkbenchOpen(false);
-          setIssueToPrOpen(false);
-          setMigrationAgentOpen(false);
-          setSecurityAutofixOpen(false);
-          setGlobalSearchOpen(false);
-          setAgentInboxOpen(false);
-          setRedTeamLabOpen(false);
-          setKnowledgeGraphOpen(false);
-          setSpreadsheetCopilotOpen(false);
-          setEvidenceBoardOpen(false);
-          setGoldenDatasetBuilderOpen(false);
-          setDebateOpen(false);
-          setDbAdminGuardrailsOpen(false);
-          setDailyBriefOpen(false);
-          setApiContractDiffLabOpen(false);
-          setDataNotebookOpen(false);
-          setSyntheticMonitoringOpen(false);
-          setCrossRepoIntelligenceOpen(false);
-          setWorkCanvasOpen(false);
-          setPmCopilotOpen(false);
-          setDeepResearchOpen(false);
-          setBriefStudioOpen(false);
-          setCrossRepoPlannerOpen(false);
-          setVisualEditModeOpen(false);
-          setSettingsOpen(false);
+          resetFeaturePanels();
           setSettingsInitialTab(undefined);
           newSession();
         },
-        openSettings: () => {
-          setRunCenterOpen(false);
-          setBrowserWorkbenchOpen(false);
-          setIssueToPrOpen(false);
-          setMigrationAgentOpen(false);
-          setSecurityAutofixOpen(false);
-          setGlobalSearchOpen(false);
-          setAgentInboxOpen(false);
-          setRedTeamLabOpen(false);
-          setKnowledgeGraphOpen(false);
-          setSpreadsheetCopilotOpen(false);
-          setEvidenceBoardOpen(false);
-          setGoldenDatasetBuilderOpen(false);
-          setDebateOpen(false);
-          setDbAdminGuardrailsOpen(false);
-          setDailyBriefOpen(false);
-          setApiContractDiffLabOpen(false);
-          setDataNotebookOpen(false);
-          setSyntheticMonitoringOpen(false);
-          setCrossRepoIntelligenceOpen(false);
-          setWorkCanvasOpen(false);
-          setPmCopilotOpen(false);
-          setDeepResearchOpen(false);
-          setBriefStudioOpen(false);
-          setCrossRepoPlannerOpen(false);
-          setVisualEditModeOpen(false);
-          setSettingsInitialTab(undefined);
-          setSettingsOpen(true);
-        },
+        openSettings: () => openFeaturePanel("settings"),
         openShortcuts: () => openSettingsTab("shortcuts"),
         toggleWorkspacePanel: () => setWorkspacePanelOpen((open) => !open),
         openCommandPalette: () => openCommandPalette(),
@@ -589,7 +559,7 @@ function App() {
     // that stop bubbling for their own local Enter/Escape handling.
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [newSession, openCommandPalette, openSettingsTab, permissionPending]);
+  }, [newSession, openCommandPalette, openFeaturePanel, openSettingsTab, permissionPending, resetFeaturePanels]);
 
   // The OS-level global shortcut (works even when Little Monkey isn't the
   // focused app) is registered in Rust and, on press, shows/focuses this
@@ -764,797 +734,55 @@ function App() {
           strip stays empty as a drag region and clears the macOS traffic
           lights. Workspace folder picking now lives in the WorkspaceBar
           above the chat input (see ChatWindow). */}
-      <aside className="flex w-72 shrink-0 flex-col border-r border-border bg-surface">
+      <aside className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface">
         <div data-tauri-drag-region className="h-11 shrink-0" />
         <div className="min-h-0 flex-1 overflow-y-auto [overscroll-behavior:contain]">
           <ChatSessionList />
         </div>
         <AppMenu
-          onOpenSettings={() => {
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSecurityAutofixOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-setApiContractDiffLabOpen(false);
-setDataNotebookOpen(false);
-setSyntheticMonitoringOpen(false);
-setCrossRepoIntelligenceOpen(false);
-setWorkCanvasOpen(false);
-setPmCopilotOpen(false);
-setDeepResearchOpen(false);
-setBriefStudioOpen(false);
-setCrossRepoPlannerOpen(false);
-setVisualEditModeOpen(false);
-            setSettingsOpen(true);
-          }}
-          onOpenRunCenter={() => {
-            setSettingsOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSecurityAutofixOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-setApiContractDiffLabOpen(false);
-setDataNotebookOpen(false);
-setSyntheticMonitoringOpen(false);
-setCrossRepoIntelligenceOpen(false);
-setWorkCanvasOpen(false);
-setPmCopilotOpen(false);
-setDeepResearchOpen(false);
-setBriefStudioOpen(false);
-setCrossRepoPlannerOpen(false);
-setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setRunCenterOpen(true);
-          }}
-          onOpenGlobalSearch={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSecurityAutofixOpen(false);
-            setAgentInboxOpen(false);
-            setCommandPaletteOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-setApiContractDiffLabOpen(false);
-setDataNotebookOpen(false);
-setSyntheticMonitoringOpen(false);
-setCrossRepoIntelligenceOpen(false);
-setWorkCanvasOpen(false);
-setPmCopilotOpen(false);
-setDeepResearchOpen(false);
-setBriefStudioOpen(false);
-setCrossRepoPlannerOpen(false);
-setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setGlobalSearchOpen(true);
-          }}
-          onOpenBrowserWorkbench={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setIssueToPrOpen(false);
-            setSecurityAutofixOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-setApiContractDiffLabOpen(false);
-setDataNotebookOpen(false);
-setSyntheticMonitoringOpen(false);
-setCrossRepoIntelligenceOpen(false);
-setWorkCanvasOpen(false);
-setPmCopilotOpen(false);
-setDeepResearchOpen(false);
-setBriefStudioOpen(false);
-setCrossRepoPlannerOpen(false);
-setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setBrowserWorkbenchOpen(true);
-          }}
+          onOpenSettings={() => openFeaturePanel("settings")}
+          onOpenRunCenter={() => openFeaturePanel("run-center")}
+          onOpenGlobalSearch={() => openFeaturePanel("global-search")}
+          onOpenBrowserWorkbench={() => openFeaturePanel("browser-workbench")}
           onOpenCommandPalette={openCommandPalette}
-          onOpenIssueToPr={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setBriefStudioOpen(false);
-            setVisualEditModeOpen(false);
-            setSecurityAutofixOpen(false);
-            setSettingsInitialTab(undefined);
-            setIssueToPrOpen(true);
-          }}
-          onOpenSecurityAutofix={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setGlobalSearchOpen(false);
-            setAgentInboxOpen(false);
-            setSettingsInitialTab(undefined);
-            setSecurityAutofixOpen(true);
-          }}
-          onOpenTrustScorecards={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setGlobalSearchOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setVisualEditModeOpen(false);
-            setSecurityAutofixOpen(false);
-            setSettingsInitialTab(undefined);
-            setTrustScorecardsOpen(true);
-          }}
-          onOpenSopCompiler={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setGlobalSearchOpen(false);
-            setTrustScorecardsOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setDataNotebookOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setSopCompilerOpen(true);
-          }}
-          onOpenMcpGenerator={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setGlobalSearchOpen(false);
-            setSopCompilerOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setMcpGeneratorOpen(true);
-          }}
-          onOpenMigrationAgent={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setGlobalSearchOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setAgentInboxOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setSettingsInitialTab(undefined);
-            setMigrationAgentOpen(true);
-          }}
-          onOpenConnectorBuilder={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setGlobalSearchOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setAgentInboxOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setSettingsInitialTab(undefined);
-            setConnectorBuilderOpen(true);
-          }}
-          onOpenApiContractDiffLab={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setSettingsInitialTab(undefined);
-            setApiContractDiffLabOpen(true);
-          }}
-          onOpenAgentInbox={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setSecurityAutofixOpen(false);
-            setSettingsInitialTab(undefined);
-            setAgentInboxOpen(true);
-          }}
-          onOpenRedTeamLab={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setRedTeamLabOpen(true);
-          }}
-          onOpenKnowledgeGraph={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setRedTeamLabOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setKnowledgeGraphOpen(true);
-          }}
-          onOpenSpreadsheetCopilot={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setAgentInboxOpen(false);
-            setKnowledgeGraphOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setSettingsInitialTab(undefined);
-            setSpreadsheetCopilotOpen(true);
-          }}
-          onOpenEvidenceBoard={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setVisualEditModeOpen(false);
-            setSettingsInitialTab(undefined);
-            setEvidenceBoardOpen(true);
-          }}
-          onOpenGoldenDatasetBuilder={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setAgentInboxOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setApiContractDiffLabOpen(false);
-            setSettingsInitialTab(undefined);
-            setGoldenDatasetBuilderOpen(true);
-          }}
-          onOpenDailyBrief={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDataNotebookOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSettingsInitialTab(undefined);
-            setDailyBriefOpen(true);
-          }}
-          onOpenDataNotebook={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSettingsInitialTab(undefined);
-            setDataNotebookOpen(true);
-          }}
-          onOpenSyntheticMonitoring={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setApiContractDiffLabOpen(false);
-            setDailyBriefOpen(false);
-            setDataNotebookOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSettingsInitialTab(undefined);
-            setSyntheticMonitoringOpen(true);
-          }}
-          onOpenCrossRepoIntelligence={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setWorkCanvasOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setCrossRepoIntelligenceOpen(true);
-          }}
-          onOpenWorkCanvas={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setWorkCanvasOpen(true);
-          }}
-          onOpenPmCopilot={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setWorkCanvasOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setPmCopilotOpen(true);
-          }}
-          onOpenDeepResearch={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setPmCopilotOpen(false);
-            setWorkCanvasOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setDeepResearchOpen(true);
-          }}
-          onOpenBriefStudio={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setVisualEditModeOpen(false);
-            setDeepResearchOpen(false);
-            setPmCopilotOpen(false);
-            setWorkCanvasOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setBriefStudioOpen(true);
-          }}
-          onOpenCrossRepoChangePlanner={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setVisualEditModeOpen(false);
-            setBriefStudioOpen(false);
-            setDeepResearchOpen(false);
-            setPmCopilotOpen(false);
-            setWorkCanvasOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setCrossRepoPlannerOpen(true);
-          }}
-          onOpenVisualEditMode={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDebateOpen(false);
-            setDailyBriefOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setBriefStudioOpen(false);
-            setDeepResearchOpen(false);
-            setPmCopilotOpen(false);
-            setWorkCanvasOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDataNotebookOpen(false);
-            setSettingsInitialTab(undefined);
-            setVisualEditModeOpen(true);
-          }}
+          onOpenIssueToPr={() => openFeaturePanel("issue-to-pr")}
+          onOpenDesignToApp={() => openFeaturePanel("design-to-app")}
+          onOpenProductionDebugging={() => openFeaturePanel("production-debugging")}
+          onOpenIncidentCommander={() => openFeaturePanel("incident-commander")}
+          onOpenSecurityAutofix={() => openFeaturePanel("security-autofix")}
+          onOpenTrustScorecards={() => openFeaturePanel("trust-scorecards")}
+          onOpenSopCompiler={() => openFeaturePanel("sop-compiler")}
+          onOpenMcpGenerator={() => openFeaturePanel("mcp-generator")}
+          onOpenConnectorBuilder={() => openFeaturePanel("connector-builder")}
+          onOpenMigrationAgent={() => openFeaturePanel("migration-agent")}
+          onOpenSideTasks={() => openRightTab("sideTasks")}
+          onOpenAgentInbox={() => openFeaturePanel("agent-inbox")}
+          onOpenKnowledgeGraph={() => openFeaturePanel("knowledge-graph")}
+          onOpenSpreadsheetCopilot={() => openFeaturePanel("spreadsheet-copilot")}
           onOpenTerminal={() => setTerminalOpen(true)}
-          onOpenSideTasks={() => {
-            openRightTab("sideTasks");
-          }}
-          onOpenDebate={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setGlobalSearchOpen(false);
-            setCommandPaletteOpen(false);
-            setAgentInboxOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setConnectorBuilderOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setSpreadsheetCopilotOpen(false);
-            setEvidenceBoardOpen(false);
-            setGoldenDatasetBuilderOpen(false);
-            setDailyBriefOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setApiContractDiffLabOpen(false);
-            setDataNotebookOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setWorkCanvasOpen(false);
-            setPmCopilotOpen(false);
-            setDeepResearchOpen(false);
-            setBriefStudioOpen(false);
-            setCrossRepoPlannerOpen(false);
-            setCrossRepoIntelligenceOpen(false);
-            setVisualEditModeOpen(false);
-            setSecurityAutofixOpen(false);
-            setSettingsInitialTab(undefined);
-            setDebateOpen(true);
-          }}
-          onOpenDbAdminGuardrails={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setGlobalSearchOpen(false);
-            setAgentInboxOpen(false);
-            setIssueToPrOpen(false);
-            setTrustScorecardsOpen(false);
-            setSopCompilerOpen(false);
-            setMcpGeneratorOpen(false);
-            setRedTeamLabOpen(false);
-            setKnowledgeGraphOpen(false);
-            setEvidenceBoardOpen(false);
-            setDailyBriefOpen(false);
-            setDebateOpen(false);
-            setSettingsInitialTab(undefined);
-            setDbAdminGuardrailsOpen(true);
-          }}
+          onOpenRedTeamLab={() => openFeaturePanel("red-team-lab")}
+          onOpenEvidenceBoard={() => openFeaturePanel("evidence-board")}
+          onOpenDebate={() => openFeaturePanel("debate")}
+          onOpenDbAdminGuardrails={() => openFeaturePanel("db-admin-guardrails")}
           onRestartOnboarding={() => {
-            setSettingsOpen(false);
-            setRunCenterOpen(false);
-            setBrowserWorkbenchOpen(false);
-            setIssueToPrOpen(false);
-            setMigrationAgentOpen(false);
-            setGlobalSearchOpen(false);
-            setAgentInboxOpen(false);
-            setSyntheticMonitoringOpen(false);
-            setDebateOpen(false);
-            setDbAdminGuardrailsOpen(false);
-            setDataNotebookOpen(false);
+            resetFeaturePanels();
+            setSettingsInitialTab(undefined);
             setTerminalOpen(false);
             restartOnboarding();
           }}
+          onOpenDailyBrief={() => openFeaturePanel("daily-brief")}
+          onOpenApiContractDiffLab={() => openFeaturePanel("api-contract-diff-lab")}
+          onOpenGoldenDatasetBuilder={() => openFeaturePanel("golden-dataset-builder")}
+          onOpenDataNotebook={() => openFeaturePanel("data-notebook")}
+          onOpenSyntheticMonitoring={() => openFeaturePanel("synthetic-monitoring")}
+          onOpenCrossRepoIntelligence={() => openFeaturePanel("cross-repo-intelligence")}
+          onOpenWorkCanvas={() => openFeaturePanel("work-canvas")}
+          onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
+          onOpenDeepResearch={() => openFeaturePanel("deep-research")}
+          onOpenBriefStudio={() => openFeaturePanel("brief-studio")}
+          onOpenCrossRepoChangePlanner={() => openFeaturePanel("cross-repo-planner")}
+          onOpenVisualEditMode={() => openFeaturePanel("visual-edit-mode")}
+          onOpenWorkflowTestHarness={() => openFeaturePanel("workflow-test-harness")}
         />
       </aside>
 
@@ -1576,136 +804,149 @@ setVisualEditModeOpen(false);
         {/* Per-pane boundary so one pane crashing doesn't take down the other
             (or the sidebar/workspace). `resetKey` clears a shown error on
             session switch — the replacement session gets a fresh render. */}
-        <ErrorBoundary resetKey={globalSearchOpen ? "global-search" : agentInboxOpen ? "agent-inbox" : redTeamLabOpen ? "red-team-lab" : knowledgeGraphOpen ? "knowledge-graph" : spreadsheetCopilotOpen ? "spreadsheet-copilot" : evidenceBoardOpen ? "evidence-board" : goldenDatasetBuilderOpen ? "golden-dataset-builder" : dailyBriefOpen ? "daily-brief" : dataNotebookOpen ? "data-notebook" : syntheticMonitoringOpen ? "synthetic-monitoring" : workCanvasOpen ? "work-canvas" : pmCopilotOpen ? "pm-copilot" : deepResearchOpen ? "deep-research" : briefStudioOpen ? "brief-studio" : crossRepoPlannerOpen ? "cross-repo-planner" : crossRepoIntelligenceOpen ? "cross-repo-intelligence" : visualEditModeOpen ? "visual-edit-mode" : runCenterOpen ? "run-center" : debateOpen ? "debate" : dbAdminGuardrailsOpen ? "db-admin-guardrails" : issueToPrOpen ? "issue-to-pr" : securityAutofixOpen ? "security-autofix" : trustScorecardsOpen ? "trust-scorecards" : sopCompilerOpen ? "sop-compiler" : mcpGeneratorOpen ? "mcp-generator" : connectorBuilderOpen ? "connector-builder" : migrationAgentOpen ? "migration-agent" : apiContractDiffLabOpen ? "api-contract-diff-lab" : browserWorkbenchOpen ? `browser-${activeSessionId}` : activeComparisonId ?? activeCrewSessionId ?? activeSessionId}>
+        <ErrorBoundary
+          resetKey={
+            browserWorkbenchOpen
+              ? `browser-${activeSessionId}`
+              : activeFeaturePanel && activeFeaturePanel !== "settings"
+                ? activeFeaturePanel
+                : activeComparisonId ?? activeCrewSessionId ?? activeSessionId
+          }
+        >
           {globalSearchOpen ? (
             <GlobalSearch
-              onClose={() => setGlobalSearchOpen(false)}
+              onClose={() => closeFeaturePanel("global-search")}
               onOpenRun={(runId) => {
-                setGlobalSearchOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
             />
           ) : agentInboxOpen ? (
             <AgentInbox
-              onClose={() => setAgentInboxOpen(false)}
+              onClose={() => closeFeaturePanel("agent-inbox")}
               onOpenRunCenter={(runId) => {
-                setAgentInboxOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
             />
           ) : redTeamLabOpen ? (
-            <RedTeamLabPanel onClose={() => setRedTeamLabOpen(false)} />
+            <RedTeamLabPanel onClose={() => closeFeaturePanel("red-team-lab")} />
           ) : knowledgeGraphOpen ? (
-            <KnowledgeGraphExplorerPanel onClose={() => setKnowledgeGraphOpen(false)} />
+            <KnowledgeGraphExplorerPanel onClose={() => closeFeaturePanel("knowledge-graph")} />
           ) : spreadsheetCopilotOpen ? (
-            <SpreadsheetCopilotPanel onClose={() => setSpreadsheetCopilotOpen(false)} />
+            <SpreadsheetCopilotPanel onClose={() => closeFeaturePanel("spreadsheet-copilot")} />
           ) : evidenceBoardOpen ? (
-            <EvidenceBoardPanel sessionId={activeSessionId} onClose={() => setEvidenceBoardOpen(false)} />
+            <EvidenceBoardPanel sessionId={activeSessionId} onClose={() => closeFeaturePanel("evidence-board")} />
           ) : goldenDatasetBuilderOpen ? (
-            <GoldenDatasetBuilderPanel onClose={() => setGoldenDatasetBuilderOpen(false)} />
+            <GoldenDatasetBuilderPanel onClose={() => closeFeaturePanel("golden-dataset-builder")} />
           ) : dailyBriefOpen ? (
             <DailyBriefPanel
-              onClose={() => setDailyBriefOpen(false)}
+              onClose={() => closeFeaturePanel("daily-brief")}
               onOpenRunCenter={(runId) => {
-                setDailyBriefOpen(false);
-                setApiContractDiffLabOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
-              onOpenAgentInbox={() => {
-                setDailyBriefOpen(false);
-                setApiContractDiffLabOpen(false);
-                setAgentInboxOpen(true);
-              }}
+              onOpenAgentInbox={() => openFeaturePanel("agent-inbox")}
               onOpenSettingsTab={openSettingsTab}
             />
           ) : dataNotebookOpen ? (
-            <DataNotebookPanel onClose={() => setDataNotebookOpen(false)} />
+            <DataNotebookPanel onClose={() => closeFeaturePanel("data-notebook")} />
           ) : syntheticMonitoringOpen ? (
-            <SyntheticMonitoringPanel onClose={() => setSyntheticMonitoringOpen(false)} />
+            <SyntheticMonitoringPanel onClose={() => closeFeaturePanel("synthetic-monitoring")} />
           ) : workCanvasOpen ? (
             <WorkCanvasPanel
-              onClose={() => setWorkCanvasOpen(false)}
+              onClose={() => closeFeaturePanel("work-canvas")}
               onOpenSession={(sessionId) => {
-                setWorkCanvasOpen(false);
+                closeFeaturePanel("work-canvas");
                 switchSession(sessionId);
               }}
               onOpenRun={(runId) => {
-                setWorkCanvasOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
               onOpenFile={(path) => void handleOpenFileFromCanvas(path)}
             />
           ) : pmCopilotOpen ? (
-            <PmCopilotPanel onClose={() => setPmCopilotOpen(false)} />
+            <PmCopilotPanel onClose={() => closeFeaturePanel("pm-copilot")} />
           ) : deepResearchOpen ? (
-            <DeepResearchWorkspacePanel onClose={() => setDeepResearchOpen(false)} />
+            <DeepResearchWorkspacePanel onClose={() => closeFeaturePanel("deep-research")} />
           ) : briefStudioOpen ? (
-            <BriefStudioPanel onClose={() => setBriefStudioOpen(false)} />
+            <BriefStudioPanel onClose={() => closeFeaturePanel("brief-studio")} />
           ) : crossRepoPlannerOpen ? (
-            <CrossRepoChangePlannerPanel onClose={() => setCrossRepoPlannerOpen(false)} />
+            <CrossRepoChangePlannerPanel onClose={() => closeFeaturePanel("cross-repo-planner")} />
           ) : crossRepoIntelligenceOpen ? (
-            <CrossRepoIntelligencePanel onClose={() => setCrossRepoIntelligenceOpen(false)} />
+            <CrossRepoIntelligencePanel onClose={() => closeFeaturePanel("cross-repo-intelligence")} />
           ) : visualEditModeOpen ? (
-            <VisualEditModePanel onClose={() => setVisualEditModeOpen(false)} />
-          ) : runCenterOpen ? (
-            <RunCenter onClose={() => setRunCenterOpen(false)} />
-          ) : debateOpen ? (
-            <DebatePanel onClose={() => setDebateOpen(false)} />
-          ) : dbAdminGuardrailsOpen ? (
-            <DatabaseAdminGuardrailsPanel onClose={() => setDbAdminGuardrailsOpen(false)} />
-          ) : issueToPrOpen ? (
-            <IssueToPrPanel
-              onClose={() => setIssueToPrOpen(false)}
+            <VisualEditModePanel onClose={() => closeFeaturePanel("visual-edit-mode")} />
+          ) : designToAppOpen ? (
+            <DesignToAppPanel
+              onClose={() => closeFeaturePanel("design-to-app")}
               onOpenRunCapsule={(runId) => {
-                setIssueToPrOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
             />
+          ) : runCenterOpen ? (
+            <RunCenter onClose={() => closeFeaturePanel("run-center")} />
+          ) : debateOpen ? (
+            <DebatePanel onClose={() => closeFeaturePanel("debate")} />
+          ) : dbAdminGuardrailsOpen ? (
+            <DatabaseAdminGuardrailsPanel onClose={() => closeFeaturePanel("db-admin-guardrails")} />
+          ) : issueToPrOpen ? (
+            <IssueToPrPanel
+              onClose={() => closeFeaturePanel("issue-to-pr")}
+              onOpenRunCapsule={(runId) => {
+                openFeaturePanel("run-center");
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
+          ) : productionDebuggingOpen ? (
+            <ProductionDebuggingPanel
+              onClose={() => closeFeaturePanel("production-debugging")}
+              onOpenRunCapsule={(runId) => {
+                openFeaturePanel("run-center");
+                void useRunStore.getState().selectRun(runId);
+              }}
+            />
+          ) : incidentCommanderOpen ? (
+            <IncidentCommanderPanel onClose={() => closeFeaturePanel("incident-commander")} />
           ) : securityAutofixOpen ? (
             <SecurityAutofixPanel
-              onClose={() => setSecurityAutofixOpen(false)}
+              onClose={() => closeFeaturePanel("security-autofix")}
               onOpenRunCapsule={(runId) => {
-                setSecurityAutofixOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
             />
           ) : trustScorecardsOpen ? (
-            <TrustScorecardsPanel onClose={() => setTrustScorecardsOpen(false)} />
+            <TrustScorecardsPanel onClose={() => closeFeaturePanel("trust-scorecards")} />
           ) : sopCompilerOpen ? (
             <SopCompilerPanel
-              onClose={() => setSopCompilerOpen(false)}
-              onOpenSkillProposals={() => {
-                setSopCompilerOpen(false);
-                openSettingsTab("prompts");
-              }}
+              onClose={() => closeFeaturePanel("sop-compiler")}
+              onOpenSkillProposals={() => openSettingsTab("prompts")}
             />
           ) : mcpGeneratorOpen ? (
-            <McpGeneratorPanel onClose={() => setMcpGeneratorOpen(false)} />
+            <McpGeneratorPanel onClose={() => closeFeaturePanel("mcp-generator")} />
           ) : connectorBuilderOpen ? (
-            <ConnectorBuilderPanel onClose={() => setConnectorBuilderOpen(false)} />
+            <ConnectorBuilderPanel onClose={() => closeFeaturePanel("connector-builder")} />
           ) : migrationAgentOpen ? (
             <MigrationAgentPanel
-              onClose={() => setMigrationAgentOpen(false)}
+              onClose={() => closeFeaturePanel("migration-agent")}
               onOpenRunCapsule={(runId) => {
-                setMigrationAgentOpen(false);
-                setRunCenterOpen(true);
+                openFeaturePanel("run-center");
                 void useRunStore.getState().selectRun(runId);
               }}
             />
           ) : apiContractDiffLabOpen ? (
-            <ApiContractDiffLabPanel onClose={() => setApiContractDiffLabOpen(false)} />
+            <ApiContractDiffLabPanel onClose={() => closeFeaturePanel("api-contract-diff-lab")} />
+          ) : workflowTestHarnessOpen ? (
+            <EvalHarnessPanel onClose={() => closeFeaturePanel("workflow-test-harness")} />
           ) : browserWorkbenchOpen ? (
             <BrowserWorkbench
               key={activeSessionId}
               taskId={activeSessionId}
               chatSessionId={activeSessionId}
-              onClose={() => setBrowserWorkbenchOpen(false)}
+              onClose={() => closeFeaturePanel("browser-workbench")}
             />
           ) : activeComparisonId ? (
             <CompareView groupId={activeComparisonId} />
@@ -1731,7 +972,7 @@ setVisualEditModeOpen(false);
           menu's "Open in > Split view" — Claude-Desktop-style, inside the
           same window. Its top strip doubles as the pane header: session
           title + close, still draggable like the other title-bar strips. */}
-      {!globalSearchOpen && !agentInboxOpen && !redTeamLabOpen && !knowledgeGraphOpen && !spreadsheetCopilotOpen && !evidenceBoardOpen && !goldenDatasetBuilderOpen && !dailyBriefOpen && !dataNotebookOpen && !syntheticMonitoringOpen && !workCanvasOpen && !pmCopilotOpen && !deepResearchOpen && !briefStudioOpen && !crossRepoPlannerOpen && !crossRepoIntelligenceOpen && !visualEditModeOpen && !runCenterOpen && !debateOpen && !dbAdminGuardrailsOpen && !issueToPrOpen && !securityAutofixOpen && !trustScorecardsOpen && !sopCompilerOpen && !mcpGeneratorOpen && !connectorBuilderOpen && !migrationAgentOpen && !apiContractDiffLabOpen && !browserWorkbenchOpen && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
+      {(activeFeaturePanel === null || activeFeaturePanel === "settings") && activeComparisonId === null && activeCrewSessionId === null && splitSessionId !== null && (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col border-l border-border">
           <div data-tauri-drag-region className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
             <span className="pointer-events-none min-w-0 truncate text-sm font-medium text-foreground">
@@ -2080,7 +1321,7 @@ setVisualEditModeOpen(false);
       <SettingsModal
         open={settingsOpen}
         onClose={() => {
-          setSettingsOpen(false);
+          closeFeaturePanel("settings");
           // Consume the deep-link tab on close so it only affects the
           // opening it was requested for — otherwise it would stick around
           // and force every later normal open (e.g. the plain gear icon)

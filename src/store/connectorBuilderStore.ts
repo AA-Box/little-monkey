@@ -17,14 +17,10 @@
  *    definition's `McpServerSpec` — reused unchanged, not duplicated. This
  *    is the acceptance gate: `ready` only ever becomes true when
  *    `simulation.clean` is true.
- * 4. `registerWithMcp`, enabled only once `ready`, calls the EXISTING
- *    `useMcpStore().addServer` — the same registration path Settings' own
- *    MCP server list uses — to add a real `McpServerEntry` to
- *    `mcp_servers.json`. See `connectorBuilder.ts`'s module doc comment for
- *    the labeled scope cut: registration adds the config entry; actually
- *    *connecting* it still requires the target URL to speak MCP itself,
- *    which a bare REST API described by an OpenAPI doc does not (a
- *    REST-to-MCP bridge is future work, not this MVP).
+ * 4. Registration stays blocked because this client currently has no
+ *    generated REST-to-MCP bridge artifact. A clean schema simulation is
+ *    useful evidence, but registering the OpenAPI base URL as though it were
+ *    an MCP endpoint would create a server that can never connect.
  */
 import { create } from "zustand";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -38,11 +34,12 @@ import {
   type ConnectorDefinition,
 } from "../lib/connectorBuilder";
 import { runSimulation, type SimulationReport } from "../lib/mcpSimulator";
-import { useMcpStore, type McpServerEntry } from "./mcpStore";
 
 /** Mirrors `sopCompilerStore.ts`'s own `MAX_IMPORT_FILE_BYTES` guard — an
  * OpenAPI document has no business being larger than this locally. */
 const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024;
+export const CONNECTOR_BRIDGE_REQUIRED =
+  "Registration is blocked: this OpenAPI document describes a REST API, not an MCP server. Generate and execute-verify a REST-to-MCP bridge artifact before making it available to agents.";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -60,10 +57,11 @@ interface ConnectorBuilderStore {
 
   simulation: SimulationReport | null;
   simulating: boolean;
-  /** The acceptance gate: true only once a simulation has run AND come back
-   * clean. Recomputed on every `generate`/`runSimulator` call, never set
-   * directly. */
+  /** Availability gate. It remains false until an executable bridge artifact
+   * exists and passes an artifact-level probe; spec simulation alone cannot
+   * satisfy it. */
   ready: boolean;
+  availabilityBlockReason: string | null;
 
   registering: boolean;
   registeredServerId: string | null;
@@ -91,13 +89,24 @@ export const useConnectorBuilderStore = create<ConnectorBuilderStore>((set, get)
   simulation: null,
   simulating: false,
   ready: false,
+  availabilityBlockReason: null,
 
   registering: false,
   registeredServerId: null,
 
   error: null,
 
-  setSpecText: (text) => set({ specText: text, specFileName: null, error: null }),
+  setSpecText: (text) => set({
+    specText: text,
+    specFileName: null,
+    definition: null,
+    summary: null,
+    simulation: null,
+    ready: false,
+    availabilityBlockReason: null,
+    registeredServerId: null,
+    error: null,
+  }),
 
   importFromFile: async () => {
     set({ importing: true, error: null });
@@ -118,7 +127,17 @@ export const useConnectorBuilderStore = create<ConnectorBuilderStore>((set, get)
       }
       const content = await readTextFile(selected);
       const fileName = selected.split(/[\\/]/).pop() ?? selected;
-      set({ specText: content, specFileName: fileName, importing: false });
+      set({
+        specText: content,
+        specFileName: fileName,
+        importing: false,
+        definition: null,
+        summary: null,
+        simulation: null,
+        ready: false,
+        availabilityBlockReason: null,
+        registeredServerId: null,
+      });
     } catch (error) {
       set({ importing: false, error: errorText(error) });
     }
@@ -137,19 +156,20 @@ export const useConnectorBuilderStore = create<ConnectorBuilderStore>((set, get)
       summary: null,
       simulation: null,
       ready: false,
+      availabilityBlockReason: null,
       registeredServerId: null,
     });
     try {
       const parsed = parseOpenApiSpec(specText, specFileName ?? undefined);
       const definition = buildConnectorDefinition(parsed);
-      set({ definition, generating: false });
+      set({ definition, generating: false, availabilityBlockReason: CONNECTOR_BRIDGE_REQUIRED });
     } catch (error) {
       set({ generating: false, error: errorText(error) });
       return;
     }
 
-    // Best-effort: a failed/timed-out draft never blocks the (already-set)
-    // deterministic definition, simulation, or registration.
+    // Best-effort: a failed/timed-out draft never blocks the deterministic
+    // definition or schema simulation. Availability is gated separately.
     set({ drafting: true });
     try {
       const target = await resolveConnectorDraftTarget();
@@ -168,42 +188,19 @@ export const useConnectorBuilderStore = create<ConnectorBuilderStore>((set, get)
     set({ simulating: true, error: null });
     try {
       const report = runSimulation(definition.server);
-      set({ simulation: report, ready: report.clean, simulating: false });
+      // This validates only the declared schema. There is no executable MCP
+      // bridge artifact yet, so it must never flip availability to ready.
+      set({ simulation: report, ready: false, availabilityBlockReason: CONNECTOR_BRIDGE_REQUIRED, simulating: false });
     } catch (error) {
       set({ simulating: false, error: errorText(error) });
     }
   },
 
   registerWithMcp: async () => {
-    const { definition, ready } = get();
+    const { definition } = get();
     if (!definition) throw new Error("Generate a connector before registering it.");
-    if (!ready) {
-      throw new Error("This connector has not passed the simulator yet — run the simulator and resolve every failure before it becomes available to agents.");
-    }
-    set({ registering: true, error: null });
-    try {
-      const existingIds = new Set(useMcpStore.getState().servers.map((server) => server.id));
-      let id = definition.server.name;
-      let suffix = 2;
-      while (existingIds.has(id)) {
-        id = `${definition.server.name}-${suffix}`;
-        suffix += 1;
-      }
-      const entry: McpServerEntry = {
-        id,
-        label: definition.server.name,
-        transport: { type: "http", url: definition.server.target },
-        enabled: true,
-        tool_allowlist: null,
-        timeout_secs: null,
-      };
-      await useMcpStore.getState().addServer(entry);
-      set({ registering: false, registeredServerId: id });
-      return id;
-    } catch (error) {
-      set({ registering: false, error: errorText(error) });
-      throw error;
-    }
+    set({ registering: false, registeredServerId: null, error: CONNECTOR_BRIDGE_REQUIRED });
+    throw new Error(CONNECTOR_BRIDGE_REQUIRED);
   },
 
   reset: () =>
@@ -214,6 +211,7 @@ export const useConnectorBuilderStore = create<ConnectorBuilderStore>((set, get)
       summary: null,
       simulation: null,
       ready: false,
+      availabilityBlockReason: null,
       registeredServerId: null,
       error: null,
     }),

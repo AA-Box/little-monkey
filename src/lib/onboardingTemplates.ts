@@ -43,10 +43,9 @@ export interface OnboardingSeedResult {
  * will attempt for this id — every template seeds a persona; only the ones
  * with a genuine recipe-shaped workflow also seed a recipe, and only the two
  * that are naturally periodic also seed a (disabled-by-default) scheduled
- * task on top of that recipe. Model-routing rules and eval suites are
- * unshipped roadmap items — no template here pretends otherwise; see each
- * one's `caveatKey` for the ones that would naturally want a connector or an
- * eval suite that doesn't exist yet.
+ * task on top of that recipe. Model-routing rules remain a roadmap item;
+ * automated eval suites live in the Workflow & Agent Test Harness, while
+ * onboarding deliberately seeds only lightweight starter personas here.
  */
 export interface OnboardingTemplate {
   id: string;
@@ -54,8 +53,7 @@ export interface OnboardingTemplate {
   descriptionKey: string;
   assumptions: OnboardingAssumptionKind[];
   /** Extra one-liner shown under the assumption chips for templates that
-   * would ideally want a connector or eval-suite system this build doesn't
-   * have — e.g. "Jira Triage" until a Jira connector ships. */
+   * need a connector, another feature surface, or a deliberate setup step. */
   caveatKey?: string;
   seeds: {
     persona: true;

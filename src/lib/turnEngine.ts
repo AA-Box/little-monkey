@@ -25,6 +25,7 @@ import { riskCacheKey, type RiskClassification } from './riskJudge';
 import { runSubagentTask } from './subagent';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
+import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -575,17 +576,77 @@ export async function executeToolCall(
     }
   }
 
+  // `generate_image` dispatches to a real `tool_generate_image` Rust command,
+  // but can't take the generic pass-through below: the model supplies SVG
+  // markup, and only the webview can rasterize it into the PNG bytes the
+  // Rust command actually persists (see `GENERATE_IMAGE_TOOL`'s doc comment
+  // in tools.ts). Arguments are re-shaped here — `svg` is consumed by the
+  // rasterizer and replaced with frontend-computed `content_base64`/`width`/
+  // `height`. The Rust command writes only to app-owned artifact storage, so
+  // no workspace path, permission context, or checkpoint id is injected.
+  if (name === 'generate_image') {
+    const filename = typeof args.filename === 'string'
+      ? args.filename.trim()
+      : typeof args.path === 'string'
+        ? args.path.trim()
+        : '';
+    const svg = typeof args.svg === 'string' ? args.svg.trim() : '';
+    if (!filename || !svg) {
+      return stringifyToolError(new Error('generate_image requires both "filename" and "svg" string arguments.'));
+    }
+    if (!filename.toLowerCase().endsWith('.png')) {
+      return stringifyToolError(new Error(`"${filename}" must end in .png — generate_image always produces a PNG file.`));
+    }
+
+    let raster: RasterizedPng;
+    try {
+      raster = await rasterizeSvgToPng(svg);
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+    // Rasterization isn't Rust-cancellable, so Stop during it is honored
+    // here, before the durable artifact write begins.
+    if (signal?.aborted) return CANCELLED_TOOL_RESULT;
+
+    const passthrough = { ...args };
+    delete passthrough.svg;
+    delete passthrough.filename;
+    delete passthrough.path;
+    const invocation = invoke('tool_generate_image', {
+      ...passthrough,
+      filename,
+      content_base64: raster.contentBase64,
+      width: raster.width,
+      height: raster.height,
+    }).then(stringifyToolResult, stringifyToolError);
+    return raceInvocationWithStop(invocation, turnId, signal);
+  }
+
   const invocation = name.startsWith('mcp__')
     ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
     : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+  return raceInvocationWithStop(invocation, turnId, signal);
+}
+
+/** Races an in-flight tool `invoke` against the Stop button: on abort, the
+ * Rust side is told to cancel everything cancellable (`tools_cancel_running`
+ * kills any running shell child and denies any pending permission prompt)
+ * and a cancelled result is returned immediately rather than waiting the
+ * command out. The original invocation promise already has handlers attached
+ * (never an unhandled rejection) and its eventual result is simply
+ * discarded. Extracted verbatim from `executeToolCall`'s tail so the
+ * `generate_image` interception branch shares the exact same race/cancel
+ * shape instead of hand-rolling its own. */
+async function raceInvocationWithStop(
+  invocation: Promise<string>,
+  turnId: string,
+  signal?: AbortSignal
+): Promise<string> {
   if (!signal) return invocation;
 
   const raced = await Promise.race([invocation, abortedPromise(signal).then(() => null)]);
   if (raced !== null) return raced;
 
-  // Aborted mid-invocation: kill what can be killed on the Rust side. The
-  // original invocation promise already has handlers attached (never an
-  // unhandled rejection) and its eventual result is simply discarded.
   void invoke('tools_cancel_running', { turnId }).catch(() => {});
   return CANCELLED_TOOL_RESULT;
 }

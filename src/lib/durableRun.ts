@@ -45,7 +45,7 @@ export function redactSensitiveText(value: string): string {
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [REDACTED]")
     .replace(/\b(?:sk|pk|ghp|gho|github_pat|xox[baprs])-[-A-Za-z0-9_]{10,}\b/g, "[REDACTED TOKEN]")
     .replace(
-      /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|passwd|secret)\b\s*[:=]\s*["']?[^\s"',;}]+["']?/gi,
+      /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|authorization|password|passwd|secret|private[_-]?key|cookie)\b\s*[:=]\s*["']?[^\s"',;}]+["']?/gi,
       "$1=[REDACTED]",
     )
     .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@");

@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { execSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const mocks = vi.hoisted(() => ({
   attemptStream: vi.fn(),
@@ -19,8 +23,11 @@ vi.mock("./agentLoop", () => ({
 import type { McpServerSpec } from "./mcpGenerator";
 import {
   buildGeneratorPrompt,
+  buildGeneratedArtifactProbeCommand,
   extractCodeFromModelOutput,
   generateMcpServerCode,
+  inspectGeneratedArtifact,
+  probeGeneratedMcpArtifact,
   resolveGeneratorTarget,
   suggestedFileName,
   validateServerSpec,
@@ -184,4 +191,83 @@ describe("suggestedFileName", () => {
   it("derives a filename from the server name", () => {
     expect(suggestedFileName(validSpec())).toBe("weather-cli.mcp.ts");
   });
+});
+
+describe("generated artifact verification", () => {
+  const executableArtifact = [
+    "import { Server } from '@modelcontextprotocol/sdk/server/index.js';",
+    "import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';",
+    "import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';",
+    "const server = new Server({ name: 'weather-cli', version: '1.0.0' }, { capabilities: { tools: {} } });",
+    "server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));",
+    "server.setRequestHandler(CallToolRequestSchema, async () => { throw new Error('unknown tool'); });",
+    "await server.connect(new StdioServerTransport());",
+  ].join("\n");
+
+  it("rejects TODO/placeholder source before execution", () => {
+    expect(inspectGeneratedArtifact(`${executableArtifact}\n// TODO: wire the real call`)).toEqual(
+      expect.arrayContaining([expect.stringMatching(/placeholder|todo/i)]),
+    );
+  });
+
+  it("keeps generated code out of shell syntax by passing only base64 arguments", () => {
+    const hostile = `${executableArtifact}\nconst inert = \"'; rm -rf /; #\";`;
+    const command = buildGeneratedArtifactProbeCommand(hostile, validSpec());
+    expect(command).not.toContain("rm -rf");
+    expect(command).toMatch(/^node -e /);
+  });
+
+  it("does not accept a sandbox success without typecheck and runtime probe evidence", async () => {
+    const runner = vi.fn().mockResolvedValue({
+      runId: "run-1", isolation: "os_sandboxed", passed: true,
+      stdoutExcerpt: "spec simulation only", stderrExcerpt: "",
+    });
+    const report = await probeGeneratedMcpArtifact(executableArtifact, validSpec(), runner);
+    expect(report.clean).toBe(false);
+    expect(report.typechecked).toBe(false);
+    expect(report.executed).toBe(false);
+  });
+
+  it("requires matching typecheck, execution, and probed-tool count evidence", async () => {
+    const runner = vi.fn().mockResolvedValue({
+      runId: "run-2", isolation: "os_sandboxed", passed: true,
+      stdoutExcerpt: "LITTLE_MONKEY_MCP_TYPECHECK_OK\nLITTLE_MONKEY_MCP_PROBE_OK:1\n", stderrExcerpt: "",
+    });
+    const report = await probeGeneratedMcpArtifact(executableArtifact, validSpec(), runner);
+    expect(report.clean).toBe(true);
+    expect(report.probedToolCount).toBe(1);
+    expect(runner).toHaveBeenCalledWith(expect.any(String), {
+      timeoutMs: 45_000,
+      allowNetwork: false,
+      approvedEnv: [],
+    });
+  });
+
+  it("really typechecks and executes a generated MCP artifact through the probe harness", () => {
+    const completeArtifact = [
+      "import { Server } from '@modelcontextprotocol/sdk/server/index.js';",
+      "import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';",
+      "import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';",
+      "const server = new Server({ name: 'weather-cli', version: '1.0.0' }, { capabilities: { tools: {} } });",
+      "server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{ name: 'get_forecast', description: 'Get forecast', inputSchema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } }] }));",
+      "server.setRequestHandler(CallToolRequestSchema, async (request) => {",
+      "  if (request.params.name !== 'get_forecast') throw new Error('unknown tool');",
+      "  if (typeof request.params.arguments?.city !== 'string') throw new Error('city is required');",
+      "  return { content: [{ type: 'text', text: request.params.arguments.city }] };",
+      "});",
+      "await server.connect(new StdioServerTransport());",
+    ].join("\n");
+    const probeDir = mkdtempSync(join(tmpdir(), "little-monkey-mcp-probe-"));
+    try {
+      const stdout = execSync(buildGeneratedArtifactProbeCommand(completeArtifact, validSpec()), {
+        cwd: probeDir,
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      expect(stdout).toContain("LITTLE_MONKEY_MCP_TYPECHECK_OK");
+      expect(stdout).toContain("LITTLE_MONKEY_MCP_PROBE_OK:1");
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true });
+    }
+  }, 35_000);
 });

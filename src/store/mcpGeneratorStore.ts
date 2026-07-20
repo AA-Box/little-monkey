@@ -4,9 +4,11 @@ import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 import {
   generateMcpServerCode,
+  probeGeneratedMcpArtifact,
   resolveGeneratorTarget,
   suggestedFileName,
   validateServerSpec,
+  type GeneratedArtifactProbeReport,
   type McpServerSpec,
   type McpSourceKind,
   type McpToolParamSpec,
@@ -21,9 +23,9 @@ export interface GeneratedMcpServerEntry {
   spec: McpServerSpec;
   code: string | null;
   simulation: SimulationReport | null;
-  /** True only once a simulation has run AND come back clean — the
-   * acceptance gate ("Generated MCP servers must pass the simulator before
-   * install"). Recomputed on every generate/simulate, never set directly. */
+  artifactProbe: GeneratedArtifactProbeReport | null;
+  /** True only when both the spec fixture simulation and the generated
+   * artifact's isolated compile/runtime probe are clean. */
   ready: boolean;
   savedPath: string | null;
   createdAt: number;
@@ -61,7 +63,7 @@ interface McpGeneratorStore {
   updateParam: (toolIndex: number, paramIndex: number, patch: Partial<McpToolParamSpec>) => void;
 
   generate: () => Promise<GeneratedMcpServerEntry>;
-  runSimulator: (entryId: string) => void;
+  runSimulator: (entryId: string) => Promise<void>;
   selectEntry: (entryId: string | null) => void;
   removeEntry: (entryId: string) => void;
   saveToDisk: (entryId: string) => Promise<string | null>;
@@ -69,7 +71,7 @@ interface McpGeneratorStore {
 
 function persist(entries: GeneratedMcpServerEntry[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: 1, entries }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: 2, entries }));
   } catch {
     // Non-fatal: the entry stays live in memory for the rest of this session.
   }
@@ -78,7 +80,7 @@ function persist(entries: GeneratedMcpServerEntry[]): void {
 function hydrate(): GeneratedMcpServerEntry[] {
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null") as { version?: unknown; entries?: unknown } | null;
-    if (raw?.version !== 1 || !Array.isArray(raw.entries)) return [];
+    if ((raw?.version !== 1 && raw?.version !== 2) || !Array.isArray(raw.entries)) return [];
     return raw.entries.filter((value): value is GeneratedMcpServerEntry => {
       const entry = value as Partial<GeneratedMcpServerEntry>;
       return Boolean(
@@ -88,6 +90,15 @@ function hydrate(): GeneratedMcpServerEntry[] {
         typeof entry.spec === "object" &&
         typeof entry.createdAt === "number",
       );
+    }).map((entry) => {
+      const artifactProbe = entry.artifactProbe ?? null;
+      return {
+        ...entry,
+        artifactProbe,
+        // Legacy persisted entries were marked ready from a spec-only
+        // simulation. They must earn readiness again through artifact code.
+        ready: Boolean(entry.simulation?.clean && artifactProbe?.clean),
+      };
     });
   } catch {
     return [];
@@ -170,6 +181,7 @@ export const useMcpGeneratorStore = create<McpGeneratorStore>((set, get) => ({
         spec: structuredClone(spec),
         code,
         simulation: null,
+        artifactProbe: null,
         ready: false,
         savedPath: null,
         createdAt: now,
@@ -188,15 +200,30 @@ export const useMcpGeneratorStore = create<McpGeneratorStore>((set, get) => ({
     }
   },
 
-  runSimulator: (entryId) => {
+  runSimulator: async (entryId) => {
     const entry = get().entries.find((candidate) => candidate.id === entryId);
     if (!entry) return;
-    set({ simulating: true, error: null });
+    const invalidated = get().entries.map((candidate) =>
+      candidate.id === entryId
+        ? { ...candidate, simulation: null, artifactProbe: null, ready: false, updatedAt: Date.now() }
+        : candidate,
+    );
+    persist(invalidated);
+    set({ entries: invalidated, simulating: true, error: null });
     try {
       const report = runSimulation(entry.spec);
+      const artifactProbe = entry.code
+        ? await probeGeneratedMcpArtifact(entry.code, entry.spec)
+        : null;
       const entries = get().entries.map((candidate) =>
         candidate.id === entryId
-          ? { ...candidate, simulation: report, ready: report.clean, updatedAt: Date.now() }
+          ? {
+              ...candidate,
+              simulation: report,
+              artifactProbe,
+              ready: Boolean(report.clean && artifactProbe?.clean),
+              updatedAt: Date.now(),
+            }
           : candidate,
       );
       persist(entries);
@@ -224,7 +251,7 @@ export const useMcpGeneratorStore = create<McpGeneratorStore>((set, get) => ({
     const entry = get().entries.find((candidate) => candidate.id === entryId);
     if (!entry || !entry.code) throw new Error("Generate the server code before saving it.");
     if (!entry.ready) {
-      throw new Error("This server has not passed the simulator yet — run the simulator and resolve every failure before saving it for install.");
+      throw new Error("This server has not passed both the spec simulator and the isolated generated-artifact probe. Typecheck and runtime evidence are required before saving it for install.");
     }
     set({ saving: true, error: null });
     try {

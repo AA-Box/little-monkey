@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const fr: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const fr: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "Aucun connecteur Slack n'est câblé dans cette version — crée seulement une persona pour des transcriptions collées manuellement.",
   "Onboarding.templateModelEvaluationName": "Évaluation de modèles",
   "Onboarding.templateModelEvaluationDescription": "Compare les réponses de plusieurs modèles à un prompt que vous fournissez.",
-  "Onboarding.templateModelEvaluationCaveat": "Aucun système de suites d'évaluation automatisées n'existe encore — crée seulement une persona pour des comparaisons manuelles ponctuelles.",
+  "Onboarding.templateModelEvaluationCaveat": "Crée une persona de comparaison ; utilisez Workflow & Agent Test Harness pour les suites de régression automatisées et les barrières de publication.",
   "Onboarding.templateBrowserQaName": "QA navigateur",
   "Onboarding.templateBrowserQaDescription": "Parcourt un flux web avec les outils navigateur et signale ce qui casse.",
   "Onboarding.templateBrowserQaCaveat": "Crée seulement une persona — associez-la au Browser Workbench pour des parcours enregistrés.",
@@ -1004,6 +1020,9 @@ export const fr: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Pièce jointe",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Aperçu",
+  "WorkspaceImage.loading": "Chargement de l'image…",
+  "WorkspaceImage.error": "Image indisponible : {{error}}",
+  "WorkspaceImage.generatedAlt": "Image générée",
   "MessageList.argumentsLabel": "Arguments",
   "MessageList.resultLabel": "Résultat",
   "MessageList.regenerateButton": "Régénérer",

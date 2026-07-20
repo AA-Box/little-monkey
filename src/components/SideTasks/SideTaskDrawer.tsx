@@ -279,7 +279,10 @@ function SideTaskCard({ task, expanded, onToggleDetails }: { task: SideTaskRecor
   );
 }
 
-function SideTaskDetail({ task }: { task: SideTaskRecord }) {
+/** Shared side-task lifecycle/evidence view. Agent Inbox reuses this exact
+ * component so pause/resume/cancel/retry/archive/promote behavior cannot
+ * drift between the two task surfaces. */
+export function SideTaskDetail({ task }: { task: SideTaskRecord }) {
   const approvalsWaiting = usePermissionStore(
     (state) => state.queue.filter((request) => request.agent_label === `Side task "${task.title}"`).length,
   );

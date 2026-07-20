@@ -1,6 +1,7 @@
 import { Boxes, Cpu, Database, Gauge, HardDrive, Server } from "lucide-react";
 import { StatusPill } from "../../ui";
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
+import { resolveEdgeRuntimeProfile } from "../../../lib/runtimeEdgeProfiles";
 import type { M3AcceleratorStatus } from "../../../lib/runtimeHubClient";
 import { ErrorNotice, formatBytes, labelize, SectionHeading } from "./RuntimeHubShared";
 
@@ -77,6 +78,9 @@ export function RuntimeHubOverview() {
       backend: "Verified app-private Apple Silicon service",
     },
   ];
+  const edgeProfile = hardware && profile
+    ? resolveEdgeRuntimeProfile(hardware, profile, compatibilityReport)
+    : null;
 
   return (
     <div role="tabpanel" id="runtime-hub-panel-overview" aria-labelledby="runtime-hub-tab-overview" className="flex flex-col gap-5">
@@ -177,6 +181,49 @@ export function RuntimeHubOverview() {
           )}
         </div>
         {hardware && <p className="mt-3 text-xs text-muted">Snapshot captured {new Date(hardware.captured_at_ms).toLocaleString()}.</p>}
+      </section>
+
+      <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="runtime-edge-profile-heading">
+        <SectionHeading
+          title="Edge device runtime profile"
+          description="A conservative local recommendation derived from detected hardware. Runtime compatibility and a measured benchmark still gate actual use."
+        />
+        {edgeProfile ? (
+          <div id="runtime-edge-profile-heading" className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+            <div className="rounded-md border border-border bg-surface-2 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-sm font-semibold text-foreground">{edgeProfile.label}</p>
+                <StatusPill tone={edgeProfile.confidence === "confirmed" ? "success" : "neutral"}>
+                  {edgeProfile.confidence}
+                </StatusPill>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-muted">{edgeProfile.summary}</p>
+              <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                <div><dt className="text-faint">Runtime</dt><dd className="font-medium text-foreground">{labelize(edgeProfile.recommendedRuntime)}</dd></div>
+                <div><dt className="text-faint">Model class</dt><dd className="font-medium text-foreground">{edgeProfile.recommendedModelClass}</dd></div>
+                <div><dt className="text-faint">Safe context start</dt><dd className="font-medium text-foreground">{edgeProfile.contextTokens.toLocaleString()} tokens</dd></div>
+                <div><dt className="text-faint">Process slots</dt><dd className="font-medium text-foreground">{edgeProfile.processSlots}</dd></div>
+              </dl>
+              <p className="mt-3 text-xs leading-5 text-muted">{edgeProfile.expectedSpeed}</p>
+            </div>
+            <div className="rounded-md border border-border bg-surface-2 p-3 text-xs leading-5 text-muted">
+              <p className="font-semibold text-foreground">Required components</p>
+              <ul className="mt-1 list-disc pl-5">
+                {edgeProfile.requiredComponents.map((entry) => <li key={entry}>{entry}</li>)}
+              </ul>
+              <p className="mt-3 font-semibold text-foreground">Safe fallbacks</p>
+              <ul className="mt-1 list-disc pl-5">
+                {edgeProfile.fallbacks.map((entry) => <li key={entry}>{entry}</li>)}
+              </ul>
+              <p className="mt-3 font-semibold text-foreground">Evidence</p>
+              <ul className="mt-1 list-disc pl-5">
+                {edgeProfile.evidence.map((entry) => <li key={entry}>{entry}</li>)}
+              </ul>
+            </div>
+          </div>
+        ) : (
+          <p id="runtime-edge-profile-heading" className="mt-3 text-sm text-muted">Loading the local hardware profile…</p>
+        )}
       </section>
 
       <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="runtime-compatibility-heading">
