@@ -23,10 +23,12 @@ import {
   generateContractTestStub,
   generateMockResponses,
   parseOpenApiDocument,
+  runGeneratedContractTests,
   type ApiChange,
   type ApiContractDiffCallResult,
   type ApiDocument,
   type ClientImpactNote,
+  type ContractTestReport,
   type MockExample,
 } from "../lib/apiContractDiff";
 
@@ -58,6 +60,7 @@ interface ApiContractDiffStore {
   changes: ApiChange[];
   mocks: MockExample[];
   testStub: string;
+  contractTests: ContractTestReport | null;
   /** True once `runDiff` has completed at least once against the currently
    * loaded pair — distinguishes "diffed, zero changes found" (a real,
    * displayable release-ready verdict) from "not diffed yet" (no verdict to
@@ -102,6 +105,7 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
   changes: [],
   mocks: [],
   testStub: "",
+  contractTests: null,
   hasRun: false,
   diffError: null,
 
@@ -127,6 +131,7 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
         changes: [],
         mocks: [],
         testStub: "",
+        contractTests: null,
         hasRun: false,
         diffError: null,
         impactNotes: [],
@@ -147,9 +152,17 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
       const changes = diffApiDocuments(oldSpec.doc, newSpec.doc);
       const mocks = generateMockResponses(newSpec.doc);
       const testStub = generateContractTestStub(newSpec.doc);
-      set({ changes, mocks, testStub, hasRun: true, diffError: null, impactNotes: [], draftError: null });
+      const contractTests = runGeneratedContractTests(newSpec.doc);
+      set({ changes, mocks, testStub, contractTests, hasRun: true, diffError: null, impactNotes: [], draftError: null });
     } catch (err) {
-      set({ hasRun: false, diffError: err instanceof Error ? err.message : String(err) });
+      set({
+        changes: [],
+        mocks: [],
+        testStub: "",
+        contractTests: null,
+        hasRun: false,
+        diffError: err instanceof Error ? err.message : String(err),
+      });
     }
   },
 
@@ -192,6 +205,7 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
       changes: [],
       mocks: [],
       testStub: "",
+      contractTests: null,
       hasRun: false,
       diffError: null,
       drafting: false,

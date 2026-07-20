@@ -5,6 +5,7 @@ import {
   ArchiveRestore,
   ExternalLink,
   Filter,
+  ListTodo,
   Pause,
   Play,
   RefreshCw,
@@ -55,7 +56,14 @@ import { useAutomationsStore } from "../../store/automationsStore";
 import { usePermissionStore } from "../../store/permissionStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { useRecipeStore } from "../../store/recipeStore";
+import {
+  buildMcpResultSideTaskSeed,
+  useSideTaskStore,
+  type SideTaskRecord,
+} from "../../store/sideTaskStore";
+import { useSessionStore } from "../../store/sessionStore";
 import { Button, IconButton, StatusPill, Tabs, type PillTone } from "../ui";
+import { SideTaskDetail } from "../SideTasks";
 
 interface AgentInboxProps {
   onClose: () => void;
@@ -148,19 +156,41 @@ function InboxRow({ item, selected, onSelect }: { item: InboxItem; selected: boo
   );
 }
 
-function ToolCallRow({ call, t }: { call: RunEnrichment["toolCalls"][number]; t: ReturnType<typeof useT>["t"] }) {
+function ToolCallRow({
+  call,
+  t,
+  onStartSideTask,
+}: {
+  call: RunEnrichment["toolCalls"][number];
+  t: ReturnType<typeof useT>["t"];
+  onStartSideTask?: () => void;
+}) {
   const tone: PillTone = call.outcome === "succeeded" ? "success" : call.outcome === "failed" || call.outcome === "denied" ? "danger" : call.outcome === "cancelled" ? "neutral" : "warning";
   return (
-    <li className="flex items-center justify-between gap-3 rounded-md border border-border bg-surface px-3 py-2 text-xs">
-      <div className="min-w-0">
-        <p className="truncate font-mono text-foreground">{call.toolName}</p>
-        <p className="mt-0.5 text-[11px] text-faint">
-          {call.connectorId ? `${call.connectorId} · ` : ""}
-          {call.mutation ? "mutates" : "read-only"}
-          {call.durationMs != null ? ` · ${call.durationMs}ms` : ""}
-        </p>
+    <li className="rounded-md border border-border bg-surface px-3 py-2 text-xs">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate font-mono text-foreground">{call.toolName}</p>
+          <p className="mt-0.5 text-[11px] text-faint">
+            {call.connectorId ? `${call.connectorId} · ` : ""}
+            {call.mutation ? "mutates" : "read-only"}
+            {call.durationMs != null ? ` · ${call.durationMs}ms` : ""}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {onStartSideTask && (
+            <Button size="sm" variant="ghost" onClick={onStartSideTask} title="Review this MCP result in a side task">
+              <ListTodo size={12} /> Side task
+            </Button>
+          )}
+          <StatusPill tone={tone}>{call.outcome ? t(`AgentInbox.detail.outcome.${call.outcome}`) : t("AgentInbox.detail.pending")}</StatusPill>
+        </div>
       </div>
-      <StatusPill tone={tone}>{call.outcome ? t(`AgentInbox.detail.outcome.${call.outcome}`) : t("AgentInbox.detail.pending")}</StatusPill>
+      {call.outputExcerpt && (
+        <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-mono text-[11px] text-muted">
+          {call.outputExcerpt}
+        </pre>
+      )}
     </li>
   );
 }
@@ -189,6 +219,7 @@ interface DetailPaneProps {
   daemonManagedRunIds: string[];
   automationEntries: ReturnType<typeof useAutomationsStore.getState>["entries"];
   chatApprovalQueue: ReturnType<typeof usePermissionStore.getState>["queue"];
+  sideTasks: readonly SideTaskRecord[];
   isHeadOfChatQueue: boolean;
   actionBusy: string | null;
   onDecideRunApproval: (requestId: string, operationSha256: string, decision: PermissionDecision) => void;
@@ -200,6 +231,8 @@ interface DetailPaneProps {
   onRunAutomationNow: () => void;
   onToggleAutomation: () => void;
   onOpenRunCenter: (runId: string) => void;
+  onRevealSideTask: () => void;
+  onStartSideTaskFromMcpResult: (call: RunEnrichment["toolCalls"][number]) => void;
 }
 
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "archived"]);
@@ -261,6 +294,23 @@ function DetailPane(props: DetailPaneProps) {
             </Button>
           )}
         </div>
+      </div>
+    );
+  }
+
+  if (item.sourceKind === "side_task") {
+    const task = props.sideTasks.find((candidate) => candidate.id === item.sideTaskId) ?? null;
+    if (!task) {
+      return <p className="p-6 text-sm text-faint">This side task is no longer available.</p>;
+    }
+    return (
+      <div className="mx-auto max-w-4xl p-5">
+        <div className="mb-2 flex justify-end">
+          <Button size="sm" variant="primary" onClick={props.onRevealSideTask}>
+            <ExternalLink size={12} /> Open in Side Tasks
+          </Button>
+        </div>
+        <SideTaskDetail task={task} />
       </div>
     );
   }
@@ -408,7 +458,16 @@ function DetailPane(props: DetailPaneProps) {
             <p className="mt-1 text-xs text-faint">{t("AgentInbox.detail.noTools")}</p>
           ) : (
             <ul className="mt-2 space-y-1.5">
-              {enrichment.toolCalls.map((call) => <ToolCallRow key={call.toolCallId} call={call} t={t} />)}
+              {enrichment.toolCalls.map((call) => (
+                <ToolCallRow
+                  key={call.toolCallId}
+                  call={call}
+                  t={t}
+                  onStartSideTask={call.connectorId && call.outputExcerpt?.trim()
+                    ? () => props.onStartSideTaskFromMcpResult(call)
+                    : undefined}
+                />
+              ))}
             </ul>
           )}
         </section>
@@ -500,6 +559,14 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
 
   const recipes = useRecipeStore((state) => state.recipes);
 
+  const sideTaskById = useSideTaskStore((state) => state.tasks);
+  const sideTaskOrder = useSideTaskStore((state) => state.order);
+  const sideTasks = useMemo(
+    () => sideTaskOrder.map((id) => sideTaskById[id]).filter((task): task is SideTaskRecord => Boolean(task)),
+    [sideTaskById, sideTaskOrder],
+  );
+  const activeChatSessionId = useSessionStore((state) => state.activeSessionId);
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [statusTab, setStatusTab] = useState<InboxStatus | "all">("all");
   const [needsApprovalOnly, setNeedsApprovalOnly] = useState(false);
@@ -569,10 +636,10 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
     const runItems = buildRunInboxItems(runs, enrichmentByRunId, daemonManagedRunIds);
     const automationItems = buildAutomationInboxItems(automationEntries, nextRunCache.current);
     const chatItems = buildChatApprovalInboxItems(chatApprovalQueue, knownServerIds);
-    const sideTaskItems = buildSideTaskInboxItems();
+    const sideTaskItems = buildSideTaskInboxItems(sideTasks);
     return sortInboxItems(mergeInboxItems(runItems, automationItems, chatItems, sideTaskItems));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runs, automationEntries, chatApprovalQueue, knownServerIds, daemon, enrichmentVersion, nextRunVersion]);
+  }, [runs, automationEntries, chatApprovalQueue, sideTasks, knownServerIds, daemon, enrichmentVersion, nextRunVersion]);
 
   // Eagerly enrich active/waiting runs — the rows most likely to answer
   // "what needs me right now".
@@ -643,6 +710,7 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
 
   const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? null;
   const selectedRun = selectedItem?.runId ? runs.find((r) => r.spec.run_id === selectedItem.runId) ?? null : null;
+  const selectedSideTask = selectedItem?.sideTaskId ? sideTaskById[selectedItem.sideTaskId] ?? null : null;
   useEffect(() => {
     if (selectedRun) requestEnrichment(selectedRun.spec.run_id, selectedRun.updatedAtMs);
   }, [selectedRun, requestEnrichment]);
@@ -740,6 +808,23 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
     if (!entry) return;
     useAutomationsStore.getState().updateEntry(entry.id, { enabled: !entry.enabled });
   }, [selectedItem, automationEntries]);
+
+  const handleRevealSideTask = useCallback(() => {
+    if (!selectedSideTask) return;
+    const store = useSideTaskStore.getState();
+    store.selectTask(selectedSideTask.id);
+    store.revealPanel();
+  }, [selectedSideTask]);
+
+  const handleStartSideTaskFromMcpResult = useCallback((call: RunEnrichment["toolCalls"][number]) => {
+    if (!call.connectorId || !call.outputExcerpt?.trim()) return;
+    useSideTaskStore.getState().openComposer(buildMcpResultSideTaskSeed({
+      sessionId: activeChatSessionId,
+      serverId: call.connectorId,
+      toolName: call.toolName,
+      output: call.outputExcerpt,
+    }));
+  }, [activeChatSessionId]);
 
   const isHeadOfChatQueue = chatApprovalQueue[0]?.id === selectedItem?.approvalRequestId;
 
@@ -897,6 +982,7 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
               daemonManagedRunIds={daemon?.managedRunIds ?? []}
               automationEntries={automationEntries}
               chatApprovalQueue={chatApprovalQueue}
+              sideTasks={sideTasks}
               isHeadOfChatQueue={isHeadOfChatQueue}
               actionBusy={actionBusy}
               onDecideRunApproval={handleDecideRunApproval}
@@ -908,6 +994,8 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
               onRunAutomationNow={handleRunAutomationNow}
               onToggleAutomation={handleToggleAutomation}
               onOpenRunCenter={onOpenRunCenter}
+              onRevealSideTask={handleRevealSideTask}
+              onStartSideTaskFromMcpResult={handleStartSideTaskFromMcpResult}
             />
           )}
         </div>

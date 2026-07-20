@@ -19,7 +19,10 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::workspace::display_relative_path;
-use crate::{checkpoints, memory, native_skill_commands, permissions, workspace, AppState};
+use crate::{
+    artifact_commands, artifact_store::ArtifactStore, checkpoints, memory, native_skill_commands,
+    permissions, workspace, AppState,
+};
 
 /// Directory names that are never descended into by [`tool_grep`] — build
 /// output, VCS metadata, and dependency trees are noisy, huge, and almost
@@ -368,6 +371,174 @@ pub async fn tool_write_file(
         .map_err(|e| format!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Wrote {} bytes to {}", content.len(), path))
+}
+
+/// Extension → IANA media type for the image formats the chat's inline
+/// preview can display. Case-insensitive; `None` for everything else.
+fn image_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Cap on the decoded size of a generated PNG ([`tool_generate_image`]) and
+/// on a previewed image file's on-disk size ([`workspace_read_image`]). Both
+/// travel through IPC as base64 (~4/3 inflation), so this also bounds the
+/// transport payload.
+const IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Receipt persisted in the tool result. The transcript stores this compact
+/// reference while the PNG bytes live in the app-owned durable artifact
+/// store, so previews survive restarts without requiring an open workspace.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedImageReceipt {
+    artifact_id: String,
+    media_type: &'static str,
+    width: u32,
+    height: u32,
+    size: u64,
+    suggested_name: String,
+}
+
+fn generated_image_filename(
+    value: &str,
+    timestamp: &str,
+    uniqueness_suffix: &str,
+) -> Result<String, String> {
+    let trimmed = value.trim();
+    let name = trimmed
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or_default();
+    if name.is_empty() || !name.to_ascii_lowercase().ends_with(".png") {
+        return Err(format!("'{value}' must be a PNG filename ending in .png"));
+    }
+    let raw_stem = &name[..name.len() - 4];
+    let mut safe_stem = String::with_capacity(raw_stem.len());
+    for character in raw_stem.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            safe_stem.push(character);
+        } else if !safe_stem.ends_with('-') {
+            safe_stem.push('-');
+        }
+    }
+    let safe_stem = safe_stem.trim_matches('-');
+    let safe_stem = if safe_stem.is_empty() {
+        "generated-image"
+    } else {
+        safe_stem
+    };
+    Ok(format!("{safe_stem}-{timestamp}-{uniqueness_suffix}.png"))
+}
+
+fn persist_generated_image(
+    store: &ArtifactStore,
+    filename: &str,
+    content_base64: &str,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let suggested_name = generated_image_filename(filename, &timestamp, &unique[..8])?;
+    let bytes = crate::artifact_commands::decode_bounded(
+        content_base64,
+        IMAGE_MAX_BYTES,
+        "image",
+    )?;
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err("Generated image content is not a PNG (bad magic number)".to_string());
+    }
+    let blob = store.put(&bytes).map_err(|error| error.to_string())?;
+    serde_json::to_string(&GeneratedImageReceipt {
+        artifact_id: blob.id,
+        media_type: "image/png",
+        width,
+        height,
+        size: blob.size,
+        suggested_name,
+    })
+    .map_err(|error| format!("Failed to serialize generated image receipt: {error}"))
+}
+
+/// Persist a frontend-rasterized PNG in the app's private durable artifact
+/// store — the Rust half of the `generate_image` model tool. The model only
+/// supplies SVG markup and a suggested download filename; rasterization to
+/// PNG happens in the webview (`imageGeneration.ts`, where a canvas exists).
+///
+/// This is deliberately not a workspace mutation: it resolves no workspace
+/// path, requests no edit permission, and creates no checkpoint. The user
+/// chooses a filesystem destination later via the card's Download action.
+/// The PNG magic-number check is defense-in-depth against a spoofed IPC call.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tool_generate_image(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    filename: String,
+    content_base64: String,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
+    let store = artifact_commands::store_for(&app, state.inner())?;
+    persist_generated_image(&store, &filename, &content_base64, width, height)
+}
+
+/// A workspace image file's bytes and media type, for inline display in the
+/// chat transcript. New generated images use the app-owned durable artifact
+/// store above; this stays for ordinary workspace images and legacy turns.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceImage {
+    pub mime: String,
+    pub content_base64: String,
+    pub size: u64,
+}
+
+/// Read an image file from the workspace as base64, for the chat's inline
+/// image previews (`WorkspaceImagePreview.tsx`), legacy generated-image tool
+/// rows, and workspace-relative `![...](x.png)` references in assistant
+/// Markdown. Read-only and sandboxed through `resolve_path_and_root` like
+/// [`tool_read_file`], so intentionally NOT permission-gated; NOT a model
+/// tool (no `tool_` prefix — the model never calls this, only the UI does).
+/// Refuses non-image extensions and files over [`IMAGE_MAX_BYTES`].
+#[tauri::command(rename_all = "snake_case")]
+pub async fn workspace_read_image(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<WorkspaceImage, String> {
+    use base64::Engine;
+    let (resolved, _root) = workspace::resolve_path_and_root(state.inner(), &path)?;
+    let mime = image_mime_for_path(&resolved).ok_or_else(|| {
+        format!("'{path}' is not a previewable image (png, jpg, gif, webp, bmp, svg)")
+    })?;
+
+    let metadata =
+        std::fs::metadata(&resolved).map_err(|e| format!("Failed to stat '{}': {}", path, e))?;
+    if !metadata.is_file() {
+        return Err(format!("'{path}' is not a regular file"));
+    }
+    if metadata.len() > IMAGE_MAX_BYTES {
+        return Err(format!(
+            "'{path}' is {} bytes, exceeding the {IMAGE_MAX_BYTES}-byte preview limit",
+            metadata.len()
+        ));
+    }
+
+    let bytes =
+        std::fs::read(&resolved).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    Ok(WorkspaceImage {
+        mime: mime.to_string(),
+        content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    })
 }
 
 /// Build a short, human-readable diff-style preview (no external diff crate)
@@ -864,6 +1035,89 @@ pub fn list_workspace_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_mime_covers_preview_formats_case_insensitively_and_rejects_the_rest() {
+        use std::path::Path;
+        assert_eq!(
+            image_mime_for_path(Path::new("a/chart.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_mime_for_path(Path::new("a/PHOTO.JPG")),
+            Some("image/jpeg")
+        );
+        assert_eq!(image_mime_for_path(Path::new("x.jpeg")), Some("image/jpeg"));
+        assert_eq!(image_mime_for_path(Path::new("x.webp")), Some("image/webp"));
+        assert_eq!(
+            image_mime_for_path(Path::new("x.svg")),
+            Some("image/svg+xml")
+        );
+        assert_eq!(image_mime_for_path(Path::new("x.ts")), None);
+        assert_eq!(image_mime_for_path(Path::new("no-extension")), None);
+    }
+
+    #[test]
+    fn image_base64_decode_roundtrips_and_enforces_both_bounds() {
+        assert_eq!(
+            crate::artifact_commands::decode_bounded("aGVsbG8=", 5, "image").unwrap(),
+            b"hello"
+        );
+        // Decoded size over the cap.
+        assert!(crate::artifact_commands::decode_bounded("aGVsbG8=", 4, "image").is_err());
+        // Encoded length rejected before any decode allocation.
+        let oversized = "A".repeat(64);
+        assert!(crate::artifact_commands::decode_bounded(&oversized, 4, "image")
+            .unwrap_err()
+            .contains("Encoded image exceeds"));
+        assert!(crate::artifact_commands::decode_bounded("not base64", 128, "image").is_err());
+    }
+
+    #[test]
+    fn generated_image_filename_adds_a_timestamp_and_unique_suffix() {
+        assert_eq!(
+            generated_image_filename(
+                "images/brand/Proxy Kit.PNG",
+                "20260719-233420-123",
+                "a1b2c3d4"
+            )
+            .unwrap(),
+            "Proxy-Kit-20260719-233420-123-a1b2c3d4.png"
+        );
+        assert_eq!(
+            generated_image_filename("images\\brand\\logo.png", "20260719-233420-124", "e5f6a7b8")
+                .unwrap(),
+            "logo-20260719-233420-124-e5f6a7b8.png"
+        );
+        assert!(generated_image_filename("logo.svg", "timestamp", "unique").is_err());
+        assert!(generated_image_filename("  ", "timestamp", "unique").is_err());
+    }
+
+    #[test]
+    fn generated_image_persists_without_a_workspace_root() {
+        let tree = TempTree::new();
+        let store = ArtifactStore::new(tree.path.join("generated-artifacts")).unwrap();
+        let result = persist_generated_image(
+            &store,
+            "images/no-workspace-needed.png",
+            "iVBORw0KGgo=",
+            150,
+            180,
+        )
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let artifact_id = receipt["artifactId"].as_str().unwrap();
+        let suggested_name = receipt["suggestedName"].as_str().unwrap();
+        assert!(
+            Regex::new(r"^no-workspace-needed-\d{8}-\d{6}-\d{3}-[0-9a-f]{8}\.png$")
+                .unwrap()
+                .is_match(suggested_name)
+        );
+        assert_ne!(suggested_name, "no-workspace-needed.png");
+        assert_eq!(receipt["width"], 150);
+        assert_eq!(receipt["height"], 180);
+        assert_eq!(store.read(artifact_id).unwrap(), b"\x89PNG\r\n\x1a\n");
+    }
 
     #[test]
     fn diff_preview_contains_removed_and_added_markers() {

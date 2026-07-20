@@ -12,37 +12,8 @@ export interface DurableArtifactContent {
   contentBase64: string;
 }
 
-export interface DurableArtifactIntegrityIssue {
-  path: string;
-  blobId: string | null;
-  message: string;
-}
-
-export interface DurableArtifactIntegrityReport {
-  checkedBlobs: number;
-  validBlobs: number;
-  validBytes: number;
-  issues: DurableArtifactIntegrityIssue[];
-}
-
-export function importDurableArtifactFile(path: string): Promise<DurableArtifactBlob> {
-  return invoke<DurableArtifactBlob>("artifact_blob_import_file", { path });
-}
-
-export function putDurableArtifactBase64(contentBase64: string): Promise<DurableArtifactBlob> {
-  return invoke<DurableArtifactBlob>("artifact_blob_put_base64", { contentBase64 });
-}
-
 export function readDurableArtifact(id: string): Promise<DurableArtifactContent> {
   return invoke<DurableArtifactContent>("artifact_blob_read_base64", { id });
-}
-
-export function durableArtifactExists(id: string): Promise<boolean> {
-  return invoke<boolean>("artifact_blob_exists", { id });
-}
-
-export function scanDurableArtifactIntegrity(): Promise<DurableArtifactIntegrityReport> {
-  return invoke<DurableArtifactIntegrityReport>("artifact_blob_scan_integrity");
 }
 
 /** Build a model/UI data URL only at the edge. Persist the content hash, not

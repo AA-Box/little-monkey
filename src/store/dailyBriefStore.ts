@@ -1,12 +1,15 @@
 import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
 
 import { useRunStore } from "./runStore";
 import { useAutomationsStore, type AutomationEntry, type AutomationRunStatus } from "./automationsStore";
 import { usePermissionStore, type PermissionRequest } from "./permissionStore";
-import { useMcpStore } from "./mcpStore";
+import { useMcpStore, type McpServerInfo } from "./mcpStore";
 import { useRuntimeHubStore } from "./runtimeHubStore";
 import type { RiskLevel, RunRecord, RunStatus } from "../lib/runProtocol";
 import type { HardwareSnapshot, M3RuntimeCapability, M3StorageStatus } from "../lib/runtimeHubClient";
+import { formatMcpCallToolResult, type McpCallToolResult } from "../lib/mcpTools";
+import { neutralizeModelControlTokens } from "../lib/untrustedContent";
 
 /**
  * Daily Brief and Command Center (ROADMAP.md Phase 6): a purely additive,
@@ -84,10 +87,23 @@ export interface StaleTaskBrief {
  * unused today (see `buildConnectorHighlights`'s doc comment) but kept as a
  * named export so a later change that wires real content in has a type to
  * fill rather than inventing one under time pressure. */
+export interface DailyBriefConnectorSource {
+  id: string;
+  serverId: string;
+  toolName: string;
+  label: string;
+  arguments: Record<string, unknown>;
+  enabled: boolean;
+}
+
 export interface ConnectorHighlight {
+  id: string;
   connectorId: string;
   label: string;
   summary: string;
+  toolName: string;
+  fetchedAtMs: number;
+  status: "ok" | "error";
 }
 
 export interface RuntimeNodeSummary {
@@ -275,21 +291,141 @@ export function buildStaleTasks(
 // Connector-sourced highlights
 // ---------------------------------------------------------------------------
 
-/**
- * Deliberately always returns `[]` today. `mcpStore.ts` only caches a
- * connected server's *tool schema list* (`McpServerInfo.tools`), never any
- * content a tool call returned — there is no already-fetched "what happened
- * over there" data for any connector to surface as a highlight. Producing
- * one here would mean querying the connector live from a passive brief
- * refresh, which the roadmap's acceptance line ("no connector is queried
- * unless connected and enabled for the brief") is written to rule out, not
- * merely gate. `DailyBriefPanel` already omits this section whenever the
- * list is empty, so this is the correct behavior until some connector
- * exposes cached content this store can read instead of query — not a
- * placeholder to fill in blindly later.
- */
-export function buildConnectorHighlights(): ConnectorHighlight[] {
-  return [];
+const CONNECTOR_SOURCE_STORAGE_KEY = "little-monkey-daily-brief-connectors-v1";
+const CONNECTOR_SUMMARY_CHARS = 800;
+const READ_VERB = /(?:^|[_.:/-])(get|list|search|read|fetch|query|lookup|status|health|mentions|calendar|inbox|checks)(?:$|[_.:/-])/i;
+const WRITE_VERB = /(?:^|[_.:/-])(create|add|send|post|write|update|delete|remove|merge|close|approve|deploy|publish|mutate)(?:$|[_.:/-])/i;
+
+/** Daily Brief may only poll obviously read-oriented tools. Unknown names
+ * fail closed; enabling a source never becomes a generic connector grant. */
+export function isReadOnlyBriefTool(toolName: string): boolean {
+  return READ_VERB.test(toolName) && !WRITE_VERB.test(toolName);
+}
+
+function sanitizeConnectorSource(value: unknown): DailyBriefConnectorSource | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Partial<DailyBriefConnectorSource>;
+  if (
+    typeof source.id !== "string" || !source.id
+    || typeof source.serverId !== "string" || !source.serverId
+    || typeof source.toolName !== "string" || !isReadOnlyBriefTool(source.toolName)
+    || typeof source.label !== "string" || !source.label.trim()
+    || !source.arguments || typeof source.arguments !== "object" || Array.isArray(source.arguments)
+    || typeof source.enabled !== "boolean"
+  ) return null;
+  return {
+    id: source.id.slice(0, 120),
+    serverId: source.serverId.slice(0, 120),
+    toolName: source.toolName.slice(0, 200),
+    label: source.label.trim().slice(0, 160),
+    arguments: structuredClone(source.arguments as Record<string, unknown>),
+    enabled: source.enabled,
+  };
+}
+
+export function loadDailyBriefConnectorSources(): DailyBriefConnectorSource[] {
+  try {
+    const raw = localStorage.getItem(CONNECTOR_SOURCE_STORAGE_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .slice(0, 32)
+      .map(sanitizeConnectorSource)
+      .filter((source): source is DailyBriefConnectorSource => source !== null);
+  } catch {
+    return [];
+  }
+}
+
+function persistDailyBriefConnectorSources(sources: readonly DailyBriefConnectorSource[]): void {
+  try {
+    localStorage.setItem(CONNECTOR_SOURCE_STORAGE_KEY, JSON.stringify(sources));
+  } catch {
+    // The brief still works for this session when storage is unavailable.
+  }
+}
+
+function boundedConnectorSummary(value: string): string {
+  const normalized = neutralizeModelControlTokens(value).replace(/\s+/g, " ").trim();
+  if (!normalized) return "The connector returned no text content.";
+  return normalized.length <= CONNECTOR_SUMMARY_CHARS
+    ? normalized
+    : `${normalized.slice(0, CONNECTOR_SUMMARY_CHARS)}…`;
+}
+
+export type DailyBriefMcpCaller = (
+  serverId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  turnId: string,
+  toolCallId: string,
+) => Promise<McpCallToolResult>;
+
+const invokeBriefMcpTool: DailyBriefMcpCaller = (serverId, toolName, args, turnId, toolCallId) =>
+  invoke<McpCallToolResult>("mcp_call_tool", {
+    server_id: serverId,
+    tool_name: toolName,
+    arguments: args,
+    turn_id: turnId,
+    tool_call_id: toolCallId,
+  });
+
+/** Queries only sources that the user enabled and whose server is both
+ * enabled and connected. Every configured tool is rechecked against the live
+ * schema/allowlist and the read-only name policy before invocation. */
+export async function queryConnectorHighlights(
+  sources: readonly DailyBriefConnectorSource[],
+  servers: readonly McpServerInfo[],
+  call: DailyBriefMcpCaller = invokeBriefMcpTool,
+  nowMs: number = Date.now(),
+): Promise<ConnectorHighlight[]> {
+  const highlights: ConnectorHighlight[] = [];
+  for (const source of sources) {
+    if (!source.enabled || !isReadOnlyBriefTool(source.toolName)) continue;
+    const server = servers.find((candidate) => candidate.id === source.serverId);
+    if (!server || !server.enabled || server.status !== "connected") continue;
+    if (server.toolAllowlist && !server.toolAllowlist.includes(source.toolName)) continue;
+    if (!server.tools.some((tool) => tool.name === source.toolName)) continue;
+
+    try {
+      const result = await call(
+        source.serverId,
+        source.toolName,
+        structuredClone(source.arguments),
+        `daily-brief:${source.id}:${crypto.randomUUID()}`,
+        `daily-brief-call:${crypto.randomUUID()}`,
+      );
+      const formatted = formatMcpCallToolResult(result);
+      highlights.push({
+        id: source.id,
+        connectorId: source.serverId,
+        label: source.label,
+        summary: boundedConnectorSummary(formatted),
+        toolName: source.toolName,
+        fetchedAtMs: nowMs,
+        status: result.isError ? "error" : "ok",
+      });
+    } catch (error) {
+      highlights.push({
+        id: source.id,
+        connectorId: source.serverId,
+        label: source.label,
+        summary: boundedConnectorSummary(errorMessage(error)),
+        toolName: source.toolName,
+        fetchedAtMs: nowMs,
+        status: "error",
+      });
+    }
+  }
+  return highlights;
+}
+
+/** Stable newest-first presentation helper used by aggregate tests and by
+ * persisted/cached callers that already have connector evidence. */
+export function buildConnectorHighlights(
+  highlights: readonly ConnectorHighlight[] = [],
+): ConnectorHighlight[] {
+  return [...highlights].sort((left, right) => right.fetchedAtMs - left.fetchedAtMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +509,7 @@ const EMPTY_BRIEF: DailyBriefData = {
 };
 
 interface DailyBriefStoreState extends DailyBriefData {
+  connectorSources: DailyBriefConnectorSource[];
   loading: boolean;
   /** Set only when re-deriving from already-loaded store state fails
    * unexpectedly (it shouldn't — every input is a plain, already-validated
@@ -381,6 +518,9 @@ interface DailyBriefStoreState extends DailyBriefData {
    * block the rest of the brief from rendering. */
   error: string | null;
   lastRefreshedAtMs: number | null;
+  saveConnectorSource: (source: Omit<DailyBriefConnectorSource, "id"> & { id?: string }) => void;
+  removeConnectorSource: (id: string) => void;
+  setConnectorSourceEnabled: (id: string, enabled: boolean) => void;
   /** Recomputes every section from whatever is currently in the other
    * stores' state, then asks each source to refresh itself (best-effort,
    * independently) and recomputes again — so the panel shows something
@@ -404,9 +544,51 @@ function deriveFromStores(): DailyBriefData {
 
 export const useDailyBriefStore = create<DailyBriefStoreState>((set) => ({
   ...EMPTY_BRIEF,
+  connectorSources: loadDailyBriefConnectorSources(),
   loading: false,
   error: null,
   lastRefreshedAtMs: null,
+
+  saveConnectorSource: (candidate) => {
+    const source = sanitizeConnectorSource({
+      ...candidate,
+      id: candidate.id || crypto.randomUUID(),
+    });
+    if (!source) throw new Error("Daily Brief connector source is invalid or is not a read-only tool.");
+    set((state) => {
+      const connectorSources = state.connectorSources.some((entry) => entry.id === source.id)
+        ? state.connectorSources.map((entry) => entry.id === source.id ? source : entry)
+        : [...state.connectorSources, source];
+      persistDailyBriefConnectorSources(connectorSources);
+      return { connectorSources };
+    });
+  },
+
+  removeConnectorSource: (id) => {
+    set((state) => {
+      const connectorSources = state.connectorSources.filter((source) => source.id !== id);
+      persistDailyBriefConnectorSources(connectorSources);
+      return {
+        connectorSources,
+        connectorHighlights: state.connectorHighlights.filter((highlight) => highlight.id !== id),
+      };
+    });
+  },
+
+  setConnectorSourceEnabled: (id, enabled) => {
+    set((state) => {
+      const connectorSources = state.connectorSources.map((source) =>
+        source.id === id ? { ...source, enabled } : source
+      );
+      persistDailyBriefConnectorSources(connectorSources);
+      return {
+        connectorSources,
+        ...(!enabled
+          ? { connectorHighlights: state.connectorHighlights.filter((highlight) => highlight.id !== id) }
+          : {}),
+      };
+    });
+  },
 
   refresh: async () => {
     set({ loading: true, error: null, ...deriveFromStores() });
@@ -419,11 +601,16 @@ export const useDailyBriefStore = create<DailyBriefStoreState>((set) => ({
       useRuntimeHubStore.getState().refresh(),
     ]);
     const firstFailure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    const connectorHighlights = await queryConnectorHighlights(
+      useDailyBriefStore.getState().connectorSources,
+      useMcpStore.getState().servers,
+    );
     set({
       loading: false,
       lastRefreshedAtMs: Date.now(),
       error: firstFailure ? errorMessage(firstFailure.reason) : null,
       ...deriveFromStores(),
+      connectorHighlights: buildConnectorHighlights(connectorHighlights),
     });
   },
 }));

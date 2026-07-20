@@ -4,7 +4,7 @@ import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { AlertTriangle, CheckCircle2, Download, FileJson, RefreshCw, Sparkles, Upload, X } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
-import type { ApiChange } from "../../lib/apiContractDiff";
+import { isReleaseReady, type ApiChange } from "../../lib/apiContractDiff";
 import { useApiContractDiffStore, type DiffSlot } from "../../store/apiContractDiffStore";
 import { Button, IconButton, StatusPill } from "../ui";
 
@@ -13,7 +13,7 @@ import { Button, IconButton, StatusPill } from "../ui";
  * full-screen panel — same toggle pattern as `SopCompilerPanel`/
  * `EvidenceBoardPanel` (see `App.tsx`) — for comparing two local OpenAPI
  * JSON/YAML files and getting a breaking-vs-non-breaking change report, one
- * example mock response per schema, a contract-test-stub skeleton, and (for
+ * example mock response per schema, executable generated contract tests, and (for
  * every breaking change) a drafted plain-English client-impact note plus
  * migration suggestion. All state lives in `apiContractDiffStore.ts`; this
  * component is presentation only. MVP scope: OpenAPI JSON/YAML, two local
@@ -89,6 +89,7 @@ export function ApiContractDiffLabPanel({ onClose }: ApiContractDiffLabPanelProp
   const changes = useApiContractDiffStore((state) => state.changes);
   const mocks = useApiContractDiffStore((state) => state.mocks);
   const testStub = useApiContractDiffStore((state) => state.testStub);
+  const contractTests = useApiContractDiffStore((state) => state.contractTests);
   const hasRun = useApiContractDiffStore((state) => state.hasRun);
   const diffError = useApiContractDiffStore((state) => state.diffError);
   const drafting = useApiContractDiffStore((state) => state.drafting);
@@ -102,7 +103,7 @@ export function ApiContractDiffLabPanel({ onClose }: ApiContractDiffLabPanelProp
 
   const breaking = useMemo(() => changes.filter((change) => change.severity === "breaking"), [changes]);
   const nonBreaking = useMemo(() => changes.filter((change) => change.severity === "non-breaking"), [changes]);
-  const releaseReady = breaking.length === 0;
+  const releaseReady = isReleaseReady(changes, contractTests);
 
   const handleSaveTestStub = async () => {
     setSaveError(null);
@@ -179,8 +180,27 @@ export function ApiContractDiffLabPanel({ onClose }: ApiContractDiffLabPanelProp
               {releaseReady ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
               {releaseReady
                 ? t("ApiContractDiffLab.verdictReady")
-                : t("ApiContractDiffLab.verdictNotReady", { count: breaking.length })}
+                : breaking.length > 0
+                  ? t("ApiContractDiffLab.verdictNotReady", { count: breaking.length })
+                  : "Not release ready: generated contract tests did not produce a clean executable report."}
             </div>
+
+            {contractTests && (
+              <section className="rounded-md border border-border bg-surface px-3 py-2.5">
+                <h2 className="text-sm font-semibold text-foreground">Executable contract report</h2>
+                <p className={`mt-1 text-xs ${contractTests.clean ? "text-success" : "text-danger"}`}>
+                  {contractTests.passCount}/{contractTests.results.length} generated request/response cases passed.
+                  {contractTests.results.length === 0 ? " No schema-backed cases were generated, so this is not release evidence." : ""}
+                </p>
+                {contractTests.failCount > 0 && (
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-danger">
+                    {contractTests.results.filter((result) => !result.passed).map((result) => (
+                      <li key={result.id}>{result.label}: {result.errors.join(" ")}</li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+            )}
 
             {breaking.length > 0 && (
               <section>
