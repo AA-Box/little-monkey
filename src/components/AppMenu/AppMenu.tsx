@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Activity,
   BookOpenText,
+  Bug,
   Check,
   ChevronRight,
   ChevronsUpDown,
@@ -11,6 +13,7 @@ import {
   ClipboardCheck,
   Compass,
   FileDiff,
+  FlaskConical,
   Database,
   GitPullRequest,
   Globe,
@@ -20,6 +23,7 @@ import {
   Inbox,
   Network,
   Newspaper,
+  PanelsTopLeft,
   Plug,
   Radar,
   Search,
@@ -27,6 +31,7 @@ import {
   Settings as SettingsIcon,
   ShieldAlert,
   ShieldCheck,
+  Siren,
   SquareTerminal,
   Table2,
   Telescope,
@@ -37,8 +42,10 @@ import {
 import monkeyAvatar from "../../assets/monkey-avatar.png";
 import { useT, LOCALES } from "../../lib/i18n";
 import { useLocaleStore } from "../../store/localeStore";
+import packageMetadata from "../../../package.json";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = packageMetadata.version;
+const HELP_URL = "https://github.com/AA-Box/little-monkey#readme";
 
 interface AppMenuProps {
   onOpenSettings: () => void;
@@ -47,6 +54,9 @@ interface AppMenuProps {
   onOpenBrowserWorkbench: () => void;
   onOpenCommandPalette: () => void;
   onOpenIssueToPr: () => void;
+  onOpenDesignToApp: () => void;
+  onOpenProductionDebugging: () => void;
+  onOpenIncidentCommander: () => void;
   onOpenSecurityAutofix: () => void;
   onOpenTrustScorecards: () => void;
   onOpenSopCompiler: () => void;
@@ -75,6 +85,7 @@ interface AppMenuProps {
   onOpenBriefStudio: () => void;
   onOpenCrossRepoChangePlanner: () => void;
   onOpenVisualEditMode: () => void;
+  onOpenWorkflowTestHarness: () => void;
 }
 
 interface MenuRowProps {
@@ -155,6 +166,9 @@ export function AppMenu({
   onOpenBrowserWorkbench,
   onOpenCommandPalette,
   onOpenIssueToPr,
+  onOpenDesignToApp,
+  onOpenProductionDebugging,
+  onOpenIncidentCommander,
   onOpenSecurityAutofix,
   onOpenTrustScorecards,
   onOpenSopCompiler,
@@ -183,6 +197,7 @@ export function AppMenu({
   onOpenBriefStudio,
   onOpenCrossRepoChangePlanner,
   onOpenVisualEditMode,
+  onOpenWorkflowTestHarness,
 }: AppMenuProps) {
   const { t } = useT();
   const locale = useLocaleStore((state) => state.locale);
@@ -232,7 +247,9 @@ export function AppMenu({
       icon: <GitBranch size={14} className={iconClass} />,
       label: t("AppMenu.groupBuildShip"),
       items: [
+        { key: "designToApp", icon: <PanelsTopLeft size={14} className={iconClass} />, label: t("AppMenu.designToApp"), onOpen: onOpenDesignToApp },
         { key: "issueToPr", icon: <GitPullRequest size={14} className={iconClass} />, label: t("AppMenu.issueToPr"), onOpen: onOpenIssueToPr },
+        { key: "productionDebugging", icon: <Bug size={14} className={iconClass} />, label: t("AppMenu.productionDebugging"), onOpen: onOpenProductionDebugging },
         { key: "visualEditMode", icon: <Wand2 size={14} className={iconClass} />, label: t("AppMenu.visualEditMode"), onOpen: onOpenVisualEditMode },
         { key: "browserWorkbench", icon: <Globe size={14} className={iconClass} />, label: t("AppMenu.browserWorkbench"), onOpen: onOpenBrowserWorkbench },
         { key: "integratedTerminal", icon: <SquareTerminal size={14} className={iconClass} />, label: t("AppMenu.integratedTerminal"), onOpen: onOpenTerminal },
@@ -250,6 +267,8 @@ export function AppMenu({
         { key: "sopCompiler", icon: <Workflow size={14} className={iconClass} />, label: t("AppMenu.sopCompiler"), onOpen: onOpenSopCompiler },
         { key: "mcpGenerator", icon: <ServerCog size={14} className={iconClass} />, label: t("AppMenu.mcpGenerator"), onOpen: onOpenMcpGenerator },
         { key: "connectorBuilder", icon: <Plug size={14} className={iconClass} />, label: t("AppMenu.connectorBuilder"), onOpen: onOpenConnectorBuilder },
+        { key: "incidentCommander", icon: <Siren size={14} className={iconClass} />, label: t("AppMenu.incidentCommander"), onOpen: onOpenIncidentCommander },
+        { key: "workflowTestHarness", icon: <FlaskConical size={14} className={iconClass} />, label: "Workflow & Agent Test Harness", onOpen: onOpenWorkflowTestHarness },
         { key: "syntheticMonitoring", icon: <Radar size={14} className={iconClass} />, label: t("AppMenu.syntheticMonitoring"), onOpen: onOpenSyntheticMonitoring },
         { key: "sideTasks", icon: <ListTodo size={14} className={iconClass} />, label: t("AppMenu.sideTasks"), onOpen: onOpenSideTasks },
         { key: "debate", icon: <Swords size={14} className={iconClass} />, label: t("AppMenu.debate"), onOpen: onOpenDebate },
@@ -392,7 +411,12 @@ export function AppMenu({
           <MenuRow
             icon={<HelpCircle size={14} className="text-faint" />}
             label={t("AppMenu.getHelp")}
-            onClick={closeAll}
+            onClick={() => {
+              closeAll();
+              void openUrl(HELP_URL).catch((error) => {
+                console.error("Failed to open Little Monkey help", error);
+              });
+            }}
           />
 
           <div className="my-1 border-t border-border" />

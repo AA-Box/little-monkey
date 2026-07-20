@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   generateMcpServerCode: vi.fn(),
+  probeGeneratedMcpArtifact: vi.fn(),
   resolveGeneratorTarget: vi.fn(),
   save: vi.fn(),
   writeTextFile: vi.fn(),
@@ -14,6 +15,7 @@ vi.mock("../lib/mcpGenerator", async () => {
   return {
     ...actual,
     generateMcpServerCode: (...args: unknown[]) => mocks.generateMcpServerCode(...args),
+    probeGeneratedMcpArtifact: (...args: unknown[]) => mocks.probeGeneratedMcpArtifact(...args),
     resolveGeneratorTarget: (...args: unknown[]) => mocks.resolveGeneratorTarget(...args),
   };
 });
@@ -57,9 +59,21 @@ function validDraft() {
 beforeEach(() => {
   localStorage.clear();
   mocks.generateMcpServerCode.mockReset();
+  mocks.probeGeneratedMcpArtifact.mockReset();
   mocks.resolveGeneratorTarget.mockReset();
   mocks.save.mockReset();
   mocks.writeTextFile.mockReset();
+  mocks.probeGeneratedMcpArtifact.mockResolvedValue({
+    clean: true,
+    runId: "probe-run",
+    isolation: "os_sandboxed",
+    typechecked: true,
+    executed: true,
+    probedToolCount: 1,
+    summary: "verified",
+    stdoutExcerpt: "LITTLE_MONKEY_MCP_TYPECHECK_OK\nLITTLE_MONKEY_MCP_PROBE_OK:1",
+    stderrExcerpt: "",
+  });
   useMcpGeneratorStore.setState({
     draft: emptyServerDraft(),
     entries: [],
@@ -108,6 +122,7 @@ describe("generate", () => {
     expect(entry.code).toBe("// generated code");
     expect(entry.ready).toBe(false);
     expect(entry.simulation).toBeNull();
+    expect(entry.artifactProbe).toBeNull();
     expect(useMcpGeneratorStore.getState().entries).toHaveLength(1);
     expect(useMcpGeneratorStore.getState().selectedEntryId).toBe(entry.id);
     expect(JSON.parse(localStorage.getItem("little-monkey-mcp-generator-v1")!).entries).toHaveLength(1);
@@ -132,12 +147,47 @@ describe("runSimulator", () => {
     return useMcpGeneratorStore.getState().generate();
   }
 
-  it("marks a clean spec ready after simulating", async () => {
+  it("marks an entry ready only after simulating and probing generated code", async () => {
     const entry = await seedEntry();
-    useMcpGeneratorStore.getState().runSimulator(entry.id);
+    await useMcpGeneratorStore.getState().runSimulator(entry.id);
     const updated = useMcpGeneratorStore.getState().entries.find((e) => e.id === entry.id)!;
     expect(updated.simulation?.clean).toBe(true);
+    expect(updated.artifactProbe?.clean).toBe(true);
     expect(updated.ready).toBe(true);
+  });
+
+  it("never marks spec-only simulation ready when generated artifact execution fails", async () => {
+    const entry = await seedEntry();
+    mocks.probeGeneratedMcpArtifact.mockResolvedValue({
+      clean: false,
+      runId: "probe-failed",
+      isolation: "os_sandboxed",
+      typechecked: true,
+      executed: false,
+      probedToolCount: 0,
+      summary: "runtime failed",
+      stdoutExcerpt: "LITTLE_MONKEY_MCP_TYPECHECK_OK",
+      stderrExcerpt: "boom",
+    });
+    await useMcpGeneratorStore.getState().runSimulator(entry.id);
+    const updated = useMcpGeneratorStore.getState().entries.find((candidate) => candidate.id === entry.id)!;
+    expect(updated.simulation?.clean).toBe(true);
+    expect(updated.artifactProbe?.clean).toBe(false);
+    expect(updated.ready).toBe(false);
+  });
+
+  it("invalidates an earlier ready verdict before a probe retry that throws", async () => {
+    const entry = await seedEntry();
+    await useMcpGeneratorStore.getState().runSimulator(entry.id);
+    expect(useMcpGeneratorStore.getState().entries.find((candidate) => candidate.id === entry.id)?.ready).toBe(true);
+
+    mocks.probeGeneratedMcpArtifact.mockRejectedValue(new Error("sandbox unavailable"));
+    await useMcpGeneratorStore.getState().runSimulator(entry.id);
+
+    const updated = useMcpGeneratorStore.getState().entries.find((candidate) => candidate.id === entry.id)!;
+    expect(updated.ready).toBe(false);
+    expect(updated.artifactProbe).toBeNull();
+    expect(useMcpGeneratorStore.getState().error).toBe("sandbox unavailable");
   });
 
   it("does not mark an entry ready when the underlying spec would fail simulation", async () => {
@@ -152,13 +202,14 @@ describe("runSimulator", () => {
         spec: { ...validDraft(), tools: [{ name: "bad tool name", description: "x", requiresAuth: false, params: [] }] },
         code: "// code",
         simulation: null,
+        artifactProbe: null,
         ready: false,
         savedPath: null,
         createdAt: 1,
         updatedAt: 1,
       }],
     });
-    useMcpGeneratorStore.getState().runSimulator("bad-entry");
+    await useMcpGeneratorStore.getState().runSimulator("bad-entry");
     const updated = useMcpGeneratorStore.getState().entries.find((e) => e.id === "bad-entry")!;
     expect(updated.ready).toBe(false);
     expect(useMcpGeneratorStore.getState().error).toBeTruthy();
@@ -171,7 +222,7 @@ describe("saveToDisk", () => {
     mocks.resolveGeneratorTarget.mockResolvedValue({ kind: "provider", providerId: "openai", model: "gpt" });
     mocks.generateMcpServerCode.mockResolvedValue("// generated code");
     const entry = await useMcpGeneratorStore.getState().generate();
-    useMcpGeneratorStore.getState().runSimulator(entry.id);
+    await useMcpGeneratorStore.getState().runSimulator(entry.id);
     return entry.id;
   }
 

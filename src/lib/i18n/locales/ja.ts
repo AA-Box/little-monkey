@@ -30,8 +30,24 @@ import { briefStudioLocale } from "./briefStudio";
 import { crossRepoChangePlannerLocale } from "./crossRepoChangePlanner";
 import { visualEditModeLocale } from "./visualEditMode";
 import { localAppsLocale } from "./localApps";
+import { dbAdminGuardrailsLocale } from "./dbAdminGuardrails";
+import { developerLocale } from "./developer";
+import { ecosystemLocale } from "./ecosystem";
+import { inboxLocale } from "./inbox";
+import { paletteLocale } from "./palette";
+import { privacyFirewallLocale } from "./privacyFirewall";
+import { redTeamLabLocale } from "./redTeamLab";
+import { sandboxLocale } from "./sandbox";
 
 export const ja: Record<string, string> = {
+  ...dbAdminGuardrailsLocale,
+  ...developerLocale,
+  ...ecosystemLocale,
+  ...inboxLocale,
+  ...paletteLocale,
+  ...privacyFirewallLocale,
+  ...redTeamLabLocale,
+  ...sandboxLocale,
   ...syntheticMonitoringLocale,
   ...crewLocale,
   ...runLocale,
@@ -334,7 +350,7 @@ export const ja: Record<string, string> = {
   "Onboarding.templateSlackSummaryCaveat": "このビルドにはSlackコネクタが組み込まれていません。手動で貼り付けたやり取り用のペルソナのみを作成します。",
   "Onboarding.templateModelEvaluationName": "モデル評価",
   "Onboarding.templateModelEvaluationDescription": "指定したプロンプトに対する候補モデルの出力を比較します。",
-  "Onboarding.templateModelEvaluationCaveat": "自動評価スイートの仕組みはまだ実装されていません。単発の手動比較用のペルソナのみを作成します。",
+  "Onboarding.templateModelEvaluationCaveat": "比較用ペルソナを作成します。自動回帰スイートとリリースゲートには Workflow & Agent Test Harness を使用してください。",
   "Onboarding.templateBrowserQaName": "ブラウザQA",
   "Onboarding.templateBrowserQaDescription": "ブラウザツールを使ってWebフローを一つずつ確認し、壊れた箇所を報告します。",
   "Onboarding.templateBrowserQaCaveat": "ペルソナのみを作成します。記録されたフローにはBrowser Workbenchと組み合わせて使ってください。",
@@ -1003,6 +1019,9 @@ export const ja: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "添付画像",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "プレビュー",
+  "WorkspaceImage.loading": "画像を読み込み中…",
+  "WorkspaceImage.error": "画像を利用できません: {{error}}",
+  "WorkspaceImage.generatedAlt": "生成された画像",
   "MessageList.argumentsLabel": "引数",
   "MessageList.resultLabel": "結果",
   "MessageList.regenerateButton": "再生成",

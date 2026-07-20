@@ -9,20 +9,18 @@
 //! tables — see `run_ledger.rs`'s `MIGRATION_V4_SQL`) rather than an
 //! extension of `PermissionState`, exactly like the design brief calls for.
 //!
-//! Nothing in this build calls [`run_approval_chain`] from another feature —
-//! per the brief, later features (Issue-to-PR/Triage/a future Local App
-//! Builder) may wire themselves up to it once they exist, but none of them
-//! depend on it existing first. The only caller shipped in this stage is the
-//! `approval_chains_start` command, driven from the Settings panel's
-//! "Approval Chains" tab, so the feature has a real, clickable UI path
-//! end-to-end without requiring another stage to integrate it.
+//! Production workflow approvals call [`run_approval_chain`] before the
+//! workflow broker records an allow decision. The Settings panel also keeps a
+//! manual trigger for inspecting templates and exercising the audit trail.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Emitter;
@@ -383,6 +381,7 @@ fn load_stage_decisions(
         .collect::<Result<Vec<_>, LedgerError>>()
 }
 
+#[cfg(test)]
 fn load_chain_run(ledger: &RunLedger, chain_id: &str) -> Result<Option<ApprovalChainRun>, LedgerError> {
     let row = ledger
         .connection()
@@ -567,9 +566,9 @@ pub fn approval_chains_list_templates() -> Vec<ApprovalChainTemplate> {
     built_in_templates()
 }
 
-/// Manual trigger for a chain run — the Settings panel's "Approval Chains"
-/// tab is the reachable entry point for this stage (no other shipped feature
-/// calls [`run_approval_chain`] yet — see this module's top doc comment).
+/// Manual trigger for a chain run from the Settings panel's "Approval Chains"
+/// tab. Production workflow approvals use the same state machine through the
+/// M4 command adapter.
 /// `operation_digest` is computed here (not caller-supplied) from
 /// `template_id`/`detail`/a fresh nonce, the same "the request payload can
 /// never be forged by the caller" reasoning as
@@ -620,21 +619,6 @@ pub fn approval_chain_respond(
     // before the user clicked), there's nothing left to notify.
     let _ = pending.sender.send((allow, identity));
     Ok(())
-}
-
-/// Looks up a single chain run by id — used by `ApprovalChainModal` to
-/// re-fetch the full stage-decision history for a chain it's currently
-/// showing (e.g. after the modal reopens), without waiting for the next
-/// `approval-chain://stage` event.
-#[tauri::command]
-pub fn approval_chains_get(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    chain_id: String,
-) -> Result<Option<ApprovalChainRun>, String> {
-    crate::run_commands::with_ledger(&app, state.inner(), |ledger| {
-        load_chain_run(ledger, &chain_id)
-    })
 }
 
 /// Audit history: who/when/what for every stage of every past chain run,

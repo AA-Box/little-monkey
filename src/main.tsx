@@ -4,15 +4,42 @@ import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
 import { applyAppearance, subscribeToSystemTheme } from "./lib/theme";
+import { resolveAppearanceSettings } from "./lib/appearanceProfiles";
 import { useSettingsStore } from "./store/settingsStore";
+import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
 import { hydratePrompts } from "./store/promptStore";
 import { CompanionOverlay } from "./components/Companion";
 
-applyAppearance(useSettingsStore.getState());
-subscribeToSystemTheme(() => {
+function committedAppearance() {
   const settings = useSettingsStore.getState();
-  if (settings.themePreference === "system") applyAppearance(settings);
+  const workspaceKey = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null;
+  return resolveAppearanceSettings(
+    settings.deviceAppearance,
+    settings.appearanceWorkspaceOverrides,
+    workspaceKey,
+  );
+}
+
+function applyCommittedAppearance(): void {
+  applyAppearance(committedAppearance());
+}
+
+applyCommittedAppearance();
+useSettingsStore.subscribe((settings, previous) => {
+  if (
+    settings.deviceAppearance !== previous.deviceAppearance
+    || settings.appearanceWorkspaceOverrides !== previous.appearanceWorkspaceOverrides
+  ) {
+    applyCommittedAppearance();
+  }
+});
+useWorkspaceStore.subscribe((workspace, previous) => {
+  if (workspace.roots !== previous.roots) applyCommittedAppearance();
+});
+subscribeToSystemTheme(() => {
+  const appearance = committedAppearance();
+  if (appearance.themePreference === "system") applyAppearance(appearance);
 });
 
 // Sessions (and the prompt/persona library, same file-based pattern — see
