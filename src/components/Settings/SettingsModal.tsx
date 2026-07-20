@@ -21,7 +21,6 @@ import {
   MonitorCheck,
   MousePointerClick,
   Palette,
-  Plug,
   PlugZap,
   ScrollText,
   Search,
@@ -43,7 +42,6 @@ import { AutomationPanel } from "./AutomationPanel";
 import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { MemoryStudioPanel } from "./MemoryStudioPanel";
-import { McpPanel } from "./McpPanel";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import { PromptLibraryPanel } from "./PromptLibraryPanel";
 import { ApiServerPanel } from "./ApiServerPanel";
@@ -85,7 +83,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "mcp" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab";
+export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab";
 
 const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   local: Cpu,
@@ -95,7 +93,6 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   automation: Zap,
   rules: ScrollText,
   memorystudio: Brain,
-  mcp: Plug,
   connectors: PlugZap,
   prompts: MessageSquare,
   apiserver: Terminal,
@@ -125,7 +122,7 @@ const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] 
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "privacy", "diagnostics", "approvalchains", "team", "companion", "desktopcontrol", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "mcp", "connectors", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
@@ -136,7 +133,6 @@ const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
   automation: "SettingsModal.tabAutomation",
   rules: "SettingsModal.tabRules",
   memorystudio: "SettingsModal.tabMemoryStudio",
-  mcp: "SettingsModal.tabMcp",
   connectors: "SettingsModal.tabConnectors",
   prompts: "SettingsModal.tabPrompts",
   apiserver: "SettingsModal.tabApiServer",
@@ -378,7 +374,6 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "automation" && <AutomationPanel />}
               {tab === "rules" && <RulesMemoryPanel />}
               {tab === "memorystudio" && <MemoryStudioPanel />}
-              {tab === "mcp" && <McpPanel />}
               {tab === "connectors" && <ConnectorsPanel />}
               {tab === "prompts" && <PromptLibraryPanel />}
               {tab === "apiserver" && <ApiServerPanel />}
