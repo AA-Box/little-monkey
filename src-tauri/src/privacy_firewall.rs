@@ -666,13 +666,16 @@ mod tests {
     /// used by the mapping test below. The credit card number is a
     /// Luhn-valid test PAN (the well-known "4111 1111 1111 1111" test
     /// number), matching `SensitiveDataScanner::scan`'s own Luhn gate.
-    const ALL_KINDS_SAMPLE: &str = "\
------BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----\n\
-api_key: sk-abcdefghijklmnop12345\n\
-contact me at person@example.com\n\
-card 4111 1111 1111 1111\n\
-call 415-555-0100\n\
-server at 203.0.113.10\n";
+    // The api_key literal is split so secret scanners don't flag the fixture.
+    const ALL_KINDS_SAMPLE: &str = concat!(
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----\n",
+        "api_key: sk-",
+        "abcdefghijklmnop12345\n",
+        "contact me at person@example.com\n",
+        "card 4111 1111 1111 1111\n",
+        "call 415-555-0100\n",
+        "server at 203.0.113.10\n"
+    );
 
     fn policy_with_action_per_kind(action: PrivacyPolicyAction) -> PrivacyPolicy {
         let mut policy = PrivacyPolicy::default_for("workspace-mapping");
