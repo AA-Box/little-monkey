@@ -172,7 +172,16 @@ fn auth_err(e: AuthError) -> String {
 /// Only the map itself is guarded by the (synchronous, briefly-held)
 /// `std::sync::Mutex`; the returned `Arc<tokio::sync::Mutex<()>>` is what
 /// callers actually hold across the `.await`ing refresh call.
-fn refresh_lock_for(state: &AppState, server_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+///
+/// `pub(crate)` so `hosted_oauth.rs` can serialize its own refresh calls
+/// through the same map — a server id only ever belongs to one OAuth flow
+/// (this module's generic rmcp one, or the hosted-broker one), so sharing
+/// the map is just reusing the "one lock per server id" bookkeeping rather
+/// than standing up a second, identical map for the same concern.
+pub(crate) fn refresh_lock_for(
+    state: &AppState,
+    server_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     let mut guard = state
         .mcp_oauth_refresh_locks
         .lock()

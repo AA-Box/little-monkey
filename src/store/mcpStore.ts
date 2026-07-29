@@ -99,6 +99,21 @@ interface McpOAuthStatusEvent {
   error: string | null;
 }
 
+/** Payload of the `hosted-oauth://status` Tauri event emitted by
+ * `src-tauri/src/hosted_oauth.rs::emit_progress` — same shape as
+ * `McpOAuthStatusEvent`/`McpOAuthPhase`, but for the Cloudflare-Worker-
+ * brokered flow Slack/Google Drive/Gmail use instead of the generic
+ * RFC 7591 one (neither provider supports dynamic client registration —
+ * see that module's doc comment). Reuses `McpOAuthPhase`: the phases that
+ * actually appear on this event are a subset (never `"needs_client_id"`,
+ * since the Worker either has both providers' credentials configured or it
+ * doesn't — there's no per-connect manual client id step). */
+interface HostedOAuthStatusEvent {
+  serverId: string;
+  phase: Exclude<McpOAuthPhase, "idle">;
+  error: string | null;
+}
+
 /**
  * Payload of the `mcp://status` Tauri event emitted by src-tauri/src/mcp.rs
  * — mirrors modelStore.ts's `llama://status` handling. Deliberately doesn't
@@ -142,6 +157,32 @@ export interface McpStore {
   oauthCancel: (id: string) => Promise<void>;
   /** Clears an HTTP server's saved OAuth credentials from the keychain. */
   oauthDisconnect: (id: string) => Promise<void>;
+  /** Materializes a bundled MCP server's embedded source (see
+   * `src-tauri/src/bundled_mcp_servers.rs`) under the app data directory and
+   * returns its absolute path — used by `McpPanel`'s quick-add templates
+   * that need a real local file (e.g. the AppleScript-control server)
+   * rather than an externally installed command. */
+  stageBundledServer: (id: string) => Promise<string>;
+  /** Live progress of an in-flight/last `hostedOauthConnect` call, keyed by
+   * server id — updated by `hosted-oauth://status` events. Separate from
+   * `oauthStatus` since a given server id only ever uses one of the two
+   * flows, but nothing stops both maps existing side by side. */
+  hostedOauthStatus: Record<string, McpOAuthStatus>;
+  /** Starts the Cloudflare-Worker-brokered OAuth flow for `id` against
+   * `provider` (`"slack"` or `"google"`) — opens the system browser on the
+   * provider's real login page and returns as soon as that succeeds.
+   * Completion streams later via `hostedOauthStatus`/`hosted-oauth://status`
+   * events (there's no local redirect listener to await here, unlike
+   * `oauthConnect` — see `hosted_oauth.rs`'s module doc). */
+  hostedOauthConnect: (id: string, provider: "slack" | "google") => Promise<void>;
+  /** Drops a pending `hostedOauthConnect` attempt for `id` so a later,
+   * now-unwanted deep-link callback is ignored. There's no in-flight task
+   * to interrupt (unlike `oauthCancel`) — this only resets local/pending
+   * state. */
+  hostedOauthCancel: (id: string) => Promise<void>;
+  /** Clears an HTTP server's saved hosted-OAuth credentials from the
+   * keychain. */
+  hostedOauthDisconnect: (id: string) => Promise<void>;
 }
 
 export const useMcpStore = create<McpStore>((set, get) => ({
@@ -215,6 +256,32 @@ export const useMcpStore = create<McpStore>((set, get) => ({
     });
     await get().refresh();
   },
+
+  stageBundledServer: async (id) => {
+    return await invoke<string>("mcp_stage_bundled_server", { id });
+  },
+
+  hostedOauthStatus: {},
+
+  hostedOauthConnect: async (id, provider) => {
+    set((state) => ({
+      hostedOauthStatus: { ...state.hostedOauthStatus, [id]: { phase: "opening_browser", error: null } },
+    }));
+    await invoke("hosted_oauth_connect", { server_id: id, provider });
+  },
+
+  hostedOauthCancel: async (id) => {
+    await invoke("hosted_oauth_cancel", { server_id: id });
+  },
+
+  hostedOauthDisconnect: async (id) => {
+    await invoke("hosted_oauth_disconnect", { server_id: id });
+    set((state) => {
+      const { [id]: _removed, ...rest } = state.hostedOauthStatus;
+      return { hostedOauthStatus: rest };
+    });
+    await get().refresh();
+  },
 }));
 
 // Tauri-shell only: in plain-browser dev `listen` itself throws.
@@ -263,5 +330,21 @@ if (isTauri()) {
     }
   }).catch((error) => {
     console.error("Failed to listen for mcp-oauth://status events", error);
+  });
+
+  void listen<HostedOAuthStatusEvent>("hosted-oauth://status", (event) => {
+    const { serverId, phase, error } = event.payload;
+    useMcpStore.setState((state) => ({
+      hostedOauthStatus: { ...state.hostedOauthStatus, [serverId]: { phase, error } },
+    }));
+    if (phase === "connected") {
+      // Picks up the just-saved hosted-OAuth credentials as `hasOauth:
+      // true` — the event itself doesn't carry the server's full
+      // config/status, same reasoning as the `mcp-oauth://status` handler
+      // above.
+      void useMcpStore.getState().refresh();
+    }
+  }).catch((error) => {
+    console.error("Failed to listen for hosted-oauth://status events", error);
   });
 }
