@@ -1,0 +1,26 @@
+name: Notify website of release
+
+# release.yml creates releases as drafts (releaseDraft: true) — this only
+# fires once a human publishes one, so the website never rebuilds for a
+# half-finished draft.
+on:
+  release:
+    types: [published]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger little-monkey-website rebuild
+        env:
+          # Fine-grained PAT scoped to AA-Box/little-monkey-website only
+          # (Contents: read and write) — repository_dispatch needs
+          # push-equivalent permission on the *target* repo; the default
+          # GITHUB_TOKEN here is scoped to this repo, not that one.
+          TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/AA-Box/little-monkey-website/dispatches \
+            -d '{"event_type":"release_published","client_payload":{"tag":"${{ github.event.release.tag_name }}"}}'
