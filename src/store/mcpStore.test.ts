@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: (name: string, handler: (event: { payload: unknown }) => void) => {
     if (name === "mcp-oauth://status") {
       oauthStatusHandlerRef.current = handler;
-    } else {
+    } else if (name === "mcp://status") {
       statusHandlerRef.current = handler;
     }
     return Promise.resolve(() => {});
