@@ -317,7 +317,7 @@ export function DailyBriefPanel({ onClose, onOpenRunCenter, onOpenAgentInbox, on
                   title={item.label}
                   subtitle={`${item.summary} · ${item.connectorId}/${item.toolName} · ${new Date(item.fetchedAtMs).toLocaleTimeString()}`}
                   tone={item.status === "ok" ? "success" : "danger"}
-                  action={{ label: t("DailyBriefPanel.connectors.open"), onClick: () => onOpenSettingsTab("mcp") }}
+                  action={{ label: t("DailyBriefPanel.connectors.open"), onClick: () => onOpenSettingsTab("connectors") }}
                 />
               ))}
             </Section>

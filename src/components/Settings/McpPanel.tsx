@@ -3,12 +3,9 @@ import {
   ChevronDown,
   Cloud,
   GitPullRequest,
-  HardDrive,
-  Mail,
-  MessageCircle,
   Plug,
   RefreshCw,
-  Ticket,
+  Terminal,
   Trash2,
   type LucideIcon,
 } from "lucide-react";
@@ -74,6 +71,25 @@ interface AppConnectorTemplate {
   detailKey: string;
   icon: LucideIcon;
   draft: McpServerDraft;
+  /** Only offered on macOS — hidden from the template grid everywhere else
+   * (see `isMacPlatform`). */
+  macOnly?: boolean;
+  /** When set, clicking "Use template" first stages this bundled MCP
+   * server's embedded source under the app data directory (see
+   * `mcpStore.stageBundledServer` / `src-tauri/src/bundled_mcp_servers.rs`)
+   * and fills the resulting absolute path in as the draft's sole arg,
+   * rather than using `draft.argsText` verbatim. */
+  stageBundledServerId?: string;
+}
+
+/** Crude but standard best-effort client-side OS check (no IPC round trip
+ * needed, unlike `desktop_control.rs`'s Rust-side platform gating) — used
+ * only to hide macOS-only templates from the grid on other platforms; the
+ * bundled AppleScript server itself also refuses at call time on non-macOS,
+ * so this is a UX nicety, not the actual safety boundary. */
+function isMacPlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /mac/i.test(navigator.platform || navigator.userAgent || "");
 }
 
 export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
@@ -108,62 +124,6 @@ export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
     },
   },
   {
-    id: "slack",
-    labelKey: "McpPanel.templateSlackLabel",
-    descriptionKey: "McpPanel.templateSlackDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateSlackDetail",
-    icon: MessageCircle,
-    draft: {
-      transportKind: "http",
-      label: "Slack",
-      url: "https://mcp.slack.com/mcp",
-      timeoutText: "90",
-    },
-  },
-  {
-    id: "atlassian",
-    labelKey: "McpPanel.templateAtlassianLabel",
-    descriptionKey: "McpPanel.templateAtlassianDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateAtlassianDetail",
-    icon: Ticket,
-    draft: {
-      transportKind: "http",
-      label: "Atlassian",
-      url: "https://mcp.atlassian.com/v1/mcp/authv2",
-      timeoutText: "90",
-    },
-  },
-  {
-    id: "google-drive",
-    labelKey: "McpPanel.templateGoogleDriveLabel",
-    descriptionKey: "McpPanel.templateGoogleDriveDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateGoogleDriveDetail",
-    icon: HardDrive,
-    draft: {
-      transportKind: "http",
-      label: "Google Drive",
-      url: "https://drivemcp.googleapis.com/mcp/v1",
-      timeoutText: "90",
-    },
-  },
-  {
-    id: "gmail",
-    labelKey: "McpPanel.templateGmailLabel",
-    descriptionKey: "McpPanel.templateGmailDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateGmailDetail",
-    icon: Mail,
-    draft: {
-      transportKind: "http",
-      label: "Gmail",
-      url: "https://gmailmcp.googleapis.com/mcp/v1",
-      timeoutText: "90",
-    },
-  },
-  {
     id: "custom-http",
     labelKey: "McpPanel.templateCustomHttpLabel",
     descriptionKey: "McpPanel.templateCustomHttpDescription",
@@ -175,6 +135,25 @@ export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
       label: "Custom app",
       url: "",
       timeoutText: "60",
+    },
+  },
+  {
+    id: "osascript-control",
+    labelKey: "McpPanel.templateAppleScriptLabel",
+    descriptionKey: "McpPanel.templateAppleScriptDescription",
+    badgeKey: "McpPanel.templateLocalBadge",
+    detailKey: "McpPanel.templateAppleScriptDetail",
+    icon: Terminal,
+    macOnly: true,
+    stageBundledServerId: "osascript-control",
+    draft: {
+      transportKind: "stdio",
+      label: "macOS Control (AppleScript)",
+      command: "node",
+      // Filled in with the staged server's absolute path right before the
+      // draft is applied — see `stageBundledServerId` above.
+      argsText: "",
+      timeoutText: "30",
     },
   },
 ];
@@ -577,12 +556,46 @@ function ServerRow({ server }: { server: McpServerInfo }) {
 export function McpPanel() {
   const { t } = useT();
   const servers = useMcpStore((s) => s.servers);
+  const stageBundledServer = useMcpStore((s) => s.stageBundledServer);
   const [draft, setDraft] = useState<McpServerDraft | null>(null);
   const [draftVersion, setDraftVersion] = useState(0);
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  const [stagingTemplateId, setStagingTemplateId] = useState<string | null>(null);
 
   const totalCachedTools = servers
     .filter((s) => s.enabled && s.status === "connected")
     .reduce((sum, s) => sum + s.tools.length, 0);
+
+  const visibleTemplates = APP_CONNECTOR_TEMPLATES.filter(
+    (template) => !template.macOnly || isMacPlatform()
+  );
+
+  async function useTemplate(template: AppConnectorTemplate) {
+    setTemplateError(null);
+    let draftPatch: Partial<McpServerDraft> = {};
+    if (template.stageBundledServerId) {
+      setStagingTemplateId(template.id);
+      try {
+        const path = await stageBundledServer(template.stageBundledServerId);
+        draftPatch = { argsText: path };
+      } catch (err) {
+        setTemplateError(
+          t("McpPanel.templateAppleScriptStagingError", {
+            error: err instanceof Error ? err.message : String(err),
+          })
+        );
+        return;
+      } finally {
+        setStagingTemplateId(null);
+      }
+    }
+    setDraft({
+      ...template.draft,
+      ...draftPatch,
+      env: template.draft.env ? { ...template.draft.env } : undefined,
+    });
+    setDraftVersion((version) => version + 1);
+  }
 
   return (
     <div className="flex flex-col gap-3 py-2">
@@ -597,8 +610,9 @@ export function McpPanel() {
           </div>
         </div>
         <div className="mt-3 grid gap-2 lg:grid-cols-2">
-          {APP_CONNECTOR_TEMPLATES.map((template) => {
+          {visibleTemplates.map((template) => {
             const Icon = template.icon;
+            const staging = stagingTemplateId === template.id;
             return (
               <article key={template.id} className="rounded-lg border border-border bg-background p-3">
                 <div className="flex items-start gap-3">
@@ -617,20 +631,15 @@ export function McpPanel() {
                   </div>
                 </div>
                 <div className="mt-3 flex justify-end">
-                  <Button
-                    size="sm"
-                    onClick={() => {
-                      setDraft({ ...template.draft, env: template.draft.env ? { ...template.draft.env } : undefined });
-                      setDraftVersion((version) => version + 1);
-                    }}
-                  >
-                    {t("McpPanel.useTemplateButton")}
+                  <Button size="sm" onClick={() => void useTemplate(template)} disabled={staging}>
+                    {staging ? t("McpPanel.useTemplatePreparingButton") : t("McpPanel.useTemplateButton")}
                   </Button>
                 </div>
               </article>
             );
           })}
         </div>
+        {templateError && <p className="mt-2 text-xs text-danger">{templateError}</p>}
       </section>
 
       {totalCachedTools > TOOL_COUNT_WARNING_THRESHOLD && (

@@ -26,17 +26,11 @@ describe("MCP connector templates", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("includes a Google Drive template pointed at the real hosted MCP endpoint", () => {
-    const googleDrive = APP_CONNECTOR_TEMPLATES.find((template) => template.id === "google-drive");
-
-    expect(googleDrive?.draft.transportKind).toBe("http");
-    expect(googleDrive?.draft.url).toBe("https://drivemcp.googleapis.com/mcp/v1");
-  });
-
-  it("includes a Gmail template pointed at the real hosted MCP endpoint", () => {
-    const gmail = APP_CONNECTOR_TEMPLATES.find((template) => template.id === "gmail");
-
-    expect(gmail?.draft.transportKind).toBe("http");
-    expect(gmail?.draft.url).toBe("https://gmailmcp.googleapis.com/mcp/v1");
+  it("no longer duplicates ConnectorsPanel's hosted-OAuth catalog entries", () => {
+    const ids = APP_CONNECTOR_TEMPLATES.map((template) => template.id);
+    expect(ids).not.toContain("slack");
+    expect(ids).not.toContain("atlassian");
+    expect(ids).not.toContain("google-drive");
+    expect(ids).not.toContain("gmail");
   });
 });

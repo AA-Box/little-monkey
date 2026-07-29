@@ -474,10 +474,13 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-warning-soft text-warning">
                 <ShieldCheck size={18} />
               </div>
-              <div>
+              <div className="min-w-0 flex-1">
                 <h3 id="terminal-evidence-title" className="text-sm font-semibold text-foreground">{t("TerminalPanel.approvalTitle")}</h3>
                 <p className="mt-1 text-xs text-muted">{t("TerminalPanel.approvalDescription")}</p>
               </div>
+              <IconButton size="sm" variant="ghost" onClick={() => setEvidencePreview(null)} aria-label={t("TerminalPanel.cancel")}>
+                <X size={14} />
+              </IconButton>
             </div>
             {evidencePreview.truncated && (
               <div className="flex items-center gap-2 border-b border-warning/30 bg-warning-soft px-4 py-2 text-xs text-warning">
@@ -487,8 +490,7 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
             <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-surface-2 p-3 font-mono text-xs leading-5 text-foreground">
               {evidencePreview.content}
             </pre>
-            <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-end">
-              <Button variant="ghost" onClick={() => setEvidencePreview(null)}>{t("TerminalPanel.cancel")}</Button>
+            <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-center">
               <Button variant="secondary" onClick={startSideTaskFromEvidence}>
                 <ListTodo size={13} /> Start side task
               </Button>

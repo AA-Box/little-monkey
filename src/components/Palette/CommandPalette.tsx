@@ -506,7 +506,7 @@ export function CommandPalette({ onClose, onOpenSettingsTab }: CommandPalettePro
         sensitive: false,
         icon: KIND_ICONS.connector,
         onSelect: () => {
-          onOpenSettingsTab("mcp");
+          onOpenSettingsTab("connectors");
           onClose();
         },
       });
