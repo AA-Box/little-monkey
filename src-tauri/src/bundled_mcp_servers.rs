@@ -93,7 +93,13 @@ mod tests {
     fn stages_the_osascript_control_server_with_its_exact_embedded_source() {
         let data_dir = temp_data_dir();
         let path = stage_bundled_server_impl(&data_dir, "osascript-control").unwrap();
-        assert!(path.ends_with("bundled-mcp-servers/osascript-control/index.mjs"));
+        // `path` is a plain `String` — `str::ends_with` is a literal byte
+        // match, so a hardcoded `/`-separated suffix fails on Windows where
+        // the real separator is `\`. Compare as `Path` components instead.
+        let expected_suffix = std::path::Path::new("bundled-mcp-servers")
+            .join("osascript-control")
+            .join("index.mjs");
+        assert!(std::path::Path::new(&path).ends_with(&expected_suffix));
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, OSASCRIPT_CONTROL_SOURCE);
         let _ = std::fs::remove_dir_all(&data_dir);
