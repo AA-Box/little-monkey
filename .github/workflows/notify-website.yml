@@ -7,6 +7,11 @@ on:
   release:
     types: [published]
 
+# Job only calls out with its own RELEASE_DISPATCH_TOKEN PAT, never the
+# default GITHUB_TOKEN — restricted to the minimum a workflow can hold.
+permissions:
+  contents: read
+
 jobs:
   dispatch:
     runs-on: ubuntu-latest
