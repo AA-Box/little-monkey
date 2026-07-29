@@ -98,6 +98,8 @@ function readInitialSize(): TerminalPanelSize {
  * remains in the store so the backend/frontend snapshots stay comparable. */
 export function readableTerminalOutput(output: string): string {
   return output
+    // OSC sequences (window title, cwd, shell-integration markers) run until BEL or ST.
+    .replace(/\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g, "")
     // CSI plus the short two-byte ESC forms commonly emitted by shells.
     .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, "")
     .replace(/\r\n/g, "\n")

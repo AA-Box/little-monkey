@@ -381,20 +381,35 @@ pub async fn connect_impl(
                 rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                     url.clone(),
                 );
-            // An OAuth-connected server (see `mcp_oauth::mcp_oauth_connect`)
-            // takes priority over a manually pasted static token: its
-            // presence means the user explicitly ran the OAuth flow for this
-            // server id, and `get_access_token_if_connected` auto-refreshes
-            // the token if it's expired. `Ok(None)` means no OAuth
+            // An OAuth-connected server (either flow — see below) takes
+            // priority over a manually pasted static token: its presence
+            // means the user explicitly ran an OAuth flow for this server
+            // id, and both flows' `get_access_token_if_connected` auto-
+            // refresh an expired token. `Ok(None)` from both means no OAuth
             // credentials are stored for this id at all — fall back to
             // whatever static token (if any) was saved via
-            // `mcp_set_http_token`. An `Err` here (stored OAuth credentials
-            // exist but can't produce a usable token — e.g. refresh failed
-            // and re-authorization is required) is surfaced as a real
-            // connect failure rather than silently degrading to the static
-            // token, since that static token may be stale/absent precisely
-            // because OAuth was set up instead.
-            match crate::mcp_oauth::get_access_token_if_connected(state, &entry.id, url).await? {
+            // `mcp_set_http_token`. An `Err` (stored credentials exist but
+            // can't produce a usable token — e.g. refresh failed and
+            // re-authorization is required) is surfaced as a real connect
+            // failure rather than silently degrading to the static token,
+            // since that static token may be stale/absent precisely because
+            // OAuth was set up instead.
+            //
+            // Two flows, not one, because not every provider can use the
+            // first: `mcp_oauth`'s generic RFC 7591 dynamic-client-
+            // registration + loopback-redirect flow works for servers that
+            // support it (Atlassian, Notion, Stripe, PostHog, ...); Slack
+            // and Google Drive/Gmail don't (confirmed against their own
+            // docs — no DCR, and Slack additionally requires a
+            // `client_secret` no desktop binary can hold safely), so those
+            // three go through `hosted_oauth`'s Cloudflare-Worker-brokered
+            // flow instead. A given server id only ever has credentials in
+            // one of the two.
+            let oauth_token = match crate::hosted_oauth::get_access_token_if_connected(state, &entry.id).await? {
+                Some(token) => Some(token),
+                None => crate::mcp_oauth::get_access_token_if_connected(state, &entry.id, url).await?,
+            };
+            match oauth_token {
                 Some(token) => config = config.auth_header(token),
                 None => {
                     if let Some(token) = read_http_token(&entry.id) {
@@ -692,7 +707,8 @@ fn build_info(
         has_http_token: matches!(entry.transport, McpTransport::Http { .. })
             && read_http_token(&entry.id).is_some(),
         has_oauth: matches!(entry.transport, McpTransport::Http { .. })
-            && crate::mcp_oauth::has_oauth_credentials(&entry.id),
+            && (crate::mcp_oauth::has_oauth_credentials(&entry.id)
+                || crate::hosted_oauth::has_oauth_credentials(&entry.id)),
     }
 }
 
@@ -856,6 +872,7 @@ pub async fn mcp_remove_server(
     // fails the removal itself over keychain cleanup.
     let _ = remove_http_token_impl(&server_id);
     let _ = crate::mcp_oauth::remove_oauth_credentials_impl(&server_id);
+    let _ = crate::hosted_oauth::remove_oauth_credentials(&server_id);
     Ok(())
 }
 
