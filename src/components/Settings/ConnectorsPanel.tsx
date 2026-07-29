@@ -114,6 +114,17 @@ interface AppConnectorTemplate {
    * misleading "needs client id" error from `rmcp`'s legacy-fallback DCR
    * guess. Every other catalog entry is a real remote OAuth server. */
   requiresOAuth?: boolean;
+  /** Set only for Slack/Google Drive/Gmail — these providers don't support
+   * RFC 7591 dynamic client registration (confirmed against their own
+   * docs), so the generic `mcp_oauth.rs` flow can't give them one-click
+   * OAuth the way Notion/Stripe/PostHog/Atlassian get it. Instead they go
+   * through `hosted_oauth.rs`'s Cloudflare-Worker-brokered flow — see that
+   * module's doc comment. `hostedProvider` is the Worker-side provider id
+   * (`"google"` covers both `google-drive` and `gmail`, which share one
+   * Google OAuth client but request different scopes).
+   */
+  authMode?: "hosted";
+  hostedProvider?: "slack" | "google";
 }
 
 /** The "browse and one-click connect" catalog (mirrors the desktop app's
@@ -123,10 +134,10 @@ interface AppConnectorTemplate {
  * connects via the generic MCP-spec OAuth flow (`mcpStore.oauthConnect`),
  * same mechanism `McpPanel`'s per-server "Connect via OAuth" uses. */
 const APP_CONNECTORS: AppConnectorTemplate[] = [
-  { id: "slack", labelKey: "ConnectorsPanel.appSlackLabel", descriptionKey: "ConnectorsPanel.appSlackDescription", icon: MessageCircle, category: "communication", url: "https://mcp.slack.com/mcp" },
+  { id: "slack", labelKey: "ConnectorsPanel.appSlackLabel", descriptionKey: "ConnectorsPanel.appSlackDescription", icon: MessageCircle, category: "communication", url: "https://mcp.slack.com/mcp", authMode: "hosted", hostedProvider: "slack" },
   { id: "atlassian", labelKey: "ConnectorsPanel.appAtlassianLabel", descriptionKey: "ConnectorsPanel.appAtlassianDescription", icon: Ticket, category: "devTools", url: "https://mcp.atlassian.com/v1/mcp/authv2" },
-  { id: "google-drive", labelKey: "ConnectorsPanel.appGoogleDriveLabel", descriptionKey: "ConnectorsPanel.appGoogleDriveDescription", icon: HardDrive, category: "cloudStorage", url: "https://drivemcp.googleapis.com/mcp/v1" },
-  { id: "gmail", labelKey: "ConnectorsPanel.appGmailLabel", descriptionKey: "ConnectorsPanel.appGmailDescription", icon: Mail, category: "communication", url: "https://gmailmcp.googleapis.com/mcp/v1" },
+  { id: "google-drive", labelKey: "ConnectorsPanel.appGoogleDriveLabel", descriptionKey: "ConnectorsPanel.appGoogleDriveDescription", icon: HardDrive, category: "cloudStorage", url: "https://drivemcp.googleapis.com/mcp/v1", authMode: "hosted", hostedProvider: "google" },
+  { id: "gmail", labelKey: "ConnectorsPanel.appGmailLabel", descriptionKey: "ConnectorsPanel.appGmailDescription", icon: Mail, category: "communication", url: "https://gmailmcp.googleapis.com/mcp/v1", authMode: "hosted", hostedProvider: "google" },
   { id: "figma", labelKey: "ConnectorsPanel.appFigmaLabel", descriptionKey: "ConnectorsPanel.appFigmaDescription", icon: Palette, category: "creative", url: "http://127.0.0.1:3845/mcp", requiresOAuth: false },
   { id: "notion", labelKey: "ConnectorsPanel.appNotionLabel", descriptionKey: "ConnectorsPanel.appNotionDescription", icon: NotebookText, category: "productivity", url: "https://mcp.notion.com/mcp" },
   { id: "linear", labelKey: "ConnectorsPanel.appLinearLabel", descriptionKey: "ConnectorsPanel.appLinearDescription", icon: ListChecks, category: "devTools", url: "" },
@@ -170,9 +181,13 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
   const oauthConnect = useMcpStore((s) => s.oauthConnect);
   const oauthCancel = useMcpStore((s) => s.oauthCancel);
   const oauthDisconnect = useMcpStore((s) => s.oauthDisconnect);
+  const hostedOauthConnect = useMcpStore((s) => s.hostedOauthConnect);
+  const hostedOauthCancel = useMcpStore((s) => s.hostedOauthCancel);
+  const hostedOauthDisconnect = useMcpStore((s) => s.hostedOauthDisconnect);
   const connect = useMcpStore((s) => s.connect);
   const disconnect = useMcpStore((s) => s.disconnect);
-  const phaseInfo = useMcpStore((s) => s.oauthStatus[template.id]);
+  const genericPhaseInfo = useMcpStore((s) => s.oauthStatus[template.id]);
+  const hostedPhaseInfo = useMcpStore((s) => s.hostedOauthStatus[template.id]);
 
   const [urlInput, setUrlInput] = useState("");
   const [clientIdInput, setClientIdInput] = useState("");
@@ -181,11 +196,25 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
   const [error, setError] = useState<string | null>(null);
 
   const Icon = template.icon;
+  const isHosted = template.authMode === "hosted";
   const usesOAuth = template.requiresOAuth !== false;
   const server = servers.find((s) => s.id === template.id);
+  const phaseInfo = isHosted ? hostedPhaseInfo : genericPhaseInfo;
   const phase: McpOAuthPhase = phaseInfo?.phase ?? "idle";
   const needsUrlInput = !server && template.url.length === 0;
   const isConnected = usesOAuth ? Boolean(server?.hasOauth) : server?.status === "connected";
+
+  // The hosted flow's Rust command returns as soon as the browser opens —
+  // completion (credential save) happens later, out of band, driven by the
+  // `hosted-oauth://status` "connected" event. Establish the actual live
+  // MCP connection once that lands, mirroring what the generic flow does
+  // inline within its own `handleConnect` below.
+  useEffect(() => {
+    if (isHosted && phase === "connected" && server && server.status !== "connected") {
+      void connect(template.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isHosted, phase, server?.status]);
 
   async function handleConnect(clientId?: string) {
     setError(null);
@@ -203,7 +232,11 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
           timeout_secs: 90,
         });
       }
-      if (usesOAuth) {
+      if (isHosted) {
+        await hostedOauthConnect(template.id, template.hostedProvider ?? "slack");
+        // No further `.await` here — see the effect above for what happens
+        // once the browser round trip actually finishes.
+      } else if (usesOAuth) {
         await oauthConnect(template.id, clientId);
         // Same reasoning as `OAuthConnectSection`: `mcp_oauth_connect` only
         // saves credentials, it doesn't itself (re)connect the server.
@@ -223,7 +256,9 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
   async function handleDisconnect() {
     setDisconnecting(true);
     try {
-      if (usesOAuth) {
+      if (isHosted) {
+        await hostedOauthDisconnect(template.id);
+      } else if (usesOAuth) {
         await oauthDisconnect(template.id);
       } else {
         await disconnect(template.id);
@@ -273,7 +308,11 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
               <StatusPill tone={APP_OAUTH_PHASE_TONE[phase] ?? "neutral"}>{t(`ConnectorsPanel.appOauthPhase_${phase}`)}</StatusPill>
             )}
             {usesOAuth && connecting && (
-              <Button variant="ghost" size="sm" onClick={() => void oauthCancel(template.id)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void (isHosted ? hostedOauthCancel(template.id) : oauthCancel(template.id))}
+              >
                 {t("ConnectorsPanel.appCancelButton")}
               </Button>
             )}

@@ -143,6 +143,12 @@ mod git;
 // this module's Tauri-command surface stays desktop-app-only).
 pub mod llama;
 pub mod mcp;
+// Small, dependency-free stdio MCP servers embedded in the binary via
+// `include_str!` and materialized on demand under the app data dir — backs
+// `McpPanel.tsx`'s "quick add" templates that need a real local file (e.g.
+// the bundled AppleScript-control server) rather than an externally
+// installed command like `docker`/`npx`.
+pub mod bundled_mcp_servers;
 // Generic MCP-spec OAuth 2.0 (RFC 8414 discovery, RFC 7591 dynamic client
 // registration, PKCE authorization-code flow) for HTTP MCP servers — an
 // additional, alternative way to obtain `mcp.rs`'s `McpTransport::Http`
@@ -150,6 +156,14 @@ pub mod mcp;
 // Kept as its own module (rather than growing `mcp.rs` further) since it's
 // the one place a future `rmcp` OAuth API change would need editing.
 pub mod mcp_oauth;
+// Brokered OAuth for MCP servers whose provider requires a confidential
+// client (a `client_secret`) — Slack and Google, confirmed via their own
+// docs to not support `mcp_oauth.rs`'s dynamic-client-registration/loopback
+// flow. A Cloudflare Worker (little-monkey-website/worker/) holds the
+// secret and exchanges the code server-side; this module only ever sees the
+// resulting access/refresh tokens, via a `littlemonkey://` deep link. See
+// newApp/.claude/plans/linear-moseying-wolf.md for the full design.
+pub mod hosted_oauth;
 // Connector Catalog: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/S3
 // connections, verified live before saving, secrets in the OS keychain only.
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
@@ -423,6 +437,15 @@ pub struct AppState {
     /// across the refresh call.
     pub mcp_oauth_refresh_locks:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Pending hosted-OAuth attempts (see `hosted_oauth.rs`), keyed by the
+    /// random `state` value embedded in the authorize URL sent to the
+    /// browser — looked up when the `littlemonkey://oauth/callback` deep
+    /// link comes back, so a spoofed/stale deep link (wrong or unknown
+    /// `state`) is dropped rather than trusted. Entries are removed once
+    /// redeemed (success or error) or found stale (see
+    /// `hosted_oauth::PENDING_TTL`) on next insert.
+    pub hosted_oauth_pending:
+        std::sync::Mutex<std::collections::HashMap<String, hosted_oauth::PendingHostedOAuth>>,
     /// Serializes `web_settings.json` writes (see `web.rs::web_set_settings`)
     /// — same reasoning as `mcp_config_lock` protects `mcp_servers.json`.
     /// `web_set_settings` is a synchronous command (Tauri can dispatch two
@@ -547,6 +570,7 @@ impl Default for AppState {
             mcp: Default::default(),
             mcp_oauth_cancel: Default::default(),
             mcp_oauth_refresh_locks: Default::default(),
+            hosted_oauth_pending: Default::default(),
             web_settings_lock: Default::default(),
             api_server: Default::default(),
             api_server_config_lock: Default::default(),
@@ -647,6 +671,20 @@ pub fn run() {
         })
         .build();
     let app = tauri::Builder::default()
+        // Must be registered first (per tauri-plugin-single-instance's own
+        // docs) so it can intercept a second launch before anything else
+        // runs. Only matters on Windows/Linux, where a `littlemonkey://`
+        // deep link while the app is already running spawns a second OS
+        // process rather than delivering a live event to the first one (see
+        // `hosted_oauth.rs`'s module doc) — this pipes that second launch's
+        // argv into the already-running instance instead of letting a
+        // second, windowless copy of the app start up.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(url) = hosted_oauth::extract_deep_link_from_argv(&argv) {
+                hosted_oauth::handle_deep_link_urls(app, vec![url]);
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -675,6 +713,13 @@ pub fn run() {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
         .setup(|app| {
+            // Listens for `littlemonkey://` deep links (macOS/mobile live
+            // events; Windows/Linux fresh-launch CLI-arg parsing — a
+            // still-running instance on those platforms is covered by the
+            // single-instance plugin's closure above instead). See
+            // `hosted_oauth.rs`'s module doc for the full flow.
+            hosted_oauth::register(app.handle());
+
             // Finish or roll back any portable-profile transaction interrupted
             // between staged file publication and its durable commit marker.
             // This runs before session/prompt hydration and before the profile
@@ -937,9 +982,13 @@ pub fn run() {
             mcp::mcp_set_http_token,
             mcp::mcp_remove_http_token,
             mcp::mcp_call_tool,
+            bundled_mcp_servers::mcp_stage_bundled_server,
             mcp_oauth::mcp_oauth_connect,
             mcp_oauth::mcp_oauth_cancel,
             mcp_oauth::mcp_oauth_disconnect,
+            hosted_oauth::hosted_oauth_connect,
+            hosted_oauth::hosted_oauth_cancel,
+            hosted_oauth::hosted_oauth_disconnect,
             system::reveal_in_finder,
             system::open_in_terminal,
             system::open_in_editor,
