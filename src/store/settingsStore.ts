@@ -55,7 +55,7 @@ export interface SettingsState {
   providerRateLimits: Record<string, ProviderRateLimit>;
   /** "providerId:modelId" -> manual correction of the built-in vision-capability heuristic (see `visionModels.ts`). */
   visionOverrides: Record<string, boolean>;
-  /** Provider id -> user-curated model allowlist for that provider's model list (e.g. the OpenRouter tab's picker). Absent/`showAll: true` means unfiltered. */
+  /** Provider id -> user-curated model allowlist for that connected provider's model-selection tab. Absent/`showAll: true` means every available model is selected. */
   providerModelFilters: Record<string, ProviderModelFilter>;
   /** How many finished checkpoints (see checkpoints.rs) to keep on disk before the oldest are pruned — passed as `checkpoint_begin`'s `max_keep` param. Range 5-100, default 20 (mirrors the backend's own `MAX_CHECKPOINTS` fallback). */
   checkpointRetention: number;
@@ -136,8 +136,16 @@ export interface SettingsState {
   clearProviderRateLimit: (providerId: string) => void;
   setVisionOverride: (key: string, value: boolean) => void;
   clearVisionOverride: (key: string) => void;
-  setProviderModelShowAll: (providerId: string, showAll: boolean) => void;
-  toggleProviderModelSelected: (providerId: string, modelId: string) => void;
+  setProviderModelSelection: (
+    providerId: string,
+    selectedModelIds: string[],
+    availableModelIds: string[],
+  ) => void;
+  toggleProviderModelSelected: (
+    providerId: string,
+    modelId: string,
+    availableModelIds: string[],
+  ) => void;
   clearProviderModelSelection: (providerId: string) => void;
   setCheckpointRetention: (value: number) => void;
   setMemoryEnabled: (value: boolean) => void;
@@ -164,11 +172,11 @@ export interface SubagentModelOverride {
   model: string;
 }
 
-/** A provider's curated model list: which ids to show, and whether to bypass curation entirely. */
+/** A provider's curated model list: which ids to show, and whether every currently available model is selected. */
 export interface ProviderModelFilter {
-  /** When true, every model for this provider is shown regardless of `selectedModelIds` — lets a user keep favorites checked while still browsing the full list. */
+  /** When true, every currently available model for this provider is selected. This also makes newly-discovered models visible without requiring a second select-all action. */
   showAll: boolean;
-  /** Model ids the user has explicitly checked. Ignored while `showAll` is true, and also ignored (i.e. treated as "show everything") when empty, so a freshly-connected provider isn't curated down to nothing before the user has picked anything. */
+  /** Model ids the user explicitly selected while `showAll` is false. An empty list means no models are selected. */
   selectedModelIds: string[];
 }
 
@@ -180,6 +188,20 @@ export interface ProviderModelFilter {
  * re-render loop.
  */
 export const DEFAULT_PROVIDER_MODEL_FILTER: ProviderModelFilter = { showAll: true, selectedModelIds: [] };
+
+/** Builds one canonical persisted selection from the provider's current model inventory. */
+export function normalizeProviderModelSelection(
+  selectedModelIds: string[],
+  availableModelIds: string[],
+): ProviderModelFilter {
+  const available = [...new Set(availableModelIds.filter(Boolean))];
+  const selected = new Set(selectedModelIds);
+  const normalizedSelected = available.filter((modelId) => selected.has(modelId));
+  return {
+    showAll: available.length > 0 && normalizedSelected.length === available.length,
+    selectedModelIds: normalizedSelected,
+  };
+}
 
 const DEFAULT_CONTEXT_TRIM_THRESHOLD = 85;
 /** Mirrors `MAX_CHECKPOINTS` in src-tauri/src/checkpoints.rs — the backend's
@@ -283,7 +305,7 @@ function sanitizeProviderModelFilters(raw: unknown): Record<string, ProviderMode
     out[providerId] = {
       showAll: typeof entry.showAll === "boolean" ? entry.showAll : true,
       selectedModelIds: Array.isArray(entry.selectedModelIds)
-        ? entry.selectedModelIds.filter((id): id is string => typeof id === "string")
+        ? [...new Set(entry.selectedModelIds.filter((id): id is string => typeof id === "string"))]
         : [],
     };
   }
@@ -473,29 +495,52 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     persist({ ...get() });
   },
 
-  setProviderModelShowAll: (providerId, showAll) => {
+  setProviderModelSelection: (providerId, selectedModelIds, availableModelIds) => {
     set((state) => {
-      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
-      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, showAll } } };
+      const selection = normalizeProviderModelSelection(selectedModelIds, availableModelIds);
+      return {
+        providerModelFilters: {
+          ...state.providerModelFilters,
+          [providerId]: selection,
+        },
+      };
     });
     persist({ ...get() });
   },
 
-  toggleProviderModelSelected: (providerId, modelId) => {
+  toggleProviderModelSelected: (providerId, modelId, availableModelIds) => {
     set((state) => {
       const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
-      const selectedModelIds = existing.selectedModelIds.includes(modelId)
-        ? existing.selectedModelIds.filter((id) => id !== modelId)
-        : [...existing.selectedModelIds, modelId];
-      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds } } };
+      const effectiveSelection = new Set(
+        existing.showAll ? availableModelIds : existing.selectedModelIds,
+      );
+      if (effectiveSelection.has(modelId)) {
+        effectiveSelection.delete(modelId);
+      } else {
+        effectiveSelection.add(modelId);
+      }
+      const selection = normalizeProviderModelSelection(
+        [...effectiveSelection],
+        availableModelIds,
+      );
+      return {
+        providerModelFilters: {
+          ...state.providerModelFilters,
+          [providerId]: selection,
+        },
+      };
     });
     persist({ ...get() });
   },
 
   clearProviderModelSelection: (providerId) => {
     set((state) => {
-      const existing = state.providerModelFilters[providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
-      return { providerModelFilters: { ...state.providerModelFilters, [providerId]: { ...existing, selectedModelIds: [] } } };
+      return {
+        providerModelFilters: {
+          ...state.providerModelFilters,
+          [providerId]: { showAll: false, selectedModelIds: [] },
+        },
+      };
     });
     persist({ ...get() });
   },

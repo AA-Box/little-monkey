@@ -2857,6 +2857,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "keyring",
+ "libc",
  "notify",
  "pdf-extract",
  "portable-pty",

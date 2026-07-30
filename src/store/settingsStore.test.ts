@@ -1,7 +1,101 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_APPEARANCE_SETTINGS, THEME_STORAGE_KEY } from "../lib/theme";
-import { STORAGE_KEY, useSettingsStore } from "./settingsStore";
+import {
+  normalizeProviderModelSelection,
+  STORAGE_KEY,
+  useSettingsStore,
+} from "./settingsStore";
+
+describe("settingsStore.providerModelFilters", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ providerModelFilters: {} });
+  });
+
+  it("normalizes selections to available ids and recognizes a complete selection", () => {
+    expect(
+      normalizeProviderModelSelection(
+        ["model-b", "missing", "model-a", "model-a"],
+        ["model-a", "model-b"],
+      ),
+    ).toEqual({
+      showAll: true,
+      selectedModelIds: ["model-a", "model-b"],
+    });
+  });
+
+  it("selects every available model in one persisted filter update", () => {
+    useSettingsStore
+      .getState()
+      .setProviderModelSelection(
+        "openrouter",
+        ["model-a", "model-b"],
+        ["model-a", "model-b"],
+      );
+
+    expect(useSettingsStore.getState().providerModelFilters.openrouter).toEqual({
+      showAll: true,
+      selectedModelIds: ["model-a", "model-b"],
+    });
+  });
+
+  it("unchecking one model materializes the implicit show-all selection", () => {
+    useSettingsStore
+      .getState()
+      .toggleProviderModelSelected(
+        "openrouter",
+        "model-a",
+        ["model-a", "model-b", "model-c"],
+      );
+
+    expect(useSettingsStore.getState().providerModelFilters.openrouter).toEqual({
+      showAll: false,
+      selectedModelIds: ["model-b", "model-c"],
+    });
+  });
+
+  it("rechecking the last missing model makes show-all truthful again", () => {
+    useSettingsStore.setState({
+      providerModelFilters: {
+        openrouter: {
+          showAll: false,
+          selectedModelIds: ["model-b", "model-c"],
+        },
+      },
+    });
+
+    useSettingsStore
+      .getState()
+      .toggleProviderModelSelected(
+        "openrouter",
+        "model-a",
+        ["model-a", "model-b", "model-c"],
+      );
+
+    expect(useSettingsStore.getState().providerModelFilters.openrouter).toEqual({
+      showAll: true,
+      selectedModelIds: ["model-a", "model-b", "model-c"],
+    });
+  });
+
+  it("clears both the all-model flag and every selected id", () => {
+    useSettingsStore.setState({
+      providerModelFilters: {
+        openrouter: {
+          showAll: true,
+          selectedModelIds: ["model-a", "model-b"],
+        },
+      },
+    });
+
+    useSettingsStore.getState().clearProviderModelSelection("openrouter");
+
+    expect(useSettingsStore.getState().providerModelFilters.openrouter).toEqual({
+      showAll: false,
+      selectedModelIds: [],
+    });
+  });
+});
 
 describe("settingsStore.checkpointRetention", () => {
   beforeEach(() => {

@@ -72,6 +72,13 @@ fn process_is_alive(pid: u32) -> bool {
 /// returns, leaving the process running in the background for subsequent
 /// `monkey-cli stacks reindex`/`search_docs` calls to use.
 pub async fn start(model_path: String) -> Result<(), String> {
+    let verification_path = PathBuf::from(&model_path);
+    tokio::task::spawn_blocking(move || {
+        little_monkey_lib::model_sources::verify_managed_model_for_runtime(&verification_path)
+    })
+    .await
+    .map_err(|error| format!("Managed model verification task failed: {error}"))??;
+
     if let Some(pid) = read_pid() {
         if process_is_alive(pid) {
             println!(
@@ -88,7 +95,7 @@ pub async fn start(model_path: String) -> Result<(), String> {
     let binary = llama::find_llama_server_binary()?;
     let args = llama::embed_server_args(&model_path);
 
-    let child = std::process::Command::new(&binary)
+    let mut child = std::process::Command::new(&binary)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -102,23 +109,57 @@ pub async fn start(model_path: String) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut ready = false;
     while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "Embedding llama-server exited before becoming ready ({status})"
+                ))
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Failed to inspect embedding llama-server process: {error}"
+                ));
+            }
+        }
+
         if let Ok(resp) = client
             .get(&health_url)
             .timeout(Duration::from_secs(2))
             .send()
             .await
         {
-            if resp.status().is_success() {
-                ready = true;
+            if resp.status().is_success()
+                && llama::server_reports_alias(&client, llama::EMBED_PORT, &model_path).await
+            {
+                // A different process can answer on this fixed port while
+                // our child is still failing its bind. Recheck the child only
+                // after the exact bounded alias response succeeds.
+                match child.try_wait() {
+                    Ok(None) => ready = true,
+                    Ok(Some(status)) => {
+                        return Err(format!(
+                            "Embedding llama-server exited before becoming ready ({status})"
+                        ))
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "Failed to inspect embedding llama-server process: {error}"
+                        ));
+                    }
+                }
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     if !ready {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .status();
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(
             "Timed out waiting for the embedding server to become healthy after 60s".to_string(),
         );
@@ -134,9 +175,8 @@ pub async fn start(model_path: String) -> Result<(), String> {
         .send()
         .await;
     if !matches!(verify, Ok(resp) if resp.status().is_success()) {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .status();
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(
             "The embedding server process started but a test /v1/embeddings request failed — this build of \
              llama-server may not support --pooling mean, or may need a newer version."
@@ -144,7 +184,11 @@ pub async fn start(model_path: String) -> Result<(), String> {
         );
     }
 
-    write_pid(pid)?;
+    if let Err(error) = write_pid(pid) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     println!(
         "Embedding server ready on port {} (pid {pid}).",
         llama::EMBED_PORT
