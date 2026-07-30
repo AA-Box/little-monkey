@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useId, useState } from "react";
 import { Bot, ChevronRight } from "lucide-react";
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
@@ -145,6 +145,7 @@ export function resolveSubagentStatus(liveStatus: SubagentStatus | undefined, re
 const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result }: SubagentRowProps) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
+  const detailsId = useId();
   const live = useSubagentStore((state) => state.runs[taskId]);
   const persisted = useSessionStore((state) => state.sessions.find((s) => s.id === sessionId)?.subagentRuns?.[taskId]);
   // Stats snapshotted at finish time — the tokens/count source once the
@@ -166,12 +167,14 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
       <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
         <button
           type="button"
+          aria-expanded={open}
+          aria-controls={detailsId}
           onClick={() => setOpen((prev) => !prev)}
-          className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+          className="flex min-h-11 w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset motion-reduce:transition-none"
         >
           <ChevronRight
             size={12}
-            className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+            className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
           />
           <Bot size={13} className="shrink-0 text-faint" />
           <span className="truncate font-medium text-foreground">{description}</span>
@@ -196,7 +199,7 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
           )}
         </button>
         {open && (
-          <div className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
+          <div id={detailsId} className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
             <div className="flex items-center gap-2 text-faint">
               <span>{t("SubagentRow.toolCallCount", { count: toolCallCount })}</span>
               {usage && (

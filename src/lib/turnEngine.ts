@@ -323,6 +323,14 @@ export interface SubagentContext {
    * single `task` entry, never the child's nested write_file/edit_file
    * calls. `undefined` for a caller that doesn't track mutated files at all. */
   onMutatedPath?: (path: string) => void;
+  /** Called for every failed child `write_file`/`edit_file` so the parent
+   * mutation contract cannot mistake one successful child edit for complete
+   * success when another requested edit was denied or failed. */
+  onMutationFailure?: (
+    path: string | null,
+    reason: string,
+    toolCallId: string,
+  ) => void;
 }
 
 /**
@@ -511,6 +519,7 @@ export async function executeToolCall(
         effort: subagent.effort,
         risk: subagent.risk,
         onMutatedPath: subagent.onMutatedPath,
+        onMutationFailure: subagent.onMutationFailure,
       });
     } catch (err) {
       return stringifyToolError(err);

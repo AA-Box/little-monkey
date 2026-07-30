@@ -1,10 +1,11 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   BookmarkX,
   BookOpen,
   Bot,
   Brain,
+  CheckCircle2,
   ChevronRight,
   ClipboardCheck,
   Eye,
@@ -14,6 +15,7 @@ import {
   Folder,
   Globe,
   ListChecks,
+  LoaderCircle,
   MessageSquareX,
   Plug,
   RefreshCw,
@@ -69,6 +71,20 @@ import SubagentRow from "./SubagentRow";
 import SubagentGroupCard, { type SubagentGroupTask } from "./SubagentGroupCard";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
 import { useT } from "../../lib/i18n";
+import {
+  activityCallDiff,
+  activityCallLabel,
+  activityCallSubject,
+  activityProgress,
+  formatActivityResult,
+  groupAssistantRound,
+  liveActivityLabel,
+  resultLooksLikeError,
+  summarizeActivity,
+  type ActivityCall,
+} from "./activityTimeline";
+
+export { resultLooksLikeError } from "./activityTimeline";
 
 export interface MessageListProps {
   /** The session whose transcript `messages` is — checkpoint notices mutate
@@ -100,7 +116,7 @@ export interface MessageListProps {
 
 type TimelineItem =
   | { kind: "bubble"; key: string; message: ChatMessage; index: number }
-  | { kind: "tool"; key: string; name: string; args: string; result?: string; prompt: string }
+  | { kind: "activity"; key: string; calls: ActivityCall[]; prompt: string }
   | { kind: "subagent"; key: string; taskId: string; args: string; result?: string }
   | { kind: "subagentGroup"; key: string; tasks: SubagentGroupTask[] }
   | { kind: "notice"; key: string; text: string }
@@ -116,9 +132,10 @@ type TimelineItem =
 /**
  * Flattens the raw `ChatMessage[]` history into a render-friendly timeline:
  * - user / assistant text messages render as chat bubbles.
- * - each assistant `tool_call` is paired with its matching `role: 'tool'`
- *   result (correlated via `tool_call_id`) into a single compact,
- *   collapsible "used tool" entry.
+ * - every assistant round's non-task `tool_call`s are paired with matching
+ *   `role: 'tool'` results (correlated via `tool_call_id`) and grouped into
+ *   one compact, collapsible activity row.
+ * - `task` calls keep their dedicated live subagent row/group.
  * - a trailing empty assistant message (no content, no tool calls yet)
  *   renders as a typing indicator.
  * - `system` messages are never shown in the transcript, except our own
@@ -155,52 +172,44 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         items.push({ kind: "typing", key: `typing-${index}` });
       }
 
-      // PARALLEL `task` calls in one round collapse into a single
-      // `SubagentGroupCard` (agent count + per-agent status dots) instead of
-      // N stacked `SubagentRow` spinners — the group item lands where the
-      // FIRST task call appeared, so its position in the round is preserved.
-      const taskCallCount = toolCalls.reduce((count, call) => (call.function.name === "task" ? count + 1 : count), 0);
-      let groupEmitted = false;
-
       for (const toolCall of toolCalls) {
         renderedCallIds.add(toolCall.id);
-        // A `task` call gets its own dedicated `SubagentRow` (live status +
-        // expandable child transcript) rather than the generic `ToolCallRow`
-        // every other tool renders as — see `SubagentRow.tsx`. `toolCall.id`
-        // is what `subagentStore`/`ChatSession.subagentRuns` are keyed by
-        // (see `subagent.ts`'s `RunSubagentTaskParams.toolCallId` doc
-        // comment for why THIS id, not the Rust-facing turn id).
-        if (toolCall.function.name === "task") {
-          if (taskCallCount >= 2) {
-            if (!groupEmitted) {
-              groupEmitted = true;
-              items.push({
-                kind: "subagentGroup",
-                key: `subagent-group-${toolCall.id}`,
-                tasks: toolCalls
-                  .filter((call) => call.function.name === "task")
-                  .map((call) => ({ taskId: call.id, args: call.function.arguments, result: resultByCallId.get(call.id) })),
-              });
-            }
-            continue;
-          }
+      }
+
+      // One assistant round becomes at most one normal activity row and one
+      // task row/group. `groupAssistantRound` positions each at the first
+      // call of its kind and preserves the calls' original order inside it.
+      for (const entry of groupAssistantRound(toolCalls, resultByCallId)) {
+        if (entry.kind === "activity") {
           items.push({
-            kind: "subagent",
-            key: `subagent-${toolCall.id}`,
-            taskId: toolCall.id,
-            args: toolCall.function.arguments,
-            result: resultByCallId.get(toolCall.id),
+            kind: "activity",
+            key: `activity-${entry.calls[0].id}`,
+            calls: entry.calls,
+            prompt: latestUserPrompt,
           });
           continue;
         }
-        items.push({
-          kind: "tool",
-          key: `tool-${toolCall.id}`,
-          name: toolCall.function.name,
-          args: toolCall.function.arguments,
-          result: resultByCallId.get(toolCall.id),
-          prompt: latestUserPrompt,
-        });
+
+        if (entry.calls.length >= 2) {
+          items.push({
+            kind: "subagentGroup",
+            key: `subagent-group-${entry.calls[0].id}`,
+            tasks: entry.calls.map((call) => ({
+              taskId: call.id,
+              args: call.args,
+              result: call.result,
+            })),
+          });
+        } else {
+          const [call] = entry.calls;
+          items.push({
+            kind: "subagent",
+            key: `subagent-${call.id}`,
+            taskId: call.id,
+            args: call.args,
+            result: call.result,
+          });
+        }
       }
       return;
     }
@@ -210,11 +219,14 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
       if (msg.tool_call_id && renderedCallIds.has(msg.tool_call_id)) return;
       // Orphaned result (e.g. history was truncated) — still show something.
       items.push({
-        kind: "tool",
-        key: `tool-orphan-${index}`,
-        name: "tool",
-        args: "",
-        result: textContent(msg.content),
+        kind: "activity",
+        key: `activity-orphan-${index}`,
+        calls: [{
+          id: msg.tool_call_id ?? `orphan-${index}`,
+          name: "tool",
+          args: "",
+          result: textContent(msg.content),
+        }],
         prompt: latestUserPrompt,
       });
     }
@@ -295,15 +307,6 @@ function formatJson(raw: string): string {
   }
 }
 
-export function resultLooksLikeError(raw: string): boolean {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null && "error" in parsed;
-  } catch {
-    return false;
-  }
-}
-
 const TOOL_ICONS: Record<string, LucideIcon> = {
   run_shell: TerminalSquare,
   write_file: FilePenLine,
@@ -348,12 +351,180 @@ function argsImageFilename(args: string): string | null {
   }
 }
 
+function diffBlock(text: string, marker: "-" | "+"): string {
+  const value = text.length > 0 ? text : "(empty)";
+  return value
+    .split("\n")
+    .map((line) => `${marker} ${line}`)
+    .join("\n");
+}
+
+const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: ActivityCall }) {
+  const pending = call.result === undefined;
+  const failed = call.result !== undefined && resultLooksLikeError(call.result);
+  const statusLabel = pending ? "Running" : failed ? "Failed" : "Completed";
+  const StatusIcon = pending ? LoaderCircle : failed ? TriangleAlert : CheckCircle2;
+  const Icon = toolIcon(call.name);
+  const subject = activityCallSubject(call);
+  const diff = activityCallDiff(call);
+  const result = call.result === undefined ? null : formatActivityResult(call.result);
+
+  return (
+    <li className="min-w-0 rounded-md border border-border bg-background px-3 py-2.5">
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon size={13} className="shrink-0 text-faint" aria-hidden />
+        <span className="truncate text-xs font-medium text-foreground">{activityCallLabel(call.name)}</span>
+        <code
+          title={call.name}
+          className="max-w-[38%] shrink truncate rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-faint"
+        >
+          {call.name}
+        </code>
+        <span
+          className={`ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium ${
+            failed ? "text-danger" : pending ? "text-warning" : "text-success"
+          }`}
+        >
+          <StatusIcon
+            size={12}
+            className={pending ? "animate-spin motion-reduce:animate-none" : ""}
+            aria-hidden
+          />
+          {statusLabel}
+        </span>
+      </div>
+
+      <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-2 px-2 py-1.5 font-mono text-[11px] text-muted">
+        {subject}
+      </pre>
+
+      {diff && (
+        <div
+          className="mt-2 space-y-2"
+          aria-label={`${activityCallLabel(call.name)} ${diff.state} preview`}
+        >
+          {diff.state !== "applied" && (
+            <div
+              className={`text-[10px] font-medium uppercase tracking-wide ${
+                diff.state === "attempted" ? "text-danger" : "text-warning"
+              }`}
+            >
+              {diff.state === "attempted" ? "Attempted change (failed)" : "Proposed change"}
+            </div>
+          )}
+          {diff.before && (
+            <div>
+              <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-faint">
+                {diff.state === "applied" ? "Before" : "Expected before"}
+              </div>
+              <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-all border-l-2 border-danger bg-danger-soft px-2 py-1.5 font-mono text-[11px] text-danger">
+                {diffBlock(diff.before.text, "-")}
+              </pre>
+            </div>
+          )}
+          <div>
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-faint">
+              {diff.state === "applied"
+                ? diff.kind === "write" ? "Added content" : "After"
+                : diff.state === "attempted" ? "Attempted content" : "Proposed content"}
+            </div>
+            <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-all border-l-2 border-success bg-success-soft px-2 py-1.5 font-mono text-[11px] text-success">
+              {diffBlock(diff.after.text, "+")}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-2">
+        <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-faint">Result</div>
+        {result ? (
+          <pre
+            className={`max-h-56 overflow-auto whitespace-pre-wrap break-all rounded px-2 py-1.5 font-mono text-[11px] ${
+              failed ? "bg-danger-soft text-danger" : "bg-surface-2 text-muted"
+            }`}
+          >
+            {result.text || "(no output)"}
+          </pre>
+        ) : (
+          <div className="flex items-center gap-1.5 rounded bg-surface-2 px-2 py-1.5 text-[11px] text-muted">
+            <LoaderCircle size={12} className="animate-spin motion-reduce:animate-none" aria-hidden />
+            Waiting for result…
+          </div>
+        )}
+      </div>
+    </li>
+  );
+});
+
+/** Codex-style operational timeline for one assistant round. It deliberately
+ * reports only observable tool activity; model reasoning remains represented
+ * by the generic live "Thinking" status below. */
+const ActivityRow = memo(function ActivityRow({ calls }: { calls: ActivityCall[] }) {
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const summary = summarizeActivity(calls);
+  const progress = activityProgress(calls);
+  const ProgressIcon = progress.status === "running"
+    ? LoaderCircle
+    : progress.status === "failed"
+      ? TriangleAlert
+      : CheckCircle2;
+
+  return (
+    <div className="flex justify-start">
+      <div className="w-full max-w-[92%] min-w-0">
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={detailsId}
+          onClick={() => setOpen((prev) => !prev)}
+          className="flex min-h-11 w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-reduce:transition-none"
+        >
+          <ChevronRight
+            size={13}
+            className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
+            aria-hidden
+          />
+          <ListChecks size={15} className="shrink-0 text-faint" aria-hidden />
+          <span className="min-w-0 truncate font-medium text-foreground">{summary}</span>
+          <span
+            className={`ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium ${
+              progress.status === "failed"
+                ? "text-danger"
+                : progress.status === "running"
+                  ? "text-warning"
+                  : "text-success"
+            }`}
+          >
+            <ProgressIcon
+              size={12}
+              className={progress.status === "running" ? "animate-spin motion-reduce:animate-none" : ""}
+              aria-hidden
+            />
+            {progress.label}
+          </span>
+        </button>
+        {open && (
+          <div id={detailsId} className="ml-5 border-l border-border py-2 pl-4">
+            <ol className="space-y-2">
+              {calls.map((call) => (
+                <ActivityCallDetail key={call.id} call={call} />
+              ))}
+            </ol>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
 /** Memoized like `MessageBubble`: props are plain strings (stable for every
  * settled call), so streaming deltas to the transcript's last message don't
  * re-render the (potentially long) tool-call history. */
 export const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { name: string; args: string; result?: string }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
+  const detailsId = useId();
   const pending = result === undefined;
   const failed = !pending && resultLooksLikeError(result);
   const Icon = toolIcon(name);
@@ -364,12 +535,14 @@ export const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { n
       <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
         <button
           type="button"
+          aria-expanded={open}
+          aria-controls={detailsId}
           onClick={() => setOpen((prev) => !prev)}
-          className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left font-mono text-xs text-muted transition-colors duration-150 hover:text-foreground"
+          className="flex min-h-11 w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left font-mono text-xs text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset motion-reduce:transition-none"
         >
           <ChevronRight
             size={12}
-            className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+            className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
           />
           <Icon size={13} className="shrink-0 text-faint" />
           <span
@@ -381,9 +554,12 @@ export const ToolCallRow = memo(function ToolCallRow({ name, args, result }: { n
             {name}
             {preview ? `(${preview})` : "()"}
           </span>
+          <StatusPill tone={pending ? "warning" : failed ? "danger" : "success"}>
+            {t(pending ? "SubagentRow.statusRunning" : failed ? "SubagentRow.statusFailed" : "SubagentRow.statusDone")}
+          </StatusPill>
         </button>
         {open && (
-          <div className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
+          <div id={detailsId} className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
             {args && (
               <div>
                 <div className="mb-1 text-faint">{t("MessageList.argumentsLabel")}</div>
@@ -884,7 +1060,7 @@ function TurnStatusLine({ status }: { status: TurnStatus }) {
   const elapsedMs = Date.now() - status.startedAt;
   const silentMs = Date.now() - status.lastEventAt;
   const word = status.activity
-    ? `${status.activity}…`
+    ? `${liveActivityLabel(status.activity)}…`
     : t(silentMs >= STILL_THINKING_AFTER_MS ? "MessageList.turnStatusStillThinking" : "MessageList.turnStatusThinking");
 
   return (
@@ -1018,23 +1194,27 @@ export default function MessageList({
                 />
               );
             }
-            if (item.kind === "tool") {
-              if (item.name === "generate_image") {
-                const path = argsImageFilename(item.args);
-                if (path) {
-                  return (
-                    <GeneratedImageCard
-                      key={item.key}
-                      path={path}
-                      prompt={item.prompt}
-                      result={item.result}
-                      failed={item.result !== undefined && resultLooksLikeError(item.result)}
-                      onEdit={onEditGeneratedImage}
-                    />
-                  );
-                }
-              }
-              return <ToolCallRow key={item.key} name={item.name} args={item.args} result={item.result} />;
+            if (item.kind === "activity") {
+              return (
+                <div key={item.key} className="space-y-3">
+                  <ActivityRow calls={item.calls} />
+                  {item.calls.map((call) => {
+                    if (call.name !== "generate_image") return null;
+                    const path = argsImageFilename(call.args);
+                    if (!path) return null;
+                    return (
+                      <GeneratedImageCard
+                        key={`generated-image-${call.id}`}
+                        path={path}
+                        prompt={item.prompt}
+                        result={call.result}
+                        failed={call.result !== undefined && resultLooksLikeError(call.result)}
+                        onEdit={onEditGeneratedImage}
+                      />
+                    );
+                  })}
+                </div>
+              );
             }
             if (item.kind === "subagent") {
               return (

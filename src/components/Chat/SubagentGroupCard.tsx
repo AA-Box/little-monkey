@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useId, useState } from "react";
 import { Bot, ChevronRight } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 
@@ -53,6 +53,7 @@ function dotClass(status: SubagentStatus): string {
 const SubagentGroupCard = memo(function SubagentGroupCard({ sessionId, tasks }: { sessionId: string; tasks: SubagentGroupTask[] }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
+  const detailsId = useId();
   // One subscription for the whole group — a fresh array per snapshot, so
   // `useShallow` keeps it from re-render-looping, same as the drawer's list
   // selectors.
@@ -95,10 +96,12 @@ const SubagentGroupCard = memo(function SubagentGroupCard({ sessionId, tasks }: 
       <div className="max-w-[85%] min-w-0 overflow-hidden rounded-md border border-border bg-surface-2">
         <button
           type="button"
+          aria-expanded={open}
+          aria-controls={detailsId}
           onClick={() => setOpen((prev) => !prev)}
-          className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground"
+          className="flex min-h-11 w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset motion-reduce:transition-none"
         >
-          <ChevronRight size={12} className={`shrink-0 text-faint transition-transform duration-150 ${open ? "rotate-90" : ""}`} />
+          <ChevronRight size={12} className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`} />
           <Bot size={13} className="shrink-0 text-faint" />
           <span className="truncate font-medium text-foreground">{t("SubagentGroupCard.title", { count: tasks.length })}</span>
           <StatusPill tone={tone}>{t(statusLabelKey(groupStatus))}</StatusPill>
@@ -117,7 +120,7 @@ const SubagentGroupCard = memo(function SubagentGroupCard({ sessionId, tasks }: 
           </span>
         </button>
         {open && (
-          <div className="space-y-2 border-t border-border bg-background px-3 py-2">
+          <div id={detailsId} className="space-y-2 border-t border-border bg-background px-3 py-2">
             {tasks.map((task) => (
               <SubagentRow key={task.taskId} sessionId={sessionId} taskId={task.taskId} args={task.args} result={task.result} />
             ))}

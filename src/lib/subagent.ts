@@ -33,6 +33,7 @@ import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
+import { mutationToolFailureReason } from './workspaceMutation';
 
 /** Hard cap on model/tool round trips for a single subagent run — smaller
  * than the parent's own `MAX_ITERATIONS` (25, agentLoop.ts) since a
@@ -242,6 +243,15 @@ export interface RunSubagentTaskParams {
    * a turn where every mutation happened inside a delegated `task` call.
    * `undefined` for a caller that doesn't track mutated files at all. */
   onMutatedPath?: (path: string) => void;
+  /** Reports a failed `write_file`/`edit_file` attempt to the parent mutation
+   * contract. The originating tool-call id gives path-less failures a stable,
+   * unique key; a later success for the same concrete path clears the failure
+   * through `onMutatedPath`. */
+  onMutationFailure?: (
+    path: string | null,
+    reason: string,
+    toolCallId: string,
+  ) => void;
 }
 
 /**
@@ -264,7 +274,7 @@ export interface RunSubagentTaskParams {
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
   useUsageHistoryStore.getState().recordSubagentTaskStarted();
-  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort, risk, onMutatedPath } =
+  const { sessionId, runId, parentCheckpointId, parentSignal, taskId, toolCallId, description, prompt, profile, target, effort, risk, onMutatedPath, onMutationFailure } =
     params;
 
   // The key `subagentStore`/`ChatSession.subagentRuns` are updated under —
@@ -457,13 +467,21 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         // call, since the parent round's own `toolCalls` only ever contains
         // the single `task` entry.
         if (
-          !aborted &&
-          allowed &&
-          (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file') &&
-          isSuccessfulMutationResult(resultContent)
+          !aborted
+          && allowed
+          && (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file')
         ) {
           const path = toolCallPathArg(toolCall);
-          if (path) onMutatedPath?.(path);
+          if (isSuccessfulMutationResult(resultContent)) {
+            if (path) onMutatedPath?.(path);
+          } else {
+            onMutationFailure?.(
+              path,
+              mutationToolFailureReason(resultContent)
+                ?? 'The file-mutation tool returned an error.',
+              toolCall.id,
+            );
+          }
         }
       }
 
