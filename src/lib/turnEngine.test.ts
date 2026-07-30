@@ -381,14 +381,20 @@ describe("executeToolCall / task delegation", () => {
 
   // Review findings: a code-profile subagent's mutations must get the same
   // risk classification the parent's own calls would, and must be able to
-  // report mutated paths back into the parent's own `mutatedFiles` tracking
-  // (see `SubagentContext.risk`/`onMutatedPath`'s doc comments) — both
-  // threaded straight through to `runSubagentTask`'s params.
-  it("threads SubagentContext.risk and onMutatedPath through to runSubagentTask's params unchanged", async () => {
+  // report both successes and failures back into the parent's mutation
+  // tracking — all threaded straight through to `runSubagentTask`'s params.
+  it("threads SubagentContext mutation callbacks and risk through to runSubagentTask unchanged", async () => {
     runSubagentTaskMock.mockResolvedValue("done");
     const risk: RiskAnnotationContext = { enabled: true, cache: new Map(), classify: vi.fn() };
     const onMutatedPath = vi.fn();
-    const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget, risk, onMutatedPath };
+    const onMutationFailure = vi.fn();
+    const subagent: SubagentContext = {
+      sessionId: "session-1",
+      target: fakeTarget,
+      risk,
+      onMutatedPath,
+      onMutationFailure,
+    };
 
     await executeToolCall(
       call("task", { description: "d", prompt: "p", profile: "code" }),
@@ -404,9 +410,10 @@ describe("executeToolCall / task delegation", () => {
     const params = runSubagentTaskMock.mock.calls[0][0];
     expect(params.risk).toBe(risk);
     expect(params.onMutatedPath).toBe(onMutatedPath);
+    expect(params.onMutationFailure).toBe(onMutationFailure);
   });
 
-  it("passes risk/onMutatedPath through as undefined when SubagentContext never set them", async () => {
+  it("passes optional risk and mutation callbacks as undefined when omitted", async () => {
     runSubagentTaskMock.mockResolvedValue("done");
     const subagent: SubagentContext = { sessionId: "session-1", target: fakeTarget };
 
@@ -415,6 +422,7 @@ describe("executeToolCall / task delegation", () => {
     const params = runSubagentTaskMock.mock.calls[0][0];
     expect(params.risk).toBeUndefined();
     expect(params.onMutatedPath).toBeUndefined();
+    expect(params.onMutationFailure).toBeUndefined();
   });
 });
 

@@ -18,6 +18,7 @@ import {
 } from "./SubagentRow";
 import { CANCELLED_TOOL_RESULT } from "../../lib/turnEngine";
 import type { ChatMessage } from "../../lib/llamaClient";
+import { protectToolResult } from "../../lib/untrustedContent";
 
 describe("parseTaskArgs", () => {
   it("parses a well-formed task call's description and profile", () => {
@@ -70,6 +71,15 @@ describe("resolveSubagentStatus", () => {
 
   it("falls back to 'cancelled' for an exact CANCELLED_TOOL_RESULT match, without a live entry", () => {
     expect(resolveSubagentStatus(undefined, CANCELLED_TOOL_RESULT)).toBe("cancelled");
+  });
+
+  it("keeps a persisted protected cancellation classified as cancelled", () => {
+    expect(
+      resolveSubagentStatus(
+        undefined,
+        protectToolResult("task", CANCELLED_TOOL_RESULT),
+      ),
+    ).toBe("cancelled");
   });
 
   it("falls back to 'error' for any other error-shaped JSON result, without a live entry", () => {

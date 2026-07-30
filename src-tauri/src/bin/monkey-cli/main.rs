@@ -1,10 +1,11 @@
 //! LM's terminal agent: same sandboxed file/shell tools and permission
 //! model as the desktop app (reused directly from `little_monkey_lib`), driven from
 //! a shell instead of a WebView. Supports both a one-shot invocation
-//! (`monkey MODEL "prompt"`) and an interactive REPL (`monkey MODEL`, no prompt), plus
-//! Ollama-CLI-style model management subcommands (`monkey list/pull/run/...`)
-//! spoken directly to the daemon's HTTP API. A bare `monkey` prints the
-//! subcommand overview (see [`is_bare_invocation`]).
+//! (`monkey MODEL "prompt"`) and an interactive REPL (`monkey MODEL`, no prompt).
+//! `monkey pull/run` use Little Monkey's app-owned model store and bundled
+//! llama-server by default; explicit `--provider ollama` and the remaining
+//! Ollama-compatible management commands retain their daemon behavior. A bare
+//! `monkey` prints the subcommand overview (see [`is_bare_invocation`]).
 
 mod acp;
 mod agent;
@@ -14,6 +15,7 @@ mod cmds;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod managed_model_cli;
 mod mcp_cli;
 mod modelfile;
 mod ollama_api;
@@ -141,8 +143,9 @@ struct Cli {
 
 /// Generation options shared by the flat invocation and `run` (declared
 /// global so they parse after subcommands too, like --workspace). The
-/// Ollama-only ones (--num-ctx, --keepalive, --think) warn and are ignored
-/// on OpenAI-compat targets.
+/// Ollama-only ones (--keepalive, --think) warn and are ignored on
+/// OpenAI-compatible targets; managed `run` consumes --num-ctx while starting
+/// its app-owned server.
 #[derive(Args, Debug)]
 struct ChatFlags {
     /// Sampling temperature (0 = deterministic-ish)
@@ -161,7 +164,7 @@ struct ChatFlags {
     #[arg(long, global = true, value_name = "SEQUENCE")]
     stop: Vec<String>,
 
-    /// Context window size in tokens (Ollama targets only)
+    /// Context window size (Ollama requests or managed run server startup)
     #[arg(long, global = true)]
     num_ctx: Option<i64>,
 
@@ -279,10 +282,11 @@ enum Cmd {
     List,
     /// List running models
     Ps,
-    /// Pull a model from a registry
+    /// Install a verified public GGUF into Little Monkey's app-owned model store
     Pull {
+        /// Ollama tag, or pinned Hugging Face GGUF reference
         model: String,
-        /// Use an insecure registry
+        /// Legacy Ollama daemon only; managed installs reject insecure transport
         #[arg(long)]
         insecure: bool,
     },
@@ -337,8 +341,9 @@ enum Cmd {
     Signout,
     /// Start the ollama daemon (runs the ollama binary)
     Serve,
-    /// Chat with a local Ollama model, pulling it first if missing
+    /// Install and chat with a public GGUF using Little Monkey's bundled runtime
     Run {
+        /// Ollama tag, or pinned Hugging Face GGUF reference
         model: String,
         /// One-shot prompt. Omit to start an interactive REPL instead.
         prompt: Option<String>,
@@ -563,6 +568,30 @@ fn native_ollama_target(model: String) -> chat::Target {
         base_url: ollama_api::host(),
         model: Some(model),
         native_ollama: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCommandBackend {
+    Managed,
+    Ollama,
+}
+
+/// `pull` and `run` are app-owned by default. The explicit provider override
+/// is the compatibility boundary for callers that intentionally want the
+/// legacy Ollama daemon behavior.
+fn model_command_backend(cli: &Cli) -> Result<ModelCommandBackend, String> {
+    if cli.ollama.is_some() {
+        return Ok(ModelCommandBackend::Ollama);
+    }
+    match cli.provider.as_deref() {
+        None | Some("managed-llama" | "llama" | "llama.cpp") => {
+            Ok(ModelCommandBackend::Managed)
+        }
+        Some("ollama") => Ok(ModelCommandBackend::Ollama),
+        Some(provider) => Err(format!(
+            "`monkey pull/run` supports the app-owned managed runtime or explicit `--provider ollama`, not provider '{provider}'"
+        )),
     }
 }
 
@@ -1024,7 +1053,7 @@ async fn main() {
         Err(e) => fail(&e),
     };
     let mcp_entries = resolve_mcp_entries(&cli, &state).await;
-    chat_loop(
+    if let Err(error) = chat_loop(
         &client,
         target,
         &state,
@@ -1035,7 +1064,10 @@ async fn main() {
         &mcp_entries,
         &cli.stack,
     )
-    .await;
+    .await
+    {
+        fail(&error);
+    }
 }
 
 /// Dispatches a parsed subcommand; prints failures and exits non-zero.
@@ -1043,7 +1075,11 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
     let result = match cmd {
         Cmd::List => cmds::list(client).await,
         Cmd::Ps => cmds::ps(client).await,
-        Cmd::Pull { model, insecure } => cmds::pull(client, model, *insecure).await,
+        Cmd::Pull { model, insecure } => match model_command_backend(cli) {
+            Ok(ModelCommandBackend::Managed) => managed_model_cli::pull(model, *insecure).await,
+            Ok(ModelCommandBackend::Ollama) => cmds::pull(client, model, *insecure).await,
+            Err(error) => Err(error),
+        },
         Cmd::Rm { models } => cmds::rm(client, models).await,
         Cmd::Cp {
             source,
@@ -1083,7 +1119,8 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             prompt,
             system,
         } => {
-            // Validate chat-side flags before a potentially long auto-pull.
+            // Validate chat-side flags before a potentially long verified
+            // install (or legacy Ollama auto-pull).
             let (state, mode, mut options, persona) = match chat_setup(cli) {
                 Ok(v) => v,
                 Err(e) => fail(&e),
@@ -1098,16 +1135,49 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             if let Some(system) = system {
                 options.system = effective_system(cli, &state, Some(system.as_str()));
             }
-            if let Err(e) = cmds::ensure_model(client, model).await {
-                fail(&e);
-            }
-            let target = chat::Target::Local {
-                base_url: ollama_api::host(),
-                model: Some(model.clone()),
-                native_ollama: true,
+            let backend = match model_command_backend(cli) {
+                Ok(backend) => backend,
+                Err(error) => fail(&error),
             };
+
+            let (target, managed_session) = match backend {
+                ModelCommandBackend::Ollama => {
+                    if let Err(error) = cmds::ensure_model(client, model).await {
+                        fail(&error);
+                    }
+                    (native_ollama_target(model.clone()), None)
+                }
+                ModelCommandBackend::Managed => {
+                    let context_tokens = match managed_model_cli::context_tokens(options.num_ctx) {
+                        Ok(context_tokens) => context_tokens,
+                        Err(error) => fail(&error),
+                    };
+                    // Managed llama-server consumes this at process startup;
+                    // do not forward it as an OpenAI-compatible request option.
+                    options.num_ctx = None;
+                    let installed = match managed_model_cli::install_for_run(model).await {
+                        Ok(installed) => installed,
+                        Err(error) => fail(&error),
+                    };
+                    let session =
+                        match managed_model_cli::start_server(client, &installed, context_tokens)
+                            .await
+                        {
+                            Ok(session) => session,
+                            Err(error) => fail(&error),
+                        };
+                    let target = chat::Target::Local {
+                        base_url: session.base_url(),
+                        model: Some(installed.resolved.canonical_reference),
+                        native_ollama: false,
+                    };
+                    (target, Some(session))
+                }
+            };
+
             let mcp_entries = resolve_mcp_entries(cli, &state).await;
-            chat_loop(
+            let managed_one_shot = managed_session.is_some() && prompt.is_some();
+            let mut chat_future = Box::pin(chat_loop(
                 client,
                 target,
                 &state,
@@ -1117,8 +1187,29 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 prompt.as_deref(),
                 &mcp_entries,
                 &cli.stack,
-            )
-            .await;
+            ));
+            let result = if managed_one_shot {
+                tokio::select! {
+                    result = &mut chat_future => result,
+                    interrupt = tokio::signal::ctrl_c() => {
+                        match interrupt {
+                            Ok(()) => {
+                                eprintln!("\nInterrupted; stopping managed llama-server.");
+                                Ok(())
+                            }
+                            Err(error) => Err(format!("Failed to listen for Ctrl-C: {error}")),
+                        }
+                    }
+                }
+            } else {
+                chat_future.await
+            };
+            // Explicitly stop and reap the managed child before a returned
+            // chat error reaches `fail()` (which exits the parent process).
+            drop(managed_session);
+            if let Err(error) = result {
+                fail(&error);
+            }
             return;
         }
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
@@ -1262,7 +1353,7 @@ async fn chat_loop(
     prompt: Option<&str>,
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
-) {
+) -> Result<(), String> {
     if !target.is_native()
         && (options.num_ctx.is_some() || options.keep_alive.is_some() || options.think.is_some())
     {
@@ -1275,10 +1366,8 @@ async fn chat_loop(
     let workspace = workspace::primary_root_canon(state).ok();
     let discovered_skills = match app_data_dir() {
         Some(data_dir) => {
-            match skills_cli::discover_for_chat(&data_dir, workspace.as_deref(), &prompt_entries) {
-                Ok(skills) => skills,
-                Err(error) => fail(&format!("Could not load the skill registry: {error}")),
-            }
+            skills_cli::discover_for_chat(&data_dir, workspace.as_deref(), &prompt_entries)
+                .map_err(|error| format!("Could not load the skill registry: {error}"))?
         }
         None => Vec::new(),
     };
@@ -1291,7 +1380,7 @@ async fn chat_loop(
             &discovered_skills,
         ) {
             Ok(system) => system,
-            Err(error) => fail(&error),
+            Err(error) => return Err(error),
         };
         let mut perms = TerminalPermissions::new(mode);
         let mut history: Vec<serde_json::Value> = Vec::new();
@@ -1308,10 +1397,9 @@ async fn chat_loop(
         )
         .await
         {
-            eprintln!("\nError: {e}");
-            std::process::exit(1);
+            return Err(e);
         }
-        return;
+        return Ok(());
     }
 
     repl::run(
@@ -1326,6 +1414,7 @@ async fn chat_loop(
         attached_stacks,
     )
     .await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1446,6 +1535,52 @@ mod tests {
                 prompt: Some("Hello".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn model_command_pull_and_run_default_to_the_app_owned_backend() {
+        let pull = Cli::try_parse_from(["monkey", "pull", "qwen3:4b"]).unwrap();
+        assert_eq!(
+            model_command_backend(&pull).unwrap(),
+            ModelCommandBackend::Managed
+        );
+
+        let run = Cli::try_parse_from([
+            "monkey",
+            "run",
+            "hf:owner/repo@main#model-Q4_K_M.gguf",
+            "Hello",
+        ])
+        .unwrap();
+        assert_eq!(
+            model_command_backend(&run).unwrap(),
+            ModelCommandBackend::Managed
+        );
+    }
+
+    #[test]
+    fn model_command_explicit_ollama_provider_preserves_legacy_routing() {
+        let pull =
+            Cli::try_parse_from(["monkey", "--provider", "ollama", "pull", "llama3.2"]).unwrap();
+        assert_eq!(
+            model_command_backend(&pull).unwrap(),
+            ModelCommandBackend::Ollama
+        );
+
+        let run =
+            Cli::try_parse_from(["monkey", "--provider", "ollama", "run", "llama3.2"]).unwrap();
+        assert_eq!(
+            model_command_backend(&run).unwrap(),
+            ModelCommandBackend::Ollama
+        );
+    }
+
+    #[test]
+    fn model_command_rejects_unrelated_provider_overrides() {
+        let cli = Cli::try_parse_from(["monkey", "--provider", "openai", "pull", "qwen3"]).unwrap();
+        let error = model_command_backend(&cli).unwrap_err();
+        assert!(error.contains("explicit `--provider ollama`"));
+        assert!(error.contains("openai"));
     }
 
     #[test]

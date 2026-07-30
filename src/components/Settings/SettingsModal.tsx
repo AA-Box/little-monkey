@@ -39,7 +39,13 @@ import { useModelStore } from "../../store/modelStore";
 import { ProviderCard } from "./ProviderCard";
 import { AddCustomProviderForm } from "./AddCustomProviderForm";
 import { AutomationPanel } from "./AutomationPanel";
-import { OpenRouterModelsPanel } from "./OpenRouterModelsPanel";
+import { ProviderModelsPanel } from "./OpenRouterModelsPanel";
+import {
+  connectedProviderNavigationItems,
+  isOllamaConfigured,
+  providerIdFromSettingsTab,
+  type ProviderSettingsTab,
+} from "./providerSettingsNavigation";
 import { RulesMemoryPanel } from "./RulesMemoryPanel";
 import { MemoryStudioPanel } from "./MemoryStudioPanel";
 import { ConnectorsPanel } from "./ConnectorsPanel";
@@ -83,9 +89,10 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-export type SettingsTab = "local" | "ollama" | "providers" | "openrouter" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "approvalchains" | "localapps" | "comparelab";
+export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
-const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
+const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   local: Cpu,
   ollama: Server,
   providers: Cloud,
@@ -118,14 +125,14 @@ const ICONS: Record<Exclude<SettingsTab, "openrouter">, LucideIcon> = {
   comparelab: FlaskConical,
 };
 
-const GROUPS: { labelKey: string; ids: Exclude<SettingsTab, "openrouter">[] }[] = [
+const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "security", "privacy", "diagnostics", "approvalchains", "team", "companion", "desktopcontrol", "shortcuts", "usage", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
   { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "prompts", "apiserver"] },
 ];
 
-const LABEL_KEYS: Record<Exclude<SettingsTab, "openrouter">, string> = {
+const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   local: "SettingsModal.tabLocalModels",
   ollama: "SettingsModal.tabOllama",
   providers: "SettingsModal.tabAiProviders",
@@ -176,7 +183,12 @@ const FOCUSABLE_SELECTOR = [
  */
 export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0 }: SettingsModalProps) {
   const refreshProviders = useModelStore((s) => s.refreshProviders);
+  const refreshOllama = useModelStore((s) => s.refreshOllama);
   const providers = useModelStore((s) => s.providers);
+  const ollamaReachable = useModelStore((s) => s.ollamaReachable);
+  const ollamaBinaryFound = useModelStore((s) => s.ollamaBinaryFound);
+  const ollamaModels = useModelStore((s) => s.ollamaModels);
+  const ollamaSignedInUser = useModelStore((s) => s.ollamaSignedInUser);
 
   const [tab, setTab] = useState<SettingsTab>("appearance");
   const [query, setQuery] = useState("");
@@ -186,20 +198,37 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
-  const openrouterProvider = providers.find((p) => p.id === "openrouter");
-  const openrouterConnected = openrouterProvider?.has_key ?? false;
+  const connectedProviderItems = connectedProviderNavigationItems(providers);
+  const ollamaConfigured = isOllamaConfigured({
+    reachable: ollamaReachable,
+    binaryFound: ollamaBinaryFound,
+    installedModelCount: ollamaModels.length,
+    signedInUser: ollamaSignedInUser,
+  });
+  const selectedProviderId = providerIdFromSettingsTab(tab);
+  const selectedProvider = selectedProviderId
+    ? providers.find((provider) => provider.id === selectedProviderId && provider.has_key)
+    : undefined;
 
-  // A dedicated nav item named after the provider, inserted right before "AI
-  // Providers" — only while OpenRouter is connected. OpenRouter alone
-  // returns 400+ models (see `ProviderCard.tsx`'s `FILTER_THRESHOLD`), so it
-  // gets its own curation surface instead of dumping everything into the
-  // chat toolbar's model switcher unfiltered.
+  // Connected providers get their own model-selection entry immediately
+  // before the always-available provider configuration tab. This is derived
+  // from the backend's live `has_key` probes, so built-ins and custom
+  // providers follow the same rule without hardcoded provider names.
   const navGroups = GROUPS.map((group) => ({
     label: t(group.labelKey),
     items: group.ids.flatMap((id) => {
       const items: { id: SettingsTab; label: string; icon: LucideIcon }[] = [];
-      if (id === "providers" && openrouterConnected) {
-        items.push({ id: "openrouter", label: openrouterProvider?.label ?? "OpenRouter", icon: Sparkles });
+      if (id === "ollama" && !ollamaConfigured) {
+        return items;
+      }
+      if (id === "providers") {
+        items.push(
+          ...connectedProviderItems.map((provider) => ({
+            id: provider.tabId,
+            label: provider.label,
+            icon: Sparkles,
+          })),
+        );
       }
       items.push({ id, label: t(LABEL_KEYS[id]), icon: ICONS[id] });
       return items;
@@ -212,16 +241,25 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
     .filter((group) => group.items.length > 0);
 
   const activeLabel =
-    navGroups.flatMap((group) => group.items).find((item) => item.id === tab)?.label ?? t(LABEL_KEYS[tab === "openrouter" ? "providers" : tab]);
+    selectedProvider?.label ??
+    navGroups.flatMap((group) => group.items).find((item) => item.id === tab)?.label ??
+    t(LABEL_KEYS[selectedProviderId ? "providers" : tab as StaticSettingsTab]);
 
   useEffect(() => {
     if (!open) return;
     void refreshProviders();
-  }, [open, refreshProviders]);
+    void refreshOllama();
+  }, [open, refreshOllama, refreshProviders]);
 
   useEffect(() => {
-    if (tab === "openrouter" && !openrouterConnected) setTab("providers");
-  }, [tab, openrouterConnected]);
+    if (tab === "ollama" && !ollamaConfigured) {
+      setTab("providers");
+      return;
+    }
+    if (selectedProviderId && !selectedProvider) {
+      setTab("providers");
+    }
+  }, [ollamaConfigured, selectedProvider, selectedProviderId, tab]);
 
   // Jump to the requested tab whenever the modal opens with one specified
   // (e.g. PersonaSelector's "Manage prompts…" row) — re-applied on every
@@ -361,7 +399,12 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
             <div className="h-full overflow-y-auto px-6 pb-6 pt-4 [overscroll-behavior:contain]">
               {tab === "local" && <ModelManager />}
               {tab === "ollama" && <OllamaPanel />}
-              {tab === "openrouter" && <OpenRouterModelsPanel />}
+              {selectedProvider && (
+                <ProviderModelsPanel
+                  providerId={selectedProvider.id}
+                  providerLabel={selectedProvider.label}
+                />
+              )}
               {tab === "providers" && (
                 <div className="flex flex-col gap-2">
                   {providers.map((provider) => (

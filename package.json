@@ -15,6 +15,7 @@
     "test:git-delivery-action": "node .github/actions/little-monkey-review/review.test.mjs",
     "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
+    "stage:runtime": "node scripts/stage-managed-runtime.mjs",
     "stage:cli": "node scripts/stage-cli-sidecar.mjs",
     "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs",
     "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri"

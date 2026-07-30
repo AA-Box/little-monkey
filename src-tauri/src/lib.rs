@@ -37,6 +37,8 @@ pub mod m5_delivery;
 // platform-gated adapters. The core is Tauri-free so daemon/API/desktop use
 // the same validation, cancellation, residency, and scheduling semantics.
 pub mod runtime_adapter;
+// Verified app-owned llama.cpp runtime shared by desktop, CLI, and M3.
+pub mod managed_runtime;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
 // the same hostile-input and citation semantics.
@@ -174,6 +176,8 @@ pub mod connectors;
 // draft-only reply/comment/status-update generation. Every write goes through
 // `permissions::request_permission`, same as every other mutating tool.
 pub mod triage;
+pub mod model_sources;
+mod process_lock;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -720,6 +724,21 @@ pub fn run() {
             // `hosted_oauth.rs`'s module doc for the full flow.
             hosted_oauth::register(app.handle());
 
+            // Verify and copy the bundled llama.cpp runtime into app data at
+            // launch so the separately installed `monkey` CLI can use the
+            // same app-owned runtime without Ollama or a system install.
+            // A source/dev build may intentionally have no staged bundle;
+            // model start still fails closed if a present bundle is invalid.
+            if let Ok(runtime_app_data) = app.path().app_data_dir() {
+                let resource_dir = app.path().resource_dir().ok();
+                if let Err(error) = managed_runtime::materialize_bundled_runtime(
+                    resource_dir.as_deref(),
+                    &runtime_app_data,
+                ) {
+                    eprintln!("Managed llama.cpp runtime setup failed: {error}");
+                }
+            }
+
             // Finish or roll back any portable-profile transaction interrupted
             // between staged file publication and its durable commit marker.
             // This runs before session/prompt hydration and before the profile
@@ -876,6 +895,8 @@ pub fn run() {
             models::models_list_curated,
             models::models_list_installed,
             models::models_download,
+            models::models_resolve_reference,
+            models::models_install_reference,
             models::models_delete,
             models::models_add_external,
             models::models_remove_external,

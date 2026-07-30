@@ -90,6 +90,16 @@ import {
   type ActiveDaemonDesktopTurn,
   type FrozenAttachmentInput,
 } from './daemonDesktopTurn';
+import {
+  canRetryWithoutTools,
+  mutationAttemptFailureMessage,
+  mutationPlainResponseAction,
+  mutationToolFailureReason,
+  requiresWorkspaceMutation,
+  workspaceMutationPreflightFailure,
+  WORKSPACE_MUTATION_CORRECTION,
+  WORKSPACE_MUTATION_FAILURE,
+} from './workspaceMutation';
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -1487,11 +1497,61 @@ export async function runAgentTurn(
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
   try {
+    const mutationRequired = requiresWorkspaceMutation(
+      userText,
+      usePermissionStore.getState().mode,
+    );
+    const sessionState = useSessionStore.getState();
+    const activeWorkspacePath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null;
+    const session = sessionState.sessions.find((entry) => entry.id === sessionId);
+    // A blank compose slate may have been created before the user selected a
+    // different folder. Bind that still-empty session to the folder active at
+    // its first turn; once a transcript exists, the binding is immutable and
+    // the mismatch preflight below protects against editing another project.
+    if (
+      session
+      && session.messages.length === 0
+      && activeWorkspacePath !== null
+      && session.workspacePath !== activeWorkspacePath
+    ) {
+      useSessionStore.setState((state) => ({
+        sessions: state.sessions.map((entry) =>
+          entry.id === sessionId ? { ...entry, workspacePath: activeWorkspacePath } : entry
+        ),
+      }));
+    }
+    const sessionWorkspacePath =
+      session?.messages.length === 0 ? activeWorkspacePath : session?.workspacePath ?? null;
+    const preflightFailure = workspaceMutationPreflightFailure(
+      mutationRequired,
+      activeWorkspacePath,
+      sessionWorkspacePath,
+    );
+    if (preflightFailure !== null) {
+      sessionState.addMessage(sessionId, { role: 'user', content: userText });
+      sessionState.addMessage(sessionId, { role: 'assistant', content: preflightFailure });
+      return;
+    }
+
     const route = await daemonDesktopRoute();
-    if (route === 'daemon') {
+    // The resident runner has its own natural-exit loop and cannot yet prove
+    // that a requested write happened. Keep explicit mutation turns on the
+    // in-process desktop loop, where the bounded corrective retry and
+    // mutation-success guard below are enforced.
+    if (route === 'daemon' && !mutationRequired) {
       await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
     } else {
-      await runTurnGuarded(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, availableSkills, ultracode);
+      await runTurnGuarded(
+        sessionId,
+        userText,
+        attachments,
+        controller.signal,
+        turnId,
+        skillInvocations,
+        availableSkills,
+        ultracode,
+        mutationRequired,
+      );
     }
   } finally {
     turnControllers.delete(sessionId);
@@ -1769,6 +1829,7 @@ async function runTurnGuarded(
   skillInvocations: SkillInvocationSnapshot[],
   availableSkills: SlashSkill[] = [],
   ultracode = false,
+  mutationRequired = false,
 ): Promise<void> {
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
@@ -1813,6 +1874,7 @@ async function runTurnGuarded(
       skillInvocations,
       availableSkills,
       ultracode,
+      mutationRequired,
     );
     maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
   } catch (error) {
@@ -1877,6 +1939,7 @@ async function runAgentTurnBody(
   skillInvocations: SkillInvocationSnapshot[] = [],
   availableSkills: SlashSkill[] = [],
   ultracode = false,
+  mutationRequired = false,
 ): Promise<void> {
   // Every transcript mutation this turn makes is pinned to the session the
   // turn was submitted from — the user may be running another turn in the
@@ -2036,6 +2099,11 @@ async function runAgentTurnBody(
   // own tool-calling loop. See `toolsForMode`'s doc comment for why
   // `present_plan` is gated on this snapshot.
   const mode = usePermissionStore.getState().mode;
+  // Re-check the frozen permission mode inside the actual loop. The outer
+  // preflight already excludes Plan Mode, but this keeps a mode switch during
+  // early async setup from turning a read-only planning turn into an enforced
+  // write contract.
+  const enforceMutation = mutationRequired && mode !== 'plan';
 
   const startDurableRecorder = async (
     resolvedTarget: ResolvedTarget,
@@ -2235,6 +2303,18 @@ async function runAgentTurnBody(
   // whether there's anything worth verifying. Populated in the tool-call
   // loop right below via `isSuccessfulMutationResult`/`toolCallPathArg`.
   const mutatedFiles = new Set<string>();
+  // Unlike `mutatedFiles`, this is intentionally never cleared after a
+  // verification failure: the contract asks whether this turn ever changed a
+  // real file, while the Set is reused to decide whether a new verification
+  // pass is needed for only the latest edit round.
+  let mutationSucceeded = false;
+  let mutationCorrectiveRetryUsed = false;
+  let mutationCorrectionPending = false;
+  // Failed mutation calls remain unresolved until a later successful
+  // write/edit targets the same path. A per-path map lets the model recover
+  // from an old_string miss without allowing a success on some other file to
+  // conceal the failure.
+  const unresolvedMutationFailures = new Map<string, string>();
 
   // How many verification feed-back rounds have been consumed so far this
   // turn — compared against `settings.verifyMaxRounds` (default 1, clamp
@@ -2317,6 +2397,9 @@ async function runAgentTurnBody(
       ...(wireContent !== null
         ? history.map((message) => (message === storedUserMessage ? { ...message, content: wireContent } : message))
         : history),
+      ...(mutationCorrectionPending
+        ? [{ role: 'system' as const, content: WORKSPACE_MUTATION_CORRECTION }]
+        : []),
     ]
       // `/btw` side-question exchanges are display-only: stored in the
       // transcript but never part of the conversation a model sees.
@@ -2350,7 +2433,13 @@ async function runAgentTurnBody(
     // fine for a plain-text reply. Only tool_calls can be lost this way
     // (`toolsForTurn` empty on retry means the model literally cannot emit
     // one), so the outer round-trip loop just sees a normal plain answer.
-    if (attempt.streamError !== null && !attempt.contentStarted && toolsForTurn.length > 0 && TOOL_UNSUPPORTED_ERROR_PATTERN.test(attempt.streamError)) {
+    if (
+      attempt.streamError !== null
+      && !attempt.contentStarted
+      && toolsForTurn.length > 0
+      && canRetryWithoutTools(enforceMutation)
+      && TOOL_UNSUPPORTED_ERROR_PATTERN.test(attempt.streamError)
+    ) {
       durable.recorder?.recordStatus(
         `status-${turnId}-${iteration}-tools`,
         `Target rejected tool calling; retrying without tools: ${attempt.streamError}`,
@@ -2426,6 +2515,10 @@ async function runAgentTurnBody(
         durable.recorder?.runId,
       );
     }
+    // The corrective instruction is wire-only and belongs to exactly this
+    // model round trip (including any failover attempts above). Never persist
+    // it into the transcript or let it bias later turns.
+    mutationCorrectionPending = false;
 
     const { content, toolCalls, streamError } = attempt;
     const messageId = `message-${turnId}-${iteration}`;
@@ -2437,7 +2530,12 @@ async function runAgentTurnBody(
     if (streamError !== null) {
       durable.failure = streamError;
       updateLastMessage({
-        content: content.length > 0 ? `${content}\n\n[Error: ${streamError}]` : `[Error: ${streamError}]`,
+        content:
+          enforceMutation && !mutationSucceeded
+            ? `No files changed. The requested workspace edit could not be completed because tool calling failed: ${streamError}`
+            : content.length > 0
+              ? `${content}\n\n[Error: ${streamError}]`
+              : `[Error: ${streamError}]`,
       });
       return;
     }
@@ -2447,6 +2545,34 @@ async function runAgentTurnBody(
         // Stop button fired before any content streamed in — drop the empty
         // placeholder instead of leaving a stuck "typing" bubble behind.
         removeLastMessage();
+        return;
+      }
+      const mutationAction = mutationPlainResponseAction(
+        enforceMutation,
+        mutationSucceeded,
+        mutationCorrectiveRetryUsed,
+        unresolvedMutationFailures.size > 0,
+      );
+      if (mutationAction === 'retry') {
+        // A chat/code answer is not evidence that the workspace changed.
+        // Remove it from the visible transcript and give the same
+        // tool-capable turn exactly one more chance with a wire-only system
+        // correction. The booleans make the retry strictly bounded and keep
+        // the correction out of future turns.
+        removeLastMessage();
+        mutationCorrectionPending = true;
+        mutationCorrectiveRetryUsed = true;
+        continue;
+      }
+      if (mutationAction === 'fail') {
+        const unresolvedFailure = unresolvedMutationFailures.values().next().value as string | undefined;
+        const failureMessage = unresolvedFailure !== undefined
+          ? mutationAttemptFailureMessage(mutationSucceeded, unresolvedFailure)
+          : WORKSPACE_MUTATION_FAILURE;
+        durable.failure = failureMessage;
+        // Replace the plain response in place so it cannot look like a
+        // completed edit after either a failed tool call or the bounded retry.
+        updateLastMessage({ content: failureMessage });
         return;
       }
       // The model gave a plain answer with no further tool requests — this
@@ -2555,7 +2681,17 @@ async function runAgentTurnBody(
         target,
         effort,
         risk: riskAnnotation,
-        onMutatedPath: (path) => mutatedFiles.add(path),
+        onMutatedPath: (path) => {
+          mutatedFiles.add(path);
+          mutationSucceeded = true;
+          unresolvedMutationFailures.delete(path);
+        },
+        onMutationFailure: (path, reason, childToolCallId) => {
+          unresolvedMutationFailures.set(
+            path ?? `subagent-tool-call:${childToolCallId}`,
+            reason,
+          );
+        },
       };
       const result = await executeToolCall(
         toolCall,
@@ -2594,12 +2730,24 @@ async function runAgentTurnBody(
       // cancelled, not rejected above) and actually succeeded (the
       // "Wrote…"/"Edited…" string shape, not `{"error": ...}"`).
       if (
-        !signal?.aborted &&
-        (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file') &&
-        isSuccessfulMutationResult(resultContent)
+        !signal?.aborted
+        && (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file')
       ) {
-        const path = toolCallPathArg(toolCall);
-        if (path) mutatedFiles.add(path);
+        if (isSuccessfulMutationResult(resultContent)) {
+          const path = toolCallPathArg(toolCall);
+          if (path) {
+            mutatedFiles.add(path);
+            mutationSucceeded = true;
+            unresolvedMutationFailures.delete(path);
+          }
+        } else {
+          const path = toolCallPathArg(toolCall);
+          unresolvedMutationFailures.set(
+            path ?? `tool-call:${toolCall.id}`,
+            mutationToolFailureReason(resultContent)
+              ?? 'The file-mutation tool returned an error.',
+          );
+        }
       }
 
       // A successful `remember` gets its own transcript notice (with a
@@ -2649,6 +2797,15 @@ async function runAgentTurnBody(
   // Safety cap reached: the model kept requesting tools without ever
   // settling on a final answer. Surface this clearly instead of looping
   // forever or silently truncating.
+  if (enforceMutation && (!mutationSucceeded || unresolvedMutationFailures.size > 0)) {
+    const unresolvedFailure = unresolvedMutationFailures.values().next().value as string | undefined;
+    const failureMessage = unresolvedFailure !== undefined
+      ? mutationAttemptFailureMessage(mutationSucceeded, unresolvedFailure)
+      : WORKSPACE_MUTATION_FAILURE;
+    durable.failure = failureMessage;
+    addMessage({ role: 'assistant', content: failureMessage });
+    return;
+  }
   durable.failure = `Reached the safety limit of ${MAX_ITERATIONS} tool-calling iterations.`;
   addMessage({
     role: 'assistant',

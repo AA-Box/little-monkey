@@ -175,6 +175,10 @@ pub struct GgufHeaderInfo {
     pub name: Option<String>,
     pub quantization_version: Option<String>,
     pub declared_license: Option<String>,
+    /// Kept internal so callers can validate runtime compatibility without
+    /// exposing a potentially large template in reports or over IPC.
+    #[serde(skip)]
+    pub(crate) chat_template: Option<String>,
 }
 
 /// A `Read` adapter that errors once more than `remaining` bytes have been
@@ -306,7 +310,8 @@ fn read_gguf_value<R: Read>(
 }
 
 /// Parses a GGUF file's magic, version, tensor/metadata counts, and a
-/// handful of well-known `general.*` string metadata keys, from any `Read`
+/// handful of well-known `general.*` and tokenizer string metadata keys,
+/// from any `Read`
 /// (a real file when sniffing on disk, an in-memory cursor in tests). Only
 /// ever reads through the metadata + tensor-info sections — the tensor
 /// payload itself is never touched, so this is fast and bounded even on a
@@ -352,6 +357,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     let mut name = None;
     let mut quantization_version = None;
     let mut declared_license = None;
+    let mut chat_template = None;
     for _ in 0..metadata_kv_count {
         let key = read_gguf_string(&mut reader)?;
         let value_type = read_u32(&mut reader)
@@ -361,6 +367,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
             ("general.architecture", Some(text)) => architecture = Some(text),
             ("general.name", Some(text)) => name = Some(text),
             ("general.quantization_version", Some(text)) => quantization_version = Some(text),
+            ("tokenizer.chat_template", Some(text)) => chat_template = Some(text),
             ("general.license" | "general.license.name" | "general.license.spdx", Some(text))
                 if declared_license.is_none() =>
             {
@@ -401,10 +408,11 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
         name,
         quantization_version,
         declared_license,
+        chat_template,
     })
 }
 
-fn sniff_gguf_file(path: &Path) -> QuantizationResult<GgufHeaderInfo> {
+pub(crate) fn sniff_gguf_file(path: &Path) -> QuantizationResult<GgufHeaderInfo> {
     let file = File::open(path).map_err(|error| io_at("open GGUF source", path, error))?;
     sniff_gguf_header(file)
 }
@@ -1308,11 +1316,19 @@ mod tests {
     /// exercise header/metadata/tensor-table parsing and the passthrough
     /// backend end to end.
     fn build_minimal_gguf(architecture: &str, license: Option<&str>) -> Vec<u8> {
+        build_minimal_gguf_with_template(architecture, license, None)
+    }
+
+    fn build_minimal_gguf_with_template(
+        architecture: &str,
+        license: Option<&str>,
+        chat_template: Option<&str>,
+    ) -> Vec<u8> {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&GGUF_MAGIC);
         write_u32(&mut buffer, 3);
         write_u64(&mut buffer, 1); // tensor_count
-        let metadata_count = if license.is_some() { 2 } else { 1 };
+        let metadata_count = 1 + u64::from(license.is_some()) + u64::from(chat_template.is_some());
         write_u64(&mut buffer, metadata_count);
 
         write_string(&mut buffer, "general.architecture");
@@ -1323,6 +1339,12 @@ mod tests {
             write_string(&mut buffer, "general.license");
             write_u32(&mut buffer, GGUF_TYPE_STRING);
             write_string(&mut buffer, license);
+        }
+
+        if let Some(chat_template) = chat_template {
+            write_string(&mut buffer, "tokenizer.chat_template");
+            write_u32(&mut buffer, GGUF_TYPE_STRING);
+            write_string(&mut buffer, chat_template);
         }
 
         // One tensor: name, 1 dimension, ggml type 0 (F32), offset 0.
@@ -1373,6 +1395,18 @@ mod tests {
         assert_eq!(header.metadata_kv_count, 2);
         assert_eq!(header.architecture.as_deref(), Some("llama"));
         assert_eq!(header.declared_license.as_deref(), Some("apache-2.0"));
+    }
+
+    #[test]
+    fn sniffs_embedded_chat_template_without_serializing_its_body() {
+        let template = "{% if tools %}{{ tools | tojson }}{% endif %}";
+        let bytes = build_minimal_gguf_with_template("llama", None, Some(template));
+        let header = sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF fixture must parse");
+
+        assert_eq!(header.chat_template.as_deref(), Some(template));
+        let wire = serde_json::to_value(&header).unwrap();
+        assert!(wire.get("chatTemplate").is_none());
+        assert!(!wire.to_string().contains(template));
     }
 
     #[test]
@@ -1707,5 +1741,3 @@ exit 0
         dir
     }
 }
-
-

@@ -251,7 +251,6 @@ export function CompareTargetPicker({ value, onChange, disabled = false, placeme
           const filter = providerModelFilters[target.providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
           const curated =
             filter.showAll ||
-            filter.selectedModelIds.length === 0 ||
             filter.selectedModelIds.includes(target.model) ||
             draftKeys.has(target.key);
           if (!curated) return false;

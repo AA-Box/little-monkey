@@ -25,6 +25,7 @@ import {
   parseSourcesNotice,
   parseVerifyNotice,
   PLAN_NOTE_PREFIX,
+  runAgentTurn,
   runToolCallsForRound,
   runVerificationPhase,
   shouldFeedBackVerifyFailure,
@@ -47,6 +48,7 @@ import { useSettingsStore } from "../store/settingsStore";
 import { usePermissionStore } from "../store/permissionStore";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useArtifactStore } from "../store/artifactStore";
+import { useWorkspaceStore } from "../store/workspaceStore";
 
 function link(overrides: Partial<CheckpointChainLink> & { id: string }): CheckpointChainLink {
   return { shellRan: false, prevId: null, ...overrides };
@@ -1083,5 +1085,52 @@ describe("maybeAutoPreviewNewestArtifact", () => {
     maybeAutoPreviewNewestArtifact(sessionId, 0);
 
     expect(useArtifactStore.getState().active?.ref.messageIndex).toBe(1);
+  });
+});
+
+describe("runAgentTurn / workspace mutation preflight", () => {
+  it("records an unchanged-files failure without invoking IPC when only a typed path was supplied", async () => {
+    const sessionId = "mutation-preflight-session";
+    const session: ChatSession = {
+      id: sessionId,
+      title: "Test",
+      messages: [],
+      createdAt: 0,
+      updatedAt: 0,
+      pinned: false,
+      unread: false,
+      archived: false,
+      groupId: null,
+      modelTarget: null,
+      comparisonBranch: null,
+      workspacePath: null,
+      personaId: null,
+      attachedStackIds: [],
+      docChatMode: false,
+      subagentRuns: {},
+    };
+    useSessionStore.setState({
+      sessions: [session],
+      activeSessionId: sessionId,
+      messages: [],
+      runningTurns: {},
+    });
+    useWorkspaceStore.setState({ roots: [] });
+    usePermissionStore.setState({ mode: "manual" });
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+
+    await runAgentTurn(sessionId, "Edit /tmp/example/src/main.ts and save the real file.");
+
+    const messages = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.messages ?? [];
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(messages[1]?.content).toContain("No files changed");
+    expect(messages[1]?.content).toContain("folder picker");
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    // Drain sessionStore's debounced persistence so it cannot leak an IPC
+    // call into a later test file sharing this worker.
+    await new Promise((resolve) => setTimeout(resolve, 425));
+    invokeMock.mockReset();
   });
 });
