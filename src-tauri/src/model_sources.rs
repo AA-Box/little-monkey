@@ -260,11 +260,10 @@ where
         let destination_file_name = local_file_name(&resolution.public, disambiguated);
         let destination = models_dir.join(&destination_file_name);
         validate_direct_child(&models_dir, &destination)?;
-        let lock_path = append_file_suffix(&destination, ".install.lock")?;
-        validate_direct_child(&models_dir, &lock_path)?;
-        let install_lock = acquire_install_lock(lock_path).await?;
+        let install_lock = acquire_destination_lock(&models_dir, &destination).await?;
 
-        if !destination.exists() {
+        if path_entry_is_missing(&destination)? {
+            remove_stale_provenance_for_missing_model(&destination)?;
             break (destination_file_name, destination, install_lock);
         }
         let existing_provenance = match reusable_existing_install(&destination, &resolution.public)?
@@ -1528,6 +1527,114 @@ async fn acquire_install_lock(path: PathBuf) -> Result<CrossProcessFileLock, Str
         .map_err(|error| format!("Model install lock task failed: {error}"))?
 }
 
+async fn acquire_destination_lock(
+    models_dir: &Path,
+    destination: &Path,
+) -> Result<CrossProcessFileLock, String> {
+    let lock_path = append_file_suffix(destination, ".install.lock")?;
+    validate_direct_child(models_dir, &lock_path)?;
+    acquire_install_lock(lock_path).await
+}
+
+fn path_entry_is_missing(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "Failed to inspect managed model path {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn remove_provenance_entry_if_present(model_path: &Path) -> Result<(), String> {
+    let sidecar = provenance_path(model_path)?;
+    match fs::symlink_metadata(&sidecar) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(&sidecar).map_err(|error| {
+                format!(
+                    "Failed to remove model provenance {}: {error}",
+                    sidecar.display()
+                )
+            })
+        }
+        Ok(_) => Err(format!(
+            "Model provenance {} is not a removable file",
+            sidecar.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to inspect model provenance {}: {error}",
+            sidecar.display()
+        )),
+    }
+}
+
+/// Cleans up the only unsafe half of an interrupted delete: metadata whose
+/// model file is already gone. The caller must hold this destination's
+/// install lock so an installer cannot publish the GGUF between the absence
+/// check and sidecar removal.
+fn remove_stale_provenance_for_missing_model(model_path: &Path) -> Result<(), String> {
+    if !path_entry_is_missing(model_path)? {
+        return Err(format!(
+            "Refusing to remove provenance while model {} still exists",
+            model_path.display()
+        ));
+    }
+    remove_provenance_entry_if_present(model_path)
+}
+
+/// Deletes one app-owned managed model under the same per-destination lock
+/// used by [`install_reference`]. Metadata is removed first: a crash between
+/// the two removals leaves a verified GGUF without a sidecar, which the
+/// installer can recover without downloading again. The inverse order could
+/// leave a dangling sidecar that permanently blocks publication.
+pub async fn delete_installed_model(models_dir: &Path, model_path: &Path) -> Result<(), String> {
+    let models_dir = canonical_models_dir(models_dir)?;
+    validate_direct_child(&models_dir, model_path)?;
+    let _install_lock = acquire_destination_lock(&models_dir, model_path).await?;
+
+    let metadata = match fs::symlink_metadata(model_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_stale_provenance_for_missing_model(model_path)?;
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect managed model {}: {error}",
+                model_path.display()
+            ))
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "Managed model {} is not a regular file",
+            model_path.display()
+        ));
+    }
+    let canonical_model = model_path.canonicalize().map_err(|error| {
+        format!(
+            "Failed to resolve managed model {}: {error}",
+            model_path.display()
+        )
+    })?;
+    if canonical_model != model_path || canonical_model.parent() != Some(models_dir.as_path()) {
+        return Err(format!(
+            "Managed model path {} changed or escapes its models directory",
+            model_path.display()
+        ));
+    }
+
+    remove_provenance_entry_if_present(model_path)?;
+    fs::remove_file(model_path).map_err(|error| {
+        format!(
+            "Failed to delete managed model {}: {error}",
+            model_path.display()
+        )
+    })
+}
+
 fn reusable_existing_install(
     path: &Path,
     resolved: &ResolvedModelReference,
@@ -2482,6 +2589,60 @@ mod tests {
             "little-monkey-model-source-{label}-{}",
             Uuid::new_v4().simple()
         ))
+    }
+
+    #[test]
+    fn missing_model_cleanup_removes_a_dangling_provenance_sidecar() {
+        let directory = test_dir("dangling-sidecar");
+        fs::create_dir_all(&directory).unwrap();
+        let model_path = directory.join("managed.gguf");
+        let sidecar = provenance_path(&model_path).unwrap();
+        fs::write(&sidecar, b"stale metadata").unwrap();
+
+        remove_stale_provenance_for_missing_model(&model_path).unwrap();
+
+        assert!(!sidecar.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn managed_delete_removes_sidecar_before_the_model_under_its_install_lock() {
+        let directory = test_dir("managed-delete");
+        fs::create_dir_all(&directory).unwrap();
+        let canonical_directory = directory.canonicalize().unwrap();
+        let model_path = canonical_directory.join("managed.gguf");
+        let sidecar = provenance_path(&model_path).unwrap();
+        fs::write(&model_path, b"model bytes").unwrap();
+        fs::write(&sidecar, b"metadata").unwrap();
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(delete_installed_model(&canonical_directory, &model_path))
+            .unwrap();
+
+        assert!(!model_path.exists());
+        assert!(!sidecar.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn managed_delete_keeps_the_model_when_sidecar_is_not_a_file() {
+        let directory = test_dir("unsafe-delete-sidecar");
+        fs::create_dir_all(&directory).unwrap();
+        let canonical_directory = directory.canonicalize().unwrap();
+        let model_path = canonical_directory.join("managed.gguf");
+        let sidecar = provenance_path(&model_path).unwrap();
+        fs::write(&model_path, b"model bytes").unwrap();
+        fs::create_dir(&sidecar).unwrap();
+
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(delete_installed_model(&canonical_directory, &model_path))
+            .unwrap_err();
+
+        assert!(error.contains("not a removable file"));
+        assert!(model_path.is_file());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
