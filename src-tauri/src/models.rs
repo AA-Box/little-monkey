@@ -715,16 +715,7 @@ pub async fn models_delete(
     )
     .await?;
 
-    std::fs::remove_file(&p).map_err(|e| format!("Failed to delete {path}: {e}"))?;
-    if let Ok(sidecar) = model_sources::provenance_path(&p) {
-        if std::fs::symlink_metadata(&sidecar)
-            .map(|metadata| metadata.file_type().is_file() || metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            let _ = std::fs::remove_file(sidecar);
-        }
-    }
-    Ok(())
+    model_sources::delete_installed_model(&dir_canon, &p).await
 }
 
 #[cfg(test)]

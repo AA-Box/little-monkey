@@ -1168,7 +1168,7 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                         };
                     let target = chat::Target::Local {
                         base_url: session.base_url(),
-                        model: Some(installed.resolved.canonical_reference),
+                        model: Some(session.model_alias().to_string()),
                         native_ollama: false,
                     };
                     (target, Some(session))

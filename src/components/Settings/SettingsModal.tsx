@@ -401,6 +401,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "ollama" && <OllamaPanel />}
               {selectedProvider && (
                 <ProviderModelsPanel
+                  key={selectedProvider.id}
                   providerId={selectedProvider.id}
                   providerLabel={selectedProvider.label}
                 />
