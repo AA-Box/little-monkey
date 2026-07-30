@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "identifier": "com.littlemonkey.app",
   "build": {
-    "beforeDevCommand": "pnpm stage:cli && pnpm dev",
+    "beforeDevCommand": "pnpm stage:runtime && pnpm stage:cli && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm stage:cli && pnpm build",
+    "beforeBuildCommand": "pnpm stage:runtime && pnpm stage:cli && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -48,6 +48,9 @@
     ],
     "externalBin": [
       "binaries/monkey-cli"
+    ],
+    "resources": [
+      "resources/managed-runtime/**/*"
     ],
     "macOS": {
       "files": {

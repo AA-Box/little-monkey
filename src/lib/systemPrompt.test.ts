@@ -47,6 +47,12 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('permission');
   });
 
+  it('says real workspace edits must use mutating tools rather than chat code blocks', () => {
+    const prompt = buildSystemPrompt([primary], 'macOS');
+    expect(prompt).toContain('A code block in chat is not a substitute for editing the real file');
+    expect(prompt).toContain('must not claim files changed unless a mutating tool succeeded');
+  });
+
   it('lists remember alongside the other mutating tools that may prompt for permission', () => {
     const prompt = buildSystemPrompt([primary], 'macOS');
     expect(prompt).toContain('Mutating tools (write_file, edit_file, run_shell, remember)');

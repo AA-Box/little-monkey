@@ -66,7 +66,10 @@ import { useSideChatStore } from "../../store/sideChatStore";
 import SideChatPanel from "./SideChatPanel";
 import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
 import { mcpToolDefs } from "../../lib/mcpTools";
-import { useSettingsStore } from "../../store/settingsStore";
+import {
+  DEFAULT_PROVIDER_MODEL_FILTER,
+  useSettingsStore,
+} from "../../store/settingsStore";
 import { usePermissionStore } from "../../store/permissionStore";
 import { useModelStore } from "../../store/modelStore";
 import { useUsageStore } from "../../store/usageStore";
@@ -78,6 +81,7 @@ import { useMcpStore } from "../../store/mcpStore";
 import { useTerminalStore } from "../../store/terminalStore";
 import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
 import type { SettingsTab } from "../Settings";
+import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
 
 const MAX_TEXTAREA_HEIGHT_PX = 192;
 
@@ -250,8 +254,9 @@ function activeModelDescription(): string {
   return state.active ? `local:${state.active.name} (${state.llamaStatus})` : `local runtime (${state.llamaStatus}; no model selected)`;
 }
 
-async function switchModelFromSlash(selector: string): Promise<string> {
+export async function switchModelFromSlash(selector: string): Promise<string> {
   const state = useModelStore.getState();
+  const providerModelFilters = useSettingsStore.getState().providerModelFilters;
   const requested = selector.trim().toLowerCase();
   if (!requested) return activeModelDescription();
   const candidates: Array<{ canonical: string; aliases: string[]; activate: () => Promise<void> }> = [];
@@ -270,7 +275,14 @@ async function switchModelFromSlash(selector: string): Promise<string> {
     });
   }
   for (const provider of state.providers) {
-    for (const model of state.providerModels[provider.id] ?? []) {
+    if (!provider.has_key) continue;
+    const providerModels = visibleProviderModelsForProvider(
+      provider.id,
+      state.providerModels[provider.id] ?? [],
+      providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER,
+      state,
+    );
+    for (const model of providerModels) {
       candidates.push({
         canonical: `${provider.id}:${model.id}`,
         aliases: [model.id.toLowerCase()],

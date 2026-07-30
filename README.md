@@ -145,14 +145,14 @@ Built-ins run locally and deterministically. Unknown leading `/text` remains ord
 ## Prerequisites
 
 - Node.js, `pnpm`, Rust, Cargo, and the Tauri 2 prerequisites for your operating system.
-- Optional managed GGUF runtime: `llama-server` from `llama.cpp` on `PATH` or in a supported Homebrew location.
-- Optional Ollama runtime: Ollama reachable at `http://127.0.0.1:11434`.
+- Desktop releases include a pinned, checksum-verified `llama.cpp` runtime. Source builds stage the same official runtime automatically before `tauri dev`/`tauri build`; a system `llama-server` remains a development fallback only.
+- Optional Ollama runtime: Ollama reachable at `http://127.0.0.1:11434` when using the explicit Ollama provider or daemon-management commands.
 - Optional MLX runtime: supported Apple Silicon plus the configured MLX Python environment.
 - Optional browser verification: a supported Chromium/Chrome binary.
 - Optional GitHub delivery: Git and an authenticated GitHub CLI (`gh`).
 - Optional local OCR, transcription, image generation, IDE extensions, and remote handoff: their explicitly configured worker/model, endpoint, SDK, or TLS identity.
 
-On macOS, the existing unmanaged GGUF setup can use:
+On macOS, developers who intentionally want the unmanaged fallback can use:
 
 ```sh
 brew install llama.cpp
@@ -164,10 +164,10 @@ The Runtime Hub can also install checksum-pinned artifacts from a configured cat
 
 ```sh
 pnpm install
-pnpm tauri dev       # build/stage the CLI sidecar and run the desktop app
+pnpm tauri dev       # verify/stage llama.cpp + the CLI sidecar, then run the app
 pnpm dev             # Vite frontend only
 pnpm build           # TypeScript check and frontend production build
-pnpm tauri build     # desktop bundles for the current platform
+pnpm tauri build     # build a desktop bundle containing the managed runtime
 ```
 
 ## Testing
@@ -204,7 +204,7 @@ LITTLE_MONKEY_COMPLETION_MODEL='your-exact-fim-tag' npm run benchmark:completion
 The installed command is `monkey`. The preferred chat form is model first:
 
 ```sh
-# Local-first automatic resolution; an installed Ollama tag wins.
+# Existing target/provider auto-resolution.
 monkey llama3.2 "Summarize this project"
 
 # Omit the prompt for the interactive REPL.
@@ -218,7 +218,30 @@ monkey --provider ollama llama3.2 "Explain the failing test"
 monkey --local-url http://127.0.0.1:8090 local-model "Inspect the workspace"
 ```
 
-If a non-local model is exposed by more than one configured provider, `monkey` asks for `--provider <id>` instead of guessing. The legacy `--ollama`, `--model`, and `monkey run` forms remain compatibility aliases, but new scripts should use `monkey [--provider ID] MODEL [PROMPT]`.
+For the app-owned path that does not require Ollama or a separate
+`llama.cpp` installation, pull or run a public Ollama Registry tag or a
+public Hugging Face single-file GGUF reference:
+
+```sh
+monkey pull llama3.2:3b
+monkey run llama3.2:3b "Summarize this project"
+monkey run hf.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q4_K_M
+```
+
+`monkey run` resolves immutable metadata, verifies the expected model SHA-256,
+inspects the checksum-bound GGUF's embedded llama.cpp/Jinja chat template
+before advertising tool support, resumes interrupted downloads, reuses
+verified installs offline, and starts the bundled loopback-only runtime for
+that session. Ollama's separate Go-template layer is never passed to
+llama.cpp. The runtime's
+per-file manifest is itself authenticated by a digest embedded in the compiled
+app. Private/gated Hugging Face repositories, non-GGUF or sharded artifacts,
+and Ollama models that require separate adapters or projectors are rejected
+with a clear error.
+
+If a non-local model is exposed by more than one configured provider,
+`monkey` asks for `--provider <id>` instead of guessing. The legacy
+`--ollama` and `--model` forms remain compatibility aliases.
 
 Useful chat flags:
 
@@ -229,15 +252,21 @@ Useful chat flags:
 - `--persona <slash-command>` and repeatable `--stack <name>` — attach saved context.
 - `--verify` / `--no-verify`, `--subagents`, `--no-rules`, and `--no-mcp` — opt into verification/subagents or suppress configured context.
 - `--temperature`, `--top-p`, `--seed`, `--stop`, `--num-predict`, `--system`, `--format`, `--verbose`, and `--attach-images` — generation controls.
-- `--num-ctx`, `--keepalive`, `--think`, and `--hidethinking` — Ollama-native controls.
+- `--num-ctx` — managed-runtime/Ollama context size; `--keepalive`, `--think`, and `--hidethinking` remain Ollama-native controls.
 
-Ollama-compatible model management remains available:
+App-owned install and run:
+
+```sh
+monkey pull <model>
+monkey run <model> "Prompt text"
+```
+
+The remaining Ollama-daemon compatibility commands still require a
+user-installed Ollama runtime:
 
 ```sh
 monkey list
 monkey ps
-monkey pull <model>
-monkey run <model> "Prompt text"
 monkey rm <model> [model...]
 monkey cp <source> <destination>
 monkey show <model>
@@ -306,8 +335,8 @@ It does not edit shell startup files. If the selected directory is not already o
 
 ## Model setup
 
-1. For managed GGUF, install `llama-server` or configure a verified Runtime Hub catalog, then use **Settings → Local Models** or **Runtime Hub**.
-2. For Ollama, open **Settings → Ollama**, confirm the daemon is reachable, pull/import a model, and select it.
+1. For an app-owned local model, open **Settings → Local Models → Add custom model**, enter an Ollama tag such as `llama3.2:3b` or a Hugging Face reference such as `hf.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q4_K_M`, review the resolved file/size/license/digest metadata, then install and start it. No Ollama installation is required.
+2. For a user-managed Ollama daemon, open **Settings → Ollama**, confirm the daemon is reachable, pull/import a model, and select it.
 3. For cloud/BYOK, open **Settings → AI Providers**, store the key, refresh the provider model list, and select a model.
 4. For MLX, configure the supported Apple Silicon MLX runtime in **Settings → Runtime Hub → Runtimes**.
 
