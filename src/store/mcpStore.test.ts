@@ -21,7 +21,11 @@ vi.mock("@tauri-apps/api/event", () => ({
   },
 }));
 
-import { useMcpStore, type McpServerInfo } from "./mcpStore";
+import {
+  mcpServerNeedsAuthentication,
+  useMcpStore,
+  type McpServerInfo,
+} from "./mcpStore";
 
 function makeInfo(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
   return {
@@ -44,6 +48,43 @@ function makeInfo(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
 beforeEach(() => {
   invokeMock.mockReset();
   useMcpStore.setState({ servers: [], oauthStatus: {} });
+});
+
+describe("mcpServerNeedsAuthentication", () => {
+  it("does not infer authentication from HTTP transport and missing credentials alone", () => {
+    const publicServer = makeInfo({
+      transport: { type: "http", url: "https://public.example/mcp" },
+      status: "connected",
+    });
+
+    expect(mcpServerNeedsAuthentication(publicServer)).toBe(false);
+  });
+
+  it("recognizes an observed authentication failure on a credential-free HTTP server", () => {
+    const protectedServer = makeInfo({
+      transport: { type: "http", url: "https://protected.example/mcp" },
+      status: "error",
+      error: "HTTP 401 Unauthorized",
+    });
+
+    expect(mcpServerNeedsAuthentication(protectedServer)).toBe(true);
+  });
+
+  it("does not show the warning when credentials are saved or the server is local", () => {
+    const authenticatedServer = makeInfo({
+      transport: { type: "http", url: "https://protected.example/mcp" },
+      status: "error",
+      error: "authentication required",
+      hasOauth: true,
+    });
+    const localServer = makeInfo({
+      status: "error",
+      error: "401 Unauthorized",
+    });
+
+    expect(mcpServerNeedsAuthentication(authenticatedServer)).toBe(false);
+    expect(mcpServerNeedsAuthentication(localServer)).toBe(false);
+  });
 });
 
 describe("mcpStore.refresh", () => {
@@ -183,22 +224,42 @@ describe("mcp://status event handling", () => {
 });
 
 describe("mcpStore OAuth actions", () => {
-  it("oauthConnect seeds a discovering phase then invokes mcp_oauth_connect with server_id and client_id", async () => {
+  it("oauthConnect seeds a discovering phase then invokes mcp_oauth_connect with the user's own client credentials", async () => {
     invokeMock.mockResolvedValueOnce(undefined);
 
-    const promise = useMcpStore.getState().oauthConnect("srv", "byo-client-id");
+    const promise = useMcpStore.getState().oauthConnect("srv", "byo-client-id", "byo-client-secret");
     expect(useMcpStore.getState().oauthStatus.srv).toEqual({ phase: "discovering", error: null });
     await promise;
 
-    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", { server_id: "srv", client_id: "byo-client-id" });
+    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", {
+      server_id: "srv",
+      client_id: "byo-client-id",
+      client_secret: "byo-client-secret",
+    });
   });
 
-  it("oauthConnect passes client_id as null when the caller didn't supply one", async () => {
+  it("oauthConnect passes both client fields as null when the caller didn't supply them, so the backend reuses any saved registration", async () => {
     invokeMock.mockResolvedValueOnce(undefined);
 
     await useMcpStore.getState().oauthConnect("srv");
 
-    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", { server_id: "srv", client_id: null });
+    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", {
+      server_id: "srv",
+      client_id: null,
+      client_secret: null,
+    });
+  });
+
+  it("oauthConnect omits a client secret the user left blank — a public PKCE client sends none at all", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await useMcpStore.getState().oauthConnect("srv", "byo-client-id");
+
+    expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_connect", {
+      server_id: "srv",
+      client_id: "byo-client-id",
+      client_secret: null,
+    });
   });
 
   it("oauthCancel invokes mcp_oauth_cancel with server_id", async () => {
@@ -209,15 +270,61 @@ describe("mcpStore OAuth actions", () => {
     expect(invokeMock).toHaveBeenCalledWith("mcp_oauth_cancel", { server_id: "srv" });
   });
 
-  it("oauthDisconnect invokes mcp_oauth_disconnect, clears local oauth status, then refreshes", async () => {
-    useMcpStore.setState({ oauthStatus: { srv: { phase: "connected", error: null } } });
-    invokeMock.mockResolvedValueOnce(undefined).mockResolvedValueOnce([makeInfo({ hasOauth: false })]);
+  it("oauthDisconnect stops the live transport before clearing credentials, then refreshes truthful state", async () => {
+    useMcpStore.setState({
+      servers: [
+        makeInfo({
+          status: "connected",
+          tools: [{ name: "search", description: null, inputSchema: {} }],
+          instructions: "Live instructions",
+          hasOauth: true,
+        }),
+      ],
+      oauthStatus: { srv: { phase: "connected", error: null } },
+    });
+    invokeMock
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce([makeInfo({ status: "disconnected", hasOauth: false })]);
 
     await useMcpStore.getState().oauthDisconnect("srv");
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_oauth_disconnect", { server_id: "srv" });
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_list_servers");
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_disconnect", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_oauth_disconnect", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "mcp_list_servers");
     expect(useMcpStore.getState().oauthStatus.srv).toBeUndefined();
+    expect(useMcpStore.getState().servers[0]).toMatchObject({
+      status: "disconnected",
+      hasOauth: false,
+      tools: [],
+      instructions: null,
+    });
+  });
+
+  it("oauthDisconnect keeps saved-credential state when keychain removal fails, but leaves the transport stopped", async () => {
+    const keychainError = new Error("keychain unavailable");
+    useMcpStore.setState({
+      servers: [makeInfo({ status: "connected", hasOauth: true })],
+      oauthStatus: { srv: { phase: "connected", error: null } },
+    });
+    invokeMock
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(keychainError)
+      .mockResolvedValueOnce([makeInfo({ status: "disconnected", hasOauth: true })]);
+
+    await expect(useMcpStore.getState().oauthDisconnect("srv")).rejects.toBe(keychainError);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mcp_disconnect", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "mcp_oauth_disconnect", { server_id: "srv" });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "mcp_list_servers");
+    expect(useMcpStore.getState().servers[0]).toMatchObject({
+      status: "disconnected",
+      hasOauth: true,
+    });
+    expect(useMcpStore.getState().oauthStatus.srv).toEqual({
+      phase: "connected",
+      error: null,
+    });
   });
 });
 

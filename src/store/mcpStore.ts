@@ -70,6 +70,26 @@ export interface McpServerInfo {
   hasOauth: boolean;
 }
 
+/** Whether the backend has actually observed an authentication failure for a
+ * credential-free HTTP server. HTTP transport alone is not evidence that a
+ * server is protected: public MCP endpoints are valid and must not be shown as
+ * broken merely because they have no saved token. */
+export function mcpServerNeedsAuthentication(server: McpServerInfo): boolean {
+  if (
+    server.transport.type !== "http" ||
+    server.status !== "error" ||
+    server.hasOauth ||
+    server.hasHttpToken ||
+    !server.error
+  ) {
+    return false;
+  }
+
+  return /(?:\b401\b|\b403\b|\bunauthori[sz]ed\b|\bforbidden\b|\bauthentication (?:is )?required\b|\bauthorization (?:is )?required\b|\b(?:missing|invalid|expired) (?:access |bearer |oauth )?token\b)/i.test(
+    server.error,
+  );
+}
+
 /** Progress phase of an in-flight (or just-finished) `oauthConnect` call —
  * mirrors the string values `mcp_oauth.rs`'s `emit_progress` produces via
  * the `mcp-oauth://status` event. `"idle"` is a frontend-only value (never
@@ -101,10 +121,12 @@ interface McpOAuthStatusEvent {
 
 /** Payload of the `hosted-oauth://status` Tauri event emitted by
  * `src-tauri/src/hosted_oauth.rs::emit_progress` — same shape as
- * `McpOAuthStatusEvent`/`McpOAuthPhase`, but for the Cloudflare-Worker-
- * brokered flow Slack/Google Drive/Gmail use instead of the generic
- * RFC 7591 one (neither provider supports dynamic client registration —
- * see that module's doc comment). Reuses `McpOAuthPhase`: the phases that
+ * `McpOAuthStatusEvent`/`McpOAuthPhase`, but for the broker-hosted flow, which
+ * needs a deployed service holding OAuth client secrets and is therefore not
+ * wired into any connector card in a public build (Slack/Google Drive/Gmail
+ * connect with the user's own OAuth app through `oauthConnect` instead — see
+ * `docs/byo-oauth-clients.md`). Kept for builds that run their own broker.
+ * Reuses `McpOAuthPhase`: the phases that
  * actually appear on this event are a subset (never `"needs_client_id"`,
  * since the Worker either has both providers' credentials configured or it
  * doesn't — there's no per-connect manual client id step). */
@@ -151,11 +173,25 @@ export interface McpStore {
   removeHttpToken: (id: string) => Promise<void>;
   /** Live progress of an in-flight/last `oauthConnect` call, keyed by server id — updated by `mcp-oauth://status` events. */
   oauthStatus: Record<string, McpOAuthStatus>;
-  /** Runs a full generic MCP-spec OAuth 2.0 connect for an HTTP server (RFC 8414 discovery, RFC 7591 dynamic client registration or `clientId` as a fallback, PKCE, opening the system browser, awaiting the loopback redirect). Progress streams via `oauthStatus`; this promise resolves once the flow finishes (or rejects on failure/cancellation). */
-  oauthConnect: (id: string, clientId?: string) => Promise<void>;
+  /** Runs a full generic MCP-spec OAuth 2.0 connect for an HTTP server (RFC 8414 discovery, RFC 7591 dynamic client registration or the user's own `clientId`/`clientSecret` as a fallback, PKCE, opening the system browser, awaiting the loopback redirect). Progress streams via `oauthStatus`; this promise resolves once the flow finishes (or rejects on failure/cancellation).
+   *
+   * `clientSecret` is only for providers that authenticate the client at the
+   * token endpoint (Google's installed-app clients do; most MCP-native
+   * providers don't). Both are remembered in the OS keychain by the backend,
+   * so omitting them on a later connect for the same server reuses what was
+   * saved. */
+  oauthConnect: (id: string, clientId?: string, clientSecret?: string) => Promise<void>;
+  /** The loopback redirect URI `oauthConnect` will use for `id` — what the user
+   * registers with their provider when bringing their own OAuth app. Stable per
+   * server id (see `loopback_port_for` in `mcp_oauth.rs`), so registering it
+   * once is enough, and computable without any network call or saved
+   * credential. */
+  oauthRedirectUri: (id: string) => Promise<string>;
   /** Cancels an in-flight `oauthConnect` for `id`. A no-op if none is running. */
   oauthCancel: (id: string) => Promise<void>;
-  /** Clears an HTTP server's saved OAuth credentials from the keychain. */
+  /** Disconnects the live MCP transport, then clears this HTTP server's saved
+   * OAuth credentials from the keychain. If credential removal fails, the
+   * transport stays disconnected and the saved-credential state is retained. */
   oauthDisconnect: (id: string) => Promise<void>;
   /** Materializes a bundled MCP server's embedded source (see
    * `src-tauri/src/bundled_mcp_servers.rs`) under the app data directory and
@@ -168,9 +204,11 @@ export interface McpStore {
    * `oauthStatus` since a given server id only ever uses one of the two
    * flows, but nothing stops both maps existing side by side. */
   hostedOauthStatus: Record<string, McpOAuthStatus>;
-  /** Starts the Cloudflare-Worker-brokered OAuth flow for `id` against
-   * `provider` (`"slack"` or `"google"`) — opens the system browser on the
-   * provider's real login page and returns as soon as that succeeds.
+  /** Starts the broker-hosted OAuth flow for `id` against `provider`
+   * (`"slack"` or `"google"`) — opens the system browser on the
+   * provider's real login page and returns as soon as that succeeds. Rejects
+   * outright on a build whose broker client ids are still placeholders, which
+   * is every public build; nothing in the UI calls this today.
    * Completion streams later via `hostedOauthStatus`/`hosted-oauth://status`
    * events (there's no local redirect listener to await here, unlike
    * `oauthConnect` — see `hosted_oauth.rs`'s module doc). */
@@ -235,13 +273,21 @@ export const useMcpStore = create<McpStore>((set, get) => ({
 
   oauthStatus: {},
 
-  oauthConnect: async (id, clientId) => {
+  oauthConnect: async (id, clientId, clientSecret) => {
     // `mcp-oauth://status` events (see the listener below) are the source
     // of truth for phase transitions while this is in flight; this just
     // seeds an immediate "discovering" phase so the UI doesn't sit blank
     // for the brief window before the first event arrives.
     set((state) => ({ oauthStatus: { ...state.oauthStatus, [id]: { phase: "discovering", error: null } } }));
-    await invoke("mcp_oauth_connect", { server_id: id, client_id: clientId ?? null });
+    await invoke("mcp_oauth_connect", {
+      server_id: id,
+      client_id: clientId ?? null,
+      client_secret: clientSecret ?? null,
+    });
+  },
+
+  oauthRedirectUri: async (id) => {
+    return await invoke<string>("mcp_oauth_redirect_uri", { server_id: id });
   },
 
   oauthCancel: async (id) => {
@@ -249,10 +295,42 @@ export const useMcpStore = create<McpStore>((set, get) => ({
   },
 
   oauthDisconnect: async (id) => {
-    await invoke("mcp_oauth_disconnect", { server_id: id });
+    // Credentials can back an already-running transport. Stop that transport
+    // first so "Disconnect OAuth" cannot leave a usable authenticated
+    // connection alive after the UI says it was disconnected.
+    await invoke("mcp_disconnect", { server_id: id });
+    set((state) => ({
+      servers: state.servers.map((server) =>
+        server.id === id
+          ? {
+              ...server,
+              status: "disconnected",
+              error: null,
+              tools: [],
+              instructions: null,
+            }
+          : server,
+      ),
+    }));
+
+    try {
+      await invoke("mcp_oauth_disconnect", { server_id: id });
+    } catch (error) {
+      // The transport is definitely stopped, but credentials may still exist.
+      // Refresh best-effort so the UI keeps that distinction truthful without
+      // hiding the original keychain error.
+      await get().refresh().catch(() => {});
+      throw error;
+    }
+
     set((state) => {
       const { [id]: _removed, ...rest } = state.oauthStatus;
-      return { oauthStatus: rest };
+      return {
+        oauthStatus: rest,
+        servers: state.servers.map((server) =>
+          server.id === id ? { ...server, hasOauth: false } : server,
+        ),
+      };
     });
     await get().refresh();
   },
