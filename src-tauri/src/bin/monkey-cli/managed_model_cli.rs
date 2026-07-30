@@ -261,11 +261,16 @@ fn chat_server_args(
 pub struct ManagedServerSession {
     child: Option<Child>,
     port: u16,
+    model_alias: String,
 }
 
 impl ManagedServerSession {
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", Ipv4Addr::LOCALHOST, self.port)
+    }
+
+    pub fn model_alias(&self) -> &str {
+        &self.model_alias
     }
 }
 
@@ -310,7 +315,18 @@ async fn wait_until_healthy(
             if response.status().is_success()
                 && server_reports_alias(client, port, expected_alias).await
             {
-                return Ok(());
+                // The port candidate was released before spawn, so another
+                // process can still win the bind race. Prove our child
+                // remains alive after the nonce identity response.
+                return match child.try_wait() {
+                    Ok(None) => Ok(()),
+                    Ok(Some(status)) => Err(format!(
+                        "Managed llama-server exited before becoming healthy ({status})"
+                    )),
+                    Err(error) => Err(format!(
+                        "Failed to inspect managed llama-server process: {error}"
+                    )),
+                };
             }
         }
         tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
@@ -377,12 +393,8 @@ pub async fn start_server(
     let binary = managed_llama_server(&data)?;
     for attempt in 1..=MAX_START_ATTEMPTS {
         let port = candidate_loopback_port()?;
-        let args = chat_server_args(
-            &installed.local_path,
-            port,
-            context_tokens,
-            &installed.resolved.canonical_reference,
-        );
+        let startup_alias = little_monkey_lib::llama::fresh_server_alias();
+        let args = chat_server_args(&installed.local_path, port, context_tokens, &startup_alias);
         eprintln!("Starting Little Monkey's managed llama-server on 127.0.0.1:{port}...");
 
         let mut command = Command::new(&binary);
@@ -401,19 +413,13 @@ pub async fn start_server(
             )
         })?;
 
-        match wait_until_healthy(
-            client,
-            &mut child,
-            port,
-            &installed.resolved.canonical_reference,
-        )
-        .await
-        {
+        match wait_until_healthy(client, &mut child, port, &startup_alias).await {
             Ok(()) => {
                 eprintln!("Managed model ready.");
                 return Ok(ManagedServerSession {
                     child: Some(child),
                     port,
+                    model_alias: startup_alias,
                 });
             }
             Err(error) => {
@@ -484,6 +490,14 @@ mod tests {
         ));
         assert!(!models_payload_reports_alias(payload, "other-model"));
         assert!(!models_payload_reports_alias(b"not-json", "other-model"));
+    }
+
+    #[test]
+    fn managed_startup_aliases_are_unique_nonces() {
+        let first = little_monkey_lib::llama::fresh_server_alias();
+        let second = little_monkey_lib::llama::fresh_server_alias();
+        assert_ne!(first, second);
+        assert!(!first.contains("hf:org/repo"));
     }
 
     #[test]

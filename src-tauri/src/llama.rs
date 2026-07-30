@@ -46,12 +46,20 @@ pub const EMBED_CTX: u32 = 2048;
 /// child, so never buffer an arbitrarily large `/v1/models` body.
 const MAX_MODELS_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Generates a per-process identity that cannot be predicted from the model
+/// path. Fixed ports may still have an orphan or unrelated server listening;
+/// only the child launched for this exact attempt can know this nonce alias.
+pub fn fresh_server_alias() -> String {
+    format!("little-monkey-{}", uuid::Uuid::new_v4().simple())
+}
+
 fn chat_server_args(
     model_path: &str,
     port: u16,
     ctx_size: u32,
     gpu_layers: i32,
     embeddings: bool,
+    alias: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "-m".into(),
@@ -66,7 +74,7 @@ fn chat_server_args(
         gpu_layers.to_string(),
         "--jinja".into(),
         "--alias".into(),
-        model_path.to_string(),
+        alias.to_string(),
     ];
     if embeddings {
         args.push("--embeddings".into());
@@ -80,7 +88,7 @@ fn chat_server_args(
 /// doc comment for why the CLI needs its own process lifecycle rather than
 /// reusing `embed_server_start` directly) launches the exact same flags
 /// rather than a second, potentially-drifting copy of them.
-pub fn embed_server_args(model_path: &str) -> Vec<String> {
+pub fn embed_server_args(model_path: &str, alias: &str) -> Vec<String> {
     vec![
         "-m".into(),
         model_path.to_string(),
@@ -96,7 +104,7 @@ pub fn embed_server_args(model_path: &str) -> Vec<String> {
         "--pooling".into(),
         "mean".into(),
         "--alias".into(),
-        model_path.to_string(),
+        alias.to_string(),
     ]
 }
 
@@ -474,7 +482,15 @@ pub async fn llama_start(
         guard.embeddings_enabled = embeddings;
     }
 
-    let args = chat_server_args(&model_path, port, ctx_size, gpu_layers, embeddings);
+    let startup_alias = fresh_server_alias();
+    let args = chat_server_args(
+        &model_path,
+        port,
+        ctx_size,
+        gpu_layers,
+        embeddings,
+        &startup_alias,
+    );
 
     spawn_and_wait_healthy(
         &app,
@@ -484,7 +500,7 @@ pub async fn llama_start(
         &args,
         port,
         &model_path,
-        &model_path,
+        &startup_alias,
     )
     .await
 }
@@ -540,7 +556,8 @@ pub async fn embed_server_start(
     .map_err(|error| format!("Managed model verification task failed: {error}"))??;
 
     let binary = find_llama_server_binary_for_app(&app)?;
-    let args = embed_server_args(&model_path);
+    let startup_alias = fresh_server_alias();
+    let args = embed_server_args(&model_path, &startup_alias);
 
     spawn_and_wait_healthy(
         &app,
@@ -550,14 +567,14 @@ pub async fn embed_server_start(
         &args,
         EMBED_PORT,
         &model_path,
-        &model_path,
+        &startup_alias,
     )
     .await?;
 
     let client = reqwest::Client::new();
     let verify = client
         .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
-        .json(&json!({ "model": model_path, "input": ["ready check"] }))
+        .json(&json!({ "model": startup_alias, "input": ["ready check"] }))
         .timeout(Duration::from_secs(10))
         .send()
         .await;
@@ -671,7 +688,14 @@ mod tests {
     #[test]
     fn desktop_server_args_bind_loopback_and_set_identity_alias() {
         assert_eq!(
-            chat_server_args("/models/chat.gguf", 8090, 4096, 99, true),
+            chat_server_args(
+                "/models/chat.gguf",
+                8090,
+                4096,
+                99,
+                true,
+                "little-monkey-chat-nonce",
+            ),
             [
                 "-m",
                 "/models/chat.gguf",
@@ -685,12 +709,12 @@ mod tests {
                 "99",
                 "--jinja",
                 "--alias",
-                "/models/chat.gguf",
+                "little-monkey-chat-nonce",
                 "--embeddings",
             ]
         );
         assert_eq!(
-            embed_server_args("/models/embed.gguf"),
+            embed_server_args("/models/embed.gguf", "little-monkey-embed-nonce"),
             [
                 "-m",
                 "/models/embed.gguf",
@@ -706,8 +730,18 @@ mod tests {
                 "--pooling",
                 "mean",
                 "--alias",
-                "/models/embed.gguf",
+                "little-monkey-embed-nonce",
             ]
         );
+    }
+
+    #[test]
+    fn startup_alias_is_unpredictable_and_path_independent() {
+        let first = fresh_server_alias();
+        let second = fresh_server_alias();
+        assert!(first.starts_with("little-monkey-"));
+        assert!(second.starts_with("little-monkey-"));
+        assert_ne!(first, second);
+        assert!(!first.contains('/') && !first.contains('\\'));
     }
 }
