@@ -3,6 +3,7 @@ import { Bot, ChevronRight } from "lucide-react";
 
 import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { CANCELLED_TOOL_RESULT } from "../../lib/turnEngine";
+import { unwrapUntrustedContent } from "../../lib/untrustedContent";
 import { useSubagentStore, type SubagentStatus } from "../../store/subagentStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { StatusPill, type PillTone } from "../ui";
@@ -122,7 +123,7 @@ export function statusLabelKey(status: SubagentStatus): string {
 export function resolveSubagentStatus(liveStatus: SubagentStatus | undefined, result: string | undefined): SubagentStatus {
   if (liveStatus) return liveStatus;
   if (result === undefined) return "running";
-  if (result === CANCELLED_TOOL_RESULT) return "cancelled";
+  if (unwrapUntrustedContent(result) === CANCELLED_TOOL_RESULT) return "cancelled";
   if (resultLooksLikeError(result)) return "error";
   return "done";
 }
