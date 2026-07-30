@@ -1420,7 +1420,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
       <RunningTasksChip onClick={onOpenBackgroundTasks} />
 
-      <div className="relative shrink-0 border-t border-border bg-background px-4 py-3">
+      <div className="relative shrink-0 bg-background px-4 py-3">
         <SideChatPanel sessionId={sessionId} />
         <WorkspaceBar sessionId={sessionId} />
         <div className="relative mx-auto max-w-3xl">

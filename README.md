@@ -79,6 +79,7 @@ The current working tree includes the shipped foundations described below. Some 
 - Seed a signed first-party catalog containing six skills (review, testing, documentation, browser QA, release preparation, and knowledge workflows) plus declarative GitHub, GitLab, WebDAV, and REST/webhook connector packages.
 - Inspect plugin health and component setup, use explicit package assistants, activate package workflow templates, and apply verified package rules to normal, Compare, and Crew turns with provenance.
 - Configure remote MCP OAuth metadata/tokens, preserve structured MCP content, route relevant tools without bypassing allowlists, and host interactive MCP Apps in an opaque-origin window with a narrow declared bridge and text fallback.
+- Connect remote MCP servers over OAuth without any client credentials shipped in this binary: servers that support dynamic client registration are one click, and the rest (Google, Slack) use an OAuth app you register yourself, stored in your keychain — see [docs/byo-oauth-clients.md](docs/byo-oauth-clients.md).
 - Build typed workflow DAGs visually with model, agent/subagent, tool, MCP, browser, Git/PR, shell, verify, transform, condition, bounded-loop, human-approval, artifact, and output nodes. Validate before saving, run from UI or CLI, inspect node history, cancel, replay from safe boundaries, and reconcile ambiguous external effects.
 - Attach manual, in-app cron, persistent cron, filesystem, signed-webhook, and event-ingestion triggers. Persistent triggers are hosted by the explicitly installed daemon.
 
