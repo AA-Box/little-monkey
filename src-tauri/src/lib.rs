@@ -417,14 +417,23 @@ pub struct AppState {
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
     /// Per-server cancellation signal for an in-flight `mcp_oauth_connect`
-    /// (see `mcp_oauth.rs`) — keyed by server id, mirroring `tool_cancel`'s
-    /// shape. `mcp_oauth_cancel` looks up the entry and calls
-    /// `notify_waiters()`; the connect command races its own flow against
-    /// `notified()` in a `tokio::select!` and removes its entry when done
-    /// (success, failure, or cancellation), so this map only ever holds
-    /// entries for genuinely in-flight connect attempts.
-    pub mcp_oauth_cancel:
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// (see `mcp_oauth.rs`) — keyed by server id. `mcp_oauth_cancel` calls the
+    /// shared `CancellationToken`'s `cancel()` method; every overlapping
+    /// connect races against `cancelled()`. Cancellation is sticky, so a
+    /// cancel arriving immediately before the waiter is polled cannot be lost
+    /// (unlike `Notify::notify_waiters`). The tuple's active-attempt count is
+    /// updated under the same mutex as the map, so the final overlapping call
+    /// removes the entry atomically and the next independent attempt receives
+    /// a fresh token.
+    pub mcp_oauth_cancel: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            (
+                std::sync::Arc<tokio_util::sync::CancellationToken>,
+                usize,
+            ),
+        >,
+    >,
     /// Per-server async lock serializing OAuth access-token retrieval/refresh
     /// (see `mcp_oauth::get_access_token_if_connected`) — keyed by server id.
     /// `connect_impl`'s `Http` branch calls that function on every
@@ -1005,6 +1014,7 @@ pub fn run() {
             mcp::mcp_call_tool,
             bundled_mcp_servers::mcp_stage_bundled_server,
             mcp_oauth::mcp_oauth_connect,
+            mcp_oauth::mcp_oauth_redirect_uri,
             mcp_oauth::mcp_oauth_cancel,
             mcp_oauth::mcp_oauth_disconnect,
             hosted_oauth::hosted_oauth_connect,

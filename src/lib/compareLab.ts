@@ -362,7 +362,10 @@ export function buildLabReport(run: LabRun): LabReport {
 }
 
 function escapeMarkdownCell(value: string): string {
-  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
+  // Escape backslashes in the same pass as pipes. Escaping pipes alone leaves
+  // `a\|b` as `a\\|b`, which markdown renders as a literal backslash followed
+  // by an unescaped pipe — the cell still breaks out of the table.
+  return value.replace(/[\\|]/g, "\\$&").replace(/\r?\n/g, " ").trim();
 }
 
 function formatMsForReport(value: number | null): string {

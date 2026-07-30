@@ -110,13 +110,15 @@ try {
     );
   }
   const bytes = Buffer.from(await response.arrayBuffer());
-  writeFileSync(archivePath, bytes);
-  const actualArchiveSha = sha256File(archivePath);
+  // Verify the pinned digest in memory, before the download reaches the
+  // filesystem, so an archive that fails its checksum is never written at all.
+  const actualArchiveSha = createHash("sha256").update(bytes).digest("hex");
   if (actualArchiveSha !== asset.sha256) {
     throw new Error(
       `Runtime archive checksum mismatch: expected ${asset.sha256}, got ${actualArchiveSha}`,
     );
   }
+  writeFileSync(archivePath, bytes);
 
   // bsdtar is present on GitHub's macOS/Linux/Windows images and on supported
   // local developer platforms. Passing each argument separately avoids a
