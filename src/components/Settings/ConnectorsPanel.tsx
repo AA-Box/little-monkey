@@ -36,7 +36,7 @@ import {
 } from "../../store/connectorsStore";
 import { useMcpStore, type McpOAuthPhase } from "../../store/mcpStore";
 import { useT } from "../../lib/i18n";
-import { McpPanel } from "./McpPanel";
+import { McpPanel, shouldShowManualOAuthClientFields } from "./McpPanel";
 
 const PROVIDER_ICONS: Record<ConnectorProvider, LucideIcon> = {
   github: GitPullRequest,
@@ -114,17 +114,22 @@ interface AppConnectorTemplate {
    * misleading "needs client id" error from `rmcp`'s legacy-fallback DCR
    * guess. Every other catalog entry is a real remote OAuth server. */
   requiresOAuth?: boolean;
-  /** Set only for Slack/Google Drive/Gmail — these providers don't support
-   * RFC 7591 dynamic client registration (confirmed against their own
-   * docs), so the generic `mcp_oauth.rs` flow can't give them one-click
-   * OAuth the way Notion/Stripe/PostHog/Atlassian get it. Instead they go
-   * through `hosted_oauth.rs`'s Cloudflare-Worker-brokered flow — see that
-   * module's doc comment. `hostedProvider` is the Worker-side provider id
-   * (`"google"` covers both `google-drive` and `gmail`, which share one
-   * Google OAuth client but request different scopes).
-   */
-  authMode?: "hosted";
-  hostedProvider?: "slack" | "google";
+  /** Set for Slack/Google Drive/Gmail — these providers don't support RFC 7591
+   * dynamic client registration (confirmed against their own docs), so
+   * connecting them can't be as one-click as Notion/Stripe/PostHog/Atlassian:
+   * the generic `mcp_oauth.rs` flow asks for the credentials of an OAuth app
+   * the user registers themselves, once, and keeps them in their keychain for
+   * later reconnects. Confidential clients use an id and secret; a public
+   * client may omit the secret only when its provider explicitly supports and
+   * enables PKCE. `docs/byo-oauth-clients.md` walks through it, and
+   * `appByoClientHint` says so on the card.
+   *
+   * This app can't do better than that without holding OAuth client secrets,
+   * which a public open-source binary can't keep secret from anyone who
+   * downloads it. (`hosted_oauth.rs` brokers exactly that through a server for
+   * builds that run one — it's deliberately not wired up here; see its module
+   * doc.) */
+  authMode?: "byoClient";
 }
 
 /** The "browse and one-click connect" catalog (mirrors the desktop app's
@@ -134,10 +139,10 @@ interface AppConnectorTemplate {
  * connects via the generic MCP-spec OAuth flow (`mcpStore.oauthConnect`),
  * same mechanism `McpPanel`'s per-server "Connect via OAuth" uses. */
 const APP_CONNECTORS: AppConnectorTemplate[] = [
-  { id: "slack", labelKey: "ConnectorsPanel.appSlackLabel", descriptionKey: "ConnectorsPanel.appSlackDescription", icon: MessageCircle, category: "communication", url: "https://mcp.slack.com/mcp", authMode: "hosted", hostedProvider: "slack" },
+  { id: "slack", labelKey: "ConnectorsPanel.appSlackLabel", descriptionKey: "ConnectorsPanel.appSlackDescription", icon: MessageCircle, category: "communication", url: "https://mcp.slack.com/mcp", authMode: "byoClient" },
   { id: "atlassian", labelKey: "ConnectorsPanel.appAtlassianLabel", descriptionKey: "ConnectorsPanel.appAtlassianDescription", icon: Ticket, category: "devTools", url: "https://mcp.atlassian.com/v1/mcp/authv2" },
-  { id: "google-drive", labelKey: "ConnectorsPanel.appGoogleDriveLabel", descriptionKey: "ConnectorsPanel.appGoogleDriveDescription", icon: HardDrive, category: "cloudStorage", url: "https://drivemcp.googleapis.com/mcp/v1", authMode: "hosted", hostedProvider: "google" },
-  { id: "gmail", labelKey: "ConnectorsPanel.appGmailLabel", descriptionKey: "ConnectorsPanel.appGmailDescription", icon: Mail, category: "communication", url: "https://gmailmcp.googleapis.com/mcp/v1", authMode: "hosted", hostedProvider: "google" },
+  { id: "google-drive", labelKey: "ConnectorsPanel.appGoogleDriveLabel", descriptionKey: "ConnectorsPanel.appGoogleDriveDescription", icon: HardDrive, category: "cloudStorage", url: "https://drivemcp.googleapis.com/mcp/v1", authMode: "byoClient" },
+  { id: "gmail", labelKey: "ConnectorsPanel.appGmailLabel", descriptionKey: "ConnectorsPanel.appGmailDescription", icon: Mail, category: "communication", url: "https://gmailmcp.googleapis.com/mcp/v1", authMode: "byoClient" },
   { id: "figma", labelKey: "ConnectorsPanel.appFigmaLabel", descriptionKey: "ConnectorsPanel.appFigmaDescription", icon: Palette, category: "creative", url: "http://127.0.0.1:3845/mcp", requiresOAuth: false },
   { id: "notion", labelKey: "ConnectorsPanel.appNotionLabel", descriptionKey: "ConnectorsPanel.appNotionDescription", icon: NotebookText, category: "productivity", url: "https://mcp.notion.com/mcp" },
   { id: "linear", labelKey: "ConnectorsPanel.appLinearLabel", descriptionKey: "ConnectorsPanel.appLinearDescription", icon: ListChecks, category: "devTools", url: "" },
@@ -181,42 +186,48 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
   const oauthConnect = useMcpStore((s) => s.oauthConnect);
   const oauthCancel = useMcpStore((s) => s.oauthCancel);
   const oauthDisconnect = useMcpStore((s) => s.oauthDisconnect);
-  const hostedOauthConnect = useMcpStore((s) => s.hostedOauthConnect);
-  const hostedOauthCancel = useMcpStore((s) => s.hostedOauthCancel);
-  const hostedOauthDisconnect = useMcpStore((s) => s.hostedOauthDisconnect);
+  const oauthRedirectUri = useMcpStore((s) => s.oauthRedirectUri);
   const connect = useMcpStore((s) => s.connect);
   const disconnect = useMcpStore((s) => s.disconnect);
-  const genericPhaseInfo = useMcpStore((s) => s.oauthStatus[template.id]);
-  const hostedPhaseInfo = useMcpStore((s) => s.hostedOauthStatus[template.id]);
+  const phaseInfo = useMcpStore((s) => s.oauthStatus[template.id]);
 
   const [urlInput, setUrlInput] = useState("");
   const [clientIdInput, setClientIdInput] = useState("");
+  const [clientSecretInput, setClientSecretInput] = useState("");
+  const [redirectUri, setRedirectUri] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [manualClientWasPrompted, setManualClientWasPrompted] = useState(false);
 
   const Icon = template.icon;
-  const isHosted = template.authMode === "hosted";
+  const needsOwnClient = template.authMode === "byoClient";
   const usesOAuth = template.requiresOAuth !== false;
   const server = servers.find((s) => s.id === template.id);
-  const phaseInfo = isHosted ? hostedPhaseInfo : genericPhaseInfo;
   const phase: McpOAuthPhase = phaseInfo?.phase ?? "idle";
   const needsUrlInput = !server && template.url.length === 0;
-  const isConnected = usesOAuth ? Boolean(server?.hasOauth) : server?.status === "connected";
+  const hasOauth = Boolean(server?.hasOauth);
+  const showManualClientFields = shouldShowManualOAuthClientFields(phase, manualClientWasPrompted);
+  // Saved credentials and a live transport are separate states. A credential
+  // surviving a failed keychain removal must not leave this card claiming the
+  // server is still connected.
+  const isConnected = server?.status === "connected";
 
-  // The hosted flow's Rust command returns as soon as the browser opens —
-  // completion (credential save) happens later, out of band, driven by the
-  // `hosted-oauth://status` "connected" event. Establish the actual live
-  // MCP connection once that lands, mirroring what the generic flow does
-  // inline within its own `handleConnect` below.
   useEffect(() => {
-    if (isHosted && phase === "connected" && server && server.status !== "connected") {
-      void connect(template.id);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isHosted, phase, server?.status]);
+    if (phase === "needs_client_id") setManualClientWasPrompted(true);
+  }, [phase]);
 
-  async function handleConnect(clientId?: string) {
+  // Same reason as `McpPanel`'s `OAuthConnectSection`: providers that want a
+  // client id usually want its redirect URI registered too, and getting that
+  // wrong fails on the provider's own error page, not in this app.
+  useEffect(() => {
+    if (phase !== "needs_client_id" || redirectUri !== null) return;
+    void oauthRedirectUri(template.id)
+      .then(setRedirectUri)
+      .catch(() => {});
+  }, [phase, redirectUri, oauthRedirectUri, template.id]);
+
+  async function handleConnect(clientId?: string, clientSecret?: string) {
     setError(null);
     setConnecting(true);
     try {
@@ -232,12 +243,8 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
           timeout_secs: 90,
         });
       }
-      if (isHosted) {
-        await hostedOauthConnect(template.id, template.hostedProvider ?? "slack");
-        // No further `.await` here — see the effect above for what happens
-        // once the browser round trip actually finishes.
-      } else if (usesOAuth) {
-        await oauthConnect(template.id, clientId);
+      if (usesOAuth) {
+        await oauthConnect(template.id, clientId, clientSecret);
         // Same reasoning as `OAuthConnectSection`: `mcp_oauth_connect` only
         // saves credentials, it doesn't itself (re)connect the server.
         await connect(template.id).catch(() => {});
@@ -255,14 +262,15 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
 
   async function handleDisconnect() {
     setDisconnecting(true);
+    setError(null);
     try {
-      if (isHosted) {
-        await hostedOauthDisconnect(template.id);
-      } else if (usesOAuth) {
+      if (usesOAuth) {
         await oauthDisconnect(template.id);
       } else {
         await disconnect(template.id);
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setDisconnecting(false);
     }
@@ -286,11 +294,44 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
       </div>
 
       {isConnected ? (
-        <div className="mt-3 flex items-center justify-between gap-2">
-          <StatusPill tone="success">{t("ConnectorsPanel.appConnectedLabel")}</StatusPill>
-          <Button variant="ghost" size="sm" onClick={() => void handleDisconnect()} disabled={disconnecting} className="text-danger hover:bg-danger-soft">
-            {disconnecting ? t("ConnectorsPanel.appDisconnectingButton") : t("ConnectorsPanel.appDisconnectButton")}
-          </Button>
+        <div className="mt-3 flex flex-col gap-1.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <StatusPill tone="success">{t("ConnectorsPanel.appConnectedLabel")}</StatusPill>
+            <div className="flex flex-wrap items-center justify-end gap-1.5">
+              {usesOAuth && hasOauth && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void handleConnect()}
+                  disabled={connecting || disconnecting}
+                >
+                  <RefreshCw size={12} className={connecting ? "animate-spin" : ""} />
+                  {connecting ? t("ConnectorsPanel.appReauthorizingButton") : t("ConnectorsPanel.appReauthorizeButton")}
+                </Button>
+              )}
+              {usesOAuth && connecting && (
+                <Button variant="ghost" size="sm" onClick={() => void oauthCancel(template.id)}>
+                  {t("ConnectorsPanel.appCancelButton")}
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void handleDisconnect()}
+                disabled={connecting || disconnecting}
+                className="text-danger hover:bg-danger-soft"
+              >
+                {disconnecting ? t("ConnectorsPanel.appDisconnectingButton") : t("ConnectorsPanel.appDisconnectButton")}
+              </Button>
+            </div>
+          </div>
+          {usesOAuth && phase !== "idle" && phase !== "connected" && (
+            <div>
+              <StatusPill tone={APP_OAUTH_PHASE_TONE[phase] ?? "neutral"}>{t(`ConnectorsPanel.appOauthPhase_${phase}`)}</StatusPill>
+            </div>
+          )}
+          {usesOAuth && phase === "error" && phaseInfo?.error && <p className="text-xs text-danger">{lastAppErrorLine(phaseInfo.error)}</p>}
+          {error && <p className="text-xs text-danger">{error}</p>}
         </div>
       ) : (
         <div className="mt-3 flex flex-col gap-1.5">
@@ -308,29 +349,41 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
               <StatusPill tone={APP_OAUTH_PHASE_TONE[phase] ?? "neutral"}>{t(`ConnectorsPanel.appOauthPhase_${phase}`)}</StatusPill>
             )}
             {usesOAuth && connecting && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => void (isHosted ? hostedOauthCancel(template.id) : oauthCancel(template.id))}
-              >
+              <Button variant="ghost" size="sm" onClick={() => void oauthCancel(template.id)}>
                 {t("ConnectorsPanel.appCancelButton")}
               </Button>
             )}
-            <Button
-              size="sm"
-              onClick={() => void handleConnect()}
-              disabled={connecting || (needsUrlInput && !urlInput.trim())}
-            >
-              {connecting
-                ? t("ConnectorsPanel.appConnectingButton")
-                : needsUrlInput
-                  ? t("ConnectorsPanel.appUrlSaveConnectButton")
-                  : t("ConnectorsPanel.appConnectButton")}
-            </Button>
+            {!showManualClientFields && (
+              <Button
+                size="sm"
+                onClick={() => void handleConnect()}
+                disabled={connecting || disconnecting || (needsUrlInput && !urlInput.trim())}
+              >
+                {disconnecting
+                  ? t("ConnectorsPanel.appDisconnectingButton")
+                  : connecting
+                    ? hasOauth
+                      ? t("ConnectorsPanel.appReauthorizingButton")
+                      : t("ConnectorsPanel.appConnectingButton")
+                    : needsUrlInput
+                      ? t("ConnectorsPanel.appUrlSaveConnectButton")
+                      : hasOauth
+                        ? t("ConnectorsPanel.appReauthorizeButton")
+                        : t("ConnectorsPanel.appConnectButton")}
+              </Button>
+            )}
           </div>
-          {usesOAuth && phase === "needs_client_id" && (
+          {/* Said before the first click, not only after the flow bounces off a
+              missing client id: these providers have no dynamic client
+              registration, so "Connect" is a two-step process and the user
+              needs to know a browser trip to their provider's console is part
+              of it. */}
+          {usesOAuth && needsOwnClient && !showManualClientFields && (
+            <p className="text-[11px] text-faint">{t("ConnectorsPanel.appByoClientHint")}</p>
+          )}
+          {usesOAuth && showManualClientFields && (
             <div className="flex flex-col gap-1">
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <input
                   type="text"
                   value={clientIdInput}
@@ -338,10 +391,38 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
                   placeholder={t("ConnectorsPanel.appClientIdPlaceholder")}
                   className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
                 />
-                <Button variant="ghost" size="sm" onClick={() => void handleConnect(clientIdInput.trim())} disabled={!clientIdInput.trim() || connecting}>
-                  {t("ConnectorsPanel.appContinueButton")}
+                {/* Confidential clients require a secret. A public client sends
+                    none, but its provider must explicitly support and enable
+                    PKCE for that app (including Slack's public-client mode). */}
+                <input
+                  type="password"
+                  value={clientSecretInput}
+                  onChange={(event) => setClientSecretInput(event.target.value)}
+                  placeholder={t("ConnectorsPanel.appClientSecretPlaceholder")}
+                  autoComplete="off"
+                  className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void handleConnect(clientIdInput.trim(), clientSecretInput.trim() || undefined)}
+                  disabled={!clientIdInput.trim() || connecting}
+                >
+                  {phase === "error" ? t("ConnectorsPanel.appRetryButton") : t("ConnectorsPanel.appContinueButton")}
                 </Button>
               </div>
+              {redirectUri && (
+                <div className="flex items-center gap-1.5">
+                  <span className="shrink-0 text-[11px] text-faint">{t("ConnectorsPanel.appRedirectUriLabel")}</span>
+                  <input
+                    type="text"
+                    value={redirectUri}
+                    readOnly
+                    onFocus={(event) => event.currentTarget.select()}
+                    className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface-2 px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+                  />
+                </div>
+              )}
               <p className="text-[11px] text-faint">{t("ConnectorsPanel.appClientIdHint")}</p>
             </div>
           )}

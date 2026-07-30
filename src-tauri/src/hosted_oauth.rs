@@ -54,10 +54,15 @@ const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
 /// ever sends anyway. Only the matching `client_secret`s (held by the
 /// Cloudflare Worker, never this app) are actually sensitive.
 ///
-/// TODO(ahmad): replace with the real values once the Slack app / Google
-/// Cloud OAuth client are registered (see the plan's Part B) — connecting
-/// Slack or Google Drive/Gmail will fail with an authorize-URL error from
-/// the provider until these are filled in.
+/// Still placeholders, and nothing in the shipped UI routes here because of
+/// it: the connector catalog (`ConnectorsPanel.tsx`) connects Slack/Google
+/// Drive/Gmail through `mcp_oauth.rs`'s bring-your-own-OAuth-app flow, which
+/// needs no broker and no credentials baked into a public binary. This module
+/// stays for builds that *do* run their own broker (and for anyone whose
+/// keychain still holds credentials it saved earlier); until these consts are
+/// filled in, [`provider_client_id`] refuses the flow with a message pointing
+/// at that alternative instead of opening a browser on an `invalid_client`
+/// error page.
 const SLACK_CLIENT_ID: &str = "TODO_SLACK_CLIENT_ID";
 const GOOGLE_CLIENT_ID: &str = "TODO_GOOGLE_CLIENT_ID";
 
@@ -165,9 +170,36 @@ fn provider_scope(provider: &str, server_id: &str) -> Result<&'static str, Strin
     }
 }
 
+/// The public client id for `provider`, or a clear error while it's still a
+/// placeholder.
+///
+/// This whole module needs a deployed broker holding client *secrets*, which a
+/// public open-source build can't ship — so on a build where these consts were
+/// never filled in, connecting here would send the user to a provider error
+/// page reading `invalid_client`. Failing before the browser opens, with the
+/// alternative named, is the difference between "this app is broken" and "use
+/// your own OAuth app": `mcp_oauth.rs`'s bring-your-own-client flow covers
+/// every one of these providers without any broker at all (see
+/// `docs/byo-oauth-clients.md`), and is what the Settings connector catalog
+/// points at by default.
+fn provider_client_id(provider: &str) -> Result<&'static str, String> {
+    let (client_id, placeholder) = match provider {
+        "slack" => (SLACK_CLIENT_ID, "TODO_SLACK_CLIENT_ID"),
+        "google" => (GOOGLE_CLIENT_ID, "TODO_GOOGLE_CLIENT_ID"),
+        other => return Err(format!("unknown hosted-oauth provider '{other}'")),
+    };
+    if client_id == placeholder {
+        return Err(format!(
+            "This build has no hosted OAuth client configured for {provider}, so the brokered sign-in can't run. Connect with your own OAuth app instead: open the server's Connection settings and use \"Connect via OAuth\" (see docs/byo-oauth-clients.md)."
+        ));
+    }
+    Ok(client_id)
+}
+
 fn authorize_url(provider: &str, server_id: &str, state: &str) -> Result<String, String> {
     let redirect_uri = format!("{BACKEND_BASE}/mcp/oauth/{provider}/callback");
     let scope = provider_scope(provider, server_id)?;
+    let client_id = provider_client_id(provider)?;
     let mut url = url::Url::parse(match provider {
         "slack" => "https://slack.com/oauth/v2_user/authorize",
         "google" => "https://accounts.google.com/o/oauth2/v2/auth",
@@ -177,14 +209,7 @@ fn authorize_url(provider: &str, server_id: &str, state: &str) -> Result<String,
     {
         let mut pairs = url.query_pairs_mut();
         pairs
-            .append_pair(
-                "client_id",
-                match provider {
-                    "slack" => SLACK_CLIENT_ID,
-                    "google" => GOOGLE_CLIENT_ID,
-                    _ => unreachable!("validated above"),
-                },
-            )
+            .append_pair("client_id", client_id)
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("state", state);
         if provider == "slack" {

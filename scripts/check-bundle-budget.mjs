@@ -1,5 +1,5 @@
 import { gzipSync } from "node:zlib";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const root = process.cwd();
@@ -20,9 +20,10 @@ const LIMITS = {
 
 function assetSize(file) {
   const path = resolve(dist, file);
-  const raw = statSync(path).size;
-  const gzip = gzipSync(readFileSync(path)).length;
-  return { file, raw, gzip };
+  // One read, not statSync + readFileSync: the raw size is the buffer length,
+  // so there is no window in which the file can change between the two calls.
+  const contents = readFileSync(path);
+  return { file, raw: contents.length, gzip: gzipSync(contents).length };
 }
 
 function kib(bytes) {
