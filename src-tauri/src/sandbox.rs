@@ -596,7 +596,12 @@ pub fn build_seatbelt_profile(
     read_roots.extend(
         readable_roots
             .iter()
-            .filter(|path| path.is_absolute() && path.as_path() != Path::new("/"))
+            // `has_root` rather than `is_absolute`: identical on Unix, but keeps
+            // this pure builder deterministic on Windows, where Unix-style
+            // Seatbelt roots like "/System/Library" have no drive prefix and
+            // `is_absolute()` would drop them (the profile is only ever
+            // consumed by sandbox-exec on macOS).
+            .filter(|path| path.has_root() && path.as_path() != Path::new("/"))
             .cloned(),
     );
     let ancestors = traversal_ancestors(&read_roots);
