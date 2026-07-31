@@ -10,11 +10,12 @@ import {
 } from "../../lib/companionClient";
 import { wrapUntrustedContent } from "../../lib/untrustedContent";
 import { Button, IconButton } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 const GRANT_LIFETIME_MS = 15 * 60_000;
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export function CompanionOverlay() {

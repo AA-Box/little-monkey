@@ -6,6 +6,7 @@ import { Button, StatusPill } from "../ui";
 import { ecosystemClient, type InstalledPackageState, type PackageCatalogEntry, type PackagePermission, type PortablePackageExport } from "../../lib/ecosystemClient";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
+import { errorMessage } from "../../lib/errors";
 
 type PreviewIntent = "install" | "update";
 
@@ -135,7 +136,7 @@ export function EcosystemPackages({ view }: { view: "marketplace" | "installed" 
         expected || value.bundle_sha256.toLowerCase(),
       );
     } catch (error) {
-      useEcosystemStore.setState({ error: error instanceof Error ? error.message : String(error) });
+      useEcosystemStore.setState({ error: errorMessage(error) });
     }
   }
 

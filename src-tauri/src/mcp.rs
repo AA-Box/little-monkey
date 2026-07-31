@@ -47,7 +47,8 @@ use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
     ClientRequest, ServerResult,
 };
-use rmcp::service::{PeerRequestOptions, RunningService};
+use rmcp::service::{PeerRequestOptions, RunningService, ServiceError};
+use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::RoleClient;
 use tauri::{Emitter, Manager};
 
@@ -381,20 +382,39 @@ pub async fn connect_impl(
                 rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                     url.clone(),
                 );
-            // An OAuth-connected server (see `mcp_oauth::mcp_oauth_connect`)
-            // takes priority over a manually pasted static token: its
-            // presence means the user explicitly ran the OAuth flow for this
-            // server id, and `get_access_token_if_connected` auto-refreshes
-            // the token if it's expired. `Ok(None)` means no OAuth
+            // An OAuth-connected server (either flow — see below) takes
+            // priority over a manually pasted static token: its presence
+            // means the user explicitly ran an OAuth flow for this server
+            // id, and both flows' `get_access_token_if_connected` auto-
+            // refresh an expired token. `Ok(None)` from both means no OAuth
             // credentials are stored for this id at all — fall back to
             // whatever static token (if any) was saved via
-            // `mcp_set_http_token`. An `Err` here (stored OAuth credentials
-            // exist but can't produce a usable token — e.g. refresh failed
-            // and re-authorization is required) is surfaced as a real
-            // connect failure rather than silently degrading to the static
-            // token, since that static token may be stale/absent precisely
-            // because OAuth was set up instead.
-            match crate::mcp_oauth::get_access_token_if_connected(state, &entry.id, url).await? {
+            // `mcp_set_http_token`. An `Err` (stored credentials exist but
+            // can't produce a usable token — e.g. refresh failed and
+            // re-authorization is required) is surfaced as a real connect
+            // failure rather than silently degrading to the static token,
+            // since that static token may be stale/absent precisely because
+            // OAuth was set up instead.
+            //
+            // Two flows, not one, because not every provider can use the
+            // first: `mcp_oauth`'s generic RFC 7591 dynamic-client-
+            // registration + loopback-redirect flow works for servers that
+            // support it (Atlassian, Notion, Stripe, PostHog, ...); Slack
+            // and Google Drive/Gmail don't (confirmed against their own
+            // docs — no DCR, and Slack additionally requires a
+            // `client_secret` no desktop binary can hold safely), so those
+            // three go through `hosted_oauth`'s Cloudflare-Worker-brokered
+            // flow instead. A given server id only ever has credentials in
+            // one of the two.
+            let oauth_token =
+                match crate::hosted_oauth::get_access_token_if_connected(state, &entry.id).await? {
+                    Some(token) => Some(token),
+                    None => {
+                        crate::mcp_oauth::get_access_token_if_connected(state, &entry.id, url)
+                            .await?
+                    }
+                };
+            match oauth_token {
                 Some(token) => config = config.auth_header(token),
                 None => {
                     if let Some(token) = read_http_token(&entry.id) {
@@ -550,6 +570,116 @@ async fn resolve_call_tool(
     Ok((peer, params))
 }
 
+/// A single call attempt keeps a genuine streamable-HTTP authentication
+/// rejection distinct from every other failure until the retry decision has
+/// been made. In particular, a JSON-RPC/tool error is always `Other`, even if
+/// its message happens to contain "401", "unauthorized", or "invalid_token".
+#[derive(Debug)]
+enum ToolCallAttemptError {
+    TransportAuthRequired(String),
+    Other(String),
+}
+
+impl ToolCallAttemptError {
+    fn into_message(self) -> String {
+        match self {
+            Self::TransportAuthRequired(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+fn transport_auth_status_message<T>(outcome: &Result<T, ToolCallAttemptError>) -> Option<&str> {
+    match outcome {
+        Err(ToolCallAttemptError::TransportAuthRequired(message)) => Some(message),
+        Ok(_) | Err(ToolCallAttemptError::Other(_)) => None,
+    }
+}
+
+/// Whether `error` is the streamable-HTTP transport itself reporting an HTTP
+/// 401. `rmcp` normally represents that as `AuthRequired`; a server that omits
+/// the required `WWW-Authenticate` header instead becomes an
+/// `UnexpectedServerResponse("HTTP 401 ...")`, so accept that narrowly typed
+/// transport case too. Never inspect a JSON-RPC/tool error's text.
+fn is_transport_auth_required(error: &ServiceError) -> bool {
+    let ServiceError::TransportSend(transport_error) = error else {
+        return false;
+    };
+    let Some(http_error) = transport_error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+    else {
+        return false;
+    };
+
+    match http_error {
+        StreamableHttpError::AuthRequired(_) => true,
+        StreamableHttpError::UnexpectedServerResponse(message) => message
+            .strip_prefix("HTTP ")
+            .is_some_and(|rest| rest.starts_with("401 ") || rest.starts_with("401:")),
+        StreamableHttpError::Client(error) => {
+            error.status() == Some(reqwest::StatusCode::UNAUTHORIZED)
+        }
+        _ => false,
+    }
+}
+
+fn classify_tool_call_error(
+    tool_name: &str,
+    server_id: &str,
+    error: ServiceError,
+) -> ToolCallAttemptError {
+    let auth_required = is_transport_auth_required(&error);
+    let message = format!(
+        "MCP tool call to '{}' on '{}' failed: {}",
+        tool_name, server_id, error
+    );
+    if auth_required {
+        ToolCallAttemptError::TransportAuthRequired(message)
+    } else {
+        ToolCallAttemptError::Other(message)
+    }
+}
+
+/// Whether a failed tool call is worth retrying after re-establishing the
+/// connection: only for an HTTP server whose token this app can actually
+/// re-mint, i.e. one with OAuth credentials saved. A static pasted token
+/// wouldn't change on reconnect, and a stdio server has no token at all.
+fn can_retry_after_reauth(entry: &McpServerEntry) -> bool {
+    matches!(entry.transport, McpTransport::Http { .. })
+        && (crate::mcp_oauth::has_oauth_credentials(&entry.id)
+            || crate::hosted_oauth::has_oauth_credentials(&entry.id))
+}
+
+#[derive(Debug, PartialEq)]
+enum ReconnectAttemptError {
+    Cancelled(String),
+    Failed(String),
+}
+
+/// Re-establishes an authenticated connection without letting the reconnect
+/// bypass the call's existing Stop/timeout signal. The explicit connection
+/// bound is needed because [`connect_impl`] is deliberately unbounded.
+async fn reconnect_with_cancel<F, C, T>(
+    reconnect: F,
+    mut cancel: std::pin::Pin<&mut C>,
+    server_id: &str,
+    timeout: Duration,
+) -> Result<T, ReconnectAttemptError>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+    C: std::future::Future<Output = String> + ?Sized,
+{
+    tokio::select! {
+        result = reconnect => result.map_err(ReconnectAttemptError::Failed),
+        reason = &mut cancel => Err(ReconnectAttemptError::Cancelled(reason)),
+        _ = tokio::time::sleep(timeout) => Err(ReconnectAttemptError::Failed(format!(
+            "Reconnecting to MCP server '{}' timed out after {} seconds",
+            server_id,
+            timeout.as_secs()
+        ))),
+    }
+}
+
 /// Validates that `tool_name` is both currently offered by the connected
 /// server AND permitted by `entry.tool_allowlist` (when set), then calls it
 /// with `arguments` — genuinely cancellably: if `cancel` resolves with a
@@ -583,7 +713,74 @@ pub async fn call_tool_with_cancel_impl(
     arguments: serde_json::Value,
     cancel: impl std::future::Future<Output = String>,
 ) -> Result<CallToolResult, String> {
-    let (peer, params) = resolve_call_tool(state, entry, tool_name, arguments).await?;
+    call_tool_with_cancel_classified(state, entry, tool_name, arguments, cancel)
+        .await
+        .map_err(ToolCallAttemptError::into_message)
+}
+
+async fn call_tool_with_cancel_classified(
+    state: &AppState,
+    entry: &McpServerEntry,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    cancel: impl std::future::Future<Output = String>,
+) -> Result<CallToolResult, ToolCallAttemptError> {
+    tokio::pin!(cancel);
+
+    // An HTTP server's bearer token is baked into its transport's
+    // `Authorization` header when `connect_impl` builds it, so a token that
+    // expires while the connection is up (an OAuth access token typically
+    // lasts an hour; connections here live as long as the app does) turns
+    // every subsequent tool call into a 401 that no amount of retrying at the
+    // same connection can fix. Reconnect once — which re-reads the keychain
+    // and refreshes the access token via `get_access_token_if_connected` —
+    // and replay the call.
+    //
+    // Safe to replay specifically because the failure was an auth rejection:
+    // the server refused the request before running the tool, so this can't
+    // duplicate a side effect. No other error class is retried here.
+    match call_tool_once(state, entry, tool_name, arguments.clone(), cancel.as_mut()).await {
+        Err(ToolCallAttemptError::TransportAuthRequired(message))
+            if can_retry_after_reauth(entry) =>
+        {
+            match reconnect_with_cancel(
+                connect_impl(state, entry),
+                cancel.as_mut(),
+                &entry.id,
+                Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(ReconnectAttemptError::Cancelled(reason)) => {
+                    return Err(ToolCallAttemptError::Other(reason));
+                }
+                Err(ReconnectAttemptError::Failed(reconnect_error)) => {
+                    return Err(ToolCallAttemptError::TransportAuthRequired(format!(
+                        "{message}\n\nReconnecting to refresh authorization also failed: {reconnect_error}"
+                    )));
+                }
+            }
+            call_tool_once(state, entry, tool_name, arguments, cancel.as_mut()).await
+        }
+        Err(error) => Err(error),
+        Ok(result) => Ok(result),
+    }
+}
+
+/// One attempt of [`call_tool_with_cancel_impl`] — see that function for the
+/// contract; this is split out only so the auth-expiry retry above can run the
+/// same body twice against the same (still-pending) `cancel` future.
+async fn call_tool_once(
+    state: &AppState,
+    entry: &McpServerEntry,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    mut cancel: std::pin::Pin<&mut impl std::future::Future<Output = String>>,
+) -> Result<CallToolResult, ToolCallAttemptError> {
+    let (peer, params) = resolve_call_tool(state, entry, tool_name, arguments)
+        .await
+        .map_err(ToolCallAttemptError::Other)?;
 
     let handle = peer
         .send_cancellable_request(
@@ -591,12 +788,7 @@ pub async fn call_tool_with_cancel_impl(
             PeerRequestOptions::no_options(),
         )
         .await
-        .map_err(|e| {
-            format!(
-                "MCP tool call to '{}' on '{}' failed: {}",
-                tool_name, entry.id, e
-            )
-        })?;
+        .map_err(|error| classify_tool_call_error(tool_name, &entry.id, error))?;
 
     // Captured before `handle` is moved into `handle.await_response()` below
     // — everything `notify_cancelled` needs to tell the server to stop this
@@ -605,23 +797,21 @@ pub async fn call_tool_with_cancel_impl(
     let cancel_peer = handle.peer.clone();
     let cancel_request_id = handle.id.clone();
 
-    tokio::pin!(cancel);
-
     tokio::select! {
         response = handle.await_response() => response
-            .map_err(|e| format!("MCP tool call to '{}' on '{}' failed: {}", tool_name, entry.id, e))
+            .map_err(|error| classify_tool_call_error(tool_name, &entry.id, error))
             .and_then(|result| match result {
                 ServerResult::CallToolResult(result) => Ok(result),
-                _ => Err(format!(
+                _ => Err(ToolCallAttemptError::Other(format!(
                     "MCP server '{}' returned an unexpected response type for tool '{}'",
                     entry.id, tool_name
-                )),
+                ))),
             }),
         reason = &mut cancel => {
             let _ = cancel_peer
                 .notify_cancelled(CancelledNotificationParam::new(Some(cancel_request_id), Some(reason.clone())))
                 .await;
-            Err(reason)
+            Err(ToolCallAttemptError::Other(reason))
         }
     }
 }
@@ -692,7 +882,8 @@ fn build_info(
         has_http_token: matches!(entry.transport, McpTransport::Http { .. })
             && read_http_token(&entry.id).is_some(),
         has_oauth: matches!(entry.transport, McpTransport::Http { .. })
-            && crate::mcp_oauth::has_oauth_credentials(&entry.id),
+            && (crate::mcp_oauth::has_oauth_credentials(&entry.id)
+                || crate::hosted_oauth::has_oauth_credentials(&entry.id)),
     }
 }
 
@@ -856,6 +1047,7 @@ pub async fn mcp_remove_server(
     // fails the removal itself over keychain cleanup.
     let _ = remove_http_token_impl(&server_id);
     let _ = crate::mcp_oauth::remove_oauth_credentials_impl(&server_id);
+    let _ = crate::hosted_oauth::remove_oauth_credentials(&server_id);
     Ok(())
 }
 
@@ -1052,9 +1244,14 @@ pub async fn mcp_call_tool(
         }
     };
 
-    let outcome =
-        call_tool_with_cancel_impl(state.inner(), &entry, &tool_name, arguments, cancel_reason)
-            .await;
+    let outcome = call_tool_with_cancel_classified(
+        state.inner(),
+        &entry,
+        &tool_name,
+        arguments,
+        cancel_reason,
+    )
+    .await;
 
     // Drop this turn's cancel channel once no other MCP/shell call for the
     // same turn still holds it — same bookkeeping as `tool_run_shell`.
@@ -1071,7 +1268,11 @@ pub async fn mcp_call_tool(
         }
     }
 
-    outcome
+    if let Some(message) = transport_auth_status_message(&outcome) {
+        emit_status(&app, &server_id, "error", Some(message.to_string()), None);
+    }
+
+    outcome.map_err(ToolCallAttemptError::into_message)
 }
 
 #[cfg(test)]
@@ -1108,6 +1309,155 @@ mod tests {
             tool_allowlist: None,
             timeout_secs: None,
         }
+    }
+
+    fn http_entry(id: &str) -> McpServerEntry {
+        McpServerEntry {
+            id: id.to_string(),
+            label: format!("Test server {id}"),
+            transport: McpTransport::Http {
+                url: "https://example.test/mcp".to_string(),
+            },
+            enabled: true,
+            tool_allowlist: None,
+            timeout_secs: None,
+        }
+    }
+
+    // --- expired-token retry ---------------------------------------------
+
+    #[test]
+    fn typed_streamable_http_auth_rejection_is_retry_eligible() {
+        let http_error = StreamableHttpError::<reqwest::Error>::AuthRequired(
+            rmcp::transport::streamable_http_client::AuthRequiredError::new(
+                "Bearer realm=\"test\"".to_string(),
+            ),
+        );
+        let error =
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "test streamable HTTP transport",
+                std::any::TypeId::of::<()>(),
+                Box::new(http_error),
+            ));
+
+        assert!(is_transport_auth_required(&error));
+    }
+
+    #[test]
+    fn typed_headerless_http_401_is_retry_eligible() {
+        let http_error = StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+            std::borrow::Cow::Borrowed("HTTP 401 Unauthorized: token expired"),
+        );
+        let error =
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "test streamable HTTP transport",
+                std::any::TypeId::of::<()>(),
+                Box::new(http_error),
+            ));
+
+        assert!(is_transport_auth_required(&error));
+    }
+
+    #[test]
+    fn tool_level_401_is_never_retry_eligible() {
+        let error = ServiceError::McpError(rmcp::model::ErrorData::internal_error(
+            "401 Unauthorized: invalid_token while creating the draft",
+            None,
+        ));
+
+        let outcome: Result<(), ToolCallAttemptError> =
+            Err(classify_tool_call_error("create_draft", "gmail", error));
+
+        assert!(matches!(
+            &outcome,
+            Err(ToolCallAttemptError::Other(message))
+                if message.contains("401 Unauthorized")
+                    && message.contains("invalid_token")
+        ));
+        assert!(transport_auth_status_message(&outcome).is_none());
+    }
+
+    #[test]
+    fn typed_transport_auth_rejection_surfaces_as_status_error() {
+        let http_error = StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+            std::borrow::Cow::Borrowed("HTTP 401 Unauthorized: token expired"),
+        );
+        let error =
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "test streamable HTTP transport",
+                std::any::TypeId::of::<()>(),
+                Box::new(http_error),
+            ));
+        let outcome: Result<(), ToolCallAttemptError> =
+            Err(classify_tool_call_error("send_message", "slack", error));
+
+        let status_message =
+            transport_auth_status_message(&outcome).expect("transport 401 should update status");
+        assert!(status_message.contains("send_message"));
+        assert!(status_message.contains("slack"));
+        assert!(status_message.contains("HTTP 401 Unauthorized"));
+    }
+
+    #[test]
+    fn non_http_transport_error_text_is_never_retry_eligible() {
+        let error =
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "test non-HTTP transport",
+                std::any::TypeId::of::<()>(),
+                Box::new(std::io::Error::other(
+                    "Auth required: HTTP 401 Unauthorized invalid_token",
+                )),
+            ));
+
+        assert!(!is_transport_auth_required(&error));
+    }
+
+    #[test]
+    fn only_oauth_connected_http_servers_are_worth_retrying_after_reauth() {
+        // A stdio server has no bearer token to re-mint, so a reconnect+replay
+        // would only duplicate the failure.
+        assert!(!can_retry_after_reauth(&stdio_entry("local", "echo", &[])));
+
+        // An HTTP server with no OAuth credentials saved (the case that
+        // produced the original Gmail failure, and a static pasted token) —
+        // reconnecting can't produce a token it doesn't have.
+        assert!(!can_retry_after_reauth(&http_entry("no-credentials-saved")));
+    }
+
+    #[tokio::test]
+    async fn reauth_reconnect_obeys_existing_cancel_signal() {
+        let mut cancel = Box::pin(async { "MCP tool call cancelled by the user".to_string() });
+        let result: Result<(), ReconnectAttemptError> = reconnect_with_cancel(
+            std::future::pending(),
+            cancel.as_mut(),
+            "gmail",
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            ReconnectAttemptError::Cancelled("MCP tool call cancelled by the user".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reauth_reconnect_has_a_connection_timeout() {
+        let mut cancel = Box::pin(std::future::pending::<String>());
+        let result: Result<(), ReconnectAttemptError> = reconnect_with_cancel(
+            std::future::pending(),
+            cancel.as_mut(),
+            "gmail",
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            ReconnectAttemptError::Failed(
+                "Reconnecting to MCP server 'gmail' timed out after 0 seconds".to_string()
+            )
+        );
     }
 
     // --- config load/save/CRUD -------------------------------------------

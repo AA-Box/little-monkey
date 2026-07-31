@@ -19,6 +19,7 @@ import {
 import { useConnectorsStore } from "../../store/connectorsStore";
 import { getActiveChatTarget } from "../../store/modelStore";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 const SOURCE_ICONS: Record<TriageSource, LucideIcon> = {
   github: GitPullRequest,
@@ -189,7 +190,7 @@ function ItemDetail({ item, onDiscard }: { item: TriageItem; onDiscard: (itemId:
     try {
       await generateDraft(item.id, chatTarget.providerId, chatTarget.model);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setGenerating(false);
     }
@@ -201,7 +202,7 @@ function ItemDetail({ item, onDiscard }: { item: TriageItem; onDiscard: (itemId:
     try {
       await sendDraft(item.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
       setSending(false);
     }
   }

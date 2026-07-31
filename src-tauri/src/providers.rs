@@ -401,9 +401,10 @@ pub async fn fetch_models(
     Ok(models)
 }
 
-/// Returns the built-in provider presets, so the frontend carries zero
-/// hardcoded provider URLs of its own.
-#[tauri::command]
+/// Returns the built-in provider presets for native API/CLI consumers.
+/// Desktop IPC uses [`providers_list_configured`], which already includes
+/// these entries and their live keychain status, so exposing a second Tauri
+/// command would only create two overlapping frontend contracts.
 pub fn providers_list_presets() -> Vec<ProviderPreset> {
     PROVIDER_PRESETS
         .iter()

@@ -1,10 +1,12 @@
 //! Lifecycle management for managed `llama-server` (llama.cpp) processes.
 //!
-//! Little Monkey does not bundle or auto-download the `llama-server` binary — it must
-//! already be installed on the host (e.g. via `brew install llama.cpp`). This
-//! module locates that binary, spawns it against a chosen GGUF model, polls
-//! its `/health` endpoint until it is ready to serve requests, and exposes
-//! Tauri commands so the frontend can start/stop it and read its status.
+//! Release builds bundle a pinned, checksum-verified `llama-server` runtime
+//! and materialize it inside Little Monkey's app-data directory. Developer
+//! builds still fall back to a host installation when no staged resource is
+//! present. This module locates that binary, spawns it against a chosen GGUF
+//! model, polls its `/health` endpoint until it is ready to serve requests,
+//! and exposes Tauri commands so the frontend can start/stop it and read its
+//! status.
 //!
 //! Two independent instances share the same spawn/health-poll/kill core
 //! ([`spawn_and_wait_healthy`]): the chat instance (`AppState::llama`, port
@@ -16,12 +18,12 @@
 //! never has to fight the chat model for the same server slot, and so
 //! stopping/restarting one never interrupts the other.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::AppState;
 
@@ -39,6 +41,46 @@ pub const EMBED_PORT: u16 = 8091;
 /// so `monkey-cli`'s `embed_cli::start` can build the exact same args via
 /// [`embed_server_args`].
 pub const EMBED_CTX: u32 = 2048;
+/// Upper bound for the startup identity response. A local process on the
+/// fixed port is untrusted until it proves the exact alias we passed to the
+/// child, so never buffer an arbitrarily large `/v1/models` body.
+const MAX_MODELS_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Generates a per-process identity that cannot be predicted from the model
+/// path. Fixed ports may still have an orphan or unrelated server listening;
+/// only the child launched for this exact attempt can know this nonce alias.
+pub fn fresh_server_alias() -> String {
+    format!("little-monkey-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn chat_server_args(
+    model_path: &str,
+    port: u16,
+    ctx_size: u32,
+    gpu_layers: i32,
+    embeddings: bool,
+    alias: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-m".into(),
+        model_path.to_string(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "-c".into(),
+        ctx_size.to_string(),
+        "-ngl".into(),
+        gpu_layers.to_string(),
+        "--jinja".into(),
+        "--alias".into(),
+        alias.to_string(),
+    ];
+    if embeddings {
+        args.push("--embeddings".into());
+    }
+    args
+}
 
 /// Builds the embeddings-only `llama-server` process's argument list for
 /// `model_path` — factored out of [`embed_server_start`] so `monkey-cli`'s
@@ -46,7 +88,7 @@ pub const EMBED_CTX: u32 = 2048;
 /// doc comment for why the CLI needs its own process lifecycle rather than
 /// reusing `embed_server_start` directly) launches the exact same flags
 /// rather than a second, potentially-drifting copy of them.
-pub fn embed_server_args(model_path: &str) -> Vec<String> {
+pub fn embed_server_args(model_path: &str, alias: &str) -> Vec<String> {
     vec![
         "-m".into(),
         model_path.to_string(),
@@ -61,6 +103,8 @@ pub fn embed_server_args(model_path: &str) -> Vec<String> {
         "--embeddings".into(),
         "--pooling".into(),
         "mean".into(),
+        "--alias".into(),
+        alias.to_string(),
     ]
 }
 
@@ -106,11 +150,19 @@ impl LlamaState {
     }
 }
 
-/// Locate the `llama-server` binary: first on PATH (via `which`), then in the
-/// common Homebrew install locations. `pub` (not module-private) so
+/// Locate `llama-server`: first the verified app-owned runtime shared by the
+/// desktop and CLI, then PATH/common Homebrew locations as a developer
+/// fallback. `pub` (not module-private) so
 /// `monkey-cli`'s `embed_cli::start` (RAG design doc slice 4 CLI parity) can
 /// resolve the same binary without re-implementing this search.
 pub fn find_llama_server_binary() -> Result<String, String> {
+    if let Some(app_data_dir) = crate::app_paths::data_dir() {
+        let _ = crate::managed_runtime::materialize_bundled_runtime(None, &app_data_dir);
+        if let Some(path) = crate::managed_runtime::find_managed_llama_server(Some(&app_data_dir)) {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+    }
+
     if let Ok(output) = Command::new("which").arg("llama-server").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -130,13 +182,36 @@ pub fn find_llama_server_binary() -> Result<String, String> {
     }
 
     Err(
-        "Could not find the `llama-server` binary on your PATH or in common install locations.\n\n\
-         Install llama.cpp to get it:\n\n  brew install llama.cpp\n\n\
-         (On Linux, install via your package manager or build llama.cpp from source: \
-         https://github.com/ggerganov/llama.cpp). Once installed, make sure `llama-server` \
-         is on your PATH and try again."
+        "Little Monkey's managed llama.cpp runtime is missing or failed verification. \
+         Reinstall Little Monkey to restore the bundled runtime. Developers running from source \
+         can run `pnpm stage:runtime` or put `llama-server` on PATH."
             .to_string(),
     )
+}
+
+/// Desktop-specific resolver that can use Tauri's authoritative resource
+/// directory even when the current executable layout is non-standard (for
+/// example an installer-managed Windows resource directory). Successful
+/// materialization makes the same runtime available to the standalone CLI.
+fn find_llama_server_binary_for_app(app: &AppHandle) -> Result<String, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    let resource_dir = app.path().resource_dir().ok();
+    match crate::managed_runtime::materialize_bundled_runtime(
+        resource_dir.as_deref(),
+        &app_data_dir,
+    ) {
+        Ok(Some(path)) => return Ok(path.to_string_lossy().into_owned()),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(format!(
+                "Little Monkey's bundled llama.cpp runtime failed verification: {error}"
+            ))
+        }
+    }
+    find_llama_server_binary()
 }
 
 /// Emit a status event (`llama://status` or `embed://status`) to all windows
@@ -158,13 +233,92 @@ fn emit_status(
     );
 }
 
+/// Returns whether a bounded OpenAI-compatible models payload contains the
+/// exact alias passed to the child. Substrings and malformed payloads never
+/// establish process identity.
+fn models_payload_reports_alias(bytes: &[u8], expected_alias: &str) -> bool {
+    let payload: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    payload["data"].as_array().is_some_and(|models| {
+        models
+            .iter()
+            .any(|model| model["id"].as_str() == Some(expected_alias))
+    })
+}
+
+/// Checks the fixed-port service's bounded `/v1/models` response for the
+/// exact startup alias. This is public so the standalone embedding CLI can
+/// apply the same identity boundary as the desktop process manager.
+pub async fn server_reports_alias(
+    client: &reqwest::Client,
+    port: u16,
+    expected_alias: &str,
+) -> bool {
+    let models_url = format!("http://127.0.0.1:{port}/v1/models");
+    let mut response = match client
+        .get(models_url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return false,
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
+    {
+        return false;
+    }
+
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => return false,
+        };
+        if bytes.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+            return false;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    models_payload_reports_alias(&bytes, expected_alias)
+}
+
+/// Reports a startup failure when the child exited or disappeared from the
+/// managed state. This check deliberately runs both before probing the port
+/// and again after HTTP identity succeeds: a different service can answer on
+/// a fixed port while our child is still in the process of failing its bind.
+fn spawned_child_failure(state: &std::sync::Mutex<LlamaState>) -> Result<Option<String>, String> {
+    let mut guard = state.lock().map_err(|error| error.to_string())?;
+    let Some(child) = guard.process.as_mut() else {
+        return Ok(Some(
+            "Managed llama-server child disappeared during startup".to_string(),
+        ));
+    };
+    match child.try_wait() {
+        Ok(Some(exit_status)) => Ok(Some(format!(
+            "llama-server exited unexpectedly before becoming ready (status: {exit_status})"
+        ))),
+        Ok(None) => Ok(None),
+        Err(error) => Ok(Some(format!(
+            "Failed to check llama-server process status: {error}"
+        ))),
+    }
+}
+
 /// Shared spawn + health-poll body for a managed `llama-server` instance —
 /// used by both [`llama_start`] (chat instance) and [`embed_server_start`]
-/// (embeddings instance). Kills any previous process already held in
-/// `state`, spawns `binary` with `args`, then polls `GET /health` on `port`
-/// for up to 60s, updating `state`'s status and emitting `event_name` status
-/// events along the way. On success `state.status == "ready"`; on failure or
-/// timeout the process is killed and `state.status == "error"`.
+/// (embeddings instance). Kills any previous process already held in `state`,
+/// spawns `binary` with `args`, then polls `GET /health` and bounded
+/// `GET /v1/models` identity on `port` for up to 60s. Readiness requires the
+/// exact alias passed to the spawned child and a final child-liveness recheck;
+/// this prevents an unrelated service on the fixed port from being accepted.
+/// On success `state.status == "ready"`; on failure or timeout the process is
+/// killed and `state.status == "error"`.
 ///
 /// Does NOT perform any embeddings-specific verification — `/health` only
 /// proves the process is alive, not that `/v1/embeddings` actually works
@@ -178,6 +332,7 @@ async fn spawn_and_wait_healthy(
     args: &[String],
     port: u16,
     model_path: &str,
+    expected_alias: &str,
 ) -> Result<(), String> {
     {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
@@ -235,24 +390,8 @@ async fn spawn_and_wait_healthy(
     let mut failure: Option<String> = None;
 
     while Instant::now() < deadline {
-        {
-            let mut guard = state.lock().map_err(|e| e.to_string())?;
-            if let Some(child) = guard.process.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(exit_status)) => {
-                        failure = Some(format!(
-                            "llama-server exited unexpectedly before becoming ready (status: {exit_status})"
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        failure = Some(format!("Failed to check llama-server process status: {e}"));
-                    }
-                }
-            }
-        }
-
-        if failure.is_some() {
+        if let Some(error) = spawned_child_failure(state)? {
+            failure = Some(error);
             break;
         }
 
@@ -262,8 +401,17 @@ async fn spawn_and_wait_healthy(
             .send()
             .await
         {
-            if resp.status().is_success() {
-                ready = true;
+            if resp.status().is_success()
+                && server_reports_alias(&client, port, expected_alias).await
+            {
+                // Identity alone is not enough: a pre-existing service could
+                // answer while our just-spawned process is about to lose the
+                // port bind. Prove the child still exists after the response.
+                if let Some(error) = spawned_child_failure(state)? {
+                    failure = Some(error);
+                } else {
+                    ready = true;
+                }
                 break;
             }
         }
@@ -319,7 +467,14 @@ pub async fn llama_start(
     gpu_layers: i32,
     embeddings: bool,
 ) -> Result<(), String> {
-    let binary = find_llama_server_binary()?;
+    let verification_path = PathBuf::from(&model_path);
+    tokio::task::spawn_blocking(move || {
+        crate::model_sources::verify_managed_model_for_runtime(&verification_path)
+    })
+    .await
+    .map_err(|error| format!("Managed model verification task failed: {error}"))??;
+
+    let binary = find_llama_server_binary_for_app(&app)?;
     let port = state.llama.lock().map_err(|e| e.to_string())?.port;
 
     {
@@ -327,22 +482,15 @@ pub async fn llama_start(
         guard.embeddings_enabled = embeddings;
     }
 
-    let mut args: Vec<String> = vec![
-        "-m".into(),
-        model_path.clone(),
-        "--host".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
-        port.to_string(),
-        "-c".into(),
-        ctx_size.to_string(),
-        "-ngl".into(),
-        gpu_layers.to_string(),
-        "--jinja".into(),
-    ];
-    if embeddings {
-        args.push("--embeddings".into());
-    }
+    let startup_alias = fresh_server_alias();
+    let args = chat_server_args(
+        &model_path,
+        port,
+        ctx_size,
+        gpu_layers,
+        embeddings,
+        &startup_alias,
+    );
 
     spawn_and_wait_healthy(
         &app,
@@ -352,6 +500,7 @@ pub async fn llama_start(
         &args,
         port,
         &model_path,
+        &startup_alias,
     )
     .await
 }
@@ -399,8 +548,16 @@ pub async fn embed_server_start(
     state: State<'_, AppState>,
     model_path: String,
 ) -> Result<(), String> {
-    let binary = find_llama_server_binary()?;
-    let args = embed_server_args(&model_path);
+    let verification_path = PathBuf::from(&model_path);
+    tokio::task::spawn_blocking(move || {
+        crate::model_sources::verify_managed_model_for_runtime(&verification_path)
+    })
+    .await
+    .map_err(|error| format!("Managed model verification task failed: {error}"))??;
+
+    let binary = find_llama_server_binary_for_app(&app)?;
+    let startup_alias = fresh_server_alias();
+    let args = embed_server_args(&model_path, &startup_alias);
 
     spawn_and_wait_healthy(
         &app,
@@ -410,13 +567,14 @@ pub async fn embed_server_start(
         &args,
         EMBED_PORT,
         &model_path,
+        &startup_alias,
     )
     .await?;
 
     let client = reqwest::Client::new();
     let verify = client
         .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
-        .json(&json!({ "model": model_path, "input": ["ready check"] }))
+        .json(&json!({ "model": startup_alias, "input": ["ready check"] }))
         .timeout(Duration::from_secs(10))
         .send()
         .await;
@@ -496,5 +654,94 @@ pub fn stop_all_blocking(state: &AppState) {
             let _ = child.wait();
         }
         guard.status = "stopped".to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_identity_requires_the_exact_model_alias() {
+        let payload = br#"{
+            "object": "list",
+            "data": [
+                {"id": "/models/verified.gguf", "object": "model"}
+            ]
+        }"#;
+        assert!(models_payload_reports_alias(
+            payload,
+            "/models/verified.gguf"
+        ));
+        assert!(!models_payload_reports_alias(payload, "/models/verified"));
+        assert!(!models_payload_reports_alias(payload, "verified.gguf"));
+        assert!(!models_payload_reports_alias(
+            b"not-json",
+            "/models/verified.gguf"
+        ));
+        assert!(!models_payload_reports_alias(
+            br#"{"data":{"id":"/models/verified.gguf"}}"#,
+            "/models/verified.gguf"
+        ));
+    }
+
+    #[test]
+    fn desktop_server_args_bind_loopback_and_set_identity_alias() {
+        assert_eq!(
+            chat_server_args(
+                "/models/chat.gguf",
+                8090,
+                4096,
+                99,
+                true,
+                "little-monkey-chat-nonce",
+            ),
+            [
+                "-m",
+                "/models/chat.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8090",
+                "-c",
+                "4096",
+                "-ngl",
+                "99",
+                "--jinja",
+                "--alias",
+                "little-monkey-chat-nonce",
+                "--embeddings",
+            ]
+        );
+        assert_eq!(
+            embed_server_args("/models/embed.gguf", "little-monkey-embed-nonce"),
+            [
+                "-m",
+                "/models/embed.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8091",
+                "-c",
+                "2048",
+                "-ub",
+                "2048",
+                "--embeddings",
+                "--pooling",
+                "mean",
+                "--alias",
+                "little-monkey-embed-nonce",
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_alias_is_unpredictable_and_path_independent() {
+        let first = fresh_server_alias();
+        let second = fresh_server_alias();
+        assert!(first.starts_with("little-monkey-"));
+        assert!(second.starts_with("little-monkey-"));
+        assert_ne!(first, second);
+        assert!(!first.contains('/') && !first.contains('\\'));
     }
 }

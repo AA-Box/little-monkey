@@ -4854,10 +4854,12 @@ mod tests {
     #[test]
     fn secret_scan_masks_values_and_redaction_is_reproducible() {
         let scanner = SensitiveDataScanner::new().expect("scanner");
+        // Split so secret scanners don't flag the fixture as a real key.
+        let fake_key = ["sk-", "1234567890abcdef"].concat();
         let text =
-            "email a.person@example.com api_key = sk-1234567890abcdef card 4242 4242 4242 4242";
-        let first = scanner.preview(text);
-        let second = scanner.preview(text);
+            format!("email a.person@example.com api_key = {fake_key} card 4242 4242 4242 4242");
+        let first = scanner.preview(&text);
+        let second = scanner.preview(&text);
         assert_eq!(first, second);
         assert!(first
             .findings
@@ -4869,10 +4871,10 @@ mod tests {
             .any(|finding| finding.kind == SensitiveDataKind::CreditCard));
         assert!(!serde_json::to_string(&first.findings)
             .expect("serialize findings")
-            .contains("sk-1234567890abcdef"));
+            .contains(&fake_key));
         assert!(first.redacted_text.contains("[REDACTED:API_CREDENTIAL]"));
         assert!(matches!(
-            scanner.apply_policy(text, SensitiveDataMode::RejectSecrets),
+            scanner.apply_policy(&text, SensitiveDataMode::RejectSecrets),
             Err(PipelineError::SensitiveData(_))
         ));
     }

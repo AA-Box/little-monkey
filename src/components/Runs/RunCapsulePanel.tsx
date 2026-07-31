@@ -31,6 +31,8 @@ import {
 } from "../../lib/runCapsule";
 import { loadRunEvents, type RunEventEnvelopeWire, type RunRecord } from "../../lib/runProtocol";
 import { Button, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
+import { formatBytes, formatDuration, formatTimestamp } from "../../lib/format";
 
 interface RunCapsulePanelProps {
   run: RunRecord;
@@ -53,22 +55,8 @@ function replayTone(classification: ReplayClassification): PillTone {
   return "danger";
 }
 
-function formatTime(value: number): string {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" }).format(value);
-}
 
-function formatDuration(value: number | null): string {
-  if (value === null) return "—";
-  if (value < 1_000) return `${value} ms`;
-  if (value < 60_000) return `${(value / 1_000).toFixed(1)} s`;
-  return `${Math.floor(value / 60_000)}m ${Math.round((value % 60_000) / 1_000)}s`;
-}
 
-function formatBytes(value: number): string {
-  if (value < 1_024) return `${value} B`;
-  if (value < 1_048_576) return `${(value / 1_024).toFixed(1)} KiB`;
-  return `${(value / 1_048_576).toFixed(1)} MiB`;
-}
 
 function formatCost(value: number | null): string {
   return value === null ? "—" : `$${(value / 1_000_000).toFixed(4)}`;
@@ -134,7 +122,7 @@ export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, acti
     void loadRunEvents(compareRunId).then((peerEvents) => {
       if (!cancelled) setCompareCapsule(buildRunCapsule(peer, peerEvents));
     }).catch((caught) => {
-      if (!cancelled) setStatus({ tone: "danger", message: caught instanceof Error ? caught.message : String(caught) });
+      if (!cancelled) setStatus({ tone: "danger", message: errorMessage(caught) });
     }).finally(() => {
       if (!cancelled) setComparisonLoading(false);
     });
@@ -166,7 +154,7 @@ export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, acti
       await writeTextFile(destination, serializeRedactedRunCapsule(capsule));
       setStatus({ tone: "success", message: t("RunCapsule.exportComplete") });
     } catch (caught) {
-      setStatus({ tone: "danger", message: caught instanceof Error ? caught.message : String(caught) });
+      setStatus({ tone: "danger", message: errorMessage(caught) });
     } finally {
       setBusy(null);
     }
@@ -179,7 +167,7 @@ export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, acti
       const content = await readDurableArtifact(artifactId);
       setPreview({ artifactId, name, url: artifactDataUrl(mediaType, content.contentBase64) });
     } catch (caught) {
-      setStatus({ tone: "danger", message: caught instanceof Error ? caught.message : String(caught) });
+      setStatus({ tone: "danger", message: errorMessage(caught) });
     } finally {
       setBusy(null);
     }
@@ -191,7 +179,7 @@ export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, acti
       await onReplay();
       setStatus({ tone: "success", message: t("RunCapsule.replayQueued") });
     } catch (caught) {
-      setStatus({ tone: "danger", message: caught instanceof Error ? caught.message : String(caught) });
+      setStatus({ tone: "danger", message: errorMessage(caught) });
     }
   }
 
@@ -234,7 +222,7 @@ export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, acti
           <div><dt className="text-faint">{t("RunCapsule.model")}</dt><dd className="mt-1 font-medium text-foreground">{capsule.target.label}</dd></div>
           <div><dt className="text-faint">{t("RunCapsule.routing")}</dt><dd className="mt-1 text-muted">{capsule.routing.description}</dd></div>
           <div><dt className="text-faint">{t("RunCapsule.permissionMode")}</dt><dd className="mt-1 font-medium text-foreground">{capsule.execution.permissionPolicy.mode}</dd></div>
-          <div><dt className="text-faint">{t("RunCapsule.created")}</dt><dd className="mt-1 font-medium text-foreground">{formatTime(capsule.run.createdAtMs)}</dd></div>
+          <div><dt className="text-faint">{t("RunCapsule.created")}</dt><dd className="mt-1 font-medium text-foreground">{formatTimestamp(capsule.run.createdAtMs, { timeStyle: "medium" })}</dd></div>
         </dl>
       </section>
 
@@ -316,7 +304,7 @@ export function RunCapsulePanel({ run, events, runs, replayEngineAvailable, acti
       <section className="rounded-xl border border-border bg-surface p-4" aria-labelledby="run-capsule-timeline-title">
         <h4 id="run-capsule-timeline-title" className="text-sm font-semibold">{t("RunCapsule.timeline")}</h4>
         {capsule.timeline.length === 0 ? <EmptyEvidence>{t("RunCapsule.noTimeline")}</EmptyEvidence> : (
-          <ol className="mt-3 border-l border-border pl-4">{capsule.timeline.map((entry) => <li key={entry.eventId} className="relative pb-4 last:pb-0"><span className="absolute -left-[1.18rem] top-1.5 h-2 w-2 rounded-full border border-background bg-accent" /><div className="flex flex-col gap-0.5 sm:flex-row sm:items-start sm:justify-between sm:gap-3"><p className="text-xs font-medium text-foreground">#{entry.sequence} · {entry.title}</p><time className="shrink-0 text-[10px] text-faint" dateTime={new Date(entry.occurredAtMs).toISOString()}>{formatTime(entry.occurredAtMs)}</time></div><p className="mt-1 text-xs leading-relaxed text-muted">{entry.summary}</p></li>)}</ol>
+          <ol className="mt-3 border-l border-border pl-4">{capsule.timeline.map((entry) => <li key={entry.eventId} className="relative pb-4 last:pb-0"><span className="absolute -left-[1.18rem] top-1.5 h-2 w-2 rounded-full border border-background bg-accent" /><div className="flex flex-col gap-0.5 sm:flex-row sm:items-start sm:justify-between sm:gap-3"><p className="text-xs font-medium text-foreground">#{entry.sequence} · {entry.title}</p><time className="shrink-0 text-[10px] text-faint" dateTime={new Date(entry.occurredAtMs).toISOString()}>{formatTimestamp(entry.occurredAtMs, { timeStyle: "medium" })}</time></div><p className="mt-1 text-xs leading-relaxed text-muted">{entry.summary}</p></li>)}</ol>
         )}
       </section>
 

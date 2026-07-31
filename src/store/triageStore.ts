@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { errorMessage } from "../lib/errors";
 
 /** Mirrors the Rust `TriageSource` enum (src-tauri/src/triage.rs) exactly —
  * `#[serde(rename_all = "snake_case")]`. */
@@ -96,7 +97,7 @@ export const useTriageStore = create<TriageStore>((set, get) => ({
       set({ items, loading: false });
     } catch (err) {
       if (requestId !== latestListRequest) return;
-      set({ error: err instanceof Error ? err.message : String(err), loading: false });
+      set({ error: errorMessage(err), loading: false });
     }
   },
 
@@ -113,7 +114,7 @@ export const useTriageStore = create<TriageStore>((set, get) => ({
       });
     } catch (err) {
       if (requestId !== latestListRequest) return;
-      set({ error: err instanceof Error ? err.message : String(err), loading: false });
+      set({ error: errorMessage(err), loading: false });
     }
   },
 

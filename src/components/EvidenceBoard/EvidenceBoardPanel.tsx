@@ -6,6 +6,7 @@ import type { Claim, ClaimConfidence, ClaimStatus } from "../../lib/evidenceBoar
 import { useEvidenceBoardStore } from "../../store/evidenceBoardStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Evidence Board and Claim Checker (ROADMAP.md Phase 7, item 6): a
@@ -177,7 +178,7 @@ export function EvidenceBoardPanel({ sessionId, onClose }: EvidenceBoardPanelPro
     try {
       await runExtraction(activeBoardId);
     } catch (error) {
-      setRunError(error instanceof Error ? error.message : String(error));
+      setRunError(errorMessage(error));
     }
   };
 

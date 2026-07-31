@@ -2,6 +2,7 @@ import { create } from "zustand";
 
 import * as api from "../lib/securityAutofix";
 import type { SecurityFinding, SecurityFixProposal } from "../lib/securityAutofix";
+import { errorMessage } from "../lib/errors";
 
 export type ApplyStatus = "idle" | "creating_branch" | "running" | "done" | "error" | "cancelled";
 
@@ -28,7 +29,7 @@ function idleApplyState(): ApplyState {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** In-flight "apply in branch" cancellation handles, keyed by finding id —

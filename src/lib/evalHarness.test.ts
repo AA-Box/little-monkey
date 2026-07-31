@@ -9,6 +9,7 @@ import {
   exportEvalSuite,
   goldenSimilarity,
   releaseGateStatus,
+  workflowReleaseGate,
   validateEvalSuite,
   type EvalExecutionEvidence,
   type EvalRuntime,
@@ -155,6 +156,33 @@ describe("eval harness", () => {
     expect(releaseGateStatus(suite, [{ ...run, passCount: 1, results: [{ ...run.results[0], assertions: [] }] }])).toMatchObject({ status: "blocked" });
     expect(releaseGateStatus({ ...suite, revision: suite.revision + 1 }, [run])).toEqual({ status: "unverified", run: null });
     expect(releaseGateStatus({ ...suite, releaseGate: false }, [run])).toEqual({ status: "not-gated", run: null });
+  });
+
+  // The audit's "'blocked' gate blocks nothing" fix: `workflowReleaseGate`
+  // is what `EcosystemWorkflows.tsx` consults before starting a run, so its
+  // aggregation rules ARE the enforcement contract.
+  it("aggregates every gating suite for a workflow into one run/refuse verdict", async () => {
+    const suite = runnableSuite();
+    suite.releaseGate = true;
+    suite.target = { kind: "workflow", workflowId: "wf-1" };
+    const passing = await executeEvalSuite(suite, runtime(), new AbortController().signal);
+
+    // Ungated workflow: nothing to enforce.
+    expect(workflowReleaseGate("wf-other", [suite], [passing]).status).toBe("not-gated");
+    // One gating suite with a complete passing run of the current revision.
+    expect(workflowReleaseGate("wf-1", [suite], [passing]).status).toBe("passed");
+    // Same suite bumped a revision — the old pass no longer counts.
+    expect(workflowReleaseGate("wf-1", [{ ...suite, revision: suite.revision + 1 }], [passing])).toMatchObject({
+      status: "unverified",
+      blocking: [{ suiteName: suite.name, status: "unverified" }],
+    });
+    // A second gating suite that is blocked wins over the passing one.
+    const failing = { ...suite, id: "suite-blocked", name: "Blocked suite" };
+    const failedRun = { ...passing, id: "run-blocked", suiteId: "suite-blocked", passCount: 1, results: [{ ...passing.results[0], assertions: [] }] };
+    expect(workflowReleaseGate("wf-1", [suite, failing], [passing, failedRun])).toMatchObject({
+      status: "blocked",
+      blocking: [{ suiteName: "Blocked suite", status: "blocked" }],
+    });
   });
 
   it("exports reproducible, versioned suite and run artifacts", async () => {

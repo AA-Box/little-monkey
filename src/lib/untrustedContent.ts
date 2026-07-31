@@ -40,6 +40,20 @@ export function wrapUntrustedContent(source: string, content: string): string {
   ].join("\n");
 }
 
+/**
+ * Returns the original payload from one of this module's own persisted
+ * untrusted-data envelopes. UI status/rendering may inspect the payload while
+ * the transcript still keeps the envelope intact for the next model request.
+ * Strings that merely contain marker-like text are left untouched.
+ */
+export function unwrapUntrustedContent(content: string): string {
+  if (!content.startsWith("[Untrusted data from ")) return content;
+  const begin = content.indexOf(`${BEGIN}\n`);
+  const end = content.lastIndexOf(`\n${END}`);
+  if (begin < 0 || end <= begin) return content;
+  return content.slice(begin + BEGIN.length + 1, end);
+}
+
 const UNTRUSTED_TOOL_NAMES = new Set([
   "read_file",
   "list_dir",

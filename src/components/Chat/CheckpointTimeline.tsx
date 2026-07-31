@@ -14,6 +14,7 @@ import { selectTurnRunning, sessionMessages, useSessionStore } from "../../store
 import { useCheckpointStore, type CheckpointInfo } from "../../store/checkpointStore";
 import { CheckpointCompareModal } from "./CheckpointCompareModal";
 import { CheckpointPreviewModal } from "./CheckpointPreviewModal";
+import { errorMessage } from "../../lib/errors";
 
 /** The three restore scopes offered per row — same semantics as
  * `MessageList.tsx`'s `CheckpointRow` (Claude Code /rewind: code only /
@@ -123,7 +124,7 @@ function TimelineRow({
       syncNoticeReverted(sessionId, info.id, true);
       return true;
     } catch (err) {
-      setError(t("MessageList.checkpointRevertFailed", { error: err instanceof Error ? err.message : String(err) }));
+      setError(t("MessageList.checkpointRevertFailed", { error: errorMessage(err) }));
       return false;
     }
   };
@@ -154,7 +155,7 @@ function TimelineRow({
       syncNoticeReverted(sessionId, info.id, false);
       onChanged();
     } catch (err) {
-      setError(t("MessageList.checkpointReapplyFailed", { error: err instanceof Error ? err.message : String(err) }));
+      setError(t("MessageList.checkpointReapplyFailed", { error: errorMessage(err) }));
     } finally {
       setBusy(false);
     }
@@ -296,7 +297,7 @@ function RestoreToHereButton({
       }
       onDone();
     } catch (err) {
-      setError(t("CheckpointTimeline.restoreToHereFailed", { error: err instanceof Error ? err.message : String(err) }));
+      setError(t("CheckpointTimeline.restoreToHereFailed", { error: errorMessage(err) }));
     } finally {
       setBusy(false);
     }

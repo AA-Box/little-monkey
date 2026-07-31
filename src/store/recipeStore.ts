@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { errorMessage } from "../lib/errors";
 
 /** Emitted by the backend after a successful `recipes_save`/`recipes_delete`
  * (see src-tauri/src/recipes.rs), with the acting window's label as payload —
@@ -92,7 +93,7 @@ export const useRecipeStore = create<RecipeStore>((set, get) => ({
       const recipes = await invoke<DiscoveredRecipe[]>("recipes_list");
       set({ recipes, loading: false, error: null });
     } catch (err) {
-      set({ loading: false, error: err instanceof Error ? err.message : String(err) });
+      set({ loading: false, error: errorMessage(err) });
     }
   },
 

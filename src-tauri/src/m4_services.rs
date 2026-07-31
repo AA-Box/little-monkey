@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::mcp_app_core::{
     authorize_ui_bridge_action, begin_oauth, build_ui_host_plan, complete_oauth,
     prepare_ui_bridge_action, refresh_oauth, revoke_oauth, route_tools, verify_ui_resource_bytes,
-    AuthorizedBridgeAction, BridgeCapability, McpContentLimits, McpCoreError, McpStructuredResult,
+    AuthorizedBridgeAction, BridgeCapability, McpCoreError,
     McpToolDescriptor, McpUiHostPlan, McpUiManifest, OAuthAuthorizationPlan, OAuthCallback,
     OAuthClientConfig, OAuthFlowStore, OAuthSecretVault, OAuthSecurityProvider,
     OAuthServerMetadata, OAuthTokenMetadata, OAuthTransport, PreparedBridgeAction, RoutedTool,
@@ -1615,14 +1615,6 @@ impl McpAppService {
         Ok(lock(&self.ui_sessions, "MCP UI sessions")?
             .remove(session_id)
             .is_some())
-    }
-
-    pub fn content_text_fallback(
-        &self,
-        result: &McpStructuredResult,
-        limits: &McpContentLimits,
-    ) -> Result<String, M4ServiceError> {
-        Ok(result.text_fallback(limits)?)
     }
 
     pub fn route_tools(

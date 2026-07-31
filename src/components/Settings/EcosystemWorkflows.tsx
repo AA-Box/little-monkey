@@ -15,8 +15,11 @@ import {
   type WorkflowTrigger,
 } from "../../lib/ecosystemClient";
 import { useT } from "../../lib/i18n";
+import { workflowReleaseGate } from "../../lib/evalHarness";
 import { makeWorkflowNode, newWorkflowDefinition, useEcosystemStore } from "../../store/ecosystemStore";
+import { useEvalHarnessStore } from "../../store/evalHarnessStore";
 import { useMcpStore } from "../../store/mcpStore";
+import { errorMessage } from "../../lib/errors";
 
 const FIELD = "h-9 w-full rounded-lg border border-border bg-surface-2 px-3 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
 const AREA = "w-full rounded-lg border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
@@ -192,6 +195,15 @@ export function EcosystemWorkflowDesigner() {
   const [localError, setLocalError] = useState<string | null>(null);
   const [triggerIds, setTriggerIds] = useState<string[]>([]);
   const [triggerStatus, setTriggerStatus] = useState<string | null>(null);
+  // Release gate (Eval Harness): a suite marked `releaseGate` that targets
+  // this workflow must have a complete passing run against the CURRENT suite
+  // revision before the desktop Run button starts it. Overriding is possible
+  // but requires a second, explicit click — never the same click that
+  // intended a normal run.
+  const evalSuites = useEvalHarnessStore((state) => state.suites);
+  const evalRuns = useEvalHarnessStore((state) => state.runs);
+  const [gateOverrideArmed, setGateOverrideArmed] = useState(false);
+  const releaseGate = workflowReleaseGate(definition.workflow_id, evalSuites, evalRuns);
   const selectedNode = definition.nodes.find((node) => node.node_id === selectedNodeId) ?? null;
   const selectedAdapterActions = selectedNode && selectedNode.kind.kind in ADAPTER_ACTIONS
     ? ADAPTER_ACTIONS[selectedNode.kind.kind as keyof typeof ADAPTER_ACTIONS]
@@ -205,7 +217,7 @@ export function EcosystemWorkflowDesigner() {
         await refreshMcpServers();
         await ecosystemClient.refreshWorkflowCapabilities();
       } catch (error) {
-        setLocalError(error instanceof Error ? error.message : String(error));
+        setLocalError(errorMessage(error));
       }
     })();
   }, [refreshMcpServers]);
@@ -237,6 +249,7 @@ export function EcosystemWorkflowDesigner() {
     setConfirmDelete(false);
     setTriggerIds([]);
     setTriggerStatus(null);
+    setGateOverrideArmed(false);
     setWorkflowRunDefaults(copied);
   }
 
@@ -296,7 +309,7 @@ export function EcosystemWorkflowDesigner() {
       setLocalError(null);
       return next;
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : String(error));
+      setLocalError(errorMessage(error));
       return null;
     }
   }
@@ -418,7 +431,7 @@ export function EcosystemWorkflowDesigner() {
   async function validate() {
     const draft = applyDraft();
     if (!draft) return;
-    try { await validateWorkflow(draft); setLocalError(null); } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    try { await validateWorkflow(draft); setLocalError(null); } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function save() {
@@ -428,7 +441,7 @@ export function EcosystemWorkflowDesigner() {
     try {
       await saveWorkflow(saving, exists);
       loadDefinition(saving);
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function importLegacy() {
@@ -438,14 +451,14 @@ export function EcosystemWorkflowDesigner() {
       const imported = await ecosystemClient.loadWorkflow(ir.workflow_id);
       loadDefinition(imported);
       setShowLegacy(false);
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function prepareApproval(node: WorkflowNode) {
     try {
       const challenge = await ecosystemClient.prepareWorkflowApproval(definition.workflow_id, runId, node.node_id, approvalSummary(node));
       setApprovalChallenges((current) => ({ ...current, [node.node_id]: challenge }));
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function decideApproval(nodeId: string, approved: boolean) {
@@ -455,10 +468,21 @@ export function EcosystemWorkflowDesigner() {
       const chainApproved = await ecosystemClient.decideWorkflowApproval(challenge.challenge_id, approved);
       setApprovalChallenges((current) => { const next = { ...current }; delete next[nodeId]; return next; });
       setApprovedNodes((current) => { const next = new Set(current); if (chainApproved) next.add(nodeId); else next.delete(nodeId); return next; });
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
-  async function run() {
+  async function run(overrideReleaseGate = false) {
+    if (releaseGate.status !== "not-gated" && releaseGate.status !== "passed" && !overrideReleaseGate) {
+      setGateOverrideArmed(true);
+      setLocalError(
+        t("EcosystemWorkflow.releaseGateBlockedError", {
+          suites: releaseGate.blocking
+            .map((entry) => `${entry.suiteName} (${entry.status})`)
+            .join(", "),
+        }),
+      );
+      return;
+    }
     try {
       const request: WorkflowRunRequest = {
         run_id: runId,
@@ -470,7 +494,9 @@ export function EcosystemWorkflowDesigner() {
       setRunId(newRunId());
       setApprovedNodes(new Set());
       setApprovalChallenges({});
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+      setGateOverrideArmed(false);
+      setLocalError(null);
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function registerTriggers() {
@@ -479,7 +505,7 @@ export function EcosystemWorkflowDesigner() {
       setTriggerIds(ids);
       setTriggerStatus(ids.length > 0 ? t("EcosystemWorkflow.triggersEnabled", { count: ids.length }) : t("EcosystemWorkflow.noPersistentTriggers"));
       setLocalError(null);
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function unregisterTriggers() {
@@ -488,7 +514,7 @@ export function EcosystemWorkflowDesigner() {
       setTriggerIds([]);
       setTriggerStatus(t("EcosystemWorkflow.triggersDisabled"));
       setLocalError(null);
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   const humanApprovalNodes = definition.nodes.filter((node) => node.kind.kind === "human_approval");
@@ -577,7 +603,23 @@ export function EcosystemWorkflowDesigner() {
             <label className="mt-3 block text-xs text-muted"><span className="mb-1 block">{t("EcosystemWorkflow.runId")}</span><input className={FIELD} value={runId} onChange={(event) => { setRunId(event.target.value); setApprovedNodes(new Set()); setApprovalChallenges({}); }} /></label>
             <div className="mt-3 grid gap-3 lg:grid-cols-3"><label className="text-xs text-muted"><span className="mb-1 block">{t("EcosystemWorkflow.inputsJson")}</span><textarea rows={9} className={AREA} value={runInputsText} onChange={(event) => setRunInputsText(event.target.value)} /></label><label className="text-xs text-muted"><span className="mb-1 block">{t("EcosystemWorkflow.secretRefsJson")}</span><textarea rows={9} className={AREA} value={secretBindingsText} onChange={(event) => setSecretBindingsText(event.target.value)} /></label><label className="text-xs text-muted"><span className="mb-1 block">{t("EcosystemWorkflow.triggerJson")}</span><textarea rows={9} className={AREA} value={runTriggerText} onChange={(event) => setRunTriggerText(event.target.value)} /></label></div>
             {humanApprovalNodes.length > 0 && <div className="mt-4 space-y-2 rounded-lg border border-warning/30 bg-warning-soft p-3"><h4 className="text-xs font-semibold text-foreground">{t("EcosystemWorkflow.approvalsTitle")}</h4>{humanApprovalNodes.map((node) => { const challenge = approvalChallenges[node.node_id]; const approved = approvedNodes.has(node.node_id); return <div key={node.node_id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-background/50 p-2.5 text-xs"><div><p className="font-medium text-foreground">{node.node_id}</p><p className="mt-0.5 text-muted">{approvalSummary(node)}</p></div>{approved ? <StatusPill tone="success">{t("EcosystemWorkflow.approvedOnce")}</StatusPill> : challenge ? <div className="flex gap-2"><Button size="sm" variant="ghost" onClick={() => void decideApproval(node.node_id, false)}>{t("EcosystemWorkflow.deny")}</Button><Button size="sm" variant="primary" onClick={() => void decideApproval(node.node_id, true)}>{t("EcosystemWorkflow.approveOnce")}</Button></div> : <Button size="sm" onClick={() => void prepareApproval(node)}>{t("EcosystemWorkflow.reviewApproval")}</Button>}</div>; })}</div>}
-            <div className="mt-4 flex flex-wrap justify-end gap-2"><Button disabled={!persisted} onClick={() => void registerTriggers()}><ServerCog size={14} />{t("EcosystemWorkflow.enablePersistentTriggers")}</Button><Button disabled={!persisted} variant="ghost" onClick={() => void unregisterTriggers()}>{t("EcosystemWorkflow.disablePersistentTriggers")}</Button><Button variant="primary" disabled={!persisted || Boolean(activeRunId) || humanApprovalNodes.some((node) => !approvedNodes.has(node.node_id))} onClick={() => void run()}><Play size={14} />{t("EcosystemWorkflow.run")}</Button></div>
+            {releaseGate.status !== "not-gated" && (
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <StatusPill tone={releaseGate.status === "passed" ? "success" : "danger"}>
+                  {releaseGate.status === "passed"
+                    ? t("EcosystemWorkflow.releaseGatePassed")
+                    : releaseGate.status === "blocked"
+                      ? t("EcosystemWorkflow.releaseGateBlocked")
+                      : t("EcosystemWorkflow.releaseGateUnverified")}
+                </StatusPill>
+                {releaseGate.blocking.length > 0 && (
+                  <span className="text-[11px] text-muted">
+                    {releaseGate.blocking.map((entry) => entry.suiteName).join(", ")}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="mt-4 flex flex-wrap justify-end gap-2"><Button disabled={!persisted} onClick={() => void registerTriggers()}><ServerCog size={14} />{t("EcosystemWorkflow.enablePersistentTriggers")}</Button><Button disabled={!persisted} variant="ghost" onClick={() => void unregisterTriggers()}>{t("EcosystemWorkflow.disablePersistentTriggers")}</Button>{gateOverrideArmed && releaseGate.status !== "not-gated" && releaseGate.status !== "passed" && <Button variant="danger" disabled={!persisted || Boolean(activeRunId)} onClick={() => void run(true)}><AlertTriangle size={14} />{t("EcosystemWorkflow.runDespiteReleaseGate")}</Button>}<Button variant="primary" disabled={!persisted || Boolean(activeRunId) || humanApprovalNodes.some((node) => !approvedNodes.has(node.node_id))} onClick={() => void run()}><Play size={14} />{t("EcosystemWorkflow.run")}</Button></div>
             {triggerStatus && <p role="status" className="mt-2 text-xs text-muted">{triggerStatus}</p>}
             {triggerIds.length > 0 && <div className="mt-3 rounded-lg bg-surface-2 p-3"><p className="text-xs font-medium text-foreground">{t("EcosystemWorkflow.triggerIds")}</p>{triggerIds.map((id) => <code key={id} className="mt-1 block break-all text-[11px] text-muted">{id}</code>)}</div>}
           </section>
@@ -599,7 +641,7 @@ export function EcosystemWorkflowRuns() {
   useEffect(() => { if (!selectedRunId && histories[0]) setSelectedRunId(histories[0].run_id); }, [histories, selectedRunId]);
 
   async function reconcile(nodeId: string, decision: "verified_applied" | "verified_not_applied" | "abandon") {
-    try { await ecosystemClient.reconcileWorkflowNode(selected!.run_id, nodeId, decision); await refreshHistories(); } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    try { await ecosystemClient.reconcileWorkflowNode(selected!.run_id, nodeId, decision); await refreshHistories(); } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   async function replay() {
@@ -608,7 +650,7 @@ export function EcosystemWorkflowRuns() {
       const request: WorkflowRunRequest = { run_id: newRunId("replay"), inputs: selected.input_snapshot, secret_bindings: selected.secret_reference_snapshot, trigger: selected.trigger };
       await ecosystemClient.replayWorkflow(selected.workflow_id, selected.run_id, boundaryNodeId, replayApproval, request);
       await refreshHistories();
-    } catch (error) { setLocalError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setLocalError(errorMessage(error)); }
   }
 
   return (

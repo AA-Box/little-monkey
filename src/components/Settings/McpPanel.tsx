@@ -1,19 +1,17 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ChevronDown,
   Cloud,
   GitPullRequest,
-  HardDrive,
-  Mail,
-  MessageCircle,
   Plug,
   RefreshCw,
-  Ticket,
+  Terminal,
   Trash2,
   type LucideIcon,
 } from "lucide-react";
 import { Button, StatusPill, type PillTone } from "../ui";
 import {
+  mcpServerNeedsAuthentication,
   useMcpStore,
   type McpOAuthPhase,
   type McpServerEntry,
@@ -22,6 +20,7 @@ import {
 } from "../../store/mcpStore";
 import { useT } from "../../lib/i18n";
 import { AddMcpServerForm, type McpServerDraft } from "./AddMcpServerForm";
+import { errorMessage } from "../../lib/errors";
 
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` rather than promoted prematurely. */
@@ -74,6 +73,25 @@ interface AppConnectorTemplate {
   detailKey: string;
   icon: LucideIcon;
   draft: McpServerDraft;
+  /** Only offered on macOS — hidden from the template grid everywhere else
+   * (see `isMacPlatform`). */
+  macOnly?: boolean;
+  /** When set, clicking "Use template" first stages this bundled MCP
+   * server's embedded source under the app data directory (see
+   * `mcpStore.stageBundledServer` / `src-tauri/src/bundled_mcp_servers.rs`)
+   * and fills the resulting absolute path in as the draft's sole arg,
+   * rather than using `draft.argsText` verbatim. */
+  stageBundledServerId?: string;
+}
+
+/** Crude but standard best-effort client-side OS check (no IPC round trip
+ * needed, unlike `desktop_control.rs`'s Rust-side platform gating) — used
+ * only to hide macOS-only templates from the grid on other platforms; the
+ * bundled AppleScript server itself also refuses at call time on non-macOS,
+ * so this is a UX nicety, not the actual safety boundary. */
+function isMacPlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /mac/i.test(navigator.platform || navigator.userAgent || "");
 }
 
 export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
@@ -108,62 +126,6 @@ export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
     },
   },
   {
-    id: "slack",
-    labelKey: "McpPanel.templateSlackLabel",
-    descriptionKey: "McpPanel.templateSlackDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateSlackDetail",
-    icon: MessageCircle,
-    draft: {
-      transportKind: "http",
-      label: "Slack",
-      url: "https://mcp.slack.com/mcp",
-      timeoutText: "90",
-    },
-  },
-  {
-    id: "atlassian",
-    labelKey: "McpPanel.templateAtlassianLabel",
-    descriptionKey: "McpPanel.templateAtlassianDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateAtlassianDetail",
-    icon: Ticket,
-    draft: {
-      transportKind: "http",
-      label: "Atlassian",
-      url: "https://mcp.atlassian.com/v1/mcp/authv2",
-      timeoutText: "90",
-    },
-  },
-  {
-    id: "google-drive",
-    labelKey: "McpPanel.templateGoogleDriveLabel",
-    descriptionKey: "McpPanel.templateGoogleDriveDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateGoogleDriveDetail",
-    icon: HardDrive,
-    draft: {
-      transportKind: "http",
-      label: "Google Drive",
-      url: "https://drivemcp.googleapis.com/mcp/v1",
-      timeoutText: "90",
-    },
-  },
-  {
-    id: "gmail",
-    labelKey: "McpPanel.templateGmailLabel",
-    descriptionKey: "McpPanel.templateGmailDescription",
-    badgeKey: "McpPanel.templateRemoteBadge",
-    detailKey: "McpPanel.templateGmailDetail",
-    icon: Mail,
-    draft: {
-      transportKind: "http",
-      label: "Gmail",
-      url: "https://gmailmcp.googleapis.com/mcp/v1",
-      timeoutText: "90",
-    },
-  },
-  {
     id: "custom-http",
     labelKey: "McpPanel.templateCustomHttpLabel",
     descriptionKey: "McpPanel.templateCustomHttpDescription",
@@ -175,6 +137,25 @@ export const APP_CONNECTOR_TEMPLATES: AppConnectorTemplate[] = [
       label: "Custom app",
       url: "",
       timeoutText: "60",
+    },
+  },
+  {
+    id: "osascript-control",
+    labelKey: "McpPanel.templateAppleScriptLabel",
+    descriptionKey: "McpPanel.templateAppleScriptDescription",
+    badgeKey: "McpPanel.templateLocalBadge",
+    detailKey: "McpPanel.templateAppleScriptDetail",
+    icon: Terminal,
+    macOnly: true,
+    stageBundledServerId: "osascript-control",
+    draft: {
+      transportKind: "stdio",
+      label: "macOS Control (AppleScript)",
+      command: "node",
+      // Filled in with the staged server's absolute path right before the
+      // draft is applied — see `stageBundledServerId` above.
+      argsText: "",
+      timeoutText: "30",
     },
   },
 ];
@@ -219,6 +200,15 @@ const OAUTH_PHASE_TONE: Partial<Record<McpOAuthPhase, PillTone>> = {
   cancelled: "neutral",
 };
 
+/** Keep a user-supplied OAuth client editable after its authorization attempt
+ * fails, without opening the same form for an unrelated DCR/CIMD failure. */
+export function shouldShowManualOAuthClientFields(
+  phase: McpOAuthPhase,
+  manualClientWasPrompted: boolean,
+): boolean {
+  return phase === "needs_client_id" || (phase === "error" && manualClientWasPrompted);
+}
+
 /**
  * Generic MCP-spec OAuth 2.0 "Connect via OAuth" action for one HTTP
  * server's connection-settings disclosure (see `ServerRow`) — an
@@ -235,19 +225,42 @@ function OAuthConnectSection({ server }: { server: McpServerInfo }) {
   const oauthConnect = useMcpStore((s) => s.oauthConnect);
   const oauthCancel = useMcpStore((s) => s.oauthCancel);
   const oauthDisconnect = useMcpStore((s) => s.oauthDisconnect);
+  const oauthRedirectUri = useMcpStore((s) => s.oauthRedirectUri);
   const connect = useMcpStore((s) => s.connect);
   const phaseInfo = useMcpStore((s) => s.oauthStatus[server.id]);
 
   const [clientIdInput, setClientIdInput] = useState("");
+  const [clientSecretInput, setClientSecretInput] = useState("");
+  const [redirectUri, setRedirectUri] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [disconnectError, setDisconnectError] = useState<string | null>(null);
+  const [manualClientWasPrompted, setManualClientWasPrompted] = useState(false);
 
   const phase: McpOAuthPhase = phaseInfo?.phase ?? "idle";
+  const showManualClientFields = shouldShowManualOAuthClientFields(phase, manualClientWasPrompted);
 
-  async function handleConnect(clientId?: string) {
+  useEffect(() => {
+    if (phase === "needs_client_id") setManualClientWasPrompted(true);
+  }, [phase]);
+
+  // Providers without dynamic client registration usually require the redirect
+  // URI to be registered alongside the client (Google Web-application clients
+  // and every Slack app do), and a mismatch fails in the browser with an opaque
+  // provider error page rather than anywhere in this app — so show the exact
+  // URI to register at the moment the user is being asked for a client id.
+  useEffect(() => {
+    if (phase !== "needs_client_id" || redirectUri !== null) return;
+    void oauthRedirectUri(server.id)
+      .then(setRedirectUri)
+      .catch(() => {});
+  }, [phase, redirectUri, oauthRedirectUri, server.id]);
+
+  async function handleConnect(clientId?: string, clientSecret?: string) {
+    setDisconnectError(null);
     setConnecting(true);
     try {
-      await oauthConnect(server.id, clientId);
+      await oauthConnect(server.id, clientId, clientSecret);
       // `mcp_oauth_connect` only saves credentials to the keychain — it
       // never itself connects/reconnects the MCP server (see that command's
       // own doc comment), so the server's top-level status pill would
@@ -267,8 +280,11 @@ function OAuthConnectSection({ server }: { server: McpServerInfo }) {
 
   async function handleDisconnect() {
     setDisconnecting(true);
+    setDisconnectError(null);
     try {
       await oauthDisconnect(server.id);
+    } catch (error) {
+      setDisconnectError(errorMessage(error));
     } finally {
       setDisconnecting(false);
     }
@@ -276,17 +292,38 @@ function OAuthConnectSection({ server }: { server: McpServerInfo }) {
 
   if (server.hasOauth) {
     return (
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="font-mono text-xs text-muted">{t("McpPanel.oauthConnected")}</span>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => void handleDisconnect()}
-          disabled={disconnecting}
-          className="text-danger hover:bg-danger-soft"
-        >
-          {disconnecting ? t("McpPanel.oauthDisconnectingButton") : t("McpPanel.oauthDisconnectButton")}
-        </Button>
+      <div className="flex flex-col gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="font-mono text-xs text-muted">{t("McpPanel.oauthConnected")}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void handleConnect()}
+            disabled={connecting || disconnecting}
+          >
+            <RefreshCw size={12} className={connecting ? "animate-spin" : ""} />
+            {connecting ? t("McpPanel.oauthReauthorizingButton") : t("McpPanel.oauthReauthorizeButton")}
+          </Button>
+          {connecting && (
+            <Button variant="ghost" size="sm" onClick={() => void oauthCancel(server.id)}>
+              {t("McpPanel.oauthCancelButton")}
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void handleDisconnect()}
+            disabled={connecting || disconnecting}
+            className="text-danger hover:bg-danger-soft"
+          >
+            {disconnecting ? t("McpPanel.oauthDisconnectingButton") : t("McpPanel.oauthDisconnectButton")}
+          </Button>
+          {phase !== "idle" && phase !== "connected" && (
+            <StatusPill tone={OAUTH_PHASE_TONE[phase] ?? "neutral"}>{t(`McpPanel.oauthPhase_${phase}`)}</StatusPill>
+          )}
+        </div>
+        {phase === "error" && phaseInfo?.error && <p className="text-xs text-danger">{lastErrorLine(phaseInfo.error)}</p>}
+        {disconnectError && <p className="text-xs text-danger">{lastErrorLine(disconnectError)}</p>}
       </div>
     );
   }
@@ -294,14 +331,16 @@ function OAuthConnectSection({ server }: { server: McpServerInfo }) {
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex flex-wrap items-center gap-1.5">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => void handleConnect(clientIdInput.trim() || undefined)}
-          disabled={connecting}
-        >
-          {connecting ? t("McpPanel.oauthConnectingButton") : t("McpPanel.oauthConnectButton")}
-        </Button>
+        {!showManualClientFields && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void handleConnect()}
+            disabled={connecting}
+          >
+            {connecting ? t("McpPanel.oauthConnectingButton") : t("McpPanel.oauthConnectButton")}
+          </Button>
+        )}
         {connecting && (
           <Button variant="ghost" size="sm" onClick={() => void oauthCancel(server.id)}>
             {t("McpPanel.oauthCancelButton")}
@@ -311,23 +350,49 @@ function OAuthConnectSection({ server }: { server: McpServerInfo }) {
           <StatusPill tone={OAUTH_PHASE_TONE[phase] ?? "neutral"}>{t(`McpPanel.oauthPhase_${phase}`)}</StatusPill>
         )}
       </div>
-      {phase === "needs_client_id" && (
-        <div className="flex items-center gap-1.5">
-          <input
-            type="text"
-            value={clientIdInput}
-            onChange={(event) => setClientIdInput(event.target.value)}
-            placeholder={t("McpPanel.oauthClientIdPlaceholder")}
-            className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
-          />
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => void handleConnect(clientIdInput.trim())}
-            disabled={!clientIdInput.trim() || connecting}
-          >
-            {t("McpPanel.oauthContinueButton")}
-          </Button>
+      {showManualClientFields && (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-1.5">
+            <input
+              type="text"
+              value={clientIdInput}
+              onChange={(event) => setClientIdInput(event.target.value)}
+              placeholder={t("McpPanel.oauthClientIdPlaceholder")}
+              className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            {/* Confidential clients authenticate at the token endpoint and
+                require this secret. Public clients send no secret, but the
+                provider must explicitly support and enable PKCE for that app. */}
+            <input
+              type="password"
+              value={clientSecretInput}
+              onChange={(event) => setClientSecretInput(event.target.value)}
+              placeholder={t("McpPanel.oauthClientSecretPlaceholder")}
+              autoComplete="off"
+              className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 font-mono text-xs text-foreground placeholder:font-sans placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void handleConnect(clientIdInput.trim(), clientSecretInput.trim() || undefined)}
+              disabled={!clientIdInput.trim() || connecting}
+            >
+              {phase === "error" ? t("McpPanel.oauthRetryButton") : t("McpPanel.oauthContinueButton")}
+            </Button>
+          </div>
+          {redirectUri && (
+            <div className="flex items-center gap-1.5">
+              <span className="shrink-0 text-[11px] text-faint">{t("McpPanel.oauthRedirectUriLabel")}</span>
+              <input
+                type="text"
+                value={redirectUri}
+                readOnly
+                onFocus={(event) => event.currentTarget.select()}
+                className="h-7 min-w-0 flex-1 rounded-md border border-border bg-surface-2 px-2 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            </div>
+          )}
+          <p className="text-[11px] text-faint">{t("McpPanel.oauthClientIdHint")}</p>
         </div>
       )}
       {phase === "error" && phaseInfo?.error && <p className="text-xs text-danger">{lastErrorLine(phaseInfo.error)}</p>}
@@ -363,7 +428,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await connect(server.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setReconnecting(false);
     }
@@ -375,7 +440,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await removeServer(server.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
       setRemoving(false);
     }
   }
@@ -389,7 +454,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await updateServer(toEntry(server, { timeout_secs: nextTimeout }));
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setSavingTimeout(false);
     }
@@ -403,7 +468,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
       await setHttpToken(server.id, tokenInput.trim());
       setTokenInput("");
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setSavingToken(false);
     }
@@ -415,7 +480,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await removeHttpToken(server.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setRemovingToken(false);
     }
@@ -433,11 +498,21 @@ function ServerRow({ server }: { server: McpServerInfo }) {
 
   const allowedSet = new Set(server.toolAllowlist ?? server.tools.map((tool) => tool.name));
 
+  // Authorization is optional for HTTP MCP servers. Only show this warning
+  // after the backend has observed an auth-shaped connection error; transport
+  // plus missing credentials alone would incorrectly flag public endpoints.
+  const needsAuth = mcpServerNeedsAuthentication(server);
+
   return (
     <div className="rounded-lg border border-border bg-background p-3">
       <div className="flex items-center gap-2">
         <span className="truncate text-sm font-medium text-foreground">{server.label}</span>
         <StatusPill tone={STATUS_TONE[server.status]}>{t(`McpPanel.status_${server.status}`)}</StatusPill>
+        {needsAuth && (
+          <span title={t("McpPanel.needsAuthPillTitle")}>
+            <StatusPill tone="warning">{t("McpPanel.needsAuthPill")}</StatusPill>
+          </span>
+        )}
         <div className="ml-auto flex shrink-0 items-center gap-2">
           <Toggle
             checked={server.enabled}
@@ -577,12 +652,46 @@ function ServerRow({ server }: { server: McpServerInfo }) {
 export function McpPanel() {
   const { t } = useT();
   const servers = useMcpStore((s) => s.servers);
+  const stageBundledServer = useMcpStore((s) => s.stageBundledServer);
   const [draft, setDraft] = useState<McpServerDraft | null>(null);
   const [draftVersion, setDraftVersion] = useState(0);
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  const [stagingTemplateId, setStagingTemplateId] = useState<string | null>(null);
 
   const totalCachedTools = servers
     .filter((s) => s.enabled && s.status === "connected")
     .reduce((sum, s) => sum + s.tools.length, 0);
+
+  const visibleTemplates = APP_CONNECTOR_TEMPLATES.filter(
+    (template) => !template.macOnly || isMacPlatform()
+  );
+
+  async function useTemplate(template: AppConnectorTemplate) {
+    setTemplateError(null);
+    let draftPatch: Partial<McpServerDraft> = {};
+    if (template.stageBundledServerId) {
+      setStagingTemplateId(template.id);
+      try {
+        const path = await stageBundledServer(template.stageBundledServerId);
+        draftPatch = { argsText: path };
+      } catch (err) {
+        setTemplateError(
+          t("McpPanel.templateAppleScriptStagingError", {
+            error: errorMessage(err),
+          })
+        );
+        return;
+      } finally {
+        setStagingTemplateId(null);
+      }
+    }
+    setDraft({
+      ...template.draft,
+      ...draftPatch,
+      env: template.draft.env ? { ...template.draft.env } : undefined,
+    });
+    setDraftVersion((version) => version + 1);
+  }
 
   return (
     <div className="flex flex-col gap-3 py-2">
@@ -597,8 +706,9 @@ export function McpPanel() {
           </div>
         </div>
         <div className="mt-3 grid gap-2 lg:grid-cols-2">
-          {APP_CONNECTOR_TEMPLATES.map((template) => {
+          {visibleTemplates.map((template) => {
             const Icon = template.icon;
+            const staging = stagingTemplateId === template.id;
             return (
               <article key={template.id} className="rounded-lg border border-border bg-background p-3">
                 <div className="flex items-start gap-3">
@@ -617,20 +727,15 @@ export function McpPanel() {
                   </div>
                 </div>
                 <div className="mt-3 flex justify-end">
-                  <Button
-                    size="sm"
-                    onClick={() => {
-                      setDraft({ ...template.draft, env: template.draft.env ? { ...template.draft.env } : undefined });
-                      setDraftVersion((version) => version + 1);
-                    }}
-                  >
-                    {t("McpPanel.useTemplateButton")}
+                  <Button size="sm" onClick={() => void useTemplate(template)} disabled={staging}>
+                    {staging ? t("McpPanel.useTemplatePreparingButton") : t("McpPanel.useTemplateButton")}
                   </Button>
                 </div>
               </article>
             );
           })}
         </div>
+        {templateError && <p className="mt-2 text-xs text-danger">{templateError}</p>}
       </section>
 
       {totalCachedTools > TOOL_COUNT_WARNING_THRESHOLD && (

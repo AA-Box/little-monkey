@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import { errorMessage } from "../lib/errors";
 
 /** Mirrors the camelCase `CheckpointInfo` payload returned by the Rust
  * `checkpoint_list` command (src-tauri/src/checkpoints.rs). `files` is a
@@ -63,7 +64,7 @@ export const useCheckpointStore = create<CheckpointStoreState>((set) => ({
         loadingSessions: { ...state.loadingSessions, [sessionId]: false },
       }));
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         loadingSessions: { ...state.loadingSessions, [sessionId]: false },
         errorsBySession: { ...state.errorsBySession, [sessionId]: message },

@@ -1,2 +1,3 @@
-export { SideTaskDetail, SideTaskDrawer, type SideTaskDrawerProps } from "./SideTaskDrawer";
-export { SideTaskComposer } from "./SideTaskComposer";
+export { SideTaskDetail } from "./SideTaskDetail";
+export { SideTaskPane, type SideTaskPaneProps } from "./SideTaskPane";
+export { SideTaskConversation } from "./SideTaskConversation";

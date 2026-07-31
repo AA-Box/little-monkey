@@ -139,10 +139,6 @@ export function scrollBrowser(sessionId: string, x: number, y: number): Promise<
   return invoke("browser_scroll", { sessionId, x, y });
 }
 
-export function screenshotBrowser(sessionId: string): Promise<DurableArtifactBlob> {
-  return invoke("browser_screenshot", { sessionId });
-}
-
 export function captureBrowserEvidence(sessionId: string): Promise<BrowserEvidence> {
   return invoke("browser_capture_evidence", { sessionId });
 }

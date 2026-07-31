@@ -4,6 +4,7 @@ import type { PillTone } from "../ui/StatusPill";
 import { useApiServerStore, type Backend, type Scope, type TokenAuditEntry } from "../../store/apiServerStore";
 import { useT } from "../../lib/i18n";
 import { buildWidgetEmbedSnippet, resolveExpiryPreset, type TokenExpiryPreset } from "../../lib/chatWidgetEmbed";
+import { errorMessage } from "../../lib/errors";
 
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` (the description-supporting
@@ -178,7 +179,7 @@ export function ApiServerPanel() {
         await stop();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -195,7 +196,7 @@ export function ApiServerPanel() {
     try {
       await setConfig({ ...config, ...patch });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     }
   }
 
@@ -205,7 +206,7 @@ export function ApiServerPanel() {
     try {
       await setConfig({ ...config, port: portInput });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setSavingPort(false);
     }
@@ -240,7 +241,7 @@ export function ApiServerPanel() {
       setCreateLabel("");
       setCreateExpiry("never");
     } catch (err) {
-      setCreateError(err instanceof Error ? err.message : String(err));
+      setCreateError(errorMessage(err));
     } finally {
       setCreatingToken(false);
     }
@@ -252,7 +253,7 @@ export function ApiServerPanel() {
     try {
       setAuditRows(await exportAudit());
     } catch (err) {
-      setAuditError(err instanceof Error ? err.message : String(err));
+      setAuditError(errorMessage(err));
     } finally {
       setAuditLoading(false);
     }
@@ -262,7 +263,7 @@ export function ApiServerPanel() {
     try {
       await revokeToken(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setConfirmingRevokeId(null);
     }

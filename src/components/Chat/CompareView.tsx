@@ -22,6 +22,7 @@ import {
 import { Button } from "../ui";
 import { markdownComponents, PROSE_CLASSES } from "./MessageBubble";
 import MessageList from "./MessageList";
+import { errorMessage } from "../../lib/errors";
 
 interface CompareViewProps {
   groupId: string;
@@ -68,7 +69,7 @@ function BranchCard({ session, baseMessageCount }: { session: ChatSession; baseM
   const retry = () => {
     setActionError(null);
     void retryComparisonBranch(session.id).catch((error: unknown) => {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     });
   };
 
@@ -180,17 +181,17 @@ function SynthesisPanel({
     try {
       const handle = startComparisonSynthesis(groupId, selectedTarget);
       void handle.done.catch((error: unknown) => {
-        setActionError(error instanceof Error ? error.message : String(error));
+        setActionError(errorMessage(error));
       });
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     }
   }
 
   function retryFrozen() {
     setActionError(null);
     void retryComparisonSynthesis(groupId).catch((error: unknown) => {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     });
   }
 

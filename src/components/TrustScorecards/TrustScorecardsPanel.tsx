@@ -8,6 +8,7 @@ import { useConnectorsStore } from "../../store/connectorsStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { useEcosystemStore } from "../../store/ecosystemStore";
 import {
+  scorecardWeight,
   TRUST_DIMENSION_KEYS,
   type TrustDimensionKey,
   type TrustEntityKind,
@@ -153,7 +154,15 @@ export function TrustScorecardsPanel({ onClose }: TrustScorecardsPanelProps) {
     return scorecards
       .filter((card) => (kindFilter === "all" ? true : card.kind === kindFilter))
       .filter((card) => (needle ? card.name.toLowerCase().includes(needle) || (card.subtitle ?? "").toLowerCase().includes(needle) : true))
-      .sort((a, b) => KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || a.name.localeCompare(b.name));
+      // Within a kind, weaker profiles first (see `LEVEL_WEIGHT`) so the
+      // rows most worth a second look are never buried; name is only the
+      // final tiebreak.
+      .sort(
+        (a, b) =>
+          KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind)
+          || scorecardWeight(a) - scorecardWeight(b)
+          || a.name.localeCompare(b.name),
+      );
   }, [scorecards, kindFilter, query]);
 
   const toggleSelected = (id: string) => {

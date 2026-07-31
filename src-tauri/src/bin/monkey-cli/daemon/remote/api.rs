@@ -11,14 +11,34 @@ use crate::daemon::ledger::SharedLedger;
 use crate::daemon::store::{DaemonPaths, DaemonStore};
 use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
 
+use little_monkey_lib::run_protocol::OutputChannel;
+
 use super::desktop::DesktopControlRuntime;
 use super::protocol::{
-    canonical_request, sha256_hex, ApprovalRequestBody, CancelRequestBody,
+    canonical_request, legacy_capabilities, sha256_hex, ApprovalRequestBody, CancelRequestBody,
     DesktopControlActionRequest, DesktopControlStartRequest, DesktopControlStopRequest,
-    PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
+    DeviceCapability, PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
     SignedRequestHeaders, MAX_REMOTE_BODY_BYTES, REMOTE_PROTOCOL_VERSION,
 };
-use super::store::{CommandReservation, KeyringRemoteSecrets, RemoteSecretStore, RemoteStore};
+use super::store::{
+    CommandReservation, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
+    MobileMessageRecord, MobileWorkflowRunRecord, RemoteSecretStore, RemoteStore,
+};
+
+/// Seam through which the mobile chat route reaches the daemon's recipe
+/// queue. Production (`daemon::DaemonMobileChatQueue`) queues the
+/// operator-configured `mobile-chat` recipe; tests inject a fake so the API
+/// contract is testable without a configured daemon.
+pub trait MobileChatQueue: Send + Sync {
+    /// Queues one chat turn. `client_key` is the mobile message id — the
+    /// implementation derives a deterministic job id from it, so replaying
+    /// the same signed request can never double-queue. Returns the durable
+    /// run id.
+    fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String>;
+    /// Resolves the durable run id previously queued for `client_key`, if
+    /// the job has one yet.
+    fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String>;
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiRequest {
@@ -68,6 +88,10 @@ pub struct RemoteApi {
     /// hatch can force-stop the same live sessions this API creates. `None`
     /// only in desktop-agnostic unit tests.
     desktop: Option<Arc<DesktopControlRuntime>>,
+    /// Chat execution seam for `/v1/remote/mobile/sessions/*/messages`.
+    /// `None` (bare unit tests) answers those routes with a clear 501-style
+    /// error instead of pretending to queue anything.
+    mobile_chat: Option<Arc<dyn MobileChatQueue>>,
 }
 
 impl Clone for RemoteApi {
@@ -78,6 +102,7 @@ impl Clone for RemoteApi {
             store: Arc::clone(&self.store),
             secrets: Arc::clone(&self.secrets),
             desktop: self.desktop.clone(),
+            mobile_chat: self.mobile_chat.clone(),
         }
     }
 }
@@ -87,6 +112,7 @@ impl RemoteApi {
         paths: DaemonPaths,
         host: RemoteHostConfig,
         desktop: Arc<DesktopControlRuntime>,
+        mobile_chat: Arc<dyn MobileChatQueue>,
     ) -> Result<Self, String> {
         let store = RemoteStore::open(&paths.root)?;
         Ok(Self {
@@ -95,6 +121,7 @@ impl RemoteApi {
             store: Arc::new(Mutex::new(store)),
             secrets: Arc::new(KeyringRemoteSecrets),
             desktop: Some(desktop),
+            mobile_chat: Some(mobile_chat),
         })
     }
 
@@ -111,7 +138,16 @@ impl RemoteApi {
             store: Arc::new(Mutex::new(store)),
             secrets,
             desktop: None,
+            mobile_chat: None,
         }
+    }
+
+    /// Test builder: the injected API plus a fake chat queue, so the mobile
+    /// chat contract is exercisable without a configured daemon.
+    #[cfg(test)]
+    pub fn with_mobile_chat(mut self, mobile_chat: Arc<dyn MobileChatQueue>) -> Self {
+        self.mobile_chat = Some(mobile_chat);
+        self
     }
 
     pub fn handle(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
@@ -219,8 +255,7 @@ impl RemoteApi {
         );
         let response = self.dispatch_authorized(
             &request,
-            &device.scopes,
-            &headers.device_id,
+            &device,
             &request_sha256,
             now_ms,
         );
@@ -282,11 +317,12 @@ impl RemoteApi {
     fn dispatch_authorized(
         &self,
         request: &ApiRequest,
-        scopes: &RemoteScopes,
-        device_id: &str,
+        device: &DeviceRecord,
         request_sha256: &str,
         now_ms: u64,
     ) -> ApiResponse {
+        let scopes = &device.scopes;
+        let device_id = device.device_id.as_str();
         let (path, query) = request
             .path_and_query
             .split_once('?')
@@ -336,6 +372,50 @@ impl RemoteApi {
             ("POST", ["v1", "remote", "desktop-control", "stop"]) => {
                 require_action(scopes, RemoteAction::ControlDesktop)
                     .and_then(|_| self.desktop_control_stop(&request.body, device_id))
+            }
+            // --- Versioned `/v1/remote/mobile/*` extension (first-party
+            // mobile companion). Chat and workflow launch use the dedicated
+            // capability grant; a legacy pairing without capabilities
+            // resolves through `legacy_capabilities`, which never includes
+            // the mobile-only grants — so an old runner pairing cannot be
+            // escalated into a chat surface by a client-side update.
+            ("GET", ["v1", "remote", "mobile", "sessions"]) => {
+                require_capability(device, DeviceCapability::ViewSessions)
+                    .and_then(|_| self.mobile_sessions())
+            }
+            ("GET", ["v1", "remote", "mobile", "sessions", session_id, "messages"]) => {
+                require_capability(device, DeviceCapability::ViewSessions)
+                    .and_then(|_| self.mobile_messages_get(session_id, now_ms))
+            }
+            ("POST", ["v1", "remote", "mobile", "sessions", session_id, "messages"]) => {
+                require_capability(device, DeviceCapability::Chat).and_then(|_| {
+                    self.mobile_message_post(
+                        session_id,
+                        &request.body,
+                        device_id,
+                        request_sha256,
+                        now_ms,
+                    )
+                })
+            }
+            ("GET", ["v1", "remote", "mobile", "workflows"]) => {
+                require_capability(device, DeviceCapability::ViewTasks)
+                    .and_then(|_| self.mobile_workflows())
+            }
+            ("POST", ["v1", "remote", "mobile", "workflows", workflow_id, "runs"]) => {
+                require_capability(device, DeviceCapability::RunWorkflows)
+                    .and_then(|_| self.mobile_workflow_launch(workflow_id, device_id, now_ms))
+            }
+            ("POST", ["v1", "remote", "mobile", "captures"]) => {
+                require_capability(device, DeviceCapability::Capture).and_then(|_| {
+                    self.mobile_capture_post(&request.body, device, request_sha256, now_ms)
+                })
+            }
+            // Self-revocation needs no extra capability: a device may always
+            // sever itself. The store path force-stops any live desktop
+            // session the device owns, exactly like an operator revoke.
+            ("DELETE", ["v1", "remote", "mobile", "devices", "self"]) => {
+                self.mobile_revoke_self(device_id, now_ms)
             }
             _ => Err((404, "Unknown remote runner endpoint".to_string())),
         };
@@ -753,6 +833,447 @@ impl RemoteApi {
         RunLedger::open(&self.paths.ledger_db).map_err(internal)
     }
 
+    // --- `/v1/remote/mobile/*` handlers -----------------------------------
+
+    fn locked_store(&self) -> Result<std::sync::MutexGuard<'_, RemoteStore>, (u16, String)> {
+        self.store
+            .lock()
+            .map_err(|_| (500, "Remote state lock was poisoned".to_string()))
+    }
+
+    fn mobile_sessions(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let sessions = self.locked_store()?.mobile_session_summaries().map_err(internal)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "sessions": sessions
+                    .iter()
+                    .map(|session| serde_json::json!({
+                        "id": session.session_id,
+                        "title": bounded_text(&session.title, 120),
+                        "model_label": "Node mobile-chat recipe",
+                        "updated_at_ms": session.updated_at_ms,
+                        "unread_count": 0,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            None,
+        ))
+    }
+
+    fn mobile_messages_get(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        self.materialize_mobile_replies(session_id, now_ms)?;
+        let messages = self
+            .locked_store()?
+            .mobile_messages(session_id, 2_000)
+            .map_err(internal)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "messages": messages
+                    .iter()
+                    .map(|message| serde_json::json!({
+                        "id": message.message_id,
+                        "role": message.role,
+                        "text": message.text,
+                        "created_at_ms": message.created_at_ms,
+                        "task_state": message.task_state,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Some(session_id.to_string()),
+        ))
+    }
+
+    /// Turns terminal chat runs into visible replies. Called lazily from the
+    /// message GET (the client already polls), so no daemon-loop hook is
+    /// needed: for every still-`queued` user message, resolve its durable
+    /// run; once that run is terminal, append the assistant text (or a
+    /// system-role failure notice) and settle the user row's `task_state`.
+    /// Both inserts are idempotent (`ON CONFLICT DO NOTHING` + the state
+    /// filter), so concurrent polls cannot double-append.
+    fn materialize_mobile_replies(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(), (u16, String)> {
+        let Some(queue) = self.mobile_chat.as_ref() else {
+            return Ok(());
+        };
+        let pending: Vec<MobileMessageRecord> = {
+            let store = self.locked_store()?;
+            store
+                .mobile_messages(session_id, 2_000)
+                .map_err(internal)?
+                .into_iter()
+                .filter(|message| message.role == "user" && message.task_state == "queued")
+                .collect()
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let ledger = self.run_ledger()?;
+        for message in pending {
+            let Some(run_id) = queue.chat_run_id(&message.message_id).map_err(internal)? else {
+                continue;
+            };
+            let events = match ledger.load_events(&run_id, 0, 1_000) {
+                Ok(events) => events,
+                Err(_) => continue, // Run not recorded yet — try again next poll.
+            };
+            let mut assistant_text = String::new();
+            let mut completed_summary: Option<String> = None;
+            let mut failed: Option<String> = None;
+            let mut cancelled = false;
+            for envelope in &events {
+                match &envelope.event {
+                    RunEvent::ModelDelta { channel, text, .. } => {
+                        if matches!(channel, OutputChannel::Assistant) {
+                            assistant_text.push_str(text);
+                        }
+                    }
+                    RunEvent::Completed { summary, .. } => {
+                        completed_summary = summary.clone();
+                    }
+                    RunEvent::Failed { message, .. } => failed = Some(message.clone()),
+                    RunEvent::Cancelled { .. } => cancelled = true,
+                    _ => {}
+                }
+            }
+            let terminal = completed_summary.is_some()
+                || failed.is_some()
+                || cancelled
+                || events
+                    .iter()
+                    .any(|envelope| matches!(envelope.event, RunEvent::Completed { .. }));
+            if !terminal {
+                continue;
+            }
+            let (role, text, final_state) = if let Some(reason) = failed {
+                (
+                    "system",
+                    format!("The node could not answer this message: {}", bounded_text(&reason, 2_048)),
+                    "failed",
+                )
+            } else if cancelled && assistant_text.trim().is_empty() {
+                ("system", "This message's run was cancelled on the node.".to_string(), "failed")
+            } else {
+                let text = if assistant_text.trim().is_empty() {
+                    completed_summary.unwrap_or_else(|| "(The run completed without any output.)".to_string())
+                } else {
+                    assistant_text
+                };
+                ("assistant", text, "accepted")
+            };
+            let mut store = self.locked_store()?;
+            store
+                .insert_mobile_message(&MobileMessageRecord {
+                    message_id: format!("{}-reply", message.message_id),
+                    session_id: message.session_id.clone(),
+                    device_id: message.device_id.clone(),
+                    role: role.to_string(),
+                    text,
+                    request_sha256: message.request_sha256.clone(),
+                    task_state: final_state.to_string(),
+                    created_at_ms: now_ms,
+                })
+                .map_err(internal)?;
+            store
+                .set_mobile_message_state(&message.message_id, final_state, now_ms)
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    fn mobile_message_post(
+        &self,
+        session_id: &str,
+        body: &[u8],
+        device_id: &str,
+        request_sha256: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let Some(queue) = self.mobile_chat.as_ref() else {
+            return Err((
+                501,
+                "This node build does not expose mobile chat execution".to_string(),
+            ));
+        };
+        let parsed: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid mobile message body: {error}")))?;
+        let text = parsed
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or((400, "Mobile message requires non-empty 'text'".to_string()))?;
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || !session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err((400, "Mobile session id must be 1-128 URL-safe characters".to_string()));
+        }
+        // The message id doubles as the idempotent queue key: derived from
+        // the signed request digest, so an at-least-once retry of the SAME
+        // signed request maps onto the same message and job.
+        let message_id = format!("mm-{}", &request_sha256[..32]);
+        {
+            let mut store = self.locked_store()?;
+            store
+                .insert_mobile_message(&MobileMessageRecord {
+                    message_id: message_id.clone(),
+                    session_id: session_id.to_string(),
+                    device_id: device_id.to_string(),
+                    role: "user".to_string(),
+                    text: text.to_string(),
+                    request_sha256: request_sha256.to_string(),
+                    task_state: "queued".to_string(),
+                    created_at_ms: now_ms,
+                })
+                .map_err(internal)?;
+        }
+        match queue.queue_chat(&message_id, text) {
+            Ok(_run_id) => {}
+            Err(error) => {
+                let mut store = self.locked_store()?;
+                let _ = store.set_mobile_message_state(&message_id, "failed", now_ms);
+                return Err((503, format!("Mobile chat could not be queued: {error}")));
+            }
+        }
+        Ok((
+            201,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "message": { "id": message_id, "created_at_ms": now_ms },
+            }),
+            Some(session_id.to_string()),
+        ))
+    }
+
+    fn mobile_workflows(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let app_data = self
+            .paths
+            .root
+            .parent()
+            .ok_or_else(|| internal("Daemon root has no app-data parent"))?
+            .to_path_buf();
+        let service = little_monkey_lib::m4_runtime::production_workflow_service(&app_data)
+            .map_err(internal)?;
+        let definitions = service.list().map_err(internal)?;
+        let last_runs = self.locked_store()?.mobile_workflow_last_runs().map_err(internal)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "workflows": definitions
+                    .iter()
+                    .map(|definition| {
+                        let mut entry = serde_json::json!({
+                            "id": definition.workflow_id,
+                            "name": definition.name,
+                            "summary": format!("v{} · {} nodes", definition.workflow_version, definition.nodes.len()),
+                        });
+                        if let Some(last) = last_runs.get(&definition.workflow_id) {
+                            entry["last_run_at_ms"] = serde_json::json!(last);
+                        }
+                        entry
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+            None,
+        ))
+    }
+
+    fn mobile_workflow_launch(
+        &self,
+        workflow_id: &str,
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let store = DaemonStore::open(&self.paths).map_err(internal)?;
+        if store.kill_switch().map_err(internal)? {
+            return Err((409, "Global kill switch is engaged".to_string()));
+        }
+        drop(store);
+        let app_data = self
+            .paths
+            .root
+            .parent()
+            .ok_or_else(|| internal("Daemon root has no app-data parent"))?
+            .to_path_buf();
+        let service = little_monkey_lib::m4_runtime::production_workflow_service(&app_data)
+            .map_err(internal)?;
+        let definition = service
+            .load(workflow_id)
+            .map_err(|error| (404, format!("Workflow is not available: {error}")))?;
+        let ir = service
+            .validate(&definition)
+            .map_err(|error| (409, format!("Workflow no longer validates: {error}")))?;
+        // A replay of the same SIGNED request never reaches this code — the
+        // command reservation in `handle` returns the cached response — so
+        // this id only needs to be unique per accepted launch.
+        let run_id = format!(
+            "m4-mobile-{}",
+            &sha256_hex(format!("{device_id}:{workflow_id}:{now_ms}").as_bytes())[..32]
+        );
+        let history = little_monkey_lib::m4_runtime::run_daemon_workflow_delivery(
+            &app_data,
+            workflow_id,
+            &ir.definition_sha256,
+            &run_id,
+            little_monkey_lib::workflow_core::WorkflowTrigger::Manual,
+            serde_json::json!({}),
+        )
+        .map_err(|error| (409, format!("Workflow launch failed: {error}")))?;
+        self.locked_store()?
+            .insert_mobile_workflow_run(&MobileWorkflowRunRecord {
+                run_id: history.run_id.clone(),
+                workflow_id: workflow_id.to_string(),
+                device_id: device_id.to_string(),
+                created_at_ms: now_ms,
+            })
+            .map_err(internal)?;
+        Ok((
+            201,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "run": {
+                    "run_id": history.run_id,
+                    "status": format!("{:?}", history.status).to_ascii_lowercase(),
+                    "kind": "workflow",
+                    "created_at_ms": now_ms,
+                    "updated_at_ms": now_ms,
+                    "pending_approval_count": 0,
+                },
+            }),
+            Some(workflow_id.to_string()),
+        ))
+    }
+
+    fn mobile_capture_post(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        request_sha256: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let parsed: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid mobile capture body: {error}")))?;
+        let field = |name: &str| parsed.get(name).and_then(|value| value.as_str());
+        let capture_id = field("capture_id")
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .ok_or((400, "Capture requires a URL-safe 'capture_id'".to_string()))?;
+        let kind = field("kind")
+            .filter(|value| matches!(*value, "text" | "image" | "file" | "voice"))
+            .ok_or((400, "Capture 'kind' must be text, image, file, or voice".to_string()))?;
+        let title = field("title")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or((400, "Capture requires a non-empty 'title'".to_string()))?;
+        let text = field("text").map(str::to_string);
+        let declared_sha = field("content_sha256").map(str::to_string);
+        let media_type = field("mime_type").map(str::to_string);
+        let declared_size = parsed.get("size_bytes").and_then(|value| value.as_u64());
+
+        let mut stored_size: Option<u64> = None;
+        if let Some(content) = field("content_base64") {
+            let bytes = STANDARD
+                .decode(content)
+                .map_err(|_| (400, "Capture content is not valid base64".to_string()))?;
+            if bytes.len() as u64 > device.scopes.max_artifact_bytes {
+                return Err((
+                    413,
+                    "Capture exceeds this device grant's artifact budget".to_string(),
+                ));
+            }
+            let digest = sha256_hex(&bytes);
+            match &declared_sha {
+                Some(declared) if declared.eq_ignore_ascii_case(&digest) => {}
+                _ => {
+                    return Err((
+                        400,
+                        "Capture content_sha256 does not match the uploaded bytes".to_string(),
+                    ))
+                }
+            }
+            if let Some(size) = declared_size {
+                if size != bytes.len() as u64 {
+                    return Err((400, "Capture size_bytes does not match the uploaded bytes".to_string()));
+                }
+            }
+            let captures_dir = self.paths.root.join("mobile-captures");
+            std::fs::create_dir_all(&captures_dir)
+                .map_err(|error| internal(format!("Could not create capture directory: {error}")))?;
+            std::fs::write(captures_dir.join(capture_id), &bytes)
+                .map_err(|error| internal(format!("Could not persist capture payload: {error}")))?;
+            stored_size = Some(bytes.len() as u64);
+        } else if text.is_none() {
+            return Err((400, "Capture needs either 'text' or 'content_base64'".to_string()));
+        }
+
+        self.locked_store()?
+            .insert_mobile_capture(&MobileCaptureRecord {
+                capture_id: capture_id.to_string(),
+                device_id: device.device_id.clone(),
+                kind: kind.to_string(),
+                title: title.to_string(),
+                text,
+                content_sha256: declared_sha,
+                size_bytes: stored_size.or(declared_size),
+                media_type,
+                request_sha256: request_sha256.to_string(),
+                created_at_ms: now_ms,
+            })
+            .map_err(internal)?;
+        Ok((
+            201,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "capture_id": capture_id,
+            }),
+            Some(capture_id.to_string()),
+        ))
+    }
+
+    fn mobile_revoke_self(
+        &self,
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let killer = self.desktop.as_ref().map(|desktop| {
+            Arc::clone(desktop) as Arc<dyn super::store::DesktopSessionKiller>
+        });
+        self.locked_store()?
+            .revoke_device(
+                device_id,
+                "Self-revoked from the paired mobile device",
+                now_ms,
+                self.secrets.as_ref(),
+                killer.as_deref(),
+            )
+            .map_err(internal)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "revoked": true,
+            }),
+            Some(device_id.to_string()),
+        ))
+    }
+
     fn audit_denied(
         &self,
         now_ms: u64,
@@ -772,6 +1293,26 @@ fn require_action(scopes: &RemoteScopes, action: RemoteAction) -> Result<(), (u1
         Ok(())
     } else {
         Err((403, format!("Remote action '{action:?}' is not paired")))
+    }
+}
+
+/// Capability gate for the mobile extension. A device paired before
+/// capabilities existed resolves through `legacy_capabilities`, which maps
+/// only the legacy run-scope actions — so legacy pairings can never reach
+/// chat, workflow launch, or capture without an explicit re-pair.
+fn require_capability(
+    device: &DeviceRecord,
+    capability: DeviceCapability,
+) -> Result<(), (u16, String)> {
+    let effective = if device.capabilities.is_empty() {
+        legacy_capabilities(&device.scopes)
+    } else {
+        device.capabilities.clone()
+    };
+    if effective.contains(&capability) {
+        Ok(())
+    } else {
+        Err((403, format!("Device capability '{capability:?}' is not granted")))
     }
 }
 
@@ -1251,6 +1792,207 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(approval.decision, Some(PermissionDecision::AllowOnce));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // --- `/v1/remote/mobile/*` extension ----------------------------------
+
+    #[derive(Default)]
+    struct FakeChatQueue {
+        queued: Mutex<Vec<(String, String)>>,
+    }
+
+    impl MobileChatQueue for FakeChatQueue {
+        fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String> {
+            self.queued
+                .lock()
+                .unwrap()
+                .push((client_key.to_string(), prompt.to_string()));
+            Ok(format!("run-{client_key}"))
+        }
+
+        fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String> {
+            Ok(self
+                .queued
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key == client_key)
+                .map(|(key, _)| format!("run-{key}")))
+        }
+    }
+
+    /// The whole point of the separate capability grant: a device paired
+    /// before mobile capabilities existed (or paired deliberately as a
+    /// runner-only controller) resolves through `legacy_capabilities`, which
+    /// never contains Chat — so a newer phone build cannot talk itself into
+    /// a chat surface the operator never granted.
+    #[test]
+    fn legacy_pairing_cannot_reach_mobile_chat_or_workflow_launch() {
+        let (root, api, _secrets, device, secret) = fixture();
+        let api = api.with_mobile_chat(Arc::new(FakeChatQueue::default()));
+        for (index, (method, path, body)) in [
+            ("GET", "/v1/remote/mobile/sessions", &b""[..]),
+            ("POST", "/v1/remote/mobile/sessions/s1/messages", br#"{"text":"hi"}"#),
+            ("GET", "/v1/remote/mobile/workflows", b""),
+            ("POST", "/v1/remote/mobile/workflows/wf/runs", b"{}"),
+            ("POST", "/v1/remote/mobile/captures", br#"{"capture_id":"c1","kind":"text","title":"t","text":"x"}"#),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = api.handle(
+                signed(
+                    &device,
+                    &secret,
+                    index as u64 + 1,
+                    &format!("cmd-legacy-{index}"),
+                    method,
+                    path,
+                    body,
+                ),
+                2_000 + index as u64,
+            );
+            assert_eq!(response.status, 403, "{method} {path} should be capability-denied");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn granted_device_queues_one_chat_turn_and_reads_it_back() {
+        let (root, api, secrets, _legacy_device, _legacy_secret) = fixture();
+        let queue = Arc::new(FakeChatQueue::default());
+        let api = api.with_mobile_chat(queue.clone());
+        // Pair a second device that DOES carry the mobile grants.
+        let (device, secret) = {
+            let mut store = RemoteStore::open(&DaemonPaths::under(&root).root).unwrap();
+            let scopes = RemoteScopes {
+                actions: BTreeSet::from([RemoteAction::ViewRuns]),
+                run_ids: BTreeSet::from(["run-one".into()]),
+                workspace_ids: BTreeSet::new(),
+                max_artifact_bytes: 1_024,
+            };
+            let capabilities = BTreeSet::from([
+                DeviceCapability::ViewRuns,
+                DeviceCapability::ViewSessions,
+                DeviceCapability::Chat,
+            ]);
+            let invite = store
+                .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
+                .unwrap();
+            let accepted = store
+                .accept_invitation(
+                    &invite.pairing_id,
+                    &invite.token,
+                    "granted-phone",
+                    "runner-one",
+                    1_100,
+                    secrets.as_ref(),
+                )
+                .unwrap();
+            (
+                accepted.device_id,
+                accepted.device_secret.as_bytes().to_vec(),
+            )
+        };
+
+        let post = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-chat-post",
+                "POST",
+                "/v1/remote/mobile/sessions/s1/messages",
+                br#"{"text":"what is queued?"}"#,
+            ),
+            2_000,
+        );
+        assert_eq!(post.status, 201, "body: {:?}", String::from_utf8_lossy(&post.body));
+        assert_eq!(queue.queued.lock().unwrap().len(), 1);
+        assert_eq!(queue.queued.lock().unwrap()[0].1, "what is queued?");
+
+        let get = api.handle(
+            signed(
+                &device,
+                &secret,
+                2,
+                "cmd-chat-get",
+                "GET",
+                "/v1/remote/mobile/sessions/s1/messages",
+                b"",
+            ),
+            2_001,
+        );
+        assert_eq!(get.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&get.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "only the user turn exists until the run is terminal");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["text"], "what is queued?");
+        assert_eq!(messages[0]["task_state"], "queued");
+
+        // The session list is derived from the same rows.
+        let sessions = api.handle(
+            signed(&device, &secret, 3, "cmd-sessions", "GET", "/v1/remote/mobile/sessions", b""),
+            2_002,
+        );
+        assert_eq!(sessions.status, 200);
+        let listed: serde_json::Value = serde_json::from_slice(&sessions.body).unwrap();
+        assert_eq!(listed["sessions"][0]["id"], "s1");
+        assert_eq!(listed["sessions"][0]["title"], "what is queued?");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A capture whose declared digest does not match the uploaded bytes is
+    /// rejected outright — the node never stores content it cannot vouch for.
+    #[test]
+    fn capture_rejects_a_digest_that_does_not_match_its_bytes() {
+        let (root, api, secrets, _d, _s) = fixture();
+        let (device, secret) = {
+            let mut store = RemoteStore::open(&DaemonPaths::under(&root).root).unwrap();
+            let scopes = RemoteScopes {
+                actions: BTreeSet::from([RemoteAction::ViewRuns]),
+                run_ids: BTreeSet::from(["run-one".into()]),
+                workspace_ids: BTreeSet::new(),
+                max_artifact_bytes: 1_024,
+            };
+            let capabilities =
+                BTreeSet::from([DeviceCapability::ViewRuns, DeviceCapability::Capture]);
+            let invite = store
+                .create_invitation_with_capabilities(&scopes, &capabilities, 1_000, 3_000)
+                .unwrap();
+            let accepted = store
+                .accept_invitation(
+                    &invite.pairing_id,
+                    &invite.token,
+                    "capture-phone",
+                    "runner-one",
+                    1_100,
+                    secrets.as_ref(),
+                )
+                .unwrap();
+            (accepted.device_id, accepted.device_secret.as_bytes().to_vec())
+        };
+        let payload = STANDARD.encode(b"hello");
+        let body = format!(
+            r#"{{"capture_id":"c1","kind":"file","title":"note","content_base64":"{payload}","content_sha256":"{}"}}"#,
+            "b".repeat(64)
+        );
+        let response = api.handle(
+            signed(
+                &device,
+                &secret,
+                1,
+                "cmd-capture-bad",
+                "POST",
+                "/v1/remote/mobile/captures",
+                body.as_bytes(),
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 400);
+        assert!(String::from_utf8_lossy(&response.body).contains("content_sha256"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

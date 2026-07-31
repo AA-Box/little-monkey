@@ -134,10 +134,17 @@ export const SHORTCUTS = [
     bindings: [{ key: "p", code: "KeyP", primary: true }],
   },
   {
-    id: "openSideTasksPanel",
+    id: "openBackgroundTasksPanel",
     scope: "global",
-    labelKey: "App.rightPanelSideTasks",
-    descriptionKey: "KeyboardShortcutsPanel.openSideTasksDescription",
+    labelKey: "App.rightPanelBackgroundTasks",
+    descriptionKey: "KeyboardShortcutsPanel.openBackgroundTasksDescription",
+    bindings: [{ key: "j", code: "KeyJ", primary: true, alt: true }],
+  },
+  {
+    id: "openSideTaskPane",
+    scope: "global",
+    labelKey: "App.sideTaskPaneTitle",
+    descriptionKey: "KeyboardShortcutsPanel.openSideTaskPaneDescription",
     bindings: [{ key: "s", code: "KeyS", primary: true, alt: true }],
   },
   {

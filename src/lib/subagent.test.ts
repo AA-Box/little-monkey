@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { errorMessage } from "./errors";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
@@ -21,7 +22,7 @@ vi.mock("./turnEngine", () => ({
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
-  stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+  stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: ResolvedTarget) =>
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
@@ -635,7 +636,7 @@ describe("runSubagentTask / onMutatedPath reporting", () => {
     expect(onMutatedPath).toHaveBeenCalledWith("b.txt");
   });
 
-  it("does not report a failed write_file call", async () => {
+  it("reports a failed write_file call without reporting a successful mutation", async () => {
     attemptStreamMock
       .mockResolvedValueOnce({
         content: "",
@@ -646,10 +647,75 @@ describe("runSubagentTask / onMutatedPath reporting", () => {
       .mockResolvedValueOnce({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
     executeToolCallMock.mockResolvedValue(JSON.stringify({ error: "Permission denied" }));
     const onMutatedPath = vi.fn();
+    const onMutationFailure = vi.fn();
 
-    await runSubagentTask(baseParams({ profile: "code", onMutatedPath }));
+    await runSubagentTask(baseParams({
+      profile: "code",
+      onMutatedPath,
+      onMutationFailure,
+    }));
 
     expect(onMutatedPath).not.toHaveBeenCalled();
+    expect(onMutationFailure).toHaveBeenCalledWith(
+      "a.txt",
+      "Permission denied",
+      "call-w",
+    );
+  });
+
+  it("reports a failed child edit even when another child edit succeeds", async () => {
+    attemptStreamMock
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [
+          {
+            id: "call-ok",
+            type: "function",
+            function: {
+              name: "write_file",
+              arguments: JSON.stringify({ path: "done.txt", content: "x" }),
+            },
+          },
+          {
+            id: "call-failed",
+            type: "function",
+            function: {
+              name: "edit_file",
+              arguments: JSON.stringify({
+                path: "missing.txt",
+                old_string: "x",
+                new_string: "y",
+              }),
+            },
+          },
+        ],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({
+        content: "finished",
+        toolCalls: [],
+        streamError: null,
+        contentStarted: true,
+      });
+    executeToolCallMock
+      .mockResolvedValueOnce("Wrote 1 bytes to done.txt")
+      .mockResolvedValueOnce(JSON.stringify({ error: "old_string not found" }));
+    const onMutatedPath = vi.fn();
+    const onMutationFailure = vi.fn();
+
+    await runSubagentTask(baseParams({
+      profile: "code",
+      onMutatedPath,
+      onMutationFailure,
+    }));
+
+    expect(onMutatedPath).toHaveBeenCalledWith("done.txt");
+    expect(onMutationFailure).toHaveBeenCalledWith(
+      "missing.txt",
+      "old_string not found",
+      "call-failed",
+    );
   });
 
   it("does not report a read-only tool call", async () => {

@@ -21,6 +21,7 @@ import type {
 } from "../../lib/syntheticMonitoring";
 import { useSyntheticMonitoringStore, type CreateMonitorInput } from "../../store/syntheticMonitoringStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface SyntheticMonitoringPanelProps {
   onClose: () => void;
@@ -92,7 +93,7 @@ function runStatusTone(status: MonitorRun["status"]): PillTone {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function RunEvidenceThumbnail({ artifactId, alt }: { artifactId: string | null; alt: string }) {

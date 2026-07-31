@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Mirrors the Rust `Role` enum (src-tauri/src/team_mode.rs) exactly — a
@@ -43,7 +44,7 @@ export interface TeamAuditReport {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export interface TeamModeStore {

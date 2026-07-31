@@ -32,6 +32,7 @@ import {
   type SyntheticMonitor,
 } from "../lib/syntheticMonitoring";
 import { effortForTarget } from "./modelStore";
+import { errorMessage } from "../lib/errors";
 
 const MONITORS_STORAGE_KEY = "little-monkey-synthetic-monitors-v1";
 const RUNS_STORAGE_KEY = "little-monkey-synthetic-monitor-runs-v1";
@@ -43,7 +44,7 @@ const MAX_RUNS_PER_MONITOR = 20;
 const TICK_INTERVAL_MS = 30_000;
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function persistMonitors(monitors: SyntheticMonitor[]): void {

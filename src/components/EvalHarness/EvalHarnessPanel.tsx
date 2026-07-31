@@ -35,6 +35,8 @@ import { nativeSkills, type SlashSkill } from "../../lib/skills";
 import { useEvalHarnessStore } from "../../store/evalHarnessStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface EvalHarnessPanelProps {
   onClose: () => void;
@@ -54,9 +56,9 @@ function nullableNumber(value: string): number | null {
 }
 
 function statusTone(status: EvalRunStatus): PillTone {
-  if (status === "passed") return "success";
-  if (status === "running") return "warning";
-  return "danger";
+  // "running" reads as in-flight here; everything non-passed is a failure
+  // signal for a suite, including "cancelled".
+  return sharedStatusTone(status, { running: "warning", cancelled: "danger" });
 }
 
 function formatTime(timestamp: number): string {
@@ -104,7 +106,7 @@ function CaseEditor({ suiteId, testCase, target }: { suiteId: string; testCase: 
       setJsonError(null);
       patchExpectations({ jsonSubset: parsed as Record<string, unknown> });
     } catch (error) {
-      setJsonError(error instanceof Error ? error.message : String(error));
+      setJsonError(errorMessage(error));
     }
   };
 
@@ -345,17 +347,17 @@ export function EvalHarnessPanel({ onClose }: EvalHarnessPanelProps) {
     try {
       setSkills(nativeSkills(await nativeSkillsClient.discover()));
     } catch (error) {
-      errors.push(`Skills: ${error instanceof Error ? error.message : String(error)}`);
+      errors.push(`Skills: ${errorMessage(error)}`);
     }
     try {
       setWorkflows(await ecosystemClient.workflows());
     } catch (error) {
-      errors.push(`Workflows: ${error instanceof Error ? error.message : String(error)}`);
+      errors.push(`Workflows: ${errorMessage(error)}`);
     }
     try {
       await refreshMcp();
     } catch (error) {
-      errors.push(`Connectors: ${error instanceof Error ? error.message : String(error)}`);
+      errors.push(`Connectors: ${errorMessage(error)}`);
     }
     setTargetError(errors.length > 0 ? errors.join(" · ") : null);
     setTargetsBusy(false);
@@ -369,7 +371,7 @@ export function EvalHarnessPanel({ onClose }: EvalHarnessPanelProps) {
       const destination = await save({ defaultPath, filters: [{ name: "JSON", extensions: ["json"] }] });
       if (destination) await writeTextFile(destination, `${content}\n`);
     } catch (error) {
-      setExportError(error instanceof Error ? error.message : String(error));
+      setExportError(errorMessage(error));
     }
   };
 

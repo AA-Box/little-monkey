@@ -29,6 +29,7 @@ import initSqlJs, { type Database, type SqlJsStatic, type SqlValue } from "sql.j
 // context — in Node, sql.js's own `require`+`__dirname` resolution already
 // finds the real `.wasm` file next to `sql-wasm.js` without any help.
 import sqlWasmUrl from "sql.js/dist/sql-wasm.wasm?url";
+import { errorMessage } from "./errors";
 
 export type NotebookCellType = "sql" | "markdown";
 export type SqlColumnType = "INTEGER" | "REAL" | "TEXT";
@@ -377,7 +378,7 @@ export function runSqlStatements(db: Database, source: string): NotebookCellOutp
 }
 
 function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorMessage(err);
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import {
 } from "../../lib/mcpGenerator";
 import { useMcpGeneratorStore } from "../../store/mcpGeneratorStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface McpGeneratorPanelProps {
   onClose: () => void;
@@ -30,7 +31,7 @@ const PARAM_TYPES: McpParamType[] = ["string", "number", "boolean", "array", "ob
 const SOURCE_KINDS: McpSourceKind[] = ["api", "cli", "script", "workflow"];
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export function McpGeneratorPanel({ onClose }: McpGeneratorPanelProps) {

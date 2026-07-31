@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Mirrors the Rust `ConnectorProvider` enum (src-tauri/src/connectors.rs)
@@ -102,7 +103,7 @@ export const useConnectorsStore = create<ConnectorsStore>((set, get) => ({
       set({ accounts, loading: false });
     } catch (err) {
       if (requestId !== latestRefreshRequest) return;
-      set({ error: err instanceof Error ? err.message : String(err), loading: false });
+      set({ error: errorMessage(err), loading: false });
     }
   },
 

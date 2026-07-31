@@ -13,6 +13,7 @@
  * from both the runner and the UI.
  */
 import type { ModelTargetSnapshot } from "./modelTargets";
+import { errorMessage } from "./errors";
 
 export type BenchmarkCategory = "coding" | "writing" | "rag" | "browser_qa" | "connector" | "custom";
 
@@ -236,7 +237,7 @@ export function evaluateVerifier(verifier: LabVerifier | null, content: string):
         const description = `/${pattern}/${verifier.flags ?? ""}`;
         return { ok, message: ok ? `Matches ${description}.` : `Does not match ${description}.` };
       } catch (error) {
-        return { ok: false, message: `Invalid verifier regex: ${error instanceof Error ? error.message : String(error)}` };
+        return { ok: false, message: `Invalid verifier regex: ${errorMessage(error)}` };
       }
     }
     case "json_valid": {
@@ -362,7 +363,10 @@ export function buildLabReport(run: LabRun): LabReport {
 }
 
 function escapeMarkdownCell(value: string): string {
-  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
+  // Escape backslashes in the same pass as pipes. Escaping pipes alone leaves
+  // `a\|b` as `a\\|b`, which markdown renders as a literal backslash followed
+  // by an unescaped pipe — the cell still breaks out of the table.
+  return value.replace(/[\\|]/g, "\\$&").replace(/\r?\n/g, " ").trim();
 }
 
 function formatMsForReport(value: number | null): string {

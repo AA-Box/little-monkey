@@ -23,6 +23,7 @@ import {
 } from './turnEngine';
 import { protectToolResult } from './untrustedContent';
 import { isVisionCapableProviderModel } from './visionModels';
+import { errorMessage } from "./errors";
 
 const CANCELLED_SUMMARY = 'Cancelled by the user.';
 
@@ -237,6 +238,6 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
       `Stopped after reaching the safety limit of ${params.maxIterations} tool-calling iterations without a final answer.`,
     );
   } catch (error) {
-    return finish('error', error instanceof Error ? error.message : String(error));
+    return finish('error', errorMessage(error));
   }
 }

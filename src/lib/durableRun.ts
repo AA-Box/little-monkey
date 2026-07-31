@@ -20,6 +20,7 @@ import {
 } from "./runProtocol";
 import type { PermissionMode } from "../store/permissionStore";
 import type { WorkspaceRootInfo } from "../store/workspaceStore";
+import { errorMessage } from "./errors";
 
 const MUTATING_TOOLS = new Set([
   "write_file",
@@ -570,7 +571,7 @@ export class DurableRunRecorder {
   async fail(error: unknown, retryable = false): Promise<void> {
     if (this.terminal) return this.flush();
     this.terminal = true;
-    const message = this.redact(error instanceof Error ? error.message : String(error));
+    const message = this.redact(errorMessage(error));
     await this.enqueue({ type: "failed", payload: { code: "desktop_turn_failed", message, retryable } });
     await this.flush();
   }

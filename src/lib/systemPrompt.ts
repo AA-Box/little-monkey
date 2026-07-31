@@ -358,6 +358,7 @@ export function buildSystemPrompt(
     'You have tools to read, search, and modify files in the workspace and to run shell commands. Guidance:',
     '- Gather context before acting: use glob to find files by name, grep to search content, read_file before editing.',
     '- Prefer edit_file (exact unique old_string -> new_string) for changes to existing files; use write_file only for new files or full rewrites.',
+    '- Outside Plan Mode, when the user explicitly asks you to create or change workspace files, make the change with edit_file or write_file. A code block in chat is not a substitute for editing the real file, and you must not claim files changed unless a mutating tool succeeded.',
     '- Mutating tools (write_file, edit_file, run_shell, remember) may prompt the user for permission and can be denied — if denied, stop and ask rather than retrying.',
     '- Paths must stay inside the workspace; commands run with a 120-second timeout.',
     '- After making changes, verify them when practical (re-read the file, or run the project\'s tests/build via run_shell).',

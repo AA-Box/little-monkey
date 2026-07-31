@@ -1,33 +1,66 @@
+import { useEffect, useSyncExternalStore } from "react";
 import { useLocaleStore } from "../../store/localeStore";
 import { DEFAULT_LOCALE, LOCALES, type LocaleCode } from "./locales";
 import { en } from "./locales/en";
-import { fr } from "./locales/fr";
-import { de } from "./locales/de";
-import { hi } from "./locales/hi";
-import { id } from "./locales/id";
-import { it } from "./locales/it";
-import { ja } from "./locales/ja";
-import { ko } from "./locales/ko";
-import { pt } from "./locales/pt";
-import { es419 } from "./locales/es419";
-import { esES } from "./locales/esES";
 
 export { LOCALES, DEFAULT_LOCALE };
 export type { LocaleCode };
 
-export const TRANSLATIONS: Record<LocaleCode, Record<string, string>> = {
+export const TRANSLATIONS: Partial<Record<LocaleCode, Record<string, string>>> = {
   "en-US": en,
-  "fr-FR": fr,
-  "de-DE": de,
-  "hi-IN": hi,
-  "id-ID": id,
-  "it-IT": it,
-  "ja-JP": ja,
-  "ko-KR": ko,
-  "pt-BR": pt,
-  "es-419": es419,
-  "es-ES": esES,
 };
+
+const localeLoaders: Record<LocaleCode, () => Promise<Record<string, string>>> = {
+  "en-US": async () => en,
+  "fr-FR": () => import("./locales/fr").then(({ fr }) => fr),
+  "de-DE": () => import("./locales/de").then(({ de }) => de),
+  "hi-IN": () => import("./locales/hi").then(({ hi }) => hi),
+  "id-ID": () => import("./locales/id").then(({ id }) => id),
+  "it-IT": () => import("./locales/it").then(({ it }) => it),
+  "ja-JP": () => import("./locales/ja").then(({ ja }) => ja),
+  "ko-KR": () => import("./locales/ko").then(({ ko }) => ko),
+  "pt-BR": () => import("./locales/pt").then(({ pt }) => pt),
+  "es-419": () => import("./locales/es419").then(({ es419 }) => es419),
+  "es-ES": () => import("./locales/esES").then(({ esES }) => esES),
+};
+
+const localeLoads = new Map<LocaleCode, Promise<void>>();
+const listeners = new Set<() => void>();
+let translationsRevision = 0;
+
+/**
+ * Loads one locale exactly once. Startup awaits this before the first render
+ * and `useT` also invokes it for later in-app locale changes.
+ */
+export function loadLocaleTranslations(locale: LocaleCode): Promise<void> {
+  if (TRANSLATIONS[locale]) return Promise.resolve();
+  const inFlight = localeLoads.get(locale);
+  if (inFlight) return inFlight;
+
+  const load = localeLoaders[locale]()
+    .then((dict) => {
+      TRANSLATIONS[locale] = dict;
+      translationsRevision += 1;
+      for (const listener of listeners) listener();
+    })
+    .catch((error: unknown) => {
+      console.error(`Failed to load translations for ${locale}:`, error);
+    })
+    .finally(() => {
+      localeLoads.delete(locale);
+    });
+  localeLoads.set(locale, load);
+  return load;
+}
+
+function subscribeToTranslations(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function translationSnapshot(): number {
+  return translationsRevision;
+}
 
 type TranslateVars = Record<string, string | number>;
 
@@ -46,10 +79,15 @@ function interpolate(template: string, vars?: TranslateVars): string {
  */
 export function useT() {
   const locale = useLocaleStore((state) => state.locale);
-  const dict = TRANSLATIONS[locale] ?? TRANSLATIONS[DEFAULT_LOCALE];
+  useSyncExternalStore(subscribeToTranslations, translationSnapshot, translationSnapshot);
+  useEffect(() => {
+    void loadLocaleTranslations(locale);
+  }, [locale]);
+  const fallback = TRANSLATIONS[DEFAULT_LOCALE] ?? en;
+  const dict = TRANSLATIONS[locale] ?? fallback;
 
   function t(key: string, vars?: TranslateVars): string {
-    const template = dict[key] ?? TRANSLATIONS[DEFAULT_LOCALE][key] ?? key;
+    const template = dict[key] ?? fallback[key] ?? key;
     return interpolate(template, vars);
   }
 

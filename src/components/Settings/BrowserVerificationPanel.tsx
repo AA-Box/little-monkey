@@ -18,9 +18,10 @@ import {
   typeBrowserText,
 } from "../../lib/browserVerification";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function ArtifactLink({ label, id }: { label: string; id?: string | null }) {

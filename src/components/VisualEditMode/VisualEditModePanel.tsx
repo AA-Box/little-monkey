@@ -13,6 +13,7 @@ import { artifactDataUrl, readDurableArtifact } from "../../lib/durableArtifacts
 import { useVisualEditModeStore, type VisualEdit, type VisualEditStatus } from "../../store/visualEditModeStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
 import { DiffViewer } from "../Workspace";
+import { errorMessage } from "../../lib/errors";
 
 interface VisualEditModePanelProps {
   onClose: () => void;
@@ -205,7 +206,7 @@ export function VisualEditModePanel({ onClose }: VisualEditModePanelProps) {
         setSelectedSessionId(list[0].sessionId);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setBusy(null);
     }
@@ -226,7 +227,7 @@ export function VisualEditModePanel({ onClose }: VisualEditModePanelProps) {
       const screenshot = await screenshotFromArtifact(result.evidence.screenshot);
       setBeforeScreenshot(screenshot);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
       setAnnotation(null);
       setBeforeScreenshot(null);
     } finally {

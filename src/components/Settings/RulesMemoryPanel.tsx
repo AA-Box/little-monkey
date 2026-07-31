@@ -6,6 +6,7 @@ import { useT } from "../../lib/i18n";
 import { useRulesStore, type MemoryFact } from "../../store/rulesStore";
 import { useWorkspaceStore } from "../../store/workspaceStore";
 import { useSettingsStore } from "../../store/settingsStore";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Filename `rules_write`'s `"project"` scope expects to find at the top of a
@@ -109,7 +110,7 @@ function RuleEditor({ heading, description, placeholder, initialContent, truncat
       setDirty(false);
       setJustSaved(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setSaving(false);
     }
@@ -183,7 +184,7 @@ function FactRow({ fact, onChanged }: { fact: MemoryFact; onChanged: () => Promi
       await onChanged();
       setEditing(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setSaving(false);
     }
@@ -196,7 +197,7 @@ function FactRow({ fact, onChanged }: { fact: MemoryFact; onChanged: () => Promi
       await invoke("memory_delete", { id: fact.id });
       await onChanged();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setDeleting(false);
     }
   }
@@ -298,7 +299,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
       await refresh();
       setNewFactText("");
     } catch (e) {
-      setAddError(e instanceof Error ? e.message : String(e));
+      setAddError(errorMessage(e));
     } finally {
       setAdding(false);
     }
@@ -312,7 +313,7 @@ function MemorySection({ hasWorkspace }: { hasWorkspace: boolean }) {
       await refresh();
       setConfirmingClear(false);
     } catch (e) {
-      setClearError(e instanceof Error ? e.message : String(e));
+      setClearError(errorMessage(e));
     } finally {
       setClearing(false);
     }

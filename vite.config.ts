@@ -15,7 +15,9 @@ const productionBuild = {
         if (/[\\/]node_modules[\\/](react|react-dom|scheduler|zustand)[\\/]/.test(id)) return "react-vendor";
         if (/[\\/]node_modules[\\/]@tauri-apps[\\/]/.test(id)) return "tauri-vendor";
         if (/[\\/]node_modules[\\/](react-markdown|remark-|rehype-|unified|micromark|mdast-|hast-|unist-)/.test(id)) return "markdown-vendor";
-        if (/[\\/]node_modules[\\/](react-syntax-highlighter|highlight.js|refractor|prismjs)[\\/]/.test(id)) return "highlight-vendor";
+        // Syntax highlighting is only used by the lazy ArtifactPane. Let
+        // Rollup keep it with that async surface; forcing it into a manual
+        // vendor chunk makes the entry import it to resolve a chunk cycle.
         // Mermaid intentionally keeps its own renderer chunks. Combining the
         // whole graph stack into one manual chunk creates a multi-megabyte
         // download even when only one diagram type is used.

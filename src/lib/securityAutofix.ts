@@ -65,6 +65,7 @@ import type { ChatMessage, ToolCall } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
 import { parseModelJsonCandidates } from './modelJson';
 import { attemptStream, executeToolCall } from './turnEngine';
+import { errorMessage } from "./errors";
 
 // ---------------------------------------------------------------------
 // Types
@@ -287,7 +288,7 @@ export async function runDependencyAudit(options: { cwd?: string } = {}): Promis
     }
     return { findings, error: null };
   } catch (err) {
-    return { findings: [], error: err instanceof Error ? err.message : String(err) };
+    return { findings: [], error: errorMessage(err) };
   }
 }
 

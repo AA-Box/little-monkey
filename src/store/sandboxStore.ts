@@ -8,9 +8,10 @@ import type {
   SandboxRunSummary,
 } from "../lib/sandbox";
 import { readDurableArtifact } from "../lib/durableArtifacts";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function decodeBase64Text(base64: string): string {

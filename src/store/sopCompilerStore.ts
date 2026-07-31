@@ -24,6 +24,7 @@ import {
   type SopCompilerCallResult,
 } from "../lib/sopCompiler";
 import { useSkillProposalStore, type SkillProposal } from "./skillProposalStore";
+import { errorMessage } from "../lib/errors";
 
 const STORAGE_KEY = "little-monkey-sop-compiler-drafts-v1";
 /** Fixed pseudo-session id for the compiler's one-shot model call — this run
@@ -151,7 +152,7 @@ export const useSopCompilerStore = create<SopCompilerStore>((set, get) => ({
       const fileName = selected.split(/[\\/]/).pop() ?? selected;
       set({ sourceText: content, sourceFileName: fileName, importing: false });
     } catch (err) {
-      set({ importing: false, error: err instanceof Error ? err.message : String(err) });
+      set({ importing: false, error: errorMessage(err) });
     }
   },
 
@@ -191,7 +192,7 @@ export const useSopCompilerStore = create<SopCompilerStore>((set, get) => ({
       persist(drafts);
       set({ drafts, selectedDraftId: entry.id, compiling: false });
     } catch (err) {
-      set({ compiling: false, error: err instanceof Error ? err.message : String(err) });
+      set({ compiling: false, error: errorMessage(err) });
     }
   },
 

@@ -38,6 +38,7 @@ import { wrapUntrustedContent } from './untrustedContent';
 import { usePermissionStore } from '../store/permissionStore';
 import { primaryRoot, useWorkspaceStore, type WorkspaceRootInfo } from '../store/workspaceStore';
 import type { VerifyCommand } from '../store/verifyStore';
+import { errorMessage } from "./errors";
 
 export const MAX_DESIGN_SOURCES = 12;
 export const MAX_DESIGN_IMAGES = 4;
@@ -239,7 +240,7 @@ function validateJsonPayload(content: string, label: string): void {
     const value = JSON.parse(content) as unknown;
     if (!value || typeof value !== 'object') throw new Error('payload must be a JSON object or array');
   } catch (error) {
-    throw new Error(`${label} must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`${label} must be valid JSON: ${errorMessage(error)}`);
   }
 }
 
@@ -867,7 +868,7 @@ export async function runDesignToAppImplementation(params: {
     if (agent.outcome === 'completed') {
       return {
         outcome: 'error',
-        summary: `Implementation finished, but the owned worktree could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
+        summary: `Implementation finished, but the owned worktree could not be inspected: ${errorMessage(error)}`,
         durableRunId: agent.durableRunId,
         patch,
         verification: [],
@@ -960,7 +961,7 @@ export async function captureDesignBrowserEvidence(params: {
       screenshotArtifactId: null,
       artifactIds: [],
       accessibilityIssues: [],
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage(error),
       capturedAtMs: Date.now(),
     };
   } finally {

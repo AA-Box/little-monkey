@@ -25,6 +25,8 @@ import { useT } from "../../lib/i18n";
 import { useIssueToPrStore } from "../../store/issueToPrStore";
 import { useSpecScorerStore } from "../../store/specScorerStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface IssueToPrPanelProps {
   onClose: () => void;
@@ -32,14 +34,17 @@ interface IssueToPrPanelProps {
 }
 
 function statusTone(status: IssueToPrStatus): PillTone {
-  if (status === "done") return "success";
-  if (status === "failed") return "danger";
-  if (status === "cancelled") return "neutral";
+  // Only three of this pipeline's states are terminal; every other step
+  // (planning, implementing, checking, opening_pr, awaiting_review) is work
+  // still in flight.
+  if (status === "done" || status === "failed" || status === "cancelled") {
+    return sharedStatusTone(status);
+  }
   return "warning";
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** Two real GitHub writes — pushing the owned branch, then opening the

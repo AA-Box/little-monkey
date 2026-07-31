@@ -139,6 +139,7 @@ export function CrossRepoIntelligencePanel({ onClose }: CrossRepoIntelligencePan
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
+              data-focus-ring="custom"
               className="h-9 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-faint"
               placeholder={t("CrossRepoIntelligencePanel.searchPlaceholder")}
               disabled={builtAtMs == null}

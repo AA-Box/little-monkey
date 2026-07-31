@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useStackStore, type KnowledgeStack } from "./stackStore";
+import { errorMessage } from "../lib/errors";
 
 export type KnowledgeConnector =
   | { kind: "local_file"; path: string }
@@ -315,7 +316,7 @@ interface KnowledgeV2Store {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export const useKnowledgeV2Store = create<KnowledgeV2Store>((set, get) => ({

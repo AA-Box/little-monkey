@@ -5,15 +5,23 @@ import "@xterm/xterm/css/xterm.css";
 import {
   AlertTriangle,
   Box,
+  ChevronDown,
+  ChevronUp,
+  CircleStop,
+  CornerDownLeft,
+  History as HistoryIcon,
   Maximize2,
   Minimize2,
   ListTodo,
   PanelBottom,
   PanelRight,
   Paperclip,
+  Play,
   Plus,
   RefreshCw,
+  Search,
   ShieldCheck,
+  Square,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -24,6 +32,11 @@ import { buildTerminalOutputSideTaskSeed, useSideTaskStore } from "../../store/s
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { Button, IconButton } from "../ui";
 import { SandboxPanel } from "./SandboxPanel";
+import {
+  findTerminalSearchMatches,
+  nextTerminalSearchIndex,
+  type TerminalSearchMatch,
+} from "./terminalSearch";
 
 /** Reads the app's themed color custom properties into concrete values for
  * xterm's theme object (xterm cannot consume `var(...)` references). The
@@ -60,6 +73,10 @@ interface TerminalPanelProps {
   hideFullscreenButton?: boolean;
 }
 
+type TerminalConfirmation =
+  | { kind: "kill" | "close"; sessionId: string }
+  | { kind: "run"; sessionId: string; command: string };
+
 export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreenButton }: TerminalPanelProps) {
   const { t } = useT();
   const roots = useWorkspaceStore((state) => state.roots);
@@ -71,10 +88,15 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
   const initialize = useTerminalStore((state) => state.initialize);
   const createSession = useTerminalStore((state) => state.createSession);
   const setActive = useTerminalStore((state) => state.setActive);
+  const execute = useTerminalStore((state) => state.execute);
   const write = useTerminalStore((state) => state.write);
+  const interrupt = useTerminalStore((state) => state.interrupt);
+  const kill = useTerminalStore((state) => state.kill);
   const restart = useTerminalStore((state) => state.restart);
   const close = useTerminalStore((state) => state.close);
   const resize = useTerminalStore((state) => state.resize);
+  const loadHistory = useTerminalStore((state) => state.loadHistory);
+  const historyByWorkspace = useTerminalStore((state) => state.historyByWorkspace);
   const queueEvidence = useTerminalStore((state) => state.queueEvidence);
   const clearError = useTerminalStore((state) => state.clearError);
   const dock = useTerminalStore((state) => state.dock);
@@ -88,10 +110,20 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
   const [attachedNotice, setAttachedNotice] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatches, setSearchMatches] = useState<TerminalSearchMatch[]>([]);
+  const [searchMatchIndex, setSearchMatchIndex] = useState(-1);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [confirmation, setConfirmation] = useState<TerminalConfirmation | null>(null);
+  const [controlBusy, setControlBusy] = useState<"interrupt" | "confirm" | null>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
 
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const confirmationTriggerRef = useRef<HTMLButtonElement | null>(null);
   /** Length of `active.output` already written to the emulator — new store
    * chunks are appended as deltas. When the bounded tail slides (256KB cap)
    * the prefix assumption breaks; the emulator is then reset and replayed. */
@@ -100,6 +132,13 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
   const active = sessions.find((session) => session.id === activeSessionId) ?? null;
   const activeId = active?.id ?? null;
   const activeStatus = active?.status ?? null;
+  const activeWorkspaceId = active?.workspace_id ?? null;
+  const activeHistory = active ? historyByWorkspace[active.workspace_id] ?? [] : [];
+
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    window.requestAnimationFrame(() => searchInputRef.current?.focus());
+  }, []);
 
   useEffect(() => {
     void initialize();
@@ -108,6 +147,18 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
   useEffect(() => {
     if (!selectedWorkspaceId && defaultRoot) setSelectedWorkspaceId(defaultRoot.id);
   }, [defaultRoot, selectedWorkspaceId]);
+
+  useEffect(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchMatches([]);
+    setSearchMatchIndex(-1);
+    setHistoryOpen(false);
+  }, [activeId]);
+
+  useEffect(() => {
+    if (historyOpen && activeWorkspaceId) void loadHistory(activeWorkspaceId);
+  }, [activeWorkspaceId, historyOpen, loadHistory]);
 
   const startTerminal = useCallback(async () => {
     if (!selectedWorkspaceId) return;
@@ -170,6 +221,21 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
       writtenRef.current = replay.length;
     }
 
+    term.attachCustomKeyEventHandler((event) => {
+      if (
+        event.type === "keydown"
+        && (event.metaKey || event.ctrlKey)
+        && !event.altKey
+        && event.key.toLocaleLowerCase() === "f"
+      ) {
+        openSearch();
+        return false;
+      }
+      // Ctrl+C, arrows, shell history, completion, and every other key stay
+      // on xterm's native path.
+      return true;
+    });
+
     const data = term.onData((chunk) => {
       void write(activeId, chunk);
     });
@@ -192,7 +258,7 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
       fitRef.current = null;
       writtenRef.current = 0;
     };
-  }, [activeId, resize, write]);
+  }, [activeId, openSearch, resize, write]);
 
   // Streams store output into the emulator as deltas (the store remains the
   // single source of truth so evidence capture and session replay keep
@@ -211,6 +277,55 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
       writtenRef.current = output.length;
     }
   }, [output]);
+
+  const revealSearchMatch = useCallback((match: TerminalSearchMatch) => {
+    const term = termRef.current;
+    if (!term) return;
+    term.select(match.column, match.row, match.length);
+    term.scrollToLine(Math.max(0, match.row - Math.floor(term.rows / 2)));
+  }, []);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      const term = termRef.current;
+      const query = searchQuery.trim();
+      if (!term || !query) {
+        term?.clearSelection();
+        setSearchMatches([]);
+        setSearchMatchIndex(-1);
+        return;
+      }
+
+      const matches = findTerminalSearchMatches(term.buffer.active, query);
+      const nextIndex = matches.length === 0
+        ? -1
+        : Math.min(Math.max(searchMatchIndex, 0), matches.length - 1);
+      setSearchMatches(matches);
+      setSearchMatchIndex(nextIndex);
+      if (nextIndex >= 0) revealSearchMatch(matches[nextIndex]);
+      else term.clearSelection();
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // `searchMatchIndex` is intentionally advanced only by navigation. An
+    // output append revalidates the current match without cycling it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, output, revealSearchMatch, searchOpen, searchQuery]);
+
+  const navigateSearch = useCallback((direction: "next" | "previous") => {
+    const nextIndex = nextTerminalSearchIndex(searchMatchIndex, searchMatches.length, direction);
+    setSearchMatchIndex(nextIndex);
+    if (nextIndex >= 0) revealSearchMatch(searchMatches[nextIndex]);
+  }, [revealSearchMatch, searchMatchIndex, searchMatches]);
+
+  const closeSearch = useCallback(() => {
+    termRef.current?.clearSelection();
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchMatches([]);
+    setSearchMatchIndex(-1);
+    window.requestAnimationFrame(() => termRef.current?.focus());
+  }, []);
 
   // Re-fit when the expanded height toggles (height transition ends fast;
   // ResizeObserver above also fires, this makes the refit immediate).
@@ -240,6 +355,86 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
     target.addEventListener("pointerup", up);
     target.addEventListener("pointercancel", up);
   }, [dock, panelSize, setPanelSize]);
+
+  const showConfirmation = useCallback((
+    next: TerminalConfirmation,
+    trigger: HTMLButtonElement,
+  ) => {
+    confirmationTriggerRef.current = trigger;
+    setDialogError(null);
+    setConfirmation(next);
+  }, []);
+
+  const dismissConfirmation = useCallback(() => {
+    if (controlBusy === "confirm") return;
+    setConfirmation(null);
+    setDialogError(null);
+    window.requestAnimationFrame(() => {
+      const trigger = confirmationTriggerRef.current;
+      if (trigger?.isConnected) trigger.focus();
+      else termRef.current?.focus();
+    });
+  }, [controlBusy]);
+
+  const closeSession = useCallback((sessionId: string, trigger: HTMLButtonElement) => {
+    const session = sessions.find((entry) => entry.id === sessionId);
+    if (session?.status === "running") {
+      showConfirmation({ kind: "close", sessionId }, trigger);
+      return;
+    }
+    void close(sessionId).catch(() => {});
+  }, [close, sessions, showConfirmation]);
+
+  const interruptActive = useCallback(async () => {
+    if (!active || active.status !== "running" || controlBusy) return;
+    setControlBusy("interrupt");
+    try {
+      await interrupt(active.id);
+      termRef.current?.focus();
+    } catch {
+      // The store owns the persistent error banner.
+    } finally {
+      setControlBusy(null);
+    }
+  }, [active, controlBusy, interrupt]);
+
+  const confirmPendingAction = useCallback(async () => {
+    if (!confirmation || controlBusy) return;
+    setControlBusy("confirm");
+    setDialogError(null);
+    try {
+      if (confirmation.kind === "run") {
+        await execute(confirmation.sessionId, confirmation.command);
+      } else if (confirmation.kind === "close") {
+        await close(confirmation.sessionId);
+      } else {
+        await kill(confirmation.sessionId);
+      }
+      setConfirmation(null);
+      window.requestAnimationFrame(() => {
+        const trigger = confirmationTriggerRef.current;
+        if (trigger?.isConnected) trigger.focus();
+        else termRef.current?.focus();
+      });
+    } catch (actionError) {
+      setDialogError(String(actionError));
+    } finally {
+      setControlBusy(null);
+    }
+  }, [close, confirmation, controlBusy, execute, kill]);
+
+  const toggleHistory = useCallback(() => {
+    setHistoryOpen((open) => {
+      const next = !open;
+      if (next && activeWorkspaceId) void loadHistory(activeWorkspaceId);
+      return next;
+    });
+  }, [activeWorkspaceId, loadHistory]);
+
+  const insertHistoryCommand = useCallback((command: string) => {
+    if (!active || active.status !== "running") return;
+    void write(active.id, command).then(() => termRef.current?.focus());
+  }, [active, write]);
 
   const prepareEvidence = useCallback(() => {
     if (!active) return;
@@ -399,7 +594,7 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
               <button
                 type="button"
                 aria-label={t("TerminalPanel.closeTab")}
-                onClick={() => void close(session.id)}
+                onClick={(event) => closeSession(session.id, event.currentTarget)}
                 className="mr-1 rounded-sm p-0.5 text-faint opacity-70 hover:bg-background hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
               >
                 <X size={11} />
@@ -409,8 +604,200 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
         </div>
       )}
 
+      {active && (
+        <div className="flex min-h-10 shrink-0 items-center gap-1.5 overflow-x-auto border-t border-border bg-surface px-3 py-1 [scrollbar-width:thin]">
+          <span
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-medium ${
+              active.status === "running"
+                ? "bg-success-soft text-success"
+                : active.status === "error"
+                  ? "bg-danger-soft text-danger"
+                  : "bg-surface-2 text-muted"
+            }`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${
+              active.status === "running" ? "bg-success" : active.status === "error" ? "bg-danger" : "bg-faint"
+            }`} />
+            {t(`TerminalPanel.status.${active.status}`)}
+          </span>
+          <IconButton
+            size="sm"
+            variant={searchOpen ? "active" : "ghost"}
+            onClick={searchOpen ? closeSearch : openSearch}
+            aria-label={t("TerminalPanel.searchLabel")}
+            title={`${t("TerminalPanel.searchLabel")} (${navigator.platform.includes("Mac") ? "⌘F" : "Ctrl+F"})`}
+            aria-expanded={searchOpen}
+            aria-controls={`terminal-search-${active.id}`}
+          >
+            <Search size={14} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant={historyOpen ? "active" : "ghost"}
+            onClick={toggleHistory}
+            aria-label={t("TerminalPanel.history")}
+            title={t("TerminalPanel.history")}
+            aria-expanded={historyOpen}
+            aria-controls={`terminal-history-${active.id}`}
+          >
+            <HistoryIcon size={14} />
+          </IconButton>
+          <div className="flex-1" />
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => void interruptActive()}
+            disabled={active.status !== "running" || controlBusy !== null}
+            title={t("TerminalPanel.interruptDescription")}
+          >
+            <CircleStop size={13} /> {t("TerminalPanel.interrupt")}
+          </Button>
+          <Button
+            size="sm"
+            variant="danger"
+            onClick={(event) => showConfirmation(
+              { kind: "kill", sessionId: active.id },
+              event.currentTarget,
+            )}
+            disabled={active.status !== "running" || controlBusy !== null}
+          >
+            <Square size={12} fill="currentColor" /> {t("TerminalPanel.kill")}
+          </Button>
+        </div>
+      )}
+
+      {active && searchOpen && (
+        <div
+          id={`terminal-search-${active.id}`}
+          className="flex min-h-11 shrink-0 flex-wrap items-center gap-1.5 border-t border-border bg-surface-2 px-3 py-1.5"
+        >
+          <label htmlFor={`terminal-search-input-${active.id}`} className="sr-only">
+            {t("TerminalPanel.searchLabel")}
+          </label>
+          <input
+            ref={searchInputRef}
+            id={`terminal-search-input-${active.id}`}
+            type="search"
+            value={searchQuery}
+            onChange={(event) => {
+              setSearchMatchIndex(0);
+              setSearchQuery(event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                navigateSearch(event.shiftKey ? "previous" : "next");
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                closeSearch();
+              }
+            }}
+            placeholder={t("TerminalPanel.searchPlaceholder")}
+            aria-describedby={`terminal-search-status-${active.id}`}
+            className="h-8 min-w-28 flex-1 rounded-md border border-border bg-background px-2.5 text-xs text-foreground placeholder:text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          />
+          <span
+            id={`terminal-search-status-${active.id}`}
+            className={`order-last min-h-4 basis-full text-left text-[11px] ${
+              searchQuery.trim() && searchMatches.length === 0 ? "text-warning" : "text-muted"
+            }`}
+            role="status"
+            aria-live="polite"
+          >
+            {searchQuery.trim()
+              ? searchMatches.length > 0
+                ? t("TerminalPanel.searchResults", {
+                    current: searchMatchIndex + 1,
+                    count: searchMatches.length,
+                  })
+                : t("TerminalPanel.noSearchResults")
+              : ""}
+          </span>
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={() => navigateSearch("previous")}
+            disabled={searchMatches.length === 0}
+            aria-label={t("TerminalPanel.previousMatch")}
+            title={t("TerminalPanel.previousMatch")}
+          >
+            <ChevronUp size={14} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={() => navigateSearch("next")}
+            disabled={searchMatches.length === 0}
+            aria-label={t("TerminalPanel.nextMatch")}
+            title={t("TerminalPanel.nextMatch")}
+          >
+            <ChevronDown size={14} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            variant="ghost"
+            onClick={closeSearch}
+            aria-label={t("TerminalPanel.closeSearch")}
+            title={t("TerminalPanel.closeSearch")}
+          >
+            <X size={14} />
+          </IconButton>
+        </div>
+      )}
+
+      {active && historyOpen && (
+        <div
+          id={`terminal-history-${active.id}`}
+          className="max-h-44 shrink-0 overflow-y-auto border-t border-border bg-surface-2 px-3 py-2"
+          aria-label={t("TerminalPanel.history")}
+        >
+          <p className="mb-2 text-[11px] leading-4 text-muted">
+            {t("TerminalPanel.historyHint")}
+          </p>
+          {activeHistory.length === 0 ? (
+            <p className="py-3 text-center text-xs text-muted" role="status">
+              {t("TerminalPanel.historyEmpty")}
+            </p>
+          ) : (
+            <ol className="space-y-1">
+              {[...activeHistory].reverse().map((command, index) => (
+                <li
+                  key={`${activeHistory.length - index}:${command}`}
+                  className="flex flex-wrap items-center justify-end gap-2 rounded-md border border-border bg-background px-2 py-1.5"
+                >
+                  <code className="min-w-0 basis-full truncate text-xs text-foreground" title={command}>
+                    {command}
+                  </code>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => insertHistoryCommand(command)}
+                    disabled={active.status !== "running"}
+                    aria-label={`${t("TerminalPanel.insertCommand")}: ${command}`}
+                  >
+                    <CornerDownLeft size={12} /> {t("TerminalPanel.insertCommand")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={(event) => showConfirmation(
+                      { kind: "run", sessionId: active.id, command },
+                      event.currentTarget,
+                    )}
+                    disabled={active.status !== "running" || busy}
+                    aria-label={`${t("TerminalPanel.runCommand")}: ${command}`}
+                  >
+                    <Play size={12} /> {t("TerminalPanel.runCommand")}
+                  </Button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )}
+
       {error && (
-        <div className="flex items-center justify-between gap-3 border-b border-danger bg-danger-soft px-3 py-1.5 text-xs text-danger">
+        <div className="flex items-center justify-between gap-3 border-b border-danger bg-danger-soft px-3 py-1.5 text-xs text-danger" role="alert">
           <span className="min-w-0 truncate">{error}</span>
           <button type="button" onClick={clearError} className="shrink-0 underline">{t("TerminalPanel.dismiss")}</button>
         </div>
@@ -467,6 +854,72 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
         </div>
       )}
 
+      {confirmation && (
+        <div
+          className="absolute inset-0 z-30 flex items-center justify-center bg-black/50 p-3"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="terminal-confirm-title"
+          aria-describedby="terminal-confirm-description"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              dismissConfirmation();
+            }
+          }}
+        >
+          <div className="w-full max-w-md rounded-xl border border-border bg-background p-4 shadow-xl">
+            <h3 id="terminal-confirm-title" className="text-sm font-semibold text-foreground">
+              {t(confirmation.kind === "run"
+                ? "TerminalPanel.runConfirmTitle"
+                : confirmation.kind === "close"
+                  ? "TerminalPanel.closeConfirmTitle"
+                  : "TerminalPanel.killConfirmTitle")}
+            </h3>
+            <p id="terminal-confirm-description" className="mt-2 text-xs leading-5 text-muted">
+              {t(confirmation.kind === "run"
+                ? "TerminalPanel.runConfirmDescription"
+                : confirmation.kind === "close"
+                  ? "TerminalPanel.closeConfirmDescription"
+                  : "TerminalPanel.killConfirmDescription")}
+            </p>
+            {confirmation.kind === "run" && (
+              <pre className="mt-3 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-surface-2 p-2 font-mono text-xs text-foreground">
+                {confirmation.command}
+              </pre>
+            )}
+            {dialogError && (
+              <p className="mt-3 rounded-md bg-danger-soft px-2.5 py-2 text-xs text-danger" role="alert">
+                {dialogError}
+              </p>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <Button
+                autoFocus
+                variant="secondary"
+                onClick={dismissConfirmation}
+                disabled={controlBusy === "confirm"}
+              >
+                {t("TerminalPanel.cancel")}
+              </Button>
+              <Button
+                variant={confirmation.kind === "run" ? "primary" : "danger"}
+                onClick={() => void confirmPendingAction()}
+                disabled={controlBusy === "confirm"}
+              >
+                {controlBusy === "confirm"
+                  ? t("TerminalPanel.working")
+                  : t(confirmation.kind === "run"
+                    ? "TerminalPanel.confirmRun"
+                    : confirmation.kind === "close"
+                      ? "TerminalPanel.confirmClose"
+                      : "TerminalPanel.confirmKill")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {evidencePreview && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50 p-3" role="dialog" aria-modal="true" aria-labelledby="terminal-evidence-title">
           <div className="flex max-h-full w-full max-w-xl flex-col rounded-xl border border-border bg-background shadow-xl">
@@ -474,10 +927,13 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-warning-soft text-warning">
                 <ShieldCheck size={18} />
               </div>
-              <div>
+              <div className="min-w-0 flex-1">
                 <h3 id="terminal-evidence-title" className="text-sm font-semibold text-foreground">{t("TerminalPanel.approvalTitle")}</h3>
                 <p className="mt-1 text-xs text-muted">{t("TerminalPanel.approvalDescription")}</p>
               </div>
+              <IconButton size="sm" variant="ghost" onClick={() => setEvidencePreview(null)} aria-label={t("TerminalPanel.cancel")}>
+                <X size={14} />
+              </IconButton>
             </div>
             {evidencePreview.truncated && (
               <div className="flex items-center gap-2 border-b border-warning/30 bg-warning-soft px-4 py-2 text-xs text-warning">
@@ -487,8 +943,7 @@ export function TerminalPanel({ chatSessionId, onClose, embedded, hideFullscreen
             <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-surface-2 p-3 font-mono text-xs leading-5 text-foreground">
               {evidencePreview.content}
             </pre>
-            <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-end">
-              <Button variant="ghost" onClick={() => setEvidencePreview(null)}>{t("TerminalPanel.cancel")}</Button>
+            <div className="flex flex-col-reverse gap-2 border-t border-border p-3 sm:flex-row sm:justify-center">
               <Button variant="secondary" onClick={startSideTaskFromEvidence}>
                 <ListTodo size={13} /> Start side task
               </Button>

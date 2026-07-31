@@ -152,7 +152,7 @@ export const TOOLS: ToolDef[] = [
     function: {
       name: 'run_shell',
       description:
-        'Run a shell command via `sh -c` in the workspace (or a subdirectory of it), with a 120 second timeout. Returns stdout, stderr, and exit code. Requires user permission.',
+        'Run a shell command via `sh -c` in the workspace (or a subdirectory of it), with a 120 second timeout. Returns stdout, stderr, and exit code. Set run_in_background for a command that should outlive this tool call (a dev server, a file watcher, a long build) — it returns a task id immediately instead of waiting, and the command keeps running until it exits or shell_kill stops it. Requires user permission.',
       parameters: {
         type: 'object',
         properties: {
@@ -165,8 +165,56 @@ export const TOOLS: ToolDef[] = [
             description:
               "Optional working directory, relative to the primary workspace folder. Defaults to the primary folder's root. If a secondary folder is attached, prefix the path with its label to run inside it instead, e.g. 'other-folder'.",
           },
+          run_in_background: {
+            type: 'boolean',
+            description:
+              'Run the command in the background instead of waiting for it. Returns { id, command, status } straight away; read its output later with shell_output and stop it with shell_kill. Use for long-running or never-exiting commands; leave unset for anything you need the output of right now.',
+          },
         },
         required: ['command'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'shell_output',
+      description:
+        'Read output from a background command started by run_shell with run_in_background. By default returns only the output produced since the previous shell_output call for that id, so polling a chatty process stays cheap. Also reports the command status and exit code. No permission prompt — it only reads output the user can already see in the Background Tasks panel.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: {
+            type: 'string',
+            description: 'The background task id returned by run_shell.',
+          },
+          drain: {
+            type: 'boolean',
+            description:
+              'Defaults to true (only new output since the last read). Pass false to re-read the whole retained output tail without advancing the cursor.',
+          },
+        },
+        required: ['id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'shell_kill',
+      description:
+        'Stop a background command started by run_shell with run_in_background. Returns the task in its final state; killing an already-finished task is a no-op rather than an error.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: {
+            type: 'string',
+            description: 'The background task id returned by run_shell.',
+          },
+        },
+        required: ['id'],
         additionalProperties: false,
       },
     },
@@ -186,6 +234,36 @@ export const TOOLS: ToolDef[] = [
           },
         },
         required: ['text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'spawn_task',
+      description:
+        "Flag an out-of-scope issue for a separate background task. Use when you notice something worth fixing that would bloat the current change — dead code, stale docs, missing coverage, a confirmed TODO, or a security issue spotted in passing. Don't flag vague code-smell observations, trivial fixes you can do inline, or low-confidence hunches. A chip appears for the user; one click spins it off into its own session. Your current turn continues uninterrupted, and nothing runs unless the user clicks. The prompt must stand alone — include file paths and enough context to act without this conversation.",
+      parameters: {
+        type: 'object',
+        properties: {
+          title: {
+            type: 'string',
+            description:
+              'Under 60 characters, an imperative action phrase starting with a verb, e.g. "Fix stale README badge". Shown as the chip label.',
+          },
+          tldr: {
+            type: 'string',
+            description:
+              '1-2 sentence plain-English summary of what the spawned session would do and why. Shown to the user on hover — keep it readable, no file paths or code.',
+          },
+          prompt: {
+            type: 'string',
+            description:
+              'The initial message for the spawned session. Must be self-contained: include file paths and enough context to act without this conversation.',
+          },
+        },
+        required: ['title', 'prompt'],
         additionalProperties: false,
       },
     },
@@ -339,7 +417,17 @@ export function buildTools(attachedStackNames: string[]): ToolDef[] {
  * See `tools.test.ts` for the test proving this by construction.
  */
 const EXPLORE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set(['read_file', 'list_dir', 'glob', 'grep']);
-const CODE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set([...EXPLORE_PROFILE_TOOL_NAMES, 'write_file', 'edit_file', 'run_shell']);
+const CODE_PROFILE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ...EXPLORE_PROFILE_TOOL_NAMES,
+  'write_file',
+  'edit_file',
+  'run_shell',
+  // Offered alongside `run_shell` rather than separately: a profile allowed
+  // to start a background command must also be able to read its output and
+  // stop it, or it can only ever leak processes it cannot observe.
+  'shell_output',
+  'shell_kill',
+]);
 
 export function toolsForProfile(profile: 'explore' | 'code'): ToolDef[] {
   const names = profile === 'code' ? CODE_PROFILE_TOOL_NAMES : EXPLORE_PROFILE_TOOL_NAMES;

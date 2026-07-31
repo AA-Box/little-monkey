@@ -4,6 +4,7 @@ import { AlertTriangle, Ban, Check, KeyRound, MousePointerClick, Navigation, Shi
 import type { DraftWorkflow, DraftWorkflowInput, DraftWorkflowStep } from "../../lib/workflowRecorder";
 import { useWorkflowDraftStore } from "../../store/workflowDraftStore";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface WorkflowDraftReviewProps {
   /** A freshly converted draft (from `convertRecordingToDraft`) or an
@@ -105,7 +106,7 @@ export function WorkflowDraftReview({ initialDraft, onDiscard, onSaved }: Workfl
       const saved = useWorkflowDraftStore.getState().drafts.find((entry) => entry.id === draft.id);
       onSaved(saved ?? draft);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(errorMessage(cause));
     }
   }
 

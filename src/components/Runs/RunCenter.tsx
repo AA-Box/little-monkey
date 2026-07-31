@@ -35,6 +35,9 @@ import { initializeRunStore, useRunStore } from "../../store/runStore";
 import { Button, IconButton, StatusPill, Tabs, type PillTone } from "../ui";
 import { RunCapsulePanel } from "./RunCapsulePanel";
 import { startRunCapsuleReplay } from "../../lib/runCapsuleReplay";
+import { errorMessage } from "../../lib/errors";
+import { formatTimestamp } from "../../lib/format";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface RunCenterProps {
   onClose: () => void;
@@ -52,15 +55,10 @@ interface PendingApproval {
 const TERMINAL = new Set<RunStatus>(["succeeded", "failed", "cancelled", "needs_reconciliation"]);
 
 function statusTone(status: RunStatus): PillTone {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "needs_reconciliation") return "danger";
-  if (status === "waiting_for_permission" || status === "paused" || status === "cancelling") return "warning";
-  return "neutral";
+  // A paused/cancelling durable run still needs the operator's attention.
+  return sharedStatusTone(status, { paused: "warning", cancelling: "warning" });
 }
 
-function formatTime(value: number): string {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(value);
-}
 
 function pendingApprovals(events: RunEventEnvelopeWire[]): PendingApproval[] {
   const pending = new Map<string, PendingApproval>();
@@ -106,7 +104,7 @@ function RunListItem({ run, selected, onSelect }: { run: RunRecord; selected: bo
       </div>
       <div className="mt-2 flex items-center justify-between gap-2 text-xs text-faint">
         <span className="truncate">{run.spec.target.label}</span>
-        <time dateTime={new Date(run.spec.created_at_ms).toISOString()}>{formatTime(run.spec.created_at_ms)}</time>
+        <time dateTime={new Date(run.spec.created_at_ms).toISOString()}>{formatTimestamp(run.spec.created_at_ms)}</time>
       </div>
     </button>
   );
@@ -162,7 +160,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
       await decideRunPermission(selectedRunId, approval.requestId, approval.operationSha256, decision);
       await refreshRun(selectedRunId);
     } catch (caught) {
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     } finally {
       setActionBusy(null);
     }
@@ -180,7 +178,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
       }
       await refreshRun(selectedRunId);
     } catch (caught) {
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     } finally {
       setActionBusy(null);
     }
@@ -193,7 +191,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
     try {
       await archiveRunAction(selectedRunId);
     } catch (caught) {
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     } finally {
       setActionBusy(null);
     }
@@ -206,7 +204,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
     try {
       await unarchiveRunAction(selectedRunId);
     } catch (caught) {
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     } finally {
       setActionBusy(null);
     }
@@ -224,7 +222,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
         await daemonRetry(selectedRunId, hasMutationBoundary);
         await refresh();
       } catch (caught) {
-        setActionError(caught instanceof Error ? caught.message : String(caught));
+        setActionError(errorMessage(caught));
       } finally {
         setActionBusy(null);
       }
@@ -236,7 +234,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
       await (action === "pause" ? daemonPause(selectedRunId) : daemonResume(selectedRunId));
       await refreshRun(selectedRunId);
     } catch (caught) {
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     } finally {
       setActionBusy(null);
     }
@@ -378,7 +376,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
               <dl className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-surface p-3 text-xs sm:grid-cols-4">
                 <div><dt className="text-faint">{t("RunCenter.kind")}</dt><dd className="mt-1 font-medium">{selectedRun.spec.kind}</dd></div>
                 <div><dt className="text-faint">{t("RunCenter.target")}</dt><dd className="mt-1 truncate font-medium">{selectedRun.spec.target.label}</dd></div>
-                <div><dt className="text-faint">{t("RunCenter.created")}</dt><dd className="mt-1 font-medium">{formatTime(selectedRun.spec.created_at_ms)}</dd></div>
+                <div><dt className="text-faint">{t("RunCenter.created")}</dt><dd className="mt-1 font-medium">{formatTimestamp(selectedRun.spec.created_at_ms)}</dd></div>
                 <div><dt className="text-faint">{t("RunCenter.events")}</dt><dd className="mt-1 font-medium">{selectedRun.lastSequence}</dd></div>
               </dl>
 
@@ -395,7 +393,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
                             {approval.riskLevel && <StatusPill tone="warning">{approval.riskLevel}</StatusPill>}
                           </div>
                           <p className="mt-2 font-mono text-[10px] text-faint" title={approval.operationSha256}>{t("RunCenter.digest")}: {approval.operationSha256.slice(0, 16)}…</p>
-                          <p className="mt-1 text-[11px] text-faint">{t("RunCenter.expires")}: {formatTime(approval.expiresAtMs)}</p>
+                          <p className="mt-1 text-[11px] text-faint">{t("RunCenter.expires")}: {formatTimestamp(approval.expiresAtMs)}</p>
                           <div className="mt-3 flex flex-wrap gap-2">
                             {expired ? (
                               <Button size="sm" disabled={actionBusy !== null} onClick={() => void decide(approval, "expired")}>{t("RunCenter.markExpired")}</Button>
@@ -445,7 +443,7 @@ export function RunCenter({ onClose }: RunCenterProps) {
                         <li key={event.event_id} className="rounded-lg border border-border bg-surface p-3">
                           <div className="flex items-center justify-between gap-3 text-xs">
                             <span className="font-medium">#{event.sequence} · {eventTitle(event, t)}</span>
-                            <time className="text-faint" dateTime={new Date(event.occurred_at_ms).toISOString()}>{formatTime(event.occurred_at_ms)}</time>
+                            <time className="text-faint" dateTime={new Date(event.occurred_at_ms).toISOString()}>{formatTimestamp(event.occurred_at_ms)}</time>
                           </div>
                           {(event.actor_id || event.emitter.kind) && <p className="mt-1 text-[11px] text-faint">{event.actor_id ? `${t("RunCenter.actor")}: ${event.actor_id} · ` : ""}{event.emitter.kind}</p>}
                           <details className="mt-2 text-xs">
