@@ -51,6 +51,7 @@ import {
   type StatementKind,
   type TableInfo,
 } from "../lib/dbAdminGuardrails";
+import { errorMessage } from "../lib/errors";
 
 /** Fixed pseudo-session id for this feature's one-shot model calls — mirrors
  * `sopCompilerStore.ts`'s `SOP_COMPILER_SESSION_ID`; `recordUsage: false`
@@ -188,7 +189,7 @@ export const useDbAdminGuardrailsStore = create<DbAdminGuardrailsState>((set, ge
         fileName: null,
         fileSizeBytes: null,
         tables: [],
-        proposalError: err instanceof Error ? err.message : String(err),
+        proposalError: errorMessage(err),
       });
     }
   },
@@ -271,7 +272,7 @@ export const useDbAdminGuardrailsStore = create<DbAdminGuardrailsState>((set, ge
         });
       }
     } catch (err) {
-      set({ proposing: false, proposalError: err instanceof Error ? err.message : String(err) });
+      set({ proposing: false, proposalError: errorMessage(err) });
     }
   },
 
@@ -283,7 +284,7 @@ export const useDbAdminGuardrailsStore = create<DbAdminGuardrailsState>((set, ge
       const result = dryRunWrite(currentDb, proposedSql, tables);
       set({ dryRunning: false, dryRun: result });
     } catch (err) {
-      set({ dryRunning: false, dryRunError: err instanceof Error ? err.message : String(err) });
+      set({ dryRunning: false, dryRunError: errorMessage(err) });
     }
   },
 
@@ -331,7 +332,7 @@ export const useDbAdminGuardrailsStore = create<DbAdminGuardrailsState>((set, ge
         nlRequest: "",
       }));
     } catch (err) {
-      set({ applying: false, applyError: err instanceof Error ? err.message : String(err) });
+      set({ applying: false, applyError: errorMessage(err) });
     }
   },
 

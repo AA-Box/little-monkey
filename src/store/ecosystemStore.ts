@@ -20,9 +20,10 @@ import {
   type WorkflowRunHistory,
   type WorkflowRunRequest,
 } from "../lib/ecosystemClient";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function baseNode(nodeId: string, kind: WorkflowNodeKind): WorkflowNode {

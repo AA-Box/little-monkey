@@ -6,6 +6,8 @@ import {
   type MigrationPlan,
 } from "../lib/migrationAgent";
 import { runMigrationSliceAgent, type MigrationSliceAgentResult } from "../lib/migrationAgentRunner";
+import { errorMessage } from "../lib/errors";
+import { hydrateState, persistState } from "../lib/persistedState";
 
 const STORAGE_KEY = "little-monkey-migration-agent-runs-v1";
 const STORAGE_VERSION = 1;
@@ -61,17 +63,11 @@ export interface MigrationRun {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function persist(runs: MigrationRun[]): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: STORAGE_VERSION, runs }));
-  } catch {
-    // The run stays live in memory for this session even if persistence
-    // fails (e.g. storage quota) — nothing downstream depends on the write
-    // having succeeded.
-  }
+  persistState(STORAGE_KEY, STORAGE_VERSION, { runs });
 }
 
 function isMigrationRunStatus(value: unknown): value is MigrationRunStatus {
@@ -87,26 +83,20 @@ function isMigrationRunStatus(value: unknown): value is MigrationRunStatus {
 }
 
 function hydrate(): MigrationRun[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null") as
-      | { version?: unknown; runs?: unknown }
-      | null;
-    if (raw?.version !== STORAGE_VERSION || !Array.isArray(raw.runs)) return [];
-    return raw.runs.filter((value): value is MigrationRun => {
-      const item = value as Partial<MigrationRun>;
-      return Boolean(
-        item &&
-        typeof item.runId === "string" &&
-        typeof item.goal === "string" &&
-        typeof item.repositorySlug === "string" &&
-        isMigrationRunStatus(item.status) &&
-        typeof item.createdAtMs === "number" &&
-        typeof item.updatedAtMs === "number",
-      );
-    });
-  } catch {
-    return [];
-  }
+  const raw = hydrateState(STORAGE_KEY, STORAGE_VERSION);
+  if (!raw || !Array.isArray(raw.runs)) return [];
+  return raw.runs.filter((value): value is MigrationRun => {
+    const item = value as Partial<MigrationRun>;
+    return Boolean(
+      item &&
+      typeof item.runId === "string" &&
+      typeof item.goal === "string" &&
+      typeof item.repositorySlug === "string" &&
+      isMigrationRunStatus(item.status) &&
+      typeof item.createdAtMs === "number" &&
+      typeof item.updatedAtMs === "number",
+    );
+  });
 }
 
 /** In-flight cancellation handles, keyed by run id — deliberately NOT part

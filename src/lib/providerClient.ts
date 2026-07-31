@@ -16,6 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { SseEventParser } from './llamaClient';
 import type { ChatMessage, StreamEvent, ToolDef } from './llamaClient';
+import { errorMessage } from "./errors";
 
 interface ChatChunkEvent {
   request_id: string;
@@ -118,7 +119,7 @@ export async function* streamProviderChat(
     effort: effort ?? null,
     runId: runId ?? null,
   }).catch((err: unknown) => {
-    fail(err instanceof Error ? err.message : String(err));
+    fail(errorMessage(err));
   });
 
   try {

@@ -64,6 +64,9 @@ export interface RemotePairRequest {
   runIds: string[];
   workspaceIds: string[];
   maxArtifactBytes: number;
+  /** First-party mobile-companion grants. Additive to `actions` and never
+   * widening the run scope; omitted/empty means a runner-only controller. */
+  mobileCapabilities?: string[];
 }
 
 export const MAX_REMOTE_ARTIFACT_BYTES = 32 * 1024 * 1024;
@@ -78,6 +81,15 @@ const REMOTE_ACTIONS = new Set([
   "cancel",
   "kill",
   "control-desktop",
+]);
+
+/** Mobile-only grants — see `protocol::DeviceCapability` on the node. */
+const MOBILE_CAPABILITIES = new Set([
+  "view-sessions",
+  "chat",
+  "view-tasks",
+  "run-workflows",
+  "capture",
 ]);
 
 export const daemonStatus = () => invoke<DaemonStatus>("daemon_desktop_status");
@@ -153,6 +165,18 @@ export function validateRemotePairRequest(request: RemotePairRequest): string[] 
   }
   if ((request.actions.includes("approve") || request.actions.includes("read-artifacts")) && !request.actions.includes("view-runs")) {
     warnings.push("Approve and artifact access also require view-runs.");
+  }
+  const mobile = request.mobileCapabilities ?? [];
+  if (mobile.some((capability) => !MOBILE_CAPABILITIES.has(capability))) {
+    warnings.push("Unknown mobile companion capability.");
+  }
+  // Mirrors `protocol::validate_capabilities` on the node, so an invalid
+  // combination is caught before the CLI is ever invoked.
+  if (mobile.includes("chat") && !mobile.includes("view-sessions")) {
+    warnings.push("Mobile chat also requires view-sessions.");
+  }
+  if (mobile.includes("run-workflows") && !mobile.includes("view-tasks")) {
+    warnings.push("Mobile workflow launch also requires view-tasks.");
   }
   return warnings;
 }

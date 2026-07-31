@@ -17,6 +17,7 @@ import {
   translateMessage,
 } from "../../lib/translation";
 import type { MessageTranslation } from "../../store/sessionStore";
+import { errorMessage } from "../../lib/errors";
 
 export interface MessageBubbleProps {
   message: ChatMessage;
@@ -437,7 +438,7 @@ function TranslationControls({
       onDisplay(translation);
     } catch (caught) {
       if (!(caught instanceof DOMException && caught.name === "AbortError")) {
-        setError(caught instanceof Error ? caught.message : String(caught));
+        setError(errorMessage(caught));
       }
     } finally {
       setRunning(false);

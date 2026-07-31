@@ -15,6 +15,7 @@ import { useT } from "../../lib/i18n";
 import { BUILT_IN_SLASH_COMMANDS } from "../../lib/slashCommands";
 import { useSkillProposalStore } from "../../store/skillProposalStore";
 import { NativeSkillsManager } from "./NativeSkillsManager";
+import { errorMessage } from "../../lib/errors";
 
 /** Same slash-trigger slug shape the design doc pins for `PromptEntry.command`. */
 const COMMAND_PATTERN = /^[a-z0-9-]{1,32}$/;
@@ -174,7 +175,7 @@ export function PromptLibraryPanel() {
       if (!path) return;
       await invoke("prompts_write_external", { path, payload: exportPayload() });
     } catch (err) {
-      setExportError(err instanceof Error ? err.message : String(err));
+      setExportError(errorMessage(err));
     } finally {
       setExportBusy(false);
     }
@@ -196,7 +197,7 @@ export function PromptLibraryPanel() {
       }
       setImportPreview(parsed);
     } catch (err) {
-      setImportError(err instanceof Error ? err.message : String(err));
+      setImportError(errorMessage(err));
     } finally {
       setImportBusy(false);
     }
@@ -302,7 +303,7 @@ export function PromptLibraryPanel() {
                         setProposalBusy(proposal.id);
                         setProposalError(null);
                         void approveProposal(proposal.id, proposal.contentSha256)
-                          .catch((reason: unknown) => setProposalError(reason instanceof Error ? reason.message : String(reason)))
+                          .catch((reason: unknown) => setProposalError(errorMessage(reason)))
                           .finally(() => setProposalBusy(null));
                       }}
                     >

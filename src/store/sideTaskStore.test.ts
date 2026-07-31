@@ -21,7 +21,9 @@ function reset(): void {
   useSideTaskStore.setState({
     tasks: {},
     order: [],
-    drawerOpen: false,
+    paneOpen: false,
+    openTabs: [],
+    activeTabId: null,
     selectedTaskId: null,
     composerSeed: null,
     composerOpen: false,
@@ -84,8 +86,8 @@ describe("sideTaskStore / source seed builders", () => {
   });
 });
 
-describe("sideTaskStore / drawer + composer UI state", () => {
-  it("requests the app-shell panel for source actions without making openDrawer recursive", () => {
+describe("sideTaskStore / pane + composer UI state", () => {
+  it("requests the app-shell panel for source actions without making openPane recursive", () => {
     const eventTarget = new EventTarget();
     vi.stubGlobal("window", eventTarget);
     let requests = 0;
@@ -93,7 +95,7 @@ describe("sideTaskStore / drawer + composer UI state", () => {
     try {
       useSideTaskStore.getState().openComposer({ title: "t", prompt: "p", profile: "explore", source, sessionId: "s1" });
       expect(requests).toBe(1);
-      useSideTaskStore.getState().openDrawer();
+      useSideTaskStore.getState().openPane();
       expect(requests).toBe(1);
       useSideTaskStore.getState().revealPanel();
       expect(requests).toBe(2);
@@ -102,21 +104,21 @@ describe("sideTaskStore / drawer + composer UI state", () => {
     }
   });
 
-  it("openDrawer/closeDrawer/toggleDrawer flip drawerOpen", () => {
-    expect(useSideTaskStore.getState().drawerOpen).toBe(false);
-    useSideTaskStore.getState().openDrawer();
-    expect(useSideTaskStore.getState().drawerOpen).toBe(true);
-    useSideTaskStore.getState().closeDrawer();
-    expect(useSideTaskStore.getState().drawerOpen).toBe(false);
-    useSideTaskStore.getState().toggleDrawer();
-    expect(useSideTaskStore.getState().drawerOpen).toBe(true);
+  it("openPane/closePane/togglePane flip paneOpen", () => {
+    expect(useSideTaskStore.getState().paneOpen).toBe(false);
+    useSideTaskStore.getState().openPane();
+    expect(useSideTaskStore.getState().paneOpen).toBe(true);
+    useSideTaskStore.getState().closePane();
+    expect(useSideTaskStore.getState().paneOpen).toBe(false);
+    useSideTaskStore.getState().togglePane();
+    expect(useSideTaskStore.getState().paneOpen).toBe(true);
   });
 
-  it("openComposer stages a seed, opens the composer, and opens the drawer — mirrors browserWorkbenchStore's stage-then-consume shape", () => {
+  it("openComposer stages a seed, opens the composer, and opens the pane — mirrors browserWorkbenchStore's stage-then-consume shape", () => {
     useSideTaskStore.getState().openComposer({ title: "t", prompt: "p", profile: "explore", source, sessionId: "s1" });
     const state = useSideTaskStore.getState();
     expect(state.composerOpen).toBe(true);
-    expect(state.drawerOpen).toBe(true);
+    expect(state.paneOpen).toBe(true);
     expect(state.composerSeed).toEqual({ title: "t", prompt: "p", profile: "explore", source, sessionId: "s1" });
 
     useSideTaskStore.getState().consumeComposerSeed();

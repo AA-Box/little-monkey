@@ -15,13 +15,14 @@ import {
 import { useT } from "../../lib/i18n";
 import { useConnectorBuilderStore } from "../../store/connectorBuilderStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface ConnectorBuilderPanelProps {
   onClose: () => void;
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function statusPill(ready: boolean, bridgeBlocked: boolean, t: (key: string) => string) {

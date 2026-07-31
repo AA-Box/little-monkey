@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { errorMessage } from "./errors";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
@@ -16,7 +17,7 @@ vi.mock("./turnEngine", () => ({
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
-  stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+  stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: { kind: string; providerId?: string; model?: string }) =>
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));
@@ -27,6 +28,7 @@ vi.mock("./agentLoop", () => ({ resolveTarget: (...args: unknown[]) => resolveTa
 import {
   MAX_SIDE_TASK_ITERATIONS,
   cancelSideTask,
+  continueSideTask,
   openSideTaskAsFullChat,
   pauseSideTask,
   promoteSideTask,
@@ -63,7 +65,7 @@ beforeEach(() => {
   executeToolCallMock.mockReset();
   resolveTargetMock.mockReset();
   resolveTargetMock.mockResolvedValue(localTarget);
-  useSideTaskStore.setState({ tasks: {}, order: [], drawerOpen: false, selectedTaskId: null, composerSeed: null, composerOpen: false });
+  useSideTaskStore.setState({ tasks: {}, order: [], paneOpen: false, openTabs: [], activeTabId: null, selectedTaskId: null, composerSeed: null, composerOpen: false });
   useSessionStore.setState({ sessions: [], activeSessionId: "" } as never);
 });
 
@@ -432,5 +434,41 @@ describe("openSideTaskAsFullChat", () => {
 
   it("returns null for an unknown task id", () => {
     expect(openSideTaskAsFullChat("missing")).toBeNull();
+  });
+});
+
+describe("continueSideTask", () => {
+  it("runs a follow-up turn on the same record, with the earlier transcript as context", async () => {
+    attemptStreamMock.mockResolvedValue({ content: "First answer.", toolCalls: [], streamError: null, contentStarted: true });
+    const record = seedTask();
+    await runSideTask(record.id);
+    const firstTurnId = useSideTaskStore.getState().tasks[record.id].turnId;
+
+    attemptStreamMock.mockResolvedValue({ content: "Second answer.", toolCalls: [], streamError: null, contentStarted: true });
+    expect(continueSideTask(record.id, "Now check the refresh path")).toBe(true);
+    // `runSideTask` is fired without awaiting (same shape as `startSideTask`),
+    // so let its microtasks drain before asserting on the settled state.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const task = useSideTaskStore.getState().tasks[record.id];
+    expect(task.status).toBe("completed");
+    expect(task.finalReport).toBe("Second answer.");
+    expect(task.messages.map((message) => message.content)).toContain("Now check the refresh path");
+    // The wire history the follow-up turn sent still carries the first answer.
+    const lastCallHistory = attemptStreamMock.mock.calls[attemptStreamMock.mock.calls.length - 1][1] as { content?: unknown }[];
+    expect(lastCallHistory.some((message) => message.content === "First answer.")).toBe(true);
+    // A follow-up mints a fresh turn id so a previous "allow for this run"
+    // grant cannot authorize the new instruction.
+    expect(task.turnId).not.toBe(firstTurnId);
+  });
+
+  it("refuses while the task is still active, and refuses empty text", async () => {
+    const record = seedTask();
+    useSideTaskStore.getState().markRunning(record.id);
+    expect(continueSideTask(record.id, "hello")).toBe(false);
+
+    useSideTaskStore.getState().finish(record.id, "completed", "done", null);
+    expect(continueSideTask(record.id, "   ")).toBe(false);
+    expect(continueSideTask("missing", "hello")).toBe(false);
   });
 });

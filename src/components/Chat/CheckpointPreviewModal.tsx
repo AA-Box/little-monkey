@@ -28,6 +28,7 @@ import {
   type FilePreviewEntry,
   type RestoreSimulation,
 } from "../../lib/checkpointPreview";
+import { errorMessage } from "../../lib/errors";
 
 const STATUS_TONE: Record<FileChangeStatus, PillTone> = {
   added: "success",
@@ -187,7 +188,7 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
       })
       .catch((err) => {
         if (cancelled) return;
-        setLoadError(err instanceof Error ? err.message : String(err));
+        setLoadError(errorMessage(err));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -225,7 +226,7 @@ export function CheckpointPreviewModal({ sessionId, checkpoint, onClose, onChang
           await invoke("checkpoint_revert", { id: checkpoint.id });
         } catch (err) {
           filesOk = false;
-          setActionError(t("CheckpointPreview.restoreFailed", { error: err instanceof Error ? err.message : String(err) }));
+          setActionError(t("CheckpointPreview.restoreFailed", { error: errorMessage(err) }));
         }
       }
       if (filesOk && scope !== "files" && preview.conversationRewindAvailable) {

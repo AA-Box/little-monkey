@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { errorMessage } from "./errors";
 
 // `runMigrationSliceAgent` delegates to the shared headless
 // model->tools->model loop, which reaches `turnEngine.ts`'s
@@ -37,7 +38,7 @@ vi.mock("./turnEngine", () => ({
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
-  stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+  stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
 }));
 
 import { MAX_MIGRATION_SLICE_ITERATIONS, runMigrationSliceAgent, type RunMigrationSliceParams } from "./migrationAgentRunner";

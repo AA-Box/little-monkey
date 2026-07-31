@@ -50,6 +50,7 @@ import {
 } from "./browserVerification";
 import { readDurableArtifact } from "./durableArtifacts";
 import type { ChatMessage } from "./llamaClient";
+import { errorMessage } from "./errors";
 
 export type MonitorTargetEnv = "local" | "staging" | "production";
 export type MonitorAssertionType = "selectorPresent" | "textPresent" | "urlPrefix";
@@ -212,7 +213,7 @@ export async function waitForMonitorCondition(sessionId: string, monitor: Synthe
         lastError = `Text "${monitor.waitForText}" was not found on the page yet.`;
       }
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = errorMessage(error);
     }
     await sleep(Math.min(400, Math.max(0, deadline - Date.now())), signal);
   } while (Date.now() < deadline);
@@ -228,7 +229,7 @@ export async function assertMonitorCondition(sessionId: string, monitor: Synthet
     try {
       await annotateBrowser(sessionId, assertion.value);
     } catch (error) {
-      throw new Error(`Assertion failed: expected selector "${assertion.value}" to be present. ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Assertion failed: expected selector "${assertion.value}" to be present. ${errorMessage(error)}`);
     }
     return;
   }
@@ -322,7 +323,7 @@ export async function runMonitorJourney(monitor: SyntheticMonitor, options: RunM
     await assertMonitorCondition(sessionId, monitor);
   } catch (error) {
     status = sessionId ? "fail" : "error";
-    failureReason = error instanceof Error ? error.message : String(error);
+    failureReason = errorMessage(error);
   } finally {
     if (sessionId) {
       evidence = await captureBrowserEvidence(sessionId).catch(() => null);

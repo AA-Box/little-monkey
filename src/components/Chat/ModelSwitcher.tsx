@@ -2,15 +2,20 @@ import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, TriangleAlert } from "lucide-react";
 
 import { useModelStore, type CloudModelRetirementWarning } from "../../store/modelStore";
-import type { ModelInfo, OllamaModelInfo, ProviderModelInfo } from "../../store/modelStore";
+import type { ModelInfo, OllamaModelInfo } from "../../store/modelStore";
 import { useSettingsStore, DEFAULT_PROVIDER_MODEL_FILTER } from "../../store/settingsStore";
 import { cloudModelRetirementWarning } from "../../lib/modelRetirement";
 import { useT } from "../../lib/i18n";
+import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
 
-/** Narrows `models` to a provider's curated allowlist — unfiltered while `showAll` is on, or until the user has actually checked something (an empty selection means "nothing curated yet", not "hide everything"). */
-function visibleProviderModels(models: ProviderModelInfo[], filter: { showAll: boolean; selectedModelIds: string[] }) {
-  if (filter.showAll || filter.selectedModelIds.length === 0) return models;
-  return models.filter((model) => filter.selectedModelIds.includes(model.id));
+/** Connected provider + loaded inventory but no curated rows is a selection
+ * state, not a missing API-key/configuration state. */
+export function providerModelsEmptyStateKey(
+  availableModelCount: number,
+): "ModelSwitcher.noCloudModelsSelected" | "ModelSwitcher.noCloudModelsConfigured" {
+  return availableModelCount > 0
+    ? "ModelSwitcher.noCloudModelsSelected"
+    : "ModelSwitcher.noCloudModelsConfigured";
 }
 
 /** Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14): a plain-language tooltip for a flagged cloud model, favoring a concrete "switch to this" suggestion when one is available. */
@@ -155,12 +160,20 @@ export function ModelSwitcher() {
           ) : (
             connectedProviders.map((provider) => {
               const filter = providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER;
-              const models = visibleProviderModels(providerModels[provider.id] ?? [], filter);
+              const availableModels = providerModels[provider.id] ?? [];
+              const models = visibleProviderModelsForProvider(
+                provider.id,
+                availableModels,
+                filter,
+                { activeProvider, activeProviderId, activeProviderModel },
+              );
               return (
                 <div key={provider.id}>
                   <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{provider.label}</p>
                   {models.length === 0 ? (
-                    <p className="px-3 py-1.5 text-xs text-faint">{t("ModelSwitcher.noCloudModelsConfigured")}</p>
+                    <p className="px-3 py-1.5 text-xs text-faint">
+                      {t(providerModelsEmptyStateKey(availableModels.length))}
+                    </p>
                   ) : (
                     models.map((model) => {
                       const isActive =

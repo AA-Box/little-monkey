@@ -1,4 +1,8 @@
+use sha2::{Digest, Sha256};
+
 fn main() {
+    emit_managed_runtime_trust();
+
     #[allow(unused_mut)]
     let mut attributes = tauri_build::Attributes::new();
 
@@ -22,18 +26,37 @@ fn main() {
         // identical manifest ourselves via a plain (non "-bins") linker
         // arg, which cargo applies to every target built from this crate —
         // bins, cdylibs, and test binaries alike.
-        attributes = attributes.windows_attributes(
-            tauri_build::WindowsAttributes::new_without_app_manifest(),
-        );
+        attributes = attributes
+            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
         embed_manifest_for_every_target();
     }
 
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
 
+fn emit_managed_runtime_trust() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("managed-runtime")
+        .join("llama-b9637")
+        .join("runtime-manifest.json");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+
+    // Source-only cargo builds deliberately have no staged runtime. In that
+    // case the crate still compiles, but app-owned runtime discovery fails
+    // closed until `pnpm stage:runtime` is run and the crate is rebuilt.
+    if let Ok(bytes) = std::fs::read(&manifest) {
+        println!(
+            "cargo:rustc-env=LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256={:x}",
+            Sha256::digest(bytes)
+        );
+    }
+}
+
 #[cfg(windows)]
 fn embed_manifest_for_every_target() {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("windows-app-manifest.xml");
+    let manifest =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("windows-app-manifest.xml");
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());

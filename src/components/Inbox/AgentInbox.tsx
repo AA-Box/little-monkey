@@ -64,6 +64,8 @@ import {
 import { useSessionStore } from "../../store/sessionStore";
 import { Button, IconButton, StatusPill, Tabs, type PillTone } from "../ui";
 import { SideTaskDetail } from "../SideTasks";
+import { errorMessage } from "../../lib/errors";
+import { formatTimestamp } from "../../lib/format";
 
 interface AgentInboxProps {
   onClose: () => void;
@@ -102,10 +104,6 @@ const RISK_TONE: Record<RiskLevel, PillTone> = {
 
 const COST_BUCKETS: CostBucket[] = ["unknown", "free", "under_0_50", "under_2", "2_plus"];
 
-function formatTime(value: number): string {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(value);
-}
 
 function formatCost(costMicros: number | null): string | null {
   if (costMicros == null) return null;
@@ -149,7 +147,7 @@ function InboxRow({ item, selected, onSelect }: { item: InboxItem; selected: boo
         {item.riskLevel && <StatusPill tone={RISK_TONE[item.riskLevel]}>{t(`AgentInbox.risk.${item.riskLevel}`)}</StatusPill>}
         {cost && <span>${cost}</span>}
         <time className="ml-auto shrink-0" dateTime={new Date(item.updatedAtMs || item.createdAtMs).toISOString()}>
-          {formatTime(item.updatedAtMs || item.createdAtMs)}
+          {formatTimestamp(item.updatedAtMs || item.createdAtMs)}
         </time>
       </div>
     </button>
@@ -282,7 +280,7 @@ function DetailPane(props: DetailPaneProps) {
         <h2 className="text-lg font-semibold text-foreground">{item.title}</h2>
         <p className="text-sm text-muted">{item.subtitle}</p>
         {item.nextRunAtMs != null && (
-          <p className="text-xs text-faint">{t("AgentInbox.nextRun")}: {formatTime(item.nextRunAtMs)}</p>
+          <p className="text-xs text-faint">{t("AgentInbox.nextRun")}: {formatTimestamp(item.nextRunAtMs)}</p>
         )}
         <div className="flex flex-wrap gap-2">
           <Button size="sm" variant="primary" disabled={props.actionBusy !== null} onClick={props.onRunAutomationNow}>
@@ -342,8 +340,8 @@ function DetailPane(props: DetailPaneProps) {
       <dl className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-surface p-3 text-xs sm:grid-cols-4">
         <div><dt className="text-faint">{t("AgentInbox.detail.model")}</dt><dd className="mt-1 truncate font-medium">{item.model ?? "—"}</dd></div>
         <div><dt className="text-faint">{t("AgentInbox.detail.workspace")}</dt><dd className="mt-1 truncate font-medium">{item.workspaceLabel ?? "—"}</dd></div>
-        <div><dt className="text-faint">{t("AgentInbox.detail.created")}</dt><dd className="mt-1 font-medium">{formatTime(item.createdAtMs)}</dd></div>
-        <div><dt className="text-faint">{t("AgentInbox.detail.updated")}</dt><dd className="mt-1 font-medium">{formatTime(item.updatedAtMs)}</dd></div>
+        <div><dt className="text-faint">{t("AgentInbox.detail.created")}</dt><dd className="mt-1 font-medium">{formatTimestamp(item.createdAtMs)}</dd></div>
+        <div><dt className="text-faint">{t("AgentInbox.detail.updated")}</dt><dd className="mt-1 font-medium">{formatTimestamp(item.updatedAtMs)}</dd></div>
       </dl>
 
       <div className="flex flex-wrap gap-2">
@@ -402,7 +400,7 @@ function DetailPane(props: DetailPaneProps) {
             <p className="mt-2 font-mono text-[10px] text-faint" title={enrichment.pendingApproval.operationSha256}>
               {t("AgentInbox.detail.digest")}: {enrichment.pendingApproval.operationSha256.slice(0, 16)}…
             </p>
-            <p className="mt-1 text-[11px] text-faint">{t("AgentInbox.detail.expires")}: {formatTime(enrichment.pendingApproval.expiresAtMs)}</p>
+            <p className="mt-1 text-[11px] text-faint">{t("AgentInbox.detail.expires")}: {formatTimestamp(enrichment.pendingApproval.expiresAtMs)}</p>
             <div className="mt-3 flex flex-wrap gap-2">
               {Date.now() >= enrichment.pendingApproval.expiresAtMs ? (
                 <Button size="sm" disabled={props.actionBusy !== null} onClick={() => props.onDecideRunApproval(enrichment.pendingApproval!.requestId, enrichment.pendingApproval!.operationSha256, "expired")}>
@@ -616,7 +614,7 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
         enrichmentErrors.current.delete(runId);
       })
       .catch((error: unknown) => {
-        enrichmentErrors.current.set(runId, error instanceof Error ? error.message : String(error));
+        enrichmentErrors.current.set(runId, errorMessage(error));
       })
       .finally(() => {
         enrichmentInFlight.current.delete(runId);
@@ -725,7 +723,7 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
       await action();
       refreshDaemon();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     } finally {
       setActionBusy(null);
     }
@@ -812,7 +810,10 @@ export function AgentInbox({ onClose, onOpenRunCenter }: AgentInboxProps) {
   const handleRevealSideTask = useCallback(() => {
     if (!selectedSideTask) return;
     const store = useSideTaskStore.getState();
-    store.selectTask(selectedSideTask.id);
+    // Opens (or re-focuses) the task's own tab in the side-task pane, then
+    // asks the shell to show that pane — "reveal" means landing on the task's
+    // conversation, not merely opening a panel that contains it somewhere.
+    store.openTab(selectedSideTask.id);
     store.revealPanel();
   }, [selectedSideTask]);
 

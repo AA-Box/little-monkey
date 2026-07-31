@@ -51,10 +51,16 @@ import { useRecipeStore, type Recipe } from "../../store/recipeStore";
 import { usePromptStore, selectSnippets } from "../../store/promptStore";
 import { useStackStore } from "../../store/stackStore";
 import { usePermissionStore, type PermissionMode } from "../../store/permissionStore";
+import {
+  DEFAULT_PROVIDER_MODEL_FILTER,
+  useSettingsStore,
+} from "../../store/settingsStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import type { KnowledgeInspectorResponse } from "../../store/knowledgeV2Store";
 import { Button, IconButton, StatusPill } from "../ui";
 import type { SettingsTab } from "../Settings";
+import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
+import { errorMessage } from "../../lib/errors";
 
 interface CommandPaletteProps {
   onClose: () => void;
@@ -98,7 +104,7 @@ const KIND_ICONS: Record<PaletteItemKind, LucideIcon> = {
 };
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function truncate(value: string, max: number): string {
@@ -132,6 +138,7 @@ export function CommandPalette({ onClose, onOpenSettingsTab }: CommandPalettePro
   const switchSession = useSessionStore((s) => s.switchSession);
 
   const modelState = useModelStore();
+  const providerModelFilters = useSettingsStore((s) => s.providerModelFilters);
   const installedChatModels = useMemo(
     () => modelState.installed.filter((model) => model.kind === "chat"),
     [modelState.installed],
@@ -453,7 +460,13 @@ export function CommandPalette({ onClose, onOpenSettingsTab }: CommandPalettePro
     }
     for (const provider of modelState.providers) {
       if (!provider.has_key) continue;
-      for (const providerModel of modelState.providerModels[provider.id] ?? []) {
+      const providerModels = visibleProviderModelsForProvider(
+        provider.id,
+        modelState.providerModels[provider.id] ?? [],
+        providerModelFilters[provider.id] ?? DEFAULT_PROVIDER_MODEL_FILTER,
+        modelState,
+      );
+      for (const providerModel of providerModels) {
         list.push({
           id: `model:provider:${provider.id}:${providerModel.id}`,
           kind: "model",
@@ -506,7 +519,7 @@ export function CommandPalette({ onClose, onOpenSettingsTab }: CommandPalettePro
         sensitive: false,
         icon: KIND_ICONS.connector,
         onSelect: () => {
-          onOpenSettingsTab("mcp");
+          onOpenSettingsTab("connectors");
           onClose();
         },
       });
@@ -533,6 +546,7 @@ export function CommandPalette({ onClose, onOpenSettingsTab }: CommandPalettePro
     activeSessionId,
     installedChatModels,
     modelState,
+    providerModelFilters,
     recipes,
     snippets,
     mcpServers,

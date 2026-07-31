@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
+use crate::model_sources::{self, ManagedModelProvenance};
 use crate::permissions;
 use crate::AppState;
 
@@ -188,6 +189,42 @@ fn strip_gguf_extension(filename: &str) -> String {
         .to_string()
 }
 
+fn managed_model_info(path: &Path, provenance: &ManagedModelProvenance) -> ModelInfo {
+    let file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(provenance.local_file_name.as_str())
+        .to_string();
+    ModelInfo {
+        id: format!("managed:{}", provenance.sha256),
+        name: provenance.display_name.clone(),
+        repo: provenance.repo.clone(),
+        file,
+        size_gb: provenance.size_bytes as f32 / 1_000_000_000.0,
+        tool_calling: provenance.tool_calling,
+        installed: true,
+        path: Some(path.to_string_lossy().to_string()),
+        is_external: false,
+        kind: ModelKind::Chat,
+    }
+}
+
+fn unverified_managed_model_info(path: &Path, filename: &str, size_gb: f32) -> ModelInfo {
+    ModelInfo {
+        id: format!("custom:{filename}"),
+        name: strip_gguf_extension(filename),
+        repo: String::new(),
+        file: filename.to_string(),
+        size_gb,
+        // A filename alone cannot prove that the model supports tools.
+        tool_calling: false,
+        installed: true,
+        path: Some(path.to_string_lossy().to_string()),
+        is_external: false,
+        kind: ModelKind::Chat,
+    }
+}
+
 /// Scans the models directory on disk and returns every `.gguf` file found
 /// there — cross-referenced against the curated registry by exact filename
 /// match where possible (`installed: true`, curated metadata + `path`
@@ -221,28 +258,31 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
             continue;
         }
 
+        let size_gb = entry
+            .metadata()
+            .map(|metadata| metadata.len() as f32 / 1_000_000_000.0)
+            .unwrap_or(0.0);
+        match model_sources::load_provenance(&path) {
+            Ok(Some(provenance)) => {
+                installed.push(managed_model_info(&path, &provenance));
+                continue;
+            }
+            // A malformed sidecar must fail closed rather than allowing a
+            // filename match to manufacture tool-call capability.
+            Err(_) => {
+                installed.push(unverified_managed_model_info(&path, filename, size_gb));
+                continue;
+            }
+            Ok(None) => {}
+        }
+
         if let Some(curated_match) = curated.iter().find(|m| m.file == filename) {
             let mut model = curated_match.clone();
             model.installed = true;
             model.path = Some(path.to_string_lossy().to_string());
             installed.push(model);
         } else {
-            let size_gb = entry
-                .metadata()
-                .map(|m| m.len() as f32 / 1_000_000_000.0)
-                .unwrap_or(0.0);
-            installed.push(ModelInfo {
-                id: format!("custom:{filename}"),
-                name: strip_gguf_extension(filename),
-                repo: String::new(),
-                file: filename.to_string(),
-                size_gb,
-                tool_calling: true,
-                installed: true,
-                path: Some(path.to_string_lossy().to_string()),
-                is_external: false,
-                kind: ModelKind::Chat,
-            });
+            installed.push(unverified_managed_model_info(&path, filename, size_gb));
         }
     }
 
@@ -266,7 +306,7 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
             repo: String::new(),
             file: filename,
             size_gb: entry.size_gb,
-            tool_calling: true,
+            tool_calling: false,
             installed: true,
             path: Some(entry.path.clone()),
             is_external: true,
@@ -368,7 +408,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
             repo: String::new(),
             file: filename,
             size_gb: existing.size_gb,
-            tool_calling: true,
+            tool_calling: false,
             installed: true,
             path: Some(canonical),
             is_external: true,
@@ -396,7 +436,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         repo: String::new(),
         file: filename,
         size_gb,
-        tool_calling: true,
+        tool_calling: false,
         installed: true,
         path: Some(canonical),
         is_external: true,
@@ -513,6 +553,45 @@ pub async fn models_download(app: AppHandle, repo: String, file: String) -> Resu
             Err(e)
         }
     }
+}
+
+/// Resolves a public Ollama or Hugging Face reference to immutable,
+/// integrity-checked single-file GGUF metadata without installing it.
+#[tauri::command]
+pub async fn models_resolve_reference(
+    reference: String,
+) -> Result<model_sources::ResolvedModelReference, String> {
+    model_sources::resolve_reference(&reference).await
+}
+
+/// Re-resolves and installs a previously reviewed model resolution. The
+/// expected digest makes resolution and install a two-step consent boundary.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn models_install_reference(
+    app: AppHandle,
+    reference: String,
+    expected_sha256: String,
+) -> Result<ModelInfo, String> {
+    let dir = models_dir(&app)?;
+    let progress_app = app.clone();
+    let progress_reference = reference.clone();
+    let installed =
+        model_sources::install_reference(&dir, &reference, &expected_sha256, move |progress| {
+            let _ = progress_app.emit(
+                "models://download-progress",
+                serde_json::json!({
+                    "file": progress.file,
+                    "reference": progress_reference,
+                    "downloaded": progress.downloaded,
+                    "total": progress.total,
+                }),
+            );
+        })
+        .await?;
+    Ok(managed_model_info(
+        &installed.local_path,
+        &installed.provenance,
+    ))
 }
 
 /// Performs the actual streaming GET + write-to-disk for `models_download`,
@@ -636,7 +715,7 @@ pub async fn models_delete(
     )
     .await?;
 
-    std::fs::remove_file(&p).map_err(|e| format!("Failed to delete {path}: {e}"))
+    model_sources::delete_installed_model(&dir_canon, &p).await
 }
 
 #[cfg(test)]

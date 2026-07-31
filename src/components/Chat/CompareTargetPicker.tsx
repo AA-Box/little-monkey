@@ -22,6 +22,7 @@ import {
   useSettingsStore,
 } from "../../store/settingsStore";
 import { Button } from "../ui/Button";
+import { formatBytes } from "../../lib/format";
 
 export interface CompareTargetPickerProps {
   value: readonly ModelTargetSnapshot[];
@@ -35,10 +36,6 @@ export interface CompareTargetPickerProps {
 
 type CapabilityKind = "tools" | "vision";
 
-function formatBytes(value: number): string {
-  const gib = value / 1024 ** 3;
-  return `${gib.toFixed(gib < 10 ? 1 : 0)} GB`;
-}
 
 function CapabilityBadge({
   kind,
@@ -251,7 +248,6 @@ export function CompareTargetPicker({ value, onChange, disabled = false, placeme
           const filter = providerModelFilters[target.providerId] ?? DEFAULT_PROVIDER_MODEL_FILTER;
           const curated =
             filter.showAll ||
-            filter.selectedModelIds.length === 0 ||
             filter.selectedModelIds.includes(target.model) ||
             draftKeys.has(target.key);
           if (!curated) return false;

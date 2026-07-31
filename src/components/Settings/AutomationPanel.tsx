@@ -18,6 +18,7 @@ import { useWebStore, type SearchProvider } from "../../store/webStore";
 import { useCliInstallStore } from "../../store/cliInstallStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /** No shared toggle-switch component exists in `ui/` yet — this one is small and specific enough to keep local rather than promote prematurely. */
 function Toggle({
@@ -303,7 +304,7 @@ function WebSettingsSection() {
     try {
       await setSettings({ ...settings, search_provider: provider });
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : String(err));
+      setSettingsError(errorMessage(err));
     }
   }
 
@@ -313,7 +314,7 @@ function WebSettingsSection() {
     try {
       await setSettings({ ...settings, searxng_base_url: searxngUrlInput.trim() || null });
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : String(err));
+      setSettingsError(errorMessage(err));
     } finally {
       setSavingSearxngUrl(false);
     }
@@ -324,7 +325,7 @@ function WebSettingsSection() {
     try {
       await setSettings({ ...settings, allow_local_network: value });
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : String(err));
+      setSettingsError(errorMessage(err));
     }
   }
 
@@ -336,7 +337,7 @@ function WebSettingsSection() {
       await setBraveKey(braveKeyInput.trim());
       setBraveKeyInput("");
     } catch (err) {
-      setBraveKeyError(err instanceof Error ? err.message : String(err));
+      setBraveKeyError(errorMessage(err));
     } finally {
       setSavingBraveKey(false);
     }
@@ -348,7 +349,7 @@ function WebSettingsSection() {
     try {
       await removeBraveKey();
     } catch (err) {
-      setBraveKeyError(err instanceof Error ? err.message : String(err));
+      setBraveKeyError(errorMessage(err));
     } finally {
       setRemovingBraveKey(false);
     }
@@ -492,7 +493,7 @@ function CliInstallSection() {
     try {
       await setEnabled(value);
     } catch (err) {
-      setToggleError(err instanceof Error ? err.message : String(err));
+      setToggleError(errorMessage(err));
     }
   }
 

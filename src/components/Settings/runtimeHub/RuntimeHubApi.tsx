@@ -17,6 +17,7 @@ import {
   SectionHeading,
   SuccessNotice,
 } from "./RuntimeHubShared";
+import { errorMessage } from "../../../lib/errors";
 
 const PROTOCOLS: Array<{ value: CompatibilityProtocol; label: string; endpoint: string }> = [
   { value: "open_ai_chat_completions", label: "OpenAI Chat Completions", endpoint: "POST /v1/chat/completions" },
@@ -128,7 +129,7 @@ export function RuntimeHubApi() {
         return null;
       }
     } catch (error) {
-      setLocalError(`Request body is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      setLocalError(`Request body is not valid JSON: ${errorMessage(error)}`);
       return null;
     }
     return {
@@ -169,7 +170,7 @@ export function RuntimeHubApi() {
       setCopied(true);
       globalThis.setTimeout(() => setCopied(false), 1500);
     } catch (error) {
-      setLocalError(`Could not copy the response: ${error instanceof Error ? error.message : String(error)}`);
+      setLocalError(`Could not copy the response: ${errorMessage(error)}`);
     }
   }
 

@@ -9,6 +9,7 @@ import { useRecipeStore, type DiscoveredRecipe, type Recipe } from "../../store/
 import { useAutomationsStore } from "../../store/automationsStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { runRecipeNow } from "../../lib/recipeRunner";
+import { errorMessage } from "../../lib/errors";
 
 const SOURCE_TONE: Record<string, PillTone> = {
   workspace: "success",
@@ -128,7 +129,7 @@ function ScheduleControls({ recipeName }: { recipeName: string }) {
       const description = await invoke<string>("cron_validate", { expr });
       setCronDescription({ ok: true, message: description });
     } catch (err) {
-      setCronDescription({ ok: false, message: err instanceof Error ? err.message : String(err) });
+      setCronDescription({ ok: false, message: errorMessage(err) });
     }
   };
 
@@ -248,7 +249,7 @@ export function ScheduledTasksPanel() {
       setEditing({ name: recipe.name, content, isNew: false });
       setValidation(null);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     }
   };
 
@@ -258,7 +259,7 @@ export function ScheduledTasksPanel() {
       const recipe = await validate(editing.content);
       setValidation({ ok: true, message: t("ScheduledTasksPanel.validateOk", { name: recipe.name }) });
     } catch (err) {
-      setValidation({ ok: false, message: err instanceof Error ? err.message : String(err) });
+      setValidation({ ok: false, message: errorMessage(err) });
     }
   };
 
@@ -270,7 +271,7 @@ export function ScheduledTasksPanel() {
       setEditing(null);
       setValidation(null);
     } catch (err) {
-      setValidation({ ok: false, message: err instanceof Error ? err.message : String(err) });
+      setValidation({ ok: false, message: errorMessage(err) });
     }
   };
 
@@ -280,7 +281,7 @@ export function ScheduledTasksPanel() {
     try {
       await remove(name);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setBusyName(null);
     }
@@ -292,7 +293,7 @@ export function ScheduledTasksPanel() {
     try {
       await runRecipeNow(recipe);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setBusyName(null);
     }

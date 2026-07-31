@@ -10,7 +10,29 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Release preflight
+        run: pnpm release:preflight
+
   release:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -68,9 +90,16 @@ jobs:
         env:
           CLI_SIDECAR_TARGET: ${{ matrix.target }}
 
+      - name: Verify and stage managed llama.cpp runtime
+        run: pnpm stage:runtime
+        env:
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANAGED_RUNTIME_TARGET: ${{ matrix.target }}
+          CLI_SIDECAR_TARGET: ${{ matrix.target }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}

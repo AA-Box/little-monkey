@@ -3,16 +3,13 @@ import { AlertCircle, CheckCircle2, LoaderCircle, TriangleAlert } from "lucide-r
 import { Button } from "../../ui";
 import type { M3HardwareCompatibilityReport, M3LocalModelStalenessWarning } from "../../../lib/runtimeHubClient";
 
+/** Re-exported so every Runtime Hub tab keeps its single import site
+ * while the implementation stays shared with the rest of the app. */
+export { formatBytes } from "../../../lib/format";
+
 export const CONTROL_CLASS =
   "min-h-11 w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-foreground placeholder:text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50";
 
-export function formatBytes(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "—";
-  if (value === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const exponent = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
-  return `${(value / 1024 ** exponent).toFixed(exponent > 1 ? 1 : 0)} ${units[exponent]}`;
-}
 
 export function formatDate(value: number | null | undefined): string {
   return value ? new Date(value).toLocaleString() : "Never";

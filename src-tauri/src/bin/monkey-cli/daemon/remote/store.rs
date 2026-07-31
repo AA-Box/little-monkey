@@ -1,11 +1,13 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::protocol::{
-    random_token, random_token_id, sha256_hex, AuditEntry, ControllerProfile, PairAcceptResponse,
-    RemoteScopes, RotationBundle, REMOTE_PROTOCOL_VERSION,
+    legacy_capabilities, random_token, random_token_id, sha256_hex, validate_capabilities,
+    AuditEntry, ControllerProfile, DeviceCapability, PairAcceptResponse, RemoteScopes,
+    RotationBundle, REMOTE_PROTOCOL_VERSION,
 };
 
 const REMOTE_SCHEMA: &str = r#"
@@ -68,6 +70,55 @@ CREATE TABLE IF NOT EXISTS remote_controllers (
     profile_json BLOB NOT NULL,
     updated_at_ms INTEGER NOT NULL
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS remote_pairing_capabilities (
+    pairing_id TEXT PRIMARY KEY REFERENCES pairing_invitations(pairing_id) ON DELETE CASCADE,
+    capabilities_json BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS remote_device_capabilities (
+    device_id TEXT PRIMARY KEY REFERENCES remote_devices(device_id) ON DELETE CASCADE,
+    capabilities_json BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS remote_mobile_messages (
+    message_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    device_id TEXT NOT NULL REFERENCES remote_devices(device_id) ON DELETE RESTRICT,
+    role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user','assistant','system')),
+    text TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK(length(request_sha256)=64),
+    task_state TEXT NOT NULL CHECK(task_state IN ('queued','accepted','failed')),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_mobile_messages_session_idx
+    ON remote_mobile_messages(session_id,created_at_ms,message_id);
+
+CREATE TABLE IF NOT EXISTS remote_mobile_captures (
+    capture_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES remote_devices(device_id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK(kind IN ('text','image','file','voice')),
+    title TEXT NOT NULL,
+    text TEXT,
+    content_sha256 TEXT CHECK(content_sha256 IS NULL OR length(content_sha256)=64),
+    size_bytes INTEGER,
+    media_type TEXT,
+    request_sha256 TEXT NOT NULL CHECK(length(request_sha256)=64),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS remote_mobile_workflow_runs (
+    run_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    device_id TEXT NOT NULL REFERENCES remote_devices(device_id) ON DELETE RESTRICT,
+    created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS remote_mobile_workflow_device_idx
+    ON remote_mobile_workflow_runs(device_id,created_at_ms DESC);
 "#;
 
 pub trait RemoteSecretStore: Send + Sync {
@@ -125,6 +176,7 @@ pub struct DeviceRecord {
     pub device_name: String,
     pub secret_generation: u64,
     pub scopes: RemoteScopes,
+    pub capabilities: std::collections::BTreeSet<DeviceCapability>,
     pub last_sequence: u64,
     pub revoked_at_ms: Option<u64>,
 }
@@ -144,7 +196,60 @@ pub struct InvitationRecord {
     pub pairing_id: String,
     pub token: String,
     pub scopes: RemoteScopes,
+    pub capabilities: BTreeSet<DeviceCapability>,
     pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileMessageRecord {
+    pub message_id: String,
+    pub session_id: String,
+    pub device_id: String,
+    /// `user`, `assistant`, or `system` — the same three roles the mobile
+    /// client renders. Assistant/system rows are node-authored (reply
+    /// materialization) and keep the ORIGINATING device/request digest for
+    /// provenance.
+    pub role: String,
+    pub text: String,
+    /// SHA-256 of the signed request that created (or, for node-authored
+    /// replies, triggered) this row.
+    pub request_sha256: String,
+    pub task_state: String,
+    pub created_at_ms: u64,
+}
+
+/// One mobile chat session summarized for `GET /v1/remote/mobile/sessions` —
+/// derived entirely from `remote_mobile_messages`, which is the node-side
+/// source of truth for mobile-originated conversations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileSessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub updated_at_ms: u64,
+    pub message_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileCaptureRecord {
+    pub capture_id: String,
+    pub device_id: String,
+    pub kind: String,
+    pub title: String,
+    pub text: Option<String>,
+    pub content_sha256: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub media_type: Option<String>,
+    /// SHA-256 of the signed request that uploaded this capture.
+    pub request_sha256: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileWorkflowRunRecord {
+    pub run_id: String,
+    pub workflow_id: String,
+    pub device_id: String,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,13 +285,36 @@ impl RemoteStore {
         Ok(Self { connection })
     }
 
+    /// Legacy-shaped invitation: exactly the capabilities implied by the
+    /// run scope, with no mobile grants. Production `pair-create` always
+    /// goes through [`Self::create_invitation_with_capabilities`] so an
+    /// operator's mobile selection is explicit; this remains for the tests
+    /// that pin legacy pairing behavior.
+    #[cfg(test)]
     pub fn create_invitation(
         &mut self,
         scopes: &RemoteScopes,
         now_ms: u64,
         expires_at_ms: u64,
     ) -> Result<InvitationRecord, String> {
+        let capabilities = legacy_capabilities(scopes);
+        self.create_invitation_with_capabilities(
+            scopes,
+            &capabilities,
+            now_ms,
+            expires_at_ms,
+        )
+    }
+
+    pub fn create_invitation_with_capabilities(
+        &mut self,
+        scopes: &RemoteScopes,
+        capabilities: &BTreeSet<DeviceCapability>,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<InvitationRecord, String> {
         scopes.validate()?;
+        validate_capabilities(capabilities, scopes)?;
         if expires_at_ms <= now_ms || expires_at_ms.saturating_sub(now_ms) > 24 * 60 * 60 * 1_000 {
             return Err("Pairing invitation lifetime must be between now and 24 hours".to_string());
         }
@@ -206,10 +334,21 @@ impl RemoteStore {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO remote_pairing_capabilities(pairing_id,capabilities_json)
+                 VALUES(?1,?2)",
+                params![
+                    pairing_id,
+                    serde_json::to_vec(capabilities).map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
         Ok(InvitationRecord {
             pairing_id,
             token,
             scopes: scopes.clone(),
+            capabilities: capabilities.clone(),
             expires_at_ms,
         })
     }
@@ -220,6 +359,28 @@ impl RemoteStore {
         token: &str,
         device_name: &str,
         runner_id: &str,
+        now_ms: u64,
+        secrets: &dyn RemoteSecretStore,
+    ) -> Result<PairAcceptResponse, String> {
+        self.accept_invitation_with_capabilities(
+            pairing_id,
+            token,
+            device_name,
+            runner_id,
+            None,
+            now_ms,
+            secrets,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_invitation_with_capabilities(
+        &mut self,
+        pairing_id: &str,
+        token: &str,
+        device_name: &str,
+        runner_id: &str,
+        requested_capabilities: Option<&BTreeSet<DeviceCapability>>,
         now_ms: u64,
         secrets: &dyn RemoteSecretStore,
     ) -> Result<PairAcceptResponse, String> {
@@ -242,8 +403,11 @@ impl RemoteStore {
                 .map_err(|error| error.to_string())?;
             let invitation = transaction
                 .query_row(
-                    "SELECT token_sha256,scopes_json,expires_at_ms,accepted_at_ms
-                     FROM pairing_invitations WHERE pairing_id=?1",
+                    "SELECT i.token_sha256,i.scopes_json,i.expires_at_ms,i.accepted_at_ms,
+                            c.capabilities_json
+                     FROM pairing_invitations i
+                     LEFT JOIN remote_pairing_capabilities c ON c.pairing_id=i.pairing_id
+                     WHERE i.pairing_id=?1",
                     [pairing_id],
                     |row| {
                         Ok((
@@ -251,6 +415,7 @@ impl RemoteStore {
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
                         ))
                     },
                 )
@@ -269,6 +434,24 @@ impl RemoteStore {
             let scopes: RemoteScopes =
                 serde_json::from_slice(&invitation.1).map_err(|error| error.to_string())?;
             scopes.validate()?;
+            let invited_capabilities = invitation
+                .4
+                .as_deref()
+                .map(serde_json::from_slice::<BTreeSet<DeviceCapability>>)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| legacy_capabilities(&scopes));
+            validate_capabilities(&invited_capabilities, &scopes)?;
+            let capabilities = requested_capabilities
+                .cloned()
+                .unwrap_or_else(|| invited_capabilities.clone());
+            if !capabilities.is_subset(&invited_capabilities) {
+                return Err(
+                    "Pairing response cannot grant capabilities absent from the invitation"
+                        .to_string(),
+                );
+            }
+            validate_capabilities(&capabilities, &scopes)?;
             transaction
                 .execute(
                     "INSERT INTO remote_devices
@@ -280,6 +463,16 @@ impl RemoteStore {
                         to_i64(secret_generation)?,
                         invitation.1,
                         to_i64(now_ms)?,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO remote_device_capabilities(device_id,capabilities_json)
+                     VALUES(?1,?2)",
+                    params![
+                        device_id,
+                        serde_json::to_vec(&capabilities).map_err(|error| error.to_string())?,
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -302,6 +495,7 @@ impl RemoteStore {
                 secret_generation,
                 device_secret: secret,
                 scopes,
+                capabilities,
             })
         })();
         if result.is_err() {
@@ -314,7 +508,9 @@ impl RemoteStore {
         self.connection
             .query_row(
                 "SELECT device_id,device_name,secret_generation,scopes_json,
-                        last_sequence,revoked_at_ms
+                        last_sequence,revoked_at_ms,
+                        (SELECT capabilities_json FROM remote_device_capabilities c
+                          WHERE c.device_id=remote_devices.device_id)
                  FROM remote_devices WHERE device_id=?1",
                 [device_id],
                 read_device,
@@ -328,7 +524,9 @@ impl RemoteStore {
             .connection
             .prepare(
                 "SELECT device_id,device_name,secret_generation,scopes_json,
-                        last_sequence,revoked_at_ms
+                        last_sequence,revoked_at_ms,
+                        (SELECT capabilities_json FROM remote_device_capabilities c
+                          WHERE c.device_id=remote_devices.device_id)
                  FROM remote_devices ORDER BY created_at_ms ASC,device_id ASC",
             )
             .map_err(|error| error.to_string())?;
@@ -450,6 +648,7 @@ impl RemoteStore {
             server_certificate_pem: certificate_pem.to_string(),
             server_certificate_sha256: certificate_sha256.to_string(),
             scopes: device.scopes,
+            capabilities: device.capabilities,
         })
     }
 
@@ -655,6 +854,189 @@ impl RemoteStore {
             .map_err(|error| error.to_string())
     }
 
+    // --- Mobile extension (`/v1/remote/mobile/*`) records -----------------
+
+    pub fn insert_mobile_message(&mut self, record: &MobileMessageRecord) -> Result<(), String> {
+        if record.message_id.is_empty() || record.message_id.len() > 128 {
+            return Err("Mobile message id must be 1-128 characters".to_string());
+        }
+        if record.session_id.is_empty() || record.session_id.len() > 128 {
+            return Err("Mobile session id must be 1-128 characters".to_string());
+        }
+        if record.text.is_empty() || record.text.len() > 256 * 1024 {
+            return Err("Mobile message text must be 1 byte to 256 KiB".to_string());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO remote_mobile_messages
+                 (message_id,session_id,device_id,role,text,request_sha256,task_state,created_at_ms,updated_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)
+                 ON CONFLICT(message_id) DO NOTHING",
+                params![
+                    record.message_id,
+                    record.session_id,
+                    record.device_id,
+                    record.role,
+                    record.text,
+                    record.request_sha256,
+                    record.task_state,
+                    to_i64(record.created_at_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_mobile_message_state(
+        &mut self,
+        message_id: &str,
+        task_state: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE remote_mobile_messages SET task_state=?2, updated_at_ms=?3
+                 WHERE message_id=?1",
+                params![message_id, task_state, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn mobile_messages(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<MobileMessageRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_id,session_id,device_id,role,text,request_sha256,task_state,created_at_ms
+                 FROM remote_mobile_messages WHERE session_id=?1
+                 ORDER BY created_at_ms ASC, message_id ASC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![session_id, i64::from(limit.min(2_000))], |row| {
+                Ok(MobileMessageRecord {
+                    message_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    device_id: row.get(2)?,
+                    role: row.get(3)?,
+                    text: row.get(4)?,
+                    request_sha256: row.get(5)?,
+                    task_state: row.get(6)?,
+                    created_at_ms: from_i64(row.get(7)?)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn mobile_session_summaries(&self) -> Result<Vec<MobileSessionSummary>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id,
+                        (SELECT text FROM remote_mobile_messages first
+                          WHERE first.session_id = all_rows.session_id AND first.role='user'
+                          ORDER BY first.created_at_ms ASC, first.message_id ASC LIMIT 1),
+                        MAX(created_at_ms),
+                        COUNT(*)
+                 FROM remote_mobile_messages all_rows
+                 GROUP BY session_id
+                 ORDER BY MAX(created_at_ms) DESC
+                 LIMIT 200",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                let title: Option<String> = row.get(1)?;
+                Ok(MobileSessionSummary {
+                    session_id: row.get(0)?,
+                    title: title.unwrap_or_default(),
+                    updated_at_ms: from_i64(row.get(2)?)?,
+                    message_count: from_i64(row.get(3)?)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn insert_mobile_capture(&mut self, record: &MobileCaptureRecord) -> Result<(), String> {
+        if record.capture_id.is_empty() || record.capture_id.len() > 128 {
+            return Err("Mobile capture id must be 1-128 characters".to_string());
+        }
+        if record.title.is_empty() || record.title.len() > 512 {
+            return Err("Mobile capture title must be 1-512 characters".to_string());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO remote_mobile_captures
+                 (capture_id,device_id,kind,title,text,content_sha256,size_bytes,media_type,request_sha256,created_at_ms,updated_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)
+                 ON CONFLICT(capture_id) DO NOTHING",
+                params![
+                    record.capture_id,
+                    record.device_id,
+                    record.kind,
+                    record.title,
+                    record.text,
+                    record.content_sha256,
+                    record.size_bytes.map(to_i64).transpose()?,
+                    record.media_type,
+                    record.request_sha256,
+                    to_i64(record.created_at_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn insert_mobile_workflow_run(
+        &mut self,
+        record: &MobileWorkflowRunRecord,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO remote_mobile_workflow_runs
+                 (run_id,workflow_id,device_id,created_at_ms)
+                 VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(run_id) DO NOTHING",
+                params![
+                    record.run_id,
+                    record.workflow_id,
+                    record.device_id,
+                    to_i64(record.created_at_ms)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Latest mobile-launched run timestamp per workflow, for the workflow
+    /// list's `last_run_at_ms` field.
+    pub fn mobile_workflow_last_runs(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u64>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workflow_id, MAX(created_at_ms)
+                 FROM remote_mobile_workflow_runs GROUP BY workflow_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, from_i64(row.get(1)?)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn save_controller(
         &mut self,
         profile: &ControllerProfile,
@@ -663,6 +1045,12 @@ impl RemoteStore {
         secrets: &dyn RemoteSecretStore,
     ) -> Result<(), String> {
         profile.scopes.validate()?;
+        let capabilities = if profile.capabilities.is_empty() {
+            legacy_capabilities(&profile.scopes)
+        } else {
+            profile.capabilities.clone()
+        };
+        validate_capabilities(&capabilities, &profile.scopes)?;
         let slot = controller_secret_slot(&profile.alias, profile.secret_generation);
         secrets.set(&slot, secret)?;
         let stored = serde_json::to_vec(profile).map_err(|error| error.to_string())?;
@@ -780,6 +1168,20 @@ impl RemoteStore {
         if !bundle.scopes.is_subset_of(&old.scopes) {
             return Err("Rotation bundle attempts to expand controller scope".to_string());
         }
+        let bundle_capabilities = if bundle.capabilities.is_empty() {
+            legacy_capabilities(&bundle.scopes)
+        } else {
+            bundle.capabilities.clone()
+        };
+        let old_capabilities = if old.capabilities.is_empty() {
+            legacy_capabilities(&old.scopes)
+        } else {
+            old.capabilities.clone()
+        };
+        if !bundle_capabilities.is_subset(&old_capabilities) {
+            return Err("Rotation bundle attempts to expand controller capabilities".to_string());
+        }
+        validate_capabilities(&bundle_capabilities, &bundle.scopes)?;
         let profile = ControllerProfile {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             alias: alias.to_string(),
@@ -790,6 +1192,7 @@ impl RemoteStore {
             device_id: bundle.device_id.clone(),
             secret_generation: bundle.secret_generation,
             scopes: bundle.scopes.clone(),
+            capabilities: bundle_capabilities,
             next_sequence: 1,
             event_cursors: old.event_cursors,
         };
@@ -801,14 +1204,28 @@ impl RemoteStore {
 
 fn read_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
     let scopes_bytes: Vec<u8> = row.get(3)?;
-    let scopes = serde_json::from_slice(&scopes_bytes).map_err(|error| {
+    let scopes: RemoteScopes = serde_json::from_slice(&scopes_bytes).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(error))
     })?;
+    // Devices paired before the capability split have no
+    // remote_device_capabilities row (the correlated subquery yields NULL);
+    // they keep exactly their legacy remote-action surface.
+    let capabilities = match row.get::<_, Option<Vec<u8>>>(6)? {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?,
+        None => legacy_capabilities(&scopes),
+    };
     Ok(DeviceRecord {
         device_id: row.get(0)?,
         device_name: row.get(1)?,
         secret_generation: from_i64(row.get(2)?)?,
         scopes,
+        capabilities,
         last_sequence: from_i64(row.get(4)?)?,
         revoked_at_ms: row.get::<_, Option<i64>>(5)?.map(from_i64).transpose()?,
     })

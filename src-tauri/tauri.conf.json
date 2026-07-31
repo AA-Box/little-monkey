@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Little Monkey",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "identifier": "com.littlemonkey.app",
   "build": {
-    "beforeDevCommand": "pnpm stage:cli && pnpm dev",
+    "beforeDevCommand": "pnpm stage:runtime && pnpm stage:cli && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm stage:cli && pnpm build",
+    "beforeBuildCommand": "pnpm stage:runtime && pnpm stage:cli && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -27,6 +27,15 @@
       "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://localhost:1420 artifact: http://artifact.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self' blob:"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": [
+        {
+          "schemes": ["littlemonkey"]
+        }
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
@@ -39,6 +48,9 @@
     ],
     "externalBin": [
       "binaries/monkey-cli"
+    ],
+    "resources": [
+      "resources/managed-runtime/**/*"
     ],
     "macOS": {
       "files": {

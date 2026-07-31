@@ -8,6 +8,7 @@ import { usePermissionStore } from "../../store/permissionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 import { markdownComponents, PROSE_CLASSES } from "./MessageBubble";
+import { errorMessage } from "../../lib/errors";
 
 /** The plain-text instruction sent as the new user turn once a plan is
  * approved — deliberately not a synthetic notice of its own (unlike the
@@ -72,7 +73,7 @@ export function PlanCard({ sessionId, notice, messageIndex }: PlanCardProps) {
       });
       void runAgentTurn(sessionId, PLAN_APPROVED_INSTRUCTION);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       setError(t("PlanCard.approveFailed", { error: message }));
     } finally {
       setBusy(false);

@@ -15,7 +15,12 @@ import {
   ollamaModelTargetKey,
   providerModelTargetKey,
 } from "../lib/modelTargets";
-import { useModelStore, type ModelInfo } from "./modelStore";
+import {
+  modelDownloadProgressEntries,
+  useModelStore,
+  type ModelInfo,
+  type ResolvedModelReference,
+} from "./modelStore";
 
 const EMBEDDINGS_ENABLED_STORAGE_KEY = "little-monkey-llama-embeddings-enabled";
 
@@ -94,6 +99,87 @@ describe("modelStore.start", () => {
       /has not been downloaded yet/,
     );
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("modelStore model reference install", () => {
+  const resolved: ResolvedModelReference = {
+    source: "ollama",
+    canonicalReference: "hf.co/library/llama3.2-GGUF:Q4_K_M",
+    displayName: "Llama 3.2 3B",
+    repo: "library/llama3.2-GGUF",
+    revision: "main",
+    fileName: "llama3.2-3b-q4_k_m.gguf",
+    downloadUrl: "https://huggingface.co/library/llama3.2-GGUF/resolve/main/llama3.2-3b-q4_k_m.gguf",
+    sha256: "a".repeat(64),
+    sizeBytes: 2_000_000_000,
+    toolCalling: true,
+    licenseName: "Llama 3.2 Community License",
+    licenseUrl: "https://example.com/license",
+  };
+
+  it("resolves a model reference with the exact backend command contract", async () => {
+    invokeMock.mockResolvedValueOnce(resolved);
+
+    await expect(useModelStore.getState().resolveModelReference("llama3.2:3b")).resolves.toEqual(
+      resolved,
+    );
+    expect(invokeMock).toHaveBeenCalledWith("models_resolve_reference", {
+      reference: "llama3.2:3b",
+    });
+  });
+
+  it("installs the resolved canonical reference with its expected digest and refreshes models", async () => {
+    const installed = makeModel({
+      id: "llama3.2-3b-q4-k-m",
+      name: "Llama 3.2 3B",
+      repo: resolved.repo,
+      file: resolved.fileName,
+      size_gb: 2,
+      path: `/models/${resolved.fileName}`,
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "models_install_reference") return Promise.resolve(installed);
+      if (command === "models_list_curated") return Promise.resolve([]);
+      if (command === "models_list_installed") return Promise.resolve([installed]);
+      if (command === "llama_status") {
+        return Promise.resolve({ status: "stopped", port: 0, model_path: null });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await expect(
+      useModelStore
+        .getState()
+        .installModelReference(
+          resolved.canonicalReference,
+          resolved.sha256,
+        ),
+    ).resolves.toEqual(installed);
+
+    expect(invokeMock).toHaveBeenCalledWith("models_install_reference", {
+      reference: resolved.canonicalReference,
+      expectedSha256: resolved.sha256,
+    });
+    expect(useModelStore.getState().installed).toEqual([installed]);
+  });
+
+  it("indexes managed download progress by both local file and canonical reference", () => {
+    const entries = modelDownloadProgressEntries({
+      file: "ollama-llama3.2-aabbccddeeff.gguf",
+      reference: "ollama:library/llama3.2:3b",
+      downloaded: 500,
+      total: 1_000,
+    });
+
+    expect(entries["ollama-llama3.2-aabbccddeeff.gguf"]).toEqual({
+      downloaded: 500,
+      total: 1_000,
+    });
+    expect(entries["ollama:library/llama3.2:3b"]).toEqual({
+      downloaded: 500,
+      total: 1_000,
+    });
   });
 });
 

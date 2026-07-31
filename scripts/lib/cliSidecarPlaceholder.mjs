@@ -11,7 +11,7 @@
 // nothing at compile time reads the staged file itself. `stage-cli-sidecar.mjs`
 // overwrites the placeholder with the real compiled binary right after.
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export function sidecarStagedPath(repoRoot, target, isWindows) {
@@ -22,9 +22,14 @@ export function sidecarStagedPath(repoRoot, target, isWindows) {
 export function ensureSidecarPlaceholder(repoRoot, target, isWindows) {
   mkdirSync(join(repoRoot, "src-tauri", "binaries"), { recursive: true });
   const path = sidecarStagedPath(repoRoot, target, isWindows);
-  if (!existsSync(path)) {
-    writeFileSync(path, "");
+  try {
+    // The "wx" flag makes create-if-missing a single atomic step. An
+    // existsSync check followed by writeFileSync races concurrent cargo
+    // builds and could truncate a real binary staged in between.
+    writeFileSync(path, "", { flag: "wx" });
     if (!isWindows) chmodSync(path, 0o755);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
   }
   return path;
 }
