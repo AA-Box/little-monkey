@@ -1492,6 +1492,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   placeholder={t("ChatWindow.inputPlaceholder")}
                   rows={1}
                   disabled={preparingTurn || startingComparison || startingCrew}
+                  data-focus-ring="custom"
                   className={`max-h-48 min-h-[2.25rem] w-full resize-none bg-transparent py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-faint ${
                     commandSegments ? "text-transparent caret-foreground" : "text-foreground"
                   }`}

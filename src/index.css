@@ -355,8 +355,11 @@ body {
 
 /* Keep the fallback unlayered so it outranks `outline-none` utilities on
    controls that forgot to provide a replacement. Components with an explicit
-   focus ring keep that design without receiving a second outline. */
-:where(button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])):focus-visible:not([class*="focus-visible:ring"]):not([class*="focus:ring"]) {
+   focus ring keep that design without receiving a second outline: either a
+   `focus:ring`/`focus-visible:ring` utility on the control itself, or
+   `data-focus-ring="custom"` when the ring is drawn by a wrapper element
+   (e.g. a `focus-within:ring` container). */
+:where(button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])):focus-visible:not([class*="focus-visible:ring"]):not([class*="focus:ring"]):not([data-focus-ring="custom"]) {
   outline: 2px solid var(--c-accent);
   outline-offset: 2px;
 }
