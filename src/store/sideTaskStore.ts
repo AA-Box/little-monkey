@@ -327,10 +327,21 @@ export interface CreateSideTaskParams {
 
 interface SideTaskStoreState {
   tasks: Record<string, SideTaskRecord>;
-  /** Insertion order, newest first — the order `SideTaskDrawer.tsx` lists
+  /** Insertion order, newest first — the order `SideTaskPane.tsx` lists
    * tasks in. */
   order: string[];
-  drawerOpen: boolean;
+  /** Whether the side-task PANE (its own column, right of the chat) is on
+   * screen. A side task is a parallel conversation, so it gets a pane with a
+   * tab strip and its own composer — not a slot in the right sidebar, which
+   * now belongs entirely to headless background tasks
+   * (`BackgroundTasks/BackgroundTasksPanel.tsx`). */
+  paneOpen: boolean;
+  /** Tasks with an open tab in the pane, left to right. A task can exist
+   * without a tab (started, then its tab closed) — closing a tab is a view
+   * action and never cancels or discards the run. */
+  openTabs: string[];
+  /** Which open tab is showing. Null only when `openTabs` is empty. */
+  activeTabId: string | null;
   selectedTaskId: string | null;
   /** Set by `openComposer` (e.g. a message's "Start side task" action) and
    * consumed once by `SideTaskComposer.tsx`'s prefill effect — mirrors
@@ -340,13 +351,18 @@ interface SideTaskStoreState {
   composerSeed: SideTaskComposerSeed | null;
   composerOpen: boolean;
 
-  openDrawer: () => void;
-  /** Reveals the task panel through the app-shell router. Unlike openDrawer,
-   * this is intended for source surfaces that may run while the Side Tasks
-   * tab is not mounted. */
+  openPane: () => void;
+  /** Reveals the pane through the app-shell router. Unlike `openPane`, this
+   * also asks `App.tsx` to mount the pane — for source surfaces that may run
+   * while it isn't on screen at all. */
   revealPanel: () => void;
-  closeDrawer: () => void;
-  toggleDrawer: () => void;
+  closePane: () => void;
+  togglePane: () => void;
+  /** Opens (or re-focuses) a task's tab and shows the pane. */
+  openTab: (id: string) => void;
+  /** Closes a tab without touching the run behind it. */
+  closeTab: (id: string) => void;
+  setActiveTab: (id: string) => void;
   selectTask: (id: string | null) => void;
   openComposer: (seed: SideTaskComposerSeed) => void;
   closeComposer: () => void;
@@ -385,22 +401,52 @@ function patchTask(
 export const useSideTaskStore = create<SideTaskStoreState>((set, get) => ({
   tasks: {},
   order: [],
-  drawerOpen: false,
+  paneOpen: false,
+  openTabs: [],
+  activeTabId: null,
   selectedTaskId: null,
   composerSeed: null,
   composerOpen: false,
 
-  openDrawer: () => set({ drawerOpen: true }),
+  openPane: () => set({ paneOpen: true }),
   revealPanel: () => {
-    set({ drawerOpen: true });
+    set({ paneOpen: true });
     requestSideTaskPanelOpen();
   },
-  closeDrawer: () => set({ drawerOpen: false }),
-  toggleDrawer: () => set((state) => ({ drawerOpen: !state.drawerOpen })),
+  closePane: () => set({ paneOpen: false }),
+  togglePane: () => set((state) => ({ paneOpen: !state.paneOpen })),
+
+  openTab: (id) =>
+    set((state) => {
+      if (!state.tasks[id]) return state;
+      return {
+        paneOpen: true,
+        openTabs: state.openTabs.includes(id) ? state.openTabs : [...state.openTabs, id],
+        activeTabId: id,
+        selectedTaskId: id,
+      };
+    }),
+
+  closeTab: (id) =>
+    set((state) => {
+      if (!state.openTabs.includes(id)) return state;
+      const openTabs = state.openTabs.filter((tab) => tab !== id);
+      // Closing the active tab falls back to its right-hand neighbour, then
+      // its left — the same "don't dump the user on an empty pane" rule the
+      // right sidebar's own tab strip follows.
+      const index = state.openTabs.indexOf(id);
+      const activeTabId =
+        state.activeTabId === id ? openTabs[index] ?? openTabs[openTabs.length - 1] ?? null : state.activeTabId;
+      return { openTabs, activeTabId, paneOpen: openTabs.length > 0 && state.paneOpen };
+    }),
+
+  setActiveTab: (id) =>
+    set((state) => (state.openTabs.includes(id) ? { activeTabId: id, selectedTaskId: id } : state)),
+
   selectTask: (id) => set({ selectedTaskId: id }),
 
   openComposer: (seed) => {
-    set({ composerSeed: seed, composerOpen: true, drawerOpen: true });
+    set({ composerSeed: seed, composerOpen: true, paneOpen: true });
     requestSideTaskPanelOpen();
   },
   closeComposer: () => set({ composerOpen: false }),
@@ -435,6 +481,12 @@ export const useSideTaskStore = create<SideTaskStoreState>((set, get) => ({
     set((state) => ({
       tasks: { ...state.tasks, [record.id]: record },
       order: [record.id, ...state.order],
+      // A new side task opens its own tab and takes focus — starting one is
+      // an explicit user action, so its conversation should be the thing on
+      // screen, exactly like opening a new chat.
+      openTabs: [...state.openTabs, record.id],
+      activeTabId: record.id,
+      paneOpen: true,
       selectedTaskId: record.id,
     }));
     return record;
@@ -503,9 +555,12 @@ export const useSideTaskStore = create<SideTaskStoreState>((set, get) => ({
       if (!state.tasks[id]) return state;
       const tasks = { ...state.tasks };
       delete tasks[id];
+      const openTabs = state.openTabs.filter((entry) => entry !== id);
       return {
         tasks,
         order: state.order.filter((entry) => entry !== id),
+        openTabs,
+        activeTabId: state.activeTabId === id ? openTabs[openTabs.length - 1] ?? null : state.activeTabId,
         selectedTaskId: get().selectedTaskId === id ? null : get().selectedTaskId,
       };
     }),

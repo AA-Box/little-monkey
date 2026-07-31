@@ -23,10 +23,6 @@ import { buildSideQuestionWire, formatBtwNotice, type BtwNotice } from './slashC
  * per-session turn controllers, so `/stop` can cancel it. */
 const sideQuestionControllers = new Map<string, AbortController>();
 
-export function sideQuestionRunning(sessionId: string): boolean {
-  return sideQuestionControllers.has(sessionId);
-}
-
 /** Aborts the session's in-flight side question, if any. Returns whether one
  * was actually running (so `/stop` can word its notice honestly). */
 export function stopSideQuestion(sessionId: string): boolean {

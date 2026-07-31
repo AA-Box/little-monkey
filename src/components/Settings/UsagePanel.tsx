@@ -3,7 +3,14 @@ import { Cpu } from "lucide-react";
 import { Button } from "../ui";
 import { useUsageHistoryStore } from "../../store/usageHistoryStore";
 import { useSessionStore } from "../../store/sessionStore";
+import {
+  evaluateCostBudget,
+  useCostControlStore,
+} from "../../store/costControlStore";
+import { useModelStore } from "../../store/modelStore";
+import { providerModelTargetKey } from "../../lib/modelTargets";
 import { useT } from "../../lib/i18n";
+import { formatDuration } from "../../lib/format";
 
 /** A full trailing year, matching the "Aug ... Jul" span of a GitHub-style contribution graph. */
 const WEEKS = 52;
@@ -27,16 +34,6 @@ function formatTokens(n: number): string {
 }
 
 /** "13h 16m" / "9m" / "42s" — mirrors how long a single `runAgentTurn` (one full user message, including every tool round-trip) took wall-clock. */
-function formatDuration(ms: number): string {
-  if (ms <= 0) return "0m";
-  const totalSeconds = Math.round(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return `${seconds}s`;
-}
 
 /** Consecutive-calendar-day run lengths computed straight off real recorded
  * days — never estimated. `current` counts back from today (or yesterday, so
@@ -128,10 +125,19 @@ export function UsagePanel() {
   const subagentTasksRun = useUsageHistoryStore((s) => s.subagentTasksRun);
   const verifyRuns = useUsageHistoryStore((s) => s.verifyRuns);
   const clear = useUsageHistoryStore((s) => s.clear);
+  const costPolicy = useCostControlStore((s) => s.policy);
+  const costRates = useCostControlStore((s) => s.rates);
+  const costEntries = useCostControlStore((s) => s.entries);
+  const setCostPolicy = useCostControlStore((s) => s.setPolicy);
+  const setCostRate = useCostControlStore((s) => s.setRate);
+  const clearCostUsage = useCostControlStore((s) => s.clearUsage);
+  const providers = useModelStore((s) => s.providers);
+  const providerModels = useModelStore((s) => s.providerModels);
   const chatSessions = useSessionStore((s) => s.sessions.length);
 
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [mode, setMode] = useState<ActivityMode>("daily");
+  const [selectedCostTarget, setSelectedCostTarget] = useState("");
   const gridWrapRef = useRef<HTMLDivElement>(null);
   const [cellHover, setCellHover] = useState<{ x: number; y: number; label: string } | null>(null);
 
@@ -213,8 +219,29 @@ export function UsagePanel() {
     [byModel],
   );
 
+  const providerTargets = useMemo(
+    () =>
+      providers.flatMap((provider) =>
+        (providerModels[provider.id] ?? []).map((model) => ({
+          key: providerModelTargetKey(provider.id, model.id),
+          label: `${provider.label} · ${model.id}`,
+        })),
+      ),
+    [providerModels, providers],
+  );
+  const activeCostTarget =
+    providerTargets.find((target) => target.key === selectedCostTarget)
+    ?? providerTargets[0]
+    ?? null;
+  const activeCostRate = activeCostTarget ? costRates[activeCostTarget.key] : undefined;
+  const costEvaluation = useMemo(
+    () => evaluateCostBudget(costPolicy, costEntries),
+    [costEntries, costPolicy],
+  );
+
   function handleClear() {
     clear();
+    clearCostUsage();
     setConfirmingClear(false);
   }
 
@@ -233,10 +260,205 @@ export function UsagePanel() {
       <div className="flex divide-x divide-border rounded-xl border border-border">
         <StatCell label={t("UsagePanel.statLifetime")} value={formatTokens(totalTokens)} />
         <StatCell label={t("UsagePanel.statPeak")} value={formatTokens(peakTurnTokens)} />
-        <StatCell label={t("UsagePanel.statLongestTask")} value={formatDuration(longestTurnMs)} />
+        <StatCell label={t("UsagePanel.statLongestTask")} value={formatDuration(longestTurnMs, { style: "coarse", fallback: "0m" })} />
         <StatCell label={t("UsagePanel.statCurrentStreak")} value={t("UsagePanel.dayCount", { count: currentStreak })} />
         <StatCell label={t("UsagePanel.statLongestStreak")} value={t("UsagePanel.dayCount", { count: longestStreak })} />
       </div>
+
+      <section className="rounded-xl border border-border bg-surface-1 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">
+              {t("UsagePanel.costControlsHeading")}
+            </h3>
+            <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted">
+              {t("UsagePanel.costControlsDescription")}
+            </p>
+          </div>
+          <label className="flex items-center gap-2 text-xs font-medium text-foreground">
+            <input
+              type="checkbox"
+              checked={costPolicy.enabled}
+              onChange={(event) => setCostPolicy({ enabled: event.target.checked })}
+              className="accent-accent"
+            />
+            {t("UsagePanel.costControlsEnabled")}
+          </label>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-4">
+          <label className="text-xs text-muted">
+            <span className="mb-1 block">{t("UsagePanel.dailyBudget")}</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={costPolicy.dailyBudgetUsd ?? ""}
+              onChange={(event) =>
+                setCostPolicy({
+                  dailyBudgetUsd:
+                    event.target.value === "" ? null : Number(event.target.value),
+                })
+              }
+              className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+            />
+          </label>
+          <label className="text-xs text-muted">
+            <span className="mb-1 block">{t("UsagePanel.monthlyBudget")}</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={costPolicy.monthlyBudgetUsd ?? ""}
+              onChange={(event) =>
+                setCostPolicy({
+                  monthlyBudgetUsd:
+                    event.target.value === "" ? null : Number(event.target.value),
+                })
+              }
+              className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+            />
+          </label>
+          <label className="text-xs text-muted">
+            <span className="mb-1 block">{t("UsagePanel.warningThreshold")}</span>
+            <input
+              type="number"
+              min="10"
+              max="99"
+              step="1"
+              value={Math.round(costPolicy.warningPercent * 100)}
+              onChange={(event) =>
+                setCostPolicy({ warningPercent: Number(event.target.value) / 100 })
+              }
+              className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+            />
+          </label>
+          <label className="text-xs text-muted">
+            <span className="mb-1 block">{t("UsagePanel.enforcement")}</span>
+            <select
+              value={costPolicy.enforcement}
+              onChange={(event) =>
+                setCostPolicy({
+                  enforcement: event.target.value === "pause" ? "pause" : "warn",
+                })
+              }
+              className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+            >
+              <option value="warn">{t("UsagePanel.enforcementWarn")}</option>
+              <option value="pause">{t("UsagePanel.enforcementPause")}</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div className="rounded-lg border border-border px-3 py-2">
+            <p className="text-[11px] uppercase tracking-wide text-faint">
+              {t("UsagePanel.todaySpend")}
+            </p>
+            <p className="mt-1 text-sm font-semibold text-foreground">
+              ${costEvaluation.daily.spentUsd.toFixed(4)}
+            </p>
+          </div>
+          <div className="rounded-lg border border-border px-3 py-2">
+            <p className="text-[11px] uppercase tracking-wide text-faint">
+              {t("UsagePanel.monthSpend")}
+            </p>
+            <p className="mt-1 text-sm font-semibold text-foreground">
+              ${costEvaluation.monthly.spentUsd.toFixed(4)}
+            </p>
+          </div>
+          <div className="rounded-lg border border-border px-3 py-2">
+            <p className="text-[11px] uppercase tracking-wide text-faint">
+              {t("UsagePanel.accountingStatus")}
+            </p>
+            <p
+              className={`mt-1 text-sm font-semibold ${
+                costEvaluation.status === "exceeded"
+                  ? "text-danger"
+                  : costEvaluation.status === "warning"
+                    ? "text-warning"
+                    : "text-foreground"
+              }`}
+            >
+              {t(`UsagePanel.costStatus.${costEvaluation.status}`)}
+            </p>
+            {costEvaluation.monthly.unknownCalls > 0 && (
+              <p className="mt-1 text-[11px] text-warning">
+                {t("UsagePanel.unknownPricedCalls", {
+                  count: costEvaluation.monthly.unknownCalls,
+                })}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <h4 className="text-xs font-semibold text-foreground">
+            {t("UsagePanel.pricingHeading")}
+          </h4>
+          <p className="mt-1 text-[11px] text-faint">
+            {t("UsagePanel.pricingDescription")}
+          </p>
+          {activeCostTarget ? (
+            <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <label className="text-xs text-muted">
+                <span className="mb-1 block">{t("UsagePanel.model")}</span>
+                <select
+                  value={activeCostTarget.key}
+                  onChange={(event) => setSelectedCostTarget(event.target.value)}
+                  className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+                >
+                  {providerTargets.map((target) => (
+                    <option key={target.key} value={target.key}>
+                      {target.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs text-muted">
+                <span className="mb-1 block">{t("UsagePanel.inputPrice")}</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={activeCostRate?.inputPerMillionUsd ?? ""}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === "" && activeCostRate === undefined) return;
+                    setCostRate(activeCostTarget.key, {
+                      inputPerMillionUsd: value === "" ? 0 : Number(value),
+                      outputPerMillionUsd: activeCostRate?.outputPerMillionUsd ?? 0,
+                    });
+                  }}
+                  className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+                />
+              </label>
+              <label className="text-xs text-muted">
+                <span className="mb-1 block">{t("UsagePanel.outputPrice")}</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={activeCostRate?.outputPerMillionUsd ?? ""}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === "" && activeCostRate === undefined) return;
+                    setCostRate(activeCostTarget.key, {
+                      inputPerMillionUsd: activeCostRate?.inputPerMillionUsd ?? 0,
+                      outputPerMillionUsd: value === "" ? 0 : Number(value),
+                    });
+                  }}
+                  className="w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground"
+                />
+              </label>
+            </div>
+          ) : (
+            <p className="mt-3 text-xs text-faint">
+              {t("UsagePanel.noProviderModels")}
+            </p>
+          )}
+        </div>
+      </section>
 
       {totalTokens === 0 ? (
         <p className="rounded-lg border border-dashed border-border p-3 text-xs text-faint">{t("UsagePanel.emptyState")}</p>

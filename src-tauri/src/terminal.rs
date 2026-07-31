@@ -28,6 +28,7 @@ const MAX_EVENT_CHUNK_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_HISTORY_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_HISTORY_ENTRIES: usize = 200;
+const MAX_PROMPT_PROBE_BYTES: usize = 2 * 1024;
 const HISTORY_FILE: &str = "terminal_history.json";
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -95,11 +96,136 @@ struct TerminalStatusEvent {
     session: TerminalSessionView,
 }
 
+/// Conservatively reconstructs commands typed through the raw PTY path.
+///
+/// This is intentionally not a generic keystroke logger. Input is eligible
+/// only after output looks like a shell prompt, and only while the line can
+/// be reconstructed exactly. Completion/history/cursor escape sequences,
+/// multiline pastes, unknown control keys, and input entered while a command
+/// or password prompt is active are dropped. The final persistence layer also
+/// rejects secret-shaped command lines.
+struct HistoryInputTracker {
+    buffer: String,
+    prompt_probe: String,
+    ready_for_command: bool,
+    reconstructable: bool,
+}
+
+impl Default for HistoryInputTracker {
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+            prompt_probe: String::new(),
+            ready_for_command: false,
+            reconstructable: true,
+        }
+    }
+}
+
+impl HistoryInputTracker {
+    fn observe_output(&mut self, chunk: &str) {
+        append_bounded(&mut self.prompt_probe, chunk, MAX_PROMPT_PROBE_BYTES);
+        if !self.ready_for_command && output_looks_like_shell_prompt(&self.prompt_probe) {
+            self.ready_for_command = true;
+            self.reconstructable = true;
+            self.buffer.clear();
+        }
+    }
+
+    fn observe_input(&mut self, data: &str) -> Vec<String> {
+        let contains_line_break = data
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'));
+        let contains_text = data.chars().any(|character| !character.is_control());
+        if contains_line_break && contains_text {
+            // A terminal paste can contain complete lines in one event. Do
+            // not treat those bytes as individually typed shell commands.
+            self.mark_submitted();
+            return Vec::new();
+        }
+
+        let mut completed = Vec::new();
+        for character in data.chars() {
+            match character {
+                '\r' | '\n' => {
+                    if self.ready_for_command
+                        && self.reconstructable
+                        && !self.buffer.trim().is_empty()
+                        && self.buffer.len() <= MAX_COMMAND_BYTES
+                    {
+                        completed.push(self.buffer.clone());
+                    }
+                    self.mark_submitted();
+                }
+                // Backspace/Delete. Unicode is removed by scalar value, so a
+                // multi-byte character never leaves invalid UTF-8 behind.
+                '\u{0008}' | '\u{007f}' if self.ready_for_command && self.reconstructable => {
+                    self.buffer.pop();
+                }
+                // readline/line-editor "kill whole line".
+                '\u{0015}' if self.ready_for_command => {
+                    self.buffer.clear();
+                    self.reconstructable = true;
+                }
+                // Common readline "delete previous word". Shell-specific
+                // WORDCHARS settings can differ, so this only handles the
+                // unambiguous whitespace-delimited case.
+                '\u{0017}' if self.ready_for_command && self.reconstructable => {
+                    while self.buffer.ends_with(char::is_whitespace) {
+                        self.buffer.pop();
+                    }
+                    while self
+                        .buffer
+                        .chars()
+                        .last()
+                        .is_some_and(|value| !value.is_whitespace())
+                    {
+                        self.buffer.pop();
+                    }
+                }
+                // Ctrl+L redraws the screen without changing the edit buffer.
+                '\u{000c}' if self.ready_for_command => {}
+                // Ctrl+C abandons the current input. The next shell prompt
+                // must be observed before capture can resume.
+                '\u{0003}' => self.mark_submitted(),
+                character if !character.is_control() && self.ready_for_command => {
+                    if self.reconstructable
+                        && self.buffer.len() + character.len_utf8() <= MAX_COMMAND_BYTES
+                    {
+                        self.buffer.push(character);
+                    } else {
+                        self.buffer.clear();
+                        self.reconstructable = false;
+                    }
+                }
+                // Tabs, arrows/escape sequences, cursor movement, bracketed
+                // paste markers, and unfamiliar control input mean the final
+                // shell line cannot be known from bytes alone.
+                _ if self.ready_for_command => {
+                    self.buffer.clear();
+                    self.reconstructable = false;
+                }
+                _ => {}
+            }
+        }
+        completed
+    }
+
+    fn mark_submitted(&mut self) {
+        self.buffer.clear();
+        self.prompt_probe.clear();
+        self.ready_for_command = false;
+        self.reconstructable = true;
+    }
+}
+
 struct TerminalProcess {
     view: Mutex<TerminalSessionView>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
+    shell_process_id: Option<u32>,
+    history_input: Mutex<HistoryInputTracker>,
 }
 
 impl TerminalProcess {
@@ -246,6 +372,132 @@ fn append_bounded(output: &mut String, chunk: &str, max_bytes: usize) -> bool {
     true
 }
 
+fn visible_terminal_text(output: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum EscapeState {
+        Text,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
+    let mut state = EscapeState::Text;
+    let mut visible = String::with_capacity(output.len());
+    for character in output.chars() {
+        state = match state {
+            EscapeState::Text if character == '\u{001b}' => EscapeState::Escape,
+            EscapeState::Text => {
+                match character {
+                    '\r' => visible.push('\n'),
+                    '\n' | '\t' => visible.push(character),
+                    value if !value.is_control() => visible.push(value),
+                    _ => {}
+                }
+                EscapeState::Text
+            }
+            EscapeState::Escape if character == '[' => EscapeState::Csi,
+            EscapeState::Escape if character == ']' => EscapeState::Osc,
+            EscapeState::Escape => EscapeState::Text,
+            EscapeState::Csi if ('@'..='~').contains(&character) => EscapeState::Text,
+            EscapeState::Csi => EscapeState::Csi,
+            EscapeState::Osc if character == '\u{0007}' => EscapeState::Text,
+            EscapeState::Osc if character == '\u{001b}' => EscapeState::OscEscape,
+            EscapeState::Osc => EscapeState::Osc,
+            EscapeState::OscEscape if character == '\\' => EscapeState::Text,
+            EscapeState::OscEscape => EscapeState::Osc,
+        };
+    }
+    visible
+}
+
+fn output_looks_like_shell_prompt(output: &str) -> bool {
+    let visible = visible_terminal_text(output);
+    let line = visible
+        .rsplit(['\r', '\n'])
+        .next()
+        .unwrap_or_default()
+        .trim_end();
+    if line.is_empty() {
+        return false;
+    }
+
+    let lower = line.to_ascii_lowercase();
+    if [
+        "password",
+        "passphrase",
+        "verification code",
+        "one-time code",
+        "otp",
+        "token:",
+        "secret:",
+        "api key",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    if ['$', '%', '#', '❯', '➜', 'λ', '»', '›', '❱']
+        .iter()
+        .any(|suffix| line.ends_with(*suffix))
+        || line.starts_with('➜')
+    {
+        return true;
+    }
+
+    if !line.ends_with('>') {
+        return false;
+    }
+
+    // Avoid mistaking ordinary REPL prompts such as `>>>` or `node>` for a
+    // shell. These patterns cover PowerShell, cmd.exe, and common fish/custom
+    // prompts while deliberately missing ambiguous prompt themes.
+    line.starts_with("PS ")
+        || line.contains('@')
+        || line.starts_with('~')
+        || line.contains('/')
+        || line
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+}
+
+#[cfg(unix)]
+fn shell_is_accepting_input(process: &TerminalProcess) -> bool {
+    let Ok(master) = process.master.lock() else {
+        return false;
+    };
+    let (Some(shell_pid), Some(foreground_pid), Some(fd)) = (
+        process.shell_process_id,
+        master.process_group_leader(),
+        master.as_raw_fd(),
+    ) else {
+        return false;
+    };
+    if foreground_pid as u32 != shell_pid {
+        return false;
+    }
+
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `fd` is the live PTY master owned by `master`, and tcgetattr
+    // initializes the supplied termios value when it returns success.
+    if unsafe { libc::tcgetattr(fd, attributes.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let attributes = unsafe { attributes.assume_init() };
+    attributes.c_lflag & libc::ECHO != 0 && attributes.c_lflag & libc::ICANON != 0
+}
+
+#[cfg(not(unix))]
+fn shell_is_accepting_input(_process: &TerminalProcess) -> bool {
+    // ConPTY does not expose a foreground process group or termios. The
+    // prompt/reconstruction guards still apply on Windows; ambiguous prompts
+    // are deliberately rejected by `output_looks_like_shell_prompt`.
+    true
+}
+
 fn exact_workspace_root(state: &AppState, workspace_id: &str) -> Result<PathBuf, String> {
     let (resolved, root) = workspace::resolve_path_and_root(state, workspace_id)?;
     let canonical_id = root.to_string_lossy();
@@ -280,10 +532,7 @@ fn bounded_size(rows: Option<u16>, cols: Option<u16>) -> PtySize {
     }
 }
 
-fn emit_status<R: tauri::Runtime>(
-    app: Option<&tauri::AppHandle<R>>,
-    session: TerminalSessionView,
-) {
+fn emit_status<R: tauri::Runtime>(app: Option<&tauri::AppHandle<R>>, session: TerminalSessionView) {
     if let Some(app) = app {
         let _ = app.emit("terminal://status", TerminalStatusEvent { session });
     }
@@ -301,9 +550,13 @@ fn spawn_reader<R: tauri::Runtime>(
                 Ok(0) => break,
                 Ok(read) => {
                     let chunk = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    if let Ok(mut history_input) = process.history_input.lock() {
+                        history_input.observe_output(&chunk);
+                    }
                     let truncated = match process.view.lock() {
                         Ok(mut view) => {
-                            let did_trim = append_bounded(&mut view.output, &chunk, MAX_OUTPUT_BYTES);
+                            let did_trim =
+                                append_bounded(&mut view.output, &chunk, MAX_OUTPUT_BYTES);
                             view.output_truncated |= did_trim;
                             view.output_truncated
                         }
@@ -359,10 +612,7 @@ fn apply_exit(view: &mut TerminalSessionView, exit_code: u32) {
     view.exit_code = Some(exit_code);
 }
 
-fn spawn_exit_watcher<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    process: Arc<TerminalProcess>,
-) {
+fn spawn_exit_watcher<R: tauri::Runtime>(app: tauri::AppHandle<R>, process: Arc<TerminalProcess>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(EXIT_POLL_INTERVAL);
         let polled = process
@@ -412,7 +662,10 @@ fn spawn_session<R: tauri::Runtime>(
     let root = exact_workspace_root(state, &workspace_id)?;
     let shell = user_shell();
     if !shell.is_file() {
-        return Err(format!("Configured shell '{}' does not exist", shell.display()));
+        return Err(format!(
+            "Configured shell '{}' does not exist",
+            shell.display()
+        ));
     }
 
     let pair = native_pty_system()
@@ -428,6 +681,7 @@ fn spawn_session<R: tauri::Runtime>(
         .slave
         .spawn_command(command)
         .map_err(|error| format!("Failed to spawn shell '{}': {error}", shell.display()))?;
+    let shell_process_id = child.process_id();
     drop(pair.slave);
     let reader = pair
         .master
@@ -454,6 +708,8 @@ fn spawn_session<R: tauri::Runtime>(
         writer: Mutex::new(writer),
         child: Mutex::new(child),
         master: Mutex::new(pair.master),
+        shell_process_id,
+        history_input: Mutex::new(HistoryInputTracker::default()),
     });
     state.terminal.insert(view.id.clone(), process.clone())?;
     spawn_reader(app.clone(), process.clone(), reader);
@@ -495,7 +751,10 @@ pub async fn terminal_execute(
             "Command exceeds the {MAX_COMMAND_BYTES}-byte terminal limit"
         ));
     }
-    if command.chars().any(|character| character == '\r' || character == '\n') {
+    if command
+        .chars()
+        .any(|character| character == '\r' || character == '\n')
+    {
         return Err("Submit one terminal command line at a time".to_string());
     }
 
@@ -508,12 +767,17 @@ pub async fn terminal_execute(
     let after = before;
 
     {
+        // Hold the tracker across the PTY write so a very fast command cannot
+        // emit its next prompt and re-arm history before this submission is
+        // marked complete.
+        let mut history_input = lock(&process.history_input, "Terminal history input")?;
         let mut writer = lock(&process.writer, "Terminal input")?;
         writer
             .write_all(command.as_bytes())
             .and_then(|_| writer.write_all(b"\r"))
             .and_then(|_| writer.flush())
             .map_err(|error| format!("Failed to write terminal input: {error}"))?;
+        history_input.mark_submitted();
     }
     let history_path = history_path()?;
     let _history_guard = lock(&state.terminal.history_lock, "Terminal history")?;
@@ -549,11 +813,38 @@ pub fn terminal_write(
     if process.view()?.status != TerminalStatus::Running {
         return Err("Terminal is not running; restart it before typing".to_string());
     }
-    let mut writer = lock(&process.writer, "Terminal input")?;
-    writer
-        .write_all(data.as_bytes())
-        .and_then(|_| writer.flush())
-        .map_err(|error| format!("Failed to write terminal input: {error}"))
+    let submits_line = data
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n'));
+    let shell_accepts_submission = !submits_line || shell_is_accepting_input(&process);
+    let completed = {
+        // The writer and conservative input tracker share one critical
+        // section so concurrent IPC writes are reconstructed in the same
+        // order the PTY actually receives them.
+        let mut history_input = lock(&process.history_input, "Terminal history input")?;
+        let mut writer = lock(&process.writer, "Terminal input")?;
+        writer
+            .write_all(data.as_bytes())
+            .and_then(|_| writer.flush())
+            .map_err(|error| format!("Failed to write terminal input: {error}"))?;
+        if shell_accepts_submission {
+            history_input.observe_input(&data)
+        } else {
+            history_input.mark_submitted();
+            Vec::new()
+        }
+    };
+
+    if completed.is_empty() {
+        return Ok(());
+    }
+    let workspace_id = process.view()?.workspace_id;
+    let history_path = history_path()?;
+    let _history_guard = lock(&state.terminal.history_lock, "Terminal history")?;
+    for command in completed {
+        append_history(&history_path, &workspace_id, command)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -565,11 +856,14 @@ pub fn terminal_interrupt(
     if process.view()?.status != TerminalStatus::Running {
         return Ok(());
     }
+    let mut history_input = lock(&process.history_input, "Terminal history input")?;
     let mut writer = lock(&process.writer, "Terminal input")?;
     writer
         .write_all(&[3])
         .and_then(|_| writer.flush())
-        .map_err(|error| format!("Failed to interrupt terminal: {error}"))
+        .map_err(|error| format!("Failed to interrupt terminal: {error}"))?;
+    history_input.mark_submitted();
+    Ok(())
 }
 
 #[tauri::command]
@@ -612,13 +906,7 @@ pub async fn terminal_restart(
         let view = process.kill()?;
         emit_status(Some(&app), view);
     }
-    spawn_session(
-        &app,
-        state.inner(),
-        old_view.workspace_id,
-        rows,
-        cols,
-    )
+    spawn_session(&app, state.inner(), old_view.workspace_id, rows, cols)
 }
 
 #[tauri::command]
@@ -642,7 +930,9 @@ pub fn terminal_history(
     exact_workspace_root(state.inner(), &workspace_id)?;
     let path = history_path()?;
     let _guard = lock(&state.terminal.history_lock, "Terminal history")?;
-    Ok(load_history(&path)?.remove(&workspace_id).unwrap_or_default())
+    Ok(load_history(&path)?
+        .remove(&workspace_id)
+        .unwrap_or_default())
 }
 
 fn history_path() -> Result<PathBuf, String> {
@@ -666,7 +956,8 @@ fn load_history(path: &Path) -> Result<HashMap<String, Vec<String>>, String> {
     if metadata.len() > MAX_HISTORY_FILE_BYTES {
         return Err("Terminal history file exceeds the safety limit".to_string());
     }
-    let bytes = fs::read(path).map_err(|error| format!("Failed to read terminal history: {error}"))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read terminal history: {error}"))?;
     let parsed: TerminalHistoryFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Failed to parse terminal history: {error}"))?;
     Ok(parsed.workspaces)
@@ -724,18 +1015,35 @@ fn append_history(path: &Path, workspace_id: &str, command: String) -> Result<()
 }
 
 fn history_command_may_contain_secret(command: &str) -> bool {
+    // Leading-space commands are a long-standing opt-out convention used by
+    // bash/zsh history settings. Respect it even if the user's shell is not
+    // configured to do so, since this is a separate app-owned history.
+    if command.starts_with(char::is_whitespace)
+        || command
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n') || character.is_control())
+    {
+        return true;
+    }
+
     let lower = command.to_ascii_lowercase();
     [
-        "password=",
-        "passwd=",
-        "token=",
-        "api_key=",
-        "apikey=",
-        "secret=",
+        "password",
+        "passwd",
+        "passphrase",
+        "token",
+        "api_key",
+        "apikey",
+        "secret",
+        "credential",
+        "private_key",
+        "access_key",
         "authorization:",
-        "--password",
-        "--token",
+        "bearer ",
         "--with-token",
+        "ghp_",
+        "github_pat_",
+        "sk-",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -751,8 +1059,7 @@ mod tests {
 
     impl TempTree {
         fn new() -> Self {
-            static COUNTER: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let path = std::env::temp_dir().join(format!(
                 "little_monkey_terminal_test_{}_{}",
@@ -804,11 +1111,10 @@ mod tests {
             exact_workspace_root(&state, canonical.to_string_lossy().as_ref()).unwrap(),
             canonical
         );
-        assert!(exact_workspace_root(
-            &state,
-            root.path.join("nested").to_string_lossy().as_ref()
-        )
-        .is_err());
+        assert!(
+            exact_workspace_root(&state, root.path.join("nested").to_string_lossy().as_ref())
+                .is_err()
+        );
         assert!(exact_workspace_root(&state, outside.path.to_string_lossy().as_ref()).is_err());
     }
 
@@ -819,6 +1125,61 @@ mod tests {
         assert!(output.len() <= 10);
         assert!(output.ends_with("suffix"));
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn raw_history_tracks_only_reconstructable_input_at_a_shell_prompt() {
+        let mut tracker = HistoryInputTracker::default();
+        tracker.observe_output("\u{001b}[32muser@host\u{001b}[0m:/workspace$ ");
+        assert!(tracker.observe_input("echo hellp").is_empty());
+        assert!(tracker.observe_input("\u{007f}o").is_empty());
+        assert_eq!(tracker.observe_input("\r"), vec!["echo hello"]);
+
+        // Output must reach another recognizable prompt before a new line is
+        // eligible. Bytes typed while a command is active are ignored.
+        assert!(tracker.observe_input("not-a-shell-command").is_empty());
+        assert!(tracker.observe_input("\r").is_empty());
+        tracker.observe_output("\r\nfinished\r\n/workspace$ ");
+        assert!(tracker.observe_input("pwd").is_empty());
+        assert_eq!(tracker.observe_input("\r"), vec!["pwd"]);
+
+        tracker.observe_output("/workspace$ ");
+        assert!(tracker.observe_input("echo $").is_empty());
+        tracker.observe_output("echo $");
+        assert!(tracker.observe_input("HOME").is_empty());
+        assert_eq!(tracker.observe_input("\r"), vec!["echo $HOME"]);
+    }
+
+    #[test]
+    fn raw_history_drops_shell_edits_pastes_and_prompted_secret_input() {
+        let mut tracker = HistoryInputTracker::default();
+        tracker.observe_output("/workspace$ ");
+        assert!(tracker.observe_input("ec").is_empty());
+        assert!(tracker.observe_input("\u{001b}[A").is_empty());
+        assert!(tracker.observe_input("\r").is_empty());
+
+        tracker.observe_output("/workspace$ ");
+        assert!(tracker.observe_input("echo one\recho two\r").is_empty());
+
+        tracker.observe_output("Password: ");
+        assert!(tracker
+            .observe_input("correct horse battery staple")
+            .is_empty());
+        assert!(tracker.observe_input("\r").is_empty());
+    }
+
+    #[test]
+    fn shell_prompt_detection_rejects_password_and_repl_prompts() {
+        assert!(output_looks_like_shell_prompt(
+            "\u{001b}]0;workspace\u{0007}\u{001b}[36m~/code\u{001b}[0m ❯ "
+        ));
+        assert!(output_looks_like_shell_prompt("➜  newApp git:(main) ✗ "));
+        assert!(!output_looks_like_shell_prompt("Password: "));
+        assert!(!output_looks_like_shell_prompt(">>> "));
+        assert!(!output_looks_like_shell_prompt("node> "));
+        assert!(!output_looks_like_shell_prompt(
+            "child output ending in $\r\n"
+        ));
     }
 
     #[test]
@@ -860,7 +1221,13 @@ mod tests {
         let path = tree.path.join("history.json");
         append_history(&path, "/a", "echo safe".to_string()).unwrap();
         append_history(&path, "/a", "export API_KEY=super-secret".to_string()).unwrap();
-        append_history(&path, "/a", "curl -H 'Authorization: Bearer secret'".to_string()).unwrap();
+        append_history(
+            &path,
+            "/a",
+            "curl -H 'Authorization: Bearer secret'".to_string(),
+        )
+        .unwrap();
+        append_history(&path, "/a", " hidden-from-app-history".to_string()).unwrap();
         assert_eq!(load_history(&path).unwrap()["/a"], vec!["echo safe"]);
     }
 }

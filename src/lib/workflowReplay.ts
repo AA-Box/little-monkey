@@ -38,6 +38,7 @@ import {
 } from "./browserVerification";
 import { registerRunCancellation } from "./runCancellationRegistry";
 import type { DraftWorkflow, DraftWorkflowStep, DraftWorkflowStepAction } from "./workflowRecorder";
+import { errorMessage } from "./errors";
 
 export type ReplayStepStatus = "pending" | "running" | "success" | "failed" | "cancelled";
 
@@ -156,7 +157,7 @@ async function waitForSelector(
       const annotation = await annotateBrowser(sessionId, selector);
       return { screenshotArtifactId: annotation.evidence.screenshot?.id ?? null, detail: `Found "${selector}" before continuing.` };
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = errorMessage(error);
       if (Date.now() >= deadline) break;
       await sleep(Math.min(400, deadline - Date.now()), signal);
     }
@@ -259,7 +260,7 @@ async function executeReplay(
         emit({ type: "step-end", run, step: findStep(run, step.id) });
       } catch (error) {
         const cancelled = signal.aborted;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         run = updateStep(run, step.id, {
           status: cancelled ? "cancelled" : "failed",
           finishedAtMs: Date.now(),

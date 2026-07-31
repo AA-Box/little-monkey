@@ -14,6 +14,7 @@ import {
 import { useT } from "../../lib/i18n";
 import { useSopCompilerStore, type SopCompilationDraft } from "../../store/sopCompilerStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface SopCompilerPanelProps {
   onClose: () => void;
@@ -24,7 +25,7 @@ interface SopCompilerPanelProps {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function draftStatusTone(status: SopCompilationDraft["status"]): PillTone {

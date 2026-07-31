@@ -35,6 +35,7 @@ import {
 import { useStackStore } from "./stackStore";
 import { DEFAULT_HYBRID_CONFIG, useKnowledgeV2Store } from "./knowledgeV2Store";
 import { useSessionStore } from "./sessionStore";
+import { errorMessage } from "../lib/errors";
 
 /** Synthetic session id these one-shot extraction calls are attributed
  * under (only relevant for `rateLimitTracker`'s per-provider bookkeeping,
@@ -78,7 +79,7 @@ interface KnowledgeGraphStore extends KnowledgeGraph {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** Turns one knowledge-stack's retrieval hits into raw `(quote, locator)`

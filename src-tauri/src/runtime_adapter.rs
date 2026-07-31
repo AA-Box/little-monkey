@@ -1299,21 +1299,6 @@ impl OllamaHttpAdapter {
         })
     }
 
-    pub fn with_reqwest(
-        runtime_id: impl Into<String>,
-        endpoint: &str,
-        endpoint_policy: EndpointPolicy,
-        platform: PlatformCapabilities,
-    ) -> RuntimeAdapterResult<Self> {
-        Self::new(
-            runtime_id,
-            endpoint,
-            endpoint_policy,
-            Arc::new(ReqwestHttpTransport::new()?),
-            platform,
-        )
-    }
-
     async fn request(
         &self,
         method: HttpMethod,

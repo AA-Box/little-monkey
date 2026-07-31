@@ -19,6 +19,7 @@ import {
   type RecipeScheduleSyncItem,
 } from "./recipeScheduleClient";
 import { runRecipeNow } from "./recipeRunner";
+import { errorMessage } from "./errors";
 
 const TICK_INTERVAL_MS = 30_000;
 const SYNC_DEBOUNCE_MS = 250;
@@ -37,7 +38,7 @@ let unlistenDaemon: (() => void) | null = null;
 let started = false;
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export function buildRecipeScheduleSyncItems(

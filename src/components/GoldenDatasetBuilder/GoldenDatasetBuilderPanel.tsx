@@ -5,6 +5,7 @@ import { useT } from "../../lib/i18n";
 import type { DatasetExample } from "../../lib/goldenDatasetBuilder";
 import { useGoldenDatasetBuilderStore } from "../../store/goldenDatasetBuilderStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Synthetic Data and Golden Dataset Builder (ROADMAP.md Phase 7, item 30): a
@@ -125,7 +126,7 @@ export function GoldenDatasetBuilderPanel({ onClose }: GoldenDatasetBuilderPanel
     try {
       await generateExamples(activeDatasetId, generateCount);
     } catch (error) {
-      setRunError(error instanceof Error ? error.message : String(error));
+      setRunError(errorMessage(error));
     }
   };
 

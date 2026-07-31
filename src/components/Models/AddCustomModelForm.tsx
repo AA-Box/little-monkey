@@ -6,6 +6,7 @@ import { useModelStore } from "../../store/modelStore";
 import type { ResolvedModelReference } from "../../store/modelStore";
 import { formatBytes } from "../../lib/modelRegistry";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Two ways to add a model outside the curated catalog: pick an already-
@@ -42,7 +43,7 @@ export function AddCustomModelForm() {
       if (!selected || Array.isArray(selected)) return;
       await addExternalModel(selected);
     } catch (err) {
-      setPickError(err instanceof Error ? err.message : String(err));
+      setPickError(errorMessage(err));
     } finally {
       setPicking(false);
     }
@@ -60,7 +61,7 @@ export function AddCustomModelForm() {
     try {
       setResolved(await resolveModelReference(trimmedReference));
     } catch (err) {
-      setResolveError(err instanceof Error ? err.message : String(err));
+      setResolveError(errorMessage(err));
     } finally {
       setResolving(false);
     }
@@ -78,7 +79,7 @@ export function AddCustomModelForm() {
       );
       setInstalledName(installed.name);
     } catch (err) {
-      setInstallError(err instanceof Error ? err.message : String(err));
+      setInstallError(errorMessage(err));
     } finally {
       setInstalling(false);
     }

@@ -20,11 +20,14 @@ export type PrivacyPolicyAction = "allow" | "redact" | "block" | "require_approv
 
 export const PRIVACY_POLICY_ACTIONS: PrivacyPolicyAction[] = ["allow", "redact", "block", "require_approval"];
 
-/** Mirrors Rust `OutboundDestination`. Only `"cloud_model"` is wired into an
- * actual send path today (see `agentLoop.ts`'s pre-turn gate) — the others
- * exist so the backend scanner/policy engine stays destination-agnostic for
- * later connector/MCP-result/paired-device call sites, per
- * `privacy_firewall.rs`'s own module doc. */
+/** Mirrors Rust `OutboundDestination`. `"cloud_model"` is wired into every
+ * actual send path today: `agentLoop.ts` gates its own turn/failover/
+ * compaction/judge wires (it owns richer outcomes like switching the whole
+ * turn local), and `turnEngine.ts`'s `attemptStream` gates every other
+ * provider-bound request in the app as the default choke point. The other
+ * destinations exist so the backend scanner/policy engine stays
+ * destination-agnostic for later connector/MCP-result/paired-device call
+ * sites, per `privacy_firewall.rs`'s own module doc. */
 export type OutboundDestination = "cloud_model" | "connector" | "remote_runner" | "mcp_server" | "paired_device";
 
 /** Mirrors Rust `PrivacyPolicy`. */

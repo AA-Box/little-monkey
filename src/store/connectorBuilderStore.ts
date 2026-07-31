@@ -34,6 +34,7 @@ import {
   type ConnectorDefinition,
 } from "../lib/connectorBuilder";
 import { runSimulation, type SimulationReport } from "../lib/mcpSimulator";
+import { errorMessage } from "../lib/errors";
 
 /** Mirrors `sopCompilerStore.ts`'s own `MAX_IMPORT_FILE_BYTES` guard — an
  * OpenAPI document has no business being larger than this locally. */
@@ -42,7 +43,7 @@ export const CONNECTOR_BRIDGE_REQUIRED =
   "Registration is blocked: this OpenAPI document describes a REST API, not an MCP server. Generate and execute-verify a REST-to-MCP bridge artifact before making it available to agents.";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 interface ConnectorBuilderStore {

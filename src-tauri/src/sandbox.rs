@@ -4,13 +4,16 @@
 //! primary workspace instead of the real one: the copy lives under
 //! `<app_data>/sandbox-runs/<run_id>/workspace`, the spawned process only
 //! ever sees that directory as its cwd, and it never receives the parent
-//! process's environment — only `PATH`/`HOME` plus whatever extra variable
-//! names the caller explicitly approved. On macOS the command additionally
-//! runs under a generated Seatbelt (`sandbox-exec`) profile that denies
-//! network access and denies filesystem writes outside the ephemeral copy;
+//! process's environment — only `PATH`, sandbox-owned `HOME`/temporary
+//! directories, a computed read-only toolchain locator when needed, plus
+//! whatever extra variable names the caller explicitly approved. On macOS
+//! the command additionally runs under a generated
+//! Seatbelt (`sandbox-exec`) profile that limits reads to the sandbox and
+//! explicit system/toolchain roots, denies writes outside the ephemeral run
+//! directory, and denies network access unless it was explicitly enabled;
 //! every other platform gets the restricted-cwd/env isolation only. Every
-//! run reports which of the two actually applied (see [`Isolation`]) —
-//! never more than what was really enforced.
+//! run reports which of the two actually applied (see [`Isolation`]) — never
+//! more than what was really enforced.
 //!
 //! Nothing the sandboxed command writes ever reaches the real workspace
 //! automatically. Copying files back out is a separate, explicit two-phase
@@ -32,7 +35,8 @@
 //! non-terminal after execution — the whole point is that the workspace
 //! stays untouched until a human decides to promote or discard.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,6 +65,8 @@ const MAX_ARTIFACT_BYTES_BUDGET: u64 = 128 * 1024 * 1024;
 const MAX_EVENT_TEXT_EXCERPT: usize = 4_096;
 const PROMOTE_PREVIEW_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_PROMOTE_FILES: usize = 500;
+const SANDBOX_HOME_DIR: &str = "home";
+const SANDBOX_TMP_DIR: &str = "tmp";
 
 /// Directory/build-artifact names that are never worth copying into the
 /// ephemeral sandbox: they are large, regenerable, and (for `.git`)
@@ -83,14 +89,47 @@ const SKIP_DIR_NAMES: &[&str] = &[
     ".cache",
 ];
 
-/// Base env vars every sandboxed process needs to function as a normal
-/// process on its platform (locate binaries, find a home directory). Never
-/// includes anything else unless the caller explicitly names it in
-/// `approved_env` — see [`allowlisted_env`]'s module-level reasoning.
+/// Parent-process env vars a sandboxed process may inherit. HOME and all
+/// temporary-directory variables are deliberately absent: they are always
+/// replaced with sandbox-owned paths by [`allowlisted_env`].
 #[cfg(not(target_os = "windows"))]
-const BASE_ENV_KEYS: &[&str] = &["PATH", "HOME"];
+const BASE_ENV_KEYS: &[&str] = &["PATH"];
 #[cfg(target_os = "windows")]
-const BASE_ENV_KEYS: &[&str] = &["PATH", "USERPROFILE", "SystemRoot", "TEMP", "TMP"];
+const BASE_ENV_KEYS: &[&str] = &["PATH", "SystemRoot"];
+
+const SANDBOX_OWNED_ENV_KEYS: &[&str] = &["HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP"];
+
+/// Content roots needed by ordinary command-line programs on macOS. These
+/// intentionally avoid broad data-bearing trees such as `/System` (which
+/// also contains `/System/Volumes/Data`), `/usr`, `/Library`, `/private`,
+/// and the user's home. Additional executable roots come only from PATH and
+/// are filtered against the real workspace and whole-home roots below.
+const MACOS_SYSTEM_READ_ROOTS: &[&str] = &[
+    "/System/Library",
+    "/System/Cryptexes/App/usr",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/share",
+    "/bin",
+    "/sbin",
+    "/Library/Apple/System/Library",
+    "/Library/Developer/CommandLineTools",
+    "/Library/Developer/Toolchains",
+    "/Applications/Xcode.app/Contents/Developer",
+    "/private/var/db/dyld",
+    "/private/var/select",
+    "/private/etc/ssl",
+    "/private/etc/hosts",
+    "/private/etc/resolv.conf",
+    "/private/etc/services",
+    "/private/etc/protocols",
+    "/private/etc/localtime",
+    "/Library/Keychains/System.keychain",
+    "/dev/null",
+    "/dev/random",
+    "/dev/urandom",
+];
 
 /// Per-process, in-memory registry of prepared-but-not-yet-confirmed promote
 /// previews, keyed by digest. Unlike `m5_delivery`'s durable SQLite preview
@@ -334,32 +373,236 @@ pub fn copy_workspace_into_sandbox(root: &Path, dest: &Path) -> io::Result<CopyS
     Ok(stats)
 }
 
-/// Builds an env list containing only `PATH`/`HOME` (platform base keys)
-/// plus whatever extra variable names the caller explicitly approved —
-/// never a blanket inheritance of the parent process's environment. Keys not
-/// present in the current process's own environment are silently omitted
-/// rather than passed through empty.
-pub fn allowlisted_env(approved_extra: &[String]) -> Vec<(String, String)> {
+fn is_sandbox_owned_env_key(key: &str) -> bool {
+    SANDBOX_OWNED_ENV_KEYS
+        .iter()
+        .any(|owned| owned.eq_ignore_ascii_case(key))
+}
+
+fn set_env_value(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, current)) = env
+        .iter_mut()
+        .find(|(current_key, _)| current_key.eq_ignore_ascii_case(key))
+    {
+        *current = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
+}
+
+/// Builds an env list containing only the platform's non-sensitive base
+/// keys plus whatever extra names the caller explicitly approved. HOME and
+/// every conventional temporary-directory variable are forcibly bound to
+/// sandbox-owned directories; approving one of those names can never
+/// restore the parent process's value.
+pub fn allowlisted_env(
+    sandbox_home: &Path,
+    sandbox_tmp: &Path,
+    approved_extra: &[String],
+) -> Vec<(String, String)> {
     let mut keys: Vec<String> = BASE_ENV_KEYS.iter().map(|k| k.to_string()).collect();
     for extra in approved_extra {
-        if !keys.iter().any(|k| k == extra) {
+        if !is_sandbox_owned_env_key(extra) && !keys.iter().any(|k| k == extra) {
             keys.push(extra.clone());
         }
     }
-    keys.into_iter()
+    let mut env: Vec<(String, String)> = keys
+        .into_iter()
         .filter_map(|key| std::env::var(&key).ok().map(|value| (key, value)))
+        .collect();
+
+    let home = sandbox_home.to_string_lossy().into_owned();
+    let tmp = sandbox_tmp.to_string_lossy().into_owned();
+    set_env_value(&mut env, "HOME", home.clone());
+    set_env_value(&mut env, "USERPROFILE", home);
+    set_env_value(&mut env, "TMPDIR", tmp.clone());
+    set_env_value(&mut env, "TMP", tmp.clone());
+    set_env_value(&mut env, "TEMP", tmp);
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+    env
+}
+
+fn policy_comparison_path(path: &Path) -> PathBuf {
+    // APFS exposes the writable data volume through both ordinary paths
+    // (`/Users/...`) and `/System/Volumes/Data/...`. Normalize the latter so
+    // a PATH entry cannot smuggle the real workspace in through that alias.
+    match path.strip_prefix("/System/Volumes/Data") {
+        Ok(suffix) => Path::new("/").join(suffix),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = policy_comparison_path(left);
+    let right = policy_comparison_path(right);
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
+fn looks_like_whole_user_home(path: &Path) -> bool {
+    let normalized = policy_comparison_path(path);
+    let parts: Vec<_> = normalized.components().collect();
+    (parts.len() <= 3
+        && matches!(
+            parts.as_slice(),
+            [
+                std::path::Component::RootDir,
+                std::path::Component::Normal(base),
+                std::path::Component::Normal(_)
+            ] if *base == OsStr::new("Users") || *base == OsStr::new("home")
+        ))
+        || normalized == Path::new("/Users")
+        || normalized == Path::new("/home")
+}
+
+fn readable_root_is_safe(
+    candidate: &Path,
+    real_home: Option<&Path>,
+    real_workspace: &Path,
+) -> bool {
+    if !candidate.is_absolute()
+        || candidate == Path::new("/")
+        || looks_like_whole_user_home(candidate)
+        || paths_overlap(candidate, real_workspace)
+    {
+        return false;
+    }
+    if let Some(home) = real_home {
+        let candidate = policy_comparison_path(candidate);
+        let home = policy_comparison_path(home);
+        // A directory *inside* HOME may be an explicit PATH/toolchain root.
+        // HOME itself and any ancestor of it must never become a read root.
+        if candidate == home || home.starts_with(&candidate) {
+            return false;
+        }
+    }
+    true
+}
+
+fn insert_existing_read_root(
+    roots: &mut BTreeSet<PathBuf>,
+    candidate: &Path,
+    real_home: Option<&Path>,
+    real_workspace: &Path,
+) {
+    let Ok(candidate) = fs::canonicalize(candidate) else {
+        return;
+    };
+    if readable_root_is_safe(&candidate, real_home, real_workspace) {
+        roots.insert(candidate);
+    }
+}
+
+fn macos_readable_roots(
+    path_env: Option<&OsStr>,
+    real_home: Option<&Path>,
+    real_workspace: &Path,
+) -> Vec<PathBuf> {
+    let canonical_home = real_home.and_then(|path| fs::canonicalize(path).ok());
+    let real_home = canonical_home.as_deref().or(real_home);
+    let canonical_workspace =
+        fs::canonicalize(real_workspace).unwrap_or_else(|_| real_workspace.to_path_buf());
+    let mut candidates: Vec<PathBuf> = MACOS_SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
+    let path_entries: Vec<PathBuf> = path_env
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|path| path.is_absolute())
+        .collect();
+    candidates.extend(path_entries.iter().cloned());
+
+    // Homebrew's PATH entries are mostly symlinks into Cellar/opt. Permit
+    // only executable/library/share roots, never its `etc` or `var` trees.
+    for prefix in [Path::new("/opt/homebrew"), Path::new("/usr/local")] {
+        if path_entries.iter().any(|entry| entry.starts_with(prefix)) {
+            for child in ["bin", "sbin", "Cellar", "opt", "lib", "share"] {
+                candidates.push(prefix.join(child));
+            }
+        }
+    }
+
+    // rustup's proxies live in ~/.cargo/bin while their executable
+    // toolchains live elsewhere. Cargo registries, git caches, config, and
+    // credentials remain outside the read boundary; network-enabled runs
+    // can populate a fresh cache under the sandbox-owned HOME instead.
+    if let Some(home) = real_home {
+        let cargo_bin = home.join(".cargo/bin");
+        if path_entries
+            .iter()
+            .any(|entry| entry.starts_with(&cargo_bin))
+        {
+            candidates.push(home.join(".rustup/toolchains"));
+            candidates.push(home.join(".rustup/settings.toml"));
+        }
+    }
+
+    let mut roots = BTreeSet::new();
+    for candidate in candidates {
+        insert_existing_read_root(&mut roots, &candidate, real_home, &canonical_workspace);
+    }
+    roots.into_iter().collect()
+}
+
+fn macos_path_uses_rustup(path_env: Option<&OsStr>, real_home: &Path) -> bool {
+    let cargo_bin = real_home.join(".cargo/bin");
+    path_env
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .any(|entry| entry.is_absolute() && entry.starts_with(&cargo_bin))
+}
+
+fn seatbelt_escape(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn seatbelt_filters(paths: &BTreeSet<PathBuf>, operator: &str) -> String {
+    paths
+        .iter()
+        .map(|path| format!("  ({operator} \"{}\")\n", seatbelt_escape(path)))
         .collect()
 }
 
-/// Pure string builder for the macOS Seatbelt profile: deny-by-default,
-/// allow reading anything (so build tools can see their toolchain and
-/// dependencies), allow writes only under `sandbox_dir`, and deny network
-/// unless `allow_network` was explicitly requested. Intentionally
-/// conservative/best-effort — this is real OS-level containment, not a
-/// substitute for not running malicious code at all. Contains no I/O and is
-/// testable without ever invoking `sandbox-exec`.
-pub fn build_seatbelt_profile(sandbox_dir: &Path, allow_network: bool) -> String {
-    let sandbox_dir = sandbox_dir.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+fn traversal_ancestors(paths: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut ancestors = BTreeSet::new();
+    for path in paths {
+        let mut parent = path.parent();
+        while let Some(current) = parent {
+            if current == Path::new("/") {
+                break;
+            }
+            ancestors.insert(current.to_path_buf());
+            parent = current.parent();
+        }
+    }
+    ancestors
+}
+
+/// Pure string builder for a deny-by-default macOS Seatbelt profile.
+/// Content reads and executable mappings are scoped to `sandbox_root` plus
+/// explicit system/toolchain roots. Writes remain scoped to the sandbox
+/// root. Enabling network changes only the network clause and can never
+/// widen filesystem access.
+pub fn build_seatbelt_profile(
+    sandbox_root: &Path,
+    readable_roots: &[PathBuf],
+    allow_network: bool,
+) -> String {
+    let mut read_roots = BTreeSet::new();
+    read_roots.insert(sandbox_root.to_path_buf());
+    read_roots.extend(
+        readable_roots
+            .iter()
+            .filter(|path| path.is_absolute() && path.as_path() != Path::new("/"))
+            .cloned(),
+    );
+    let ancestors = traversal_ancestors(&read_roots);
+    let read_filters = seatbelt_filters(&read_roots, "subpath");
+    let ancestor_filters = seatbelt_filters(&ancestors, "literal");
+    let sandbox_root = seatbelt_escape(sandbox_root);
     let network_clause = if allow_network {
         "(allow network*)"
     } else {
@@ -369,10 +612,15 @@ pub fn build_seatbelt_profile(sandbox_dir: &Path, allow_network: bool) -> String
         "(version 1)\n\
          (deny default)\n\
          (allow process-fork)\n\
-         (allow process-exec)\n\
-         (allow file-read*)\n\
-         (allow file-write* (subpath \"{sandbox_dir}\"))\n\
-         (allow file-ioctl (subpath \"{sandbox_dir}\"))\n\
+         (allow process-exec\n\
+         {read_filters})\n\
+         (allow file-read*\n\
+           (literal \"/\")\n\
+         {read_filters})\n\
+         (allow file-read-metadata\n\
+         {ancestor_filters})\n\
+         (allow file-write* (subpath \"{sandbox_root}\"))\n\
+         (allow file-ioctl (subpath \"{sandbox_root}\"))\n\
          (allow sysctl-read)\n\
          (allow mach-lookup)\n\
          (allow signal (target self))\n\
@@ -389,37 +637,105 @@ pub struct SandboxExecOutcome {
     pub duration_ms: u64,
 }
 
-/// Spawns `shell_command` with `cwd` set to `sandbox_dir`, an allowlisted
-/// env (see [`allowlisted_env`]), and a wall-clock `timeout`. On macOS the
+/// Spawns `shell_command` with `cwd` set to `workspace_dir`, an allowlisted
+/// env (see [`allowlisted_env`]), and a wall-clock `timeout`. `sandbox_root`
+/// owns the copied workspace, HOME, TMP, and Seatbelt profile; the
+/// `real_workspace_root` is an explicit forbidden read boundary. On macOS the
 /// command is additionally wrapped in `sandbox-exec` with a generated
-/// Seatbelt profile written to `profile_path` (a sibling of `sandbox_dir`,
+/// Seatbelt profile written to `profile_path` (a sibling of `workspace_dir`,
 /// never inside it, so it never shows up as an unexpected file when diffing
 /// the copy against the real workspace). On timeout the child is killed and
 /// any output captured so far is discarded (matching `tools::tool_run_shell`'s
 /// existing timeout behavior) — `timed_out` is still reported accurately.
-#[allow(unused_variables)]
 pub async fn execute_in_sandbox(
-    sandbox_dir: &Path,
+    sandbox_root: &Path,
+    workspace_dir: &Path,
+    real_workspace_root: &Path,
     profile_path: &Path,
     shell_command: &str,
     timeout: Duration,
     allow_network: bool,
     approved_env: &[String],
 ) -> io::Result<SandboxExecOutcome> {
-    let env = allowlisted_env(approved_env);
+    let sandbox_root = fs::canonicalize(sandbox_root)?;
+    let workspace_dir = fs::canonicalize(workspace_dir)?;
+    let real_workspace_root = fs::canonicalize(real_workspace_root)?;
+    if !workspace_dir.starts_with(&sandbox_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sandbox workspace must be inside the sandbox root",
+        ));
+    }
+    if paths_overlap(&sandbox_root, &real_workspace_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sandbox root must not overlap the real workspace",
+        ));
+    }
+
+    let profile_parent = profile_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Seatbelt profile must have a parent directory",
+        )
+    })?;
+    let profile_parent = fs::canonicalize(profile_parent)?;
+    if !profile_parent.starts_with(&sandbox_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Seatbelt profile must be inside the sandbox root",
+        ));
+    }
+
+    let sandbox_home = sandbox_root.join(SANDBOX_HOME_DIR);
+    let sandbox_tmp = sandbox_root.join(SANDBOX_TMP_DIR);
+    fs::create_dir_all(&sandbox_home)?;
+    fs::create_dir_all(&sandbox_tmp)?;
+    let env = allowlisted_env(&sandbox_home, &sandbox_tmp, approved_env);
     let started = std::time::Instant::now();
 
     #[cfg(target_os = "macos")]
+    let mut env = env;
+    #[cfg(target_os = "macos")]
+    let real_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|path| fs::canonicalize(path).ok());
+    #[cfg(target_os = "macos")]
+    if let Some(home) = real_home.as_deref() {
+        let path_env = env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| OsStr::new(value));
+        let rustup_home = home.join(".rustup");
+        if macos_path_uses_rustup(path_env, home) && rustup_home.is_dir() {
+            // This is a computed, read-only toolchain location, not inherited
+            // user configuration. CARGO_HOME remains under sandbox HOME, so
+            // Cargo credentials/config/registries are never exposed.
+            set_env_value(
+                &mut env,
+                "RUSTUP_HOME",
+                rustup_home.to_string_lossy().into_owned(),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     let (program, args, isolation) = {
-        let profile = build_seatbelt_profile(sandbox_dir, allow_network);
+        let path_env = env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| OsStr::new(value));
+        let readable_roots =
+            macos_readable_roots(path_env, real_home.as_deref(), &real_workspace_root);
+        let profile = build_seatbelt_profile(&sandbox_root, &readable_roots, allow_network);
         fs::write(profile_path, profile)?;
         (
-            "sandbox-exec".to_string(),
+            "/usr/bin/sandbox-exec".to_string(),
             vec![
                 "-f".to_string(),
                 profile_path.to_string_lossy().to_string(),
                 "--".to_string(),
-                "sh".to_string(),
+                "/bin/sh".to_string(),
                 "-c".to_string(),
                 shell_command.to_string(),
             ],
@@ -444,7 +760,7 @@ pub async fn execute_in_sandbox(
     let mut command = tokio::process::Command::new(&program);
     command
         .args(&args)
-        .current_dir(sandbox_dir)
+        .current_dir(&workspace_dir)
         .env_clear()
         .envs(env.iter().cloned())
         .stdin(Stdio::null())
@@ -848,6 +1164,7 @@ async fn run_sandboxed_body(
     state: &AppState,
     run_id: &str,
     root: &Path,
+    sandbox_root: &Path,
     workspace_dir: &Path,
     profile_path: &Path,
     request: &SandboxRunRequest,
@@ -877,7 +1194,9 @@ async fn run_sandboxed_body(
     )?;
 
     let outcome = execute_in_sandbox(
+        sandbox_root,
         workspace_dir,
+        root,
         profile_path,
         &request.command,
         request.timeout(),
@@ -1005,6 +1324,7 @@ async fn run_sandboxed(
         state,
         &run_id,
         &root,
+        &sandbox_root,
         &workspace_dir,
         &profile_path,
         &request,
@@ -1339,32 +1659,73 @@ mod tests {
     #[test]
     fn allowlisted_env_excludes_unapproved_secrets() {
         std::env::set_var("SANDBOX_TEST_SECRET_TOKEN", "super-secret-value");
-        let env = allowlisted_env(&[]);
-        assert!(!env.iter().any(|(key, _)| key == "SANDBOX_TEST_SECRET_TOKEN"));
+        let root = temp_dir("env-owned");
+        let home = root.join("home");
+        let tmp = root.join("tmp");
+        let env = allowlisted_env(&home, &tmp, &[]);
+        let home_text = home.to_string_lossy();
+        let tmp_text = tmp.to_string_lossy();
+        assert!(!env
+            .iter()
+            .any(|(key, _)| key == "SANDBOX_TEST_SECRET_TOKEN"));
         assert!(env.iter().any(|(key, _)| key == "PATH"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "HOME" && value == home_text.as_ref()));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "TMPDIR" && value == tmp_text.as_ref()));
         std::env::remove_var("SANDBOX_TEST_SECRET_TOKEN");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn allowlisted_env_includes_only_explicitly_approved_extras() {
+    fn allowlisted_env_includes_only_extras_and_cannot_override_owned_paths() {
         std::env::set_var("SANDBOX_TEST_APPROVED", "yes");
         std::env::set_var("SANDBOX_TEST_UNAPPROVED", "no");
-        let env = allowlisted_env(&["SANDBOX_TEST_APPROVED".to_string()]);
-        assert!(env.iter().any(|(key, value)| key == "SANDBOX_TEST_APPROVED" && value == "yes"));
+        let root = temp_dir("env-approved");
+        let home = root.join("home");
+        let tmp = root.join("tmp");
+        let env = allowlisted_env(
+            &home,
+            &tmp,
+            &[
+                "SANDBOX_TEST_APPROVED".to_string(),
+                "HOME".to_string(),
+                "TMPDIR".to_string(),
+            ],
+        );
+        let home_text = home.to_string_lossy();
+        let tmp_text = tmp.to_string_lossy();
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "SANDBOX_TEST_APPROVED" && value == "yes"));
         assert!(!env.iter().any(|(key, _)| key == "SANDBOX_TEST_UNAPPROVED"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "HOME" && value == home_text.as_ref()));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "TMPDIR" && value == tmp_text.as_ref()));
         std::env::remove_var("SANDBOX_TEST_APPROVED");
         std::env::remove_var("SANDBOX_TEST_UNAPPROVED");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn spawned_child_never_inherits_unapproved_secrets() {
         std::env::set_var("SANDBOX_TEST_CHILD_SECRET", "leak-me-not");
-        let dir = temp_dir("exec-env");
-        let profile_path = dir.join("seatbelt.sb");
+        let sandbox_root = temp_dir("exec-env");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("exec-env-real");
+        let profile_path = sandbox_root.join("seatbelt.sb");
 
         let outcome = execute_in_sandbox(
-            &dir,
+            &sandbox_root,
+            &workspace_dir,
+            &real_workspace,
             &profile_path,
             "env",
             Duration::from_secs(10),
@@ -1379,30 +1740,198 @@ mod tests {
             !stdout.contains("SANDBOX_TEST_CHILD_SECRET"),
             "child env leaked an unapproved variable: {stdout}"
         );
-        assert!(stdout.contains("PATH="), "child env should still contain PATH");
+        assert!(
+            stdout.contains("PATH="),
+            "child env should still contain PATH"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "HOME={}",
+                fs::canonicalize(&sandbox_root)
+                    .expect("canonical sandbox")
+                    .join(SANDBOX_HOME_DIR)
+                    .display()
+            )),
+            "child HOME must be sandbox-owned: {stdout}"
+        );
 
         std::env::remove_var("SANDBOX_TEST_CHILD_SECRET");
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
     }
 
     // --- build_seatbelt_profile ------------------------------------------
 
     #[test]
-    fn seatbelt_profile_denies_by_default_and_scopes_writes_to_sandbox_dir() {
+    fn seatbelt_profile_has_no_global_read_and_scopes_reads_and_writes() {
         let dir = Path::new("/tmp/example-sandbox-dir");
-        let profile = build_seatbelt_profile(dir, false);
+        let profile = build_seatbelt_profile(
+            dir,
+            &[
+                PathBuf::from("/System/Library"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/Users/example/.cargo/bin"),
+            ],
+            false,
+        );
         assert!(profile.contains("(deny default)"));
+        assert!(
+            !profile
+                .lines()
+                .any(|line| line.trim() == "(allow file-read*)"),
+            "profile must never grant unfiltered file reads:\n{profile}"
+        );
+        assert!(profile.contains("(subpath \"/tmp/example-sandbox-dir\")"));
+        assert!(profile.contains("(subpath \"/System/Library\")"));
+        assert!(profile.contains("(subpath \"/usr/bin\")"));
+        assert!(
+            !profile.contains("(subpath \"/Users/example\")"),
+            "whole user home must not be readable"
+        );
         assert!(profile.contains("(allow file-write* (subpath \"/tmp/example-sandbox-dir\"))"));
+        assert_eq!(
+            profile
+                .lines()
+                .filter(|line| line.contains("(allow file-write*"))
+                .count(),
+            1,
+            "only the sandbox write grant is allowed"
+        );
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("(allow network*)"));
     }
 
     #[test]
-    fn seatbelt_profile_allows_network_only_when_requested() {
+    fn seatbelt_profile_network_toggle_does_not_change_filesystem_rules() {
         let dir = Path::new("/tmp/example-sandbox-dir");
-        let profile = build_seatbelt_profile(dir, true);
-        assert!(profile.contains("(allow network*)"));
-        assert!(!profile.contains("(deny network*)"));
+        let roots = vec![PathBuf::from("/System/Library"), PathBuf::from("/usr/bin")];
+        let denied = build_seatbelt_profile(dir, &roots, false);
+        let allowed = build_seatbelt_profile(dir, &roots, true);
+        assert!(allowed.contains("(allow network*)"));
+        assert!(!allowed.contains("(deny network*)"));
+        assert_eq!(
+            denied.replace("(deny network*)", ""),
+            allowed.replace("(allow network*)", ""),
+            "network permission must not alter any file-read rule"
+        );
+    }
+
+    #[test]
+    fn macos_read_roots_reject_whole_home_and_real_workspace() {
+        let fixture = temp_dir("read-roots");
+        let home = fixture.join("user-home");
+        let workspace = home.join("Documents/project");
+        let workspace_bin = workspace.join("bin");
+        let cargo_bin = home.join(".cargo/bin");
+        let external_bin = fixture.join("external-tool/bin");
+        for path in [&workspace_bin, &cargo_bin, &external_bin] {
+            fs::create_dir_all(path).expect("create PATH fixture");
+        }
+        let joined = std::env::join_paths([
+            home.as_path(),
+            workspace_bin.as_path(),
+            cargo_bin.as_path(),
+            external_bin.as_path(),
+        ])
+        .expect("join PATH");
+
+        let roots = macos_readable_roots(Some(&joined), Some(&home), &workspace);
+        let canonical_home = fs::canonicalize(&home).expect("canonical home");
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+        let canonical_cargo = fs::canonicalize(&cargo_bin).expect("canonical cargo bin");
+        let canonical_external = fs::canonicalize(&external_bin).expect("canonical external bin");
+
+        assert!(!roots.iter().any(|root| root == &canonical_home));
+        assert!(
+            !roots
+                .iter()
+                .any(|root| paths_overlap(root, &canonical_workspace)),
+            "no real-workspace root or descendant may be readable: {roots:?}"
+        );
+        assert!(roots.contains(&canonical_cargo));
+        assert!(roots.contains(&canonical_external));
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sh_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_exec_cannot_read_or_write_real_workspace_with_or_without_network() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            eprintln!("skipping Seatbelt integration test: sandbox-exec is unavailable");
+            return;
+        }
+
+        let sandbox_root = temp_dir("seatbelt-integration");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("seatbelt-real-workspace");
+        let allowed_file = workspace_dir.join("allowed.txt");
+        let forbidden_file = real_workspace.join("secret.txt");
+        write(&allowed_file, "sandbox-visible");
+        write(&forbidden_file, "must-stay-secret");
+
+        let canonical_sandbox = fs::canonicalize(&sandbox_root).expect("canonical sandbox");
+        let canonical_workspace =
+            fs::canonicalize(&workspace_dir).expect("canonical sandbox workspace");
+        let canonical_forbidden =
+            fs::canonicalize(&forbidden_file).expect("canonical forbidden file");
+        let expected_home = canonical_sandbox.join(SANDBOX_HOME_DIR);
+        let expected_tmp = canonical_sandbox.join(SANDBOX_TMP_DIR);
+        let command = format!(
+            "set -eu\n\
+             test \"$HOME\" = {}\n\
+             test \"$TMPDIR\" = {}\n\
+             /bin/cat {} > \"$TMPDIR/allowed-copy\"\n\
+             if /bin/cat {} > \"$TMPDIR/forbidden-copy\"; then exit 71; fi\n\
+             if printf overwritten > {}; then exit 72; fi\n\
+             printf home-ok > \"$HOME/probe\"\n\
+             printf tmp-ok > \"$TMPDIR/probe\"",
+            sh_quote(&expected_home),
+            sh_quote(&expected_tmp),
+            sh_quote(&canonical_workspace.join("allowed.txt")),
+            sh_quote(&canonical_forbidden),
+            sh_quote(&canonical_forbidden),
+        );
+
+        for allow_network in [false, true] {
+            let profile_path = sandbox_root.join(if allow_network {
+                "seatbelt-network.sb"
+            } else {
+                "seatbelt-offline.sb"
+            });
+            let outcome = execute_in_sandbox(
+                &sandbox_root,
+                &workspace_dir,
+                &real_workspace,
+                &profile_path,
+                &command,
+                Duration::from_secs(10),
+                allow_network,
+                &[],
+            )
+            .await
+            .expect("sandbox-exec launches");
+            assert_eq!(
+                outcome.exit_code,
+                Some(0),
+                "Seatbelt boundary failed (network={allow_network}); stderr={}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&forbidden_file).expect("read real file after run"),
+                "must-stay-secret"
+            );
+        }
+        assert!(expected_home.join("probe").is_file());
+        assert!(expected_tmp.join("probe").is_file());
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
     }
 
     // --- promote digest / confirmation -----------------------------------
@@ -1541,7 +2070,8 @@ mod tests {
         .expect("valid confirmation is accepted");
         verify_unchanged_since_preview("run-1", &sandbox_dir, &accepted, &preview.digest)
             .expect("nothing changed since prepare");
-        let promoted = promote_files(&sandbox_dir, &real_root, &accepted.files).expect("promote succeeds");
+        let promoted =
+            promote_files(&sandbox_dir, &real_root, &accepted.files).expect("promote succeeds");
         assert_eq!(promoted, vec!["app.txt".to_string()]);
         assert_eq!(
             fs::read_to_string(real_root.join("app.txt")).unwrap(),

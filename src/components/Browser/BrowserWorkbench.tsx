@@ -62,6 +62,7 @@ import { buildBrowserEvidenceSideTaskSeed, useSideTaskStore } from "../../store/
 import { Button, IconButton, Tabs } from "../ui";
 import { WorkflowDraftReview } from "./WorkflowDraftReview";
 import { WorkflowLibrary } from "./WorkflowLibrary";
+import { errorMessage } from "../../lib/errors";
 
 const MAX_SNAPSHOTS = 12;
 const MAX_EVIDENCE_EXCERPT = 4_000;
@@ -292,7 +293,7 @@ export function BrowserWorkbench({ taskId, chatSessionId = null, onClose, compac
     setBusy(name);
     setError(null);
     setNotice(null);
-    try { return await action(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); return null; } finally { setBusy(null); }
+    try { return await action(); } catch (cause) { setError(errorMessage(cause)); return null; } finally { setBusy(null); }
   }, []);
 
   const rememberUrl = useCallback((nextUrl: string) => {

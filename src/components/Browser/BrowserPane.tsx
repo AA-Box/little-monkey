@@ -25,8 +25,20 @@ import {
 import { IconButton } from "../ui";
 
 interface BrowserPaneProps {
-  /** True while a fullscreen overlay (settings, palette, …) covers the pane. */
+  /** True while a fullscreen overlay (settings, palette, …) covers the pane,
+   * or — embedded — while the hosting tab is not the active one. */
   obscured?: boolean;
+  /** Space (px) the tab strip leaves free at its right end for the app's
+   * fixed dock-toggle cluster, which floats above this pane's top-right
+   * corner. Applied as a margin on the strip's row so the new-tab "+" and
+   * the pane's close X can never sit underneath those transparent icons. */
+  trailingInset?: number;
+  /** Rendered as a right-sidebar TAB rather than as its own dock column: the
+   * host owns width and closing, so the pane drops its own width style and
+   * left-edge resize handle. */
+  embedded?: boolean;
+  /** Close handler for the pane's X. Defaults to closing the dock column. */
+  onClose?: () => void;
 }
 
 function tabDisplayName(tab: BrowserPaneTab, fallback: string): string {
@@ -101,7 +113,12 @@ function TabButton({
   );
 }
 
-export function BrowserPane({ obscured = false }: BrowserPaneProps) {
+export function BrowserPane({
+  obscured = false,
+  trailingInset = 0,
+  embedded = false,
+  onClose,
+}: BrowserPaneProps) {
   const { t } = useT();
   const tabs = useBrowserPaneStore((state) => state.tabs);
   const activeId = useBrowserPaneStore((state) => state.activeId);
@@ -221,52 +238,64 @@ export function BrowserPane({ obscured = false }: BrowserPaneProps) {
 
   return (
     <aside
-      className="relative flex h-full shrink-0 flex-col overflow-hidden border-l border-border bg-surface"
-      style={{ width, minWidth: MIN_PANE_WIDTH }}
+      className={
+        embedded
+          ? "relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-surface"
+          : "relative flex h-full shrink-0 flex-col overflow-hidden border-l border-border bg-surface"
+      }
+      style={embedded ? undefined : { width, minWidth: MIN_PANE_WIDTH }}
       aria-label={t("BrowserPane.title")}
     >
-      <div
-        role="separator"
-        aria-orientation="vertical"
-        aria-label={t("BrowserPane.resize")}
-        onPointerDown={onResizeStart}
-        className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-ew-resize bg-transparent transition-colors hover:bg-accent/40 active:bg-accent/60"
-      />
+      {!embedded && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={t("BrowserPane.resize")}
+          onPointerDown={onResizeStart}
+          className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-ew-resize bg-transparent transition-colors hover:bg-accent/40 active:bg-accent/60"
+        />
+      )}
 
-      {/* Tab strip; doubles as this pane's draggable title-bar strip. */}
-      <div
-        data-tauri-drag-region
-        className="flex h-11 shrink-0 items-center gap-1 border-b border-border px-2"
-      >
-        <div role="tablist" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-          {tabs.map((tab) => (
-            <TabButton
-              key={tab.id}
-              tab={tab}
-              active={tab.id === activeId}
-              newTabLabel={t("BrowserPane.newTab")}
-              closeLabel={t("BrowserPane.closeTab")}
-              onSelect={() => void selectTab(tab.id)}
-              onClose={() => void closeTab(tab.id)}
-            />
-          ))}
+      {/* Tab strip; doubles as this pane's draggable title-bar strip. The
+          border-b lives on the outer wrapper so it always spans the full pane
+          width; the row inside stops short of the app's fixed dock-toggle
+          cluster (`trailingInset`), which floats over this corner. */}
+      <div className="shrink-0 border-b border-border">
+        <div
+          data-tauri-drag-region={embedded ? undefined : true}
+          className="flex h-11 items-center gap-1 px-2"
+          style={trailingInset > 0 ? { marginRight: trailingInset } : undefined}
+        >
+          <div role="tablist" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+            {tabs.map((tab) => (
+              <TabButton
+                key={tab.id}
+                tab={tab}
+                active={tab.id === activeId}
+                newTabLabel={t("BrowserPane.newTab")}
+                closeLabel={t("BrowserPane.closeTab")}
+                onSelect={() => void selectTab(tab.id)}
+                onClose={() => void closeTab(tab.id)}
+              />
+            ))}
+          </div>
+          <IconButton
+            size="sm"
+            onClick={() => void openTab()}
+            aria-label={t("BrowserPane.newTab")}
+            title={t("BrowserPane.newTab")}
+          >
+            <Plus size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            onClick={() => (onClose ? onClose() : setOpen(false))}
+            aria-label={t("BrowserPane.closePane")}
+            title={t("BrowserPane.closePane")}
+          >
+            <X size={15} />
+          </IconButton>
         </div>
-        <IconButton
-          size="sm"
-          onClick={() => void openTab()}
-          aria-label={t("BrowserPane.newTab")}
-          title={t("BrowserPane.newTab")}
-        >
-          <Plus size={15} />
-        </IconButton>
-        <IconButton
-          size="sm"
-          onClick={() => setOpen(false)}
-          aria-label={t("BrowserPane.closePane")}
-          title={t("BrowserPane.closePane")}
-        >
-          <X size={15} />
-        </IconButton>
       </div>
 
       {/* Toolbar: back / forward / reload + address bar + open external. */}

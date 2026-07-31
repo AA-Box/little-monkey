@@ -33,8 +33,8 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm exec tsc --noEmit
+      - name: Production build and bundle budget
+        run: pnpm build:budget
 
       - name: Frontend tests
         run: pnpm test

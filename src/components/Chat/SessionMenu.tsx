@@ -42,6 +42,7 @@ import {
   type ShortcutId,
   type ShortcutIdForScope,
 } from "../../lib/shortcuts";
+import { errorMessage } from "../../lib/errors";
 
 interface SessionMenuProps {
   session: ChatSession;
@@ -171,7 +172,7 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
       await translateThread(session.id, translationTarget);
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        setTranslationError(error instanceof Error ? error.message : String(error));
+        setTranslationError(errorMessage(error));
       }
     } finally {
       setTranslating(false);
@@ -193,7 +194,7 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
       });
       if (path) await exportPortableSession(path, session, format);
     } catch (error) {
-      setExportError(error instanceof Error ? error.message : String(error));
+      setExportError(errorMessage(error));
     } finally {
       setExporting(false);
     }

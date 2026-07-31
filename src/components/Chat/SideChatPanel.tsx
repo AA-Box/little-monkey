@@ -9,6 +9,7 @@ import { selectSideChatOpen, useSideChatStore } from "../../store/sideChatStore"
 import { isBtwNotice, parseBtwNotice, type BtwNotice } from "../../lib/slashCommands";
 import { runSideQuestion, stopSideQuestion } from "../../lib/sideQuestion";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * The floating `/btw` panel — a small always-on-top chat, separate from the
@@ -52,7 +53,7 @@ export default function SideChatPanel({ sessionId }: { sessionId: string }) {
     try {
       await runSideQuestion(sessionId, question);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     }
   };
 

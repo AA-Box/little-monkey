@@ -34,6 +34,8 @@ import {
   type IncidentSeverity,
   type IncidentStatus,
 } from "../lib/incidentCommander";
+import { errorMessage } from "../lib/errors";
+import { hydrateState, persistState } from "../lib/persistedState";
 
 export const INCIDENT_COMMANDER_STORAGE_KEY = "little-monkey-incident-commander-v1";
 const STORAGE_VERSION = 1;
@@ -66,27 +68,17 @@ interface IncidentCommanderState {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function persist(incidents: readonly IncidentRecord[]): void {
-  try {
-    localStorage.setItem(INCIDENT_COMMANDER_STORAGE_KEY, JSON.stringify({ version: STORAGE_VERSION, incidents }));
-  } catch {
-    // The in-memory incident remains usable if localStorage is unavailable or full.
-  }
+  persistState(INCIDENT_COMMANDER_STORAGE_KEY, STORAGE_VERSION, { incidents });
 }
 
 function hydrate(): IncidentRecord[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(INCIDENT_COMMANDER_STORAGE_KEY) ?? "null") as unknown;
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-    const envelope = raw as { version?: unknown; incidents?: unknown };
-    if (envelope.version !== STORAGE_VERSION || !Array.isArray(envelope.incidents)) return [];
-    return envelope.incidents.filter(isIncidentRecord).sort((left, right) => right.updatedAtMs - left.updatedAtMs);
-  } catch {
-    return [];
-  }
+  const raw = hydrateState(INCIDENT_COMMANDER_STORAGE_KEY, STORAGE_VERSION);
+  if (!raw || !Array.isArray(raw.incidents)) return [];
+  return raw.incidents.filter(isIncidentRecord).sort((left, right) => right.updatedAtMs - left.updatedAtMs);
 }
 
 const initiallyHydrated = hydrate();
