@@ -19,9 +19,10 @@ import {
   type SubagentStatus,
 } from "../../store/subagentStore";
 import { useSessionStore } from "../../store/sessionStore";
+import { useT } from "../../lib/i18n";
 import { cancelSubagentRun } from "../../lib/subagent";
 import { formatCompactTokens, formatElapsed } from "../../lib/taskFormat";
-import { extractChildToolCalls } from "../Chat/SubagentRow";
+import { textContent, type ChatMessage } from "../../lib/llamaClient";
 import { ToolCallRow } from "../Chat/MessageList";
 
 /**
@@ -38,6 +39,8 @@ import { ToolCallRow } from "../Chat/MessageList";
  * whole point of this file existing separately from that one.
  */
 
+type Translate = ReturnType<typeof useT>["t"];
+
 function shellStatusTone(status: BackgroundShellStatus): PillTone {
   switch (status) {
     case "running":
@@ -51,16 +54,18 @@ function shellStatusTone(status: BackgroundShellStatus): PillTone {
   }
 }
 
-function shellStatusLabel(task: BackgroundShellTask): string {
+function shellStatusLabel(t: Translate, task: BackgroundShellTask): string {
   switch (task.status) {
     case "running":
-      return "Running";
+      return t("BackgroundTasksPanel.shellStatusRunning");
     case "exited":
-      return "Exited";
+      return t("BackgroundTasksPanel.shellStatusExited");
     case "killed":
-      return "Stopped";
+      return t("BackgroundTasksPanel.shellStatusStopped");
     case "error":
-      return task.exit_code !== null ? `Exit ${task.exit_code}` : "Failed";
+      return task.exit_code !== null
+        ? t("BackgroundTasksPanel.shellStatusExitCode", { code: task.exit_code })
+        : t("BackgroundTasksPanel.shellStatusFailed");
     default:
       return task.status;
   }
@@ -79,16 +84,16 @@ function subagentStatusTone(status: SubagentStatus): PillTone {
   }
 }
 
-function subagentStatusLabel(status: SubagentStatus): string {
+function subagentStatusLabel(t: Translate, status: SubagentStatus): string {
   switch (status) {
     case "running":
-      return "Running";
+      return t("BackgroundTasksPanel.agentStatusRunning");
     case "done":
-      return "Completed";
+      return t("BackgroundTasksPanel.agentStatusCompleted");
     case "error":
-      return "Failed";
+      return t("BackgroundTasksPanel.agentStatusFailed");
     default:
-      return "Cancelled";
+      return t("BackgroundTasksPanel.agentStatusCancelled");
   }
 }
 
@@ -115,6 +120,7 @@ function folderName(path: string): string {
  * calls, so a user stop and an agent stop are the same operation.
  */
 function ShellTaskCard({ task }: { task: BackgroundShellTask }) {
+  const { t } = useT();
   const running = task.status === "running";
   const [showOutput, setShowOutput] = useState(false);
   useLiveTick(running);
@@ -129,31 +135,35 @@ function ShellTaskCard({ task }: { task: BackgroundShellTask }) {
         <TerminalSquare size={14} className="mt-0.5 shrink-0 text-faint" />
         <span className="min-w-0 flex-1 break-words font-mono text-xs leading-snug text-foreground">{task.command}</span>
         {running ? (
-          <IconButton size="sm" aria-label={`Stop "${task.command}"`} onClick={() => void useBackgroundShellStore.getState().kill(task.id)}>
+          <IconButton
+            size="sm"
+            aria-label={t("BackgroundTasksPanel.stopAriaLabel", { name: task.command })}
+            onClick={() => void useBackgroundShellStore.getState().kill(task.id)}
+          >
             <Square size={12} />
           </IconButton>
         ) : (
-          <StatusPill tone={shellStatusTone(task.status)}>{shellStatusLabel(task)}</StatusPill>
+          <StatusPill tone={shellStatusTone(task.status)}>{shellStatusLabel(t, task)}</StatusPill>
         )}
       </div>
       <div className="mt-1 flex items-center gap-2 text-xs">
-        <span className="text-muted">Shell</span>
+        <span className="text-muted">{t("BackgroundTasksPanel.shellKindLabel")}</span>
         <span className="truncate text-faint">{folderName(task.cwd)}</span>
         <span className="shrink-0 text-faint">{elapsed}</span>
         {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
       </div>
       <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-faint">
-        {!running && task.exit_code !== null && <span>exit {task.exit_code}</span>}
+        {!running && task.exit_code !== null && <span>{t("BackgroundTasksPanel.exitCode", { code: task.exit_code })}</span>}
         {tail.length > 0 && (
           <button type="button" onClick={() => setShowOutput((prev) => !prev)} className="cursor-pointer text-accent hover:underline">
-            {showOutput ? "Hide output" : "View output"}
+            {showOutput ? t("BackgroundTasksPanel.hideOutput") : t("BackgroundTasksPanel.viewOutput")}
           </button>
         )}
       </div>
       {!showOutput && running && lastLine && <div className="mt-1 truncate font-mono text-[11px] text-faint">{lastLine}</div>}
       {showOutput && (
         <div className="mt-2 border-t border-border pt-2">
-          {task.output_truncated && <p className="mb-1 text-[11px] text-faint">Earlier output dropped — showing the retained tail.</p>}
+          {task.output_truncated && <p className="mb-1 text-[11px] text-faint">{t("BackgroundTasksPanel.outputTruncated")}</p>}
           <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-2 font-mono text-[11px] text-foreground">
             {tail}
           </pre>
@@ -163,58 +173,114 @@ function ShellTaskCard({ task }: { task: BackgroundShellTask }) {
   );
 }
 
+/** One subagent transcript entry, in conversation order: the seed prompt,
+ * an assistant text segment, or a tool call with its result folded in from
+ * the matching `tool` message. */
+type TranscriptRow =
+  | { key: string; kind: "prompt" | "text"; text: string }
+  | { key: string; kind: "tool"; name: string; args: string; result?: string };
+
+/** Flattens a child run's `liveMessages` into the FULL exchange — prompt,
+ * every assistant text segment, every tool call — not just the tool calls:
+ * the transcript must read as the whole conversation, so the final report is
+ * simply the last text row rather than a special case appended at the end. */
+function buildTranscriptRows(messages: ChatMessage[]): TranscriptRow[] {
+  const resultByCallId = new Map<string, string>();
+  for (const message of messages) {
+    if (message.role === "tool" && message.tool_call_id) resultByCallId.set(message.tool_call_id, textContent(message.content));
+  }
+  const rows: TranscriptRow[] = [];
+  messages.forEach((message, index) => {
+    if (message.role === "user") {
+      const text = textContent(message.content).trim();
+      if (text) rows.push({ key: `prompt-${index}`, kind: "prompt", text });
+      return;
+    }
+    if (message.role !== "assistant") return;
+    const text = textContent(message.content).trim();
+    if (text) rows.push({ key: `text-${index}`, kind: "text", text });
+    (message.tool_calls ?? []).forEach((toolCall, callIndex) => {
+      rows.push({
+        // Index-qualified: provider-fallback ids (`call_0`, llamaClient.ts)
+        // can repeat across iterations within one child transcript.
+        key: `tool-${index}-${callIndex}-${toolCall.id}`,
+        kind: "tool",
+        name: toolCall.function.name,
+        args: toolCall.function.arguments,
+        result: resultByCallId.get(toolCall.id),
+      });
+    });
+  });
+  return rows;
+}
+
 /**
  * One `task`-tool subagent run — the model's own delegated work. Same card
  * shape as `ShellTaskCard` above so the two kinds read as one list: title,
  * stop square while running, then "Agent · elapsed" and the token/tool-use
- * counts, with the transcript (and final report) expanding inline through
- * the same `ToolCallRow` the inline `SubagentRow` uses.
+ * counts. The token count renders from the first second (0 until the child's
+ * first iteration reports usage) and the transcript expands inline as the
+ * full exchange via `buildTranscriptRows` — both available while the run is
+ * still going, not only after it finishes.
  */
 function AgentTaskCard({ run }: { run: SubagentRun }) {
+  const { t } = useT();
   const running = run.status === "running";
   const [showTranscript, setShowTranscript] = useState(false);
   useLiveTick(running);
 
-  const childToolCalls = extractChildToolCalls(run.liveMessages);
-  const report = [...run.liveMessages].reverse().find((message) => message.role === "assistant" && !message.tool_calls);
-  const reportText = typeof report?.content === "string" ? report.content : null;
+  const transcriptRows = buildTranscriptRows(run.liveMessages);
 
   return (
     <div className="rounded-xl border border-border bg-surface-2 p-3">
       <div className="flex items-start gap-2">
         <span className="min-w-0 flex-1 text-sm font-medium leading-snug text-foreground">{run.description}</span>
         {running ? (
-          <IconButton size="sm" aria-label={`Stop "${run.description}"`} onClick={() => cancelSubagentRun(run.cancelId)}>
+          <IconButton
+            size="sm"
+            aria-label={t("BackgroundTasksPanel.stopAriaLabel", { name: run.description })}
+            onClick={() => cancelSubagentRun(run.cancelId)}
+          >
             <Square size={12} />
           </IconButton>
         ) : (
-          run.status !== "done" && <StatusPill tone={subagentStatusTone(run.status)}>{subagentStatusLabel(run.status)}</StatusPill>
+          <StatusPill tone={subagentStatusTone(run.status)}>{subagentStatusLabel(t, run.status)}</StatusPill>
         )}
       </div>
       <div className="mt-1 flex items-center gap-2 text-xs">
-        <span className="text-muted">Agent</span>
+        <span className="text-muted">{t("BackgroundTasksPanel.agentKindLabel")}</span>
         <span className="text-faint">{formatElapsed((run.finishedAt ?? Date.now()) - run.startedAt)}</span>
         {running && <Loader2 size={11} className="shrink-0 animate-spin text-warning" />}
       </div>
       <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-faint">
-        {run.usage && <span>{formatCompactTokens(run.usage.totalTokens)} tokens</span>}
+        <span>{t("BackgroundTasksPanel.tokenUsage", { count: formatCompactTokens(run.usage?.totalTokens ?? 0) })}</span>
         <span>
-          {run.toolCallCount} tool use{run.toolCallCount === 1 ? "" : "s"}
+          {run.toolCallCount === 1
+            ? t("BackgroundTasksPanel.toolCallCountOne")
+            : t("BackgroundTasksPanel.toolCallCountMany", { count: run.toolCallCount })}
         </span>
-        {(childToolCalls.length > 0 || reportText) && (
+        {transcriptRows.length > 0 && (
           <button type="button" onClick={() => setShowTranscript((prev) => !prev)} className="cursor-pointer text-accent hover:underline">
-            {showTranscript ? "Hide transcript" : "View transcript"}
+            {showTranscript ? t("BackgroundTasksPanel.hideTranscript") : t("BackgroundTasksPanel.viewTranscript")}
           </button>
         )}
       </div>
       {running && run.lastActivity && <div className="mt-1 truncate font-mono text-[11px] text-faint">{run.lastActivity}</div>}
       {showTranscript && (
         <div className="mt-2 space-y-1.5 border-t border-border pt-2">
-          {childToolCalls.map((row) => (
-            <ToolCallRow key={row.key} name={row.name} args={row.args} result={row.result} />
-          ))}
-          {!running && reportText && (
-            <p className="whitespace-pre-wrap rounded-md border border-border bg-background p-2 text-xs text-foreground">{reportText}</p>
+          {transcriptRows.map((row) =>
+            row.kind === "tool" ? (
+              <ToolCallRow key={row.key} name={row.name} args={row.args} result={row.result} />
+            ) : (
+              <p
+                key={row.key}
+                className={`whitespace-pre-wrap rounded-md border border-border bg-background p-2 ${
+                  row.kind === "prompt" ? "font-mono text-[11px] text-muted" : "text-xs text-foreground"
+                }`}
+              >
+                {row.text}
+              </p>
+            ),
           )}
         </div>
       )}
@@ -231,6 +297,7 @@ export interface BackgroundTasksPanelProps {
 }
 
 export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPanelProps) {
+  const { t } = useT();
   // Both selectors build a fresh array per call — `useShallow` keeps the
   // uncached snapshots from re-render-looping (React's "getSnapshot should be
   // cached" guard), same as the other array-selector consumers.
@@ -315,11 +382,11 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
     <aside className="flex h-full min-h-0 w-full flex-col bg-surface">
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
         <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-faint">
-          Background tasks
+          {t("BackgroundTasksPanel.title")}
           {runningCount > 0 && <StatusPill tone="warning">{runningCount}</StatusPill>}
         </span>
         {onClose && (
-          <IconButton size="sm" onClick={onClose} aria-label="Close background tasks panel">
+          <IconButton size="sm" onClick={onClose} aria-label={t("BackgroundTasksPanel.closeAriaLabel")}>
             <X size={16} />
           </IconButton>
         )}
@@ -332,11 +399,13 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
 
         {!hasAnyTask && (
           <div className="flex flex-1 flex-col items-center justify-center py-12 text-center">
-            <p className="text-xs text-faint">Background commands and agent runs appear here</p>
+            <p className="text-xs text-faint">{t("BackgroundTasksPanel.emptyState")}</p>
           </div>
         )}
 
-        {runningEntries.length > 0 && <div className="text-[11px] font-medium uppercase tracking-wider text-faint">Running</div>}
+        {runningEntries.length > 0 && (
+          <div className="text-[11px] font-medium uppercase tracking-wider text-faint">{t("BackgroundTasksPanel.runningHeading")}</div>
+        )}
         {runningEntries.map(renderEntry)}
 
         {finishedCount > 0 && (
@@ -346,12 +415,12 @@ export function BackgroundTasksPanel({ sessionId, onClose }: BackgroundTasksPane
               onClick={() => setFinishedOpen((prev) => !prev)}
               className="flex cursor-pointer items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-faint transition-colors duration-150 hover:text-foreground"
             >
-              Finished
+              {t("BackgroundTasksPanel.finishedHeading")}
               <span>{finishedCount}</span>
               <ChevronRight size={12} className={`transition-transform duration-150 ${finishedOpen ? "rotate-90" : ""}`} />
             </button>
             <Button variant="ghost" size="sm" onClick={clearFinished}>
-              Clear
+              {t("BackgroundTasksPanel.clearButton")}
             </Button>
           </div>
         )}
