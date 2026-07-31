@@ -13,6 +13,7 @@ import {
 } from "../../lib/ecosystemClient";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
+import { errorMessage } from "../../lib/errors";
 
 const FIELD = "h-9 w-full rounded-lg border border-border bg-surface-2 px-3 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
 const AREA = "w-full rounded-lg border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
@@ -320,7 +321,7 @@ export function EcosystemMcpApps() {
         setPending(approval);
         setStatus(t("EcosystemMcpApps.awaitingApproval"));
       } catch (caught) {
-        const message = caught instanceof Error ? caught.message : String(caught);
+        const message = errorMessage(caught);
         setError(message);
         iframeRef.current?.contentWindow?.postMessage({ type: "little-monkey:mcp-action-result", actionId: data.actionId, ok: false, error: message }, "*");
       }
@@ -355,7 +356,7 @@ export function EcosystemMcpApps() {
       setManifestText(JSON.stringify(parsed, null, 2));
       setStatus(t("EcosystemMcpApps.sessionReady"));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -378,7 +379,7 @@ export function EcosystemMcpApps() {
       iframeRef.current?.contentWindow?.postMessage({ type: "little-monkey:mcp-action-result", actionId, ok: true, result }, "*");
       setStatus(t("EcosystemMcpApps.actionCompleted"));
     } catch (caught) {
-      const message = caught instanceof Error ? caught.message : String(caught);
+      const message = errorMessage(caught);
       setError(message);
       iframeRef.current?.contentWindow?.postMessage({ type: "little-monkey:mcp-action-result", actionId, ok: false, error: message }, "*");
     } finally {

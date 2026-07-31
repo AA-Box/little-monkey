@@ -40,7 +40,7 @@ import {
   Swords,
 } from "lucide-react";
 import monkeyAvatar from "../../assets/monkey-avatar.png";
-import { useT, LOCALES } from "../../lib/i18n";
+import { loadLocaleTranslations, useT, LOCALES } from "../../lib/i18n";
 import { useLocaleStore } from "../../store/localeStore";
 import packageMetadata from "../../../package.json";
 
@@ -64,6 +64,7 @@ interface AppMenuProps {
   onOpenConnectorBuilder: () => void;
   onOpenMigrationAgent: () => void;
   onOpenSideTasks: () => void;
+  onOpenBackgroundTasks: () => void;
   onOpenAgentInbox: () => void;
   onOpenKnowledgeGraph: () => void;
   onOpenSpreadsheetCopilot: () => void;
@@ -176,6 +177,7 @@ export function AppMenu({
   onOpenConnectorBuilder,
   onOpenMigrationAgent,
   onOpenSideTasks,
+  onOpenBackgroundTasks,
   onOpenAgentInbox,
   onOpenKnowledgeGraph,
   onOpenSpreadsheetCopilot,
@@ -271,6 +273,12 @@ export function AppMenu({
         { key: "workflowTestHarness", icon: <FlaskConical size={14} className={iconClass} />, label: "Workflow & Agent Test Harness", onOpen: onOpenWorkflowTestHarness },
         { key: "syntheticMonitoring", icon: <Radar size={14} className={iconClass} />, label: t("AppMenu.syntheticMonitoring"), onOpen: onOpenSyntheticMonitoring },
         { key: "sideTasks", icon: <ListTodo size={14} className={iconClass} />, label: t("AppMenu.sideTasks"), onOpen: onOpenSideTasks },
+        {
+          key: "backgroundTasks",
+          icon: <SquareTerminal size={14} className={iconClass} />,
+          label: t("AppMenu.backgroundTasks"),
+          onOpen: onOpenBackgroundTasks,
+        },
         { key: "debate", icon: <Swords size={14} className={iconClass} />, label: t("AppMenu.debate"), onOpen: onOpenDebate },
       ],
     },
@@ -388,8 +396,8 @@ export function AppMenu({
                   key={entry.code}
                   type="button"
                   onClick={() => {
-                    setLocale(entry.code);
                     closeAll();
+                    void loadLocaleTranslations(entry.code).then(() => setLocale(entry.code));
                   }}
                   className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-sm text-foreground hover:bg-surface-2"
                 >

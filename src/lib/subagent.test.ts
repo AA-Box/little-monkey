@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { errorMessage } from "./errors";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args), isTauri: () => true }));
@@ -21,7 +22,7 @@ vi.mock("./turnEngine", () => ({
   isToolCallAllowed: (toolCall: { function: { name: string } }, toolsForTurn: { function: { name: string } }[]) =>
     toolsForTurn.some((tool) => tool.function.name === toolCall.function.name),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
-  stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+  stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   describeUsageTarget: (target: ResolvedTarget) =>
     target.kind === "local" ? "Local model" : target.kind === "ollama" ? `Ollama · ${target.model}` : `${target.providerId} · ${target.model}`,
 }));

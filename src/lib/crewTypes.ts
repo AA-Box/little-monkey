@@ -256,10 +256,6 @@ export function normalizeCrewDefinition(raw: unknown): CrewDefinition | null {
   };
 }
 
-export function isCrewDefinition(raw: unknown): raw is CrewDefinition {
-  return normalizeCrewDefinition(raw) !== null;
-}
-
 function normalizeUsage(raw: unknown): CrewUsage {
   if (!isRecord(raw)) return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   return {

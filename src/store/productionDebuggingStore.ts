@@ -7,6 +7,8 @@ import type {
   ProductionEvidence,
   ProductionEvidenceKind,
 } from '../lib/productionDebugging';
+import { errorMessage } from "../lib/errors";
+import { hydrateState, persistState } from "../lib/persistedState";
 
 const NO_DIFF_RISK = 'No worktree diff was captured; inspect the owned branch before using it.';
 const VERIFICATION_RISK_PREFIX = 'Explicit verification finished with status:';
@@ -72,15 +74,11 @@ interface ProductionDebuggingState {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function persist(cases: readonly ProductionDebugCase[]): void {
-  try {
-    localStorage.setItem(PRODUCTION_DEBUG_STORAGE_KEY, JSON.stringify({ version: STORAGE_VERSION, cases }));
-  } catch {
-    // Keep the live in-memory case usable when storage is unavailable/full.
-  }
+  persistState(PRODUCTION_DEBUG_STORAGE_KEY, STORAGE_VERSION, { cases });
 }
 
 const STATUSES: ReadonlySet<ProductionDebugCaseStatus> = new Set([
@@ -128,44 +126,38 @@ function hydrateEvidence(value: unknown): ProductionEvidence[] {
 }
 
 function hydrate(): ProductionDebugCase[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(PRODUCTION_DEBUG_STORAGE_KEY) ?? 'null') as
-      | { version?: unknown; cases?: unknown }
-      | null;
-    if (raw?.version !== STORAGE_VERSION || !Array.isArray(raw.cases)) return [];
-    return raw.cases.flatMap((candidate): ProductionDebugCase[] => {
-      if (!candidate || typeof candidate !== 'object') return [];
-      const item = candidate as Partial<ProductionDebugCase>;
-      if (
-        typeof item.id !== 'string'
-        || typeof item.title !== 'string'
-        || typeof item.createdAtMs !== 'number'
-        || typeof item.updatedAtMs !== 'number'
-        || !STATUSES.has(item.status as ProductionDebugCaseStatus)
-      ) return [];
-      const wasRunning = item.status === 'diagnosing' || item.status === 'creating_worktree' || item.status === 'fixing';
-      return [{
-        id: item.id,
-        title: item.title.slice(0, 300),
-        description: typeof item.description === 'string' ? item.description.slice(0, 8_000) : '',
-        repositorySlug: typeof item.repositorySlug === 'string' ? item.repositorySlug.slice(0, 300) : '',
-        reproductionCommand: typeof item.reproductionCommand === 'string' ? item.reproductionCommand.slice(0, 8_000) : '',
-        verificationCommand: typeof item.verificationCommand === 'string' ? item.verificationCommand.slice(0, 8_000) : '',
-        evidence: hydrateEvidence(item.evidence),
-        status: wasRunning ? (item.report ? 'diagnosed' : 'draft') : item.status as ProductionDebugCaseStatus,
-        report: item.report && typeof item.report === 'object' ? item.report as ProductionDebugReport : null,
-        worktree: item.worktree && typeof item.worktree === 'object' ? item.worktree as DebugWorktree : null,
-        fixSummary: typeof item.fixSummary === 'string' ? item.fixSummary : null,
-        error: wasRunning
-          ? 'The previous local run was interrupted when the app closed. Review the saved evidence and retry.'
-          : typeof item.error === 'string' ? item.error : null,
-        createdAtMs: item.createdAtMs,
-        updatedAtMs: item.updatedAtMs,
-      }];
-    });
-  } catch {
-    return [];
-  }
+  const raw = hydrateState(PRODUCTION_DEBUG_STORAGE_KEY, STORAGE_VERSION);
+  if (!raw || !Array.isArray(raw.cases)) return [];
+  return raw.cases.flatMap((candidate): ProductionDebugCase[] => {
+    if (!candidate || typeof candidate !== 'object') return [];
+    const item = candidate as Partial<ProductionDebugCase>;
+    if (
+      typeof item.id !== 'string'
+      || typeof item.title !== 'string'
+      || typeof item.createdAtMs !== 'number'
+      || typeof item.updatedAtMs !== 'number'
+      || !STATUSES.has(item.status as ProductionDebugCaseStatus)
+    ) return [];
+    const wasRunning = item.status === 'diagnosing' || item.status === 'creating_worktree' || item.status === 'fixing';
+    return [{
+      id: item.id,
+      title: item.title.slice(0, 300),
+      description: typeof item.description === 'string' ? item.description.slice(0, 8_000) : '',
+      repositorySlug: typeof item.repositorySlug === 'string' ? item.repositorySlug.slice(0, 300) : '',
+      reproductionCommand: typeof item.reproductionCommand === 'string' ? item.reproductionCommand.slice(0, 8_000) : '',
+      verificationCommand: typeof item.verificationCommand === 'string' ? item.verificationCommand.slice(0, 8_000) : '',
+      evidence: hydrateEvidence(item.evidence),
+      status: wasRunning ? (item.report ? 'diagnosed' : 'draft') : item.status as ProductionDebugCaseStatus,
+      report: item.report && typeof item.report === 'object' ? item.report as ProductionDebugReport : null,
+      worktree: item.worktree && typeof item.worktree === 'object' ? item.worktree as DebugWorktree : null,
+      fixSummary: typeof item.fixSummary === 'string' ? item.fixSummary : null,
+      error: wasRunning
+        ? 'The previous local run was interrupted when the app closed. Review the saved evidence and retry.'
+        : typeof item.error === 'string' ? item.error : null,
+      createdAtMs: item.createdAtMs,
+      updatedAtMs: item.updatedAtMs,
+    }];
+  });
 }
 
 function upsert(cases: ProductionDebugCase[], next: ProductionDebugCase): ProductionDebugCase[] {

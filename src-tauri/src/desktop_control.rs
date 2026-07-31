@@ -895,7 +895,7 @@ pub fn desktop_control_start_session(
     approved_batch: bool,
 ) -> Result<ControlSession, String> {
     ensure_main_window(&window)?;
-    let mode = crate::permissions::get_permission_mode(permissions_state)?;
+    let mode = crate::permissions::get_permission_mode_impl(&permissions_state);
     let session =
         state.start_session_impl(&mode, allowed_applications, lifetime_ms, approved_batch)?;
     // Best-effort visible indicator — reuses the existing always-on-top

@@ -171,6 +171,7 @@ interface TerminalStore {
 }
 
 let listenersPromise: Promise<() => void> | null = null;
+const terminalWriteQueues = new Map<string, Promise<unknown>>();
 
 function upsertSession(sessions: TerminalSession[], next: TerminalSession): TerminalSession[] {
   const index = sessions.findIndex((session) => session.id === next.id);
@@ -206,6 +207,7 @@ export function disposeTerminalListenersForTests(): void {
     void listenersPromise.then((dispose) => dispose());
   }
   listenersPromise = null;
+  terminalWriteQueues.clear();
 }
 
 export const useTerminalStore = create<TerminalStore>((set, get) => ({
@@ -287,6 +289,7 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
   execute: async (sessionId, command) => {
     set({ busy: true, error: null });
     try {
+      await terminalWriteQueues.get(sessionId)?.catch(() => undefined);
       await invoke("terminal_execute", { sessionId, command });
       const session = get().sessions.find((entry) => entry.id === sessionId);
       if (session) await get().loadHistory(session.workspace_id);
@@ -298,15 +301,33 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
   },
 
   write: async (sessionId, data) => {
+    const previous = terminalWriteQueues.get(sessionId) ?? Promise.resolve();
+    const pending = previous
+      .catch(() => undefined)
+      .then(() => invoke("terminal_write", { sessionId, data }));
+    terminalWriteQueues.set(sessionId, pending);
     try {
-      await invoke("terminal_write", { sessionId, data });
+      await pending;
+      // The backend, not this raw byte stream, decides whether a submitted
+      // line was reconstructable and safe enough for app-owned history.
+      // Reload only after an Enter-shaped write so ordinary typing stays
+      // latency-free and shell editing/Ctrl+C remain entirely native.
+      if (data.includes("\r") || data.includes("\n")) {
+        const session = get().sessions.find((entry) => entry.id === sessionId);
+        if (session) await get().loadHistory(session.workspace_id);
+      }
     } catch (error) {
       set({ error: String(error) });
+    } finally {
+      if (terminalWriteQueues.get(sessionId) === pending) {
+        terminalWriteQueues.delete(sessionId);
+      }
     }
   },
 
   interrupt: async (sessionId) => {
     try {
+      await terminalWriteQueues.get(sessionId)?.catch(() => undefined);
       await invoke("terminal_interrupt", { sessionId });
     } catch (error) {
       set({ error: String(error) });

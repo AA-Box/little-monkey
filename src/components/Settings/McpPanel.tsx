@@ -20,6 +20,7 @@ import {
 } from "../../store/mcpStore";
 import { useT } from "../../lib/i18n";
 import { AddMcpServerForm, type McpServerDraft } from "./AddMcpServerForm";
+import { errorMessage } from "../../lib/errors";
 
 /** No shared toggle-switch component exists in `ui/` yet — cloned from
  * `AutomationPanel.tsx`'s local `Toggle` rather than promoted prematurely. */
@@ -283,7 +284,7 @@ function OAuthConnectSection({ server }: { server: McpServerInfo }) {
     try {
       await oauthDisconnect(server.id);
     } catch (error) {
-      setDisconnectError(error instanceof Error ? error.message : String(error));
+      setDisconnectError(errorMessage(error));
     } finally {
       setDisconnecting(false);
     }
@@ -427,7 +428,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await connect(server.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setReconnecting(false);
     }
@@ -439,7 +440,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await removeServer(server.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
       setRemoving(false);
     }
   }
@@ -453,7 +454,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await updateServer(toEntry(server, { timeout_secs: nextTimeout }));
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setSavingTimeout(false);
     }
@@ -467,7 +468,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
       await setHttpToken(server.id, tokenInput.trim());
       setTokenInput("");
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setSavingToken(false);
     }
@@ -479,7 +480,7 @@ function ServerRow({ server }: { server: McpServerInfo }) {
     try {
       await removeHttpToken(server.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setRemovingToken(false);
     }
@@ -676,7 +677,7 @@ export function McpPanel() {
       } catch (err) {
         setTemplateError(
           t("McpPanel.templateAppleScriptStagingError", {
-            error: err instanceof Error ? err.message : String(err),
+            error: errorMessage(err),
           })
         );
         return;

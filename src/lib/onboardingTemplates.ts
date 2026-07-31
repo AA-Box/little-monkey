@@ -1,6 +1,7 @@
 import { findByCommand, usePromptStore } from "../store/promptStore";
 import { useRecipeStore } from "../store/recipeStore";
 import { useAutomationsStore } from "../store/automationsStore";
+import { errorMessage } from "./errors";
 
 /**
  * The five kinds of "this template assumes something" declaration the
@@ -342,7 +343,7 @@ export async function seedOnboardingTemplate(templateId: string): Promise<Onboar
       await useRecipeStore.getState().save(content.recipeName, content.recipeYaml);
       result.recipeCreated = true;
     } catch (err) {
-      result.error = err instanceof Error ? err.message : String(err);
+      result.error = errorMessage(err);
     }
   }
 

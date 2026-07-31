@@ -28,7 +28,7 @@ import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, buildTools } from './tools';
 import { mcpToolDefs } from './mcpTools';
-import { isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
+import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
 import {
   abortedPromise,
@@ -68,6 +68,15 @@ import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
+import {
+  gatePrivacyWireMessages,
+  type PrivacyWireCache,
+} from './privacyWire';
+import { evaluateRateLimit, recordRequest } from './rateLimitTracker';
+import {
+  assertCostBudgetAllowsRequest,
+  useCostControlStore,
+} from '../store/costControlStore';
 import type { VerifyConfig } from '../store/verifyStore';
 import { extractArtifacts } from './artifacts';
 import { useArtifactStore } from '../store/artifactStore';
@@ -100,6 +109,7 @@ import {
   WORKSPACE_MUTATION_CORRECTION,
   WORKSPACE_MUTATION_FAILURE,
 } from './workspaceMutation';
+import { errorMessage } from "./errors";
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -962,7 +972,7 @@ export async function runVerificationPhase(
       // config in another window between the check above and this call) —
       // surface it as a failed notice rather than silently dropping the
       // round.
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       addMessage({
         role: 'system',
         content: formatVerifyNotice({
@@ -1066,26 +1076,69 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
   if (history.length === 0) return { changed: false, removedMessages: 0 };
 
   const settings = useSettingsStore.getState();
-  const target = await resolveTarget();
+  const privacyWorkspaceId =
+    primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
+  const privacyWireCache: PrivacyWireCache = new Map();
+  let target = await resolveTarget();
   const result = await applyContextCompaction(history, {
     strategy: settings.contextTrimStrategy,
     contextLimit: useUsageStore.getState().contextLimit,
     thresholdPercent: 100,
     sendForSummary: async (dropped) => {
+      let summaryMessages: ChatMessage[] = [
+        {
+          role: 'system',
+          content:
+            'Summarize the following earlier conversation concisely for another AI assistant to continue from. Preserve key facts, decisions, file paths, and code context. Reply with only the summary text.',
+        },
+        { role: 'user', content: renderForSummary(dropped) },
+      ];
+      if (target.kind === 'provider') {
+        const gated = await gatePrivacyWireMessages(
+          summaryMessages,
+          (content) =>
+            usePrivacyFirewallStore
+              .getState()
+              .gateOutbound(content, 'cloud_model', privacyWorkspaceId),
+          privacyWireCache,
+        );
+        if (gated.action === 'cancelled') {
+          throw new Error('Privacy Firewall cancelled cloud summarization before any content was sent.');
+        }
+        if (gated.action === 'switch_local') {
+          const local = findLocalOnlyTarget();
+          if (!local) {
+            throw new Error('Privacy Firewall requested local summarization, but no genuinely local Ollama model is configured.');
+          }
+          target = local;
+          applyTargetSwitch(local);
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: `${PRIVACY_NOTE_PREFIX} Switched manual compaction to ${targetLabel(local)} before protected history could leave the machine.`,
+          });
+        } else {
+          summaryMessages = gated.messages;
+          if (gated.newlyRedactedFindings > 0) {
+            useSessionStore.getState().addMessage(sessionId, {
+              role: 'system',
+              content: `${PRIVACY_NOTE_PREFIX} Redacted ${gated.newlyRedactedFindings} sensitive item(s) before cloud summarization.`,
+            });
+          }
+        }
+      }
       const summary = await attemptStream(
         target,
-        [
-          {
-            role: 'system',
-            content:
-              'Summarize the following earlier conversation concisely for another AI assistant to continue from. Preserve key facts, decisions, file paths, and code context. Reply with only the summary text.',
-          },
-          { role: 'user', content: renderForSummary(dropped) },
-        ],
+        summaryMessages,
         [],
         undefined,
         effortForTarget(target),
         sessionId,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        true,
+        { preGated: true },
       );
       if (summary.streamError) throw new Error(summary.streamError);
       return summary.content.trim() || '(summary unavailable)';
@@ -1161,7 +1214,10 @@ function resolvedTargetSupportsVision(target: ResolvedTarget): boolean {
     const model = useModelStore.getState().ollamaModels.find((m) => m.name === target.model);
     return model ? isVisionCapableOllamaModel(model) : false;
   }
-  return false;
+  // Deliberately delegated (rather than a literal `false`) so the day
+  // `llama.rs` gains projector-backed vision chat, flipping
+  // `isVisionCapableLocalModel` updates every vision decision at once.
+  return isVisionCapableLocalModel();
 }
 
 /**
@@ -1193,7 +1249,7 @@ function stripImagesForTextOnlyTarget(messages: ChatMessage[], target: ResolvedT
   });
 }
 
-/** Whether the currently active target satisfies `requireVision` (always `true` when vision isn't required). Local llama.cpp models are never vision-capable — see `visionModels.ts`. */
+/** Whether the currently active target satisfies `requireVision` (always `true` when vision isn't required). Local llama.cpp vision capability is delegated to `visionModels.ts`'s single source of truth. */
 function activeTargetSatisfiesVision(requireVision: boolean): boolean {
   if (!requireVision) return true;
   const state = useModelStore.getState();
@@ -1205,7 +1261,7 @@ function activeTargetSatisfiesVision(requireVision: boolean): boolean {
     const model = state.ollamaModels.find((m) => m.name === state.activeOllamaModel);
     return model ? isVisionCapableOllamaModel(model) : false;
   }
-  return false;
+  return isVisionCapableLocalModel();
 }
 
 /**
@@ -1266,10 +1322,11 @@ function buildFailoverChain(requireVision: boolean): ResolvedTarget[] {
  */
 function findLocalOnlyTarget(): ResolvedTarget | null {
   const state = useModelStore.getState();
+  const localModels = state.ollamaModels.filter((model) => model.is_cloud !== true);
   const preferred =
-    state.activeOllamaModel && state.ollamaModels.some((model) => model.name === state.activeOllamaModel)
+    state.activeOllamaModel && localModels.some((model) => model.name === state.activeOllamaModel)
       ? state.activeOllamaModel
-      : state.ollamaModels[0]?.name;
+      : localModels[0]?.name;
   if (!preferred) return null;
   return { kind: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: preferred };
 }
@@ -1602,7 +1659,7 @@ async function attachDaemonTurnToChat(
       content: latestContent,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     useSessionStore.getState().updateMessageAt(link.sessionId, link.assistantIndex, {
       content: link.output
         ? `${link.output}\n\n[Lost connection to resident run: ${message}]`
@@ -1644,8 +1701,8 @@ async function runDaemonAgentTurn(
     const candidate = findVisionCandidate();
     if (candidate) applyTargetSwitch(candidate);
   }
-  const resolvedTarget = await resolveTarget();
-  const targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
+  let resolvedTarget = await resolveTarget();
+  let targetSnapshot = snapshotForResolvedTarget(resolvedTarget);
   if (!targetSnapshot) {
     throw new Error('The selected model target could not be frozen for the resident runner.');
   }
@@ -1690,9 +1747,99 @@ async function runDaemonAgentTurn(
     ...(sourcesNotice ? [{ role: 'system' as const, content: sourcesNotice }] : []),
     wireCurrent,
   ];
-  const targetHistory = stripImagesForTextOnlyTarget(history, resolvedTarget);
+  let targetHistory = stripImagesForTextOnlyTarget(history, resolvedTarget);
+  let frozenTextRefs = textRefs;
+  if (resolvedTarget.kind === 'provider') {
+    const historyLength = targetHistory.length;
+    const privacyMessages: ChatMessage[] = [
+      ...targetHistory,
+      ...textRefs.map((reference) => ({
+        role: 'user' as const,
+        content: reference.content,
+      })),
+    ];
+    const privacyOutcome = await gatePrivacyWireMessages(
+      privacyMessages,
+      (content) =>
+        usePrivacyFirewallStore
+          .getState()
+          .gateOutbound(
+            content,
+            'cloud_model',
+            primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global',
+          ),
+      new Map(),
+    );
+    if (privacyOutcome.action === 'cancelled') {
+      store.addMessage(sessionId, {
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} The resident turn was cancelled before protected content could be submitted to ${targetLabel(resolvedTarget)}.`,
+      });
+      return;
+    }
+    if (privacyOutcome.action === 'switch_local') {
+      const local = findLocalOnlyTarget();
+      if (!local) {
+        store.addMessage(sessionId, {
+          role: 'system',
+          content: `${PRIVACY_NOTE_PREFIX} The resident turn was blocked from cloud egress and no genuinely local Ollama model is configured, so nothing was submitted.`,
+        });
+        return;
+      }
+      resolvedTarget = local;
+      targetSnapshot = snapshotForResolvedTarget(local);
+      if (!targetSnapshot) {
+        throw new Error('The Privacy Firewall local fallback could not be frozen for the resident runner.');
+      }
+      applyTargetSwitch(local);
+      targetHistory = stripImagesForTextOnlyTarget(history, local);
+      store.addMessage(sessionId, {
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Switched the resident turn to ${targetLabel(local)} before protected content could leave the machine.`,
+      });
+    } else {
+      targetHistory = privacyOutcome.messages.slice(0, historyLength);
+      frozenTextRefs = textRefs.map((reference, index) => ({
+        ...reference,
+        content: textContent(
+          privacyOutcome.messages[historyLength + index]?.content ?? '',
+        ),
+      }));
+      if (privacyOutcome.newlyRedactedFindings > 0) {
+        store.addMessage(sessionId, {
+          role: 'system',
+          content: `${PRIVACY_NOTE_PREFIX} Redacted ${privacyOutcome.newlyRedactedFindings} sensitive item(s) from the resident turn snapshot before cloud submission.`,
+        });
+      }
+    }
+  }
+
+  if (resolvedTarget.kind === 'provider') {
+    try {
+      assertCostBudgetAllowsRequest(useCostControlStore.getState());
+    } catch (error) {
+      store.addMessage(sessionId, {
+        role: 'system',
+        content: errorMessage(error),
+      });
+      return;
+    }
+    if (settings.rateLimitWarningsEnabled) {
+      for (const warning of evaluateRateLimit(
+        resolvedTarget.providerId,
+        settings.providerRateLimits[resolvedTarget.providerId],
+      )) {
+        const windowLabel = warning.window === 'minute' ? 'rolling minute' : 'rolling day';
+        store.addMessage(sessionId, {
+          role: 'system',
+          content: `[Rate limit] The queued resident request is at ${Math.round(warning.percent * 100)}% of the configured ${warning.limit}-request ${windowLabel} cap (${warning.nextCount}/${warning.limit}).`,
+        });
+      }
+    }
+  }
+
   const frozenAttachments: FrozenAttachmentInput[] = [
-    ...textRefs.map((reference) => ({
+    ...frozenTextRefs.map((reference) => ({
       path: reference.path,
       kind: reference.isDir ? 'directory' as const : 'file' as const,
       mediaType: 'text/plain; charset=utf-8',
@@ -1731,6 +1878,9 @@ async function runDaemonAgentTurn(
     attachments: frozenAttachments,
   });
   const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  if (resolvedTarget.kind === 'provider') {
+    recordRequest(resolvedTarget.providerId);
+  }
   if (signal.aborted) {
     await daemonCancel(queued.run_id, 'Stopped before attach');
   }
@@ -1983,6 +2133,9 @@ async function runAgentTurnBody(
   const requireVision = images.length > 0;
 
   const settings = useSettingsStore.getState();
+  const privacyWorkspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
+  const privacyWireCache: PrivacyWireCache = new Map();
+  const surfacedRateLimitWarnings = new Set<string>();
 
   if (!activeTargetSatisfiesVision(requireVision)) {
     if (settings.autoVisionSwitchEnabled) {
@@ -2037,16 +2190,17 @@ async function runAgentTurnBody(
   // the vision-switch checks above so their notices describe the model the
   // user actually picked, not one this gate might still redirect away from.
   //
-  // OUT OF SCOPE this pass (see `privacy_firewall.rs`'s own module doc):
-  // every other outbound path — connector writes, MCP tool results, a
-  // paired device (Phase 4, unshipped) — is not gated here. The scanner and
-  // policy engine are destination-agnostic specifically so those call sites
-  // are additive later, not a redesign of this one.
+  // This first check exists so a local-only decision can select the durable
+  // run's correct target before recording begins. It is not the only check:
+  // `privacyGateWireForTarget` below gates the complete wire payload before
+  // every provider request, including later tool/MCP/subagent results,
+  // compaction/risk side calls, retries, and failover. Connector writes,
+  // remote runners, and paired-device egress still use their own destination
+  // boundaries rather than this cloud-model path.
   if (primaryTarget.kind === 'provider') {
-    const workspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
     const gate = await usePrivacyFirewallStore
       .getState()
-      .gateOutbound(composedText, 'cloud_model', workspaceId);
+      .gateOutbound(composedText, 'cloud_model', privacyWorkspaceId);
 
     if (gate.action === 'cancelled') {
       addMessage({
@@ -2071,19 +2225,42 @@ async function runAgentTurnBody(
       });
       primaryTarget = local;
       applyTargetSwitch(local);
-    } else if (gate.content !== composedText) {
-      const redactedCount = gate.report.findings.filter((finding) => finding.action !== 'allow').length;
-      addMessage({
-        role: 'system',
-        content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
-      });
-      wireContent = toMessageContent(gate.content, images);
+    } else {
+      // Seed the turn-scoped wire cache with the decision the user just made
+      // (or the automatic allow/redact result). Every provider round-trip
+      // below re-gates the complete outbound payload so tool results, RAG,
+      // rules, and compaction prompts cannot bypass the firewall; caching
+      // this first decision prevents the current user message from opening
+      // the same approval twice.
+      privacyWireCache.set(composedText, { content: gate.content });
+      if (gate.content !== composedText) {
+        const redactedCount = gate.report.findings.filter(
+          (finding) => finding.action !== 'allow' && !finding.exempted,
+        ).length;
+        addMessage({
+          role: 'system',
+          content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
+        });
+        wireContent = toMessageContent(gate.content, images);
+      }
     }
   }
 
-  const sequence: ResolvedTarget[] =
-    settings.autoFailoverEnabled && primaryTarget.kind === 'provider'
-      ? [primaryTarget, ...buildFailoverChain(requireVision).filter((c) => !(c.kind === 'provider' && c.providerId === primaryTarget.providerId && c.model === primaryTarget.model))]
+  const initialProviderTarget =
+    primaryTarget.kind === 'provider' ? primaryTarget : null;
+  let sequence: ResolvedTarget[] =
+    settings.autoFailoverEnabled && initialProviderTarget
+      ? [
+          initialProviderTarget,
+          ...buildFailoverChain(requireVision).filter(
+            (candidate) =>
+              !(
+                candidate.kind === 'provider'
+                && candidate.providerId === initialProviderTarget.providerId
+                && candidate.model === initialProviderTarget.model
+              ),
+          ),
+        ]
       : [primaryTarget];
   let sequenceIndex = 0;
   let target = sequence[0];
@@ -2130,6 +2307,118 @@ async function runAgentTurnBody(
     console.error('Failed to start durable run', error);
     return null;
   });
+
+  const switchTurnToLocalForPrivacy = async (
+    blockedTarget: ResolvedTarget,
+  ): Promise<ResolvedTarget | null> => {
+    const local = findLocalOnlyTarget();
+    if (!local) {
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Outbound content was blocked from ${targetLabel(blockedTarget)}, and no local-only model is configured — the turn was cancelled.`,
+      });
+      await durable.recorder
+        ?.cancel('Privacy Firewall blocked cloud egress; no local model was available.')
+        .catch((error) => console.error('Failed to cancel privacy-blocked durable run', error));
+      return null;
+    }
+
+    await durable.recorder
+      ?.cancel('Privacy Firewall switched the remaining turn to a local model.')
+      .catch((error) => console.error('Failed to close cloud durable run after privacy switch', error));
+    primaryTarget = local;
+    target = local;
+    effort = effortForTarget(local);
+    sequence = [local];
+    sequenceIndex = 0;
+    applyTargetSwitch(local);
+    addMessage({
+      role: 'system',
+      content: `${PRIVACY_NOTE_PREFIX} Switched to ${targetLabel(local)} before protected outbound content could leave the machine.`,
+    });
+    durable.recorder = await startDurableRecorder(local, `${turnId}-privacy-local`).catch((error) => {
+      console.error('Failed to start local durable run after privacy switch', error);
+      return null;
+    });
+    if (durable.recorder) {
+      const controller = turnControllers.get(sessionId);
+      if (controller) registerDurableController(durable.recorder.runId, controller);
+    }
+    return local;
+  };
+
+  const surfaceRateLimitWarnings = (candidate: ResolvedTarget): void => {
+    if (
+      candidate.kind !== 'provider'
+      || !settings.rateLimitWarningsEnabled
+    ) {
+      return;
+    }
+    const warnings = evaluateRateLimit(
+      candidate.providerId,
+      settings.providerRateLimits[candidate.providerId],
+    );
+    for (const warning of warnings) {
+      const key = `${warning.providerId}:${warning.window}:${warning.severity}`;
+      if (surfacedRateLimitWarnings.has(key)) continue;
+      surfacedRateLimitWarnings.add(key);
+      const windowLabel = warning.window === 'minute' ? 'rolling minute' : 'rolling day';
+      const stateLabel =
+        warning.severity === 'exceeded'
+          ? 'would exceed'
+          : `is at ${Math.round(warning.percent * 100)}% of`;
+      addMessage({
+        role: 'system',
+        content: `[Rate limit] The next ${warning.providerId} request ${stateLabel} your configured ${warning.limit}-request ${windowLabel} cap (${warning.nextCount}/${warning.limit}). This is a local warning based on your own cap, not a provider guarantee.`,
+      });
+    }
+  };
+
+  /**
+   * Gates every string in an imminent provider request, not just the typed
+   * prompt. That includes system/rules context, retrieved sources, tool/MCP
+   * results, subagent reports, compaction prompts, retries, and failovers.
+   * Raw transcript state stays untouched; only this returned wire copy may
+   * contain redactions.
+   */
+  const privacyGateWireForTarget = async (
+    candidate: ResolvedTarget,
+    messages: ChatMessage[],
+  ): Promise<{ target: ResolvedTarget; messages: ChatMessage[] } | null> => {
+    if (candidate.kind !== 'provider') {
+      return { target: candidate, messages };
+    }
+    const outcome = await gatePrivacyWireMessages(
+      messages,
+      (content) =>
+        usePrivacyFirewallStore
+          .getState()
+          .gateOutbound(content, 'cloud_model', privacyWorkspaceId),
+      privacyWireCache,
+    );
+    if (outcome.action === 'cancelled') {
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Protected outbound content was blocked from ${targetLabel(candidate)} and the turn was cancelled before the request was sent.`,
+      });
+      await durable.recorder
+        ?.cancel('Privacy Firewall cancelled protected cloud egress.')
+        .catch((error) => console.error('Failed to cancel privacy-blocked durable run', error));
+      return null;
+    }
+    if (outcome.action === 'switch_local') {
+      const local = await switchTurnToLocalForPrivacy(candidate);
+      return local ? { target: local, messages } : null;
+    }
+    if (outcome.newlyRedactedFindings > 0) {
+      addMessage({
+        role: 'system',
+        content: `${PRIVACY_NOTE_PREFIX} Redacted ${outcome.newlyRedactedFindings} sensitive item(s) from protected context before sending to ${targetLabel(candidate)}.`,
+      });
+    }
+    surfaceRateLimitWarnings(candidate);
+    return { target: candidate, messages: outcome.messages };
+  };
 
   // Pick up any external edits to MONKEY.md (and, once slice 3 lands,
   // newly remembered facts) before building the system prompt below — two
@@ -2239,9 +2528,13 @@ async function runAgentTurnBody(
       },
       { role: 'user', content: renderForSummary(dropped) },
     ];
+    const prepared = await privacyGateWireForTarget(target, summaryMessages);
+    if (!prepared) {
+      throw new Error('Privacy Firewall cancelled context summarization.');
+    }
     const result = await attemptStream(
-      target,
-      summaryMessages,
+      prepared.target,
+      prepared.messages,
       [],
       signal,
       effort,
@@ -2250,6 +2543,8 @@ async function runAgentTurnBody(
       true,
       undefined,
       durable.recorder?.runId,
+      true,
+      { preGated: true },
     );
     if (result.streamError) throw new Error(result.streamError);
     return result.content.trim() || '(summary unavailable)';
@@ -2277,22 +2572,28 @@ async function runAgentTurnBody(
         toolName,
         toolArgs,
         workspaceRootPath,
-        (judgeMessages, judgeSignal) =>
-          attemptStream(
-            target,
-            judgeMessages,
-            [],
-            judgeSignal,
-            effort,
-            sessionId,
-            undefined,
-            true,
-            undefined,
-            durable.recorder?.runId,
-            // Judge calls are side-channel work, not the turn's own output —
-            // keep them out of the "✳ … N tokens" status line.
-            false,
-          ),
+        async (judgeMessages, judgeSignal) => {
+          const prepared = await privacyGateWireForTarget(target, judgeMessages);
+          if (!prepared) {
+            throw new Error('Privacy Firewall cancelled risk classification.');
+          }
+          return attemptStream(
+              prepared.target,
+              prepared.messages,
+              [],
+              judgeSignal,
+              effort,
+              sessionId,
+              undefined,
+              true,
+              undefined,
+              durable.recorder?.runId,
+              // Judge calls are side-channel work, not the turn's own output —
+              // keep them out of the "✳ … N tokens" status line.
+              false,
+              { preGated: true },
+            );
+        },
         signal
       ),
   };
@@ -2409,12 +2710,24 @@ async function runAgentTurnBody(
     // can't see images — see `stripImagesForTextOnlyTarget`'s doc comment.
     const wireHistoryFor = (t: ResolvedTarget): ChatMessage[] => stripImagesForTextOnlyTarget(fullWireHistory, t);
 
+    const targetBeforePrivacyGate = target;
+    const preparedWire = await privacyGateWireForTarget(
+      targetBeforePrivacyGate,
+      wireHistoryFor(targetBeforePrivacyGate),
+    );
+    if (!preparedWire) return;
+    target = preparedWire.target;
+    const outboundWireHistory =
+      target === targetBeforePrivacyGate
+        ? preparedWire.messages
+        : wireHistoryFor(target);
+
     const assistantPlaceholder: ChatMessage = { role: 'assistant', content: '' };
     addMessage(assistantPlaceholder);
 
     let attempt = await attemptStream(
       target,
-      wireHistoryFor(target),
+      outboundWireHistory,
       toolsForTurn,
       signal,
       effort,
@@ -2423,6 +2736,8 @@ async function runAgentTurnBody(
       true,
       undefined,
       durable.recorder?.runId,
+      true,
+      { preGated: true },
     );
 
     // Some cloud routes (notably free-tier OpenRouter models) reject a
@@ -2452,10 +2767,11 @@ async function runAgentTurnBody(
         role: 'system',
         content: `${SWITCH_NOTE_PREFIX} ${targetLabel(target)} doesn't support tool calling — retrying this turn without tools.`,
       });
+      surfaceRateLimitWarnings(target);
       addMessage({ role: 'assistant', content: '' });
       attempt = await attemptStream(
         target,
-        wireHistoryFor(target),
+        outboundWireHistory,
         [],
         signal,
         effort,
@@ -2464,6 +2780,8 @@ async function runAgentTurnBody(
         true,
         undefined,
         durable.recorder?.runId,
+        true,
+        { preGated: true },
       );
     }
 
@@ -2501,10 +2819,21 @@ async function runAgentTurnBody(
         role: 'system',
         content: `${SWITCH_NOTE_PREFIX} Switched to ${targetLabel(target)} after the previous provider didn't respond.`,
       });
+      const failoverTargetBeforePrivacy = target;
+      const preparedFailoverWire = await privacyGateWireForTarget(
+        failoverTargetBeforePrivacy,
+        wireHistoryFor(failoverTargetBeforePrivacy),
+      );
+      if (!preparedFailoverWire) return;
+      target = preparedFailoverWire.target;
+      const failoverWireHistory =
+        target === failoverTargetBeforePrivacy
+          ? preparedFailoverWire.messages
+          : wireHistoryFor(target);
       addMessage({ role: 'assistant', content: '' });
       attempt = await attemptStream(
         target,
-        wireHistoryFor(target),
+        failoverWireHistory,
         toolsForTurn,
         signal,
         effort,
@@ -2513,6 +2842,8 @@ async function runAgentTurnBody(
         true,
         undefined,
         durable.recorder?.runId,
+        true,
+        { preGated: true },
       );
     }
     // The corrective instruction is wire-only and belongs to exactly this
@@ -2704,6 +3035,7 @@ async function runAgentTurnBody(
         subagentContext,
         undefined,
         skillToolContext,
+        sessionId,
       );
       return finishObservedTool(result);
     });

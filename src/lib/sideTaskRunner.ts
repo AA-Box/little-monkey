@@ -58,6 +58,7 @@ import {
 import { useSessionStore } from '../store/sessionStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
+import { errorMessage } from "./errors";
 
 /** Hard cap on model/tool round trips for one side task attempt — same
  * order of magnitude as `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS` (15), a
@@ -202,7 +203,7 @@ function buildSideTaskSystemPrompt(
     `The user started this task from: ${source.label}.`,
     ...toolLines,
     '',
-    'Complete the task, then reply with a final report of what you found or did. Your reply is shown in a side panel, not the main chat — the user can choose to promote it into the chat, so make it stand on its own. Do not ask questions; if you get blocked, report what you found and why you stopped, then stop.',
+    'Complete the task, then reply with a report of what you found or did. Your reply is shown in a side pane, not the main chat — the user reads it there, can send you follow-up messages in that pane, and can choose to promote a reply into the chat, so make each reply stand on its own. If you get blocked, report what you found and why you stopped, then stop.',
   ].join('\n');
 }
 
@@ -348,7 +349,7 @@ export async function runSideTask(taskId: string): Promise<void> {
     try {
       target = await resolveTarget();
     } catch (err) {
-      finishTerminal('error', null, err instanceof Error ? err.message : String(err));
+      finishTerminal('error', null, errorMessage(err));
       return;
     }
     if (controller.signal.aborted) {
@@ -469,8 +470,54 @@ export async function runSideTask(taskId: string): Promise<void> {
       `Side task stopped after reaching the safety limit of ${MAX_SIDE_TASK_ITERATIONS} tool-calling iterations without a final answer.`,
     );
   } catch (err) {
-    finishTerminal('error', null, err instanceof Error ? err.message : String(err));
+    finishTerminal('error', null, errorMessage(err));
   }
+}
+
+/**
+ * Sends a follow-up message to an already-finished side task and runs the
+ * next turn on the SAME record — what makes a side task a conversation the
+ * user can keep talking to in its own pane (`SideTaskPane.tsx`), rather than
+ * a one-shot report. The task's existing transcript is the context, so the
+ * follow-up sees everything the first turn did.
+ *
+ * A follow-up mints a BRAND-NEW `turnId`, exactly like `retrySideTask` does
+ * and for the same reason (see `SideTaskRecord.turnId`): an "allow for this
+ * run" grant the user gave the previous turn must not silently authorize
+ * whatever this new instruction asks for.
+ *
+ * Refuses (returns `false`) while the task is still queued/running/paused —
+ * the composer disables itself in those states, and this is the backstop.
+ */
+export function continueSideTask(taskId: string, message: string): boolean {
+  const store = useSideTaskStore.getState();
+  const task = store.tasks[taskId];
+  if (!task) return false;
+  if (task.status === 'queued' || task.status === 'running' || task.status === 'paused') return false;
+  const text = message.trim();
+  if (!text) return false;
+
+  store.appendMessage(taskId, { role: 'user', content: text });
+  useSideTaskStore.setState((state) => {
+    const existing = state.tasks[taskId];
+    if (!existing) return state;
+    return {
+      tasks: {
+        ...state.tasks,
+        [taskId]: {
+          ...existing,
+          turnId: crypto.randomUUID(),
+          status: 'queued',
+          finalReport: null,
+          error: null,
+          finishedAt: null,
+          updatedAt: Date.now(),
+        },
+      },
+    };
+  });
+  void runSideTask(taskId);
+  return true;
 }
 
 /** Starts a brand-new attempt from an existing (terminal) side task's own
@@ -497,7 +544,7 @@ export { buildArtifacts as buildSideTaskArtifacts };
  * "Promote side-task output back into the main chat only by user action"
  * (ROADMAP.md acceptance) — the ONLY function in this module that ever
  * calls `sessionStore`'s `addMessage`, and it is only ever invoked from a
- * user click on a "Promote" button (`SideTaskDrawer.tsx`), never from
+ * user click on a "Promote" button (`SideTaskDetail.tsx`), never from
  * anywhere inside `runSideTask` itself. Appends the task's final report as
  * a plain assistant-role message to its originating chat session, prefixed
  * with a small provenance line (task title, tool-call count, model) so the

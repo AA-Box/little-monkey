@@ -22,6 +22,7 @@ import {
   useSettingsStore,
 } from "../../store/settingsStore";
 import { Button } from "../ui/Button";
+import { formatBytes } from "../../lib/format";
 
 export interface CompareTargetPickerProps {
   value: readonly ModelTargetSnapshot[];
@@ -35,10 +36,6 @@ export interface CompareTargetPickerProps {
 
 type CapabilityKind = "tools" | "vision";
 
-function formatBytes(value: number): string {
-  const gib = value / 1024 ** 3;
-  return `${gib.toFixed(gib < 10 ? 1 : 0)} GB`;
-}
 
 function CapabilityBadge({
   kind,

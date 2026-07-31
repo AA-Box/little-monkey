@@ -23,6 +23,7 @@ import { useModelStore } from "./modelStore";
 import { usePermissionStore } from "./permissionStore";
 import { useSessionStore } from "./sessionStore";
 import { useWorkspaceStore } from "./workspaceStore";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Evidence Board and Claim Checker (ROADMAP.md Phase 7, item 6): holds
@@ -308,7 +309,7 @@ export const useEvidenceBoardStore = create<EvidenceBoardStore>((set, get) => ({
       persistBoards(get().boards);
       await recorder?.complete(`Extracted ${extracted.length} claim(s).`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       set((state) => ({
         boards: state.boards.map((candidate) => (candidate.id === boardId ? touch({ ...candidate, lastExtractionError: message }) : candidate)),
       }));

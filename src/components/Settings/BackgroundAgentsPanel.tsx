@@ -28,8 +28,9 @@ import {
 import { useRecipeStore } from "../../store/recipeStore";
 import { useRunStore } from "../../store/runStore";
 import { Button, Tabs } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
-function errorText(error: unknown) { return error instanceof Error ? error.message : String(error); }
+function errorText(error: unknown) { return errorMessage(error); }
 
 export function BackgroundAgentsPanel() {
   const [tab, setTab] = useState<"daemon" | "queue" | "remote">("daemon");
@@ -56,7 +57,7 @@ export function BackgroundAgentsPanel() {
   const [remote, setRemote] = useState({ listen: "127.0.0.1:48321", advertiseUrl: "https://127.0.0.1:48321", tlsCertificate: "", tlsPrivateKey: "" });
   const [remoteStatus, setRemoteStatus] = useState<Record<string, unknown> | null>(null);
   const [devices, setDevices] = useState("");
-  const [pair, setPair] = useState({ expiresMinutes: 15, actions: ["view-runs", "view-events", "read-artifacts"], runIds: "", workspaceIds: "", maxArtifactBytes: 8 * 1024 * 1024 });
+  const [pair, setPair] = useState({ expiresMinutes: 15, actions: ["view-runs", "view-events", "read-artifacts"], mobileCapabilities: [] as string[], runIds: "", workspaceIds: "", maxArtifactBytes: 8 * 1024 * 1024 });
   const [audit, setAudit] = useState<unknown>(null);
   const [deviceId, setDeviceId] = useState("");
 
@@ -68,6 +69,7 @@ export function BackgroundAgentsPanel() {
     runIds: [...new Set(pair.runIds.split(",").map((value) => value.trim()).filter(Boolean))],
     workspaceIds: [...new Set(pair.workspaceIds.split(",").map((value) => value.trim()).filter(Boolean))],
     maxArtifactBytes: pair.maxArtifactBytes,
+    mobileCapabilities: pair.mobileCapabilities,
   }), [pair]);
   const pairWarnings = useMemo(() => validateRemotePairRequest(pairRequest), [pairRequest]);
 
@@ -96,6 +98,9 @@ export function BackgroundAgentsPanel() {
   }
 
   const enabledActions = ["view-runs", "view-events", "read-artifacts", "approve", "cancel", "kill", "control-desktop"];
+  // Must stay in sync with `daemon_commands.rs`'s `allowed_mobile` list and
+  // the CLI's `PairMobileCapability`.
+  const MOBILE_CAPABILITIES = ["view-sessions", "chat", "view-tasks", "run-workflows", "capture"];
   const controller = typeof remoteStatus?.advertise_url === "string" ? `${remoteStatus.advertise_url.replace(/\/$/, "")}/remote` : null;
 
   return (
@@ -142,6 +147,35 @@ export function BackgroundAgentsPanel() {
             <label className="text-xs text-muted">Allowed workspace IDs<input value={pair.workspaceIds} onChange={(event) => setPair({ ...pair, workspaceIds: event.target.value })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label>
             <label className="text-xs text-muted">Expires in minutes<input type="number" min={1} max={1440} value={pair.expiresMinutes} onChange={(event) => setPair({ ...pair, expiresMinutes: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label>
             <label className="text-xs text-muted">Artifact limit (MiB)<input type="number" min={1} max={MAX_REMOTE_ARTIFACT_BYTES / (1024 * 1024)} value={pair.maxArtifactBytes / (1024 * 1024)} onChange={(event) => setPair({ ...pair, maxArtifactBytes: Number(event.target.value) * 1024 * 1024 })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label>
+          </div>
+          <div className="mt-3 rounded-md border border-border bg-background/40 p-2">
+            <p className="text-[11px] font-medium text-foreground">Mobile companion grants</p>
+            <p className="mt-0.5 text-[10px] leading-4 text-faint">Additive to the actions above and never widening the run scope. Leave all off for a runner-only controller — the phone&apos;s chat, workflow-launch, and capture surfaces then stay unreachable for this device regardless of its app version. Chat implies session viewing; launching workflows implies task viewing.</p>
+            <div className="mt-2 flex flex-wrap gap-3">
+              {MOBILE_CAPABILITIES.map((capability) => (
+                <label key={capability} className="flex gap-1 text-xs text-muted">
+                  <input
+                    type="checkbox"
+                    checked={pair.mobileCapabilities.includes(capability)}
+                    onChange={(event) => {
+                      const next = new Set(pair.mobileCapabilities);
+                      if (event.target.checked) {
+                        next.add(capability);
+                        // Mirror the node-side dependency rules so the
+                        // invitation can never be rejected at create time.
+                        if (capability === "chat") next.add("view-sessions");
+                        if (capability === "run-workflows") next.add("view-tasks");
+                      } else {
+                        next.delete(capability);
+                        if (capability === "view-sessions") next.delete("chat");
+                        if (capability === "view-tasks") next.delete("run-workflows");
+                      }
+                      setPair({ ...pair, mobileCapabilities: [...next] });
+                    }}
+                  /> {capability}
+                </label>
+              ))}
+            </div>
           </div>
           {pairWarnings.map((warning) => <p key={warning} role="alert" className="mt-2 text-xs text-warning">{warning}</p>)}
           <Button className="mt-3" disabled={pairWarnings.length > 0 || busy !== null} onClick={async () => { const output = await save({ defaultPath: "little-monkey-pairing.json", filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("pair invitation", () => remotePairCreate({ ...pairRequest, output })); }}><KeyRound size={14} /> Create invitation…</Button>

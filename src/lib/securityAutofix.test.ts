@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { errorMessage } from "./errors";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -25,7 +26,7 @@ vi.mock("./turnEngine", () => ({
   executeToolCall: (...args: unknown[]) => mocks.executeToolCall(...args),
   isToolCallAllowed: (call: { function: { name: string } }, tools: Array<{ function: { name: string } }>) =>
     tools.some((tool) => tool.function.name === call.function.name),
-  stringifyToolError: (err: unknown) => JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+  stringifyToolError: (err: unknown) => JSON.stringify({ error: errorMessage(err) }),
   CANCELLED_TOOL_RESULT: JSON.stringify({ error: "Cancelled by the user" }),
 }));
 

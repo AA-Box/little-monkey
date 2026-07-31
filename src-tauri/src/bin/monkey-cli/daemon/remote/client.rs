@@ -9,8 +9,9 @@ use serde_json::Value;
 use crate::daemon::store::DaemonPaths;
 
 use super::protocol::{
-    certificate_fingerprint, sha256_hex, ControllerProfile, PairAcceptRequest, PairAcceptResponse,
-    PairingInvitation, RotationBundle, SignedRequestHeaders, REMOTE_PROTOCOL_VERSION,
+    certificate_fingerprint, legacy_capabilities, sha256_hex, ControllerProfile, PairAcceptRequest,
+    PairAcceptResponse, PairingInvitation, RotationBundle, SignedRequestHeaders,
+    REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{KeyringRemoteSecrets, RemoteStore};
 
@@ -43,6 +44,9 @@ pub async fn accept_invitation(
             pairing_id: invitation.pairing_id.clone(),
             pairing_token: invitation.pairing_token.clone(),
             device_name: device_name.to_string(),
+            // The CLI controller never down-selects: omitting the subset
+            // requests the invitation's complete capability grant.
+            requested_capabilities: None,
         })
         .send()
         .await
@@ -58,9 +62,23 @@ pub async fn accept_invitation(
     }
     let accepted: PairAcceptResponse = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Pairing response is invalid: {error}"))?;
+    // Resolve the empty-set legacy convention on both sides before comparing,
+    // mirroring the rotation path: a runner must not be able to hand the
+    // controller a wider capability grant than the invitation carried.
+    let invited_capabilities = if invitation.capabilities.is_empty() {
+        legacy_capabilities(&invitation.scopes)
+    } else {
+        invitation.capabilities.clone()
+    };
+    let granted_capabilities = if accepted.capabilities.is_empty() {
+        legacy_capabilities(&accepted.scopes)
+    } else {
+        accepted.capabilities.clone()
+    };
     if accepted.protocol_version != REMOTE_PROTOCOL_VERSION
         || accepted.runner_id != invitation.runner_id
         || !accepted.scopes.is_subset_of(&invitation.scopes)
+        || !granted_capabilities.is_subset(&invited_capabilities)
     {
         return Err("Pairing response attempts to change runner identity or scope".to_string());
     }
@@ -74,6 +92,7 @@ pub async fn accept_invitation(
         device_id: accepted.device_id,
         secret_generation: accepted.secret_generation,
         scopes: accepted.scopes,
+        capabilities: granted_capabilities,
         next_sequence: 1,
         event_cursors: Default::default(),
     };

@@ -202,7 +202,11 @@ const SubagentRow = memo(function SubagentRow({ sessionId, taskId, args, result 
         {open && (
           <div id={detailsId} className="space-y-2 border-t border-border bg-background px-3 py-2 font-mono text-[11px] text-muted">
             <div className="flex items-center gap-2 text-faint">
-              <span>{t("SubagentRow.toolCallCount", { count: toolCallCount })}</span>
+              <span>
+                {toolCallCount === 1
+                  ? t("SubagentRow.toolCallCountOne")
+                  : t("SubagentRow.toolCallCountMany", { count: toolCallCount })}
+              </span>
               {usage && (
                 <>
                   <span>·</span>

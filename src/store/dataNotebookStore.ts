@@ -29,6 +29,7 @@ import {
   type Notebook,
   type NotebookCellType,
 } from "../lib/dataNotebook";
+import { errorMessage } from "../lib/errors";
 
 export const DATA_NOTEBOOK_STORAGE_KEY = "little-monkey-data-notebooks";
 export const DATA_NOTEBOOK_STORAGE_VERSION = 1 as const;
@@ -40,7 +41,7 @@ interface PersistedShapeV1 {
 }
 
 function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorMessage(err);
 }
 
 /** Loose structural check on a hand-edited/corrupted persisted blob — good

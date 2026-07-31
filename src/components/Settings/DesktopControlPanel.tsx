@@ -9,6 +9,7 @@ import {
 } from "../../store/desktopControlStore";
 import { useT } from "../../lib/i18n";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Safe Desktop Control settings surface — a design-validation research
@@ -23,7 +24,7 @@ const INPUT =
   "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** No shared toggle-switch component exists in `ui/` yet — mirrors

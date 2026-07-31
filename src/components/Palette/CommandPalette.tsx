@@ -60,6 +60,7 @@ import type { KnowledgeInspectorResponse } from "../../store/knowledgeV2Store";
 import { Button, IconButton, StatusPill } from "../ui";
 import type { SettingsTab } from "../Settings";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
+import { errorMessage } from "../../lib/errors";
 
 interface CommandPaletteProps {
   onClose: () => void;
@@ -103,7 +104,7 @@ const KIND_ICONS: Record<PaletteItemKind, LucideIcon> = {
 };
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function truncate(value: string, max: number): string {

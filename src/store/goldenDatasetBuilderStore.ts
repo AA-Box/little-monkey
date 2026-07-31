@@ -40,6 +40,8 @@ import {
   type GoldenDataset,
   type ModelCallResult,
 } from "../lib/goldenDatasetBuilder";
+import { errorMessage } from "../lib/errors";
+import { hydrateState, persistState } from "../lib/persistedState";
 
 const STORAGE_KEY = "little-monkey-golden-datasets-v1";
 const STORAGE_VERSION = 1;
@@ -49,11 +51,7 @@ const STORAGE_VERSION = 1;
 const GOLDEN_DATASET_SESSION_ID = "golden-dataset-builder";
 
 function persist(datasets: GoldenDataset[]): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: STORAGE_VERSION, datasets }));
-  } catch {
-    // Best-effort only — datasets stay live in memory for the rest of this session.
-  }
+  persistState(STORAGE_KEY, STORAGE_VERSION, { datasets });
 }
 
 function isPrivacyResult(value: unknown): boolean {
@@ -119,13 +117,9 @@ function isDataset(value: unknown): value is GoldenDataset {
 }
 
 function hydrateDatasets(): GoldenDataset[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null") as { version?: unknown; datasets?: unknown } | null;
-    if (raw?.version !== STORAGE_VERSION || !Array.isArray(raw.datasets)) return [];
-    return raw.datasets.filter(isDataset);
-  } catch {
-    return [];
-  }
+  const raw = hydrateState(STORAGE_KEY, STORAGE_VERSION);
+  if (!raw || !Array.isArray(raw.datasets)) return [];
+  return raw.datasets.filter(isDataset);
 }
 
 function touch(dataset: GoldenDataset): GoldenDataset {
@@ -255,7 +249,7 @@ export const useGoldenDatasetBuilderStore = create<GoldenDatasetBuilderStore>((s
       }));
       persist(get().datasets);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       set((state) => ({
         datasets: state.datasets.map((candidate) => (candidate.id === datasetId ? touch({ ...candidate, lastError: message }) : candidate)),
       }));

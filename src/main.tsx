@@ -10,6 +10,8 @@ import { primaryRoot, useWorkspaceStore } from "./store/workspaceStore";
 import { hydrateSessions, useSessionStore } from "./store/sessionStore";
 import { hydratePrompts } from "./store/promptStore";
 import { CompanionOverlay } from "./components/Companion";
+import { loadLocaleTranslations } from "./lib/i18n";
+import { useLocaleStore } from "./store/localeStore";
 
 function committedAppearance() {
   const settings = useSettingsStore.getState();
@@ -51,16 +53,19 @@ subscribeToSystemTheme(() => {
 // `hydratePrompts()` follows suit for the same "no user action can race
 // hydration" reason.
 const isCompanionOverlay = new URLSearchParams(window.location.search).get("overlay") === "1";
+const localeReady = loadLocaleTranslations(useLocaleStore.getState().locale);
 
 if (isCompanionOverlay) {
-  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-    <React.StrictMode>
-      <ErrorBoundary>
-        <CompanionOverlay />
-      </ErrorBoundary>
-    </React.StrictMode>,
-  );
-} else void Promise.all([hydrateSessions(), hydratePrompts()]).finally(() => {
+  void localeReady.finally(() => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ErrorBoundary>
+          <CompanionOverlay />
+        </ErrorBoundary>
+      </React.StrictMode>,
+    );
+  });
+} else void Promise.all([hydrateSessions(), hydratePrompts(), localeReady]).finally(() => {
   // Secondary windows opened by the session menu's "Open in > Split view/New
   // window" (see src-tauri/src/system.rs `open_session_window`) load this
   // same entry point with `?session=<id>` — switch to it before the first

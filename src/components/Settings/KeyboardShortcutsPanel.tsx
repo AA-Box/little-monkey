@@ -26,6 +26,7 @@ import {
 } from "../../lib/shortcuts";
 import { MAX_SHORTCUT_BINDINGS, useShortcutStore } from "../../store/shortcutStore";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 function ShortcutKeys({ binding, platform }: { binding: ShortcutBinding; platform: ShortcutPlatform }) {
   const parts = formatShortcutBinding(binding, platform);
@@ -49,7 +50,7 @@ function ShortcutKeys({ binding, platform }: { binding: ShortcutBinding; platfor
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /**

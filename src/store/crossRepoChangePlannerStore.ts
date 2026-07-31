@@ -12,9 +12,10 @@ import type {
   OwnedWorktreeRecord,
 } from "../lib/gitDelivery";
 import { useWorkspaceStore } from "./workspaceStore";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** Per-step git delivery fields the user fills in before "create branch" can

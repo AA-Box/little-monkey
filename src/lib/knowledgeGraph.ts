@@ -19,6 +19,7 @@
  */
 import type { ChatMessage } from './llamaClient';
 import { parseModelJsonCandidates } from './modelJson';
+import { errorMessage } from "./errors";
 
 export type GraphNodeKind = 'person' | 'file' | 'decision' | 'term' | 'other';
 export type GraphRelation = 'mentions' | 'relates_to' | 'depends_on' | 'owns' | 'conflicts_with';
@@ -281,7 +282,7 @@ export async function buildKnowledgeGraph(
     try {
       result = await callModel(buildExtractionMessages(batch), signal);
     } catch (err) {
-      batchErrors.push(`${batch.sourceLabel}: ${err instanceof Error ? err.message : String(err)}`);
+      batchErrors.push(`${batch.sourceLabel}: ${errorMessage(err)}`);
       continue;
     }
     if (result.streamError) {

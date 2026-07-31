@@ -39,9 +39,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compatibility_hub::{
-    rfc3339_from_seconds, translate_embeddings_request, translate_ollama_chat_request,
-    translate_request, ApiBackend, ApiScope, CompatibilityProtocol, LanServerPolicy,
-    ProtocolStreamFrame, TlsPolicy,
+    protocol_error_response, rfc3339_from_seconds, translate_embeddings_request,
+    translate_ollama_chat_request, translate_request, ApiBackend, ApiScope, CompatibilityError,
+    CompatibilityProtocol, LanServerPolicy, ProtocolStreamFrame, TlsPolicy,
 };
 use crate::m3_commands::M3CommandState;
 use crate::m3_runtime_hub::{
@@ -557,6 +557,30 @@ fn error_response(
     )
 }
 
+/// Renders a request-translation failure in the CLIENT protocol's own error
+/// envelope (OpenAI `{"error":{...}}` vs Anthropic `{"type":"error",...}`)
+/// rather than this server's internal `little_monkey_m3_error` shape, so an
+/// OpenAI or Anthropic SDK can actually parse what went wrong. Only used
+/// where a real [`CompatibilityError`] is still in hand — i.e. the
+/// translation boundary. Errors raised after translation (auth, quota,
+/// runtime, storage) are about this server, not the protocol, and keep the
+/// generic shape via [`hub_error_response`].
+fn translation_error_response(
+    protocol: CompatibilityProtocol,
+    error: &CompatibilityError,
+) -> Response<ResponseBody> {
+    let (status, body, retry_after_ms) = protocol_error_response(protocol, error);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+    let mut response = json_response(status, body);
+    if let Some(milliseconds) = retry_after_ms {
+        let seconds = milliseconds.div_ceil(1_000);
+        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
 fn hub_error_response(error: M3HubError) -> Response<ResponseBody> {
     let (status, code) = match &error {
         M3HubError::Invalid { .. } | M3HubError::Compatibility(_) | M3HubError::Json(_) => {
@@ -1038,7 +1062,7 @@ async fn inference_response(
 ) -> Response<ResponseBody> {
     let canonical = match translate_request(protocol, &request_id, &body) {
         Ok(request) => request,
-        Err(error) => return hub_error_response(M3HubError::from(error)),
+        Err(error) => return translation_error_response(protocol, &error),
     };
     let runtime = match runtime_for_model(&hub, headers, &canonical.model) {
         Ok(runtime) => runtime,
@@ -1122,9 +1146,17 @@ async fn embeddings_response(
     body: Bytes,
     context: &M3OperationContext,
 ) -> Response<ResponseBody> {
+    // `/v1/embeddings` is an OpenAI-shaped route, so a translation failure
+    // uses the OpenAI error envelope (there is no dedicated embeddings
+    // protocol variant — the envelope is identical across OpenAI routes).
     let canonical = match translate_embeddings_request(&request_id, &body) {
         Ok(request) => request,
-        Err(error) => return hub_error_response(M3HubError::from(error)),
+        Err(error) => {
+            return translation_error_response(
+                CompatibilityProtocol::OpenAiChatCompletions,
+                &error,
+            )
+        }
     };
     let runtime = match runtime_for_model(&hub, headers, &canonical.model) {
         Ok(runtime) => runtime,

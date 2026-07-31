@@ -45,6 +45,8 @@ import {
 import { useT } from "../../lib/i18n";
 import { useIncidentCommanderStore } from "../../store/incidentCommanderStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface IncidentCommanderPanelProps {
   onClose: () => void;
@@ -73,10 +75,8 @@ function severityTone(severity: IncidentSeverity): PillTone {
 }
 
 function statusTone(status: IncidentRecord["status"]): PillTone {
-  if (status === "resolved" || status === "closed") return "success";
-  if (status === "mitigating" || status === "monitoring") return "warning";
-  if (status === "declared") return "danger";
-  return "neutral";
+  // A freshly declared incident is the loudest state here, not a neutral one.
+  return sharedStatusTone(status, { declared: "danger", mitigating: "warning", monitoring: "warning" });
 }
 
 function approvalTone(state: IncidentMitigation["approval"]["state"]): PillTone {
@@ -500,7 +500,7 @@ export function IncidentCommanderPanel({ onClose }: IncidentCommanderPanelProps)
       });
       if (destination) await writeTextFile(destination, content);
     } catch (error) {
-      setExportError(error instanceof Error ? error.message : String(error));
+      setExportError(errorMessage(error));
     }
   };
 

@@ -28,6 +28,8 @@ import {
 } from '../../store/productionDebuggingStore';
 import { buildTerminalEvidence, useTerminalStore } from '../../store/terminalStore';
 import { Button, IconButton, StatusPill, type PillTone } from '../ui';
+import { errorMessage } from "../../lib/errors";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface ProductionDebuggingPanelProps {
   onClose: () => void;
@@ -41,10 +43,13 @@ const EVIDENCE_KINDS: readonly ProductionEvidenceKind[] = [
 const FIELD_CLASS = 'mt-1 w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:border-accent focus:ring-1 focus:ring-accent';
 
 function statusTone(status: ProductionDebugCaseStatus): PillTone {
-  if (status === 'fix_prepared' || status === 'diagnosed') return 'success';
-  if (status === 'failed') return 'danger';
-  if (status === 'diagnosing' || status === 'creating_worktree' || status === 'fixing') return 'warning';
-  return 'neutral';
+  return sharedStatusTone(status, {
+    fix_prepared: 'success',
+    diagnosed: 'success',
+    diagnosing: 'warning',
+    creating_worktree: 'warning',
+    fixing: 'warning',
+  });
 }
 
 function commandTone(status: DebugCommandExecution['status']): PillTone {
@@ -122,7 +127,7 @@ export function ProductionDebuggingPanel({ onClose, onOpenRunCapsule }: Producti
     try {
       await action();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     }
   };
 

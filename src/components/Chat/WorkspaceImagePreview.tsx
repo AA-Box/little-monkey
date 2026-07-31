@@ -3,6 +3,7 @@ import { ImageOff, LoaderCircle } from "lucide-react";
 
 import { loadWorkspaceImage } from "../../lib/imageGeneration";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Inline preview of a workspace image file in the chat transcript — used by
@@ -40,7 +41,7 @@ function WorkspaceImagePreview({ path, refreshKey = 0, alt }: { path: string; re
       })
       .catch((caught: unknown) => {
         if (stale) return;
-        setError(caught instanceof Error ? caught.message : String(caught));
+        setError(errorMessage(caught));
         setLoading(false);
       });
     return () => {

@@ -10,6 +10,7 @@ import {
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 const ACTION_ICONS: Record<PrivacyPolicyAction, typeof Ban> = {
   allow: Eye,
@@ -26,7 +27,7 @@ const ACTION_STYLE: Record<PrivacyPolicyAction, string> = {
 };
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export function PrivacyFirewallPanel() {

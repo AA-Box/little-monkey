@@ -33,6 +33,8 @@ import {
 } from "../../store/migrationAgentStore";
 import { primaryRoot, useWorkspaceStore, type WorkspaceRootInfo } from "../../store/workspaceStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface MigrationAgentPanelProps {
   onClose: () => void;
@@ -40,13 +42,14 @@ interface MigrationAgentPanelProps {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function statusTone(status: MigrationRunStatus): PillTone {
-  if (status === "completed") return "success";
-  if (status === "failed") return "danger";
-  if (status === "cancelled") return "neutral";
+  // Every intermediate migration phase is in flight.
+  if (status === "completed" || status === "failed" || status === "cancelled") {
+    return sharedStatusTone(status);
+  }
   return "warning";
 }
 

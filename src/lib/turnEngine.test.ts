@@ -33,6 +33,12 @@ import type { McpToolRegistry } from "./mcpTools";
 import type { StreamEvent, ToolCall, ToolDef } from "./llamaClient";
 import type { SlashSkill } from "./skills";
 import { useUsageStore } from "../store/usageStore";
+import {
+  DEFAULT_COST_BUDGET_POLICY,
+  useCostControlStore,
+} from "../store/costControlStore";
+import { usePrivacyFirewallStore } from "../store/privacyFirewallStore";
+import { providerModelTargetKey } from "./modelTargets";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
@@ -778,6 +784,11 @@ describe("attemptStream / recordUsage", () => {
     streamProviderChatMock.mockReset();
     streamProviderChatMock.mockImplementation(() => fakeUsageStream());
     useUsageStore.setState({ usageBySession: {}, contextLimit: null });
+    useCostControlStore.setState({
+      policy: { ...DEFAULT_COST_BUDGET_POLICY },
+      rates: {},
+      entries: [],
+    });
   });
 
   it("records usage into useUsageStore by default (recordUsage defaults to true — every pre-existing caller is unaffected)", async () => {
@@ -815,6 +826,79 @@ describe("attemptStream / recordUsage", () => {
 
     expect(result.usage).toBeUndefined();
   });
+
+  it("attributes priced usage to the exact provider model, session, and durable run", async () => {
+    const targetKey = providerModelTargetKey("openai", "gpt-test");
+    useCostControlStore.setState({
+      rates: {
+        [targetKey]: {
+          inputPerMillionUsd: 2,
+          outputPerMillionUsd: 8,
+        },
+      },
+    });
+
+    await attemptStream(
+      fakeTarget,
+      [],
+      [],
+      undefined,
+      undefined,
+      "session-cost",
+      undefined,
+      false,
+      undefined,
+      "run-cost",
+    );
+
+    expect(useCostControlStore.getState().entries).toEqual([
+      expect.objectContaining({
+        targetKey,
+        targetLabel: "openai · gpt-test",
+        sessionId: "session-cost",
+        runId: "run-cost",
+        usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+        costUsd: 0.00006,
+      }),
+    ]);
+  });
+
+  it("pauses a provider request before transport when a hard budget is reached", async () => {
+    useCostControlStore.setState({
+      policy: {
+        enabled: true,
+        dailyBudgetUsd: 1,
+        monthlyBudgetUsd: null,
+        warningPercent: 0.8,
+        enforcement: "pause",
+      },
+      entries: [
+        {
+          id: "spent",
+          occurredAtMs: Date.now(),
+          targetKey: providerModelTargetKey("openai", "gpt-test"),
+          targetLabel: "openai · gpt-test",
+          sessionId: "prior",
+          runId: null,
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+          costUsd: 1,
+        },
+      ],
+    });
+
+    const result = await attemptStream(
+      fakeTarget,
+      [],
+      [],
+      undefined,
+      undefined,
+      "session-1",
+    );
+
+    expect(result.streamError).toContain("Cloud request paused");
+    expect(result.contentStarted).toBe(false);
+    expect(streamProviderChatMock).not.toHaveBeenCalled();
+  });
 });
 
 // Effort used to be forwarded for Anthropic only; it now travels for EVERY
@@ -830,6 +914,11 @@ describe("attemptStream / effort forwarding", () => {
   beforeEach(() => {
     streamProviderChatMock.mockReset();
     streamProviderChatMock.mockImplementation(() => fakeDoneStream());
+    useCostControlStore.setState({
+      policy: { ...DEFAULT_COST_BUDGET_POLICY },
+      rates: {},
+      entries: [],
+    });
   });
 
   it.each(["anthropic", "openai", "gemini", "openrouter"])(
@@ -878,5 +967,139 @@ describe("isToolCallAllowed", () => {
 
   it("returns false when the tool call's name was never offered", () => {
     expect(isToolCallAllowed(call("write_file"), [toolDef("read_file")])).toBe(false);
+  });
+});
+
+// The Privacy Firewall choke point (audit fix: "mid-turn tool results bypass
+// firewall"). `attemptStream` is the single function every cloud-bound
+// request in the app flows through — Compare, Crew, subagents, side tasks,
+// translation, the eval judge, and every one-shot workbench flow included —
+// so gating INSIDE it means a surface cannot forget to gate. `agentLoop.ts`
+// passes `preGated: true` for the wires it already gated itself.
+describe("attemptStream / privacy firewall choke point", () => {
+  const providerTarget: ResolvedTarget = { kind: "provider", providerId: "openai", model: "gpt-test" };
+
+  function report(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+    return {
+      destination: "cloud_model",
+      workspaceId: "global",
+      verdict: "allow",
+      findings: [],
+      redactedPreview: "",
+      originalSha256: "0".repeat(64),
+      localOnlyFallbackAvailable: false,
+      contentLength: 0,
+      ...overrides,
+    };
+  }
+
+  async function* fakeStream(): AsyncGenerator<StreamEvent> {
+    yield { type: "delta", content: "ok" };
+    yield { type: "done" };
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    streamProviderChatMock.mockReset();
+    streamProviderChatMock.mockImplementation(() => fakeStream());
+    useCostControlStore.setState({ policy: { ...DEFAULT_COST_BUDGET_POLICY }, rates: {}, entries: [] });
+    usePrivacyFirewallStore.setState({ pendingApproval: null, error: null });
+  });
+
+  it("sends the redacted wire copy when the verdict is redact, leaving the caller's original messages untouched", async () => {
+    invokeMock.mockImplementation(async (command: unknown, args: unknown) => {
+      if (command === "privacy_firewall_preview") {
+        const { content } = args as { content: string };
+        return report({
+          verdict: content.includes("sk-secret") ? "redact" : "allow",
+          redactedPreview: content.split("sk-secret").join("[REDACTED]"),
+          findings: content.includes("sk-secret")
+            ? [{ kind: "api_credential", byteStart: 0, byteEnd: 9, line: 1, column: 1, maskedPreview: "sk-…", action: "redact", exempted: false }]
+            : [],
+        });
+      }
+      throw new Error(`Unexpected invoke: ${String(command)}`);
+    });
+    const original = [{ role: "user" as const, content: "key is sk-secret please use it" }];
+
+    const result = await attemptStream(providerTarget, original, [], undefined, undefined, "session-privacy");
+
+    expect(result.streamError).toBeNull();
+    const sentWire = streamProviderChatMock.mock.calls[0][2] as Array<{ content: string }>;
+    expect(sentWire[0].content).toBe("key is [REDACTED] please use it");
+    expect(original[0].content).toBe("key is sk-secret please use it");
+  });
+
+  it("fails CLOSED — nothing is sent — when the privacy preview itself errors", async () => {
+    invokeMock.mockRejectedValue(new Error("scanner unavailable"));
+
+    const result = await attemptStream(
+      providerTarget,
+      [{ role: "user", content: "contains something" }],
+      [],
+      undefined,
+      undefined,
+      "session-privacy",
+    );
+
+    expect(result.streamError).toMatch(/Privacy Firewall could not inspect/);
+    expect(streamProviderChatMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses to send when the user chooses switch-local on a require_approval verdict (one-shot surfaces cannot switch targets)", async () => {
+    invokeMock.mockImplementation(async (command: unknown) => {
+      if (command === "privacy_firewall_preview") return report({ verdict: "require_approval" });
+      if (command === "privacy_firewall_prepare_send") {
+        return { digest: "d".repeat(64), confirmationPhrase: "CONFIRM dddd", report: report({ verdict: "require_approval" }), expiresAtMs: Date.now() + 60_000 };
+      }
+      throw new Error(`Unexpected invoke: ${String(command)}`);
+    });
+
+    const pending = attemptStream(
+      providerTarget,
+      [{ role: "user", content: "protected" }],
+      [],
+      undefined,
+      undefined,
+      "session-privacy",
+    );
+    await vi.waitFor(() => {
+      if (!usePrivacyFirewallStore.getState().pendingApproval) throw new Error("gate not pending yet");
+    });
+    await usePrivacyFirewallStore.getState().resolveDecision("switch_local");
+
+    const result = await pending;
+    expect(result.streamError).toMatch(/local model/i);
+    expect(streamProviderChatMock).not.toHaveBeenCalled();
+  });
+
+  it("skips the redundant second scan when the caller marked the wire preGated", async () => {
+    await attemptStream(
+      providerTarget,
+      [{ role: "user", content: "already gated upstream" }],
+      [],
+      undefined,
+      undefined,
+      "session-privacy",
+      undefined,
+      true,
+      undefined,
+      undefined,
+      true,
+      { preGated: true },
+    );
+
+    expect(invokeMock).not.toHaveBeenCalledWith("privacy_firewall_preview", expect.anything());
+    expect(streamProviderChatMock).toHaveBeenCalled();
+  });
+
+  it("never consults the firewall for local/Ollama targets — nothing leaves the machine", async () => {
+    const localTarget: ResolvedTarget = { kind: "ollama", baseUrl: "http://127.0.0.1:11434", model: "llama3.2" };
+    // streamChat (local transport) is not mocked here; reaching it would throw
+    // fetch errors, which is fine — the assertion below only cares that the
+    // privacy preview was never invoked for a local target.
+    await attemptStream(localTarget, [{ role: "user", content: "sk-secret stays local" }], [], undefined, undefined, "session-privacy").catch(() => undefined);
+
+    expect(invokeMock).not.toHaveBeenCalledWith("privacy_firewall_preview", expect.anything());
   });
 });
