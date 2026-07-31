@@ -129,7 +129,16 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           args: --target ${{ matrix.target }}
-          tagName: app-v__VERSION__-${{ github.run_number }}
-          releaseName: 'Little Monkey v__VERSION__ (build ${{ github.run_number }})'
+          tagName: __VERSION__
+          releaseName: 'Little Monkey v__VERSION__'
+          releaseBody: |
+            ## Install
+
+            Download the asset for your platform below.
+
+            - **macOS** — `.dmg` (`aarch64` for Apple silicon, `x64` for Intel)
+            - **Windows** — `-setup.exe` or `_en-US.msi` (`arm64` or `x64`)
+            - **Linux** — `.AppImage`, `.deb`, or `.rpm` (`aarch64`/`arm64` or `amd64`/`x86_64`)
+          generateReleaseNotes: true
           releaseDraft: true
           prerelease: false
