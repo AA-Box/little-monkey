@@ -34,6 +34,7 @@ import {
 import type { KnowledgeStack } from "../../store/stackStore";
 import { useT } from "../../lib/i18n";
 import { Button, IconButton, StatusPill } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 type ConnectorKind = KnowledgeConnector["kind"];
 
@@ -347,7 +348,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
       );
       resetForm();
     } catch (error) {
-      setFormError(error instanceof Error ? error.message : String(error));
+      setFormError(errorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -435,7 +436,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
                   onChange={(event) => {
                     setBusy(true);
                     void saveBackgroundConfig(event.target.checked, backgroundInterval, backgroundAllStacks || !stackId ? [] : [stackId])
-                      .catch((error) => setFormError(error instanceof Error ? error.message : String(error)))
+                      .catch((error) => setFormError(errorMessage(error)))
                       .finally(() => setBusy(false));
                   }}
                 />
@@ -450,7 +451,7 @@ export function KnowledgeV2Panel({ stacks }: { stacks: KnowledgeStack[] }) {
               <Button size="sm" disabled={!backgroundConfig || busy || backgroundInterval < 5 || backgroundInterval > 10080} onClick={() => {
                 setBusy(true);
                 void saveBackgroundConfig(backgroundConfig?.enabled ?? false, backgroundInterval, backgroundAllStacks || !stackId ? [] : [stackId])
-                  .catch((error) => setFormError(error instanceof Error ? error.message : String(error)))
+                  .catch((error) => setFormError(errorMessage(error)))
                   .finally(() => setBusy(false));
               }}>Save background schedule</Button>
               <span className="text-[10px] text-faint">Next: {formatWhen(backgroundConfig?.nextDueMs ?? null)} · Last success: {formatWhen(backgroundConfig?.lastSuccessMs ?? null)}</span>
@@ -889,7 +890,7 @@ function OcrControl({
       setRenderer(next.pdf_renderer_path ?? "");
       setLanguages(next.languages.join(", "));
       setThreshold(next.low_confidence_micros / 10_000);
-    }).catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));
+    }).catch((caught) => setError(errorMessage(caught)));
   }, [status]);
 
   const chooseExecutable = async (setter: (value: string) => void) => {
@@ -905,7 +906,7 @@ function OcrControl({
     try {
       setConfig(await configureExternal(executable, renderer || null, parsedLanguages(), Math.round(threshold * 10_000)));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -917,7 +918,7 @@ function OcrControl({
     try {
       setConfig(await install({ ...download, languages: parsedLanguages() }));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -1128,7 +1129,7 @@ function RetrievalInspector({
     try {
       setResult(await onQuery(stackId, queryText, config, excluded, rerank, tokenBudget, queryId));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     } finally {
       setActiveQueryId(null);
       setBusy(false);
@@ -1141,7 +1142,7 @@ function RetrievalInspector({
       const accepted = await onCancelQuery(activeQueryId);
       if (!accepted) setError("The query already finished before cancellation arrived.");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     }
   };
 
@@ -1156,7 +1157,7 @@ function RetrievalInspector({
       await onApplyChunking(nextChunkChars, nextChunkOverlap);
       setResult(null);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     } finally {
       setChunkingBusy(false);
     }
@@ -1315,7 +1316,7 @@ function PrivacyPreview({ onPreview }: { onPreview: (text: string) => Promise<Pi
     try {
       setResult(await onPreview(text));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     }
   };
 

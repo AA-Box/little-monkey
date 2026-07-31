@@ -5,6 +5,8 @@ import { Button, StatusPill } from "../ui";
 import { useModelStore } from "../../store/modelStore";
 import { modelfileClient, type DetectedFormat, type ModelfileDryRunReport } from "../../lib/modelfileClient";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
+import { formatBytes } from "../../lib/format";
 
 /** Mirrors Rust `modelfile::validate_short_name`'s accepted charset — used
  * only to suggest a short name from a picked file's basename, not to
@@ -33,13 +35,6 @@ const FORMAT_KEY: Record<DetectedFormat, string> = {
   existingModelReference: "ModelfileStudio.format.existingModelReference",
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / 1024 ** exponent;
-  return `${exponent === 0 ? value : value.toFixed(1)} ${units[exponent]}`;
-}
 
 /** Live grammar-only feedback debounce, in ms — cheap enough per the Rust
  * `modelfile_parse` doc comment ("cheap enough to call on every keystroke
@@ -100,7 +95,7 @@ export function ModelfileStudio() {
       modelfileClient
         .parse(modelfileText)
         .then(() => setGrammarIssue(null))
-        .catch((err: unknown) => setGrammarIssue(err instanceof Error ? err.message : String(err)));
+        .catch((err: unknown) => setGrammarIssue(errorMessage(err)));
     }, LIVE_PARSE_DEBOUNCE_MS);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -142,7 +137,7 @@ export function ModelfileStudio() {
       });
       setShortName((prev) => prev || suggestShortName(selected));
     } catch (err) {
-      setPickError(err instanceof Error ? err.message : String(err));
+      setPickError(errorMessage(err));
     }
   }, [invalidateValidation]);
 
@@ -158,7 +153,7 @@ export function ModelfileStudio() {
       });
       setShortName((prev) => prev || suggestShortName(selected));
     } catch (err) {
-      setPickError(err instanceof Error ? err.message : String(err));
+      setPickError(errorMessage(err));
     }
   }, [invalidateValidation]);
 
@@ -175,7 +170,7 @@ export function ModelfileStudio() {
           return next;
         });
       } catch (err) {
-        setPickError(err instanceof Error ? err.message : String(err));
+        setPickError(errorMessage(err));
       }
     },
     [invalidateValidation],
@@ -195,7 +190,7 @@ export function ModelfileStudio() {
     } catch (err) {
       setDryRunReport(null);
       setValidatedFor(null);
-      setDryRunError(err instanceof Error ? err.message : String(err));
+      setDryRunError(errorMessage(err));
     } finally {
       setValidating(false);
     }

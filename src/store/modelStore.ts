@@ -7,6 +7,7 @@ import {
   ollamaModelTargetKey,
 } from "../lib/modelTargets";
 import { useUsageStore } from "./usageStore";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Mirrors the Rust `ModelInfo` struct (src-tauri/src/models.rs) exactly —
@@ -26,6 +27,22 @@ export interface ModelInfo {
   is_external: boolean;
   /** "chat" (tool-calling instruct model) or "embedding" — see `models.rs::ModelKind`. Defaults to "chat" on the Rust side for pre-existing entries, so this is always present in practice. */
   kind: "chat" | "embedding";
+}
+
+/** Resolved metadata for a public single-file GGUF model reference. */
+export interface ResolvedModelReference {
+  source: string;
+  canonicalReference: string;
+  displayName: string;
+  repo: string;
+  revision: string;
+  fileName: string;
+  downloadUrl: string;
+  sha256: string;
+  sizeBytes: number;
+  toolCalling: boolean;
+  licenseName: string | null;
+  licenseUrl: string | null;
 }
 
 export type LlamaStatus = "stopped" | "starting" | "ready" | "error";
@@ -57,8 +74,19 @@ function readInitialEmbeddingsEnabled(): boolean {
 /** Payload of the `models://download-progress` Tauri event emitted by src-tauri/src/models.rs. */
 interface DownloadProgressEvent {
   file: string;
+  reference?: string;
   downloaded: number;
   total: number;
+}
+
+export function modelDownloadProgressEntries(
+  event: DownloadProgressEvent,
+): Record<string, DownloadProgress> {
+  const progress = { downloaded: event.downloaded, total: event.total };
+  return {
+    [event.file]: progress,
+    ...(event.reference ? { [event.reference]: progress } : {}),
+  };
 }
 
 /**
@@ -240,6 +268,13 @@ export interface ModelStore {
   refresh: () => Promise<void>;
   /** Download a curated model's GGUF weights, then refresh the installed list. */
   download: (model: ModelInfo) => Promise<void>;
+  /** Resolve an Ollama tag or Hugging Face reference into a verified public GGUF artifact. */
+  resolveModelReference: (reference: string) => Promise<ResolvedModelReference>;
+  /** Install a previously-resolved artifact and refresh the installed model list. */
+  installModelReference: (
+    reference: string,
+    expectedSha256: string,
+  ) => Promise<ModelInfo>;
   /** Start llama-server on the given (installed) model. */
   start: (model: ModelInfo) => Promise<void>;
   /** Stop the running llama-server process. */
@@ -421,6 +456,18 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     await get().refresh();
   },
 
+  resolveModelReference: async (reference) =>
+    invoke<ResolvedModelReference>("models_resolve_reference", { reference }),
+
+  installModelReference: async (reference, expectedSha256) => {
+    const model = await invoke<ModelInfo>("models_install_reference", {
+      reference,
+      expectedSha256,
+    });
+    await get().refresh();
+    return model;
+  },
+
   start: async (model) => {
     if (!model.path) {
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
@@ -491,7 +538,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       await get().refreshOllama();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [tag]: message },
       }));
@@ -512,7 +559,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       await get().refreshOllama();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [name]: message },
       }));
@@ -533,7 +580,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       await get().refreshOllama();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [shortName]: message },
       }));
@@ -624,7 +671,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
       await get().refreshProviders();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({ providerKeyError: { ...state.providerKeyError, [id]: message } }));
       throw err;
     }
@@ -658,7 +705,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       const retirements = await fetchProviderModelRetirements(id, models);
       set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({ providerKeyError: { ...state.providerKeyError, [id]: message } }));
       throw err;
     }
@@ -716,11 +763,10 @@ if (isTauri()) {
   });
 
   void listen<DownloadProgressEvent>("models://download-progress", (event) => {
-    const { file, downloaded, total } = event.payload;
     useModelStore.setState((state) => ({
       downloadProgress: {
         ...state.downloadProgress,
-        [file]: { downloaded, total },
+        ...modelDownloadProgressEntries(event.payload),
       },
     }));
   }).catch((error) => {

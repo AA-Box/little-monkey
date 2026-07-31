@@ -92,28 +92,9 @@ export const CURATED_MODELS: ModelInfo[] = [
   },
 ];
 
-/** Look up a curated model by its stable id (e.g. "qwen2.5-7b"). */
-export function findCuratedModel(id: string): ModelInfo | undefined {
-  return CURATED_MODELS.find((model) => model.id === id);
-}
-
-/** Look up a curated model by its GGUF filename, as returned by the backend's directory scan. */
-export function findCuratedModelByFile(file: string): ModelInfo | undefined {
-  return CURATED_MODELS.find((model) => model.file === file);
-}
-
-/** Format a byte count as a human-readable string (e.g. "2.3 GB", "512 MB"). */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const exponent = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
-    units.length - 1,
-  );
-  const value = bytes / 1024 ** exponent;
-  const decimals = exponent === 0 ? 0 : value >= 10 ? 1 : 2;
-  return `${value.toFixed(decimals)} ${units[exponent]}`;
-}
+/** Re-exported from `format.ts` so the model panels keep one import site
+ * while the implementation stays shared with every other surface. */
+export { formatBytes } from "./format";
 
 /** Format a model's on-disk size in GB (e.g. 4.7 -> "4.7 GB"). */
 export function formatSizeGb(sizeGb: number): string {

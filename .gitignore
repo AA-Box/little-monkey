@@ -31,6 +31,12 @@ src-tauri/gen/schemas
 # CLI sidecar staged by scripts/stage-cli-sidecar.mjs before tauri dev/build
 src-tauri/binaries/
 
+# Verified llama.cpp runtime staged by scripts/stage-managed-runtime.mjs.
+# The small README stays tracked so Tauri's resource glob also resolves
+# during plain cargo test/check runs that do not execute the staging script.
+src-tauri/resources/managed-runtime/*
+!src-tauri/resources/managed-runtime/README.md
+
 # Downloaded GGUF model weights
 /models/
 *.gguf
@@ -38,6 +44,7 @@ src-tauri/binaries/
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
+.obsidian/
 .claude/
 .idea
 .DS_Store

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { errorMessage } from "../lib/errors";
 
 /** Mirrors the Rust `DiagnosticStatus` enum (src-tauri/src/diagnostics.rs)
  * exactly — `#[serde(rename_all = "snake_case")]` on already-lowercase or
@@ -45,7 +46,7 @@ export interface DiagnosticsBundle {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 const SUMMARY_FIELD: Record<DiagnosticStatus, keyof DiagnosticSummary> = {

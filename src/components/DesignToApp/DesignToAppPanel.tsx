@@ -37,6 +37,8 @@ import {
 } from '../../store/designToAppStore';
 import { useVerifyStore } from '../../store/verifyStore';
 import { Button, IconButton, StatusPill, type PillTone } from '../ui';
+import { errorMessage } from "../../lib/errors";
+import { statusTone as sharedStatusTone } from "../../lib/statusTone";
 
 interface DesignToAppPanelProps {
   onClose: () => void;
@@ -60,10 +62,8 @@ const RUNNING_STATUSES: ReadonlySet<DesignToAppStatus> = new Set([
 ]);
 
 function statusTone(status: DesignToAppStatus): PillTone {
-  if (status === 'completed' || status === 'planned') return 'success';
-  if (status === 'failed') return 'danger';
   if (RUNNING_STATUSES.has(status)) return 'warning';
-  return 'neutral';
+  return sharedStatusTone(status, { planned: 'success' });
 }
 
 function evidenceTone(evidence: DesignBrowserEvidence | null): PillTone {
@@ -260,7 +260,7 @@ export function DesignToAppPanel({ onClose, onOpenRunCapsule }: DesignToAppPanel
     try {
       await action();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     }
   };
 

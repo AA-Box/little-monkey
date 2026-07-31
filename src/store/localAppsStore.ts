@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type { Recipe } from "./recipeStore";
 import { runRecipeNow } from "../lib/recipeRunner";
+import { errorMessage } from "../lib/errors";
 
 /** Emitted after a successful `local_apps_publish`/`local_apps_unpublish`
  * (see `src-tauri/src/local_apps.rs`), with the acting window's label as
@@ -79,7 +80,7 @@ export const useLocalAppsStore = create<LocalAppsStore>((set, get) => ({
       const apps = await invoke<LocalAppDefinition[]>("local_apps_list");
       set({ apps, loading: false, error: null });
     } catch (err) {
-      set({ loading: false, error: err instanceof Error ? err.message : String(err) });
+      set({ loading: false, error: errorMessage(err) });
     }
   },
 

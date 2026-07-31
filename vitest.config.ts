@@ -7,6 +7,6 @@ export default defineConfig({
     environment: "node",
     // `sdk/**` covers the checked-in-template client SDKs (TypeScript
     // request-building tests only — no real network calls, no Python/shell).
-    include: ["src/**/*.test.ts", "sdk/**/*.test.ts"],
+    include: ["src/**/*.test.{ts,tsx}", "sdk/**/*.test.ts"],
   },
 });

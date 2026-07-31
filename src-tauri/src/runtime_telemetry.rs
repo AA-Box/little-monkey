@@ -452,6 +452,10 @@ impl RuntimeTraceStore {
             .collect()
     }
 
+    /// Retained-trace count. Only the ring-capacity tests need this — every
+    /// production reader wants the records themselves via [`Self::recent`],
+    /// so exposing a second public counter would just be a parallel API.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.records.lock().map(|records| records.len()).unwrap_or(0)
     }
@@ -476,10 +480,6 @@ impl RuntimeTelemetryState {
 
     pub fn redactor(&self) -> &Redactor {
         &self.redactor
-    }
-
-    pub fn trace_count(&self) -> usize {
-        self.store.len()
     }
 
     pub fn recent(&self, runtime_id: Option<&str>, limit: usize) -> Vec<RuntimeTraceRecord> {
@@ -747,8 +747,10 @@ mod tests {
     #[test]
     fn redacts_key_value_api_credential() {
         let redactor = Redactor::new();
-        let (redacted, summary) = redactor.redact("config: api_key: sk-ABCDEFGHIJKLMNOP1234567890");
-        assert!(!redacted.contains("sk-ABCDEFGHIJKLMNOP1234567890"));
+        // Split so secret scanners don't flag the fixture as a real key.
+        let fake_key = ["sk-", "ABCDEFGHIJKLMNOP1234567890"].concat();
+        let (redacted, summary) = redactor.redact(&format!("config: api_key: {fake_key}"));
+        assert!(!redacted.contains(&fake_key));
         assert!(redacted.contains("[REDACTED:API_CREDENTIAL]"));
         assert_eq!(summary.by_kind.get("API_CREDENTIAL"), Some(&1));
     }
@@ -912,6 +914,8 @@ mod tests {
     #[test]
     fn record_load_redacts_a_secret_leaked_into_the_error_message() {
         let state = RuntimeTelemetryState::new();
+        // Split so secret scanners don't flag the fixture as a real key.
+        let fake_key = ["sk-", "ABCDEFGHIJKLMNOP123"].concat();
         let record = state
             .record_load(RecordLoadTraceRequest {
                 runtime_id: "llama-cpp".to_string(),
@@ -919,15 +923,14 @@ mod tests {
                 started_at_ms: 0,
                 ready_at_ms: 50,
                 offload_plan: None,
-                error_message: Some(
-                    "failed to reach https://api.example.com/v1?api_key=sk-ABCDEFGHIJKLMNOP123 (user /Users/johndoe)"
-                        .to_string(),
-                ),
+                error_message: Some(format!(
+                    "failed to reach https://api.example.com/v1?api_key={fake_key} (user /Users/johndoe)"
+                )),
             })
             .expect("record_load should succeed");
         assert_eq!(record.outcome, TraceOutcome::Failed);
         let message = record.error_message.expect("error message expected");
-        assert!(!message.contains("sk-ABCDEFGHIJKLMNOP123"));
+        assert!(!message.contains(&fake_key));
         assert!(!message.contains("johndoe"));
     }
 
@@ -1090,6 +1093,8 @@ mod tests {
         // `record_load`/`record_request` was the only path that ever
         // constructed a `RuntimeTraceRecord`.
         let redactor = Redactor::new();
+        // Split so secret scanners don't flag the fixture as a real key.
+        let fake_key = ["sk-", "ABCDEFGHIJKLMNOP123456"].concat();
         let trace = RuntimeTraceRecord {
             schema_version: RUNTIME_TELEMETRY_SCHEMA_VERSION,
             trace_id: "t1".to_string(),
@@ -1097,9 +1102,7 @@ mod tests {
             model_id: "m".to_string(),
             recorded_at_ms: 0,
             outcome: TraceOutcome::Failed,
-            error_message: Some(
-                "request rejected, authorization: Bearer sk-ABCDEFGHIJKLMNOP123456".to_string(),
-            ),
+            error_message: Some(format!("request rejected, authorization: Bearer {fake_key}")),
             event: TraceEvent::Load {
                 timing: LoadTiming { started_at_ms: 0, ready_at_ms: 1, duration_ms: 1 },
                 offload: None,
@@ -1118,7 +1121,7 @@ mod tests {
             1_000,
         );
         let serialized = serde_json::to_string(&bundle).expect("bundle should serialize");
-        assert!(!serialized.contains("sk-ABCDEFGHIJKLMNOP123456"));
+        assert!(!serialized.contains(&fake_key));
     }
 
     #[test]

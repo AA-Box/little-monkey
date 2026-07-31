@@ -37,6 +37,8 @@ pub mod m5_delivery;
 // platform-gated adapters. The core is Tauri-free so daemon/API/desktop use
 // the same validation, cancellation, residency, and scheduling semantics.
 pub mod runtime_adapter;
+// Verified app-owned llama.cpp runtime shared by desktop, CLI, and M3.
+pub mod managed_runtime;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
 // the same hostile-input and citation semantics.
@@ -143,6 +145,12 @@ mod git;
 // this module's Tauri-command surface stays desktop-app-only).
 pub mod llama;
 pub mod mcp;
+// Small, dependency-free stdio MCP servers embedded in the binary via
+// `include_str!` and materialized on demand under the app data dir — backs
+// `McpPanel.tsx`'s "quick add" templates that need a real local file (e.g.
+// the bundled AppleScript-control server) rather than an externally
+// installed command like `docker`/`npx`.
+pub mod bundled_mcp_servers;
 // Generic MCP-spec OAuth 2.0 (RFC 8414 discovery, RFC 7591 dynamic client
 // registration, PKCE authorization-code flow) for HTTP MCP servers — an
 // additional, alternative way to obtain `mcp.rs`'s `McpTransport::Http`
@@ -150,6 +158,14 @@ pub mod mcp;
 // Kept as its own module (rather than growing `mcp.rs` further) since it's
 // the one place a future `rmcp` OAuth API change would need editing.
 pub mod mcp_oauth;
+// Brokered OAuth for MCP servers whose provider requires a confidential
+// client (a `client_secret`) — Slack and Google, confirmed via their own
+// docs to not support `mcp_oauth.rs`'s dynamic-client-registration/loopback
+// flow. A Cloudflare Worker (little-monkey-website/worker/) holds the
+// secret and exchanges the code server-side; this module only ever sees the
+// resulting access/refresh tokens, via a `littlemonkey://` deep link. See
+// newApp/.claude/plans/linear-moseying-wolf.md for the full design.
+pub mod hosted_oauth;
 // Connector Catalog: guided GitHub (via `gh` CLI)/Slack/Notion/Jira/S3
 // connections, verified live before saving, secrets in the OS keychain only.
 // AppHandle-free core (bar the `AppState` config lock), same *_impl split as
@@ -160,6 +176,8 @@ pub mod connectors;
 // draft-only reply/comment/status-update generation. Every write goes through
 // `permissions::request_permission`, same as every other mutating tool.
 pub mod triage;
+pub mod model_sources;
+mod process_lock;
 mod models;
 pub mod ollama;
 pub mod providers;
@@ -178,6 +196,9 @@ mod sessions;
 mod system;
 mod terminal;
 mod tools;
+// Long-running agent shell commands that outlive the turn that started them
+// (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
+pub mod background_shell;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
@@ -302,6 +323,12 @@ pub struct AppState {
     /// in Rust so every WebView observes one lifecycle and workspace changes
     /// can terminate shells before their roots are detached.
     pub terminal: terminal::TerminalManager,
+    /// Background agent shell commands (`run_shell` with
+    /// `run_in_background: true`). Owned here rather than by the turn that
+    /// spawned them — that is what lets a dev server or watcher keep running
+    /// after the tool call returns, and what gives `shell_output`/`shell_kill`
+    /// something to address later. Killed on app shutdown.
+    pub background_shell: background_shell::BackgroundShellManager,
     pub permissions: permissions::PermissionState,
     /// Cancellation handles for in-flight `providers_stream_chat` requests,
     /// keyed by `request_id` — see `providers::providers_cancel_chat`.
@@ -399,14 +426,23 @@ pub struct AppState {
     /// `call_tool`/`connect`/`disconnect` await.
     pub mcp: tokio::sync::Mutex<std::collections::HashMap<String, mcp::McpConnection>>,
     /// Per-server cancellation signal for an in-flight `mcp_oauth_connect`
-    /// (see `mcp_oauth.rs`) — keyed by server id, mirroring `tool_cancel`'s
-    /// shape. `mcp_oauth_cancel` looks up the entry and calls
-    /// `notify_waiters()`; the connect command races its own flow against
-    /// `notified()` in a `tokio::select!` and removes its entry when done
-    /// (success, failure, or cancellation), so this map only ever holds
-    /// entries for genuinely in-flight connect attempts.
-    pub mcp_oauth_cancel:
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// (see `mcp_oauth.rs`) — keyed by server id. `mcp_oauth_cancel` calls the
+    /// shared `CancellationToken`'s `cancel()` method; every overlapping
+    /// connect races against `cancelled()`. Cancellation is sticky, so a
+    /// cancel arriving immediately before the waiter is polled cannot be lost
+    /// (unlike `Notify::notify_waiters`). The tuple's active-attempt count is
+    /// updated under the same mutex as the map, so the final overlapping call
+    /// removes the entry atomically and the next independent attempt receives
+    /// a fresh token.
+    pub mcp_oauth_cancel: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            (
+                std::sync::Arc<tokio_util::sync::CancellationToken>,
+                usize,
+            ),
+        >,
+    >,
     /// Per-server async lock serializing OAuth access-token retrieval/refresh
     /// (see `mcp_oauth::get_access_token_if_connected`) — keyed by server id.
     /// `connect_impl`'s `Http` branch calls that function on every
@@ -423,6 +459,15 @@ pub struct AppState {
     /// across the refresh call.
     pub mcp_oauth_refresh_locks:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Pending hosted-OAuth attempts (see `hosted_oauth.rs`), keyed by the
+    /// random `state` value embedded in the authorize URL sent to the
+    /// browser — looked up when the `littlemonkey://oauth/callback` deep
+    /// link comes back, so a spoofed/stale deep link (wrong or unknown
+    /// `state`) is dropped rather than trusted. Entries are removed once
+    /// redeemed (success or error) or found stale (see
+    /// `hosted_oauth::PENDING_TTL`) on next insert.
+    pub hosted_oauth_pending:
+        std::sync::Mutex<std::collections::HashMap<String, hosted_oauth::PendingHostedOAuth>>,
     /// Serializes `web_settings.json` writes (see `web.rs::web_set_settings`)
     /// — same reasoning as `mcp_config_lock` protects `mcp_servers.json`.
     /// `web_set_settings` is a synchronous command (Tauri can dispatch two
@@ -534,6 +579,7 @@ impl Default for AppState {
             ollama: Default::default(),
             workspace_roots: Default::default(),
             terminal: Default::default(),
+            background_shell: Default::default(),
             permissions: Default::default(),
             stream_cancels: Default::default(),
             checkpoints: Default::default(),
@@ -547,6 +593,7 @@ impl Default for AppState {
             mcp: Default::default(),
             mcp_oauth_cancel: Default::default(),
             mcp_oauth_refresh_locks: Default::default(),
+            hosted_oauth_pending: Default::default(),
             web_settings_lock: Default::default(),
             api_server: Default::default(),
             api_server_config_lock: Default::default(),
@@ -647,6 +694,20 @@ pub fn run() {
         })
         .build();
     let app = tauri::Builder::default()
+        // Must be registered first (per tauri-plugin-single-instance's own
+        // docs) so it can intercept a second launch before anything else
+        // runs. Only matters on Windows/Linux, where a `littlemonkey://`
+        // deep link while the app is already running spawns a second OS
+        // process rather than delivering a live event to the first one (see
+        // `hosted_oauth.rs`'s module doc) — this pipes that second launch's
+        // argv into the already-running instance instead of letting a
+        // second, windowless copy of the app start up.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(url) = hosted_oauth::extract_deep_link_from_argv(&argv) {
+                hosted_oauth::handle_deep_link_urls(app, vec![url]);
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -675,6 +736,28 @@ pub fn run() {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
         .setup(|app| {
+            // Listens for `littlemonkey://` deep links (macOS/mobile live
+            // events; Windows/Linux fresh-launch CLI-arg parsing — a
+            // still-running instance on those platforms is covered by the
+            // single-instance plugin's closure above instead). See
+            // `hosted_oauth.rs`'s module doc for the full flow.
+            hosted_oauth::register(app.handle());
+
+            // Verify and copy the bundled llama.cpp runtime into app data at
+            // launch so the separately installed `monkey` CLI can use the
+            // same app-owned runtime without Ollama or a system install.
+            // A source/dev build may intentionally have no staged bundle;
+            // model start still fails closed if a present bundle is invalid.
+            if let Ok(runtime_app_data) = app.path().app_data_dir() {
+                let resource_dir = app.path().resource_dir().ok();
+                if let Err(error) = managed_runtime::materialize_bundled_runtime(
+                    resource_dir.as_deref(),
+                    &runtime_app_data,
+                ) {
+                    eprintln!("Managed llama.cpp runtime setup failed: {error}");
+                }
+            }
+
             // Finish or roll back any portable-profile transaction interrupted
             // between staged file publication and its durable commit marker.
             // This runs before session/prompt hydration and before the profile
@@ -818,7 +901,6 @@ pub fn run() {
             triage::triage_list,
             triage::triage_generate_draft,
             triage::triage_send_draft,
-            providers::providers_list_presets,
             providers::providers_list_configured,
             providers::providers_add_custom,
             providers::providers_remove_custom,
@@ -831,12 +913,13 @@ pub fn run() {
             models::models_list_curated,
             models::models_list_installed,
             models::models_download,
+            models::models_resolve_reference,
+            models::models_install_reference,
             models::models_delete,
             models::models_add_external,
             models::models_remove_external,
             permissions::permission_respond,
             permissions::set_permission_mode,
-            permissions::get_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,
             terminal::terminal_identity,
@@ -859,6 +942,11 @@ pub fn run() {
             tools::tool_generate_image,
             tools::workspace_read_image,
             tools::tool_run_shell,
+            background_shell::tool_run_shell_background,
+            background_shell::background_shell_output,
+            background_shell::background_shell_kill,
+            background_shell::background_shell_list,
+            background_shell::background_shell_clear_finished,
             tools::tools_cancel_running,
             tools::list_workspace_paths,
             tools::tool_remember,
@@ -937,9 +1025,14 @@ pub fn run() {
             mcp::mcp_set_http_token,
             mcp::mcp_remove_http_token,
             mcp::mcp_call_tool,
+            bundled_mcp_servers::mcp_stage_bundled_server,
             mcp_oauth::mcp_oauth_connect,
+            mcp_oauth::mcp_oauth_redirect_uri,
             mcp_oauth::mcp_oauth_cancel,
             mcp_oauth::mcp_oauth_disconnect,
+            hosted_oauth::hosted_oauth_connect,
+            hosted_oauth::hosted_oauth_cancel,
+            hosted_oauth::hosted_oauth_disconnect,
             system::reveal_in_finder,
             system::open_in_terminal,
             system::open_in_editor,
@@ -1157,7 +1250,6 @@ pub fn run() {
             browser_worker::browser_click,
             browser_worker::browser_type_text,
             browser_worker::browser_scroll,
-            browser_worker::browser_screenshot,
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
             daemon_commands::daemon_desktop_status,
@@ -1287,6 +1379,7 @@ pub fn run() {
 
             let state = app_handle.state::<AppState>();
             state.terminal.kill_all(Some(app_handle));
+            state.background_shell.kill_all();
             tauri::async_runtime::block_on(mcp::disconnect_all(state.inner()));
             llama::stop_all_blocking(state.inner());
         }

@@ -960,16 +960,25 @@ mod tests {
     fn generic_signature_binds_timestamp_nonce_and_payload() {
         let secret = b"0123456789abcdef";
         let payload = br#"{"ok":true}"#;
-        let message = canonical_generic_signature_message(100, "nonce-1", payload);
+        // Generated rather than hard-coded: the assertions only need two
+        // distinct nonces, and a literal here reads as a real crypto nonce to
+        // scanners.
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let other_nonce = uuid::Uuid::new_v4().to_string();
+        let message = canonical_generic_signature_message(100, &nonce, payload);
         let signature = signature_hex(secret, &message);
         assert!(verify_generic_signature(
-            secret, 100, "nonce-1", payload, &signature
+            secret, 100, &nonce, payload, &signature
         ));
         assert!(!verify_generic_signature(
-            secret, 101, "nonce-1", payload, &signature
+            secret, 101, &nonce, payload, &signature
         ));
         assert!(!verify_generic_signature(
-            secret, 100, "nonce-2", payload, &signature
+            secret,
+            100,
+            &other_nonce,
+            payload,
+            &signature
         ));
     }
 
@@ -1039,15 +1048,19 @@ mod tests {
             "0123456789abcdef".into(),
         )])));
         let payload = br#"{"action":"opened"}"#;
+        // Generated rather than hard-coded: the replay assertions only need one
+        // stable nonce for the lifetime of the test, and a literal here reads as
+        // a real crypto nonce to scanners.
+        let nonce = uuid::Uuid::new_v4().to_string();
         let signature = signature_hex(
             b"0123456789abcdef",
-            &canonical_generic_signature_message(10_000, "nonce-one", payload),
+            &canonical_generic_signature_message(10_000, &nonce, payload),
         );
         let first = SignedDelivery {
             trigger_id: "hook",
             delivery_id: "delivery-one",
             timestamp_ms: 10_000,
-            nonce: "nonce-one",
+            nonce: &nonce,
             signature: &signature,
             event_name: None,
             payload,

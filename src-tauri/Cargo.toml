@@ -1,6 +1,6 @@
 [package]
 name = "little-monkey"
-version = "1.0.0"
+version = "1.1.0"
 description = "Little Monkey — a local model runner with agentic file/shell tools"
 authors = ["you"]
 license = "MIT"
@@ -18,6 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+sha2 = "0.10.9"
 
 [dependencies]
 # "unstable" enables the multiwebview API (Window::add_child + Manager::
@@ -32,6 +33,16 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-window-state = "2"
+# hosted_oauth.rs: receives the littlemonkey:// deep link Cloudflare Worker
+# redirects to after a Slack/Google OAuth exchange (see
+# Cargo.toml's own `reqwest`/`rmcp` comments for why the *loopback* OAuth
+# flow in mcp_oauth.rs can't serve providers that require a client_secret).
+tauri-plugin-deep-link = "2"
+# Required pairing per tauri-plugin-deep-link's own docs: without this, an OS
+# deep-link launch on Windows/Linux while the app is already running spawns a
+# second process instead of routing the URL into the existing one. Must be
+# registered first in the plugin chain (see lib.rs).
+tauri-plugin-single-instance = "2"
 tokio = { version = "1.52.3", features = ["full"] }
 # "form" added for web.rs's `tool_web_search`: reqwest 0.13 feature-gates
 # `RequestBuilder::form` (unlike earlier 0.11/0.12 examples elsewhere), needed
@@ -196,6 +207,11 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
 # workspace validation all remain in Rust.
 portable-pty = "0.9.0"
 enigo = "0.6.1"
+
+# model_sources.rs: advisory cross-process install locks on macOS/Linux keep
+# desktop and CLI pulls from mutating the same resumable partial download.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # cli_install.rs (Windows only — macOS/Linux use a plain symlink via
 # `std::os::unix::fs::symlink`, no extra dependency needed): adds the CLI

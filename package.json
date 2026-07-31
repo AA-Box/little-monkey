@@ -1,13 +1,16 @@
 {
   "name": "little-monkey",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "build": "pnpm typecheck && vite build",
+    "bundle:check": "node scripts/check-bundle-budget.mjs",
+    "build:budget": "pnpm build && pnpm bundle:check",
+    "release:preflight": "pnpm build:budget && pnpm test",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
@@ -15,6 +18,7 @@
     "test:git-delivery-action": "node .github/actions/little-monkey-review/review.test.mjs",
     "test:rust": "pnpm stage:cli:placeholder && cargo test --manifest-path src-tauri/Cargo.toml",
     "i18n:lint": "vitest run src/lib/i18n/keyLint.test.ts",
+    "stage:runtime": "node scripts/stage-managed-runtime.mjs",
     "stage:cli": "node scripts/stage-cli-sidecar.mjs",
     "stage:cli:placeholder": "node scripts/ensure-cli-sidecar-placeholder.mjs",
     "icon:mac-liquid": "tauri-liquid-icon --icon ./src-tauri/icons/AppIcon.icon --name AppIcon --output ./src-tauri/resources --tauri-dir ./src-tauri"

@@ -3,6 +3,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { Button } from "../ui";
 import { useMcpStore, type McpTransport } from "../../store/mcpStore";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /** One draft `env` row in the add-server form. `id` is a local React key
  * only — never sent to the backend (the map is rebuilt from `key`/`value`
@@ -143,7 +144,7 @@ export function AddMcpServerForm({ draft, draftVersion = 0 }: AddMcpServerFormPr
         try {
           await setHttpToken(id, token.trim());
         } catch (err) {
-          setError(err instanceof Error ? err.message : String(err));
+          setError(errorMessage(err));
         }
       }
 
@@ -164,7 +165,7 @@ export function AddMcpServerForm({ draft, draftVersion = 0 }: AddMcpServerFormPr
       setToken("");
       setTimeoutText("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }

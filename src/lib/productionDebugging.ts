@@ -28,6 +28,7 @@ import { executeToolCall } from './turnEngine';
 import { wrapUntrustedContent } from './untrustedContent';
 import { usePermissionStore } from '../store/permissionStore';
 import { primaryRoot, useWorkspaceStore, type WorkspaceRootInfo } from '../store/workspaceStore';
+import { errorMessage } from "./errors";
 
 export const MAX_PRODUCTION_EVIDENCE_ITEMS = 24;
 export const MAX_PRODUCTION_EVIDENCE_CHARS = 12_000;
@@ -657,7 +658,7 @@ export async function runProductionDebugFix(params: {
     if (agentResult.outcome === 'completed') {
       return {
         outcome: params.signal.aborted ? 'cancelled' : 'error',
-        summary: `The fix agent finished, but the owned worktree could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
+        summary: `The fix agent finished, but the owned worktree could not be inspected: ${errorMessage(error)}`,
         durableRunId: agentResult.durableRunId,
         verification,
         verificationEvidence,

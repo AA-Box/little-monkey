@@ -18,9 +18,10 @@ import { useEcosystemStore } from "./ecosystemStore";
 import { useMcpStore } from "./mcpStore";
 import { useModelStore } from "./modelStore";
 import { useUsageHistoryStore } from "./usageHistoryStore";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /**

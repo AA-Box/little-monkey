@@ -2039,17 +2039,6 @@ pub async fn browser_scroll(
 }
 
 #[tauri::command]
-pub async fn browser_screenshot(
-    state: tauri::State<'_, BrowserCommandState>,
-    session_id: String,
-) -> Result<ArtifactBlob, String> {
-    let session = state.get(&session_id)?;
-    tokio::task::spawn_blocking(move || session.screenshot())
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
 pub async fn browser_capture_evidence(
     state: tauri::State<'_, BrowserCommandState>,
     session_id: String,

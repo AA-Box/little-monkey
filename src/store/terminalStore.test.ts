@@ -103,6 +103,67 @@ describe("terminal store lifecycle", () => {
     expect(useTerminalStore.getState().activeSessionId).toBe("term-2");
   });
 
+  it("refreshes backend-owned history after raw Enter without parsing keystrokes", async () => {
+    useTerminalStore.setState({ sessions: [session()], activeSessionId: "term-1" });
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "terminal_history") return ["echo hello"];
+      return undefined;
+    });
+
+    await useTerminalStore.getState().write("term-1", "echo hello");
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+
+    await useTerminalStore.getState().write("term-1", "\r");
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, "terminal_write", {
+      sessionId: "term-1",
+      data: "\r",
+    });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(3, "terminal_history", {
+      workspaceId: "/workspace",
+    });
+    expect(useTerminalStore.getState().historyByWorkspace["/workspace"]).toEqual(["echo hello"]);
+  });
+
+  it("serializes raw writes so shell editing bytes keep their xterm order", async () => {
+    let releaseFirst!: () => void;
+    mocks.invoke
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      }))
+      .mockResolvedValueOnce(undefined);
+
+    const first = useTerminalStore.getState().write("term-1", "a");
+    const second = useTerminalStore.getState().write("term-1", "\u007f");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, "terminal_write", {
+      sessionId: "term-1",
+      data: "a",
+    });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, "terminal_write", {
+      sessionId: "term-1",
+      data: "\u007f",
+    });
+  });
+
+  it("keeps interrupt and kill as distinct PTY controls", async () => {
+    useTerminalStore.setState({ sessions: [session()], activeSessionId: "term-1" });
+    mocks.invoke
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(session({ status: "killed" }));
+
+    await useTerminalStore.getState().interrupt("term-1");
+    await useTerminalStore.getState().kill("term-1");
+
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, "terminal_interrupt", { sessionId: "term-1" });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, "terminal_kill", { sessionId: "term-1" });
+    expect(useTerminalStore.getState().sessions[0].status).toBe("killed");
+  });
+
   it("queues and atomically consumes evidence for one chat", () => {
     const evidence = buildTerminalEvidence(session({ output: "tests passed" }), undefined, 7);
     useTerminalStore.getState().queueEvidence("chat-a", evidence);

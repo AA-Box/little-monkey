@@ -1,20 +1,23 @@
-import { useSideTaskStore, selectRunningSideTaskCount } from "../../store/sideTaskStore";
+import { useBackgroundShellStore, selectRunningShellTaskCount } from "../../store/backgroundShellStore";
 import { useSubagentStore, selectRunningSubagentCount } from "../../store/subagentStore";
 import { useT } from "../../lib/i18n";
 
 /**
  * The "✳ N running tasks" pill above the composer — the chat-level aggregate
- * of ALL live background work (side tasks + `task`-tool subagents, the two
- * systems that deliberately bypass the run ledger; ledger runs already have
- * the full-pane Run Center). Renders nothing when idle, so the composer area
- * stays untouched for the common case. Clicking it opens the
- * Background-tasks drawer (wired by `App.tsx` through `ChatWindow`).
+ * of live BACKGROUND work: agent-started background shell commands plus
+ * `task`-tool subagents, the two systems that deliberately bypass the run
+ * ledger (ledger runs already have the full-pane Run Center). Side tasks are
+ * deliberately NOT counted here: they are conversations with their own pane,
+ * tab strip, and badge, not headless work this pill would send you to the
+ * wrong surface for. Renders nothing when idle, so the composer area stays
+ * untouched for the common case. Clicking it opens the Background Tasks
+ * panel (wired by `App.tsx` through `ChatWindow`).
  */
 export default function RunningTasksChip({ onClick }: { onClick?: () => void }) {
   const { t } = useT();
-  const sideTaskCount = useSideTaskStore(selectRunningSideTaskCount);
+  const shellCount = useBackgroundShellStore(selectRunningShellTaskCount);
   const subagentCount = useSubagentStore(selectRunningSubagentCount);
-  const count = sideTaskCount + subagentCount;
+  const count = shellCount + subagentCount;
 
   if (count === 0) return null;
 

@@ -47,6 +47,7 @@ import { registerRunCancellation } from "./runCancellationRegistry";
 import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from "./skills";
 import { protectKnowledgeNoticeForModel, protectToolResult, wrapUntrustedContent } from "./untrustedContent";
 import { isBtwNotice } from "./slashCommands";
+import { errorMessage } from "./errors";
 
 const MEMBER_SYSTEM_SUFFIX = [
   "",
@@ -952,12 +953,12 @@ async function runMember(sessionId: string, actorId: string, gate: BudgetGate, s
       ? "Crew actor stopped at the code-enforced time limit."
       : cancelled
         ? "Crew cancelled."
-        : error instanceof Error ? error.message : String(error);
+        : errorMessage(error);
     updateActor(sessionId, actorId, {
       status: cancelled ? "cancelled" : "failed",
       completedAt,
       durationMs: completedAt - startedAt,
-      error: cancelled ? null : error instanceof Error ? error.message : String(error),
+      error: cancelled ? null : errorMessage(error),
     });
     await finalizeActorRecorder(
       sessionId,
@@ -1060,12 +1061,12 @@ async function runCoordinator(sessionId: string, gate: BudgetGate, signal: Abort
       ? "Crew coordinator stopped at the code-enforced time limit."
       : cancelled
         ? "Crew cancelled."
-        : error instanceof Error ? error.message : String(error);
+        : errorMessage(error);
     updateActor(sessionId, actorId, {
       status: cancelled ? "cancelled" : "failed",
       completedAt,
       durationMs: completedAt - startedAt,
-      error: cancelled ? null : error instanceof Error ? error.message : String(error),
+      error: cancelled ? null : errorMessage(error),
     });
     await finalizeActorRecorder(
       sessionId,
@@ -1157,7 +1158,7 @@ async function executeCrewRun(sessionId: string): Promise<void> {
       status: cancelled ? "cancelled" : "failed",
       completedAt,
       durationMs: completedAt - startedAt,
-      error: cancelled ? null : error instanceof Error ? error.message : String(error),
+      error: cancelled ? null : errorMessage(error),
       budget: gateSnapshot(gate, limitError?.reason ?? getRun(sessionId).budget.limitReason),
     });
   } finally {

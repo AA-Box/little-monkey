@@ -22,6 +22,7 @@ import {
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
 import { usePromptStore } from "./promptStore";
 import type { UsageInfo } from "./usageStore";
+import { errorMessage } from "../lib/errors";
 
 /** localStorage key sessions were persisted under BEFORE file-based
  * persistence existed — only read (once, then removed) to migrate old data.
@@ -1343,7 +1344,7 @@ function flushPersist(): void {
       }
     })
     .catch((err: unknown) => {
-      useSessionStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+      useSessionStore.setState({ persistError: errorMessage(err) });
     });
 }
 
@@ -1360,7 +1361,7 @@ function persist(
   try {
     pendingPayload = JSON.stringify({ sessions, activeSessionId, groups, crews });
   } catch (err) {
-    useSessionStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    useSessionStore.setState({ persistError: errorMessage(err) });
     return;
   }
   if (persistTimer === null) {
@@ -1489,7 +1490,7 @@ export async function hydrateSessions(): Promise<void> {
     // Read failure (not "file missing" — that returns null). Keep the fresh
     // in-memory session and surface the error; the file on disk is left
     // untouched until the user actually does something worth saving.
-    useSessionStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    useSessionStore.setState({ persistError: errorMessage(err) });
     return;
   }
 
@@ -1534,7 +1535,7 @@ export async function hydrateSessions(): Promise<void> {
     // Only drop the legacy copy once the file write actually succeeded.
     localStorage.removeItem(LEGACY_STORAGE_KEY);
   } catch (err) {
-    useSessionStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    useSessionStore.setState({ persistError: errorMessage(err) });
   }
 }
 

@@ -10,6 +10,7 @@ import {
   type CompareFileEntry,
   type DiffResult,
 } from "../../lib/checkpointPreview";
+import { errorMessage } from "../../lib/errors";
 
 const MAX_RENDERED_DIFF_LINES = 600;
 
@@ -118,7 +119,7 @@ export function CheckpointCompareModal({ checkpoints, initial, onClose }: Checkp
         if (!cancelled) setResult(r);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (!cancelled) setError(errorMessage(err));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

@@ -7,6 +7,7 @@ import { useT } from "../../lib/i18n";
 import { isReleaseReady, type ApiChange } from "../../lib/apiContractDiff";
 import { useApiContractDiffStore, type DiffSlot } from "../../store/apiContractDiffStore";
 import { Button, IconButton, StatusPill } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * API Contract Diff and Mock Lab (ROADMAP.md Phase 7, item 23): a
@@ -116,7 +117,7 @@ export function ApiContractDiffLabPanel({ onClose }: ApiContractDiffLabPanelProp
       if (!destination) return;
       await writeTextFile(destination, testStub);
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err));
+      setSaveError(errorMessage(err));
     } finally {
       setSaveBusy(false);
     }

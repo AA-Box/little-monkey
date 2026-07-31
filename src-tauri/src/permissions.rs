@@ -709,15 +709,11 @@ fn set_permission_mode_impl(state: &AppState, mode: String) -> Result<(), String
     Ok(())
 }
 
-/// Return the currently-active permission mode.
-#[tauri::command]
-pub fn get_permission_mode(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    Ok(get_permission_mode_impl(state.inner()))
-}
-
-/// Core logic behind [`get_permission_mode`], factored out so it can be
-/// exercised directly in tests without standing up a full Tauri app/window.
-fn get_permission_mode_impl(state: &AppState) -> String {
+/// Reads the currently-active native permission mode. Desktop startup
+/// restores its persisted frontend choice through `set_permission_mode`, so
+/// a redundant read-only IPC command would create an ambiguous second source
+/// of truth; native policy code and tests use this helper directly.
+pub(crate) fn get_permission_mode_impl(state: &AppState) -> String {
     state.permissions.mode.lock().unwrap().clone()
 }
 

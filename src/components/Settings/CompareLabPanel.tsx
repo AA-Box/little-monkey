@@ -40,6 +40,7 @@ import { buildModelTargetInventory, type ModelTargetSnapshot } from "../../lib/m
 import { useModelStore } from "../../store/modelStore";
 import { MAX_RUN_HISTORY, useCompareLabStore } from "../../store/compareLabStore";
 import { Button, StatusPill, Tabs, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 type Section = "suites" | "modelSets" | "runs";
 
@@ -687,7 +688,7 @@ function RunsSection() {
       setSelectedRunId(handle.runId);
       void handle.done;
     } catch (error) {
-      setStartError(error instanceof Error ? error.message : String(error));
+      setStartError(errorMessage(error));
     }
   }
 
@@ -790,7 +791,7 @@ function RunReport({ run }: { run: LabRun }) {
       await navigator.clipboard.writeText(renderLabReportMarkdown(report));
       setStatus({ tone: "success", message: t("CompareLab.copiedMarkdown") });
     } catch (error) {
-      setStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) });
+      setStatus({ tone: "danger", message: errorMessage(error) });
     } finally {
       setBusy(null);
     }
@@ -802,7 +803,7 @@ function RunReport({ run }: { run: LabRun }) {
       await navigator.clipboard.writeText(renderLabReportJson(report));
       setStatus({ tone: "success", message: t("CompareLab.copiedJson") });
     } catch (error) {
-      setStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) });
+      setStatus({ tone: "danger", message: errorMessage(error) });
     } finally {
       setBusy(null);
     }
@@ -821,7 +822,7 @@ function RunReport({ run }: { run: LabRun }) {
       await writeTextFile(destination, content);
       setStatus({ tone: "success", message: t("CompareLab.exportComplete") });
     } catch (error) {
-      setStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) });
+      setStatus({ tone: "danger", message: errorMessage(error) });
     } finally {
       setBusy(null);
     }
@@ -831,7 +832,7 @@ function RunReport({ run }: { run: LabRun }) {
     setStatus(null);
     void promoteLabModel(target)
       .then(() => setStatus({ tone: "success", message: t("CompareLab.promotedModel", { model: target.displayName }) }))
-      .catch((error: unknown) => setStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) }));
+      .catch((error: unknown) => setStatus({ tone: "danger", message: errorMessage(error) }));
   }
 
   function promotePrompt(prompt: LabPrompt) {
@@ -840,7 +841,7 @@ function RunReport({ run }: { run: LabRun }) {
       const entry = promoteLabPrompt(prompt, run.suiteName);
       setStatus({ tone: "success", message: t("CompareLab.promotedPrompt", { command: entry.command }) });
     } catch (error) {
-      setStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) });
+      setStatus({ tone: "danger", message: errorMessage(error) });
     }
   }
 
@@ -850,7 +851,7 @@ function RunReport({ run }: { run: LabRun }) {
       promoteLabResponse(prompt, result, target);
       setStatus({ tone: "success", message: t("CompareLab.promotedResponse") });
     } catch (error) {
-      setStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) });
+      setStatus({ tone: "danger", message: errorMessage(error) });
     }
   }
 

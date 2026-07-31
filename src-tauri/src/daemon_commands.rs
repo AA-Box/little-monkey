@@ -137,6 +137,10 @@ pub struct RemotePairRequest {
     pub run_ids: Vec<String>,
     pub workspace_ids: Vec<String>,
     pub max_artifact_bytes: u64,
+    /// First-party mobile-companion grants (chat, workflow launch, capture).
+    /// Empty for a runner-only controller — see the CLI's `--mobile` flag.
+    #[serde(default)]
+    pub mobile_capabilities: Vec<String>,
 }
 
 fn cli_path() -> PathBuf {
@@ -225,6 +229,20 @@ fn validate_remote_pair_request(request: &RemotePairRequest) -> Result<(), Strin
             .any(|action| !allowed.contains(&action.as_str()))
     {
         return Err("Pairing requires valid explicit actions".to_string());
+    }
+    let allowed_mobile = [
+        "view-sessions",
+        "chat",
+        "view-tasks",
+        "run-workflows",
+        "capture",
+    ];
+    if request
+        .mobile_capabilities
+        .iter()
+        .any(|capability| !allowed_mobile.contains(&capability.as_str()))
+    {
+        return Err("Unknown mobile companion capability".to_string());
     }
     if request.run_ids.is_empty() && request.workspace_ids.is_empty() {
         return Err("Pairing requires an exact run id or declared workspace id".to_string());
@@ -918,6 +936,9 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
         validate_id("workspace id", &workspace)?;
         args.extend(["--workspace".into(), workspace]);
     }
+    for capability in request.mobile_capabilities {
+        args.extend(["--mobile".into(), capability]);
+    }
     command(args).await
 }
 
@@ -993,6 +1014,7 @@ mod tests {
             run_ids: vec!["run-one".to_string()],
             workspace_ids: Vec::new(),
             max_artifact_bytes: 8 * 1024 * 1024,
+            mobile_capabilities: Vec::new(),
         };
         assert!(validate_remote_pair_request(&valid).is_ok());
 
@@ -1004,9 +1026,20 @@ mod tests {
         oversized.max_artifact_bytes = MAX_REMOTE_ARTIFACT_BYTES + 1;
         assert!(validate_remote_pair_request(&oversized).is_err());
 
-        let mut missing_dependency = valid;
+        let mut missing_dependency = valid.clone();
         missing_dependency.actions = vec!["approve".to_string()];
         assert!(validate_remote_pair_request(&missing_dependency).is_err());
+
+        // Mobile grants are validated here too, before the CLI is dispatched:
+        // an unknown capability never becomes an argv entry.
+        let mut unknown_mobile = valid.clone();
+        unknown_mobile.mobile_capabilities = vec!["exfiltrate".to_string()];
+        assert!(validate_remote_pair_request(&unknown_mobile).is_err());
+
+        let mut granted_mobile = valid;
+        granted_mobile.mobile_capabilities =
+            vec!["view-sessions".to_string(), "chat".to_string()];
+        assert!(validate_remote_pair_request(&granted_mobile).is_ok());
     }
 
     #[test]

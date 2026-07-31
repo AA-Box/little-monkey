@@ -3,6 +3,7 @@ import { Button, StatusPill } from "../ui";
 import { useLocalAppsStore, LOCAL_APP_TEMPLATES, type LocalAppTemplate } from "../../store/localAppsStore";
 import { useRecipeStore } from "../../store/recipeStore";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Settings "Local Apps" tab (ROADMAP.md Phase 3): publishes a saved Recipe
@@ -62,7 +63,7 @@ export function LocalAppsPanel() {
       await publish(selectedRecipeName, selectedTemplate, paramLabels);
       setWizardOpen(false);
     } catch (err) {
-      setPublishError(err instanceof Error ? err.message : String(err));
+      setPublishError(errorMessage(err));
     } finally {
       setPublishing(false);
     }
@@ -76,7 +77,7 @@ export function LocalAppsPanel() {
     try {
       await unpublish(id);
     } catch (err) {
-      setRowError(err instanceof Error ? err.message : String(err));
+      setRowError(errorMessage(err));
     } finally {
       setConfirmingUnpublishId(null);
     }
@@ -89,7 +90,7 @@ export function LocalAppsPanel() {
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 1500);
     } catch (err) {
-      setRowError(err instanceof Error ? err.message : String(err));
+      setRowError(errorMessage(err));
     }
   }
 
@@ -98,7 +99,7 @@ export function LocalAppsPanel() {
       const url = await open(id);
       window.open(url, "_blank", "noopener,noreferrer");
     } catch (err) {
-      setRowError(err instanceof Error ? err.message : String(err));
+      setRowError(errorMessage(err));
     }
   }
 

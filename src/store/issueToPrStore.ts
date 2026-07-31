@@ -4,9 +4,10 @@ import * as api from "../lib/issueToPr";
 import type { IssueToPrRun } from "../lib/issueToPr";
 import { isTerminalIssueToPrStatus } from "../lib/issueToPr";
 import { runIssueToPrAgent } from "../lib/issueToPrRunner";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** In-flight cancellation handles, keyed by run id — deliberately NOT part of

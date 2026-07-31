@@ -12,6 +12,7 @@ import {
 } from "../../lib/nativeSkillsClient";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 function descriptorScope(skill: NativeSkillDescriptor): NativeSkillScope | null {
   return skill.source.kind === "global" || skill.source.kind === "workspace" ? skill.source.kind : null;
@@ -70,7 +71,7 @@ export function NativeSkillsManager() {
     try {
       setSkills(await nativeSkillsClient.discover());
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(errorMessage(reason));
     }
   }, []);
 
@@ -89,7 +90,7 @@ export function NativeSkillsManager() {
       bumpNativeSkills();
       await refresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(errorMessage(reason));
     } finally {
       setBusy(null);
     }
@@ -104,7 +105,7 @@ export function NativeSkillsManager() {
       setPreview(next);
       setPreviewSource({ kind: "local", path: localPath });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(errorMessage(reason));
     } finally {
       setBusy(null);
     }
@@ -130,7 +131,7 @@ export function NativeSkillsManager() {
       // against the exact snapshot that was previewed.
       setPreviewSource({ kind: "git", request: { ...request, commit: outcome.pinned_commit } });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(errorMessage(reason));
     } finally {
       setBusy(null);
     }

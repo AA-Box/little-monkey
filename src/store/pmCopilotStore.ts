@@ -13,6 +13,7 @@ import {
   type PmRiskSeverity,
   type PmUserStory,
 } from "../lib/pmCopilot";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Draft state for Product Manager Copilot (ROADMAP.md Phase 7): one goal,
@@ -123,7 +124,7 @@ export const usePmCopilotStore = create<PmCopilotStoreState>((set, get) => ({
     } catch (error) {
       set({
         status: "error",
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage(error),
       });
     }
   },
@@ -227,7 +228,7 @@ export const usePmCopilotStore = create<PmCopilotStoreState>((set, get) => ({
       const path = await savePmPlanToWorkspace(markdown, slug);
       set({ saveStatus: "saved", savedPath: path });
     } catch (error) {
-      set({ saveStatus: "error", saveError: error instanceof Error ? error.message : String(error) });
+      set({ saveStatus: "error", saveError: errorMessage(error) });
     }
   },
 

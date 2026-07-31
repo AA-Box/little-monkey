@@ -35,6 +35,7 @@ import {
   type DebateRoleId,
   type DebateSynthesis,
 } from '../store/debateStore';
+import { errorMessage } from "./errors";
 
 /** Caps a role's stored raw reply / a synthesis's stored raw reply — same
  * order of magnitude as `sideTaskRunner.ts`'s `MAX_REPORT_CHARS`, sized for
@@ -237,7 +238,7 @@ async function runRolePosition(
   } catch (err) {
     useDebateStore.getState().updatePosition(debateId, role.id, {
       status: signal.aborted ? 'cancelled' : 'failed',
-      error: signal.aborted ? null : err instanceof Error ? err.message : String(err),
+      error: signal.aborted ? null : errorMessage(err),
       completedAt: Date.now(),
     });
   }
@@ -304,7 +305,7 @@ export async function runDebate(debateId: string): Promise<void> {
     try {
       target = await resolveTarget();
     } catch (err) {
-      useDebateStore.getState().finish(debateId, 'failed', err instanceof Error ? err.message : String(err));
+      useDebateStore.getState().finish(debateId, 'failed', errorMessage(err));
       return;
     }
     if (controller.signal.aborted) {
@@ -371,7 +372,7 @@ export async function runDebate(debateId: string): Promise<void> {
     useDebateStore.getState().finish(
       debateId,
       controller.signal.aborted ? 'cancelled' : 'failed',
-      controller.signal.aborted ? null : err instanceof Error ? err.message : String(err),
+      controller.signal.aborted ? null : errorMessage(err),
     );
   } finally {
     controllers.delete(debateId);

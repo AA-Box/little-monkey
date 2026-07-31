@@ -14,6 +14,7 @@ import { attemptStream } from "./turnEngine";
 import type { ChatMessage, ToolDef } from "./llamaClient";
 import { effortForTarget, getActiveChatTarget } from "../store/modelStore";
 import { djb2Hash, jaccardSimilarity } from "./goldenDatasetBuilder";
+import { errorMessage } from "./errors";
 
 export type EvalTarget =
   | { kind: "model" }
@@ -286,7 +287,7 @@ export function validateEvalSuite(suite: EvalSuite): string[] {
       try {
         new RegExp(testCase.expectations.regex, "u");
       } catch (error) {
-        errors.push(`${prefix} has an invalid regular expression: ${error instanceof Error ? error.message : String(error)}`);
+        errors.push(`${prefix} has an invalid regular expression: ${errorMessage(error)}`);
       }
     }
     if (suite.target.kind === "model" || suite.target.kind === "agent" || suite.target.kind === "skill") {
@@ -360,7 +361,7 @@ export async function scoreEvalCase(
       const expression = new RegExp(testCase.expectations.regex, "u");
       results.push(assertion("regex", "Output matches regular expression", expression.test(evidence.output), `Pattern: /${testCase.expectations.regex}/u`, "verifier"));
     } catch (error) {
-      results.push(assertion("regex", "Output matches regular expression", false, `Invalid pattern: ${error instanceof Error ? error.message : String(error)}`, "verifier"));
+      results.push(assertion("regex", "Output matches regular expression", false, `Invalid pattern: ${errorMessage(error)}`, "verifier"));
     }
   }
   if (testCase.expectations.jsonSubset) {
@@ -370,7 +371,7 @@ export async function scoreEvalCase(
       const passed = isJsonSubset(testCase.expectations.jsonSubset, actual);
       results.push(assertion("json-subset", "Output contains expected JSON subset", passed, passed ? "Expected JSON subset is present." : "Expected JSON subset is missing.", "verifier"));
     } catch (error) {
-      results.push(assertion("json-subset", "Output contains expected JSON subset", false, `Output is not JSON: ${error instanceof Error ? error.message : String(error)}`, "verifier"));
+      results.push(assertion("json-subset", "Output contains expected JSON subset", false, `Output is not JSON: ${errorMessage(error)}`, "verifier"));
     }
   }
   for (const tool of testCase.expectations.expectedToolCalls) {
@@ -546,7 +547,7 @@ export async function executeEvalSuite(
         usage: null,
         costMicros: null,
         evidence: null,
-        error: cancelled ? "Cancelled by user." : error instanceof Error ? error.message : String(error),
+        error: cancelled ? "Cancelled by user." : errorMessage(error),
         reproducibility,
       });
       if (cancelled) break;
@@ -660,7 +661,7 @@ function parseObjectInput(input: string, label: string): Record<string, unknown>
   try {
     parsed = JSON.parse(input);
   } catch (error) {
-    throw new Error(`${label} input must be a JSON object: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`${label} input must be a JSON object: ${errorMessage(error)}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${label} input must be a JSON object.`);
   return parsed as Record<string, unknown>;
@@ -808,6 +809,40 @@ export function createLocalEvalRuntime(): EvalRuntime {
       }
       throw new Error("Judge returned an invalid JSON result shape.");
     },
+  };
+}
+
+/**
+ * Aggregated release-gate verdict for one workflow across every suite that
+ * gates it. This is what makes a "blocked" gate actually block something:
+ * `EcosystemWorkflows.tsx` consults it before starting a desktop workflow
+ * run and refuses (with an explicit, audited override) while any gating
+ * suite is failing or has never passed the workflow's current revision.
+ * `evalHarness.ts`'s own runners intentionally do NOT consult it — running
+ * the evals is how a blocked workflow becomes unblocked. CLI/API-server
+ * workflow starts remain ungated because suite/run state is desktop-local
+ * (see ROADMAP.md).
+ */
+export function workflowReleaseGate(
+  workflowId: string,
+  suites: EvalSuite[],
+  runs: EvalRun[],
+): { status: "not-gated" | "passed" | "blocked" | "unverified"; blocking: Array<{ suiteName: string; status: "blocked" | "unverified" }> } {
+  const gating = suites.filter(
+    (suite) => suite.releaseGate && suite.target.kind === "workflow" && suite.target.workflowId === workflowId,
+  );
+  if (gating.length === 0) return { status: "not-gated", blocking: [] };
+  const blocking: Array<{ suiteName: string; status: "blocked" | "unverified" }> = [];
+  for (const suite of gating) {
+    const { status } = releaseGateStatus(suite, runs);
+    if (status === "blocked" || status === "unverified") {
+      blocking.push({ suiteName: suite.name, status });
+    }
+  }
+  if (blocking.length === 0) return { status: "passed", blocking };
+  return {
+    status: blocking.some((entry) => entry.status === "blocked") ? "blocked" : "unverified",
+    blocking,
   };
 }
 

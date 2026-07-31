@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { APP_CONNECTOR_TEMPLATES } from "./McpPanel";
+import { APP_CONNECTOR_TEMPLATES, shouldShowManualOAuthClientFields } from "./McpPanel";
 
 describe("MCP connector templates", () => {
   it("keeps the GitHub connector read-only until the user explicitly changes it", () => {
@@ -26,17 +26,23 @@ describe("MCP connector templates", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("includes a Google Drive template pointed at the real hosted MCP endpoint", () => {
-    const googleDrive = APP_CONNECTOR_TEMPLATES.find((template) => template.id === "google-drive");
+  it("no longer duplicates ConnectorsPanel's hosted-OAuth catalog entries", () => {
+    const ids = APP_CONNECTOR_TEMPLATES.map((template) => template.id);
+    expect(ids).not.toContain("slack");
+    expect(ids).not.toContain("atlassian");
+    expect(ids).not.toContain("google-drive");
+    expect(ids).not.toContain("gmail");
+  });
+});
 
-    expect(googleDrive?.draft.transportKind).toBe("http");
-    expect(googleDrive?.draft.url).toBe("https://drivemcp.googleapis.com/mcp/v1");
+describe("manual OAuth client recovery", () => {
+  it("keeps client fields visible after a prompted manual-client flow fails", () => {
+    expect(shouldShowManualOAuthClientFields("needs_client_id", false)).toBe(true);
+    expect(shouldShowManualOAuthClientFields("error", true)).toBe(true);
   });
 
-  it("includes a Gmail template pointed at the real hosted MCP endpoint", () => {
-    const gmail = APP_CONNECTOR_TEMPLATES.find((template) => template.id === "gmail");
-
-    expect(gmail?.draft.transportKind).toBe("http");
-    expect(gmail?.draft.url).toBe("https://gmailmcp.googleapis.com/mcp/v1");
+  it("does not show client fields for an unrelated discovery or DCR failure", () => {
+    expect(shouldShowManualOAuthClientFields("error", false)).toBe(false);
+    expect(shouldShowManualOAuthClientFields("cancelled", true)).toBe(false);
   });
 });

@@ -60,7 +60,7 @@ describe("toolsForProfile", () => {
     expect(toolsForProfile("explore").map((t) => t.function.name).sort()).toEqual(["glob", "grep", "list_dir", "read_file"]);
   });
 
-  it("code profile is explore plus the three mutating tools", () => {
+  it("code profile is explore plus the mutating tools and run_shell's background companions", () => {
     expect(toolsForProfile("code").map((t) => t.function.name).sort()).toEqual([
       "edit_file",
       "glob",
@@ -68,8 +68,15 @@ describe("toolsForProfile", () => {
       "list_dir",
       "read_file",
       "run_shell",
+      "shell_kill",
+      "shell_output",
       "write_file",
     ]);
+  });
+
+  it("never offers spawn_task to a delegated profile — a chip belongs to the user's own conversation", () => {
+    expect(toolsForProfile("code").some((tool) => tool.function.name === "spawn_task")).toBe(false);
+    expect(toolsForProfile("explore").some((tool) => tool.function.name === "spawn_task")).toBe(false);
   });
 });
 
