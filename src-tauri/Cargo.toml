@@ -1,6 +1,6 @@
 [package]
 name = "little-monkey"
-version = "1.0.0"
+version = "1.1.0"
 description = "Little Monkey — a local model runner with agentic file/shell tools"
 authors = ["you"]
 license = "MIT"
