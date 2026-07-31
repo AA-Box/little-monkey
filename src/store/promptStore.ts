@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { errorMessage } from "../lib/errors";
 
 /** Emitted by the backend after every successful `prompts_save`, with the
  * saving window's label as payload (see src-tauri/src/prompts.rs). Other
@@ -424,7 +425,7 @@ function flushPersist(): void {
       }
     })
     .catch((err: unknown) => {
-      usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+      usePromptStore.setState({ persistError: errorMessage(err) });
     });
 }
 
@@ -436,7 +437,7 @@ function persist(entries: PromptEntry[], defaultPersonaId: string | null, hasSee
   try {
     pendingPayload = JSON.stringify({ version: 1, entries, defaultPersonaId, hasSeededDefaults });
   } catch (err) {
-    usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    usePromptStore.setState({ persistError: errorMessage(err) });
     return;
   }
   if (persistTimer === null) {
@@ -514,7 +515,7 @@ export async function hydratePrompts(): Promise<void> {
       // Read failure (not "file missing" — that returns null). Keep the empty
       // in-memory library and surface the error; the file on disk is left
       // untouched until the user actually does something worth saving.
-      usePromptStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+      usePromptStore.setState({ persistError: errorMessage(err) });
       return;
     }
 
@@ -661,12 +662,6 @@ export function selectPersonas(state: PromptStore): PromptEntry[] {
 /** Zustand selector: every saved snippet, in library order. */
 export function selectSnippets(state: PromptStore): PromptEntry[] {
   return state.entries.filter((e) => e.kind === "snippet");
-}
-
-/** User-authored procedural skills. Marketplace skills remain in the signed
- * M4 package registry and are merged only at discovery time. */
-export function selectSkills(state: PromptStore): PromptEntry[] {
-  return state.entries.filter((e) => e.kind === "skill");
 }
 
 /** Finds the entry (if any) whose `command` matches exactly — used for

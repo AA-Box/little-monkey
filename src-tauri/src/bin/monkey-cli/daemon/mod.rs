@@ -526,7 +526,7 @@ fn queue_command(cli: &crate::Cli, args: &DaemonRunArgs) -> Result<(), String> {
     }
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
     let options = QueueOptions::from_run_args(args);
-    let queued = enqueue(cli, &paths, &config, &mut store, &mut shared, options)?;
+    let queued = enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)?;
     if args.json {
         println!("{}", serde_json::to_string(&queued).unwrap_or_default());
     } else {
@@ -580,7 +580,91 @@ pub(crate) fn queue_client_recipe(
         parent_run_id: None,
         snapshot_is_frozen: false,
     };
-    enqueue(cli, &paths, &config, &mut store, &mut shared, options)
+    enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)
+}
+
+/// Recipe name the mobile chat route executes. The node operator authors it
+/// once (Settings → Tasks, or a recipe file) with their chosen model, system
+/// prompt, permission mode, and a `prompt` parameter — that recipe IS the
+/// mobile chat contract, which keeps the node authoritative for models and
+/// keeps this path from inventing an implicit target resolution of its own.
+pub(crate) const MOBILE_CHAT_RECIPE: &str = "mobile-chat";
+
+fn mobile_chat_job_id(client_key: &str) -> String {
+    format!(
+        "job-{}",
+        &sha256_hex(format!("mobile-chat:{client_key}").as_bytes())[..32]
+    )
+}
+
+/// Queues one mobile chat turn against the operator's `mobile-chat` recipe.
+/// Frozen snapshot (no CLI rules merging), one attempt, no worktree — the
+/// same conservative posture as `queue_client_recipe`.
+pub(crate) fn queue_mobile_chat_recipe(
+    paths: &DaemonPaths,
+    client_key: &str,
+    prompt: &str,
+) -> Result<QueuedRun, String> {
+    if client_key.is_empty() || client_key.len() > 256 {
+        return Err("Mobile chat queue key is invalid".to_string());
+    }
+    let config = DaemonConfig::load(paths).map_err(|error| {
+        format!(
+            "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
+        )
+    })?;
+    let mut store = DaemonStore::open(paths)?;
+    if store.kill_switch()? {
+        return Err("Global kill switch is engaged; mobile chat cannot be queued".to_string());
+    }
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let options = QueueOptions {
+        recipe: MOBILE_CHAT_RECIPE.to_string(),
+        params: vec![format!("prompt={prompt}")],
+        deterministic_job_id: Some(mobile_chat_job_id(client_key)),
+        priority: 0,
+        max_attempts: 1,
+        max_runtime_ms: 30 * 60 * 1_000,
+        max_memory_bytes: None,
+        owned_worktree: false,
+        repository: None,
+        branch_prefix: "codex/".to_string(),
+        allowed_remotes: vec!["origin".to_string()],
+        allow_commit: false,
+        allow_push: false,
+        allow_create_pull_request: false,
+        allow_review_comment: false,
+        parent_run_id: None,
+        // The recipe is used verbatim: its own system prompt is the mobile
+        // contract, never merged with whatever rules exist in the daemon
+        // process's cwd.
+        snapshot_is_frozen: true,
+    };
+    enqueue(None, paths, &config, &mut store, &mut shared, options)
+}
+
+/// Production implementation of the remote API's mobile chat seam.
+pub(crate) struct DaemonMobileChatQueue {
+    paths: DaemonPaths,
+}
+
+impl DaemonMobileChatQueue {
+    pub(crate) fn new(paths: DaemonPaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl remote::api::MobileChatQueue for DaemonMobileChatQueue {
+    fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String> {
+        queue_mobile_chat_recipe(&self.paths, client_key, prompt).map(|queued| queued.run_id)
+    }
+
+    fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String> {
+        let store = DaemonStore::open(&self.paths)?;
+        Ok(store
+            .get_job(&mobile_chat_job_id(client_key))?
+            .and_then(|job| job.run_id))
+    }
 }
 
 pub(crate) fn cancel_client_run(run_id: &str, reason: &str) -> Result<(), String> {
@@ -650,7 +734,10 @@ impl QueueOptions {
 }
 
 fn enqueue(
-    cli: &crate::Cli,
+    // `None` is only valid for frozen-snapshot submissions (see
+    // `snapshot_is_frozen`): the CLI value is consulted exclusively to merge
+    // rules/facts into a NON-frozen recipe's system prompt.
+    cli: Option<&crate::Cli>,
     paths: &DaemonPaths,
     config: &DaemonConfig,
     store: &mut DaemonStore,
@@ -692,6 +779,9 @@ fn enqueue(
     let effective_system = if snapshot_is_frozen {
         rendered.system.clone()
     } else {
+        let cli = cli.ok_or(
+            "A non-frozen recipe submission requires CLI context for rules merging",
+        )?;
         let state = crate::build_state(&Some(original_workspace.clone()))?;
         crate::effective_system(cli, &state, rendered.system.as_deref())
     };
@@ -1035,7 +1125,7 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         parent_run_id: prior.run_id,
         snapshot_is_frozen: true,
     };
-    let queued = enqueue(cli, &paths, &config, &mut store, &mut shared, options)?;
+    let queued = enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)?;
     let _ = std::fs::remove_file(retry_source);
     println!("Queued retry {} as {}", queued.job_id, queued.run_id);
     Ok(())
@@ -1494,7 +1584,12 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     // the serve loop can enforce revoke / kill-switch / escape-hatch stops on
     // the very same live sessions the API creates.
     let desktop_control = remote::DesktopControlRuntime::production(&paths);
-    remote::spawn_if_configured(paths.clone(), desktop_control.clone()).await?;
+    remote::spawn_if_configured(
+        paths.clone(),
+        desktop_control.clone(),
+        std::sync::Arc::new(DaemonMobileChatQueue::new(paths.clone())),
+    )
+    .await?;
     spawn_knowledge_refresh_scheduler()?;
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
@@ -1749,7 +1844,7 @@ fn process_one_pending_delivery(
         options.allow_create_pull_request = *allow_create_pull_request;
         options.allow_review_comment = *allow_review_comment;
     }
-    let queued = enqueue(cli, paths, config, store, shared, options)?;
+    let queued = enqueue(Some(cli), paths, config, store, shared, options)?;
     shared.mark_delivery_submitted(
         &pending.trigger_id,
         &pending.delivery_id,

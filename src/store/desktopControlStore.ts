@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Safe Desktop Control — a design-validation research spike. See
@@ -50,7 +51,7 @@ export interface EmergencyStopResult {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export interface DesktopControlStore {

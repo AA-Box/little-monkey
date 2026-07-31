@@ -10,6 +10,8 @@ import type {
   DesignWorktree,
 } from '../lib/designToApp';
 import { useVerifyStore } from './verifyStore';
+import { errorMessage } from "../lib/errors";
+import { hydrateState, persistState } from "../lib/persistedState";
 
 export const DESIGN_TO_APP_STORAGE_KEY = 'little-monkey-design-to-app-projects-v1';
 const STORAGE_VERSION = 1;
@@ -99,7 +101,7 @@ export function __resetDesignToAppControllersForTests(): void {
 }
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function portableProjects(projects: readonly DesignToAppProject[]): DesignToAppProject[] {
@@ -110,14 +112,7 @@ function portableProjects(projects: readonly DesignToAppProject[]): DesignToAppP
 }
 
 function persist(projects: readonly DesignToAppProject[]): void {
-  try {
-    localStorage.setItem(
-      DESIGN_TO_APP_STORAGE_KEY,
-      JSON.stringify({ version: STORAGE_VERSION, projects: portableProjects(projects) }),
-    );
-  } catch {
-    // The live project remains usable when local history is unavailable/full.
-  }
+  persistState(DESIGN_TO_APP_STORAGE_KEY, STORAGE_VERSION, { projects: portableProjects(projects) });
 }
 
 function isPlan(value: unknown): value is DesignImplementationPlan {
@@ -145,62 +140,56 @@ function isWorktree(value: unknown): value is DesignWorktree {
 }
 
 function hydrate(): DesignToAppProject[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(DESIGN_TO_APP_STORAGE_KEY) ?? 'null') as
-      | { version?: unknown; projects?: unknown }
-      | null;
-    if (raw?.version !== STORAGE_VERSION || !Array.isArray(raw.projects)) return [];
-    return raw.projects.flatMap((value): DesignToAppProject[] => {
-      if (!value || typeof value !== 'object') return [];
-      const item = value as Partial<DesignToAppProject>;
-      if (
-        typeof item.id !== 'string'
-        || typeof item.title !== 'string'
-        || typeof item.createdAtMs !== 'number'
-        || typeof item.updatedAtMs !== 'number'
-        || !STATUSES.has(item.status as DesignToAppStatus)
-      ) return [];
-      const sources = Array.isArray(item.sources)
-        ? item.sources.map(api.hydrateDesignSource).filter((source): source is DesignSource => source !== null)
-        : [];
-      const interrupted = RUNNING_STATUSES.has(item.status as DesignToAppStatus);
-      const plan = isPlan(item.plan) ? item.plan : null;
-      return [{
-        id: item.id,
-        title: item.title.slice(0, 300),
-        description: typeof item.description === 'string' ? item.description.slice(0, 8_000) : '',
-        repositorySlug: typeof item.repositorySlug === 'string' ? item.repositorySlug.slice(0, 300) : '',
-        previewUrl: typeof item.previewUrl === 'string' ? item.previewUrl.slice(0, 2_000) : '',
-        sources,
-        verificationCommandIds: Array.isArray(item.verificationCommandIds)
-          ? item.verificationCommandIds.filter((id): id is string => typeof id === 'string').slice(0, 12)
-          : [],
-        status: interrupted ? (plan ? 'planned' : 'draft') : item.status as DesignToAppStatus,
-        plan,
-        worktree: isWorktree(item.worktree) ? item.worktree : null,
-        patch: item.patch && typeof item.patch === 'object' ? item.patch as DesignPatchSummary : null,
-        verification: Array.isArray(item.verification)
-          ? item.verification.filter((result): result is DesignVerificationResult => Boolean(
-              result && typeof result === 'object' && typeof (result as DesignVerificationResult).commandId === 'string',
-            )).slice(0, 12)
-          : [],
-        beforeEvidence: item.beforeEvidence && typeof item.beforeEvidence === 'object'
-          ? item.beforeEvidence as DesignBrowserEvidence
-          : null,
-        afterEvidence: item.afterEvidence && typeof item.afterEvidence === 'object'
-          ? item.afterEvidence as DesignBrowserEvidence
-          : null,
-        implementationSummary: typeof item.implementationSummary === 'string' ? item.implementationSummary : null,
-        error: interrupted
-          ? 'The previous local run was interrupted when the app closed. Review saved history and retry; image inputs must be re-imported.'
-          : typeof item.error === 'string' ? item.error : null,
-        createdAtMs: item.createdAtMs,
-        updatedAtMs: item.updatedAtMs,
-      }];
-    });
-  } catch {
-    return [];
-  }
+  const raw = hydrateState(DESIGN_TO_APP_STORAGE_KEY, STORAGE_VERSION);
+  if (!raw || !Array.isArray(raw.projects)) return [];
+  return raw.projects.flatMap((value): DesignToAppProject[] => {
+    if (!value || typeof value !== 'object') return [];
+    const item = value as Partial<DesignToAppProject>;
+    if (
+      typeof item.id !== 'string'
+      || typeof item.title !== 'string'
+      || typeof item.createdAtMs !== 'number'
+      || typeof item.updatedAtMs !== 'number'
+      || !STATUSES.has(item.status as DesignToAppStatus)
+    ) return [];
+    const sources = Array.isArray(item.sources)
+      ? item.sources.map(api.hydrateDesignSource).filter((source): source is DesignSource => source !== null)
+      : [];
+    const interrupted = RUNNING_STATUSES.has(item.status as DesignToAppStatus);
+    const plan = isPlan(item.plan) ? item.plan : null;
+    return [{
+      id: item.id,
+      title: item.title.slice(0, 300),
+      description: typeof item.description === 'string' ? item.description.slice(0, 8_000) : '',
+      repositorySlug: typeof item.repositorySlug === 'string' ? item.repositorySlug.slice(0, 300) : '',
+      previewUrl: typeof item.previewUrl === 'string' ? item.previewUrl.slice(0, 2_000) : '',
+      sources,
+      verificationCommandIds: Array.isArray(item.verificationCommandIds)
+        ? item.verificationCommandIds.filter((id): id is string => typeof id === 'string').slice(0, 12)
+        : [],
+      status: interrupted ? (plan ? 'planned' : 'draft') : item.status as DesignToAppStatus,
+      plan,
+      worktree: isWorktree(item.worktree) ? item.worktree : null,
+      patch: item.patch && typeof item.patch === 'object' ? item.patch as DesignPatchSummary : null,
+      verification: Array.isArray(item.verification)
+        ? item.verification.filter((result): result is DesignVerificationResult => Boolean(
+            result && typeof result === 'object' && typeof (result as DesignVerificationResult).commandId === 'string',
+          )).slice(0, 12)
+        : [],
+      beforeEvidence: item.beforeEvidence && typeof item.beforeEvidence === 'object'
+        ? item.beforeEvidence as DesignBrowserEvidence
+        : null,
+      afterEvidence: item.afterEvidence && typeof item.afterEvidence === 'object'
+        ? item.afterEvidence as DesignBrowserEvidence
+        : null,
+      implementationSummary: typeof item.implementationSummary === 'string' ? item.implementationSummary : null,
+      error: interrupted
+        ? 'The previous local run was interrupted when the app closed. Review saved history and retry; image inputs must be re-imported.'
+        : typeof item.error === 'string' ? item.error : null,
+      createdAtMs: item.createdAtMs,
+      updatedAtMs: item.updatedAtMs,
+    }];
+  });
 }
 
 function upsert(projects: DesignToAppProject[], project: DesignToAppProject): DesignToAppProject[] {

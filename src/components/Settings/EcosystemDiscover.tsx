@@ -28,6 +28,7 @@ import {
   type DiscoverFilters,
   type TrustFilter,
 } from "../../lib/ecosystemDiscover";
+import { errorMessage } from "../../lib/errors";
 
 type PreviewIntent = "install" | "update";
 type DiscoverView = "browse" | "registries";
@@ -72,7 +73,7 @@ function RegistriesView({ onBack }: { onBack: () => void }) {
       setDisplayName("");
       setLocation("");
     } catch (error) {
-      useEcosystemStore.setState({ error: error instanceof Error ? error.message : String(error) });
+      useEcosystemStore.setState({ error: errorMessage(error) });
     }
   }
 

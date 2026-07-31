@@ -7,18 +7,10 @@ import { groupTracesByModel, serializeSupportBundle, supportBundleFileName } fro
 import { useRuntimeHubStore } from "../../../store/runtimeHubStore";
 import { StatusPill } from "../../ui";
 import { BusyButton, CONTROL_CLASS, ErrorNotice, JsonView, SectionHeading, SuccessNotice } from "./RuntimeHubShared";
+import { errorMessage } from "../../../lib/errors";
+import { formatBytes, formatDuration } from "../../../lib/format";
 
-function formatDuration(durationMs: number): string {
-  if (durationMs < 1_000) return `${durationMs} ms`;
-  return `${(durationMs / 1_000).toFixed(1)} s`;
-}
 
-function formatBytes(value: number): string {
-  if (value < 1_024) return `${value} B`;
-  if (value < 1_048_576) return `${(value / 1_024).toFixed(1)} KiB`;
-  if (value < 1_073_741_824) return `${(value / 1_048_576).toFixed(1)} MiB`;
-  return `${(value / 1_073_741_824).toFixed(2)} GiB`;
-}
 
 function TraceCard({ trace }: { trace: RuntimeTraceRecord }) {
   const when = new Date(trace.recordedAtMs).toLocaleString();
@@ -126,7 +118,7 @@ export function RuntimeHubTelemetry() {
       await writeTextFile(destination, serializeSupportBundle(supportBundle));
       setExportStatus({ tone: "success", message: "Support bundle exported." });
     } catch (error) {
-      setExportStatus({ tone: "danger", message: error instanceof Error ? error.message : String(error) });
+      setExportStatus({ tone: "danger", message: errorMessage(error) });
     } finally {
       setExporting(false);
     }

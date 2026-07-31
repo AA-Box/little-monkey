@@ -20,9 +20,10 @@ import { resolveTarget } from "../lib/agentLoop";
 import { attemptStream } from "../lib/turnEngine";
 import { scoreSpec, type SpecScore } from "../lib/specScorer";
 import { effortForTarget } from "./modelStore";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export type SpecScorerStatus = "idle" | "loading" | "done" | "error";

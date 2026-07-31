@@ -20,12 +20,27 @@ import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useTurnStatusStore } from '../store/turnStatusStore';
+import { useTaskSuggestionStore } from '../store/taskSuggestionStore';
 import { useModelStore } from '../store/modelStore';
+import {
+  assertCostBudgetAllowsRequest,
+  calculateUsageCostUsd,
+  useCostControlStore,
+} from '../store/costControlStore';
+import {
+  localModelTargetKey,
+  ollamaModelTargetKey,
+  providerModelTargetKey,
+} from './modelTargets';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
+import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
+import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
+import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { runSubagentTask } from './subagent';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
+import { errorMessage } from "./errors";
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -46,6 +61,28 @@ export function describeUsageTarget(target: ResolvedTarget): string {
   if (target.kind === 'local') return target.modelLabel ?? useModelStore.getState().active?.name ?? 'Local model';
   if (target.kind === 'ollama') return `Ollama · ${target.model}`;
   return `${target.providerId} · ${target.model}`;
+}
+
+function costTargetKey(target: ResolvedTarget): string {
+  if (target.kind === 'provider') {
+    return providerModelTargetKey(target.providerId, target.model);
+  }
+  if (target.kind === 'ollama') return ollamaModelTargetKey(target.model);
+  return localModelTargetKey(
+    useModelStore.getState().active?.id ?? target.modelLabel ?? 'local',
+  );
+}
+
+function isMeteredTarget(target: ResolvedTarget): boolean {
+  if (target.kind === 'provider') return true;
+  if (target.kind !== 'ollama') return false;
+  return (
+    useModelStore
+      .getState()
+      .ollamaModels
+      .find((model) => model.name === target.model)
+      ?.is_cloud === true
+  );
 }
 
 /** Stringifies a tool invocation's result (or error) for use as tool-message content. */
@@ -401,7 +438,13 @@ export async function executeToolCall(
   // `executeToolCall` with no context configured is defensively reported as
   // a tool error rather than throwing, same posture as an unconfigured
   // `subagent` reaching the `task` branch below.
-  skill?: SkillToolContext
+  skill?: SkillToolContext,
+  // The chat session this turn belongs to — needed only by the frontend-only
+  // `spawn_task` tool, whose chips render under one specific transcript.
+  // Omitted by every runner that doesn't offer `spawn_task` (subagents, side
+  // tasks, crew); a `spawn_task` call arriving without it is reported as a
+  // tool error rather than guessing which conversation to attach a chip to.
+  chatSessionId?: string
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
@@ -458,6 +501,33 @@ export async function executeToolCall(
   // site in `agentLoop.ts`.
   if (name === 'present_plan') {
     return PRESENT_PLAN_RESULT;
+  }
+
+  // `spawn_task` is frontend-only too, and deliberately inert: it stages a
+  // SUGGESTION chip under this session's transcript and returns. No model
+  // call, no session, no side effect happens until the user clicks the chip
+  // (see `taskSuggestionStore.ts`), which is why it needs no permission
+  // prompt — the model is proposing follow-up work, not starting it.
+  if (name === 'spawn_task') {
+    if (!chatSessionId) {
+      return stringifyToolError(new Error('The spawn_task tool is not available in this context.'));
+    }
+    const title = typeof args.title === 'string' ? args.title : '';
+    const prompt = typeof args.prompt === 'string' ? args.prompt : '';
+    if (!title.trim() || !prompt.trim()) {
+      return stringifyToolError(new Error('spawn_task requires non-empty "title" and "prompt" arguments.'));
+    }
+    const suggestion = useTaskSuggestionStore.getState().create({
+      sessionId: chatSessionId,
+      title,
+      tldr: typeof args.tldr === 'string' ? args.tldr : '',
+      prompt,
+    });
+    return stringifyToolResult({
+      task_id: suggestion.id,
+      status: 'suggested',
+      note: 'A chip was shown to the user. Nothing runs unless they click it — keep working on the current task.',
+    });
   }
 
   // `task` is another frontend-only tool, same treatment as `present_plan`
@@ -631,6 +701,40 @@ export async function executeToolCall(
     return raceInvocationWithStop(invocation, turnId, signal);
   }
 
+  // Background shell commands: one tool name (`run_shell`), two Rust
+  // commands. `run_in_background` selects the second — a process owned by
+  // `background_shell.rs` that outlives this turn — instead of the
+  // timeout-capped, killed-on-drop foreground child. The permission gate,
+  // and every frontend-injected arg above (checkpoint/turn/tool-call ids,
+  // the display-only risk annotation), is identical on both sides, so the
+  // flag changes the process's lifetime and nothing about its authority.
+  if (name === 'run_shell') {
+    const background = args.run_in_background === true;
+    const passthrough = { ...args };
+    delete passthrough.run_in_background;
+    const invocation = invoke(background ? 'tool_run_shell_background' : 'tool_run_shell', passthrough).then(
+      stringifyToolResult,
+      stringifyToolError,
+    );
+    return raceInvocationWithStop(invocation, turnId, signal);
+  }
+
+  // The two background-task companions to `run_shell`. Both read or stop a
+  // process the user can already see in the Background Tasks panel, so
+  // neither is permission-gated (nothing new is granted by them) and neither
+  // needs the Stop race: they return immediately. Their Rust commands aren't
+  // `tool_`-prefixed, so they can't fall through to the generic dispatch.
+  if (name === 'shell_output' || name === 'shell_kill') {
+    const id = typeof args.id === 'string' ? args.id.trim() : '';
+    if (!id) return stringifyToolError(new Error(`${name} requires an "id" argument (the background task id from run_shell).`));
+    return name === 'shell_output'
+      ? invoke('background_shell_output', { id, drain: args.drain === false ? false : true }).then(
+          stringifyToolResult,
+          stringifyToolError,
+        )
+      : invoke('background_shell_kill', { id }).then(stringifyToolResult, stringifyToolError);
+  }
+
   const invocation = name.startsWith('mcp__')
     ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
     : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
@@ -658,6 +762,68 @@ async function raceInvocationWithStop(
 
   void invoke('tools_cancel_running', { turnId }).catch(() => {});
   return CANCELLED_TOOL_RESULT;
+}
+
+/**
+ * How `attemptStream` applies the Privacy Firewall to an imminent
+ * provider-bound request. The firewall check lives INSIDE `attemptStream` —
+ * the one choke point every cloud request in the app flows through — so a
+ * surface that forgets to think about privacy (Compare, Crew, side tasks,
+ * subagents, translation, the eval judge, and every one-shot workbench
+ * flow) is gated by default rather than silently exempt.
+ */
+export interface AttemptPrivacyOptions {
+  /**
+   * The caller already passed this exact wire payload through
+   * `gatePrivacyWireMessages` (agentLoop's main turn/failover/compaction/
+   * judge paths do, because they own richer outcomes like switching the
+   * whole turn to a local model). Skips the redundant second scan.
+   */
+  preGated?: boolean;
+  /**
+   * Redaction cache shared across related attempts (e.g. one Compare run's
+   * four targets), so identical history is scanned/approved once. Scoped to
+   * a run on purpose — a longer-lived cache would let a stale "send"
+   * decision outlive a policy change.
+   */
+  cache?: PrivacyWireCache;
+}
+
+/**
+ * Applies the Privacy Firewall to a provider-bound wire copy. Returns the
+ * (possibly redacted) messages to send, or an `AttemptResult`-shaped refusal
+ * when the outcome forbids sending. A preview/gate failure fails CLOSED:
+ * nothing is sent on an error, because "the scanner broke" must never mean
+ * "the protected content left the machine anyway".
+ */
+async function gateProviderWire(
+  messages: ChatMessage[],
+  cache: PrivacyWireCache,
+): Promise<{ ok: true; messages: ChatMessage[] } | { ok: false; refusal: AttemptResult }> {
+  const workspaceId = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? 'global';
+  const refusal = (streamError: string): { ok: false; refusal: AttemptResult } => ({
+    ok: false,
+    refusal: { content: '', toolCalls: [], streamError, contentStarted: false },
+  });
+  let outcome: Awaited<ReturnType<typeof gatePrivacyWireMessages>>;
+  try {
+    outcome = await gatePrivacyWireMessages(
+      messages,
+      (content) => usePrivacyFirewallStore.getState().gateOutbound(content, 'cloud_model', workspaceId),
+      cache,
+    );
+  } catch (error) {
+    return refusal(
+      `Privacy Firewall could not inspect this request, so nothing was sent: ${errorMessage(error)}`,
+    );
+  }
+  if (outcome.action === 'cancelled') {
+    return refusal('Privacy Firewall blocked protected content from leaving the machine; the request was cancelled before anything was sent.');
+  }
+  if (outcome.action === 'switch_local') {
+    return refusal('Privacy Firewall requested a local model for this content. This surface cannot switch targets automatically — nothing was sent; pick a local target and retry.');
+  }
+  return { ok: true, messages: outcome.messages };
 }
 
 /** Result of a single streaming attempt against one target. */
@@ -725,8 +891,28 @@ export async function attemptStream(
    * classification calls run mid-turn under the same `sessionId` with
    * `recordUsage: true`, and would otherwise silently inflate the label. */
   recordTurnStatusTokens: boolean = true,
+  /** See {@link AttemptPrivacyOptions}. Omitted → gate here with a fresh
+   * per-attempt cache, which is the safe default for every one-shot caller. */
+  privacy?: AttemptPrivacyOptions,
 ): Promise<AttemptResult> {
-  if (target.kind === 'provider') recordRequest(target.providerId);
+  if (target.kind === 'provider') {
+    try {
+      assertCostBudgetAllowsRequest(useCostControlStore.getState());
+    } catch (error) {
+      return {
+        content: '',
+        toolCalls: [],
+        streamError: errorMessage(error),
+        contentStarted: false,
+      };
+    }
+    if (!privacy?.preGated) {
+      const gated = await gateProviderWire(wireHistory, privacy?.cache ?? new Map());
+      if (!gated.ok) return gated.refusal;
+      wireHistory = gated.messages;
+    }
+    recordRequest(target.providerId);
+  }
 
   let content = '';
   const toolCalls: ToolCall[] = [];
@@ -773,6 +959,19 @@ export async function attemptStream(
           completionTokens: event.usage.completion_tokens,
           totalTokens: event.usage.total_tokens,
         };
+        const costState = useCostControlStore.getState();
+        const targetKey = costTargetKey(target);
+        costState.recordUsage({
+          occurredAtMs: Date.now(),
+          targetKey,
+          targetLabel: describeUsageTarget(target),
+          sessionId,
+          runId: runId ?? null,
+          usage,
+          costUsd: isMeteredTarget(target)
+            ? calculateUsageCostUsd(costState.rates[targetKey], usage)
+            : 0,
+        });
         if (recordUsage) {
           useUsageStore.getState().setUsage(sessionId, usage);
           useUsageHistoryStore.getState().recordUsage(describeUsageTarget(target), usage);
@@ -787,7 +986,7 @@ export async function attemptStream(
       // 'done' carries no data; the generator simply returns after it.
     }
   } catch (err) {
-    streamError = err instanceof Error ? err.message : String(err);
+    streamError = errorMessage(err);
   }
 
   return { content, toolCalls, streamError, contentStarted, usage };

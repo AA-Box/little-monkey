@@ -52,6 +52,7 @@ export const crewLocale: Record<string, string> = {
   "CrewView.cost": "~${{cost}}",
   "CrewView.permissions": "{{count}} permission requests",
   "CrewView.explicitReport": "Explicit report",
+  "CrewView.plainOutput": "Output",
   "CrewView.toolRequests": "Tool requests",
   "CrewView.privateTranscript": "Private actor transcript ({{count}} events)",
   "CrewView.missing": "This saved Crew run is incomplete.",

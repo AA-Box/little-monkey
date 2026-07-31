@@ -465,16 +465,6 @@ impl AssetManager {
         self.activate_locked(&request.asset_id, &request.version)
     }
 
-    pub fn upgrade_file(
-        &self,
-        request: &AssetInstallRequest,
-        source: impl AsRef<Path>,
-    ) -> AssetManagerResult<ActiveAsset> {
-        let _guard = self.lock()?;
-        self.install_file_locked(request, source.as_ref())?;
-        self.activate_locked(&request.asset_id, &request.version)
-    }
-
     /// Explicitly unsupported: this method never opens or unpacks `archive`.
     pub fn install_archive_file(
         &self,

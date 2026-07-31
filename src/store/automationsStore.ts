@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type { RecipeSchedulerAuthority } from "../lib/recipeScheduleClient";
+import { errorMessage } from "../lib/errors";
 
 /** Emitted by the backend after a successful `automations_save` (see
  * src-tauri/src/automations.rs), with the saving window's label as payload —
@@ -128,7 +129,7 @@ function flushPersist(): void {
       await invoke("automations_save", { payload });
       useAutomationsStore.setState({ persistedEntries: persisted, persistError: null });
     } catch (err) {
-      useAutomationsStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+      useAutomationsStore.setState({ persistError: errorMessage(err) });
     }
   });
 }
@@ -146,7 +147,7 @@ function persist(entries: AutomationEntry[]): void {
   try {
     pendingPayload = JSON.stringify({ version: 1, entries } satisfies PersistedShape);
   } catch (err) {
-    useAutomationsStore.setState({ persistError: err instanceof Error ? err.message : String(err) });
+    useAutomationsStore.setState({ persistError: errorMessage(err) });
     return;
   }
   if (persistTimer === null) {
@@ -219,7 +220,7 @@ export async function hydrateAutomations(): Promise<void> {
   } catch (err) {
     useAutomationsStore.setState({
       hydrated: false,
-      persistError: err instanceof Error ? err.message : String(err),
+      persistError: errorMessage(err),
     });
   }
 }

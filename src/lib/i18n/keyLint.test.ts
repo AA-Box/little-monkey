@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { en } from "./locales/en";
-import { TRANSLATIONS } from "./index";
+import { ALL_TRANSLATIONS } from "./allTranslations";
 import { LOCALES, DEFAULT_LOCALE } from "./locales";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -107,7 +107,7 @@ describe("i18n key-lint", () => {
     const problems: string[] = [];
     for (const { code } of LOCALES) {
       if (code === DEFAULT_LOCALE) continue;
-      const dict = TRANSLATIONS[code];
+      const dict = ALL_TRANSLATIONS[code];
       const extras = Object.keys(dict).filter((k) => !enKeys.has(k));
       if (extras.length > 0) problems.push(`${code}: ${extras.join(", ")}`);
     }
@@ -122,7 +122,7 @@ describe("i18n key-lint", () => {
     // fallback (index.ts) already covers at runtime for any reader.
     for (const { code } of LOCALES) {
       if (code === DEFAULT_LOCALE) continue;
-      const dictKeys = new Set(Object.keys(TRANSLATIONS[code]));
+      const dictKeys = new Set(Object.keys(ALL_TRANSLATIONS[code]));
       const gap = [...enKeys].filter((k) => !dictKeys.has(k));
       if (gap.length > 0) {
         console.warn(

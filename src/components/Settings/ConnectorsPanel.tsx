@@ -37,6 +37,7 @@ import {
 import { useMcpStore, type McpOAuthPhase } from "../../store/mcpStore";
 import { useT } from "../../lib/i18n";
 import { McpPanel, shouldShowManualOAuthClientFields } from "./McpPanel";
+import { errorMessage } from "../../lib/errors";
 
 const PROVIDER_ICONS: Record<ConnectorProvider, LucideIcon> = {
   github: GitPullRequest,
@@ -254,7 +255,7 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
         await connect(template.id);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setConnecting(false);
     }
@@ -270,7 +271,7 @@ function AppConnectorCard({ template }: { template: AppConnectorTemplate }) {
         await disconnect(template.id);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setDisconnecting(false);
     }
@@ -456,7 +457,7 @@ function GithubConnectCard() {
       const account = await addGithub();
       setConnected(account);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setConnecting(false);
     }
@@ -524,7 +525,7 @@ function TokenConnectForm({ info, onDone }: { info: TokenProviderInfo; onDone: (
       });
       onDone();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -613,7 +614,7 @@ function S3ConnectForm({ onDone }: { onDone: () => void }) {
       });
       onDone();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -712,7 +713,7 @@ function AccountRow({ account }: { account: ConnectorAccount }) {
     try {
       await reverify(account.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
     } finally {
       setReverifying(false);
     }
@@ -724,7 +725,7 @@ function AccountRow({ account }: { account: ConnectorAccount }) {
     try {
       await remove(account.id);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(errorMessage(err));
       setRemoving(false);
     }
   }
@@ -785,7 +786,7 @@ function AuditExport() {
     try {
       setAudit(await exportAudit());
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }

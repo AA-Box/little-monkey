@@ -10,7 +10,29 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Release preflight
+        run: pnpm release:preflight
+
   release:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:

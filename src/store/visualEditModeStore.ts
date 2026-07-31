@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 import { proposeVisualEdit, writeVisualEditToDisk, type VisualEditElement } from "../lib/visualEditMode";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Visual Design Edit Mode (ROADMAP.md Phase 7) — holds every visual edit the
@@ -104,7 +105,7 @@ export const useVisualEditModeStore = create<VisualEditModeState>((set, get) => 
       );
     } catch (err) {
       set((state) =>
-        patchEdit(state, id, { status: "error", error: err instanceof Error ? err.message : String(err) }),
+        patchEdit(state, id, { status: "error", error: errorMessage(err) }),
       );
     }
   }
@@ -161,7 +162,7 @@ export const useVisualEditModeStore = create<VisualEditModeState>((set, get) => 
         await writeVisualEditToDisk(edit.targetFile, edit.newContent);
         set((state) => patchEdit(state, id, { status: "accepted", error: null }));
       } catch (err) {
-        set((state) => patchEdit(state, id, { error: err instanceof Error ? err.message : String(err) }));
+        set((state) => patchEdit(state, id, { error: errorMessage(err) }));
         throw err;
       }
     },

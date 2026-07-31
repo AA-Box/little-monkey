@@ -18,6 +18,7 @@ import { usePromptStore } from "../../store/promptStore";
 import { useShortcutStore } from "../../store/shortcutStore";
 import MessageList from "./MessageList";
 import RunningTasksChip from "./RunningTasksChip";
+import TaskSuggestionChips from "./TaskSuggestionChips";
 import { MentionAutocomplete } from "./MentionAutocomplete";
 import type { MentionEntry } from "./MentionAutocomplete";
 import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
@@ -33,7 +34,7 @@ import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
-import { WorkspaceBar } from "../Workspace";
+import { WorkspaceBar } from "../Workspace/WorkspaceBar";
 import { useT } from "../../lib/i18n";
 import { detectShortcutPlatform, shortcutIdForEvent } from "../../lib/shortcuts";
 import {
@@ -82,8 +83,9 @@ import { useTerminalStore } from "../../store/terminalStore";
 import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
 import type { SettingsTab } from "../Settings";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
+import { errorMessage } from "../../lib/errors";
 
-const MAX_TEXTAREA_HEIGHT_PX = 192;
+const MAX_TEXTAREA_HEIGHT_PX = 160;
 
 /** Shape returned by the Rust `list_workspace_paths` command. */
 interface WorkspacePathsResult {
@@ -751,7 +753,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         textareaRef.current?.focus();
       });
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     }
   }, [resizeTextarea, t]);
 
@@ -775,7 +777,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // `settingsStore.skillAutoInvokeEnabled`.
     void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
       .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(errorMessage(err));
       })
       .finally(() => {
         textareaRef.current?.focus();
@@ -946,7 +948,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       void executeBuiltIn(builtIn.definition.command, builtIn.arguments).catch((commandError: unknown) => {
         appendCommandNotice(
           builtIn.definition.command,
-          commandError instanceof Error ? commandError.message : String(commandError),
+          errorMessage(commandError),
           false,
         );
       });
@@ -960,7 +962,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     try {
       skillInvocations = await prepareTurnInstructions(text);
     } catch (skillError) {
-      setError(`No turn was sent because enabled plugin instructions could not be verified: ${skillError instanceof Error ? skillError.message : String(skillError)}`);
+      setError(`No turn was sent because enabled plugin instructions could not be verified: ${errorMessage(skillError)}`);
       preparingTurnRef.current = false;
       setPreparingTurn(false);
       return;
@@ -978,7 +980,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         setAttachments([]);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(errorMessage(err));
       } finally {
         setStartingCrew(false);
         textareaRef.current?.focus();
@@ -994,7 +996,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         setAttachments([]);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(errorMessage(err));
       } finally {
         setStartingComparison(false);
         textareaRef.current?.focus();
@@ -1028,7 +1030,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           sendTurn(newText, [], skillInvocations);
         })
         .catch((turnError: unknown) => {
-          setError(turnError instanceof Error ? turnError.message : String(turnError));
+          setError(errorMessage(turnError));
         })
         .finally(() => {
           preparingTurnRef.current = false;
@@ -1104,7 +1106,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         sendTurn(text, imageAttachments, skillInvocations, ultracodeMode);
       })
       .catch((turnError: unknown) => {
-        setError(turnError instanceof Error ? turnError.message : String(turnError));
+        setError(errorMessage(turnError));
       })
       .finally(() => {
         preparingTurnRef.current = false;
@@ -1418,6 +1420,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         </div>
       )}
 
+      <TaskSuggestionChips sessionId={sessionId} />
+
       <RunningTasksChip onClick={onOpenBackgroundTasks} />
 
       <div className="relative shrink-0 bg-background px-4 py-3">
@@ -1442,7 +1446,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
               onHoverIndex={setSlashActiveIndex}
             />
           )}
-          <div className="flex flex-col rounded-3xl border border-border bg-surface px-4 py-2.5 transition-colors focus-within:border-accent focus-within:ring-1 focus-within:ring-accent">
+          <div className="flex flex-col rounded-3xl border border-border bg-surface px-4 py-2 transition-colors focus-within:border-accent focus-within:ring-1 focus-within:ring-accent">
             {(activePackageRuleCount > 0 || invokedSkillPreview.length > 0) && (
               <div className="mb-1.5 flex flex-wrap gap-1.5" aria-label={t("ChatWindow.activeTurnInstructionsLabel")}>
                 {activePackageRuleCount > 0 && (
@@ -1493,7 +1497,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   rows={1}
                   disabled={preparingTurn || startingComparison || startingCrew}
                   data-focus-ring="custom"
-                  className={`max-h-48 min-h-[2.25rem] w-full resize-none bg-transparent py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-faint ${
+                  className={`block max-h-40 min-h-[1.75rem] w-full resize-none bg-transparent py-1 text-sm leading-relaxed outline-none placeholder:text-faint ${
                     commandSegments ? "text-transparent caret-foreground" : "text-foreground"
                   }`}
                 />
@@ -1501,7 +1505,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   <div
                     ref={commandOverlayRef}
                     aria-hidden
-                    className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words py-1.5 text-[15px] leading-relaxed text-foreground"
+                    className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words py-1 text-sm leading-relaxed text-foreground"
                   >
                     {commandSegments.map((segment, index) =>
                       segment.command ? (

@@ -196,6 +196,9 @@ mod sessions;
 mod system;
 mod terminal;
 mod tools;
+// Long-running agent shell commands that outlive the turn that started them
+// (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
+pub mod background_shell;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
@@ -320,6 +323,12 @@ pub struct AppState {
     /// in Rust so every WebView observes one lifecycle and workspace changes
     /// can terminate shells before their roots are detached.
     pub terminal: terminal::TerminalManager,
+    /// Background agent shell commands (`run_shell` with
+    /// `run_in_background: true`). Owned here rather than by the turn that
+    /// spawned them — that is what lets a dev server or watcher keep running
+    /// after the tool call returns, and what gives `shell_output`/`shell_kill`
+    /// something to address later. Killed on app shutdown.
+    pub background_shell: background_shell::BackgroundShellManager,
     pub permissions: permissions::PermissionState,
     /// Cancellation handles for in-flight `providers_stream_chat` requests,
     /// keyed by `request_id` — see `providers::providers_cancel_chat`.
@@ -570,6 +579,7 @@ impl Default for AppState {
             ollama: Default::default(),
             workspace_roots: Default::default(),
             terminal: Default::default(),
+            background_shell: Default::default(),
             permissions: Default::default(),
             stream_cancels: Default::default(),
             checkpoints: Default::default(),
@@ -891,7 +901,6 @@ pub fn run() {
             triage::triage_list,
             triage::triage_generate_draft,
             triage::triage_send_draft,
-            providers::providers_list_presets,
             providers::providers_list_configured,
             providers::providers_add_custom,
             providers::providers_remove_custom,
@@ -911,7 +920,6 @@ pub fn run() {
             models::models_remove_external,
             permissions::permission_respond,
             permissions::set_permission_mode,
-            permissions::get_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,
             terminal::terminal_identity,
@@ -934,6 +942,11 @@ pub fn run() {
             tools::tool_generate_image,
             tools::workspace_read_image,
             tools::tool_run_shell,
+            background_shell::tool_run_shell_background,
+            background_shell::background_shell_output,
+            background_shell::background_shell_kill,
+            background_shell::background_shell_list,
+            background_shell::background_shell_clear_finished,
             tools::tools_cancel_running,
             tools::list_workspace_paths,
             tools::tool_remember,
@@ -1237,7 +1250,6 @@ pub fn run() {
             browser_worker::browser_click,
             browser_worker::browser_type_text,
             browser_worker::browser_scroll,
-            browser_worker::browser_screenshot,
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
             daemon_commands::daemon_desktop_status,
@@ -1367,6 +1379,7 @@ pub fn run() {
 
             let state = app_handle.state::<AppState>();
             state.terminal.kill_all(Some(app_handle));
+            state.background_shell.kill_all();
             tauri::async_runtime::block_on(mcp::disconnect_all(state.inner()));
             llama::stop_all_blocking(state.inner());
         }

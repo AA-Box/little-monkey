@@ -452,6 +452,10 @@ impl RuntimeTraceStore {
             .collect()
     }
 
+    /// Retained-trace count. Only the ring-capacity tests need this — every
+    /// production reader wants the records themselves via [`Self::recent`],
+    /// so exposing a second public counter would just be a parallel API.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.records.lock().map(|records| records.len()).unwrap_or(0)
     }
@@ -476,10 +480,6 @@ impl RuntimeTelemetryState {
 
     pub fn redactor(&self) -> &Redactor {
         &self.redactor
-    }
-
-    pub fn trace_count(&self) -> usize {
-        self.store.len()
     }
 
     pub fn recent(&self, runtime_id: Option<&str>, limit: usize) -> Vec<RuntimeTraceRecord> {
