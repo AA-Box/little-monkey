@@ -7,6 +7,8 @@ import { useMcpStore } from "../../store/mcpStore";
 import { IconButton, StatusPill, type PillTone } from "../ui";
 import type { SettingsTab } from "../Settings";
 import type { RiskLevel, RunStatus } from "../../lib/runProtocol";
+import { errorMessage } from "../../lib/errors";
+import { formatBytes } from "../../lib/format";
 
 interface DailyBriefPanelProps {
   onClose: () => void;
@@ -33,18 +35,6 @@ const RUN_STATUS_LABEL_KEY: Record<RunStatus, string> = {
   needs_reconciliation: "DailyBriefPanel.runStatus.needs_reconciliation",
 };
 
-function formatBytes(bytes: number | null): string {
-  if (bytes == null) return "—";
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  return `${value.toFixed(1)} ${units[unitIndex]}`;
-}
 
 function formatDurationHours(ms: number): number {
   return Math.round(ms / (60 * 60 * 1000));
@@ -168,7 +158,7 @@ export function DailyBriefPanel({ onClose, onOpenRunCenter, onOpenAgentInbox, on
       setSourceLabel("");
       setSourceArguments("{}");
     } catch (error) {
-      setSourceError(error instanceof Error ? error.message : String(error));
+      setSourceError(errorMessage(error));
     }
   }
 

@@ -31,6 +31,7 @@ import {
   type ContractTestReport,
   type MockExample,
 } from "../lib/apiContractDiff";
+import { errorMessage } from "../lib/errors";
 
 /** Fixed pseudo-session id for this lab's one-shot model call — this run
  * never belongs to a chat session; `recordUsage: false` (see `compile`-style
@@ -138,7 +139,7 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
         draftError: null,
       });
     } catch (err) {
-      set({ loadingSlot: null, loadError: err instanceof Error ? err.message : String(err) });
+      set({ loadingSlot: null, loadError: errorMessage(err) });
     }
   },
 
@@ -161,7 +162,7 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
         testStub: "",
         contractTests: null,
         hasRun: false,
-        diffError: err instanceof Error ? err.message : String(err),
+        diffError: errorMessage(err),
       });
     }
   },
@@ -192,7 +193,7 @@ export const useApiContractDiffStore = create<ApiContractDiffStore>((set, get) =
       const notes = await draftClientImpactNotes(changes, callModel);
       set({ impactNotes: notes, drafting: false });
     } catch (err) {
-      set({ drafting: false, draftError: err instanceof Error ? err.message : String(err) });
+      set({ drafting: false, draftError: errorMessage(err) });
     }
   },
 

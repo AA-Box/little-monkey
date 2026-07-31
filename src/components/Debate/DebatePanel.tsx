@@ -11,6 +11,8 @@ import {
   type DebateStatus,
 } from "../../store/debateStore";
 import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+import { errorMessage } from "../../lib/errors";
+import { formatTimestamp } from "../../lib/format";
 
 interface DebatePanelProps {
   onClose: () => void;
@@ -30,9 +32,6 @@ function roleStatusTone(status: DebateRoleStatus): PillTone {
   return "neutral";
 }
 
-function formatTime(value: number): string {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(value);
-}
 
 function PositionCard({ position }: { position: DebatePosition }) {
   const { t } = useT();
@@ -95,7 +94,7 @@ export function DebatePanel({ onClose }: DebatePanelProps) {
       startDebate(question);
       setQuestion("");
     } catch (err) {
-      setValidationError(err instanceof Error ? err.message : String(err));
+      setValidationError(errorMessage(err));
     }
   }
 
@@ -137,7 +136,7 @@ export function DebatePanel({ onClose }: DebatePanelProps) {
                 </div>
                 <div className="mt-2 flex items-center justify-between gap-2 text-xs text-faint">
                   <span className="truncate">{run.modelLabel}</span>
-                  <time dateTime={new Date(run.createdAt).toISOString()}>{formatTime(run.createdAt)}</time>
+                  <time dateTime={new Date(run.createdAt).toISOString()}>{formatTimestamp(run.createdAt)}</time>
                 </div>
               </button>
             ))

@@ -15,6 +15,7 @@ import {
   type McpToolSpec,
 } from "../lib/mcpGenerator";
 import { runSimulation, type SimulationReport } from "../lib/mcpSimulator";
+import { errorMessage } from "../lib/errors";
 
 const STORAGE_KEY = "little-monkey-mcp-generator-v1";
 
@@ -192,7 +193,7 @@ export const useMcpGeneratorStore = create<McpGeneratorStore>((set, get) => ({
       set({ entries, selectedEntryId: entry.id });
       return entry;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       set({ error: message });
       throw error;
     } finally {
@@ -229,7 +230,7 @@ export const useMcpGeneratorStore = create<McpGeneratorStore>((set, get) => ({
       persist(entries);
       set({ entries });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       set({ error: message });
     } finally {
       set({ simulating: false });
@@ -268,7 +269,7 @@ export const useMcpGeneratorStore = create<McpGeneratorStore>((set, get) => ({
       set({ entries });
       return destination;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       set({ error: message });
       throw error;
     } finally {

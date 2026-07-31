@@ -17,6 +17,7 @@ import {
   parseGeneratedImageReceipt,
 } from "../../lib/imageGeneration";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 interface GeneratedImageCardProps {
   path: string;
@@ -63,7 +64,7 @@ function GeneratedImageCard({ path, prompt, result, failed, onEdit }: GeneratedI
         if (!stale) setDataUrl(url);
       })
       .catch((caught: unknown) => {
-        if (!stale) setLoadError(caught instanceof Error ? caught.message : String(caught));
+        if (!stale) setLoadError(errorMessage(caught));
       });
     return () => {
       stale = true;
@@ -90,7 +91,7 @@ function GeneratedImageCard({ path, prompt, result, failed, onEdit }: GeneratedI
       setAction("copied");
     } catch (caught) {
       setAction("idle");
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     }
   };
 
@@ -111,7 +112,7 @@ function GeneratedImageCard({ path, prompt, result, failed, onEdit }: GeneratedI
       setAction("saved");
     } catch (caught) {
       setAction("idle");
-      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setActionError(errorMessage(caught));
     }
   };
 

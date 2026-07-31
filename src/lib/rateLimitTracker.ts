@@ -4,9 +4,12 @@
  * never asserts what a provider's actual free-tier limit is, since those
  * change and aren't reliably knowable from here.
  */
+import type { ProviderRateLimit } from '../store/settingsStore';
+
 const STORAGE_KEY = 'little-monkey-rate-limit-log';
 const ONE_MINUTE_MS = 60_000;
 const ONE_DAY_MS = 24 * 60 * ONE_MINUTE_MS;
+const WARNING_THRESHOLD = 0.8;
 /** Timestamps older than this are pruned on every read/write — nothing configured warns past a day, so nothing needs to be kept longer. */
 const MAX_AGE_MS = ONE_DAY_MS;
 
@@ -60,4 +63,73 @@ export function getCountLastMinute(providerId: string, now: number = Date.now())
 /** Convenience: count within the last 24h. */
 export function getCountLastDay(providerId: string, now: number = Date.now()): number {
   return getCountInWindow(providerId, ONE_DAY_MS, now);
+}
+
+export type RateLimitWarningWindow = 'minute' | 'day';
+export type RateLimitWarningSeverity = 'approaching' | 'exceeded';
+
+export interface RateLimitWarning {
+  providerId: string;
+  window: RateLimitWarningWindow;
+  severity: RateLimitWarningSeverity;
+  currentCount: number;
+  nextCount: number;
+  limit: number;
+  percent: number;
+}
+
+function configuredLimit(value: number | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  return Math.max(1, Math.trunc(value));
+}
+
+function evaluateWindow(
+  providerId: string,
+  window: RateLimitWarningWindow,
+  currentCount: number,
+  rawLimit: number | undefined,
+): RateLimitWarning | null {
+  const limit = configuredLimit(rawLimit);
+  if (limit === null) return null;
+  const nextCount = currentCount + 1;
+  const percent = nextCount / limit;
+  if (percent < WARNING_THRESHOLD) return null;
+  return {
+    providerId,
+    window,
+    severity: nextCount > limit ? 'exceeded' : 'approaching',
+    currentCount,
+    nextCount,
+    limit,
+    percent,
+  };
+}
+
+/**
+ * Evaluates the request that is about to be attempted. Counts are
+ * intentionally read before `attemptStream` calls `recordRequest`, so the
+ * returned `nextCount` is the number the imminent request will consume.
+ * Failed requests and provider failovers still count because the provider
+ * received an attempt.
+ */
+export function evaluateRateLimit(
+  providerId: string,
+  configured: ProviderRateLimit | undefined,
+  now: number = Date.now(),
+): RateLimitWarning[] {
+  if (!configured) return [];
+  return [
+    evaluateWindow(
+      providerId,
+      'minute',
+      getCountLastMinute(providerId, now),
+      configured.rpm,
+    ),
+    evaluateWindow(
+      providerId,
+      'day',
+      getCountLastDay(providerId, now),
+      configured.rpd,
+    ),
+  ].filter((warning): warning is RateLimitWarning => warning !== null);
 }

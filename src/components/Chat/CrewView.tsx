@@ -11,12 +11,14 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
-import { cancelCrewRun, retryCrewRun } from "../../lib/crewRunner";
+import { cancelCrewRun, crewActorPlainOutput, retryCrewRun } from "../../lib/crewRunner";
 import type { CrewActorRun, CrewActorStatus, CrewRunStatus } from "../../lib/crewTypes";
 import { useT } from "../../lib/i18n";
 import { useSessionStore } from "../../store/sessionStore";
 import { Button } from "../ui";
 import { markdownComponents, PROSE_CLASSES } from "./MessageBubble";
+import { errorMessage } from "../../lib/errors";
+import { formatDuration } from "../../lib/format";
 
 interface CrewViewProps {
   sessionId: string;
@@ -30,11 +32,6 @@ function statusTone(status: CrewActorStatus | CrewRunStatus): string {
   return "border-border bg-surface-2 text-muted";
 }
 
-function formatDuration(value: number | null): string {
-  if (value === null) return "—";
-  if (value < 1_000) return `${value} ms`;
-  return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} s`;
-}
 
 function ActorCard({ actor }: { actor: CrewActorRun }) {
   const { t } = useT();
@@ -86,14 +83,25 @@ function ActorCard({ actor }: { actor: CrewActorRun }) {
           </span>
         </div>
 
-        {actor.report && (
-          <div>
-            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-faint">{t("CrewView.explicitReport")}</p>
-            <div className={`${PROSE_CLASSES} max-w-none text-sm`}>
-              <ReactMarkdown components={markdownComponents}>{actor.report}</ReactMarkdown>
+        {(() => {
+          // `crewActorPlainOutput` falls back to the member's raw text when
+          // no explicit report was parsed — without it, a member that
+          // answered plainly (or a coordinator that skipped the report
+          // format) rendered as an empty card even though it produced real
+          // output.
+          const output = crewActorPlainOutput(actor);
+          if (!output) return null;
+          return (
+            <div>
+              <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-faint">
+                {actor.report ? t("CrewView.explicitReport") : t("CrewView.plainOutput")}
+              </p>
+              <div className={`${PROSE_CLASSES} max-w-none text-sm`}>
+                <ReactMarkdown components={markdownComponents}>{output}</ReactMarkdown>
+              </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {actor.toolRequests.length > 0 && (
           <div>
@@ -167,7 +175,7 @@ export function CrewView({ sessionId }: CrewViewProps) {
   function retry() {
     setActionError(null);
     void retryCrewRun(sessionId).catch((error: unknown) => {
-      setActionError(error instanceof Error ? error.message : String(error));
+      setActionError(errorMessage(error));
     });
   }
 

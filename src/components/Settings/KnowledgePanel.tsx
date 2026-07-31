@@ -13,6 +13,7 @@ import {
   type KnowledgeStack,
   type StackQueryResult,
 } from "../../store/stackStore";
+import { errorMessage } from "../../lib/errors";
 
 const EMBED_STATUS_TONE: Record<string, PillTone> = {
   ready: "success",
@@ -127,7 +128,7 @@ export function KnowledgePanel() {
       setNewOllamaTag("");
       setCreating(false);
     } catch (err) {
-      setCreateError(err instanceof Error ? err.message : String(err));
+      setCreateError(errorMessage(err));
     }
   }, [newName, newBackend, newModelId, newOllamaTag, createStack, t]);
 
@@ -418,7 +419,7 @@ function StackRow({
       const hits = await onQuery([stack.id], query);
       setResults(hits);
     } catch (err) {
-      setSearchError(err instanceof Error ? err.message : String(err));
+      setSearchError(errorMessage(err));
     } finally {
       setSearching(false);
     }

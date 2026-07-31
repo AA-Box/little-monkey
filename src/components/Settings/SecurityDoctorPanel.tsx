@@ -16,6 +16,7 @@ import {
   type SecurityFindingStatus,
 } from "../../lib/securityDoctorClient";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 const STATUS_ORDER: Record<SecurityFindingStatus, number> = {
   critical: 0,
@@ -34,7 +35,7 @@ const STATUS_STYLE: Record<SecurityFindingStatus, string> = {
 };
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function FindingIcon({ status }: { status: SecurityFindingStatus }) {

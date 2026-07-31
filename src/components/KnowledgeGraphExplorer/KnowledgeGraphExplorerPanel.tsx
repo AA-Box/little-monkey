@@ -7,6 +7,7 @@ import { useKnowledgeGraphStore } from "../../store/knowledgeGraphStore";
 import { useStackStore } from "../../store/stackStore";
 import { useSessionStore } from "../../store/sessionStore";
 import { Button, IconButton } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface KnowledgeGraphExplorerPanelProps {
   onClose: () => void;
@@ -42,7 +43,7 @@ function MermaidDiagram({ diagram }: { diagram: string }) {
           setError(null);
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (!cancelled) setError(errorMessage(err));
       }
     })();
 

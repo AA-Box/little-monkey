@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter,
+    types::Value as SqlValue,
+    OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -565,7 +569,7 @@ pub fn global_search(
     ledger: &mut RunLedger,
     request: &GlobalSearchRequest,
 ) -> ProfileStoreResult<Vec<GlobalSearchHit>> {
-    global_search_impl(ledger, None, request)
+    global_search_impl(ledger, None, request, None)
 }
 
 /// Search variant used by the desktop/daemon boundary when the shared
@@ -577,13 +581,32 @@ pub fn global_search_with_artifacts(
     artifacts: &ArtifactStore,
     request: &GlobalSearchRequest,
 ) -> ProfileStoreResult<Vec<GlobalSearchHit>> {
-    global_search_impl(ledger, Some(artifacts), request)
+    global_search_impl(ledger, Some(artifacts), request, None)
+}
+
+/// Desktop-boundary search variant that limits workspace-owned documents to
+/// roots the native process has independently derived from `AppState`.
+/// Documents with no workspace remain visible because profile-level content
+/// (for example an intentionally global chat) has no root grant to check.
+pub fn global_search_with_artifacts_scoped(
+    ledger: &mut RunLedger,
+    artifacts: &ArtifactStore,
+    request: &GlobalSearchRequest,
+    allowed_workspace_paths: &[String],
+) -> ProfileStoreResult<Vec<GlobalSearchHit>> {
+    global_search_impl(
+        ledger,
+        Some(artifacts),
+        request,
+        Some(allowed_workspace_paths),
+    )
 }
 
 fn global_search_impl(
     ledger: &mut RunLedger,
     artifacts: Option<&ArtifactStore>,
     request: &GlobalSearchRequest,
+    allowed_workspace_paths: Option<&[String]>,
 ) -> ProfileStoreResult<Vec<GlobalSearchHit>> {
     validate_search_request(request)?;
     if !ledger_has_fts5(ledger)? {
@@ -596,7 +619,7 @@ fn global_search_impl(
     let to_ms = request.to_ms.map(sql_timestamp).transpose()?;
     let limit = i64::try_from(request.limit)
         .map_err(|_| invalid("search.limit", "cannot be represented by SQLite"))?;
-    let mut statement = ledger.connection().prepare(
+    let mut sql = String::from(
         "SELECT d.document_id, d.source_kind, d.source_id,
                 d.session_id, d.run_id, d.title, d.role,
                 snippet(profile_search_fts, 0, '[[', ']]', ' … ', 32),
@@ -611,23 +634,52 @@ fn global_search_impl(
             AND (?4 IS NULL OR d.occurred_at_ms <= ?4)
             AND (?5 IS NULL OR d.model_key = ?5)
             AND (?6 IS NULL OR d.persona_id = ?6)
-            AND (?7 IS NULL OR d.workspace_path = ?7)
-          ORDER BY bm25(profile_search_fts), d.occurred_at_ms DESC,
+            AND (?7 IS NULL OR d.workspace_path = ?7)",
+    );
+    if let Some(paths) = allowed_workspace_paths {
+        if paths.is_empty() {
+            sql.push_str("\n            AND d.workspace_path IS NULL");
+        } else {
+            let placeholders = (0..paths.len())
+                .map(|index| format!("?{}", index + 9))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(
+                "\n            AND (d.workspace_path IS NULL OR d.workspace_path IN ({placeholders}))"
+            ));
+        }
+    }
+    sql.push_str(
+        "\n          ORDER BY bm25(profile_search_fts), d.occurred_at_ms DESC,
                    d.document_id
           LIMIT ?8",
-    )?;
-    let rows = statement.query_map(
-        params![
-            fts_query,
-            i64::from(request.include_archived),
-            from_ms,
-            to_ms,
-            request.model_key,
-            request.persona_id,
-            request.workspace_path,
-            limit,
-        ],
-        |row| {
+    );
+
+    let mut values = vec![
+        SqlValue::Text(fts_query),
+        SqlValue::Integer(i64::from(request.include_archived)),
+        from_ms.map_or(SqlValue::Null, SqlValue::Integer),
+        to_ms.map_or(SqlValue::Null, SqlValue::Integer),
+        request
+            .model_key
+            .clone()
+            .map_or(SqlValue::Null, SqlValue::Text),
+        request
+            .persona_id
+            .clone()
+            .map_or(SqlValue::Null, SqlValue::Text),
+        request
+            .workspace_path
+            .clone()
+            .map_or(SqlValue::Null, SqlValue::Text),
+        SqlValue::Integer(limit),
+    ];
+    if let Some(paths) = allowed_workspace_paths {
+        values.extend(paths.iter().cloned().map(SqlValue::Text));
+    }
+
+    let mut statement = ledger.connection().prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -644,8 +696,7 @@ fn global_search_impl(
                 row.get::<_, i64>(12)?,
                 row.get::<_, f64>(13)?,
             ))
-        },
-    )?;
+        })?;
 
     let mut hits = Vec::new();
     for row in rows {
@@ -3308,6 +3359,77 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    #[test]
+    fn scoped_search_only_returns_native_allowlisted_workspaces_and_global_rows() {
+        let env = TestEnv::new("scoped-search");
+        let (mut ledger, artifacts) = env.open();
+        save_payload(&mut ledger, &artifacts, &fixture_payload()).unwrap();
+        let request = GlobalSearchRequest {
+            query: "alpha needle".to_string(),
+            include_archived: true,
+            ..GlobalSearchRequest::default()
+        };
+
+        let active = global_search_with_artifacts_scoped(
+            &mut ledger,
+            &artifacts,
+            &request,
+            &["/workspace/active".to_string()],
+        )
+        .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id.as_deref(), Some("session-active"));
+
+        let component_prefix_is_not_a_grant = global_search_with_artifacts_scoped(
+            &mut ledger,
+            &artifacts,
+            &request,
+            &["/workspace".to_string()],
+        )
+        .unwrap();
+        assert!(component_prefix_is_not_a_grant.is_empty());
+
+        let no_attached_roots =
+            global_search_with_artifacts_scoped(&mut ledger, &artifacts, &request, &[])
+                .unwrap();
+        assert!(no_attached_roots.is_empty());
+
+        let explicitly_detached = global_search_with_artifacts_scoped(
+            &mut ledger,
+            &artifacts,
+            &GlobalSearchRequest {
+                workspace_path: Some("/workspace/archived".to_string()),
+                ..request.clone()
+            },
+            &["/workspace/active".to_string()],
+        )
+        .unwrap();
+        assert!(explicitly_detached.is_empty());
+
+        let global_env = TestEnv::new("scoped-search-global");
+        let (mut global_ledger, global_artifacts) = global_env.open();
+        let mut payload = fixture_value();
+        payload["sessions"][0]["workspacePath"] = Value::Null;
+        save_payload(
+            &mut global_ledger,
+            &global_artifacts,
+            &serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+        let global_hits = global_search_with_artifacts_scoped(
+            &mut global_ledger,
+            &global_artifacts,
+            &GlobalSearchRequest {
+                query: "alpha needle".to_string(),
+                ..GlobalSearchRequest::default()
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(global_hits.len(), 1);
+        assert!(global_hits[0].workspace_path.is_none());
     }
 
     #[test]

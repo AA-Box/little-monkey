@@ -2,7 +2,7 @@
 
 Little Monkey is a local-first Tauri desktop workspace for agentic AI. It can run against managed `llama.cpp`, Ollama, MLX on supported Apple Silicon, or OpenAI-compatible providers that you configure. The React UI and Rust backend share workspace, permission, run, model, package, browser, Git, and background-service contracts instead of treating each surface as a separate product.
 
-The current working tree includes the shipped foundations described below. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations). Future product proposals and their acceptance boundaries live in [ROADMAP.md](ROADMAP.md).
+The current working tree includes the shipped foundations described below. Some release acceptance gates still require external hardware, credentials, services, signed publisher feeds, or cross-platform clean-machine testing; those are called out in [Current limitations](#current-limitations). Work that genuinely is not built yet — router policies, real benchmarking, prompt/workflow version control, mobile offline mode, a fine-tune lab, multi-GPU, and the updater — lives in [ROADMAP.md](ROADMAP.md) with its acceptance boundary. Each feature below is described with its real limits inline rather than as a checkmark.
 
 ## Features
 
@@ -98,6 +98,63 @@ requires:
 Review the requested scope. Report evidence, severity, and a concrete fix.
 ```
 
+### Agent workbenches
+
+Each of these is a real, model-driven flow rather than a mockup, and each has
+a scope boundary stated where it matters.
+
+- Turn a design source into a scaffolded local app (Design-to-App), score a
+  spec for ambiguity and missing acceptance criteria, and compile an SOP into
+  runnable steps.
+- Investigate a production issue from pasted logs, workspace files, terminal
+  output, or browser evidence; the Production Debugging workbench prepares a
+  fix in an owned worktree rather than editing the live workspace. Evidence is
+  attached by the user — no log or APM provider is polled automatically.
+- Run an incident timeline (Incident Commander), keep a claim/evidence board
+  with explicit provenance, and search across repositories (Cross-Repo
+  Intelligence uses MVP text search, not a semantic index).
+- Plan and execute a migration in reviewable slices. Execution is
+  slice-at-a-time by design: the agent proposes, the user promotes.
+- Generate an MCP server scaffold from a described API, diff two API contract
+  versions, and build a connector from an OpenAPI document.
+- Compare models side by side (Model Compare Lab), run a Golden Dataset
+  Builder over real model calls with dedupe and privacy filtering, hold a
+  multi-model debate, and exercise a Red-Team Lab against tool-loop fixtures.
+- Score models, connectors, MCP servers, skills, workflows, and plugins in
+  Trust Scorecards from live store state, with weaker profiles sorted first.
+  Every dimension cites the exact field it read; nothing is scored from
+  measurements the app did not take.
+- Build and run eval suites (Workflow/Agent Test Harness) with constraint,
+  golden-answer, and model-judge scoring, failure clustering, and reproducible
+  per-case fingerprints. A suite marked **release gate** blocks its target
+  workflow from being started in **Settings → Ecosystem** until a complete
+  passing run of the current suite revision exists; overriding requires a
+  second, explicit click. Suite state is desktop-local, so CLI and API-server
+  workflow starts are not gated.
+- Explore a knowledge graph, run deep research, draft in Brief Studio and Work
+  Canvas, work a data notebook and spreadsheet copilot, apply security
+  autofixes, run synthetic monitoring, and use database admin guardrails.
+  Each of these supports a single primary format or flow rather than the full
+  surface its name might suggest; external integrations are manual.
+
+### Runs, review, and cost
+
+- Approve, inspect, and replay from one place: the Agent Inbox and Run
+  Dashboard put approvals from every source (desktop, daemon, remote
+  controller) on a single screen with a per-run event timeline.
+- Export a Run Capsule — a redacted, replayable record of a run — and replay
+  it by class.
+- Preview a checkpoint before restoring it, compare any two read-only, and see
+  effects that cannot be safely undone marked `needs_reconciliation` rather
+  than silently skipped.
+- Track token usage and cost in **Settings → Usage**: per-request cost against
+  rates you enter yourself, daily/monthly budgets, and a `warn` or `pause`
+  enforcement mode checked before every provider request. Rates are yours, not
+  a billing feed — the app never claims to see a provider invoice.
+- Get a Daily Brief aggregating real run, task, and read-only MCP state.
+- Search everything with Universal Search; an explicit workspace filter is
+  validated against the roots actually attached to this app instance.
+
 ### Developer integrations
 
 - Run `monkey acp` as an ACP v1 stdio server. Little Monkey remains the approval authority and carries streaming, tool status, cancellation, diagnostics, artifacts, checkpoints, and diffs through the durable run protocol.
@@ -121,6 +178,16 @@ Review the requested scope. Report evidence, severity, and a concrete fix.
 - Transcribe audio files, push-to-talk clips, or meeting recordings through a configured local `whisper.cpp`-style worker or an explicit provider. Timed speaker segments are retained when the backend supplies diarization, and meeting text is prepared for user-reviewed notes, decisions, questions, and action items. Raw audio is retained only when explicitly requested.
 - Read text aloud with system TTS and stop playback through the same cancellation path.
 - Configure user-owned ComfyUI or OpenAI-compatible image endpoints, then generate or edit when the endpoint advertises editing. Jobs retain prompt, negative prompt, model, seed, dimensions, steps, CFG, source/output hashes, progress, cancellation, metadata, and a gallery action that inserts an owned artifact into chat through the normal review path.
+
+### Mobile companion
+
+- Pair a real iOS/Android app ([little-monkey-mobile](https://github.com/AA-Box/little-monkey-mobile), React Native/Expo) to a desktop or homelab node by scanning or pasting a versioned invitation. Requests are sequence-numbered and signed, and the client requires the invitation's pinned TLS certificate fingerprint unless the trusted-LAN development override is visibly enabled.
+- Browse runs, event timelines, pending approvals, and verified artifacts; approve the exact operation digest, cancel a run, or engage the kill switch — each only when the pairing grant contains that capability.
+- Use the node's versioned `/v1/remote/mobile/*` extension for chat sessions and messages, saved-workflow launch, capture upload, and device self-revocation. Chat turns execute through an operator-authored `mobile-chat` recipe, so the node stays authoritative for models, prompts, and permission mode.
+- Grant these surfaces explicitly: mobile capabilities are separate from runner actions, and a pairing created without them (including any pairing made before they existed) cannot reach chat, workflow launch, or capture regardless of the phone's app version. Chat additionally requires session viewing, and workflow launch requires task viewing.
+- Queue chat, workflow, text, image, file, and foreground voice captures while offline. File payloads are bounded, base64-encoded, and SHA-256 verified on both sides before anything is stored.
+
+Offline *browsing*, push delivery, a QR-sized invitation payload, and app-store release remain roadmap items — see [ROADMAP.md](ROADMAP.md).
 
 ## Desktop slash commands
 
@@ -354,14 +421,19 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 ## Current limitations
 
 - The Runtime Hub supports checksum/provenance validation and configured catalogs, but this repository does not include a publisher-operated, platform-complete signed `llama.cpp`/MLX artifact feed. ROCm, Vulkan, and DirectML are not advertised as maintained managed runtimes.
-- Hardware-fit estimates and runtime controls are implemented, but the roadmap's plus-or-minus-15% memory matrix, clean-machine lifecycle checks, and MLX release gate still need maintained physical reference hardware.
+- Hardware-fit estimates and runtime controls are implemented, but the plus-or-minus-15% memory matrix, clean-machine lifecycle checks, and MLX release gate still need maintained physical reference hardware. Edge-device profiles are static heuristics: no benchmark in this app measures throughput or latency yet (see [ROADMAP.md](ROADMAP.md)).
+- Several surfaces are real but deliberately narrower than their names suggest: Memory Studio has two scopes and no pin/merge/expire; approval chains are sequential and answered by the same desktop user; the connector catalog covers 5 of ~17 providers using pasted tokens rather than branded OAuth; Local App Builder's five templates are cosmetically similar; inbox triage is read-only with no rules engine; and Team Mode's RBAC is enforced at one defined point, with its audit trail attributing the exporter rather than the approver.
+- Record & Replay's draft/review/replay pipeline is real, including credential redaction, but "recording" means entering selectors in the workbench form — not demonstrating an interaction by clicking through it.
+- Sandboxed execution uses a macOS Seatbelt profile plus a disposable workspace copy; there are no containers or VMs, and non-macOS platforms get the restricted-cwd/env isolation only. Every run reports which isolation actually applied.
+- Control Desktop keeps no local audit log or screenshots on the desktop side (the daemon-hosted remote path does record them to the run ledger), does not block sensitive system dialogs, and matches its allowlist by application identity rather than verifying the frontmost window.
 - VS Code completion requires a real installed Ollama model that advertises `insert`; the latency/compile gate cannot be claimed on a machine without one.
 - Browser verification uses disposable profiles. Persistent authenticated profiles, file transfer, clipboard, browser extensions, and general host-computer control remain intentionally out of scope.
 - The Windows and Linux/X11 Control Desktop input backends compile and their pure helper logic (Wayland detection, consent-dialog parsing, UTF-16 handling) is tested, but neither has had a full runtime pass on real Windows or Linux hardware yet — that verification remains a release gate, not a completed claim. The in-app browser pane also relies on Tauri's unstable multiwebview API.
 - GitHub delivery needs local `git` plus authenticated `gh`; hosted Actions need user-supplied provider credentials, while Ollama review needs a user-owned self-hosted runner.
 - The local OCR, speech, meeting, and image paths require configured binaries/models/endpoints. WER, diarization error rate, real-time factor, and image hardware behavior are not claimed until run against the documented external fixtures and hardware.
 - Remote handoff requires a user-owned reachable network and valid TLS identity. There is no Little Monkey relay, account service, RBAC/SSO plane, or hosted GPU.
-- Release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim.
+- The mobile companion pairs, browses, approves, chats, launches saved workflows, and uploads captures — but browsing is online-only, push delivery needs an operator-selected provider, and pairing transfers the invitation as a file or pasted text rather than a QR code. Physical-device, signing, and store-submission gates are unmet.
+- Release hardening—full clean-profile migrations, signed/notarized installers on every platform, accessibility/locale completion, performance budgets, dependency review, and penetration testing—remains a release gate rather than a completed claim. There is no in-app updater; signing is macOS-only; and the ten non-English locales each fall back to English for roughly a third of their keys.
 
 ## Project layout
 

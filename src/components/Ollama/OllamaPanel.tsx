@@ -7,6 +7,7 @@ import { OllamaPullForm } from "./OllamaPullForm";
 import { OllamaImportForm } from "./OllamaImportForm";
 import { ModelfileStudio } from "./ModelfileStudio";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Top-level status row for the Ollama provider (a second, sibling model
@@ -42,7 +43,7 @@ export function OllamaPanel() {
     try {
       await startOllama();
     } catch (err) {
-      setStartError(err instanceof Error ? err.message : String(err));
+      setStartError(errorMessage(err));
     } finally {
       setStarting(false);
     }
@@ -54,7 +55,7 @@ export function OllamaPanel() {
     try {
       await signinOllama();
     } catch (err) {
-      setSigninError(err instanceof Error ? err.message : String(err));
+      setSigninError(errorMessage(err));
     } finally {
       setSigningIn(false);
     }

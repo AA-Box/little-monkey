@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { Button } from "../ui";
 import { useModelStore } from "../../store/modelStore";
 import { useT } from "../../lib/i18n";
+import { errorMessage } from "../../lib/errors";
 
 /**
  * Mini-form for registering any other OpenAI-compatible endpoint (Groq,
@@ -29,7 +30,7 @@ export function AddCustomProviderForm() {
       setLabel("");
       setBaseUrl("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }

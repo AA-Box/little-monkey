@@ -1,4 +1,4 @@
-mod api;
+pub(crate) mod api;
 mod client;
 mod desktop;
 mod protocol;
@@ -139,6 +139,12 @@ pub struct RemotePairCreateArgs {
     workspace_ids: Vec<String>,
     #[arg(long, default_value_t = protocol::MAX_REMOTE_ARTIFACT_BYTES)]
     max_artifact_bytes: u64,
+    /// Additional first-party mobile-companion capabilities to grant on top
+    /// of `--action`. Omit for a runner-only controller: the mobile chat,
+    /// workflow-launch, and capture surfaces then stay unreachable for this
+    /// device even if it runs a newer client build.
+    #[arg(long = "mobile", value_enum)]
+    mobile_capabilities: Vec<PairMobileCapability>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -150,6 +156,30 @@ pub enum PairAction {
     Cancel,
     Kill,
     ControlDesktop,
+}
+
+/// Mobile-only grants. Deliberately separate from [`PairAction`]: these do
+/// not widen the underlying run scope, and a legacy pairing can never
+/// acquire them implicitly (see `protocol::legacy_capabilities`).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum PairMobileCapability {
+    ViewSessions,
+    Chat,
+    ViewTasks,
+    RunWorkflows,
+    Capture,
+}
+
+impl From<PairMobileCapability> for protocol::DeviceCapability {
+    fn from(value: PairMobileCapability) -> Self {
+        match value {
+            PairMobileCapability::ViewSessions => Self::ViewSessions,
+            PairMobileCapability::Chat => Self::Chat,
+            PairMobileCapability::ViewTasks => Self::ViewTasks,
+            PairMobileCapability::RunWorkflows => Self::RunWorkflows,
+            PairMobileCapability::Capture => Self::Capture,
+        }
+    }
 }
 
 impl From<PairAction> for RemoteAction {
@@ -239,7 +269,10 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
         }
         RemoteCmd::HostServe => {
             let desktop = DesktopControlRuntime::production(&paths);
-            server::serve(paths, desktop).await?
+            let mobile_chat = std::sync::Arc::new(
+                crate::daemon::DaemonMobileChatQueue::new(paths.clone()),
+            );
+            server::serve(paths, desktop, mobile_chat).await?
         }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
@@ -410,8 +443,9 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
 pub async fn spawn_if_configured(
     paths: DaemonPaths,
     desktop: std::sync::Arc<DesktopControlRuntime>,
+    mobile_chat: std::sync::Arc<dyn api::MobileChatQueue>,
 ) -> Result<bool, String> {
-    server::spawn_if_configured(paths, desktop).await
+    server::spawn_if_configured(paths, desktop, mobile_chat).await
 }
 
 fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), String> {
@@ -430,8 +464,24 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
     let expires_at_ms = now
         .checked_add(args.expires_minutes.saturating_mul(60_000))
         .ok_or_else(|| "Pairing expiry overflow".to_string())?;
-    let invitation =
-        RemoteStore::open(&paths.root)?.create_invitation(&scopes, now, expires_at_ms)?;
+    // Mobile grants are additive to the legacy action set, and
+    // `validate_capabilities` enforces the dependencies (chat needs
+    // view_sessions, workflow launch needs view_tasks) before anything is
+    // written, so an invitation can never carry an unusable combination.
+    let mut capabilities = protocol::legacy_capabilities(&scopes);
+    capabilities.extend(
+        args.mobile_capabilities
+            .iter()
+            .copied()
+            .map(protocol::DeviceCapability::from),
+    );
+    protocol::validate_capabilities(&capabilities, &scopes)?;
+    let invitation = RemoteStore::open(&paths.root)?.create_invitation_with_capabilities(
+        &scopes,
+        &capabilities,
+        now,
+        expires_at_ms,
+    )?;
     let certificate = std::fs::read_to_string(&config.certificate_path)
         .map_err(|error| format!("Could not read remote certificate: {error}"))?;
     let value = PairingInvitation {
@@ -444,6 +494,7 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         pairing_token: invitation.token,
         expires_at_ms: invitation.expires_at_ms,
         scopes: invitation.scopes,
+        capabilities: invitation.capabilities,
     };
     protected_json(&args.output, &value)?;
     println!(

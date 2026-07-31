@@ -13,6 +13,7 @@ import {
   updateMemory,
   type MemoryEntry,
 } from "../../lib/memoryStudio";
+import { errorMessage } from "../../lib/errors";
 
 /** Must match `MAX_FACT_CHARS` in `src-tauri/src/memory.rs`. */
 const MAX_FACT_CHARS = 500;
@@ -78,7 +79,7 @@ function MemoryRow({ entry, onChanged }: { entry: MemoryEntry; onChanged: () => 
       await onChanged();
       setEditing(false);
     } catch (e) {
-      setRowError(e instanceof Error ? e.message : String(e));
+      setRowError(errorMessage(e));
     } finally {
       setSaving(false);
     }
@@ -91,7 +92,7 @@ function MemoryRow({ entry, onChanged }: { entry: MemoryEntry; onChanged: () => 
       await setMemoryEnabled(entry.id, entry.project_root, !entry.enabled);
       await onChanged();
     } catch (e) {
-      setRowError(e instanceof Error ? e.message : String(e));
+      setRowError(errorMessage(e));
     } finally {
       setTogglingEnabled(false);
     }
@@ -104,7 +105,7 @@ function MemoryRow({ entry, onChanged }: { entry: MemoryEntry; onChanged: () => 
       await deleteMemory(entry.id, entry.project_root);
       await onChanged();
     } catch (e) {
-      setRowError(e instanceof Error ? e.message : String(e));
+      setRowError(errorMessage(e));
       setDeleting(false);
     }
   }
@@ -259,7 +260,7 @@ export function MemoryStudioPanel() {
     try {
       setEntries(await listAllMemories());
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -276,7 +277,7 @@ export function MemoryStudioPanel() {
     try {
       await operation();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(null);
     }

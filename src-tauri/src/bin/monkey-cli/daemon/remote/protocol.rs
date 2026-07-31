@@ -10,7 +10,11 @@ use sha2::{Digest, Sha256};
 
 pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_REQUEST_SKEW_MS: u64 = 5 * 60 * 1_000;
-pub const MAX_REMOTE_BODY_BYTES: usize = 1024 * 1024;
+/// A capture may contain a 32 MiB binary artifact encoded as base64 plus
+/// bounded JSON metadata. Hyper still enforces this before allocating the
+/// complete body; endpoint-specific validation applies the tighter artifact
+/// grant after authentication.
+pub const MAX_REMOTE_BODY_BYTES: usize = 48 * 1024 * 1024;
 pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -28,6 +32,73 @@ pub enum RemoteAction {
     /// consent on the runner before a session is created, and it can be
     /// force-stopped instantly by revoke or the kill switch.
     ControlDesktop,
+}
+
+/// Capabilities exposed to first-party mobile controllers. Legacy remote
+/// actions remain in `RemoteScopes.actions` for wire compatibility; this
+/// separate grant lets a pairing invite and accept response down-scope the
+/// mobile-only surface without ever widening the underlying run scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceCapability {
+    ViewRuns,
+    ViewEvents,
+    ReadArtifacts,
+    Approve,
+    Cancel,
+    Kill,
+    ControlDesktop,
+    ViewSessions,
+    Chat,
+    ViewTasks,
+    RunWorkflows,
+    Capture,
+    Admin,
+}
+
+impl DeviceCapability {
+    pub fn for_action(action: RemoteAction) -> Self {
+        match action {
+            RemoteAction::ViewRuns => Self::ViewRuns,
+            RemoteAction::ViewEvents => Self::ViewEvents,
+            RemoteAction::ReadArtifacts => Self::ReadArtifacts,
+            RemoteAction::Approve => Self::Approve,
+            RemoteAction::Cancel => Self::Cancel,
+            RemoteAction::Kill => Self::Kill,
+            RemoteAction::ControlDesktop => Self::ControlDesktop,
+        }
+    }
+}
+
+pub fn legacy_capabilities(scopes: &RemoteScopes) -> BTreeSet<DeviceCapability> {
+    scopes
+        .actions
+        .iter()
+        .copied()
+        .map(DeviceCapability::for_action)
+        .collect()
+}
+
+pub fn validate_capabilities(
+    capabilities: &BTreeSet<DeviceCapability>,
+    scopes: &RemoteScopes,
+) -> Result<(), String> {
+    if !legacy_capabilities(scopes).is_subset(capabilities) {
+        return Err(
+            "Device capabilities must include every granted legacy remote action".to_string(),
+        );
+    }
+    if capabilities.contains(&DeviceCapability::Chat)
+        && !capabilities.contains(&DeviceCapability::ViewSessions)
+    {
+        return Err("Mobile chat also requires view_sessions".to_string());
+    }
+    if capabilities.contains(&DeviceCapability::RunWorkflows)
+        && !capabilities.contains(&DeviceCapability::ViewTasks)
+    {
+        return Err("Mobile workflow launch also requires view_tasks".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +188,8 @@ pub struct PairingInvitation {
     pub pairing_token: String,
     pub expires_at_ms: u64,
     pub scopes: RemoteScopes,
+    #[serde(default)]
+    pub capabilities: BTreeSet<DeviceCapability>,
 }
 
 impl PairingInvitation {
@@ -144,7 +217,13 @@ impl PairingInvitation {
         {
             return Err("Pairing invitation has no valid pinned certificate".to_string());
         }
-        self.scopes.validate()
+        self.scopes.validate()?;
+        let capabilities = if self.capabilities.is_empty() {
+            legacy_capabilities(&self.scopes)
+        } else {
+            self.capabilities.clone()
+        };
+        validate_capabilities(&capabilities, &self.scopes)
     }
 }
 
@@ -155,6 +234,10 @@ pub struct PairAcceptRequest {
     pub pairing_id: String,
     pub pairing_token: String,
     pub device_name: String,
+    /// Optional explicit subset selected by the controller. Legacy clients
+    /// omit it and receive the invitation's complete capability grant.
+    #[serde(default)]
+    pub requested_capabilities: Option<BTreeSet<DeviceCapability>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +251,8 @@ pub struct PairAcceptResponse {
     /// in the controller keychain. It is never written to either SQLite DB.
     pub device_secret: String,
     pub scopes: RemoteScopes,
+    #[serde(default)]
+    pub capabilities: BTreeSet<DeviceCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +267,8 @@ pub struct RotationBundle {
     pub server_certificate_pem: String,
     pub server_certificate_sha256: String,
     pub scopes: RemoteScopes,
+    #[serde(default)]
+    pub capabilities: BTreeSet<DeviceCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +296,8 @@ pub struct ControllerProfile {
     pub device_id: String,
     pub secret_generation: u64,
     pub scopes: RemoteScopes,
+    #[serde(default)]
+    pub capabilities: BTreeSet<DeviceCapability>,
     pub next_sequence: u64,
     #[serde(default)]
     pub event_cursors: BTreeMap<String, u64>,

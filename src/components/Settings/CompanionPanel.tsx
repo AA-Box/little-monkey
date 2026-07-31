@@ -12,11 +12,12 @@ import {
   type ImageGalleryEntry,
 } from "../../lib/companionClient";
 import { Button } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 const INPUT = "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function safeNumber(value: string, fallback: number): number {

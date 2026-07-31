@@ -22,6 +22,7 @@
  * uses).
  */
 import type { ChatMessage } from './llamaClient';
+import { errorMessage } from "./errors";
 
 // ---------------------------------------------------------------------------
 // Generic JSON/YAML-subset value parsing
@@ -359,7 +360,7 @@ export function parseOpenApiDocument(text: string, sourceLabel?: string): ApiDoc
   try {
     parsed = parseYamlOrJson(text);
   } catch (err) {
-    throw new Error(`Could not parse ${sourceLabel ?? 'document'} as JSON or YAML: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`Could not parse ${sourceLabel ?? 'document'} as JSON or YAML: ${errorMessage(err)}`);
   }
   if (!isPlainObject(parsed)) {
     throw new Error(`${sourceLabel ?? 'This document'} does not look like an OpenAPI document (expected an object at the top level).`);

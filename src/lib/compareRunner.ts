@@ -44,6 +44,7 @@ import { registerRunCancellation } from "./runCancellationRegistry";
 import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from "./skills";
 import { protectKnowledgeNoticeForModel, wrapUntrustedContent } from "./untrustedContent";
 import { isBtwNotice } from "./slashCommands";
+import { errorMessage } from "./errors";
 
 const COMPARE_SYSTEM_SUFFIX = [
   "",
@@ -322,7 +323,7 @@ async function runBranch(
     });
     await recorder?.complete("Comparison branch completed");
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     const completedAt = Date.now();
     if (controller.signal.aborted) {
       if (recorder && !cancellationRecordedExternally) {
@@ -395,7 +396,7 @@ function scheduleBranch(
             await unloadComparisonOllamaModel(target.model);
           } catch (error) {
             const message = `Could not release ${target.model} after its queued comparison branch: ${
-              error instanceof Error ? error.message : String(error)
+              errorMessage(error)
             }`;
             const currentPlan = useSessionStore
               .getState()
@@ -795,7 +796,7 @@ async function runSynthesis(groupId: string, synthesis: ComparisonSynthesis): Pr
       status: controller.signal.aborted ? "cancelled" : "failed",
       completedAt,
       durationMs: completedAt - startedAt,
-      error: controller.signal.aborted ? null : error instanceof Error ? error.message : String(error),
+      error: controller.signal.aborted ? null : errorMessage(error),
     });
   } finally {
     unregisterCancellation();

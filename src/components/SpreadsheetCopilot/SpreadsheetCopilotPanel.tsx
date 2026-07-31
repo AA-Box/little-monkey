@@ -10,6 +10,7 @@ import {
 } from "../../lib/spreadsheetCopilot";
 import { useSpreadsheetCopilotStore } from "../../store/spreadsheetCopilotStore";
 import { Button, IconButton } from "../ui";
+import { errorMessage } from "../../lib/errors";
 
 interface SpreadsheetCopilotPanelProps {
   onClose: () => void;
@@ -22,7 +23,7 @@ interface SpreadsheetCopilotPanelProps {
 const MAX_RENDERED_ROWS = 300;
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 /** Expands every cited range/cell string into the individual A1 refs it

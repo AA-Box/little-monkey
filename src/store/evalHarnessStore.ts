@@ -10,6 +10,7 @@ import {
   type EvalRuntime,
   type EvalSuite,
 } from "../lib/evalHarness";
+import { errorMessage } from "../lib/errors";
 
 const STORAGE_KEY = "little-monkey-eval-harness-v1";
 const STORAGE_VERSION = 1;
@@ -25,7 +26,7 @@ const controllers = new Map<string, AbortController>();
 let runtimeFactory: () => EvalRuntime = createLocalEvalRuntime;
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 function persist(suites: EvalSuite[], runs: EvalRun[]): void {

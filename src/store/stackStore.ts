@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { errorMessage } from "../lib/errors";
 
 /** Mirrors the Rust `EmbeddingBackend` enum (src-tauri/src/stacks.rs) exactly. */
 export type EmbeddingBackend = "llama" | "ollama";
@@ -192,7 +193,7 @@ export const useStackStore = create<StackStore>((set, get) => ({
       // see `KnowledgePanel.tsx`'s mount effect).
       await get().refreshStale();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({ reindexError: { ...state.reindexError, [id]: message } }));
       throw err;
     }
@@ -238,7 +239,7 @@ export const useStackStore = create<StackStore>((set, get) => ({
     try {
       await invoke("embed_server_start", { modelPath });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set({ embedError: message });
       throw err;
     }

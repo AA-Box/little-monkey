@@ -13,6 +13,7 @@
  * from both the runner and the UI.
  */
 import type { ModelTargetSnapshot } from "./modelTargets";
+import { errorMessage } from "./errors";
 
 export type BenchmarkCategory = "coding" | "writing" | "rag" | "browser_qa" | "connector" | "custom";
 
@@ -236,7 +237,7 @@ export function evaluateVerifier(verifier: LabVerifier | null, content: string):
         const description = `/${pattern}/${verifier.flags ?? ""}`;
         return { ok, message: ok ? `Matches ${description}.` : `Does not match ${description}.` };
       } catch (error) {
-        return { ok: false, message: `Invalid verifier regex: ${error instanceof Error ? error.message : String(error)}` };
+        return { ok: false, message: `Invalid verifier regex: ${errorMessage(error)}` };
       }
     }
     case "json_valid": {

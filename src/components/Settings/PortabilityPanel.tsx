@@ -33,6 +33,7 @@ import {
   type WebDavBackupConfig,
   type WebDavBackupStatus,
 } from "../../lib/portability";
+import { errorMessage } from "../../lib/errors";
 
 const BUNDLE_FILTER = [{ name: "Little Monkey bundle", extensions: ["lmbundle"] }];
 
@@ -95,7 +96,7 @@ export function PortabilityPanel() {
   };
 
   useEffect(() => {
-    void refresh().catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));
+    void refresh().catch((caught) => setError(errorMessage(caught)));
   }, []);
 
   const run = async (name: string, operation: () => Promise<void>) => {
@@ -104,7 +105,7 @@ export function PortabilityPanel() {
     try {
       await operation();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(errorMessage(caught));
     } finally {
       setBusy(null);
     }

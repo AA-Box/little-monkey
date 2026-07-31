@@ -73,6 +73,19 @@ function dim(level: TrustLevel, evidence: TrustEvidenceItem[]): TrustDimensionSc
  * comparison view can put weaker profiles first. */
 export const LEVEL_WEIGHT: Record<TrustLevel, number> = { poor: 0, unknown: 1, fair: 2, good: 3 };
 
+/**
+ * Aggregate ordinal used by `TrustScorecardsPanel.tsx` to rank rows within a
+ * kind: lower = weaker = shown first, exactly the "weaker profiles first"
+ * behavior `LEVEL_WEIGHT`'s doc comment promises. A plain sum (not an
+ * average) is fine because every card scores the same six dimensions.
+ */
+export function scorecardWeight(card: TrustScorecard): number {
+  return TRUST_DIMENSION_KEYS.reduce(
+    (total, key) => total + LEVEL_WEIGHT[card.dimensions[key]?.level ?? "unknown"],
+    0,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Models — local llama.cpp, Ollama, and configured cloud providers.
 // ---------------------------------------------------------------------------

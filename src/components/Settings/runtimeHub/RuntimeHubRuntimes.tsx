@@ -31,6 +31,7 @@ import {
   SectionHeading,
   Toggle,
 } from "./RuntimeHubShared";
+import { errorMessage } from "../../../lib/errors";
 
 function statusState(detail: RuntimeDetail | undefined): string {
   if (!detail?.status) return "unknown";
@@ -276,7 +277,7 @@ function EffectiveContextPanel({
       });
       setResolution(result);
     } catch (thrown) {
-      setError(thrown instanceof Error ? thrown.message : String(thrown));
+      setError(errorMessage(thrown));
     } finally {
       setBusy(false);
     }

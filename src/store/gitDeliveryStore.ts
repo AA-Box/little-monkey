@@ -11,9 +11,10 @@ import type {
   ReviewReport,
   WorktreeInspection,
 } from "../lib/gitDelivery";
+import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 interface GitDeliveryState {

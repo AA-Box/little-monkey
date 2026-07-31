@@ -46,6 +46,7 @@ import {
 } from "./compareLab";
 import type { ModelTargetSnapshot } from "./modelTargets";
 import { useCompareLabStore } from "../store/compareLabStore";
+import { errorMessage } from "./errors";
 
 /** Synthetic session id passed to `attemptStream` purely so provider
  * rate-limit tracking has something to key on — Lab runs never write into
@@ -141,7 +142,7 @@ async function runLabPair(
   try {
     preflightTarget(target);
   } catch (error) {
-    finalize({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+    finalize({ status: "failed", error: errorMessage(error) });
     return;
   }
 
@@ -154,7 +155,7 @@ async function runLabPair(
   try {
     resolved = await resolveTarget(target);
   } catch (error) {
-    finalize({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+    finalize({ status: "failed", error: errorMessage(error) });
     return;
   }
 
@@ -329,8 +330,4 @@ export function startLabRun(
  * their recorded terminal state; in-flight pairs are marked `cancelled`. */
 export function stopLabRun(runId: string): void {
   runControllers.get(runId)?.abort();
-}
-
-export function isLabRunActive(runId: string): boolean {
-  return runControllers.has(runId);
 }

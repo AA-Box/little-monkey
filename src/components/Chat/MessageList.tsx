@@ -83,6 +83,7 @@ import {
   summarizeActivity,
   type ActivityCall,
 } from "./activityTimeline";
+import { errorMessage } from "../../lib/errors";
 
 export { resultLooksLikeError } from "./activityTimeline";
 
@@ -676,7 +677,7 @@ const CheckpointRow = memo(function CheckpointRow({
       void useCheckpointStore.getState().refresh(sessionId);
       return true;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       setError(t("MessageList.checkpointRevertFailed", { error: message }));
       return false;
     }
@@ -695,7 +696,7 @@ const CheckpointRow = memo(function CheckpointRow({
       });
       void useCheckpointStore.getState().refresh(sessionId);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       setError(t("MessageList.checkpointReapplyFailed", { error: message }));
     } finally {
       setBusy(false);
@@ -855,7 +856,7 @@ const MemoryRow = memo(function MemoryRow({
       });
       void useRulesStore.getState().refresh();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       setError(t("MessageList.memoryForgetFailed", { error: message }));
     } finally {
       setBusy(false);

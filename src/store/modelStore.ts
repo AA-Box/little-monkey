@@ -7,6 +7,7 @@ import {
   ollamaModelTargetKey,
 } from "../lib/modelTargets";
 import { useUsageStore } from "./usageStore";
+import { errorMessage } from "../lib/errors";
 
 /**
  * Mirrors the Rust `ModelInfo` struct (src-tauri/src/models.rs) exactly —
@@ -537,7 +538,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       await get().refreshOllama();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [tag]: message },
       }));
@@ -558,7 +559,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       await get().refreshOllama();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [name]: message },
       }));
@@ -579,7 +580,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       });
       await get().refreshOllama();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({
         ollamaPullError: { ...state.ollamaPullError, [shortName]: message },
       }));
@@ -670,7 +671,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
       await get().refreshProviders();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({ providerKeyError: { ...state.providerKeyError, [id]: message } }));
       throw err;
     }
@@ -704,7 +705,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       const retirements = await fetchProviderModelRetirements(id, models);
       set((state) => ({ providerModelRetirements: { ...state.providerModelRetirements, [id]: retirements } }));
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       set((state) => ({ providerKeyError: { ...state.providerKeyError, [id]: message } }));
       throw err;
     }
