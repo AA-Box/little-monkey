@@ -147,6 +147,14 @@ pub struct ProcessAdmitArgs {
     pub external_id: String,
     #[serde(default)]
     pub parent_process_id: Option<String>,
+    /// The parent's *surface* identifier, when the caller knows that but not the
+    /// parent's process id — a subagent knows the turn id it was spawned from,
+    /// not the turn's process record. Resolved here; ignored when
+    /// `parent_process_id` is supplied.
+    #[serde(default)]
+    pub parent_external_id: Option<String>,
+    #[serde(default)]
+    pub parent_kind: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(default)]
@@ -174,10 +182,30 @@ pub fn process_admit(
     let kind = ProcessKind::parse(&args.kind).map_err(to_message)?;
     let now = crate::run_commands::unix_time_ms()? as i64;
 
+    // Resolve a parent named by its surface id. A parent that cannot be found is
+    // left unset rather than failing the admit: losing the lineage edge is worth
+    // less than refusing to record the process at all, and the alternative would
+    // make a subagent's admission depend on its parent's record having landed
+    // first.
+    let parent_process_id = match (args.parent_process_id, args.parent_external_id) {
+        (Some(explicit), _) => Some(explicit),
+        (None, Some(external)) => {
+            let parent_kind = match args.parent_kind.as_deref() {
+                Some(raw) => ProcessKind::parse(raw).map_err(to_message)?,
+                None => ProcessKind::ChatTurn,
+            };
+            with_process_table(&app, state.inner(), |table| {
+                table.find_by_external_id(parent_kind, &external)
+            })?
+            .map(|record| record.process_id)
+        }
+        (None, None) => None,
+    };
+
     let request = AdmitProcess {
         kind,
         external_id: args.external_id,
-        parent_process_id: args.parent_process_id,
+        parent_process_id,
         run_id: args.run_id,
         workspace: args.workspace,
         profile: args.profile,

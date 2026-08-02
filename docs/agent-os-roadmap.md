@@ -92,24 +92,43 @@ produce context by different rules.
 
 # Phase 1 — Process and isolation kernel
 
-## K1. One agent process abstraction
+## K1. One agent process abstraction *(partially built)*
 
-**Today:** at least five things behave like processes and none of them share a
-representation — a desktop chat turn, a daemon job
-(`bin/monkey-cli/daemon/store.rs`), a `task`-tool subagent, a workflow node
-(`workflow_core.rs`), and a remote-runner run. `run_ledger.rs` records events
-for several of them, but there is no single table you can list, no shared
-identifier scheme, and no parent/child tree that spans surfaces.
+**Shipped:** `process_table.rs` — one record with a stable self-describing id
+(`p-<kind>-<uuid>`, replacing seven schemes), a parent id that means hierarchy,
+the `admitted → running → suspended → exited` state machine with transitions
+refused rather than applied, owning workspace and profile as queryable columns,
+a declared limit set, and a structured exit (status/code/signal/reason). Stored
+as ledger migration V5, so the daemon shares it. Both invariants — legal
+transitions, and `exited` if and only if there is an exit status — are enforced
+in Rust *and* by SQL triggers, because companion stores reach the connection
+directly. `monkey processes` (alias `proc`) is the cross-surface listing.
 
-**Acceptance:** one process record with a stable id, a parent id, a state
-machine (`admitted → running → suspended → exited`), an owning workspace and
-profile, a resource-limit set, and an exit status. Every one of the five
-surfaces above creates one. `monkey ps` lists them all, from any surface,
-including runs owned by the daemon and by a paired node. A run that exists
-without a process record is a bug, not a special case.
+Three of the surfaces project onto it: the desktop chat turn
+(`agentLoop.ts`), the daemon job (reconciled once per engine tick, so no
+state-change call site can be missed), and the `task`-tool subagent (as a child
+of its turn). Every projection is fail-soft — a turn never fails because its
+bookkeeping row could not be written.
+
+**Remaining:**
+
+- **The other surfaces.** Workflow runs and nodes (`m4_services.rs`), crew
+  members, background shells, and side tasks do not create records. Remote-run
+  work is projected as its underlying `daemon_job`, so the `remote_run` kind
+  exists but is unused, and a paired controller's run is not distinguishable
+  from a local one in the listing.
+- **Parent edges across the daemon boundary.** A chat turn that routes to the
+  resident runner produces two records — the turn and the daemon job — with no
+  edge between them.
+- **A reaper that actually runs.** `reap_missing` and the `process_reap_missing`
+  command exist and are tested, but nothing calls them at startup yet, so a
+  turn whose WebView died still leaves a `running` row behind.
+- **Acceptance for "a run without a process record is a bug".** Not assertable
+  until every surface adopts; there is no test that fails when a new execution
+  path forgets to admit one.
 
 **Blocks:** everything in Phase 2 and 3. A scheduler needs something to
-schedule.
+schedule, and it cannot arbitrate between kinds that are not in the table.
 
 ## K2. Signals, lifecycle, and restart policy
 

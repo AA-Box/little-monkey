@@ -305,6 +305,50 @@ struct ActiveProcess {
     lease: LeaseToken,
 }
 
+/// `JobState` → the unified [`ProcessState`].
+///
+/// Deliberately lossy in one direction: `WaitingApproval` and `Cancelling` are
+/// both `Running`, because from an arbitration point of view the process exists
+/// and still holds its reservations. The distinction stays in `daemon_jobs`,
+/// which is the record that owns it.
+fn process_state_for(state: JobState) -> little_monkey_lib::process_table::ProcessState {
+    use little_monkey_lib::process_table::ProcessState;
+    match state {
+        JobState::Preparing | JobState::Queued => ProcessState::Admitted,
+        JobState::Running | JobState::WaitingApproval | JobState::Cancelling => {
+            ProcessState::Running
+        }
+        JobState::Paused => ProcessState::Suspended,
+        JobState::Succeeded
+        | JobState::Failed
+        | JobState::Cancelled
+        | JobState::NeedsReconciliation => ProcessState::Exited,
+    }
+}
+
+/// Terminal `JobState` → the unified exit. A non-terminal state reaching here
+/// means the job vanished from the non-terminal set without a terminal state,
+/// which is exactly what `Lost` is for.
+fn exit_for(
+    state: JobState,
+    last_error: Option<&str>,
+) -> little_monkey_lib::process_table::ProcessExit {
+    use little_monkey_lib::process_table::{ExitStatus, ProcessExit};
+    let status = match state {
+        JobState::Succeeded => ExitStatus::Succeeded,
+        JobState::Failed => ExitStatus::Failed,
+        JobState::Cancelled => ExitStatus::Cancelled,
+        JobState::NeedsReconciliation => ExitStatus::NeedsReconciliation,
+        _ => ExitStatus::Lost,
+    };
+    ProcessExit {
+        status,
+        code: None,
+        signal: None,
+        reason: last_error.map(str::to_string),
+    }
+}
+
 pub struct DaemonEngine<P, N, C> {
     pub store: DaemonStore,
     pub shared: SharedLedger,
@@ -393,10 +437,122 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.cancel_queued(now, "global kill switch is engaged")?;
         }
 
+        // Reconciled once per tick from whatever the job store now says, rather
+        // than mirrored at each of the a dozen-odd places a job's state
+        // changes. One pass cannot miss a call site, and it is idempotent, so a
+        // daemon restart converges instead of forking a second record.
+        self.sync_process_table(now)?;
+
         if now.saturating_sub(self.last_retention_ms) >= 60 * 60 * 1_000 {
             self.apply_retention(now)?;
             self.last_retention_ms = now;
         }
+        Ok(())
+    }
+
+    /// Project every daemon job onto the unified process table.
+    ///
+    /// A failure here is logged and swallowed: the process table is an
+    /// observability and arbitration surface, and a job must never fail to run
+    /// because its projection could not be written. The one thing that would be
+    /// worse than a missing row is a job that stops working to protect one.
+    fn sync_process_table(&mut self, now: u64) -> Result<(), String> {
+        if let Err(error) = self.sync_process_table_inner(now) {
+            eprintln!("monkey daemon: process table sync failed: {error}");
+        }
+        Ok(())
+    }
+
+    fn sync_process_table_inner(&mut self, now: u64) -> Result<(), String> {
+        use little_monkey_lib::process_table::{
+            AdmitProcess, ProcessExit, ProcessFilter, ProcessKind, ProcessLimits, ProcessState,
+        };
+
+        let now_ms = i64::try_from(now).map_err(|_| "clock is beyond protocol bounds".to_string())?;
+        let jobs = self.store.nonterminal_jobs()?;
+        let table = self.shared.process_table();
+
+        let mut live_job_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for job in &jobs {
+            live_job_ids.insert(job.job_id.clone());
+
+            let record = match table
+                .find_by_external_id(ProcessKind::DaemonJob, &job.job_id)
+                .map_err(|error| error.to_string())?
+            {
+                Some(existing) => existing,
+                None => table
+                    .admit(
+                        &AdmitProcess::new(ProcessKind::DaemonJob, &job.job_id).with_limits(
+                            ProcessLimits {
+                                max_wall_ms: Some(job.max_runtime_ms),
+                                max_memory_bytes: job.max_memory_bytes,
+                                max_output_bytes: Some(job.max_log_bytes),
+                                max_child_processes: None,
+                            },
+                        ),
+                        now_ms,
+                    )
+                    .map_err(|error| error.to_string())?,
+            };
+
+            // The run id is allocated after the job is inserted (`mark_queued`),
+            // and the ledger enforces foreign keys, so the link can only be
+            // written once the run row exists.
+            if record.run_id.is_none() {
+                if let Some(run_id) = job.run_id.as_deref() {
+                    table
+                        .link_run(&record.process_id, run_id, now_ms)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+
+            let pid = job.process_id.map(i64::from);
+            if record.native_pid != pid {
+                table
+                    .set_native_pid(&record.process_id, pid, now_ms)
+                    .map_err(|error| error.to_string())?;
+            }
+
+            let target = process_state_for(job.state);
+            if record.state != target && record.state.can_transition_to(target) {
+                table
+                    .transition(&record.process_id, target, None, now_ms)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+
+        // Anything this daemon still shows as live whose job has left the
+        // non-terminal set has finished. Reading the job back gives the real
+        // outcome; a job pruned by retention before the projection caught up is
+        // `Lost`, which is the honest answer rather than a guessed success.
+        let live_records = table
+            .list(&ProcessFilter {
+                kinds: vec![ProcessKind::DaemonJob],
+                live_only: true,
+                ..ProcessFilter::default()
+            })
+            .map_err(|error| error.to_string())?;
+
+        for record in live_records {
+            if live_job_ids.contains(&record.external_id) {
+                continue;
+            }
+            let exit = match self.store.get_job(&record.external_id)? {
+                Some(job) => exit_for(job.state, job.last_error.as_deref()),
+                None => ProcessExit {
+                    status: little_monkey_lib::process_table::ExitStatus::Lost,
+                    code: None,
+                    signal: None,
+                    reason: Some("daemon job record is gone".to_string()),
+                },
+            };
+            table
+                .transition(&record.process_id, ProcessState::Exited, Some(exit), now_ms)
+                .map_err(|error| error.to_string())?;
+        }
+
         Ok(())
     }
 
@@ -1128,6 +1284,132 @@ mod tests {
             engine.shared.load_run(&run_id).unwrap().unwrap().status,
             RunStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn a_job_is_projected_onto_the_unified_process_table_through_its_whole_life() {
+        use little_monkey_lib::process_table::{ExitStatus, ProcessKind, ProcessState};
+
+        let (paths, store, shared, _recorder, run_id) = fixture("processtable");
+        let adapter = fake_adapter();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            clock.clone(),
+            "daemon-test-owner".into(),
+        );
+
+        engine.tick().unwrap();
+
+        let record = {
+            let table = engine.shared.process_table();
+            table
+                .find_by_external_id(ProcessKind::DaemonJob, "job-processtable")
+                .unwrap()
+                .expect("the daemon must project its job onto the process table")
+        };
+        assert_eq!(record.state, ProcessState::Running);
+        assert_eq!(record.native_pid, Some(42), "the spawned pid is recorded");
+        assert_eq!(
+            record.run_id.as_deref(),
+            Some(run_id.as_str()),
+            "the ledger run is linked once its row exists"
+        );
+        assert_eq!(record.limits.max_wall_ms, Some(60_000));
+        assert_eq!(record.limits.max_output_bytes, Some(DEFAULT_MAX_LOG_BYTES));
+        assert!(record.started_at_ms.is_some());
+
+        // Idempotent: a second tick must not fork a second record.
+        *clock.0.lock().unwrap() = 2_001;
+        engine.tick().unwrap();
+        {
+            let table = engine.shared.process_table();
+            let all = table
+                .list(&little_monkey_lib::process_table::ProcessFilter {
+                    kinds: vec![ProcessKind::DaemonJob],
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(all.len(), 1, "the projection forked a second record");
+            assert_eq!(all[0].process_id, record.process_id);
+        }
+
+        // Cancelling the job exits the process with the real outcome.
+        engine.store.request_cancel(&run_id, 2_002).unwrap();
+        *clock.0.lock().unwrap() = 2_002;
+        engine.tick().unwrap();
+
+        let finished = {
+            let table = engine.shared.process_table();
+            table.get(&record.process_id).unwrap().unwrap()
+        };
+        assert_eq!(finished.state, ProcessState::Exited);
+        assert_eq!(
+            finished.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Cancelled),
+            "a cancelled job must not be projected as a success"
+        );
+        assert!(finished.exited_at_ms.is_some());
+
+        // And it stays exited — a later tick must not resurrect it.
+        *clock.0.lock().unwrap() = 2_003;
+        engine.tick().unwrap();
+        let table = engine.shared.process_table();
+        assert_eq!(
+            table.get(&record.process_id).unwrap().unwrap().state,
+            ProcessState::Exited
+        );
+        assert!(table.live_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn job_states_map_onto_the_process_state_machine_without_losing_liveness() {
+        use little_monkey_lib::process_table::{ExitStatus, ProcessState};
+
+        // Every JobState must map somewhere, and the terminal ones must map to
+        // an exit that is not silently "succeeded".
+        for (state, expected) in [
+            (JobState::Preparing, ProcessState::Admitted),
+            (JobState::Queued, ProcessState::Admitted),
+            (JobState::Running, ProcessState::Running),
+            (JobState::WaitingApproval, ProcessState::Running),
+            (JobState::Cancelling, ProcessState::Running),
+            (JobState::Paused, ProcessState::Suspended),
+            (JobState::Succeeded, ProcessState::Exited),
+            (JobState::Failed, ProcessState::Exited),
+            (JobState::Cancelled, ProcessState::Exited),
+            (JobState::NeedsReconciliation, ProcessState::Exited),
+        ] {
+            assert_eq!(
+                process_state_for(state),
+                expected,
+                "{state:?} mapped to the wrong process state"
+            );
+            assert_eq!(
+                state.is_terminal(),
+                expected.is_terminal(),
+                "{state:?} disagrees with its process state about being terminal"
+            );
+        }
+
+        assert_eq!(exit_for(JobState::Succeeded, None).status, ExitStatus::Succeeded);
+        assert_eq!(exit_for(JobState::Failed, Some("boom")).status, ExitStatus::Failed);
+        assert_eq!(
+            exit_for(JobState::Failed, Some("boom")).reason.as_deref(),
+            Some("boom")
+        );
+        assert_eq!(exit_for(JobState::Cancelled, None).status, ExitStatus::Cancelled);
+        assert_eq!(
+            exit_for(JobState::NeedsReconciliation, None).status,
+            ExitStatus::NeedsReconciliation
+        );
+        // A non-terminal state reaching the exit mapper means the job vanished.
+        assert_eq!(exit_for(JobState::Running, None).status, ExitStatus::Lost);
     }
 
     #[test]
