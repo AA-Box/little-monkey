@@ -13,6 +13,12 @@ README. "Partially built" entries name the shipped part honestly, because a
 half-built feature that the README already describes is still roadmap work
 for the remainder — not a done item.
 
+For the same work viewed as OS subsystems — process model, enforced isolation,
+scheduling, and a versioned platform contract — see
+[docs/agent-os-roadmap.md](docs/agent-os-roadmap.md). It cross-references the
+items below rather than duplicating them, and adds the kernel-level gaps that
+have no entry here.
+
 ---
 
 ## 1. Policy-driven model routing
@@ -131,9 +137,6 @@ These are not features, but they change what shipping the above costs.
   invoked) runs in parallel with Knowledge 2.0 (`knowledge_v*`). Retrieval
   changes must be duplicated or a user's results depend on which path their
   stack happens to use.
-- **Red-Team Lab tests a mirror.** Its fixtures exercise a copy of the tool
-  loop rather than the live pipeline, so the two can drift apart while the
-  lab stays green. Acceptance: fixtures drive the real pipeline.
 
 ---
 

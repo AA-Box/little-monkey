@@ -4323,11 +4323,18 @@ pub fn has_active_generation(app: &AppHandle, stack_id: &str) -> Result<bool, St
 /// result to the long-standing `search_docs` return shape. `None` means the
 /// stack has not migrated yet and the caller should use its vector-only
 /// fallback; errors never silently fall back from a corrupt v2 generation.
+/// The agent-facing retrieval path.
+///
+/// `cancel` is the caller's token, not one minted here. An agent's knowledge
+/// search runs inside a turn that can be stopped, and a search that ignored the
+/// stop would keep a reranker and a vector scan running after the user had
+/// already moved on.
 pub async fn query_for_agent(
     app: &AppHandle,
     stack: &KnowledgeStack,
     query: &str,
     k: usize,
+    cancel: &CancellationToken,
 ) -> Result<Option<Vec<crate::stacks::StackQueryResult>>, String> {
     let store =
         GenerationStore::new(data_root(app)?.join("indexes")).map_err(|error| error.to_string())?;
@@ -4349,14 +4356,20 @@ pub async fn query_for_agent(
         rerank_candidates: k.max(20),
         ..HybridSearchConfig::default()
     };
+    // The reranker and the token both matter for parity with the inspector path
+    // (`knowledge_v2_query`): without the reranker, the agent and the
+    // "test search" box in the panel returned differently-ordered results for
+    // the same query against the same index, and the panel was the one telling
+    // the truth about what retrieval does.
+    let reranker = LocalOverlapReranker;
     let response = index
         .search(
             query,
             &vector,
             &config,
             &PipelineLimits::default(),
-            None,
-            &CancellationToken::new(),
+            Some(&reranker),
+            cancel,
         )
         .map_err(|error| error.to_string())?;
     Ok(Some(

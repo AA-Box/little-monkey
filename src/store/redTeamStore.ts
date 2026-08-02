@@ -60,8 +60,8 @@ interface RedTeamStore {
   formError: string | null;
 
   setMode: (mode: PermissionMode) => void;
-  runAll: () => void;
-  runOne: (id: string) => void;
+  runAll: () => Promise<void>;
+  runOne: (id: string) => Promise<void>;
   clearResults: () => void;
   addFixture: (draft: CustomFixtureDraft) => boolean;
   removeFixture: (id: string) => void;
@@ -76,20 +76,26 @@ export const useRedTeamStore = create<RedTeamStore>((set, get) => ({
 
   setMode: (mode) => set({ mode }),
 
-  runAll: () => {
+  // Async since the gate verdict now comes from the real Rust decision table
+  // over IPC rather than a frontend copy of it.
+  runAll: async () => {
     set({ running: true });
-    const { fixtures, mode } = get();
-    const runResults = runAllFixtures(fixtures, mode);
-    const results: Record<string, FixtureRunResult> = {};
-    for (const result of runResults) results[result.fixtureId] = result;
-    set({ results, running: false });
+    try {
+      const { fixtures, mode } = get();
+      const runResults = await runAllFixtures(fixtures, mode);
+      const results: Record<string, FixtureRunResult> = {};
+      for (const result of runResults) results[result.fixtureId] = result;
+      set({ results });
+    } finally {
+      set({ running: false });
+    }
   },
 
-  runOne: (id) => {
+  runOne: async (id) => {
     const { fixtures, mode } = get();
     const fixture = fixtures.find((f) => f.id === id);
     if (!fixture) return;
-    const result = runFixture(fixture, mode);
+    const result = await runFixture(fixture, mode);
     set((state) => ({ results: { ...state.results, [id]: result } }));
   },
 
