@@ -1190,6 +1190,17 @@ mod shell_suspend_tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    /// Whether `ps` reports the process as stopped.
+    ///
+    /// Only the FIRST character is the state; BSD `ps` appends flag characters
+    /// after it (`<` raised priority, `+` foreground group, `s` session leader),
+    /// so a stopped process can read as `T<` rather than `T` depending on how
+    /// the host schedules it. Comparing the whole field passes locally and fails
+    /// on a CI runner, which is exactly what it did.
+    fn is_stopped(pid: u32) -> bool {
+        process_state(pid).starts_with('T')
+    }
+
     /// Spawns a real child in its own process group, exactly as
     /// `tool_run_shell` does, and registers it under `turn`.
     fn spawn_registered(state: &AppState, turn: &str) -> (std::process::Child, u32) {
@@ -1208,19 +1219,19 @@ mod shell_suspend_tests {
         let state = AppState::default();
         let (mut child, pgid) = spawn_registered(&state, "turn-1");
         std::thread::sleep(Duration::from_millis(100));
-        assert_ne!(process_state(pgid), "T", "child should start out running");
+        assert!(!is_stopped(pgid), "child should start out running");
 
         assert_eq!(signal_turn_shells(&state, "turn-1", true), 1);
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(
-            process_state(pgid),
-            "T",
-            "a suspended turn's shell must actually be stopped, not just latched"
+        assert!(
+            is_stopped(pgid),
+            "a suspended turn's shell must actually be stopped, not just latched; ps said {}",
+            process_state(pgid)
         );
 
         assert_eq!(signal_turn_shells(&state, "turn-1", false), 1);
         std::thread::sleep(Duration::from_millis(100));
-        assert_ne!(process_state(pgid), "T", "resume must restart the child");
+        assert!(!is_stopped(pgid), "resume must restart the child");
 
         forget_shell_process_group(&state, "turn-1", pgid);
         let _ = child.kill();
@@ -1236,11 +1247,11 @@ mod shell_suspend_tests {
 
         let (mut child, pgid) = spawn_registered(&state, "turn-2");
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(process_state(pgid), "T");
+        assert!(is_stopped(pgid), "ps said {}", process_state(pgid));
 
         signal_turn_shells(&state, "turn-2", false);
         std::thread::sleep(Duration::from_millis(100));
-        assert_ne!(process_state(pgid), "T");
+        assert!(!is_stopped(pgid));
 
         forget_shell_process_group(&state, "turn-2", pgid);
         let _ = child.kill();
@@ -1256,10 +1267,9 @@ mod shell_suspend_tests {
 
         signal_turn_shells(&state, "turn-a", true);
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(process_state(paused_pgid), "T");
-        assert_ne!(
-            process_state(running_pgid),
-            "T",
+        assert!(is_stopped(paused_pgid), "ps said {}", process_state(paused_pgid));
+        assert!(
+            !is_stopped(running_pgid),
             "the other pane's command must keep running"
         );
 

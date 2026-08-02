@@ -11,9 +11,14 @@ vi.mock("../lib/processTable", async (importOriginal) => {
   return {
     ...actual,
     listProcesses: (...args: unknown[]) => mocks.listProcesses(...args),
-    signalProcess: (...args: unknown[]) => mocks.signalProcess(...args),
     onProcessesChanged: (...args: unknown[]) => mocks.onProcessesChanged(...args),
   };
+});
+// `signalProcess` and the display derivation live in their own module so they
+// stay out of the eager chunk — see `processSignals.ts`.
+vi.mock("../lib/processSignals", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/processSignals")>();
+  return { ...actual, signalProcess: (...args: unknown[]) => mocks.signalProcess(...args) };
 });
 
 import {

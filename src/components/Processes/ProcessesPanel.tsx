@@ -4,13 +4,8 @@ import { Loader2, Pause, Play, RefreshCw, Square, X } from "lucide-react";
 
 import { IconButton, StatusPill } from "../ui";
 import { statusTone } from "../../lib/statusTone";
-import {
-  canResume,
-  canSuspend,
-  processDisplayState,
-  type ProcessKind,
-  type ProcessRecord,
-} from "../../lib/processTable";
+import type { ProcessKind, ProcessRecord } from "../../lib/processTable";
+import { canResume, canSuspend, processDisplayState } from "../../lib/processSignals";
 import {
   selectStateCounts,
   subscribeToProcessChanges,
@@ -41,6 +36,17 @@ import { formatElapsed } from "../../lib/taskFormat";
  */
 
 type Translate = ReturnType<typeof useT>["t"];
+
+/**
+ * Written to the record's `signal_reason` and read back by `monkey processes`.
+ * Deliberately NOT translated: an audit trail that changes language with the
+ * reader's UI locale is worse than one that is always English.
+ */
+const SIGNAL_REASON = {
+  suspend: "Paused from the Processes panel",
+  resume: "Resumed from the Processes panel",
+  stop: "Stopped from the Processes panel",
+} as const;
 
 export interface ProcessesPanelProps {
   onClose?: () => void;
@@ -131,7 +137,7 @@ function ProcessRow({ record }: { record: ProcessRecord }) {
             size="sm"
             disabled={busy}
             aria-label={t("ProcessesPanel.suspendAriaLabel", { name: record.externalId })}
-            onClick={() => void signal(record.processId, "suspend", t("ProcessesPanel.suspendReason"))}
+            onClick={() => void signal(record.processId, "suspend", SIGNAL_REASON.suspend)}
           >
             <Pause size={12} />
           </IconButton>
@@ -141,7 +147,7 @@ function ProcessRow({ record }: { record: ProcessRecord }) {
             size="sm"
             disabled={busy}
             aria-label={t("ProcessesPanel.resumeAriaLabel", { name: record.externalId })}
-            onClick={() => void signal(record.processId, "resume", t("ProcessesPanel.resumeReason"))}
+            onClick={() => void signal(record.processId, "resume", SIGNAL_REASON.resume)}
           >
             <Play size={12} />
           </IconButton>
@@ -150,7 +156,7 @@ function ProcessRow({ record }: { record: ProcessRecord }) {
           size="sm"
           disabled={busy || record.signalIntent.stopRequested}
           aria-label={t("ProcessesPanel.stopAriaLabel", { name: record.externalId })}
-          onClick={() => void signal(record.processId, "stop", t("ProcessesPanel.stopReason"))}
+          onClick={() => void signal(record.processId, "stop", SIGNAL_REASON.stop)}
         >
           <Square size={12} />
         </IconButton>

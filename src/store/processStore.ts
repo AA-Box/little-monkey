@@ -1,15 +1,13 @@
 import { create } from "zustand";
 
 import { errorMessage } from "../lib/errors";
+import { listProcesses, onProcessesChanged, type ProcessRecord } from "../lib/processTable";
 import {
-  listProcesses,
-  onProcessesChanged,
   processDisplayState,
   signalProcess,
   type ProcessDisplayState,
-  type ProcessRecord,
   type ProcessSignal,
-} from "../lib/processTable";
+} from "../lib/processSignals";
 
 /**
  * A read-and-signal mirror of the unified agent process table

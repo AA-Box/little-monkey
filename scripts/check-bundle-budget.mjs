@@ -82,7 +82,15 @@ export function analyzeBundle({ dist, manifest, limits: limitOverrides = {} }) {
   check("entry gzip", entry.gzip, limits.entryGzip, failures);
   check("initial JS raw", initialRaw, limits.initialRaw, failures);
   check("initial JS gzip", initialGzip, limits.initialGzip, failures);
+  // The entry is deliberately excluded: it has its own `entryRaw`/`entryGzip`
+  // limits, checked above. Including it here as well meant the generic
+  // per-chunk cap always bound first (900 < 1500 raw, 300 < 450 gzip), so the
+  // entry's own budget could never fail and those two constants were dead. The
+  // entry is one file the app always loads; a lazily-loaded chunk is a cost
+  // paid only by whoever opens that surface, which is why the two get
+  // different ceilings in the first place.
   for (const chunk of allJs) {
+    if (chunk.file === entry.file) continue;
     check(`${chunk.file} raw`, chunk.raw, limits.chunkRaw, failures);
     check(`${chunk.file} gzip`, chunk.gzip, limits.chunkGzip, failures);
   }
