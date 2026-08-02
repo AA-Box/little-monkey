@@ -948,6 +948,7 @@ pub fn run() {
             process_commands::process_reconcile,
             process_commands::process_signal,
             process_commands::process_signal_support,
+            process_commands::process_pending_signals,
             process_commands::process_transition,
             process_commands::process_link_run,
             process_commands::process_reap_missing,

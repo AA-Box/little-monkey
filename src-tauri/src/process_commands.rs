@@ -8,9 +8,10 @@
 //! `process_signal_support` exposes which kinds honour which signal so a caller
 //! can disable a control *with its reason* instead of offering a button that
 //! silently does nothing. Delivery belongs to the owning kind, which reads the
-//! latch at its own safe point — the daemon does this once per tick; the
-//! desktop-owned loops do not read it yet (see K2 in
-//! `docs/agent-os-roadmap.md`).
+//! latch at its own safe point: the daemon once per tick, the desktop through
+//! `processSignalDelivery.ts` — the `processes://changed` event as the fast path
+//! and `process_pending_signals` as the catch-up read for intent written by
+//! another OS process.
 
 use tauri::Emitter;
 
@@ -454,6 +455,33 @@ pub fn process_signal(
     })?;
     notify(&app, &record);
     Ok(record)
+}
+
+/// Every process with signal intent still waiting to be delivered.
+///
+/// The catch-up read behind the `processes://changed` fast path. The event only
+/// reaches windows of *this* app, so a signal written by `monkey processes
+/// signal` — a different OS process, holding its own SQLite connection, with no
+/// way to emit a Tauri event — is invisible to a listener. This is how it lands.
+///
+/// `kinds` narrows to what the caller can actually deliver to, so a desktop
+/// sweep does not walk the daemon's rows: the daemon reads its own intent once
+/// per tick and delivering twice from two processes is how you get a stop that
+/// races a resume.
+///
+/// The predicate and the "state is the acknowledgement" rule live in
+/// [`ProcessTable::pending_signals`], not here.
+#[tauri::command]
+pub fn process_pending_signals(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    kinds: Option<Vec<String>>,
+) -> Result<Vec<ProcessRecord>, String> {
+    let mut parsed = Vec::new();
+    for raw in kinds.unwrap_or_default() {
+        parsed.push(ProcessKind::parse(&raw).map_err(to_message)?);
+    }
+    with_process_table(&app, state.inner(), |table| table.pending_signals(&parsed))
 }
 
 /// Applies a projection through the shared reconcile, for native adopters that

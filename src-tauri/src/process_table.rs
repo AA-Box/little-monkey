@@ -1610,6 +1610,37 @@ mod tests {
             .expect("admit succeeds")
     }
 
+    /// The wire shape `processSignalDelivery.ts` reads to decide what to deliver.
+    ///
+    /// Worth its own assertion because nothing else catches it: a rename here
+    /// compiles, and the TypeScript side keeps typechecking against its own
+    /// interface, so the only symptom would be a signal that silently never
+    /// arrives — `stopRequested` reading as `undefined` is falsy.
+    #[test]
+    fn a_records_signal_intent_serialises_as_the_frontend_reads_it() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::SideTask, "task-wire");
+        let signalled = table
+            .signal(
+                &record.process_id,
+                ProcessSignal::Suspend,
+                Some("wire check"),
+                T0 + 1,
+            )
+            .expect("suspend is honoured for a side task");
+
+        let json = serde_json::to_value(&signalled).expect("record serialises");
+
+        assert_eq!(json["signalIntent"]["suspendRequested"], true);
+        assert_eq!(json["signalIntent"]["stopRequested"], false);
+        assert_eq!(json["signalReason"], "wire check");
+        assert_eq!(json["signalRequestedAtMs"], T0 + 1);
+        assert_eq!(json["externalId"], "task-wire");
+        assert_eq!(json["kind"], "side_task");
+        assert_eq!(json["state"], "admitted");
+    }
+
     #[test]
     fn an_admitted_process_starts_admitted_with_a_self_describing_id() {
         let ledger = ledger();
