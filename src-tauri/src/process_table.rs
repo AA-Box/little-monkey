@@ -1,0 +1,1583 @@
+//! The unified agent process table.
+//!
+//! Before this module, at least five things in this app behaved like processes
+//! and none of them shared a representation: a desktop chat turn, a daemon job,
+//! a `task`-tool subagent, a workflow run, and a remote-runner run. They had
+//! five identifier schemes with no cross-surface uniqueness, four incompatible
+//! state vocabularies (`RunStatus`'s 9, `JobState`'s 10, `WorkflowRunStatus`'s
+//! 5, `SubagentStatus`'s 4), transitions enforced in one place and nowhere
+//! else, no parent pointer that meant hierarchy rather than retry lineage, and
+//! no single answer to "what is running right now". Every listing surface —
+//! the running-tasks pill, the Background Tasks panel, the Run Center, the
+//! Agent Inbox — aggregated a different subset and missed the rest.
+//!
+//! This table is the shared representation. It deliberately does *not* replace
+//! any of those records: a daemon job still owns its queue position, budgets
+//! and pid; a ledger run still owns its event stream. What lives here is only
+//! what every kind has in common and what a scheduler will need to arbitrate
+//! between them — identity, lineage, state, ownership, limits, and how it
+//! ended.
+//!
+//! Two invariants are enforced in both Rust and SQL, deliberately duplicated
+//! because a companion store reaching the shared connection directly must not
+//! be able to bypass them (see [`MIGRATION_V5_SQL`] in `run_ledger.rs`):
+//!
+//! 1. **Legal transitions only.** `admitted → running | exited`,
+//!    `running → suspended | exited`, `suspended → running | exited`, and
+//!    `exited` is terminal. Anything else is refused rather than silently
+//!    applied — the gap that let `DaemonStore::transition` move a job from any
+//!    state to any other with an unguarded `UPDATE`.
+//! 2. **Terminal consistency.** A row is `exited` if and only if it carries an
+//!    exit status, mirroring how `runs` binds `terminal_sequence` to a terminal
+//!    status.
+
+use std::fmt;
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+/// Which execution surface a process belongs to.
+///
+/// The `as_str` values are the stored SQL enum and must match
+/// `MIGRATION_V5_SQL`'s `CHECK` constraint. The short `tag` is the id prefix
+/// (see [`new_process_id`]) so a bare id says what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessKind {
+    /// An interactive desktop chat turn (`agentLoop.ts`'s `runAgentTurn`).
+    ChatTurn,
+    /// A queued `monkey daemon` job.
+    DaemonJob,
+    /// A `task`-tool subagent, child of the turn that spawned it.
+    Subagent,
+    /// One member of a Crew run, child of the coordinator's turn.
+    CrewMember,
+    /// A workflow run (`m4` executor).
+    WorkflowRun,
+    /// A single node instance inside a workflow run.
+    WorkflowNode,
+    /// Work queued by a paired remote controller or mobile device.
+    RemoteRun,
+    /// A backgrounded `run_shell` command.
+    BackgroundShell,
+    /// A side task running beside the main conversation.
+    SideTask,
+}
+
+impl ProcessKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessKind::ChatTurn => "chat_turn",
+            ProcessKind::DaemonJob => "daemon_job",
+            ProcessKind::Subagent => "subagent",
+            ProcessKind::CrewMember => "crew_member",
+            ProcessKind::WorkflowRun => "workflow_run",
+            ProcessKind::WorkflowNode => "workflow_node",
+            ProcessKind::RemoteRun => "remote_run",
+            ProcessKind::BackgroundShell => "background_shell",
+            ProcessKind::SideTask => "side_task",
+        }
+    }
+
+    /// Short, stable id prefix. Kept distinct from [`Self::as_str`] so the
+    /// stored enum can be renamed for readability without invalidating ids
+    /// already minted.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ProcessKind::ChatTurn => "turn",
+            ProcessKind::DaemonJob => "job",
+            ProcessKind::Subagent => "sub",
+            ProcessKind::CrewMember => "crew",
+            ProcessKind::WorkflowRun => "wf",
+            ProcessKind::WorkflowNode => "wfn",
+            ProcessKind::RemoteRun => "remote",
+            ProcessKind::BackgroundShell => "sh",
+            ProcessKind::SideTask => "side",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ProcessTableError> {
+        Ok(match value {
+            "chat_turn" => ProcessKind::ChatTurn,
+            "daemon_job" => ProcessKind::DaemonJob,
+            "subagent" => ProcessKind::Subagent,
+            "crew_member" => ProcessKind::CrewMember,
+            "workflow_run" => ProcessKind::WorkflowRun,
+            "workflow_node" => ProcessKind::WorkflowNode,
+            "remote_run" => ProcessKind::RemoteRun,
+            "background_shell" => ProcessKind::BackgroundShell,
+            "side_task" => ProcessKind::SideTask,
+            other => {
+                return Err(ProcessTableError::UnknownKind {
+                    kind: other.to_string(),
+                })
+            }
+        })
+    }
+
+    /// Every kind, for exhaustive tests and for `monkey ps --kind` validation.
+    pub const ALL: &'static [ProcessKind] = &[
+        ProcessKind::ChatTurn,
+        ProcessKind::DaemonJob,
+        ProcessKind::Subagent,
+        ProcessKind::CrewMember,
+        ProcessKind::WorkflowRun,
+        ProcessKind::WorkflowNode,
+        ProcessKind::RemoteRun,
+        ProcessKind::BackgroundShell,
+        ProcessKind::SideTask,
+    ];
+}
+
+/// The one state vocabulary, replacing four incompatible ones.
+///
+/// Intentionally coarse. A daemon job's `WaitingApproval` and a ledger run's
+/// `WaitingForPermission` are both `Running` here — the process exists, holds
+/// its reservations, and is not making progress; that distinction belongs to
+/// the kind's own record, not to the arbitration layer. `Suspended` means the
+/// process has been deliberately stopped and can be resumed, which today only
+/// the daemon can actually do (see K2 in `docs/agent-os-roadmap.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessState {
+    /// Accepted and accounted for, not yet executing.
+    Admitted,
+    /// Executing, or waiting on something while still holding its place.
+    Running,
+    /// Deliberately stopped, resumable.
+    Suspended,
+    /// Finished. Terminal, and always carries an [`ExitStatus`].
+    Exited,
+}
+
+impl ProcessState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessState::Admitted => "admitted",
+            ProcessState::Running => "running",
+            ProcessState::Suspended => "suspended",
+            ProcessState::Exited => "exited",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ProcessTableError> {
+        Ok(match value {
+            "admitted" => ProcessState::Admitted,
+            "running" => ProcessState::Running,
+            "suspended" => ProcessState::Suspended,
+            "exited" => ProcessState::Exited,
+            other => {
+                return Err(ProcessTableError::UnknownState {
+                    state: other.to_string(),
+                })
+            }
+        })
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ProcessState::Exited)
+    }
+
+    /// The authoritative transition table. Mirrored by the
+    /// `agent_processes_validate_transition` SQL trigger; the two are asserted
+    /// to agree in this module's tests.
+    pub fn can_transition_to(self, next: ProcessState) -> bool {
+        match (self, next) {
+            (a, b) if a == b => true,
+            (ProcessState::Admitted, ProcessState::Running | ProcessState::Exited) => true,
+            (ProcessState::Running, ProcessState::Suspended | ProcessState::Exited) => true,
+            (ProcessState::Suspended, ProcessState::Running | ProcessState::Exited) => true,
+            _ => false,
+        }
+    }
+}
+
+/// How a process ended. One vocabulary in place of `Failed{code,message,
+/// retryable}` / `last_error: Option<String>` / a bare `exit_code` / nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// Terminated for exceeding one of its [`ProcessLimits`]. Distinguishable
+    /// from `Failed` on purpose: a limit kill is the system working, and the
+    /// ledger event must name which limit.
+    LimitExceeded,
+    /// The worker went away without reporting — a crashed WebView, a killed
+    /// child, an expired lease. Recorded by a reaper rather than by the
+    /// process itself.
+    Lost,
+    /// Ended with external effects that could not be safely undone.
+    NeedsReconciliation,
+}
+
+impl ExitStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitStatus::Succeeded => "succeeded",
+            ExitStatus::Failed => "failed",
+            ExitStatus::Cancelled => "cancelled",
+            ExitStatus::LimitExceeded => "limit_exceeded",
+            ExitStatus::Lost => "lost",
+            ExitStatus::NeedsReconciliation => "needs_reconciliation",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ProcessTableError> {
+        Ok(match value {
+            "succeeded" => ExitStatus::Succeeded,
+            "failed" => ExitStatus::Failed,
+            "cancelled" => ExitStatus::Cancelled,
+            "limit_exceeded" => ExitStatus::LimitExceeded,
+            "lost" => ExitStatus::Lost,
+            "needs_reconciliation" => ExitStatus::NeedsReconciliation,
+            other => {
+                return Err(ProcessTableError::UnknownExitStatus {
+                    status: other.to_string(),
+                })
+            }
+        })
+    }
+}
+
+/// The limit set attached to a process.
+///
+/// `None` means "not bounded by this process record" — honest, and different
+/// from zero. Nothing in this module enforces these; they are the declaration a
+/// scheduler and the platform enforcement in K4 read. Recording them here does
+/// not make them enforced, and the field docs say so rather than implying a
+/// guarantee that does not exist yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessLimits {
+    /// Wall-clock budget. The daemon already enforces its own equivalent
+    /// (`max_runtime_ms`); no other kind enforces anything.
+    pub max_wall_ms: Option<u64>,
+    /// Resident memory ceiling. Declared only; no platform mechanism reads it
+    /// yet (see K4 — there is no `setrlimit`, cgroup or job object anywhere in
+    /// this app today).
+    pub max_memory_bytes: Option<u64>,
+    /// Captured output ceiling.
+    pub max_output_bytes: Option<u64>,
+    /// Child-process ceiling.
+    pub max_child_processes: Option<u32>,
+}
+
+impl ProcessLimits {
+    pub fn is_unbounded(&self) -> bool {
+        *self == ProcessLimits::default()
+    }
+}
+
+/// The exit detail carried by an `exited` row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessExit {
+    pub status: ExitStatus,
+    /// Native exit code where one exists (daemon children, background shells).
+    pub code: Option<i32>,
+    /// Signal name where the process was signalled.
+    pub signal: Option<String>,
+    /// Human-readable reason. For [`ExitStatus::LimitExceeded`] this must name
+    /// the limit that fired.
+    pub reason: Option<String>,
+}
+
+impl ProcessExit {
+    pub fn succeeded() -> Self {
+        ProcessExit {
+            status: ExitStatus::Succeeded,
+            code: None,
+            signal: None,
+            reason: None,
+        }
+    }
+
+    pub fn failed(reason: impl Into<String>) -> Self {
+        ProcessExit {
+            status: ExitStatus::Failed,
+            code: None,
+            signal: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn cancelled(reason: impl Into<String>) -> Self {
+        ProcessExit {
+            status: ExitStatus::Cancelled,
+            code: None,
+            signal: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// One process, whatever surface it came from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessRecord {
+    /// Stable, globally unique, and self-describing — see [`new_process_id`].
+    pub process_id: String,
+    /// The spawning process, when there is one. This means hierarchy, unlike
+    /// `daemon_jobs.parent_run_id`, which carries retry lineage and is never
+    /// read.
+    pub parent_process_id: Option<String>,
+    pub kind: ProcessKind,
+    /// The surface's own identifier for this unit — a `turnId`, a `job_id`, a
+    /// subagent `cancelId`, a workflow `run_id`. Unique per kind so an adopter
+    /// can find its record again without storing a second id, which is what
+    /// makes adoption idempotent across restarts.
+    pub external_id: String,
+    pub state: ProcessState,
+    /// The ledger run this process projects onto, when it has one. Subagents
+    /// and `m4` workflow runs have none today.
+    pub run_id: Option<String>,
+    /// Owning workspace root. A first-class column here, unlike `RunSpec`'s
+    /// `workspace` which is buried in `spec_json` and cannot be queried — so
+    /// "what is running in this folder" is now answerable.
+    pub workspace: Option<String>,
+    /// Owning profile/persona.
+    pub profile: Option<String>,
+    /// OS process id, where the process owns one.
+    pub native_pid: Option<i64>,
+    pub limits: ProcessLimits,
+    /// Present if and only if `state == Exited`.
+    pub exit: Option<ProcessExit>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub exited_at_ms: Option<i64>,
+}
+
+impl ProcessRecord {
+    pub fn is_live(&self) -> bool {
+        !self.state.is_terminal()
+    }
+}
+
+/// What a caller supplies to admit a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmitProcess {
+    pub kind: ProcessKind,
+    pub external_id: String,
+    pub parent_process_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workspace: Option<String>,
+    pub profile: Option<String>,
+    pub limits: ProcessLimits,
+}
+
+impl AdmitProcess {
+    pub fn new(kind: ProcessKind, external_id: impl Into<String>) -> Self {
+        AdmitProcess {
+            kind,
+            external_id: external_id.into(),
+            parent_process_id: None,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            limits: ProcessLimits::default(),
+        }
+    }
+
+    pub fn with_parent(mut self, parent_process_id: impl Into<String>) -> Self {
+        self.parent_process_id = Some(parent_process_id.into());
+        self
+    }
+
+    pub fn with_run(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: Option<String>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: ProcessLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+/// Filter for [`ProcessTable::list`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessFilter {
+    /// Only these kinds. Empty means every kind.
+    pub kinds: Vec<ProcessKind>,
+    /// Only live processes (anything not `exited`).
+    pub live_only: bool,
+    /// Only children of this process.
+    pub parent_process_id: Option<String>,
+    /// Only processes owning this workspace root.
+    pub workspace: Option<String>,
+    /// Hard row cap. `None` uses [`DEFAULT_LIST_LIMIT`].
+    pub limit: Option<u32>,
+}
+
+/// Bounded by default, following `DaemonStore::managed_run_ids`' precedent:
+/// a listing surface must not be able to ask for an unbounded scan.
+pub const DEFAULT_LIST_LIMIT: u32 = 500;
+/// Ceiling on an explicitly requested limit.
+pub const MAX_LIST_LIMIT: u32 = 5_000;
+
+#[derive(Debug)]
+pub enum ProcessTableError {
+    Sqlite(rusqlite::Error),
+    UnknownKind {
+        kind: String,
+    },
+    UnknownState {
+        state: String,
+    },
+    UnknownExitStatus {
+        status: String,
+    },
+    NotFound {
+        process_id: String,
+    },
+    /// The surface already has a record under this `(kind, external_id)`.
+    DuplicateExternalId {
+        kind: ProcessKind,
+        external_id: String,
+        existing_process_id: String,
+    },
+    /// Refused rather than applied — see this module's invariant 1.
+    IllegalTransition {
+        process_id: String,
+        from: ProcessState,
+        to: ProcessState,
+    },
+    /// `exited` without an exit status, or an exit status without `exited`.
+    TerminalMismatch {
+        process_id: String,
+    },
+    /// A parent id that names no row. Refused so the tree can never be broken.
+    UnknownParent {
+        parent_process_id: String,
+    },
+    /// A process cannot be its own ancestor.
+    ParentCycle {
+        process_id: String,
+    },
+    InvalidField {
+        field: &'static str,
+        reason: String,
+    },
+}
+
+impl fmt::Display for ProcessTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProcessTableError::Sqlite(error) => write!(f, "process table storage error: {error}"),
+            ProcessTableError::UnknownKind { kind } => write!(f, "unknown process kind \"{kind}\""),
+            ProcessTableError::UnknownState { state } => {
+                write!(f, "unknown process state \"{state}\"")
+            }
+            ProcessTableError::UnknownExitStatus { status } => {
+                write!(f, "unknown process exit status \"{status}\"")
+            }
+            ProcessTableError::NotFound { process_id } => {
+                write!(f, "no process \"{process_id}\"")
+            }
+            ProcessTableError::DuplicateExternalId {
+                kind,
+                external_id,
+                existing_process_id,
+            } => write!(
+                f,
+                "{} \"{external_id}\" is already admitted as {existing_process_id}",
+                kind.as_str()
+            ),
+            ProcessTableError::IllegalTransition {
+                process_id,
+                from,
+                to,
+            } => write!(
+                f,
+                "process {process_id} cannot move from {} to {}",
+                from.as_str(),
+                to.as_str()
+            ),
+            ProcessTableError::TerminalMismatch { process_id } => write!(
+                f,
+                "process {process_id} must carry an exit status if and only if it has exited"
+            ),
+            ProcessTableError::UnknownParent { parent_process_id } => {
+                write!(f, "no parent process \"{parent_process_id}\"")
+            }
+            ProcessTableError::ParentCycle { process_id } => {
+                write!(f, "process {process_id} would become its own ancestor")
+            }
+            ProcessTableError::InvalidField { field, reason } => {
+                write!(f, "invalid {field}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProcessTableError {}
+
+impl From<rusqlite::Error> for ProcessTableError {
+    fn from(error: rusqlite::Error) -> Self {
+        ProcessTableError::Sqlite(error)
+    }
+}
+
+pub type ProcessTableResult<T> = Result<T, ProcessTableError>;
+
+/// Mints a process id: `p-<kind tag>-<uuid>`.
+///
+/// One namespace for every surface, replacing seven schemes that shared no
+/// convention and guaranteed uniqueness only within their own subsystem (one of
+/// them, the subagent store key, was a provider-supplied `ToolCall.id` that
+/// could collide with `call_0`).
+pub fn new_process_id(kind: ProcessKind) -> String {
+    format!(
+        "p-{}-{}",
+        kind.tag(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Companion store over the shared ledger connection.
+///
+/// Borrows rather than owns, matching `profile_store.rs` and
+/// `approval_chains.rs`: the ledger owns the database, and a companion store
+/// gets a narrow transactional view of its own tables.
+pub struct ProcessTable<'a> {
+    connection: &'a Connection,
+}
+
+impl<'a> ProcessTable<'a> {
+    pub fn new(connection: &'a Connection) -> Self {
+        ProcessTable { connection }
+    }
+
+    /// Admit a process. Idempotent by `(kind, external_id)`: a second admit for
+    /// the same surface identifier is refused with the id already assigned, so
+    /// an adopter that re-runs after a restart cannot silently fork its record.
+    pub fn admit(&self, request: &AdmitProcess, now_ms: i64) -> ProcessTableResult<ProcessRecord> {
+        if request.external_id.trim().is_empty() {
+            return Err(ProcessTableError::InvalidField {
+                field: "external_id",
+                reason: "must not be empty".to_string(),
+            });
+        }
+        if now_ms <= 0 {
+            return Err(ProcessTableError::InvalidField {
+                field: "now_ms",
+                reason: "must be a positive unix millisecond timestamp".to_string(),
+            });
+        }
+
+        if let Some(existing) = self.find_by_external_id(request.kind, &request.external_id)? {
+            return Err(ProcessTableError::DuplicateExternalId {
+                kind: request.kind,
+                external_id: request.external_id.clone(),
+                existing_process_id: existing.process_id,
+            });
+        }
+
+        if let Some(parent) = request.parent_process_id.as_deref() {
+            if self.get(parent)?.is_none() {
+                return Err(ProcessTableError::UnknownParent {
+                    parent_process_id: parent.to_string(),
+                });
+            }
+        }
+
+        let process_id = new_process_id(request.kind);
+        self.connection.execute(
+            "INSERT INTO agent_processes (
+                process_id, parent_process_id, kind, external_id, state, run_id,
+                workspace, profile, native_pid,
+                max_wall_ms, max_memory_bytes, max_output_bytes, max_child_processes,
+                exit_status, exit_code, exit_signal, exit_reason,
+                created_at_ms, updated_at_ms, started_at_ms, exited_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, 'admitted', ?5,
+                ?6, ?7, NULL,
+                ?8, ?9, ?10, ?11,
+                NULL, NULL, NULL, NULL,
+                ?12, ?12, NULL, NULL
+             )",
+            params![
+                process_id,
+                request.parent_process_id,
+                request.kind.as_str(),
+                request.external_id,
+                request.run_id,
+                request.workspace,
+                request.profile,
+                request.limits.max_wall_ms.map(|v| v as i64),
+                request.limits.max_memory_bytes.map(|v| v as i64),
+                request.limits.max_output_bytes.map(|v| v as i64),
+                request.limits.max_child_processes.map(|v| v as i64),
+                now_ms,
+            ],
+        )?;
+
+        self.get(&process_id)?
+            .ok_or_else(|| ProcessTableError::NotFound {
+                process_id: process_id.clone(),
+            })
+    }
+
+    /// Move a process to `next`. Refuses an illegal transition rather than
+    /// applying it, and requires exit detail exactly when moving to `Exited`.
+    pub fn transition(
+        &self,
+        process_id: &str,
+        next: ProcessState,
+        exit: Option<ProcessExit>,
+        now_ms: i64,
+    ) -> ProcessTableResult<ProcessRecord> {
+        let current = self
+            .get(process_id)?
+            .ok_or_else(|| ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            })?;
+
+        if !current.state.can_transition_to(next) {
+            return Err(ProcessTableError::IllegalTransition {
+                process_id: process_id.to_string(),
+                from: current.state,
+                to: next,
+            });
+        }
+        if (next == ProcessState::Exited) != exit.is_some() {
+            return Err(ProcessTableError::TerminalMismatch {
+                process_id: process_id.to_string(),
+            });
+        }
+
+        // First entry into `running` is what `started_at_ms` records; a
+        // resume from `suspended` must not overwrite it.
+        let started_at_ms = match (current.started_at_ms, next) {
+            (None, ProcessState::Running) => Some(now_ms),
+            (existing, _) => existing,
+        };
+        let exited_at_ms = if next == ProcessState::Exited {
+            Some(now_ms)
+        } else {
+            current.exited_at_ms
+        };
+
+        self.connection.execute(
+            "UPDATE agent_processes
+                SET state = ?2,
+                    exit_status = ?3,
+                    exit_code = ?4,
+                    exit_signal = ?5,
+                    exit_reason = ?6,
+                    updated_at_ms = ?7,
+                    started_at_ms = ?8,
+                    exited_at_ms = ?9
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                next.as_str(),
+                exit.as_ref().map(|value| value.status.as_str()),
+                exit.as_ref().and_then(|value| value.code),
+                exit.as_ref().and_then(|value| value.signal.clone()),
+                exit.as_ref().and_then(|value| value.reason.clone()),
+                now_ms,
+                started_at_ms,
+                exited_at_ms,
+            ],
+        )?;
+
+        self.get(process_id)?
+            .ok_or_else(|| ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            })
+    }
+
+    /// Record the OS process id once the kind has one. Separate from
+    /// [`Self::transition`] because the daemon learns the pid after spawning,
+    /// which is after it moves the job to `running`.
+    pub fn set_native_pid(
+        &self,
+        process_id: &str,
+        native_pid: Option<i64>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE agent_processes SET native_pid = ?2, updated_at_ms = ?3 WHERE process_id = ?1",
+            params![process_id, native_pid, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Link a ledger run after the fact. Some surfaces mint their process
+    /// before the run row exists (the ledger enforces foreign keys, so the
+    /// link cannot be written first).
+    pub fn link_run(
+        &self,
+        process_id: &str,
+        run_id: &str,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE agent_processes SET run_id = ?2, updated_at_ms = ?3 WHERE process_id = ?1",
+            params![process_id, run_id, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, process_id: &str) -> ProcessTableResult<Option<ProcessRecord>> {
+        self.connection
+            .query_row(
+                &format!("{SELECT_COLUMNS} WHERE process_id = ?1"),
+                params![process_id],
+                map_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn find_by_external_id(
+        &self,
+        kind: ProcessKind,
+        external_id: &str,
+    ) -> ProcessTableResult<Option<ProcessRecord>> {
+        self.connection
+            .query_row(
+                &format!("{SELECT_COLUMNS} WHERE kind = ?1 AND external_id = ?2"),
+                params![kind.as_str(), external_id],
+                map_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Newest first, always bounded.
+    pub fn list(&self, filter: &ProcessFilter) -> ProcessTableResult<Vec<ProcessRecord>> {
+        let mut sql = String::from(SELECT_COLUMNS);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if !filter.kinds.is_empty() {
+            let placeholders = filter
+                .kinds
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!("kind IN ({placeholders})"));
+            for kind in &filter.kinds {
+                values.push(Box::new(kind.as_str().to_string()));
+            }
+        }
+        if filter.live_only {
+            clauses.push("state != 'exited'".to_string());
+        }
+        if let Some(parent) = filter.parent_process_id.as_deref() {
+            clauses.push("parent_process_id = ?".to_string());
+            values.push(Box::new(parent.to_string()));
+        }
+        if let Some(workspace) = filter.workspace.as_deref() {
+            clauses.push("workspace = ?".to_string());
+            values.push(Box::new(workspace.to_string()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+
+        let limit = filter
+            .limit
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT);
+        sql.push_str(" ORDER BY created_at_ms DESC, process_id DESC LIMIT ?");
+        values.push(Box::new(limit as i64));
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let bindings: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        let rows = statement.query_map(bindings.as_slice(), map_row)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row??);
+        }
+        Ok(records)
+    }
+
+    /// Every descendant of `process_id`, breadth-first. Bounded by
+    /// [`MAX_LIST_LIMIT`] so a cycle written by some future direct-SQL writer
+    /// cannot hang a listing surface.
+    pub fn descendants(&self, process_id: &str) -> ProcessTableResult<Vec<ProcessRecord>> {
+        let mut out: Vec<ProcessRecord> = Vec::new();
+        let mut frontier = vec![process_id.to_string()];
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::from([process_id.to_string()]);
+
+        while let Some(parent) = frontier.pop() {
+            if out.len() >= MAX_LIST_LIMIT as usize {
+                break;
+            }
+            let children = self.list(&ProcessFilter {
+                parent_process_id: Some(parent),
+                limit: Some(MAX_LIST_LIMIT),
+                ..ProcessFilter::default()
+            })?;
+            for child in children {
+                if seen.insert(child.process_id.clone()) {
+                    frontier.push(child.process_id.clone());
+                    out.push(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Live count per kind, for the listing surfaces that today each aggregate
+    /// a different subset of reality.
+    pub fn live_counts(&self) -> ProcessTableResult<Vec<(ProcessKind, u32)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, COUNT(*) FROM agent_processes WHERE state != 'exited' GROUP BY kind",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, count) = row?;
+            out.push((ProcessKind::parse(&kind)?, count.max(0) as u32));
+        }
+        Ok(out)
+    }
+
+    /// Mark every live process whose worker is gone as [`ExitStatus::Lost`].
+    ///
+    /// This is the reaper guarantee nothing had outside the daemon: a desktop
+    /// turn's ledger run whose WebView died stayed `running` forever because
+    /// nothing swept it. `live_process_ids` is what the caller can still
+    /// account for; anything live and absent from it is reaped.
+    pub fn reap_missing(
+        &self,
+        live_process_ids: &[String],
+        reason: &str,
+        now_ms: i64,
+    ) -> ProcessTableResult<Vec<ProcessRecord>> {
+        let live: std::collections::HashSet<&str> =
+            live_process_ids.iter().map(String::as_str).collect();
+        let candidates = self.list(&ProcessFilter {
+            live_only: true,
+            limit: Some(MAX_LIST_LIMIT),
+            ..ProcessFilter::default()
+        })?;
+
+        let mut reaped = Vec::new();
+        for candidate in candidates {
+            if live.contains(candidate.process_id.as_str()) {
+                continue;
+            }
+            reaped.push(self.transition(
+                &candidate.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit {
+                    status: ExitStatus::Lost,
+                    code: None,
+                    signal: None,
+                    reason: Some(reason.to_string()),
+                }),
+                now_ms,
+            )?);
+        }
+        Ok(reaped)
+    }
+}
+
+const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, external_id, state, \
+     run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
+     max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
+     updated_at_ms, started_at_ms, exited_at_ms FROM agent_processes";
+
+/// Row → record. Returns a nested `Result` because a stored enum that fails to
+/// parse is a data error, not a SQLite error, and must not be reported as one.
+fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<ProcessRecord>> {
+    let kind_raw: String = row.get(2)?;
+    let state_raw: String = row.get(4)?;
+    let exit_status_raw: Option<String> = row.get(13)?;
+
+    let kind = match ProcessKind::parse(&kind_raw) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let state = match ProcessState::parse(&state_raw) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let exit = match exit_status_raw {
+        Some(raw) => match ExitStatus::parse(&raw) {
+            Ok(status) => Some(ProcessExit {
+                status,
+                code: row.get(14)?,
+                signal: row.get(15)?,
+                reason: row.get(16)?,
+            }),
+            Err(error) => return Ok(Err(error)),
+        },
+        None => None,
+    };
+
+    Ok(Ok(ProcessRecord {
+        process_id: row.get(0)?,
+        parent_process_id: row.get(1)?,
+        kind,
+        external_id: row.get(3)?,
+        state,
+        run_id: row.get(5)?,
+        workspace: row.get(6)?,
+        profile: row.get(7)?,
+        native_pid: row.get(8)?,
+        limits: ProcessLimits {
+            max_wall_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+            max_memory_bytes: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            max_output_bytes: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+            max_child_processes: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+        },
+        exit,
+        created_at_ms: row.get(17)?,
+        updated_at_ms: row.get(18)?,
+        started_at_ms: row.get(19)?,
+        exited_at_ms: row.get(20)?,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run_ledger::RunLedger;
+
+    const T0: i64 = 1_800_000_000_000;
+
+    fn ledger() -> RunLedger {
+        RunLedger::open_in_memory().expect("in-memory ledger opens")
+    }
+
+    fn admit(table: &ProcessTable<'_>, kind: ProcessKind, external: &str) -> ProcessRecord {
+        table
+            .admit(&AdmitProcess::new(kind, external), T0)
+            .expect("admit succeeds")
+    }
+
+    #[test]
+    fn an_admitted_process_starts_admitted_with_a_self_describing_id() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let record = admit(&table, ProcessKind::ChatTurn, "turn-1");
+
+        assert!(
+            record.process_id.starts_with("p-turn-"),
+            "id should name its kind: {}",
+            record.process_id
+        );
+        assert_eq!(record.state, ProcessState::Admitted);
+        assert_eq!(record.external_id, "turn-1");
+        assert!(record.exit.is_none());
+        assert!(record.started_at_ms.is_none());
+        assert!(record.exited_at_ms.is_none());
+        assert_eq!(record.created_at_ms, T0);
+        assert!(record.limits.is_unbounded());
+        assert!(record.is_live());
+    }
+
+    #[test]
+    fn every_kind_and_exit_status_survives_a_round_trip_through_sql() {
+        // Guards against adding an enum variant without extending the migration's
+        // CHECK constraint — the same enum-vs-storage drift class the red-team
+        // mirror was.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        for (index, kind) in ProcessKind::ALL.iter().enumerate() {
+            let record = table
+                .admit(&AdmitProcess::new(*kind, format!("external-{index}")), T0)
+                .unwrap_or_else(|error| {
+                    panic!("kind {} rejected by storage: {error}", kind.as_str())
+                });
+            assert_eq!(record.kind, *kind);
+        }
+
+        for (index, status) in [
+            ExitStatus::Succeeded,
+            ExitStatus::Failed,
+            ExitStatus::Cancelled,
+            ExitStatus::LimitExceeded,
+            ExitStatus::Lost,
+            ExitStatus::NeedsReconciliation,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = admit(&table, ProcessKind::SideTask, &format!("exit-{index}"));
+            let exited = table
+                .transition(
+                    &record.process_id,
+                    ProcessState::Exited,
+                    Some(ProcessExit {
+                        status,
+                        code: Some(3),
+                        signal: Some("SIGTERM".to_string()),
+                        reason: Some("because".to_string()),
+                    }),
+                    T0 + 1,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("exit status {} rejected: {error}", status.as_str())
+                });
+            let exit = exited.exit.expect("exit detail round-trips");
+            assert_eq!(exit.status, status);
+            assert_eq!(exit.code, Some(3));
+            assert_eq!(exit.signal.as_deref(), Some("SIGTERM"));
+        }
+    }
+
+    #[test]
+    fn readmitting_the_same_surface_id_is_refused_with_the_id_already_assigned() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let first = admit(&table, ProcessKind::DaemonJob, "job-1");
+
+        let error = table
+            .admit(&AdmitProcess::new(ProcessKind::DaemonJob, "job-1"), T0)
+            .expect_err("a second admit must not fork the record");
+
+        match error {
+            ProcessTableError::DuplicateExternalId {
+                existing_process_id, ..
+            } => assert_eq!(existing_process_id, first.process_id),
+            other => panic!("wrong error: {other}"),
+        }
+
+        // The same surface id under a different kind is a different process.
+        admit(&table, ProcessKind::RemoteRun, "job-1");
+    }
+
+    #[test]
+    fn the_legal_lifecycle_runs_end_to_end() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-life");
+
+        let running = table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 10)
+            .unwrap();
+        assert_eq!(running.started_at_ms, Some(T0 + 10));
+
+        let suspended = table
+            .transition(&record.process_id, ProcessState::Suspended, None, T0 + 20)
+            .unwrap();
+        assert_eq!(suspended.state, ProcessState::Suspended);
+
+        let resumed = table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 30)
+            .unwrap();
+        assert_eq!(
+            resumed.started_at_ms,
+            Some(T0 + 10),
+            "a resume must not overwrite when the process first started"
+        );
+
+        let exited = table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 40,
+            )
+            .unwrap();
+        assert_eq!(exited.exited_at_ms, Some(T0 + 40));
+        assert!(!exited.is_live());
+    }
+
+    #[test]
+    fn illegal_transitions_are_refused_rather_than_applied() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        // admitted -> suspended: nothing has started, so there is nothing to
+        // suspend.
+        let fresh = admit(&table, ProcessKind::ChatTurn, "turn-illegal");
+        assert!(matches!(
+            table.transition(&fresh.process_id, ProcessState::Suspended, None, T0 + 1),
+            Err(ProcessTableError::IllegalTransition { .. })
+        ));
+        assert_eq!(
+            table.get(&fresh.process_id).unwrap().unwrap().state,
+            ProcessState::Admitted,
+            "a refused transition must leave the row untouched"
+        );
+
+        // exited is terminal in every direction.
+        let done = admit(&table, ProcessKind::ChatTurn, "turn-done");
+        table
+            .transition(&done.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .transition(
+                &done.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::cancelled("stopped")),
+                T0 + 2,
+            )
+            .unwrap();
+        for next in [
+            ProcessState::Admitted,
+            ProcessState::Running,
+            ProcessState::Suspended,
+        ] {
+            assert!(
+                matches!(
+                    table.transition(&done.process_id, next, None, T0 + 3),
+                    Err(ProcessTableError::IllegalTransition { .. })
+                ),
+                "exited must not move to {}",
+                next.as_str()
+            );
+        }
+
+        // suspended -> admitted is backwards.
+        let held = admit(&table, ProcessKind::DaemonJob, "job-held");
+        table
+            .transition(&held.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .transition(&held.process_id, ProcessState::Suspended, None, T0 + 2)
+            .unwrap();
+        assert!(matches!(
+            table.transition(&held.process_id, ProcessState::Admitted, None, T0 + 3),
+            Err(ProcessTableError::IllegalTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn the_sql_trigger_refuses_what_rust_refuses() {
+        // The Rust table and the SQL trigger encode the same rules. A companion
+        // store holding this connection can bypass the Rust path entirely, so
+        // assert the storage layer stands on its own.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::WorkflowRun, "wf-trigger");
+
+        let raw = ledger.connection().execute(
+            "UPDATE agent_processes SET state = 'suspended' WHERE process_id = ?1",
+            params![record.process_id],
+        );
+        let message = raw.expect_err("the trigger must abort this").to_string();
+        assert!(
+            message.contains("illegal agent process state transition"),
+            "unexpected error: {message}"
+        );
+
+        // And the identity guard: kind, surface id, and creation time are fixed
+        // once admitted, so a record cannot be quietly repurposed for another
+        // process.
+        for mutation in [
+            "kind = 'daemon_job'",
+            "external_id = 'wf-somethingelse'",
+            "created_at_ms = 1",
+            "process_id = 'p-wf-rewritten'",
+        ] {
+            let message = ledger
+                .connection()
+                .execute(
+                    &format!("UPDATE agent_processes SET {mutation} WHERE process_id = ?1"),
+                    params![record.process_id],
+                )
+                .expect_err("identity must be immutable")
+                .to_string();
+            assert!(
+                message.contains("agent process identity is immutable"),
+                "unexpected error for `{mutation}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_detail_and_terminal_state_must_agree() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::BackgroundShell, "sh-1");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+
+        assert!(matches!(
+            table.transition(&record.process_id, ProcessState::Exited, None, T0 + 2),
+            Err(ProcessTableError::TerminalMismatch { .. })
+        ));
+        assert!(matches!(
+            table.transition(
+                &record.process_id,
+                ProcessState::Suspended,
+                Some(ProcessExit::succeeded()),
+                T0 + 2
+            ),
+            Err(ProcessTableError::TerminalMismatch { .. })
+        ));
+
+        // The SQL CHECK holds the same line against a direct write.
+        let raw = ledger.connection().execute(
+            "UPDATE agent_processes SET exit_status = 'succeeded' WHERE process_id = ?1",
+            params![record.process_id],
+        );
+        assert!(raw.is_err(), "an exit status on a running row must be refused");
+    }
+
+    #[test]
+    fn a_parent_must_exist_and_cannot_be_the_process_itself() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let parent = admit(&table, ProcessKind::ChatTurn, "turn-parent");
+
+        let child = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::Subagent, "sub-1")
+                    .with_parent(&parent.process_id),
+                T0 + 1,
+            )
+            .unwrap();
+        assert_eq!(child.parent_process_id.as_deref(), Some(parent.process_id.as_str()));
+
+        assert!(matches!(
+            table.admit(
+                &AdmitProcess::new(ProcessKind::Subagent, "sub-orphan").with_parent("p-turn-nope"),
+                T0 + 2
+            ),
+            Err(ProcessTableError::UnknownParent { .. })
+        ));
+
+        let self_parent = ledger.connection().execute(
+            "UPDATE agent_processes SET parent_process_id = process_id WHERE process_id = ?1",
+            params![child.process_id],
+        );
+        assert!(self_parent.is_err(), "a process must not become its own parent");
+    }
+
+    #[test]
+    fn descendants_walks_the_whole_subtree() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let turn = admit(&table, ProcessKind::ChatTurn, "turn-tree");
+        let sub = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::Subagent, "sub-tree").with_parent(&turn.process_id),
+                T0 + 1,
+            )
+            .unwrap();
+        let shell = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::BackgroundShell, "sh-tree")
+                    .with_parent(&sub.process_id),
+                T0 + 2,
+            )
+            .unwrap();
+        // A sibling tree that must not appear.
+        admit(&table, ProcessKind::ChatTurn, "turn-other");
+
+        let mut ids: Vec<String> = table
+            .descendants(&turn.process_id)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.process_id)
+            .collect();
+        ids.sort();
+        let mut expected = vec![sub.process_id, shell.process_id];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn listing_filters_by_kind_liveness_and_workspace_and_is_always_bounded() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let turn = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::ChatTurn, "turn-a")
+                    .with_workspace(Some("/work/one".to_string())),
+                T0,
+            )
+            .unwrap();
+        table
+            .admit(
+                &AdmitProcess::new(ProcessKind::DaemonJob, "job-a")
+                    .with_workspace(Some("/work/two".to_string())),
+                T0 + 1,
+            )
+            .unwrap();
+        table
+            .transition(&turn.process_id, ProcessState::Running, None, T0 + 2)
+            .unwrap();
+        // Admitted last, so it must sort first.
+        let gone = table
+            .admit(&AdmitProcess::new(ProcessKind::SideTask, "side-a"), T0 + 5)
+            .unwrap();
+        table
+            .transition(&gone.process_id, ProcessState::Running, None, T0 + 6)
+            .unwrap();
+        table
+            .transition(
+                &gone.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 7,
+            )
+            .unwrap();
+
+        let all = table.list(&ProcessFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        // Newest first.
+        assert_eq!(all[0].external_id, "side-a");
+
+        let live = table
+            .list(&ProcessFilter {
+                live_only: true,
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|record| record.is_live()));
+
+        let turns = table
+            .list(&ProcessFilter {
+                kinds: vec![ProcessKind::ChatTurn],
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert_eq!(turns.len(), 1);
+
+        let in_one = table
+            .list(&ProcessFilter {
+                workspace: Some("/work/one".to_string()),
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert_eq!(in_one.len(), 1, "the table can answer what runs in a folder");
+        assert_eq!(in_one[0].external_id, "turn-a");
+
+        // A caller cannot ask for an unbounded scan, and cannot ask for zero.
+        let clamped = table
+            .list(&ProcessFilter {
+                limit: Some(u32::MAX),
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert_eq!(clamped.len(), 3);
+        let single = table
+            .list(&ProcessFilter {
+                limit: Some(0),
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn live_counts_group_by_kind() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        admit(&table, ProcessKind::ChatTurn, "t1");
+        admit(&table, ProcessKind::ChatTurn, "t2");
+        let done = admit(&table, ProcessKind::Subagent, "s1");
+        table
+            .transition(&done.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .transition(
+                &done.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 2,
+            )
+            .unwrap();
+
+        let counts = table.live_counts().unwrap();
+        assert_eq!(counts, vec![(ProcessKind::ChatTurn, 2)]);
+    }
+
+    #[test]
+    fn reaping_marks_a_vanished_worker_lost_and_leaves_accounted_ones_alone() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let alive = admit(&table, ProcessKind::ChatTurn, "turn-alive");
+        let vanished = admit(&table, ProcessKind::ChatTurn, "turn-vanished");
+        for record in [&alive, &vanished] {
+            table
+                .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+                .unwrap();
+        }
+
+        let reaped = table
+            .reap_missing(
+                &[alive.process_id.clone()],
+                "worker no longer accounted for",
+                T0 + 5,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].process_id, vanished.process_id);
+        let exit = reaped[0].exit.as_ref().unwrap();
+        assert_eq!(exit.status, ExitStatus::Lost);
+        assert_eq!(
+            exit.reason.as_deref(),
+            Some("worker no longer accounted for")
+        );
+
+        assert_eq!(
+            table.get(&alive.process_id).unwrap().unwrap().state,
+            ProcessState::Running
+        );
+        // Reaping twice is a no-op — the reaped row is no longer live.
+        assert!(table
+            .reap_missing(&[alive.process_id.clone()], "again", T0 + 6)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pid_and_run_links_are_recorded_after_the_fact() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-pid");
+
+        table
+            .set_native_pid(&record.process_id, Some(4242), T0 + 1)
+            .unwrap();
+        assert_eq!(
+            table.get(&record.process_id).unwrap().unwrap().native_pid,
+            Some(4242)
+        );
+
+        assert!(matches!(
+            table.set_native_pid("p-job-missing", Some(1), T0 + 1),
+            Err(ProcessTableError::NotFound { .. })
+        ));
+        assert!(matches!(
+            table.link_run("p-job-missing", "run-1", T0 + 1),
+            Err(ProcessTableError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn limits_round_trip_and_zero_is_refused() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let limits = ProcessLimits {
+            max_wall_ms: Some(60_000),
+            max_memory_bytes: Some(2 * 1024 * 1024 * 1024),
+            max_output_bytes: Some(1_048_576),
+            max_child_processes: Some(8),
+        };
+        let record = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::DaemonJob, "job-limits").with_limits(limits),
+                T0,
+            )
+            .unwrap();
+        assert_eq!(record.limits, limits);
+        assert!(!record.limits.is_unbounded());
+
+        // A zero limit is a mistake, not "unlimited" — that is what None means.
+        let zero = table.admit(
+            &AdmitProcess::new(ProcessKind::DaemonJob, "job-zero").with_limits(ProcessLimits {
+                max_wall_ms: Some(0),
+                ..ProcessLimits::default()
+            }),
+            T0,
+        );
+        assert!(zero.is_err());
+    }
+
+    #[test]
+    fn an_empty_surface_id_or_a_bad_timestamp_is_refused() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        assert!(matches!(
+            table.admit(&AdmitProcess::new(ProcessKind::ChatTurn, "  "), T0),
+            Err(ProcessTableError::InvalidField {
+                field: "external_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            table.admit(&AdmitProcess::new(ProcessKind::ChatTurn, "turn-x"), 0),
+            Err(ProcessTableError::InvalidField {
+                field: "now_ms",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn kind_state_and_exit_parsing_reject_unknown_values() {
+        assert!(matches!(
+            ProcessKind::parse("not_a_kind"),
+            Err(ProcessTableError::UnknownKind { .. })
+        ));
+        assert!(matches!(
+            ProcessState::parse("zombie"),
+            Err(ProcessTableError::UnknownState { .. })
+        ));
+        assert!(matches!(
+            ExitStatus::parse("exploded"),
+            Err(ProcessTableError::UnknownExitStatus { .. })
+        ));
+
+        for kind in ProcessKind::ALL {
+            assert_eq!(ProcessKind::parse(kind.as_str()).unwrap(), *kind);
+            assert!(!kind.tag().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_transition_table_matches_the_documented_state_machine() {
+        use ProcessState::*;
+        let legal = [
+            (Admitted, Running),
+            (Admitted, Exited),
+            (Running, Suspended),
+            (Running, Exited),
+            (Suspended, Running),
+            (Suspended, Exited),
+        ];
+        for from in [Admitted, Running, Suspended, Exited] {
+            for to in [Admitted, Running, Suspended, Exited] {
+                let expected = from == to || legal.contains(&(from, to));
+                assert_eq!(
+                    from.can_transition_to(to),
+                    expected,
+                    "{} -> {} should be {}",
+                    from.as_str(),
+                    to.as_str(),
+                    if expected { "legal" } else { "refused" }
+                );
+            }
+        }
+        assert!(Exited.is_terminal());
+        assert!(!Running.is_terminal());
+    }
+}

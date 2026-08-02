@@ -239,6 +239,13 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The one process abstraction shared by every execution surface — desktop
+// turns, daemon jobs, subagents, crew members, workflow runs/nodes, remote
+// runs, background shells, side tasks. Public for the same reason the two
+// modules above are: the CLI's `monkey ps` and the daemon both read it, and
+// neither should grow a second copy of the state machine.
+pub mod process_table;
+mod process_commands;
 // Migration-controlled authoritative profile/session/search storage. Kept
 // reusable by the desktop, CLI, daemon, export/import, and restore paths.
 pub mod portability;
@@ -918,6 +925,14 @@ pub fn run() {
             models::models_delete,
             models::models_add_external,
             models::models_remove_external,
+            process_commands::process_list,
+            process_commands::process_get,
+            process_commands::process_descendants,
+            process_commands::process_live_counts,
+            process_commands::process_admit,
+            process_commands::process_transition,
+            process_commands::process_link_run,
+            process_commands::process_reap_missing,
             permissions::permission_respond,
             permissions::permission_dry_run,
             permissions::set_permission_mode,
