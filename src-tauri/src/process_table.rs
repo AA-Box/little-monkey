@@ -1077,8 +1077,14 @@ impl<'a> ProcessTable<'a> {
         }
 
         let (stop, suspend) = match signal {
-            // Kill and Stop both record "stop wanted". They differ in delivery
-            // urgency, which is the kind's concern, not this table's.
+            // Kill and Stop both record "stop wanted", so **a reader cannot tell
+            // them apart from the latch** — only the free-text `signal_reason`
+            // survives. That is honest today because the only kinds honouring
+            // `kill` deliver both the same way: the daemon maps `Stop` and `Kill`
+            // alike onto `terminate_process_group` (TERM, wait, KILL), so there is
+            // no observable difference to record. If a kind ever delivers them
+            // differently, the distinction needs its own column rather than being
+            // inferred from `signal_reason`.
             ProcessSignal::Stop | ProcessSignal::Kill => (true, record.signal_intent.suspend_requested),
             ProcessSignal::Suspend => (record.signal_intent.stop_requested, true),
             ProcessSignal::Resume => (record.signal_intent.stop_requested, false),
@@ -1107,24 +1113,53 @@ impl<'a> ProcessTable<'a> {
             })
     }
 
-    /// Live processes with a signal waiting to be delivered.
+    /// Live processes with a signal still waiting to be delivered.
     ///
-    /// What a worker polls at its safe point, and what a supervisor reads after a
-    /// restart to find work that was asked to stop before the app died.
+    /// What a supervisor reads after a restart, and what a worker in another
+    /// process checks at its safe point.
+    ///
+    /// The predicate is in SQL rather than a filter over [`Self::list`]: a
+    /// post-filter would first truncate at [`MAX_LIST_LIMIT`] and could therefore
+    /// *hide a latched stop* behind 5,000 quiet rows, which is the one failure
+    /// this function must not have. It also lets
+    /// `agent_processes_pending_signal_idx` do its job.
+    ///
+    /// **State is the acknowledgement.** A `suspend_requested` row whose state is
+    /// already `suspended` has had its signal delivered, so it is not pending;
+    /// otherwise a suspended process would be re-delivered on every read forever.
+    /// This mirrors the convention the daemon already uses
+    /// (`pause_requested && state != Paused`), and needs no extra column. A
+    /// `stop_requested` row self-clears by leaving the live set when it exits.
     pub fn pending_signals(
         &self,
         kinds: &[ProcessKind],
     ) -> ProcessTableResult<Vec<ProcessRecord>> {
-        Ok(self
-            .list(&ProcessFilter {
-                kinds: kinds.to_vec(),
-                live_only: true,
-                limit: Some(MAX_LIST_LIMIT),
-                ..ProcessFilter::default()
-            })?
-            .into_iter()
-            .filter(|record| !record.signal_intent.is_clear())
-            .collect())
+        let mut sql = format!(
+            "{SELECT_COLUMNS} WHERE state <> 'exited' AND (\
+                 stop_requested = 1 \
+                 OR (suspend_requested = 1 AND state <> 'suspended') \
+                 OR (suspend_requested = 0 AND state = 'suspended')\
+             )"
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !kinds.is_empty() {
+            let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            sql.push_str(&format!(" AND kind IN ({placeholders})"));
+            for kind in kinds {
+                values.push(Box::new(kind.as_str().to_string()));
+            }
+        }
+        sql.push_str(" ORDER BY signal_requested_at_ms ASC, process_id ASC");
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let bindings: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        let rows = statement.query_map(bindings.as_slice(), map_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row??);
+        }
+        Ok(records)
     }
 
     /// Record the OS process id once the kind has one. Separate from

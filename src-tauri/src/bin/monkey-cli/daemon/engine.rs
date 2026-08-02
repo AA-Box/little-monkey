@@ -416,6 +416,15 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.store.request_cancel_all(now)?;
         }
 
+        // Read durable signal intent *before* `tick_active`, not after. It used to
+        // sit with the projection at the end of the tick, which meant a latched
+        // stop was translated into the daemon's own bits only after the loop that
+        // acts on them had already run — costing a whole extra poll interval
+        // before anything happened.
+        if let Err(error) = self.apply_signal_intent_from_table(now) {
+            eprintln!("monkey daemon: could not read signal intent: {error}");
+        }
+
         let ids = self.active.keys().cloned().collect::<Vec<_>>();
         for job_id in ids {
             self.tick_active(&job_id, now)?;
@@ -463,6 +472,84 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         Ok(())
     }
 
+    /// Copies durable signal intent from the process table onto the matching
+    /// daemon job's own intent bits.
+    ///
+    /// Deliberately idempotent and level-triggered rather than edge-triggered:
+    /// `request_cancel` is a one-way latch and `request_pause` takes the value it
+    /// should hold, so re-applying the same intent on every tick is a no-op. That
+    /// matters because the process table has no "delivered" flag — state is the
+    /// acknowledgement, exactly as `tick_active` already treats
+    /// `pause_requested && state != Paused`.
+    ///
+    /// A job that has gone terminal between the read and here is skipped:
+    /// `request_pause` refuses a terminal job, and `request_cancel` silently
+    /// succeeds on one, so neither is worth calling.
+    /// Reads durable signal intent for every non-terminal job and applies it.
+    ///
+    /// Called at the top of [`Self::tick`] so `tick_active` sees the intent on the
+    /// same pass rather than the next one.
+    fn apply_signal_intent_from_table(&mut self, now: u64) -> Result<(), String> {
+        let jobs = self.store.nonterminal_jobs()?;
+        self.apply_signal_intent(&jobs, now)
+    }
+
+    fn apply_signal_intent(&mut self, jobs: &[DaemonJob], now: u64) -> Result<(), String> {
+        use little_monkey_lib::process_table::ProcessKind;
+
+        // Decisions are collected before any are applied: reading needs the
+        // ledger connection (`self.shared`) and applying needs `&mut self.store`,
+        // so the read borrow has to end first.
+        enum Intent {
+            Cancel,
+            Pause(bool),
+        }
+
+        let mut decisions: Vec<(String, Intent)> = Vec::new();
+        {
+            let table = self.shared.process_table();
+            for job in jobs {
+                if job.state.is_terminal() {
+                    continue;
+                }
+                let Some(record) = table
+                    .find_by_external_id(ProcessKind::DaemonJob, &job.job_id)
+                    .map_err(|error| error.to_string())?
+                else {
+                    continue;
+                };
+
+                // Stop wins over suspend, and is applied first: a job asked to
+                // stop must not be left paused, because a paused child never
+                // reaches its own cancellation branch.
+                if record.signal_intent.stop_requested {
+                    if !job.cancel_requested {
+                        decisions.push((job.job_id.clone(), Intent::Cancel));
+                    }
+                    continue;
+                }
+                if record.signal_intent.suspend_requested != job.pause_requested {
+                    decisions.push((
+                        job.job_id.clone(),
+                        Intent::Pause(record.signal_intent.suspend_requested),
+                    ));
+                }
+            }
+        }
+
+        for (job_id, intent) in decisions {
+            match intent {
+                Intent::Cancel => {
+                    self.store.request_cancel(&job_id, now)?;
+                }
+                Intent::Pause(value) => {
+                    self.store.request_pause(&job_id, value, now)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn sync_process_table_inner(&mut self, now: u64) -> Result<(), String> {
         use little_monkey_lib::process_table::{
             ProcessExit, ProcessFilter, ProcessKind, ProcessLimits, ProcessProjection, ProcessState,
@@ -470,9 +557,27 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
         let now_ms = i64::try_from(now).map_err(|_| "clock is beyond protocol bounds".to_string())?;
         let jobs = self.store.nonterminal_jobs()?;
-        let table = self.shared.process_table();
 
         let mut live_job_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Translate any durable signal intent recorded against this job's process
+        // row into the daemon's own intent bits, which `tick_active` already
+        // honours.
+        //
+        // The daemon store stays authoritative on purpose. `daemon_jobs` lives in
+        // `daemon-v1.sqlite3` and `agent_processes` in `profile-v1.sqlite3`, and
+        // ledger connections disable `ATTACH` outright, so there is no
+        // transaction, join, or compare-and-set spanning the two — leaving both
+        // writable would be a two-writer race with no arbitration primitive.
+        // Worse, the ready-queue gate filters on `pause_requested`/
+        // `cancel_requested` in SQL inside the daemon's own database, which cannot
+        // reference a table in another file. So intent flows one way, latch →
+        // daemon bits, and the daemon remains the single source of truth for what
+        // it will actually do.
+        //
+        // This is what makes `monkey processes signal` reach a live daemon job: one
+        // extra read per tick on a connection already open.
+        let table = self.shared.process_table();
 
         for job in &jobs {
             live_job_ids.insert(job.job_id.clone());
@@ -1345,6 +1450,190 @@ mod tests {
             ProcessState::Exited
         );
         assert!(table.live_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stop_written_to_the_process_table_latch_cancels_a_live_daemon_job() {
+        // The point of durable intent: `monkey processes signal` (or another
+        // window, or a previous session) writes SQLite with no access to this
+        // daemon, and the running job still stops.
+        // The daemon has its own `ProcessSignal` {Pause, Resume, Terminate} — the OS
+        // delivery verbs — which is a different vocabulary from the table's
+        // {Stop, Suspend, Resume, Kill} request verbs. Aliased so the test reads
+        // unambiguously.
+        use little_monkey_lib::process_table::{
+            ExitStatus, ProcessKind, ProcessSignal as TableSignal, ProcessState,
+        };
+
+        let (paths, store, shared, _recorder, run_id) = fixture("latch-stop");
+        let adapter = fake_adapter();
+        let signals = adapter.signals.clone();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            clock.clone(),
+            "daemon-test-owner".into(),
+        );
+
+        engine.tick().unwrap();
+        assert_eq!(engine.active_count(), 1, "the job should be running");
+        assert!(
+            !engine
+                .store
+                .get_job("job-latch-stop")
+                .unwrap()
+                .unwrap()
+                .cancel_requested,
+            "nothing has asked it to stop yet"
+        );
+
+        // Written the way an external caller would: straight to the process
+        // table, with no daemon involvement.
+        {
+            let table = engine.shared.process_table();
+            let record = table
+                .find_by_external_id(ProcessKind::DaemonJob, "job-latch-stop")
+                .unwrap()
+                .expect("the tick projected the job");
+            table
+                .signal(
+                    &record.process_id,
+                    TableSignal::Stop,
+                    Some("stopped from the CLI"),
+                    2_001,
+                )
+                .unwrap();
+        }
+
+        *clock.0.lock().unwrap() = 2_001;
+        engine.tick().unwrap();
+
+        assert!(
+            signals.lock().unwrap().contains(&ProcessSignal::Terminate),
+            "the latch did not reach the supervised child process"
+        );
+        assert_eq!(engine.active_count(), 0);
+        assert_eq!(
+            engine.shared.load_run(&run_id).unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+
+        let table = engine.shared.process_table();
+        let finished = table
+            .find_by_external_id(ProcessKind::DaemonJob, "job-latch-stop")
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.state, ProcessState::Exited);
+        assert_eq!(
+            finished.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Cancelled),
+            "a latch-driven stop must be recorded as cancelled, not failed"
+        );
+    }
+
+    #[test]
+    fn a_suspend_latch_pauses_and_resumes_without_thrashing_on_every_tick() {
+        use little_monkey_lib::process_table::{
+            ProcessKind, ProcessSignal as TableSignal, ProcessState,
+        };
+
+        let (paths, store, shared, _recorder, _run_id) = fixture("latch-suspend");
+        let adapter = fake_adapter();
+        let signals = adapter.signals.clone();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            clock.clone(),
+            "daemon-test-owner".into(),
+        );
+        engine.tick().unwrap();
+
+        let process_id = {
+            let table = engine.shared.process_table();
+            table
+                .find_by_external_id(ProcessKind::DaemonJob, "job-latch-suspend")
+                .unwrap()
+                .unwrap()
+                .process_id
+        };
+
+        // Suspend via the latch.
+        {
+            let table = engine.shared.process_table();
+            table
+                .signal(&process_id, TableSignal::Suspend, None, 2_001)
+                .unwrap();
+        }
+        *clock.0.lock().unwrap() = 2_001;
+        engine.tick().unwrap();
+        assert!(signals.lock().unwrap().contains(&ProcessSignal::Pause));
+        assert_eq!(
+            engine
+                .store
+                .get_job("job-latch-suspend")
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Paused
+        );
+
+        // Idle ticks must not re-deliver: state is the acknowledgement, so a
+        // suspended job with a set latch is not pending.
+        let pauses_after_first = signals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|signal| **signal == ProcessSignal::Pause)
+            .count();
+        for extra in 2..5 {
+            *clock.0.lock().unwrap() = 2_000 + extra;
+            engine.tick().unwrap();
+        }
+        assert_eq!(
+            signals
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|signal| **signal == ProcessSignal::Pause)
+                .count(),
+            pauses_after_first,
+            "the suspend latch was re-delivered on an idle tick"
+        );
+
+        // Resume clears it and the job runs again.
+        {
+            let table = engine.shared.process_table();
+            table
+                .signal(&process_id, TableSignal::Resume, None, 2_010)
+                .unwrap();
+        }
+        *clock.0.lock().unwrap() = 2_010;
+        engine.tick().unwrap();
+        assert!(signals.lock().unwrap().contains(&ProcessSignal::Resume));
+        assert_eq!(
+            engine
+                .store
+                .get_job("job-latch-suspend")
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+        let table = engine.shared.process_table();
+        assert_eq!(
+            table.get(&process_id).unwrap().unwrap().state,
+            ProcessState::Running
+        );
     }
 
     #[test]
