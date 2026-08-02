@@ -114,7 +114,30 @@ impl ProcessKind {
         })
     }
 
-    /// Every kind, for exhaustive tests and for `monkey ps --kind` validation.
+    /// The kinds whose worker dies with the desktop app, and which the app may
+    /// therefore reap at startup.
+    ///
+    /// Deliberately excludes [`ProcessKind::DaemonJob`] and
+    /// [`ProcessKind::RemoteRun`]: the resident daemon is a separate service
+    /// that outlives the app, so an app that reaped everything it could not
+    /// account for would declare live daemon work lost every time it launched.
+    /// The daemon reaps its own through its engine tick.
+    ///
+    /// [`ProcessKind::WorkflowRun`]/[`ProcessKind::WorkflowNode`] are excluded
+    /// for the same reason — a workflow can be hosted by the daemon via a
+    /// trigger — even though a desktop-started one does die with the app. That
+    /// costs a stale row on the rarer path and never a wrong reap on the
+    /// dangerous one.
+    pub const DESKTOP_OWNED: &'static [ProcessKind] = &[
+        ProcessKind::ChatTurn,
+        ProcessKind::Subagent,
+        ProcessKind::CrewMember,
+        ProcessKind::BackgroundShell,
+        ProcessKind::SideTask,
+    ];
+
+    /// Every kind, for exhaustive tests and for `monkey processes --kind`
+    /// validation.
     pub const ALL: &'static [ProcessKind] = &[
         ProcessKind::ChatTurn,
         ProcessKind::DaemonJob,
@@ -871,9 +894,18 @@ impl<'a> ProcessTable<'a> {
     /// This is the reaper guarantee nothing had outside the daemon: a desktop
     /// turn's ledger run whose WebView died stayed `running` forever because
     /// nothing swept it. `live_process_ids` is what the caller can still
-    /// account for; anything live and absent from it is reaped.
+    /// account for; anything live, matching `scope`, and absent from that list
+    /// is reaped.
+    ///
+    /// `scope` is not optional in practice and the reason is important: a
+    /// process's owner is not always the caller. The daemon is a separate
+    /// service that outlives the desktop app, so an app reaping "everything I
+    /// cannot account for" at startup would declare every live daemon job lost
+    /// while it is still running. Each caller passes the kinds it actually owns.
+    /// `live_only` is forced on regardless of what `scope` says.
     pub fn reap_missing(
         &self,
+        scope: &ProcessFilter,
         live_process_ids: &[String],
         reason: &str,
         now_ms: i64,
@@ -883,7 +915,7 @@ impl<'a> ProcessTable<'a> {
         let candidates = self.list(&ProcessFilter {
             live_only: true,
             limit: Some(MAX_LIST_LIMIT),
-            ..ProcessFilter::default()
+            ..scope.clone()
         })?;
 
         let mut reaped = Vec::new();
@@ -1432,6 +1464,7 @@ mod tests {
 
         let reaped = table
             .reap_missing(
+                &ProcessFilter::default(),
                 &[alive.process_id.clone()],
                 "worker no longer accounted for",
                 T0 + 5,
@@ -1453,9 +1486,60 @@ mod tests {
         );
         // Reaping twice is a no-op — the reaped row is no longer live.
         assert!(table
-            .reap_missing(&[alive.process_id.clone()], "again", T0 + 6)
+            .reap_missing(
+                &ProcessFilter::default(),
+                &[alive.process_id.clone()],
+                "again",
+                T0 + 6
+            )
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn reaping_never_touches_a_kind_the_caller_does_not_own() {
+        // The desktop app reaps at startup. The resident daemon outlives it, so
+        // a daemon job that is genuinely still running must survive — declaring
+        // it lost would be a false terminal state on live work.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let turn = admit(&table, ProcessKind::ChatTurn, "turn-owned");
+        let job = admit(&table, ProcessKind::DaemonJob, "job-not-owned");
+        let workflow = admit(&table, ProcessKind::WorkflowRun, "wf-not-owned");
+        for record in [&turn, &job, &workflow] {
+            table
+                .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+                .unwrap();
+        }
+
+        let reaped = table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "app restarted",
+                T0 + 5,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].process_id, turn.process_id);
+        assert_eq!(
+            table.get(&job.process_id).unwrap().unwrap().state,
+            ProcessState::Running,
+            "a live daemon job was reaped by the desktop"
+        );
+        assert_eq!(
+            table.get(&workflow.process_id).unwrap().unwrap().state,
+            ProcessState::Running,
+            "a workflow run that may be daemon-hosted was reaped by the desktop"
+        );
+
+        assert!(!ProcessKind::DESKTOP_OWNED.contains(&ProcessKind::DaemonJob));
+        assert!(!ProcessKind::DESKTOP_OWNED.contains(&ProcessKind::RemoteRun));
     }
 
     #[test]

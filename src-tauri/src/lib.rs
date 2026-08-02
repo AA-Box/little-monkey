@@ -831,6 +831,17 @@ pub fn run() {
                 }
             });
 
+            // A previous session's chat turns, subagents, crew members,
+            // background shells and side tasks died with that process, so any
+            // still marked live in the process table are stale. Reaped here,
+            // before any new turn can admit one, and scoped to the kinds this
+            // app owns so live daemon work is never declared lost.
+            {
+                let reap_app = app.handle().clone();
+                let reap_state = reap_app.state::<AppState>();
+                process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
+            }
+
             // A persisted M3 policy represents an explicit user opt-in. Start
             // its separate, capability-scoped compatibility listener without
             // blocking app launch; failures remain visible in Runtime Hub.

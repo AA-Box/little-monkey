@@ -120,12 +120,27 @@ bookkeeping row could not be written.
 - **Parent edges across the daemon boundary.** A chat turn that routes to the
   resident runner produces two records — the turn and the daemon job — with no
   edge between them.
-- **A reaper that actually runs.** `reap_missing` and the `process_reap_missing`
-  command exist and are tested, but nothing calls them at startup yet, so a
-  turn whose WebView died still leaves a `running` row behind.
 - **Acceptance for "a run without a process record is a bug".** Not assertable
   until every surface adopts; there is no test that fails when a new execution
   path forgets to admit one.
+
+**Also shipped since:** the startup reaper. `lib.rs`'s `setup` reaps every live
+process of a desktop-owned kind before any new turn can admit one, so a turn
+whose WebView died no longer leaves a `running` row behind. Scoped to
+`ProcessKind::DESKTOP_OWNED` rather than everything live, because the resident
+daemon outlives the app and an unscoped reap would declare live daemon work
+`lost`; the daemon reaps its own through its engine tick. A test asserts a live
+daemon job and workflow run survive a desktop reap.
+
+**The workflow-run decision this needs.** `WorkflowService` has no database
+dependency today — its history is a JSON file store, and `append_history` is
+the single choke point every run state change flows through. Adopting it is
+either (a) give `WorkflowService` a ledger handle so the projection happens at
+that one choke point, or (b) project at each call site, which misses
+daemon-triggered runs since the daemon calls the service directly rather than
+through `m4_commands.rs`. (a) is the only complete option and is a real
+architectural change to a service deliberately kept storage-agnostic, so it is
+called out here rather than done as a mechanical edit.
 
 **Blocks:** everything in Phase 2 and 3. A scheduler needs something to
 schedule, and it cannot arbitrate between kinds that are not in the table.

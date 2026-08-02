@@ -285,23 +285,85 @@ pub fn process_link_run(
 /// Reap live processes whose worker is gone.
 ///
 /// The caller passes the processes it can still account for; everything else
-/// that is live gets [`crate::process_table::ExitStatus::Lost`]. The desktop
-/// calls this at startup: a turn whose WebView died mid-run previously stayed
-/// `running` in the ledger forever, because nothing swept it.
+/// that is live *and of a kind this app owns* gets
+/// [`crate::process_table::ExitStatus::Lost`]. A turn whose WebView died mid-run
+/// previously stayed `running` in the ledger forever, because nothing swept it.
+///
+/// Scoped to [`ProcessKind::DESKTOP_OWNED`] by default rather than everything
+/// live: the resident daemon is a separate service that outlives this app, so an
+/// unscoped reap at startup would declare live daemon work lost.
 #[tauri::command]
 pub fn process_reap_missing(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     live_process_ids: Vec<String>,
     reason: Option<String>,
+    kinds: Option<Vec<String>>,
 ) -> Result<Vec<ProcessRecord>, String> {
+    let scope_kinds = match kinds {
+        Some(raw) => {
+            let mut parsed = Vec::new();
+            for value in raw {
+                parsed.push(ProcessKind::parse(&value).map_err(to_message)?);
+            }
+            parsed
+        }
+        None => ProcessKind::DESKTOP_OWNED.to_vec(),
+    };
+    let scope = ProcessFilter {
+        kinds: scope_kinds,
+        ..ProcessFilter::default()
+    };
     let now = crate::run_commands::unix_time_ms()? as i64;
     let reason = reason.unwrap_or_else(|| "worker was no longer running at startup".to_string());
     let reaped = with_process_table(&app, state.inner(), |table| {
-        table.reap_missing(&live_process_ids, &reason, now)
+        table.reap_missing(&scope, &live_process_ids, &reason, now)
     })?;
     for record in &reaped {
         notify(&app, record);
     }
     Ok(reaped)
+}
+
+/// Reaps desktop-owned processes at app startup.
+///
+/// Called from `lib.rs`'s `setup` rather than from the frontend so it runs once
+/// per app launch regardless of how many windows open, and before any new turn
+/// can admit a process that would then be in the live set. Failure is logged and
+/// swallowed — a stale row is not worth refusing to start over.
+pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+) {
+    let now = match crate::run_commands::unix_time_ms() {
+        Ok(value) => value as i64,
+        Err(error) => {
+            eprintln!("process table: startup reap skipped, clock unavailable: {error}");
+            return;
+        }
+    };
+    let scope = ProcessFilter {
+        kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+        ..ProcessFilter::default()
+    };
+    // Nothing this app instance owns can still be running: its workers died with
+    // the previous process, so the accounted-for set is empty by definition.
+    let result = with_process_table(app, state, |table| {
+        table.reap_missing(
+            &scope,
+            &[],
+            "the app restarted while this process was still running",
+            now,
+        )
+    });
+    match result {
+        Ok(reaped) if !reaped.is_empty() => {
+            eprintln!(
+                "process table: reaped {} process(es) left running by a previous app session",
+                reaped.len()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("process table: startup reap failed: {error}"),
+    }
 }
