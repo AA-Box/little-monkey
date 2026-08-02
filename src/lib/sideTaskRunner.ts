@@ -58,6 +58,7 @@ import {
 import { useSessionStore } from '../store/sessionStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
+import { admitProcess, exitProcess, markProcessRunning } from './processTable';
 import { errorMessage } from "./errors";
 
 /** Hard cap on model/tool round trips for one side task attempt — same
@@ -332,6 +333,19 @@ export async function runSideTask(taskId: string): Promise<void> {
   controllers.set(taskId, controller);
   const mutatedPaths: string[] = [];
 
+  // Projected onto the unified process table. A side task is deliberately NOT a
+  // child of the chat turn that started it — that is the whole point of a side
+  // task, and `sessionId` on the record is an association, not a parent process.
+  // Fail-soft — see `processTable.ts`.
+  const processIdPromise = admitProcess({
+    kind: 'side_task',
+    externalId: taskId,
+    profile: useSideTaskStore.getState().tasks[taskId]?.profile ?? null,
+  }).then(async (id) => {
+    if (id) await markProcessRunning(id);
+    return id;
+  });
+
   const finishTerminal = (
     status: 'completed' | 'error' | 'cancelled',
     finalReport: string | null,
@@ -342,6 +356,15 @@ export async function runSideTask(taskId: string): Promise<void> {
     if (task) store.setArtifacts(taskId, buildArtifacts(task.messages, mutatedPaths));
     store.finish(taskId, status, finalReport, error);
     controllers.delete(taskId);
+    // Not awaited: this helper is synchronous and is the single terminal path
+    // every outcome routes through, so blocking it on IPC would change the
+    // loop's shape.
+    void processIdPromise.then((id) => {
+      if (!id) return;
+      const exitStatus =
+        status === 'completed' ? 'succeeded' : status === 'cancelled' ? 'cancelled' : 'failed';
+      return exitProcess(id, exitStatus, error ?? null);
+    });
   };
 
   try {

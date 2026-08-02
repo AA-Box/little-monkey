@@ -239,6 +239,17 @@ pub mod run_protocol;
 // idempotency, leases, triggers, and the migration-controlled profile schema.
 // Like the protocol module, this remains reusable by non-Tauri clients.
 pub mod run_ledger;
+// The one process abstraction shared by every execution surface — desktop
+// turns, daemon jobs, subagents, crew members, workflow runs/nodes, remote
+// runs, background shells, side tasks. Public for the same reason the two
+// modules above are: the CLI's `monkey ps` and the daemon both read it, and
+// neither should grow a second copy of the state machine.
+pub mod process_table;
+mod process_commands;
+// Policy shared by the two HTTP listeners, which default to the same port and
+// today report a bare "address already in use" naming neither the winner nor
+// the reason. Where the shared pieces accumulate as D1 collapses them into one.
+pub mod http_policy;
 // Migration-controlled authoritative profile/session/search storage. Kept
 // reusable by the desktop, CLI, daemon, export/import, and restore paths.
 pub mod portability;
@@ -824,6 +835,17 @@ pub fn run() {
                 }
             });
 
+            // A previous session's chat turns, subagents, crew members,
+            // background shells and side tasks died with that process, so any
+            // still marked live in the process table are stale. Reaped here,
+            // before any new turn can admit one, and scoped to the kinds this
+            // app owns so live daemon work is never declared lost.
+            {
+                let reap_app = app.handle().clone();
+                let reap_state = reap_app.state::<AppState>();
+                process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
+            }
+
             // A persisted M3 policy represents an explicit user opt-in. Start
             // its separate, capability-scoped compatibility listener without
             // blocking app launch; failures remain visible in Runtime Hub.
@@ -918,7 +940,17 @@ pub fn run() {
             models::models_delete,
             models::models_add_external,
             models::models_remove_external,
+            process_commands::process_list,
+            process_commands::process_get,
+            process_commands::process_descendants,
+            process_commands::process_live_counts,
+            process_commands::process_admit,
+            process_commands::process_reconcile,
+            process_commands::process_transition,
+            process_commands::process_link_run,
+            process_commands::process_reap_missing,
             permissions::permission_respond,
+            permissions::permission_dry_run,
             permissions::set_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,

@@ -39,6 +39,7 @@ use crate::package_ecosystem::{
     signed_first_party_catalog, InstallEnvironment, InstallTrustPolicy, PackageLimits,
     RingEd25519SignatureVerifier, SemanticVersion, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
 };
+use crate::process_table::LedgerProcessProjector;
 use crate::workflow_core::{
     ArtifactReference, DaemonCapability, EffectClass, FailureClass, LegacyRecipeV1,
     NodeAdapterResult, NodeExecutionRequest, ResourceUsage, SecretBinding,
@@ -2215,8 +2216,15 @@ fn production_workflow_service_with_browser(
         Some(registrar),
         approvals,
     )
-    .map(Arc::new)
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    // Every production path — desktop start, replay, and a daemon-hosted
+    // trigger delivery — reaches this service, so attaching the projector here
+    // is what makes workflow runs and their node instances visible in the
+    // unified process table rather than only in their own JSON history store.
+    .with_process_projector(Arc::new(LedgerProcessProjector::new(
+        app_data_dir.join("profile-v1.sqlite3"),
+    )));
+    let service = Arc::new(service);
     Ok((service, browser))
 }
 

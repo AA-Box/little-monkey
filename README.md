@@ -118,8 +118,29 @@ a scope boundary stated where it matters.
 - Generate an MCP server scaffold from a described API, diff two API contract
   versions, and build a connector from an OpenAPI document.
 - Compare models side by side (Model Compare Lab), run a Golden Dataset
-  Builder over real model calls with dedupe and privacy filtering, hold a
-  multi-model debate, and exercise a Red-Team Lab against tool-loop fixtures.
+  Builder over real model calls with dedupe and privacy filtering, and hold a
+  multi-model debate.
+- Run a Red-Team Lab whose prompt-injection fixtures are scored by the real
+  code path rather than a copy of it. One corpus
+  (`src/lib/redTeamFixtures.json`) is read by both sides: the panel asks the
+  Rust permission gate what it would decide via a read-only dry run
+  (`resolve_path_and_root` → `path_risk_floor` → `compute_risk` →
+  `evaluate_gate`, the same chain a live tool call runs, remembered
+  session/run grants included), and `permissions.rs` compiles the same file in
+  to walk every fixture through that chain across all six permission modes.
+  The dry run evaluates a mode as an override, so asking "what would happen in
+  acceptEdits?" never changes the mode you are actually in or clears a grant.
+  Separately, `redTeamLiveLoop.test.ts` drives the real `runAgentTurn` with a
+  scripted model and asserts the transcript the loop produced actually carries
+  the untrusted-content envelope — it fails if the wrapping call is removed,
+  which the previous fixture-only suite did not. The corpus is what surfaced
+  the floor gap this closed: `acceptEdits`/`auto` used to approve edits without
+  consulting risk at all, so a write to `.github/workflows/`, a package
+  manifest or `.zshenv` was promptless in those modes. A floored path now
+  prompts in every mode below `bypass`, and no remembered "allow for session"
+  grant can answer one. One honest limit remains: the panel's containment
+  column exercises the real boundary functions but cannot prove from a panel
+  that the loop *invokes* them — that claim is the CI test's.
 - Score models, connectors, MCP servers, skills, workflows, and plugins in
   Trust Scorecards from live store state, with weaker profiles sorted first.
   Every dimension cites the exact field it read; nothing is scored from
@@ -139,6 +160,28 @@ a scope boundary stated where it matters.
 
 ### Runs, review, and cost
 
+- See everything the app is executing in one table. A chat turn, a daemon job,
+  a `task`-tool subagent, a Crew member, a workflow run, each of that run's
+  node instances, remote-queued work, a background shell, and a side task all
+  create a record in one process table with a shared id scheme
+  (`p-<kind>-<uuid>`), a parent id, one state machine
+  (`admitted → running → suspended → exited`), the owning workspace and profile
+  as queryable columns, a declared limit set, and a structured exit
+  (status/code/signal/reason). List it from the CLI with `monkey processes`
+  (`--kind`, `--all`, `--workspace`, `--parent`, `--json`), or `monkey
+  processes show <id>` for a process and its descendants. Named `processes`
+  because `monkey ps` is the Ollama-compatible "list running models".
+  Transitions are refused rather than silently applied, and both that rule and
+  "a row is `exited` if and only if it carries an exit status" are enforced in
+  Rust *and* by SQL triggers, because companion stores reach the shared ledger
+  connection directly. Stale records left by a killed app are reaped at
+  startup, scoped to the kinds the app owns so live daemon work is never
+  declared lost. Real limits: the table records what each kind reports, so a
+  declared memory or wall-clock limit is *not* enforced by any OS mechanism
+  yet; suspend/resume is only implemented by the daemon, so there is no
+  cross-kind signal command; a Crew member carries no edge to its coordinator
+  (actors initialize concurrently, coordinator last); and a retried daemon job
+  becomes a new process rather than inheriting the original's parent.
 - Approve, inspect, and replay from one place: the Agent Inbox and Run
   Dashboard put approvals from every source (desktop, daemon, remote
   controller) on a single screen with a per-run event timeline.

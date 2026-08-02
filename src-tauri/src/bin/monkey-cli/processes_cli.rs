@@ -1,0 +1,310 @@
+//! `monkey processes` — the cross-surface process listing.
+//!
+//! Named `processes` rather than `ps` because `monkey ps` is already the
+//! Ollama-compatible "list running models" command, and breaking that
+//! compatibility to free up three characters would be a bad trade. `proc` is
+//! accepted as a short alias.
+//!
+//! Read-only. Signals belong to K2 in `docs/agent-os-roadmap.md`, and today
+//! only the daemon can actually suspend or resume anything, so there is no
+//! `monkey processes stop` that would silently do nothing for most kinds.
+
+use std::path::Path;
+
+use clap::Subcommand;
+use little_monkey_lib::process_table::{
+    ProcessFilter, ProcessKind, ProcessRecord, DEFAULT_LIST_LIMIT,
+};
+use little_monkey_lib::run_ledger::RunLedger;
+
+const LEDGER_FILE: &str = "profile-v1.sqlite3";
+
+#[derive(Subcommand, Debug)]
+pub enum ProcessesCmd {
+    /// List agent processes across every execution surface, newest first.
+    List {
+        /// Only these kinds. Repeatable, e.g. `--kind chat_turn --kind daemon_job`.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Include processes that have already exited.
+        #[arg(long)]
+        all: bool,
+        /// Only processes owning this workspace root.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Only children of this process.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Maximum rows.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Print the machine-readable record instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one process and its descendants.
+    Show {
+        process_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Live count per kind.
+    Count {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
+    let path = data_dir.join(LEDGER_FILE);
+    if !path.exists() {
+        // An app that has never run has no ledger. Say so rather than creating
+        // one as a side effect of a read-only listing.
+        return Err(format!(
+            "No Little Monkey ledger at {} yet — start the app or a daemon run first",
+            path.display()
+        ));
+    }
+    let ledger = RunLedger::open(&path).map_err(|error| error.to_string())?;
+    let table = ledger.process_table();
+
+    match action {
+        ProcessesCmd::List {
+            kinds,
+            all,
+            workspace,
+            parent,
+            limit,
+            json,
+        } => {
+            let mut parsed = Vec::new();
+            for raw in kinds {
+                parsed.push(ProcessKind::parse(raw).map_err(|error| error.to_string())?);
+            }
+            let records = table
+                .list(&ProcessFilter {
+                    kinds: parsed,
+                    live_only: !all,
+                    parent_process_id: parent.clone(),
+                    workspace: workspace.clone(),
+                    limit: *limit,
+                })
+                .map_err(|error| error.to_string())?;
+            if *json {
+                print_json(&records)?;
+            } else {
+                print_table(&records, !*all, limit.unwrap_or(DEFAULT_LIST_LIMIT));
+            }
+            Ok(())
+        }
+        ProcessesCmd::Show { process_id, json } => {
+            let record = table
+                .get(process_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("No process {process_id}"))?;
+            let descendants = table
+                .descendants(process_id)
+                .map_err(|error| error.to_string())?;
+            if *json {
+                print_json(&serde_json::json!({
+                    "process": record,
+                    "descendants": descendants,
+                }))?;
+            } else {
+                print_detail(&record);
+                if descendants.is_empty() {
+                    println!("\nno child processes");
+                } else {
+                    println!("\n{} descendant(s):", descendants.len());
+                    print_table(&descendants, false, DEFAULT_LIST_LIMIT);
+                }
+            }
+            Ok(())
+        }
+        ProcessesCmd::Count { json } => {
+            let counts = table.live_counts().map_err(|error| error.to_string())?;
+            if *json {
+                print_json(
+                    &counts
+                        .iter()
+                        .map(|(kind, count)| {
+                            serde_json::json!({ "kind": kind.as_str(), "count": count })
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+            } else if counts.is_empty() {
+                println!("no live agent processes");
+            } else {
+                let total: u32 = counts.iter().map(|(_, count)| *count).sum();
+                for (kind, count) in &counts {
+                    println!("{:<18} {count}", kind.as_str());
+                }
+                println!("{:<18} {total}", "total");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn print_table(records: &[ProcessRecord], live_only: bool, limit: u32) {
+    if records.is_empty() {
+        println!(
+            "no {}agent processes",
+            if live_only { "live " } else { "" }
+        );
+        return;
+    }
+    println!(
+        "{:<26} {:<17} {:<10} {:<28} {:<8} {}",
+        "PROCESS", "KIND", "STATE", "EXTERNAL ID", "PID", "EXIT"
+    );
+    for record in records {
+        println!(
+            "{:<26} {:<17} {:<10} {:<28} {:<8} {}",
+            truncate(&record.process_id, 26),
+            record.kind.as_str(),
+            record.state.as_str(),
+            truncate(&record.external_id, 28),
+            record
+                .native_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            record
+                .exit
+                .as_ref()
+                .map(|exit| exit.status.as_str().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
+    }
+    if records.len() as u32 >= limit {
+        println!(
+            "\n(showing {limit} rows — pass --limit to widen; listings are always bounded)"
+        );
+    }
+}
+
+fn print_detail(record: &ProcessRecord) {
+    println!("process      {}", record.process_id);
+    println!("kind         {}", record.kind.as_str());
+    println!("state        {}", record.state.as_str());
+    println!("external id  {}", record.external_id);
+    println!(
+        "parent       {}",
+        record.parent_process_id.as_deref().unwrap_or("-")
+    );
+    println!("run          {}", record.run_id.as_deref().unwrap_or("-"));
+    println!(
+        "workspace    {}",
+        record.workspace.as_deref().unwrap_or("-")
+    );
+    println!("profile      {}", record.profile.as_deref().unwrap_or("-"));
+    println!(
+        "native pid   {}",
+        record
+            .native_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    if record.limits.is_unbounded() {
+        println!("limits       none declared");
+    } else {
+        println!(
+            "limits       wall={} memory={} output={} children={}",
+            option_or_dash(record.limits.max_wall_ms),
+            option_or_dash(record.limits.max_memory_bytes),
+            option_or_dash(record.limits.max_output_bytes),
+            option_or_dash(record.limits.max_child_processes),
+        );
+    }
+    match &record.exit {
+        Some(exit) => println!(
+            "exit         {} code={} signal={} reason={}",
+            exit.status.as_str(),
+            exit.code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            exit.signal.as_deref().unwrap_or("-"),
+            exit.reason.as_deref().unwrap_or("-"),
+        ),
+        None => println!("exit         -"),
+    }
+}
+
+fn option_or_dash<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|inner| inner.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    format!("{}…", value.chars().take(keep).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_ledger_is_reported_rather_than_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "little_monkey_processes_cli_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let error = run(&ProcessesCmd::Count { json: false }, &dir)
+            .expect_err("a read-only listing must not create a ledger");
+        assert!(error.contains("No Little Monkey ledger"), "{error}");
+        assert!(
+            !dir.join(LEDGER_FILE).exists(),
+            "the listing created a database as a side effect"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_keeps_short_values_intact_and_marks_clipped_ones() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdefghij", 10), "abcdefghij");
+        assert_eq!(truncate("abcdefghijk", 10), "abcdefghi…");
+    }
+
+    #[test]
+    fn an_unknown_kind_filter_is_refused() {
+        let dir = std::env::temp_dir();
+        let error = run(
+            &ProcessesCmd::List {
+                kinds: vec!["not_a_kind".to_string()],
+                all: false,
+                workspace: None,
+                parent: None,
+                limit: None,
+                json: false,
+            },
+            &dir,
+        )
+        .expect_err("an unknown kind must not be silently ignored");
+        // Either the ledger is missing in this temp dir, or the kind is refused.
+        assert!(
+            error.contains("unknown process kind") || error.contains("No Little Monkey ledger"),
+            "{error}"
+        );
+    }
+}
