@@ -133,12 +133,14 @@ a scope boundary stated where it matters.
   Separately, `redTeamLiveLoop.test.ts` drives the real `runAgentTurn` with a
   scripted model and asserts the transcript the loop produced actually carries
   the untrusted-content envelope — it fails if the wrapping call is removed,
-  which the previous fixture-only suite did not. Two honest limits: the panel's
-  containment column exercises the real boundary functions but cannot prove
-  from a panel that the loop *invokes* them (that claim is the CI test's), and
-  a floored path is still auto-approved under `acceptEdits`/`auto`, because
-  those two modes approve edits without consulting risk at all — only `smart`
-  honours the floor, and a test pins that rather than papering over it.
+  which the previous fixture-only suite did not. The corpus is what surfaced
+  the floor gap this closed: `acceptEdits`/`auto` used to approve edits without
+  consulting risk at all, so a write to `.github/workflows/`, a package
+  manifest or `.zshenv` was promptless in those modes. A floored path now
+  prompts in every mode below `bypass`, and no remembered "allow for session"
+  grant can answer one. One honest limit remains: the panel's containment
+  column exercises the real boundary functions but cannot prove from a panel
+  that the loop *invokes* them — that claim is the CI test's.
 - Score models, connectors, MCP servers, skills, workflows, and plugins in
   Trust Scorecards from live store state, with weaker profiles sorted first.
   Every dimension cites the exact field it read; nothing is scored from

@@ -38,7 +38,11 @@ pub struct PermissionRequestPayload {
     pub risk_reason: Option<String>,
     /// Whether `risk_level`/`risk_reason` came from the authoritative
     /// [`path_risk_floor`] rather than the LLM judge — lets the modal show a
-    /// stronger "sensitive path" warning instead of an ordinary risk badge.
+    /// stronger "sensitive path" warning instead of an ordinary risk badge,
+    /// and hide "allow for session" (a floored operation is never remembered;
+    /// see [`respond_if_pending`]). The modal's use of this is presentational
+    /// only: [`evaluate_gate`] and [`respond_if_pending`] enforce both
+    /// behaviours backend-side regardless of what the frontend renders.
     /// Always `false` when `risk_level` is `None`.
     pub risk_floored: bool,
     /// The description of the `code`-profile subagent (p3) this call
@@ -130,14 +134,14 @@ const SCRIPT_EXECUTING_MANIFESTS: &[&str] = &[
 /// any heuristic-driven relaxation of a floor — must never be gated on
 /// judge-supplied text).
 ///
-/// What the floor does *not* do is override a mode that never consults risk in
-/// the first place. [`mode_short_circuit`]'s `"acceptEdits"`/`"auto"` arms
-/// approve `write_file`/`edit_file` without looking at `risk` at all, so a
-/// floored path is still promptless in those two modes — only `"smart"` honours
-/// the floor. The
-/// `floored_paths_are_still_auto_approved_under_accept_edits_and_auto` test pins
-/// that behaviour; making those modes honour the floor would be a deliberate
-/// behaviour change for users who chose "auto-approve edits", not a bug fix.
+/// A floored path prompts in every mode below `"bypass"`, and no remembered
+/// "allow for session"/"allow for run" grant can answer it — [`evaluate_gate`]
+/// skips the grant lookup entirely when the floor fired, because those grants
+/// are keyed by tool name alone and would otherwise let one approval on an
+/// ordinary source file stand in for every later floored write. `"bypass"` is
+/// the single mode that skips the floor, exactly as it is the single mode that
+/// auto-approves `run_shell`. `floored_paths_prompt_under_accept_edits_and_auto`
+/// and `a_remembered_grant_does_not_answer_a_floored_call` pin both halves.
 ///
 /// `path` is expected already resolved/canonicalized
 /// (as `workspace::resolve_path_and_root` returns), `root` is that same
@@ -242,6 +246,13 @@ pub struct PendingPermission {
     tool_call_id: String,
     operation_sha256: String,
     expires_at_ms: u64,
+    /// Whether the prompt that produced this request carried a
+    /// [`path_risk_floor`] verdict. Stored here — the same reasoning as `tool`
+    /// above — so [`respond_if_pending`] decides whether "allow for session"
+    /// is eligible from what the *gate* saw, not from anything the IPC caller
+    /// claims. A floored operation is never remembered; see
+    /// [`NO_SESSION_REMEMBER`], which covers the same ground per-tool.
+    risk_floored: bool,
     sender: oneshot::Sender<bool>,
 }
 
@@ -306,6 +317,10 @@ impl Default for PermissionState {
 /// execution) is too large to silently pre-authorize for the rest of the
 /// session off the back of a single approval. Approving one of these always
 /// prompts again next time.
+///
+/// This is the per-*tool* half of that rule. [`respond_if_pending`] applies a
+/// per-*target* half alongside it: any operation whose path tripped
+/// [`path_risk_floor`] is never remembered either, whichever tool asked.
 const NO_SESSION_REMEMBER: &[&str] = &["run_shell"];
 
 /// Timeout for a permission prompt going unanswered — after this, the request
@@ -337,9 +352,19 @@ pub(crate) const VALID_MODES: &[&str] =
 /// show in the prompt payload if this falls through — passed in here (rather
 /// than computed inside this function) so this stays a pure decision table
 /// over already-known inputs, exercisable in tests without needing a
-/// filesystem or a judge call. Only `"smart"` ever looks at it; every other
-/// mode's decision is unchanged by whatever `risk` says (Phase 2's invariant
-/// that risk annotations are purely advisory outside "smart" mode).
+/// filesystem or a judge call. Which modes read which half of it:
+/// - `"smart"` reads both `level` and `floored` — the only mode where a judge
+///   classification can decide anything.
+/// - `"acceptEdits"`/`"auto"` read `floored` and nothing else. The
+///   deterministic floor can *add* a prompt in these modes; the judge can
+///   never add or remove one, because `level` is never consulted.
+/// - `"manual"`, `"plan"`, `"bypass"` and every unrecognized value ignore
+///   `risk` entirely.
+///
+/// So the Phase 2 invariant still holds in the form that matters: outside
+/// `"smart"`, nothing a model produced can change a decision here.
+/// [`path_risk_floor`]'s verdict is not model output — it is a pure function of
+/// the already-resolved path.
 fn mode_short_circuit(
     mode: &str,
     tool: &str,
@@ -351,7 +376,25 @@ fn mode_short_circuit(
             "Blocked: Little Monkey is in Plan Mode. Describe your plan instead of using {tool} - call the present_plan tool with your proposed plan, then ask the user to approve it and switch out of Plan Mode before making changes."
         ))),
         "acceptEdits" | "auto" => {
-            if tool == "write_file" || tool == "edit_file" || tool == "remember" {
+            // The deterministic floor binds here too. "Auto-approve my edits"
+            // is consent to promptless source-code changes, not to a
+            // promptless rewrite of a CI workflow, a package manifest, a shell
+            // rc file, `.env`, or anything inside `.git/` — those are exactly
+            // the supply-chain-shaped mutations a prompt-injected agent gets
+            // steered into, and the whole reason [`path_risk_floor`] exists.
+            // A floored target falls through to a real prompt in these two
+            // modes as it already does in "smart"; users who want promptless
+            // everything have "bypass", the same escape hatch `run_shell`
+            // points at above.
+            //
+            // Only `floored` is consulted, never `level`: the judge still has
+            // no influence on these modes whatsoever, so a fabricated "high"
+            // classification cannot start adding prompts here. The floor is
+            // computed from the resolved path alone (see [`compute_risk`]),
+            // with no model-supplied input.
+            if matches!(risk, Some(assessment) if assessment.floored) {
+                None
+            } else if tool == "write_file" || tool == "edit_file" || tool == "remember" {
                 Some(Ok(()))
             } else {
                 None
@@ -383,13 +426,14 @@ fn mode_short_circuit(
 /// - `"plan"`: always `Err(..)` — every caller of this function is already a
 ///   mutating tool (read-only tools never call it), so plan mode blocks all
 ///   of them unconditionally.
-/// - `"acceptEdits"`: `write_file`/`edit_file`/`remember` are auto-approved;
-///   anything else (i.e. `run_shell`) falls through to the normal prompting
-///   logic.
-/// - `"auto"`: same as `"acceptEdits"` — `write_file`/`edit_file`/`remember`
-///   are auto-approved, and `run_shell` ALWAYS falls through to the normal
-///   prompting logic (see [`mode_short_circuit`] for why it is never
-///   auto-approved).
+/// - `"acceptEdits"`: `write_file`/`edit_file`/`remember` are auto-approved
+///   UNLESS the target tripped [`path_risk_floor`] (`risk.floored`), in which
+///   case it falls through to a real prompt like everything else. Anything
+///   else (i.e. `run_shell`) always falls through.
+/// - `"auto"`: same as `"acceptEdits"` — floored targets prompt, unfloored
+///   `write_file`/`edit_file`/`remember` are auto-approved, and `run_shell`
+///   ALWAYS falls through to the normal prompting logic (see
+///   [`mode_short_circuit`] for why it is never auto-approved).
 /// - `"smart"` (Phase 3): `write_file`/`edit_file` are auto-approved ONLY
 ///   when `risk` is `Some` with `level == "low"` and `floored == false`;
 ///   every other case for those two tools, `remember`, and — critically —
@@ -400,18 +444,23 @@ fn mode_short_circuit(
 /// - `"manual"`, or any unrecognized value (as a safe default): always falls
 ///   through to the normal prompting logic, unchanged.
 ///
-/// `risk` (see [`RiskAssessment`]/[`compute_risk`]) is purely advisory in
-/// every mode except `"smart"`: outside `"smart"` it only ever changes what
-/// [`PermissionRequestPayload`] shows the user, never anything above — those
-/// modes' short-circuit decisions are made with no knowledge of it
-/// whatsoever, so a mis-classified "low risk" judge result can never itself
-/// approve anything under them. `"smart"` is the sole, narrow exception, and
-/// even there it can only ever affect `write_file`/`edit_file` — never
-/// `run_shell` (see [`mode_short_circuit`]).
+/// The *judge* half of `risk` (see [`RiskAssessment`]/[`compute_risk`]) is
+/// purely advisory in every mode except `"smart"`: outside `"smart"`,
+/// `risk.level` only changes what [`PermissionRequestPayload`] shows the user,
+/// so a mis-classified "low risk" judge result can never itself approve
+/// anything. `"smart"` is the sole exception, and even there it can only ever
+/// affect `write_file`/`edit_file` — never `run_shell`.
+///
+/// The *floor* half (`risk.floored`) is not advisory anywhere below
+/// `"bypass"`: it can only ever turn an auto-approval into a prompt, never the
+/// reverse, and it is computed from the resolved path with no model input at
+/// all (see [`path_risk_floor`]). Erring toward more prompts on a fixed list
+/// of sensitive paths is the one direction this design lets a signal push.
 ///
 /// The normal prompting logic: if `tool` has already been granted "allow for
-/// session", resolves `Ok(())` immediately without prompting; otherwise emits
-/// a `permission://request` event and awaits the user's decision (or the
+/// session" — and the target is not floored, which no grant can answer — the
+/// call resolves `Ok(())` immediately without prompting; otherwise it emits a
+/// `permission://request` event and awaits the user's decision (or the
 /// timeout, which counts as a denial).
 /// Resolves the mode that should govern a given permission request: a
 /// turn-scoped override (see [`PermissionState::turn_mode_overrides`]) wins
@@ -469,7 +518,8 @@ pub(crate) enum GateOutcome {
 /// Note the remembered-grant branch: a prior session/run grant turns a call
 /// that the mode alone would have prompted for into a promptless one. Any
 /// evaluation that skips this — as the deleted frontend mirror did — reports a
-/// prompt that a real run would never show.
+/// prompt that a real run would never show. A floored target is the one case
+/// that never reaches that branch at all; see the comment on it below.
 pub(crate) fn evaluate_gate(
     state: &AppState,
     mode: &str,
@@ -479,6 +529,20 @@ pub(crate) fn evaluate_gate(
 ) -> GateOutcome {
     if let Some(decision) = mode_short_circuit(mode, tool, risk) {
         return GateOutcome::ShortCircuit(decision);
+    }
+
+    // A remembered grant is keyed by tool name alone, so honouring one for a
+    // floored target would hand the floor straight back: a single "allow for
+    // session" earned on an ordinary `src/util.ts` write would silently
+    // pre-authorize every later write to `.env`, `.github/workflows/*` or a
+    // package manifest for the rest of the session. That is the laundering
+    // path the floor exists to close, so a floored call always reaches a
+    // human. [`respond_if_pending`] already refuses to *store* a grant from a
+    // floored prompt; this refuses to *honour* one earned elsewhere, which is
+    // the half that actually matters — the dangerous grant is the innocuous
+    // one, not the floored one.
+    if matches!(risk, Some(assessment) if assessment.floored) {
+        return GateOutcome::Prompt;
     }
 
     let remembered = if let Some(run_id) = turn {
@@ -686,6 +750,7 @@ pub async fn request_permission<R: tauri::Runtime>(
             tool_call_id: normalized_tool_call_id.clone(),
             operation_sha256: operation_sha256.clone(),
             expires_at_ms,
+            risk_floored: risk.as_ref().is_some_and(|assessment| assessment.floored),
             sender: tx,
         },
     );
@@ -1102,7 +1167,17 @@ pub(crate) fn respond_if_pending(
         return Ok(false);
     };
 
-    if remember && allow && !NO_SESSION_REMEMBER.contains(&pending.tool.as_str()) {
+    // A floored operation is never remembered, for the same reason `run_shell`
+    // never is: one approval must not stand in for every later write to a
+    // sensitive path. `evaluate_gate` refuses to honour such a grant anyway,
+    // so this is belt-and-braces — but it also keeps the grant sets honest, so
+    // nothing downstream reads a stored grant and concludes the user
+    // pre-authorized `.github/workflows/` edits.
+    if remember
+        && allow
+        && !pending.risk_floored
+        && !NO_SESSION_REMEMBER.contains(&pending.tool.as_str())
+    {
         if let Some(turn) = &pending.turn {
             state
                 .permissions
@@ -1210,6 +1285,16 @@ mod tests {
         tool: &str,
         turn: Option<&str>,
     ) -> oneshot::Receiver<bool> {
+        insert_pending_with_floor(state, id, tool, turn, false)
+    }
+
+    fn insert_pending_with_floor(
+        state: &AppState,
+        id: &str,
+        tool: &str,
+        turn: Option<&str>,
+        risk_floored: bool,
+    ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel::<bool>();
         state.permissions.pending.lock().unwrap().insert(
             id.to_string(),
@@ -1219,6 +1304,7 @@ mod tests {
                 tool_call_id: "tool-test".to_string(),
                 operation_sha256: "0".repeat(64),
                 expires_at_ms: u64::MAX,
+                risk_floored,
                 sender: tx,
             },
         );
@@ -2174,22 +2260,18 @@ mod tests {
         }
     }
 
-    /// The gap this corpus surfaced, pinned so it cannot be lost.
+    /// The gap this corpus surfaced, now closed and pinned shut.
     ///
-    /// [`path_risk_floor`]'s doc comment claims a floored path "always prompts
-    /// in every mode below `bypass`". That is not what [`mode_short_circuit`]
-    /// does: its `"acceptEdits"`/`"auto"` arms approve `write_file`/`edit_file`
+    /// `"acceptEdits"`/`"auto"` used to approve `write_file`/`edit_file`
     /// without consulting `risk` at all, so an edit to
-    /// `.github/workflows/deploy.yml`, `pyproject.toml` or `.zshenv` is
-    /// promptless in those two modes even though the floor fired. Only
-    /// `"smart"` honours the floor.
-    ///
-    /// This test asserts today's real behaviour rather than the documented
-    /// claim, so the suite stays honest. Closing the gap is a deliberate
-    /// behaviour change — floored paths would start prompting for users who
-    /// chose "auto-approve edits" — and belongs in its own change, not here.
+    /// `.github/workflows/deploy.yml`, `pyproject.toml` or `.zshenv` was
+    /// promptless in those two modes even though the floor had fired — only
+    /// `"smart"` honoured it. [`mode_short_circuit`] now falls through on
+    /// `risk.floored` in those arms, so "auto-approve my edits" no longer
+    /// means "auto-approve my CI pipeline". `"bypass"` is unchanged and
+    /// remains the one mode that skips the floor.
     #[test]
-    fn floored_paths_are_still_auto_approved_under_accept_edits_and_auto() {
+    fn floored_paths_prompt_under_accept_edits_and_auto() {
         let root = TempRoot::new("floored_accept");
         let state = state_with_root(&root.path);
 
@@ -2198,18 +2280,102 @@ mod tests {
                 let outcome = dry_run_fixture(&state, &fixture, mode);
                 assert!(
                     outcome.risk_floored,
-                    "{} should still be floored under {mode}",
+                    "{} should be floored under {mode}",
                     fixture.id
                 );
                 assert_eq!(
                     outcome.decision,
-                    PermissionDryRunDecision::AutoApproved,
-                    "{} behaviour under {mode} changed — if the floor now binds these modes, \
-                     this test and path_risk_floor's doc comment both need updating",
+                    PermissionDryRunDecision::RequiresPrompt,
+                    "{} escaped the floor under {mode} — the floor must bind every mode \
+                     below bypass, not just smart",
                     fixture.id
+                );
+                assert_eq!(outcome.risk_level.as_deref(), Some("high"));
+            }
+        }
+    }
+
+    /// The other half of the floor: no remembered grant may answer a floored
+    /// call.
+    ///
+    /// Grants are keyed by tool name alone, so without this a single "allow
+    /// for session" earned on an ordinary source-file write would silently
+    /// pre-authorize every later floored write for the rest of the session —
+    /// handing back exactly what the arm above just closed, and doing it in
+    /// `"smart"` and `"manual"` too.
+    #[test]
+    fn a_remembered_grant_does_not_answer_a_floored_call() {
+        let root = TempRoot::new("floored_grant");
+        let state = state_with_root(&root.path);
+
+        // The grant an innocuous edit would have earned.
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("edit_file".to_string());
+
+        for fixture in corpus().into_iter().filter(|f| f.id.starts_with("floored-")) {
+            assert_eq!(
+                fixture.triggered_action.tool, "edit_file",
+                "{} must use the granted tool or this proves nothing",
+                fixture.id
+            );
+            for mode in VALID_MODES.iter().filter(|mode| **mode != "bypass") {
+                let outcome = dry_run_fixture(&state, &fixture, mode);
+                let acceptable = matches!(
+                    outcome.decision,
+                    PermissionDryRunDecision::RequiresPrompt | PermissionDryRunDecision::Blocked
+                );
+                assert!(
+                    acceptable,
+                    "{} was answered by a remembered grant under mode {mode}: {:?}",
+                    fixture.id, outcome.decision
                 );
             }
         }
+
+        // Non-vacuity: the same grant DOES answer an unfloored call, so the
+        // assertions above failed on `floored`, not on a grant that never
+        // applied in the first place.
+        let unfloored = permission_dry_run_impl(
+            &state,
+            "edit_file",
+            Some("src/util.ts"),
+            None,
+            None,
+            None,
+            Some("manual"),
+        )
+        .expect("manual is a valid mode");
+        assert_eq!(unfloored.decision, PermissionDryRunDecision::GrantApproved);
+    }
+
+    /// Backend-side counterpart to the modal hiding "allow for session" on a
+    /// floored prompt: even if a caller asks to remember one, nothing is
+    /// stored. Same rule `NO_SESSION_REMEMBER` applies per-tool, applied
+    /// per-target.
+    #[test]
+    fn approving_a_floored_prompt_with_remember_stores_no_grant() {
+        let state = AppState::default();
+        let _floored = insert_pending_with_floor(&state, "req-floored", "edit_file", None, true);
+
+        assert!(respond_if_pending(&state, "req-floored", true, true).unwrap());
+        assert!(
+            state.permissions.session_allow.lock().unwrap().is_empty(),
+            "a floored approval must not leave a session grant behind"
+        );
+
+        // Non-vacuity: the identical call on an unfloored prompt does store.
+        let _plain = insert_pending_with_floor(&state, "req-plain", "edit_file", None, false);
+        assert!(respond_if_pending(&state, "req-plain", true, true).unwrap());
+        assert!(state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains("edit_file"));
     }
 
     #[test]
