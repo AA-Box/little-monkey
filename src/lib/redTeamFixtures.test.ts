@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import { BUILTIN_FIXTURES, type FixtureSourceType } from "./redTeamFixtures";
 
 describe("redTeamFixtures", () => {
-  it("has between 10 and 20 built-in fixtures", () => {
-    expect(BUILTIN_FIXTURES.length).toBeGreaterThanOrEqual(10);
-    expect(BUILTIN_FIXTURES.length).toBeLessThanOrEqual(20);
+  it("carries a corpus broad enough to be worth running", () => {
+    // Lower bound only. There is no upper bound worth asserting: the corpus is
+    // meant to grow as new ingestion surfaces and new floored path classes are
+    // covered, and the Rust `red_team_corpus` test walks whatever is here.
+    expect(BUILTIN_FIXTURES.length).toBeGreaterThanOrEqual(17);
   });
 
   it("every fixture has a unique id", () => {

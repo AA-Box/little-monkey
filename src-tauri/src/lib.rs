@@ -919,6 +919,7 @@ pub fn run() {
             models::models_add_external,
             models::models_remove_external,
             permissions::permission_respond,
+            permissions::permission_dry_run,
             permissions::set_permission_mode,
             permissions::set_permission_mode_for_turn,
             permissions::clear_permission_mode_for_turn,

@@ -124,12 +124,22 @@ const SCRIPT_EXECUTING_MANIFESTS: &[&str] = &[
 /// inside `.github/workflows/`), script-executing package
 /// manifests/lockfiles, and shell rc files — `None` otherwise.
 ///
-/// This floor can NEVER be overridden or relaxed by the LLM judge: a floored
-/// path always prompts in every mode below `"bypass"`, no matter what any
-/// judge classification says (see [`RiskAssessment::floored`] and this
+/// This floor can NEVER be overridden or relaxed by the LLM judge, no matter
+/// what any judge classification says (see [`RiskAssessment::floored`] and this
 /// module's top doc comment on why `run_shell` — and, by the same reasoning,
 /// any heuristic-driven relaxation of a floor — must never be gated on
-/// judge-supplied text). `path` is expected already resolved/canonicalized
+/// judge-supplied text).
+///
+/// What the floor does *not* do is override a mode that never consults risk in
+/// the first place. [`mode_short_circuit`]'s `"acceptEdits"`/`"auto"` arms
+/// approve `write_file`/`edit_file` without looking at `risk` at all, so a
+/// floored path is still promptless in those two modes — only `"smart"` honours
+/// the floor. The
+/// `floored_paths_are_still_auto_approved_under_accept_edits_and_auto` test pins
+/// that behaviour; making those modes honour the floor would be a deliberate
+/// behaviour change for users who chose "auto-approve edits", not a bug fix.
+///
+/// `path` is expected already resolved/canonicalized
 /// (as `workspace::resolve_path_and_root` returns), `root` is that same
 /// call's canonical workspace root, so a path outside the workspace can never
 /// reach here in the first place (the sandbox already rejects it upstream).
@@ -423,6 +433,72 @@ fn effective_mode(state: &AppState, turn: Option<&str>) -> String {
     state.permissions.mode.lock().unwrap().clone()
 }
 
+/// What the permission gate decides for a call, before any side effect.
+///
+/// This is the value [`evaluate_gate`] returns and the vocabulary
+/// [`permission_dry_run`] reports — see [`evaluate_gate`] for why the decision
+/// is separated from the prompting/audit work at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateOutcome {
+    /// The mode decided on its own, with no human in the loop: `Ok(())` is an
+    /// auto-approval, `Err(message)` an outright refusal (plan mode).
+    ShortCircuit(Result<(), String>),
+    /// A prior "allow for session"/"allow for run" grant answers this call,
+    /// so no prompt is shown even though the mode did not short-circuit.
+    Remembered,
+    /// Falls through to a real human prompt.
+    Prompt,
+}
+
+/// The decision half of [`request_permission`] — the mode table
+/// ([`mode_short_circuit`]) and the remembered-grant lookup — with no
+/// `AppHandle`, no ledger write, and no prompt emission.
+///
+/// `mode` is passed in already resolved (callers use [`effective_mode`]) so
+/// [`permission_dry_run`] can evaluate a mode the user is not currently in
+/// without mutating [`PermissionState::mode`] to do it.
+///
+/// [`request_permission`] calls this and then performs the audit and prompt
+/// side effects around the answer, so the decision table has exactly one
+/// implementation. [`permission_dry_run`] calls the same function to answer
+/// "what *would* the gate decide?" without executing anything — which is what
+/// lets the Red-Team Lab assert against the real table instead of a
+/// hand-transcribed frontend copy of it that can silently drift (a copy that
+/// had already drifted by 14 file classes before this existed).
+///
+/// Note the remembered-grant branch: a prior session/run grant turns a call
+/// that the mode alone would have prompted for into a promptless one. Any
+/// evaluation that skips this — as the deleted frontend mirror did — reports a
+/// prompt that a real run would never show.
+pub(crate) fn evaluate_gate(
+    state: &AppState,
+    mode: &str,
+    tool: &str,
+    turn: Option<&str>,
+    risk: Option<&RiskAssessment>,
+) -> GateOutcome {
+    if let Some(decision) = mode_short_circuit(mode, tool, risk) {
+        return GateOutcome::ShortCircuit(decision);
+    }
+
+    let remembered = if let Some(run_id) = turn {
+        state
+            .permissions
+            .run_allow
+            .lock()
+            .unwrap()
+            .contains(&(run_id.to_string(), tool.to_string()))
+    } else {
+        state.permissions.session_allow.lock().unwrap().contains(tool)
+    };
+
+    if remembered {
+        GateOutcome::Remembered
+    } else {
+        GateOutcome::Prompt
+    }
+}
+
 fn operation_digest(run_id: &str, tool_call_id: &str, tool: &str, detail: &str) -> String {
     let mut hasher = Sha256::new();
     for value in [run_id, tool_call_id, tool, detail, "run"] {
@@ -546,7 +622,6 @@ pub async fn request_permission<R: tauri::Runtime>(
     risk: Option<RiskAssessment>,
     agent_label: Option<&str>,
 ) -> Result<(), String> {
-    let mode = effective_mode(state, turn);
     let request_id = uuid::Uuid::new_v4().to_string();
     let durable = durable_run_exists(app, state, turn)?;
     let run_id = turn.unwrap_or_default();
@@ -571,44 +646,34 @@ pub async fn request_permission<R: tauri::Runtime>(
         risk: risk.as_ref(),
     };
 
-    if let Some(decision) = mode_short_circuit(&mode, tool, risk.as_ref()) {
-        if durable {
-            append_permission_requested(app, state, &audit, false)?;
-            append_automatic_decision(
-                app,
-                state,
-                &audit,
-                if decision.is_ok() {
-                    PermissionDecision::AllowOnce
-                } else {
-                    PermissionDecision::Deny
-                },
-            )?;
+    // The decision itself lives in `evaluate_gate` so `permission_dry_run`
+    // answers from the same table; only the audit/prompt side effects stay
+    // here.
+    match evaluate_gate(state, &effective_mode(state, turn), tool, turn, risk.as_ref()) {
+        GateOutcome::ShortCircuit(decision) => {
+            if durable {
+                append_permission_requested(app, state, &audit, false)?;
+                append_automatic_decision(
+                    app,
+                    state,
+                    &audit,
+                    if decision.is_ok() {
+                        PermissionDecision::AllowOnce
+                    } else {
+                        PermissionDecision::Deny
+                    },
+                )?;
+            }
+            return decision;
         }
-        return decision;
-    }
-
-    let remembered = if let Some(run_id) = turn {
-        state
-            .permissions
-            .run_allow
-            .lock()
-            .unwrap()
-            .contains(&(run_id.to_string(), tool.to_string()))
-    } else {
-        state
-            .permissions
-            .session_allow
-            .lock()
-            .unwrap()
-            .contains(tool)
-    };
-    if remembered {
-        if durable {
-            append_permission_requested(app, state, &audit, false)?;
-            append_automatic_decision(app, state, &audit, PermissionDecision::AllowForRun)?;
+        GateOutcome::Remembered => {
+            if durable {
+                append_permission_requested(app, state, &audit, false)?;
+                append_automatic_decision(app, state, &audit, PermissionDecision::AllowForRun)?;
+            }
+            return Ok(());
         }
-        return Ok(());
+        GateOutcome::Prompt => {}
     }
 
     let (tx, rx) = oneshot::channel::<bool>();
@@ -715,6 +780,158 @@ fn set_permission_mode_impl(state: &AppState, mode: String) -> Result<(), String
 /// of truth; native policy code and tests use this helper directly.
 pub(crate) fn get_permission_mode_impl(state: &AppState) -> String {
     state.permissions.mode.lock().unwrap().clone()
+}
+
+/// What [`permission_dry_run`] found the gate would do. Distinguishes the two
+/// promptless outcomes — the mode deciding versus a remembered grant deciding —
+/// because they are different findings when auditing whether a call can reach
+/// execution without a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDryRunDecision {
+    /// The mode auto-approved it: no prompt, no human.
+    AutoApproved,
+    /// A prior session/run grant approved it: no prompt, no human.
+    GrantApproved,
+    /// Refused outright by the mode (plan mode): no prompt, no execution.
+    Blocked,
+    /// Falls through to a real human prompt.
+    RequiresPrompt,
+    /// The workspace sandbox refused the target before the gate was consulted,
+    /// so no permission decision was ever reached.
+    SandboxRejected,
+}
+
+/// The answer [`permission_dry_run`] returns.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionDryRun {
+    pub decision: PermissionDryRunDecision,
+    /// The mode that governed the decision, after any turn-scoped override.
+    pub mode: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_reason: Option<String>,
+    pub risk_floored: bool,
+}
+
+/// Report what the permission gate would decide for a call, without executing
+/// the call, prompting anyone, or writing a ledger event.
+///
+/// This exists because the decision table had no read-only entry point:
+/// [`path_risk_floor`] and [`compute_risk`] are `pub` but not commands,
+/// [`mode_short_circuit`] and [`effective_mode`] are private, and
+/// [`request_permission`] is only reachable from inside a tool that is about to
+/// perform the mutation. Anything that wanted to *ask* the gate — the Red-Team
+/// Lab above all — had to reimplement it, and the reimplementation drifted.
+///
+/// Evaluation order matches the real call path in `tools.rs` exactly: the
+/// workspace sandbox resolves the target first (`resolve_path_and_root`), then
+/// [`compute_risk`] applies the deterministic floor over the *resolved* path,
+/// then [`evaluate_gate`] consults the mode and any remembered grant.
+///
+/// `mode` evaluates a mode other than the active one — the Red-Team Lab asks
+/// "what would happen in `acceptEdits`?" while the user stays in whatever mode
+/// they chose. It is validated against [`VALID_MODES`] and never written back to
+/// [`PermissionState::mode`], so asking the question cannot loosen the app.
+/// `None` uses the active mode, including any turn-scoped override.
+///
+/// Limits worth stating: this reports the decision, so it cannot tell you what
+/// a human would answer at a prompt it says is required, and passing
+/// `risk_level` here stands in for the frontend judge's classification rather
+/// than invoking a judge.
+pub(crate) fn permission_dry_run_impl(
+    state: &AppState,
+    tool: &str,
+    path: Option<&str>,
+    risk_level: Option<String>,
+    risk_reason: Option<String>,
+    turn: Option<&str>,
+    mode: Option<&str>,
+) -> Result<PermissionDryRun, String> {
+    let mode = match mode {
+        Some(requested) => {
+            if !VALID_MODES.contains(&requested) {
+                return Err(format!("Unknown permission mode \"{requested}\""));
+            }
+            requested.to_string()
+        }
+        None => effective_mode(state, turn),
+    };
+
+    let resolved = match path.filter(|raw| !raw.is_empty()) {
+        Some(raw) => match crate::workspace::resolve_path_and_root(state, raw) {
+            Ok(pair) => Some(pair),
+            Err(rejection) => {
+                return Ok(PermissionDryRun {
+                    decision: PermissionDryRunDecision::SandboxRejected,
+                    mode,
+                    reason: rejection,
+                    risk_level: None,
+                    risk_reason: None,
+                    risk_floored: false,
+                });
+            }
+        },
+        None => None,
+    };
+
+    let risk = compute_risk(
+        resolved
+            .as_ref()
+            .map(|(target, root)| (target.as_path(), root.as_path())),
+        risk_level,
+        risk_reason,
+    );
+
+    let (decision, reason) = match evaluate_gate(state, &mode, tool, turn, risk.as_ref()) {
+        GateOutcome::ShortCircuit(Ok(())) => (
+            PermissionDryRunDecision::AutoApproved,
+            format!("Mode \"{mode}\" approves \"{tool}\" without asking."),
+        ),
+        GateOutcome::ShortCircuit(Err(message)) => (PermissionDryRunDecision::Blocked, message),
+        GateOutcome::Remembered => (
+            PermissionDryRunDecision::GrantApproved,
+            format!("A remembered grant already approves \"{tool}\" without asking."),
+        ),
+        GateOutcome::Prompt => (
+            PermissionDryRunDecision::RequiresPrompt,
+            format!("Falls through to a real permission prompt under mode \"{mode}\"."),
+        ),
+    };
+
+    Ok(PermissionDryRun {
+        decision,
+        mode,
+        reason,
+        risk_level: risk.as_ref().map(|assessment| assessment.level.clone()),
+        risk_reason: risk.as_ref().map(|assessment| assessment.reason.clone()),
+        risk_floored: risk.as_ref().is_some_and(|assessment| assessment.floored),
+    })
+}
+
+/// IPC entry point for [`permission_dry_run_impl`].
+#[tauri::command]
+pub fn permission_dry_run(
+    state: tauri::State<'_, AppState>,
+    tool: String,
+    path: Option<String>,
+    risk_level: Option<String>,
+    risk_reason: Option<String>,
+    turn_id: Option<String>,
+    mode: Option<String>,
+) -> Result<PermissionDryRun, String> {
+    permission_dry_run_impl(
+        state.inner(),
+        &tool,
+        path.as_deref(),
+        risk_level,
+        risk_reason,
+        turn_id.as_deref(),
+        mode.as_deref(),
+    )
 }
 
 /// Sets a turn-scoped mode override, consulted by [`effective_mode`] before
@@ -1736,5 +1953,448 @@ mod tests {
 
         assert_eq!(effective_mode(&state, Some("turn-a")), "manual");
         assert_eq!(effective_mode(&state, Some("turn-b")), "auto");
+    }
+
+    // ---------------------------------------------------------------------
+    // Red-Team Lab corpus, walked through the real decision table.
+    //
+    // These read the same `src/lib/redTeamFixtures.json` the frontend loads.
+    // Before this existed, the lab evaluated a hand-transcribed TypeScript
+    // copy of `path_risk_floor`/`mode_short_circuit` that had already drifted
+    // by 14 file classes, so a fixture targeting `pyproject.toml` was scored
+    // against a list that did not contain it.
+    // ---------------------------------------------------------------------
+
+    /// Compiled in rather than read at runtime so renaming or deleting the
+    /// corpus is a build failure, not a test that quietly walks nothing.
+    const RED_TEAM_CORPUS: &str = include_str!("../../src/lib/redTeamFixtures.json");
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CorpusFixture {
+        id: String,
+        triggered_action: CorpusAction,
+        judge_risk_level: Option<String>,
+        expected_outcome: String,
+        evaluation_mode: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CorpusAction {
+        tool: String,
+        args: serde_json::Map<String, serde_json::Value>,
+    }
+
+    impl CorpusFixture {
+        fn path(&self) -> Option<&str> {
+            self.triggered_action.args.get("path").and_then(|v| v.as_str())
+        }
+    }
+
+    fn corpus() -> Vec<CorpusFixture> {
+        serde_json::from_str(RED_TEAM_CORPUS).expect("red-team corpus parses")
+    }
+
+    /// Same idiom as `workspace.rs`'s own tests — a real directory on disk, so
+    /// `resolve_path_and_root` does its actual canonicalization rather than a
+    /// stubbed one.
+    struct TempRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "little_monkey_redteam_{}_{}_{}_{}",
+                tag,
+                std::process::id(),
+                n,
+                nanos
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TempRoot { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn state_with_root(root: &std::path::Path) -> AppState {
+        let state = AppState::default();
+        state
+            .workspace_roots
+            .lock()
+            .unwrap()
+            .push(crate::workspace::WorkspaceRoot {
+                id: "root-0".to_string(),
+                path: root.to_path_buf(),
+                label: "workspace".to_string(),
+            });
+        state
+    }
+
+    /// Evaluates the fixture under `mode` via the explicit override, so the
+    /// state's own mode — and every remembered grant hanging off it — is left
+    /// exactly as the caller set it up.
+    fn dry_run_fixture(state: &AppState, fixture: &CorpusFixture, mode: &str) -> PermissionDryRun {
+        permission_dry_run_impl(
+            state,
+            &fixture.triggered_action.tool,
+            fixture.path(),
+            fixture.judge_risk_level.clone(),
+            fixture
+                .judge_risk_level
+                .as_ref()
+                .map(|_| "judge classification".to_string()),
+            None,
+            Some(mode),
+        )
+        .expect("mode comes from VALID_MODES")
+    }
+
+    fn is_promptless(decision: PermissionDryRunDecision) -> bool {
+        matches!(
+            decision,
+            PermissionDryRunDecision::AutoApproved | PermissionDryRunDecision::GrantApproved
+        )
+    }
+
+    #[test]
+    fn red_team_corpus_is_loaded_and_covers_the_floored_path_classes() {
+        let fixtures = corpus();
+        assert!(
+            fixtures.len() >= 17,
+            "corpus shrank to {} fixtures — the frontend loader and this test read the same file",
+            fixtures.len()
+        );
+
+        // The floor lists in this module are the reason the frontend mirror was
+        // deleted; a fixture per drifted class keeps them exercised.
+        for required in [
+            "floored-pyproject-under-smart",
+            "floored-requirements-under-smart",
+            "floored-composer-under-smart",
+            "floored-zshenv-under-smart",
+        ] {
+            assert!(
+                fixtures.iter().any(|f| f.id == required),
+                "corpus is missing the {required} canary"
+            );
+        }
+    }
+
+    #[test]
+    fn red_team_corpus_is_never_promptless_under_manual_or_smart() {
+        let root = TempRoot::new("manual_smart");
+        let state = state_with_root(&root.path);
+
+        for fixture in corpus() {
+            for mode in ["manual", "smart"] {
+                let outcome = dry_run_fixture(&state, &fixture, mode);
+                assert!(
+                    !is_promptless(outcome.decision),
+                    "{} reached execution with no human under mode {mode}: {:?} — {}",
+                    fixture.id,
+                    outcome.decision,
+                    outcome.reason
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn red_team_corpus_run_shell_is_never_promptless_below_bypass() {
+        let root = TempRoot::new("run_shell");
+        let state = state_with_root(&root.path);
+
+        let shell_fixtures: Vec<CorpusFixture> = corpus()
+            .into_iter()
+            .filter(|f| f.triggered_action.tool == "run_shell")
+            .collect();
+        assert!(
+            !shell_fixtures.is_empty(),
+            "no run_shell fixtures left to exercise the headline invariant"
+        );
+
+        for fixture in shell_fixtures {
+            for mode in VALID_MODES.iter().filter(|mode| **mode != "bypass") {
+                let outcome = dry_run_fixture(&state, &fixture, mode);
+                assert!(
+                    !is_promptless(outcome.decision),
+                    "{} auto-approved run_shell under mode {mode} — see mode_short_circuit's \
+                     invariant that shell execution never short-circuits outside bypass",
+                    fixture.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn floored_paths_defeat_a_low_risk_judge_under_smart() {
+        let root = TempRoot::new("floored_smart");
+        let state = state_with_root(&root.path);
+
+        let floored: Vec<CorpusFixture> = corpus()
+            .into_iter()
+            .filter(|f| f.id.starts_with("floored-"))
+            .collect();
+        assert_eq!(floored.len(), 4, "expected the four floored-path canaries");
+
+        for fixture in floored {
+            assert_eq!(
+                fixture.judge_risk_level.as_deref(),
+                Some("low"),
+                "{} must supply a low judge risk or it proves nothing",
+                fixture.id
+            );
+
+            let outcome = dry_run_fixture(&state, &fixture, "smart");
+            assert!(
+                outcome.risk_floored,
+                "{} was not floored — path_risk_floor no longer covers {:?}",
+                fixture.id,
+                fixture.path()
+            );
+            assert_eq!(
+                outcome.decision,
+                PermissionDryRunDecision::RequiresPrompt,
+                "{} escaped the floor under smart mode with a judge-supplied low risk",
+                fixture.id
+            );
+            assert_eq!(outcome.risk_level.as_deref(), Some("high"));
+        }
+    }
+
+    /// The gap this corpus surfaced, pinned so it cannot be lost.
+    ///
+    /// [`path_risk_floor`]'s doc comment claims a floored path "always prompts
+    /// in every mode below `bypass`". That is not what [`mode_short_circuit`]
+    /// does: its `"acceptEdits"`/`"auto"` arms approve `write_file`/`edit_file`
+    /// without consulting `risk` at all, so an edit to
+    /// `.github/workflows/deploy.yml`, `pyproject.toml` or `.zshenv` is
+    /// promptless in those two modes even though the floor fired. Only
+    /// `"smart"` honours the floor.
+    ///
+    /// This test asserts today's real behaviour rather than the documented
+    /// claim, so the suite stays honest. Closing the gap is a deliberate
+    /// behaviour change — floored paths would start prompting for users who
+    /// chose "auto-approve edits" — and belongs in its own change, not here.
+    #[test]
+    fn floored_paths_are_still_auto_approved_under_accept_edits_and_auto() {
+        let root = TempRoot::new("floored_accept");
+        let state = state_with_root(&root.path);
+
+        for fixture in corpus().into_iter().filter(|f| f.id.starts_with("floored-")) {
+            for mode in ["acceptEdits", "auto"] {
+                let outcome = dry_run_fixture(&state, &fixture, mode);
+                assert!(
+                    outcome.risk_floored,
+                    "{} should still be floored under {mode}",
+                    fixture.id
+                );
+                assert_eq!(
+                    outcome.decision,
+                    PermissionDryRunDecision::AutoApproved,
+                    "{} behaviour under {mode} changed — if the floor now binds these modes, \
+                     this test and path_risk_floor's doc comment both need updating",
+                    fixture.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn red_team_corpus_plan_mode_blocks_every_fixture_that_reaches_the_gate() {
+        let root = TempRoot::new("plan");
+        let state = state_with_root(&root.path);
+
+        for fixture in corpus() {
+            let outcome = dry_run_fixture(&state, &fixture, "plan");
+            let acceptable = matches!(
+                outcome.decision,
+                PermissionDryRunDecision::Blocked | PermissionDryRunDecision::SandboxRejected
+            );
+            assert!(
+                acceptable,
+                "{} was not refused under plan mode: {:?}",
+                fixture.id, outcome.decision
+            );
+        }
+
+        // The fixture whose entire premise is "ignore Plan Mode" must be
+        // blocked by the mode itself, not merely rejected by the sandbox.
+        let plan_fixture = corpus()
+            .into_iter()
+            .find(|f| f.expected_outcome == "blocked")
+            .expect("corpus keeps a fixture that must be blocked outright");
+        assert_eq!(plan_fixture.evaluation_mode.as_deref(), Some("plan"));
+        let outcome = dry_run_fixture(&state, &plan_fixture, "plan");
+        assert_eq!(outcome.decision, PermissionDryRunDecision::Blocked);
+    }
+
+    #[test]
+    fn bypass_is_the_mode_that_approves_everything() {
+        // Non-vacuity guard: if the assertions above passed because the dry run
+        // always answers "RequiresPrompt", this fails.
+        let root = TempRoot::new("bypass");
+        let state = state_with_root(&root.path);
+
+        let mut approved = 0usize;
+        for fixture in corpus() {
+            let outcome = dry_run_fixture(&state, &fixture, "bypass");
+            match outcome.decision {
+                PermissionDryRunDecision::AutoApproved => approved += 1,
+                // The sandbox refuses before the mode is ever consulted, so
+                // bypass cannot reach these — that is the point of the check.
+                PermissionDryRunDecision::SandboxRejected => {}
+                other => panic!("{} was not approved under bypass: {other:?}", fixture.id),
+            }
+        }
+        assert!(approved > 0, "bypass approved nothing — the dry run is inert");
+    }
+
+    #[test]
+    fn absolute_paths_outside_the_workspace_never_reach_the_gate() {
+        let root = TempRoot::new("escape");
+        let state = state_with_root(&root.path);
+
+        let escaping = corpus()
+            .into_iter()
+            .find(|f| f.path() == Some("/etc/hosts"))
+            .expect("corpus keeps a fixture targeting an absolute path outside the workspace");
+
+        for mode in VALID_MODES {
+            let outcome = dry_run_fixture(&state, &escaping, mode);
+            assert_eq!(
+                outcome.decision,
+                PermissionDryRunDecision::SandboxRejected,
+                "{} reached the permission gate under {mode} — the workspace sandbox must \
+                 refuse it first",
+                escaping.id
+            );
+            assert!(outcome.reason.contains("escapes the workspace root"));
+        }
+    }
+
+    #[test]
+    fn tilde_paths_are_workspace_relative_and_cannot_reach_the_real_home() {
+        // `~/.ssh/authorized_keys` is not an absolute path, so
+        // `resolve_path_and_root` treats it as workspace-relative and it lands
+        // in a literal `~` directory inside the workspace. No tilde expansion
+        // happens anywhere in the resolver, which is why this fixture cannot
+        // touch the user's actual `~/.ssh` — worth pinning, because the
+        // fixture's title reads as though it could.
+        let root = TempRoot::new("tilde");
+        let state = state_with_root(&root.path);
+
+        let fixture = corpus()
+            .into_iter()
+            .find(|f| f.path() == Some("~/.ssh/authorized_keys"))
+            .expect("corpus keeps the tilde-path fixture");
+
+        let outcome = dry_run_fixture(&state, &fixture, "manual");
+        assert_eq!(outcome.decision, PermissionDryRunDecision::RequiresPrompt);
+
+        let (resolved, resolved_root) =
+            crate::workspace::resolve_path_and_root(&state, "~/.ssh/authorized_keys").unwrap();
+        assert!(
+            resolved.starts_with(&resolved_root),
+            "tilde path resolved outside the workspace root: {}",
+            resolved.display()
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert!(
+                !resolved.starts_with(&home) || resolved_root.starts_with(&home),
+                "tilde path reached the real home directory: {}",
+                resolved.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_remembered_grant_turns_a_prompt_into_a_promptless_call() {
+        // The deleted frontend mirror had no concept of session/run grants, so
+        // it reported "requires prompt" for calls a real session would run with
+        // no prompt at all. `evaluate_gate` consults them, so the lab now sees
+        // what the app does.
+        let root = TempRoot::new("grant");
+        let state = state_with_root(&root.path);
+
+        let fixture = corpus()
+            .into_iter()
+            .find(|f| f.triggered_action.tool == "web_fetch")
+            .expect("corpus keeps a web_fetch fixture");
+
+        let before = dry_run_fixture(&state, &fixture, "manual");
+        assert_eq!(before.decision, PermissionDryRunDecision::RequiresPrompt);
+
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("web_fetch".to_string());
+
+        let after = dry_run_fixture(&state, &fixture, "manual");
+        assert_eq!(after.decision, PermissionDryRunDecision::GrantApproved);
+        assert_eq!(after.mode, "manual");
+    }
+
+    #[test]
+    fn a_dry_run_never_changes_the_active_mode_or_clears_grants() {
+        // The lab asks about modes the user is not in. If asking mutated
+        // `PermissionState`, opening the panel would silently change the app's
+        // permission posture — and switching to "manual"/"plan" also clears
+        // every remembered grant.
+        let root = TempRoot::new("no_mutation");
+        let state = state_with_root(&root.path);
+        set_permission_mode_impl(&state, "acceptEdits".to_string()).unwrap();
+        state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .insert("web_fetch".to_string());
+
+        for fixture in corpus() {
+            for mode in VALID_MODES {
+                let _ = dry_run_fixture(&state, &fixture, mode);
+            }
+        }
+
+        assert_eq!(get_permission_mode_impl(&state), "acceptEdits");
+        assert!(state
+            .permissions
+            .session_allow
+            .lock()
+            .unwrap()
+            .contains("web_fetch"));
+    }
+
+    #[test]
+    fn a_dry_run_rejects_an_unknown_mode() {
+        let root = TempRoot::new("bad_mode");
+        let state = state_with_root(&root.path);
+        let error = permission_dry_run_impl(
+            &state,
+            "write_file",
+            Some("NOTES.md"),
+            None,
+            None,
+            None,
+            Some("yolo"),
+        )
+        .expect_err("an unknown mode must not be silently treated as permissive");
+        assert!(error.contains("yolo"));
     }
 }

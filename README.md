@@ -118,8 +118,27 @@ a scope boundary stated where it matters.
 - Generate an MCP server scaffold from a described API, diff two API contract
   versions, and build a connector from an OpenAPI document.
 - Compare models side by side (Model Compare Lab), run a Golden Dataset
-  Builder over real model calls with dedupe and privacy filtering, hold a
-  multi-model debate, and exercise a Red-Team Lab against tool-loop fixtures.
+  Builder over real model calls with dedupe and privacy filtering, and hold a
+  multi-model debate.
+- Run a Red-Team Lab whose prompt-injection fixtures are scored by the real
+  code path rather than a copy of it. One corpus
+  (`src/lib/redTeamFixtures.json`) is read by both sides: the panel asks the
+  Rust permission gate what it would decide via a read-only dry run
+  (`resolve_path_and_root` → `path_risk_floor` → `compute_risk` →
+  `evaluate_gate`, the same chain a live tool call runs, remembered
+  session/run grants included), and `permissions.rs` compiles the same file in
+  to walk every fixture through that chain across all six permission modes.
+  The dry run evaluates a mode as an override, so asking "what would happen in
+  acceptEdits?" never changes the mode you are actually in or clears a grant.
+  Separately, `redTeamLiveLoop.test.ts` drives the real `runAgentTurn` with a
+  scripted model and asserts the transcript the loop produced actually carries
+  the untrusted-content envelope — it fails if the wrapping call is removed,
+  which the previous fixture-only suite did not. Two honest limits: the panel's
+  containment column exercises the real boundary functions but cannot prove
+  from a panel that the loop *invokes* them (that claim is the CI test's), and
+  a floored path is still auto-approved under `acceptEdits`/`auto`, because
+  those two modes approve edits without consulting risk at all — only `smart`
+  honours the floor, and a test pins that rather than papering over it.
 - Score models, connectors, MCP servers, skills, workflows, and plugins in
   Trust Scorecards from live store state, with weaker profiles sorted first.
   Every dimension cites the exact field it read; nothing is scored from
