@@ -104,19 +104,35 @@ transitions, and `exited` if and only if there is an exit status — are enforce
 in Rust *and* by SQL triggers, because companion stores reach the connection
 directly. `monkey processes` (alias `proc`) is the cross-surface listing.
 
-Three of the surfaces project onto it: the desktop chat turn
-(`agentLoop.ts`), the daemon job (reconciled once per engine tick, so no
-state-change call site can be missed), and the `task`-tool subagent (as a child
-of its turn). Every projection is fail-soft — a turn never fails because its
-bookkeeping row could not be written.
+Adopters, all going through one shared `ProcessTable::reconcile` rather than
+composing admit-and-transition themselves — that composition is where the subtle
+mistakes live (a resume overwriting `started_at_ms`, a late projection after a
+terminal write treated as an error, a restart forking the record):
+
+- the desktop chat turn (`agentLoop.ts`)
+- the daemon job, reconciled once per engine tick so no state-change call site
+  can be missed
+- the `task`-tool subagent, as a child of its turn
+- the workflow run **and each of its node instances**, projected at
+  `append_history` — the single choke point every run state change flows
+  through, which is what makes daemon-triggered runs project too even though
+  they never reach `m4_commands.rs`. A node instance had no global identity at
+  all (`node_id` is unique only within its definition); its surface id is now
+  run-qualified, so two runs of one workflow cannot collide on a single record.
+
+`WorkflowService` takes a `ProcessProjector` **port**, not a ledger handle, so
+it stays storage-agnostic — its own history is a JSON file store and its unit
+tests use a recording fake rather than standing up SQLite. Every projection is
+fail-soft: a turn or a workflow never fails because its bookkeeping row could
+not be written, and tests assert both complete with the projector erroring on
+every call.
 
 **Remaining:**
 
-- **The other surfaces.** Workflow runs and nodes (`m4_services.rs`), crew
-  members, background shells, and side tasks do not create records. Remote-run
-  work is projected as its underlying `daemon_job`, so the `remote_run` kind
-  exists but is unused, and a paired controller's run is not distinguishable
-  from a local one in the listing.
+- **The other surfaces.** Crew members, background shells, and side tasks do not
+  create records. Remote-run work is projected as its underlying `daemon_job`,
+  so the `remote_run` kind exists but is unused, and a paired controller's run
+  is not distinguishable from a local one in the listing.
 - **Parent edges across the daemon boundary.** A chat turn that routes to the
   resident runner produces two records — the turn and the daemon job — with no
   edge between them.
@@ -132,15 +148,6 @@ daemon outlives the app and an unscoped reap would declare live daemon work
 `lost`; the daemon reaps its own through its engine tick. A test asserts a live
 daemon job and workflow run survive a desktop reap.
 
-**The workflow-run decision this needs.** `WorkflowService` has no database
-dependency today — its history is a JSON file store, and `append_history` is
-the single choke point every run state change flows through. Adopting it is
-either (a) give `WorkflowService` a ledger handle so the projection happens at
-that one choke point, or (b) project at each call site, which misses
-daemon-triggered runs since the daemon calls the service directly rather than
-through `m4_commands.rs`. (a) is the only complete option and is a real
-architectural change to a service deliberately kept storage-agnostic, so it is
-called out here rather than done as a mechanical edit.
 
 **Blocks:** everything in Phase 2 and 3. A scheduler needs something to
 schedule, and it cannot arbitrate between kinds that are not in the table.

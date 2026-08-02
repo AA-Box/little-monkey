@@ -465,7 +465,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
     fn sync_process_table_inner(&mut self, now: u64) -> Result<(), String> {
         use little_monkey_lib::process_table::{
-            AdmitProcess, ProcessExit, ProcessFilter, ProcessKind, ProcessLimits, ProcessState,
+            ProcessExit, ProcessFilter, ProcessKind, ProcessLimits, ProcessProjection, ProcessState,
         };
 
         let now_ms = i64::try_from(now).map_err(|_| "clock is beyond protocol bounds".to_string())?;
@@ -477,50 +477,30 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         for job in &jobs {
             live_job_ids.insert(job.job_id.clone());
 
-            let record = match table
-                .find_by_external_id(ProcessKind::DaemonJob, &job.job_id)
-                .map_err(|error| error.to_string())?
-            {
-                Some(existing) => existing,
-                None => table
-                    .admit(
-                        &AdmitProcess::new(ProcessKind::DaemonJob, &job.job_id).with_limits(
-                            ProcessLimits {
-                                max_wall_ms: Some(job.max_runtime_ms),
-                                max_memory_bytes: job.max_memory_bytes,
-                                max_output_bytes: Some(job.max_log_bytes),
-                                max_child_processes: None,
-                            },
-                        ),
-                        now_ms,
-                    )
-                    .map_err(|error| error.to_string())?,
-            };
-
-            // The run id is allocated after the job is inserted (`mark_queued`),
-            // and the ledger enforces foreign keys, so the link can only be
-            // written once the run row exists.
-            if record.run_id.is_none() {
-                if let Some(run_id) = job.run_id.as_deref() {
-                    table
-                        .link_run(&record.process_id, run_id, now_ms)
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-
-            let pid = job.process_id.map(i64::from);
-            if record.native_pid != pid {
-                table
-                    .set_native_pid(&record.process_id, pid, now_ms)
-                    .map_err(|error| error.to_string())?;
-            }
-
-            let target = process_state_for(job.state);
-            if record.state != target && record.state.can_transition_to(target) {
-                table
-                    .transition(&record.process_id, target, None, now_ms)
-                    .map_err(|error| error.to_string())?;
-            }
+            // One `reconcile` call rather than a hand-rolled
+            // find-or-admit-then-transition: the run id is allocated after the
+            // job row exists (`mark_queued`) and the ledger enforces foreign
+            // keys, the pid only arrives after spawning, and a tick can
+            // legitimately land after a terminal write — `reconcile` owns all
+            // three cases so this loop does not re-derive them.
+            let projection = ProcessProjection::new(
+                ProcessKind::DaemonJob,
+                &job.job_id,
+                process_state_for(job.state),
+            )
+            .with_run(job.run_id.clone())
+            .with_native_pid(job.process_id.map(i64::from))
+            .with_limits(ProcessLimits {
+                max_wall_ms: Some(job.max_runtime_ms),
+                max_memory_bytes: job.max_memory_bytes,
+                max_output_bytes: Some(job.max_log_bytes),
+                max_child_processes: None,
+            });
+            // A non-terminal job never carries an exit, so this cannot be a
+            // terminal projection — the terminal case is the sweep below.
+            table
+                .reconcile(&projection, now_ms)
+                .map_err(|error| error.to_string())?;
         }
 
         // Anything this daemon still shows as live whose job has left the

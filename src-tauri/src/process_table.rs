@@ -32,6 +32,7 @@
 //!    status.
 
 use std::fmt;
+use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -429,6 +430,115 @@ impl AdmitProcess {
     }
 }
 
+/// One idempotent statement of "this surface unit exists and is in this state".
+///
+/// Callers describe the world as they see it; [`ProcessTable::reconcile`] works
+/// out whether that means admitting a record, moving an existing one, or doing
+/// nothing. This exists because every adopter otherwise hand-rolls the same
+/// find-or-admit-then-transition dance — the daemon did, and the frontend
+/// client did it differently — which is the shape that produced four
+/// incompatible state vocabularies in the first place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessProjection {
+    pub kind: ProcessKind,
+    pub external_id: String,
+    /// The parent named by *its* surface id and kind, since an adopter usually
+    /// knows that rather than the parent's process id.
+    pub parent: Option<(ProcessKind, String)>,
+    pub state: ProcessState,
+    /// Required when `state` is [`ProcessState::Exited`], ignored otherwise.
+    pub exit: Option<ProcessExit>,
+    pub run_id: Option<String>,
+    pub workspace: Option<String>,
+    pub profile: Option<String>,
+    pub native_pid: Option<i64>,
+    pub limits: ProcessLimits,
+}
+
+impl ProcessProjection {
+    pub fn new(kind: ProcessKind, external_id: impl Into<String>, state: ProcessState) -> Self {
+        ProcessProjection {
+            kind,
+            external_id: external_id.into(),
+            parent: None,
+            state,
+            exit: None,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            native_pid: None,
+            limits: ProcessLimits::default(),
+        }
+    }
+
+    pub fn exited(kind: ProcessKind, external_id: impl Into<String>, exit: ProcessExit) -> Self {
+        let mut projection = Self::new(kind, external_id, ProcessState::Exited);
+        projection.exit = Some(exit);
+        projection
+    }
+
+    pub fn with_parent(mut self, kind: ProcessKind, external_id: impl Into<String>) -> Self {
+        self.parent = Some((kind, external_id.into()));
+        self
+    }
+
+    pub fn with_run(mut self, run_id: Option<String>) -> Self {
+        self.run_id = run_id;
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: Option<String>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub fn with_native_pid(mut self, native_pid: Option<i64>) -> Self {
+        self.native_pid = native_pid;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: ProcessLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+/// What [`ProcessTable::reconcile`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// A new record was admitted.
+    Admitted,
+    /// An existing record moved state.
+    Transitioned,
+    /// Already in the requested state; only metadata may have been filled in.
+    Unchanged,
+    /// The record has already exited and the projection described a live state.
+    /// Left alone — a late projection must never resurrect a finished process,
+    /// and must not be an error either, because an adopter reconciling on a
+    /// timer will legitimately arrive after the terminal write.
+    AlreadyExited,
+}
+
+/// A sink for [`ProcessProjection`]s.
+///
+/// A port, not a ledger handle. Services that must not depend on storage —
+/// `WorkflowService` keeps its history in a JSON file store and is deliberately
+/// database-agnostic — depend on this instead, so their unit tests use a
+/// recording fake rather than standing up SQLite, and every caller of theirs
+/// (desktop, CLI, daemon-triggered) gets the projection from one place.
+///
+/// Implementations must be fail-soft at their own boundary if the caller cannot
+/// tolerate an error; `project` returns one so a caller that *can* report it
+/// has the option.
+pub trait ProcessProjector: Send + Sync {
+    fn project(&self, projection: &ProcessProjection) -> Result<(), String>;
+}
+
 /// Filter for [`ProcessTable::list`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcessFilter {
@@ -765,6 +875,106 @@ impl<'a> ProcessTable<'a> {
         Ok(())
     }
 
+    /// Apply a [`ProcessProjection`] idempotently.
+    ///
+    /// This is the single find-or-admit-then-transition implementation. Every
+    /// adopter goes through it rather than composing [`Self::admit`] and
+    /// [`Self::transition`] itself, because those compositions are where the
+    /// subtle mistakes live: forgetting that a resume must not overwrite
+    /// `started_at_ms`, treating a late projection after a terminal write as an
+    /// error, or re-admitting after a restart and forking the record.
+    ///
+    /// Semantics worth being explicit about:
+    ///
+    /// - A projection describing a live state for a record that has already
+    ///   exited is **ignored**, not an error
+    ///   ([`ReconcileOutcome::AlreadyExited`]). An adopter that reconciles on a
+    ///   timer will legitimately arrive after the terminal write, and
+    ///   resurrecting a finished process would be worse than a stale read.
+    /// - An illegal transition that is not that terminal case is still an
+    ///   error. Reconcile is forgiving about ordering, not about the state
+    ///   machine.
+    /// - A parent that cannot be resolved leaves the edge unset rather than
+    ///   refusing the projection: losing a lineage edge is worth less than
+    ///   losing the record, and a child can legitimately be projected before
+    ///   its parent.
+    pub fn reconcile(
+        &self,
+        projection: &ProcessProjection,
+        now_ms: i64,
+    ) -> ProcessTableResult<(ProcessRecord, ReconcileOutcome)> {
+        if (projection.state == ProcessState::Exited) != projection.exit.is_some() {
+            return Err(ProcessTableError::TerminalMismatch {
+                process_id: format!("{}:{}", projection.kind.as_str(), projection.external_id),
+            });
+        }
+
+        let existing = self.find_by_external_id(projection.kind, &projection.external_id)?;
+
+        let (record, admitted) = match existing {
+            Some(record) => (record, false),
+            None => {
+                let parent_process_id = match &projection.parent {
+                    Some((parent_kind, parent_external)) => self
+                        .find_by_external_id(*parent_kind, parent_external)?
+                        .map(|parent| parent.process_id),
+                    None => None,
+                };
+                let request = AdmitProcess {
+                    kind: projection.kind,
+                    external_id: projection.external_id.clone(),
+                    parent_process_id,
+                    run_id: projection.run_id.clone(),
+                    workspace: projection.workspace.clone(),
+                    profile: projection.profile.clone(),
+                    limits: projection.limits,
+                };
+                (self.admit(&request, now_ms)?, true)
+            }
+        };
+
+        // Fill in what could not be known at admission time.
+        if record.run_id.is_none() {
+            if let Some(run_id) = projection.run_id.as_deref() {
+                self.link_run(&record.process_id, run_id, now_ms)?;
+            }
+        }
+        if projection.native_pid.is_some() && record.native_pid != projection.native_pid {
+            self.set_native_pid(&record.process_id, projection.native_pid, now_ms)?;
+        }
+
+        if record.state == projection.state {
+            let refreshed = self.get(&record.process_id)?.unwrap_or(record);
+            return Ok((
+                refreshed,
+                if admitted {
+                    ReconcileOutcome::Admitted
+                } else {
+                    ReconcileOutcome::Unchanged
+                },
+            ));
+        }
+
+        if record.state.is_terminal() {
+            return Ok((record, ReconcileOutcome::AlreadyExited));
+        }
+
+        let moved = self.transition(
+            &record.process_id,
+            projection.state,
+            projection.exit.clone(),
+            now_ms,
+        )?;
+        Ok((
+            moved,
+            if admitted {
+                ReconcileOutcome::Admitted
+            } else {
+                ReconcileOutcome::Transitioned
+            },
+        ))
+    }
+
     pub fn get(&self, process_id: &str) -> ProcessTableResult<Option<ProcessRecord>> {
         self.connection
             .query_row(
@@ -936,6 +1146,57 @@ impl<'a> ProcessTable<'a> {
             )?);
         }
         Ok(reaped)
+    }
+}
+
+/// A [`ProcessProjector`] backed by the ledger at a path.
+///
+/// Deliberately path-based rather than holding Tauri state: the desktop, the
+/// CLI, and the daemon all need to project, and only one of them has an
+/// `AppHandle`. The connection is opened lazily on first use and then reused, so
+/// a service that projects on every state change does not re-run migrations each
+/// time.
+///
+/// This is the impure edge of the process table — it reads the clock, which is
+/// why [`ProcessTable`] itself takes timestamps as parameters and stays testable
+/// without one.
+pub struct LedgerProcessProjector {
+    path: std::path::PathBuf,
+    ledger: Mutex<Option<crate::run_ledger::RunLedger>>,
+}
+
+impl LedgerProcessProjector {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        LedgerProcessProjector {
+            path: path.into(),
+            ledger: Mutex::new(None),
+        }
+    }
+}
+
+impl ProcessProjector for LedgerProcessProjector {
+    fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before the unix epoch".to_string())?
+            .as_millis();
+        let now_ms = i64::try_from(now_ms).map_err(|_| "clock is beyond bounds".to_string())?;
+
+        let mut slot = self
+            .ledger
+            .lock()
+            .map_err(|_| "process projector lock was poisoned".to_string())?;
+        if slot.is_none() {
+            *slot = Some(
+                crate::run_ledger::RunLedger::open(&self.path).map_err(|error| error.to_string())?,
+            );
+        }
+        let ledger = slot.as_ref().expect("ledger initialized above");
+        ledger
+            .process_table()
+            .reconcile(projection, now_ms)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1635,6 +1896,182 @@ mod tests {
             assert_eq!(ProcessKind::parse(kind.as_str()).unwrap(), *kind);
             assert!(!kind.tag().is_empty());
         }
+    }
+
+    #[test]
+    fn reconcile_admits_once_then_moves_the_same_record() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let (first, outcome) = table
+            .reconcile(
+                &ProcessProjection::new(ProcessKind::WorkflowRun, "wf-1", ProcessState::Running),
+                T0,
+            )
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Admitted);
+        assert_eq!(first.state, ProcessState::Running);
+
+        // Same projection again: nothing to do, and no second record.
+        let (again, outcome) = table
+            .reconcile(
+                &ProcessProjection::new(ProcessKind::WorkflowRun, "wf-1", ProcessState::Running),
+                T0 + 1,
+            )
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Unchanged);
+        assert_eq!(again.process_id, first.process_id);
+
+        let (done, outcome) = table
+            .reconcile(
+                &ProcessProjection::exited(
+                    ProcessKind::WorkflowRun,
+                    "wf-1",
+                    ProcessExit::succeeded(),
+                ),
+                T0 + 2,
+            )
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Transitioned);
+        assert_eq!(done.process_id, first.process_id);
+        assert_eq!(done.state, ProcessState::Exited);
+
+        assert_eq!(table.list(&ProcessFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_ignores_a_late_live_projection_instead_of_resurrecting_or_erroring() {
+        // An adopter that reconciles on a timer will legitimately arrive after
+        // the terminal write. That must not error (it would spam a log for a
+        // benign race) and must not move the process back to running.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        table
+            .reconcile(
+                &ProcessProjection::new(ProcessKind::DaemonJob, "job-late", ProcessState::Running),
+                T0,
+            )
+            .unwrap();
+        table
+            .reconcile(
+                &ProcessProjection::exited(
+                    ProcessKind::DaemonJob,
+                    "job-late",
+                    ProcessExit::cancelled("stopped"),
+                ),
+                T0 + 1,
+            )
+            .unwrap();
+
+        let (record, outcome) = table
+            .reconcile(
+                &ProcessProjection::new(ProcessKind::DaemonJob, "job-late", ProcessState::Running),
+                T0 + 2,
+            )
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::AlreadyExited);
+        assert_eq!(record.state, ProcessState::Exited);
+        assert_eq!(
+            record.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Cancelled),
+            "the original outcome must survive a late projection"
+        );
+    }
+
+    #[test]
+    fn reconcile_resolves_a_parent_by_surface_id_and_tolerates_a_missing_one() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        // Child first: the parent does not exist yet, so the edge is left unset
+        // rather than the record being refused.
+        let (orphan, _) = table
+            .reconcile(
+                &ProcessProjection::new(
+                    ProcessKind::WorkflowNode,
+                    "wf-2:node-a",
+                    ProcessState::Admitted,
+                )
+                .with_parent(ProcessKind::WorkflowRun, "wf-2"),
+                T0,
+            )
+            .unwrap();
+        assert!(orphan.parent_process_id.is_none());
+
+        let (parent, _) = table
+            .reconcile(
+                &ProcessProjection::new(ProcessKind::WorkflowRun, "wf-2", ProcessState::Running),
+                T0 + 1,
+            )
+            .unwrap();
+
+        // A node projected after its run gets the edge.
+        let (child, _) = table
+            .reconcile(
+                &ProcessProjection::new(
+                    ProcessKind::WorkflowNode,
+                    "wf-2:node-b",
+                    ProcessState::Running,
+                )
+                .with_parent(ProcessKind::WorkflowRun, "wf-2"),
+                T0 + 2,
+            )
+            .unwrap();
+        assert_eq!(
+            child.parent_process_id.as_deref(),
+            Some(parent.process_id.as_str())
+        );
+        assert_eq!(table.descendants(&parent.process_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_refuses_a_terminal_projection_with_no_exit_and_the_reverse() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let mut no_exit =
+            ProcessProjection::new(ProcessKind::SideTask, "side-bad", ProcessState::Exited);
+        no_exit.exit = None;
+        assert!(matches!(
+            table.reconcile(&no_exit, T0),
+            Err(ProcessTableError::TerminalMismatch { .. })
+        ));
+
+        let mut live_with_exit =
+            ProcessProjection::new(ProcessKind::SideTask, "side-bad-2", ProcessState::Running);
+        live_with_exit.exit = Some(ProcessExit::succeeded());
+        assert!(matches!(
+            table.reconcile(&live_with_exit, T0),
+            Err(ProcessTableError::TerminalMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn reconcile_fills_in_the_run_link_and_pid_once_they_are_known() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let (record, _) = table
+            .reconcile(
+                &ProcessProjection::new(ProcessKind::DaemonJob, "job-late-pid", ProcessState::Admitted),
+                T0,
+            )
+            .unwrap();
+        assert!(record.native_pid.is_none());
+
+        let (updated, _) = table
+            .reconcile(
+                &ProcessProjection::new(
+                    ProcessKind::DaemonJob,
+                    "job-late-pid",
+                    ProcessState::Running,
+                )
+                .with_native_pid(Some(4321)),
+                T0 + 1,
+            )
+            .unwrap();
+        assert_eq!(updated.native_pid, Some(4321));
     }
 
     #[test]
