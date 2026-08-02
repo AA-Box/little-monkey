@@ -318,9 +318,11 @@ async fn bind_policy(policy: &LanServerPolicy) -> Result<TcpListener, String> {
     TcpListener::bind(SocketAddr::new(address, policy.port))
         .await
         .map_err(|error| {
-            format!(
-                "Could not bind {}:{}: {error}",
-                policy.bind_address, policy.port
+            crate::http_policy::describe_bind_error(
+                crate::http_policy::ListenerRole::CompatibilityListener,
+                &policy.bind_address,
+                policy.port,
+                &error,
             )
         })
 }

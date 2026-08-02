@@ -246,6 +246,10 @@ pub mod run_ledger;
 // neither should grow a second copy of the state machine.
 pub mod process_table;
 mod process_commands;
+// Policy shared by the two HTTP listeners, which default to the same port and
+// today report a bare "address already in use" naming neither the winner nor
+// the reason. Where the shared pieces accumulate as D1 collapses them into one.
+pub mod http_policy;
 // Migration-controlled authoritative profile/session/search storage. Kept
 // reusable by the desktop, CLI, daemon, export/import, and restore paths.
 pub mod portability;

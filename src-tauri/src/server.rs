@@ -2199,9 +2199,14 @@ async fn run_accept_loop(
 /// directly unit-testable without a `#[tauri::command]`/`AppHandle` — see
 /// `tests::bind_conflict_surfaces_as_status_error`.
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
-    TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("Failed to bind 127.0.0.1:{port} — {e}"))
+    TcpListener::bind(("127.0.0.1", port)).await.map_err(|error| {
+        crate::http_policy::describe_bind_error(
+            crate::http_policy::ListenerRole::LegacyProxy,
+            "127.0.0.1",
+            port,
+            &error,
+        )
+    })
 }
 
 fn record_bind_error(state: &mut ApiServerState, message: String) {
