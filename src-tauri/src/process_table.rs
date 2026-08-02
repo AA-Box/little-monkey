@@ -137,6 +137,66 @@ impl ProcessKind {
         ProcessKind::SideTask,
     ];
 
+    /// Whether this kind honours `signal`, and if not, why.
+    ///
+    /// This is a statement about what the code does *today*, not an aspiration.
+    /// The shape of it is the finding: `suspend`/`resume` exist in exactly two
+    /// places — the daemon (real OS suspend of a child it owns) and side tasks
+    /// (a cooperative `paused` status its loop already checks) — and nowhere
+    /// else. `kill` is only meaningful where this app owns an OS process.
+    ///
+    /// Each refusal names the mechanism that is missing rather than saying
+    /// "unsupported", because the caller's next question is always "why not",
+    /// and for several of these the answer is a design boundary rather than an
+    /// unwritten feature: a chat turn's loop lives in the WebView, so suspending
+    /// it and surviving a restart are different problems (see K13 in
+    /// `docs/agent-os-roadmap.md`).
+    pub fn signal_support(self, signal: ProcessSignal) -> SignalSupport {
+        use ProcessKind as K;
+        use ProcessSignal as S;
+        match (self, signal) {
+            // Stop is universal: every kind has a cancellation path.
+            (_, S::Stop) => SignalSupport::Honoured,
+
+            // Kill needs an OS process this app owns.
+            (K::DaemonJob | K::BackgroundShell, S::Kill) => SignalSupport::Honoured,
+            (K::RemoteRun, S::Kill) => SignalSupport::Honoured,
+            (_, S::Kill) => SignalSupport::Refused(
+                "this kind owns no OS process to terminate; stop it instead, which winds it \
+                 down at its next safe point",
+            ),
+
+            // Suspend/resume: real where we own a child, cooperative where the
+            // loop already checks a paused state.
+            (K::DaemonJob | K::RemoteRun, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::SideTask, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Refused(
+                "the child process is owned but not yet suspended by signal; killing it is the \
+                 only stop available today",
+            ),
+            (K::ChatTurn | K::Subagent | K::CrewMember, S::Suspend | S::Resume) => {
+                SignalSupport::Refused(
+                    "this loop has no pause point yet: it would have to yield at a round \
+                     boundary, and a paused loop cannot survive an app restart because it lives \
+                     in the WebView",
+                )
+            }
+            (K::WorkflowRun | K::WorkflowNode, S::Suspend | S::Resume) => SignalSupport::Refused(
+                "the workflow executor observes cancellation at level boundaries but has no \
+                 pause state; resuming would mean replaying from the last completed level",
+            ),
+        }
+    }
+
+    /// Every signal this kind honours.
+    pub fn honoured_signals(self) -> Vec<ProcessSignal> {
+        ProcessSignal::ALL
+            .iter()
+            .copied()
+            .filter(|signal| self.signal_support(*signal).is_honoured())
+            .collect()
+    }
+
     /// Every kind, for exhaustive tests and for `monkey processes --kind`
     /// validation.
     pub const ALL: &'static [ProcessKind] = &[
@@ -365,6 +425,14 @@ pub struct ProcessRecord {
     /// OS process id, where the process owns one.
     pub native_pid: Option<i64>,
     pub limits: ProcessLimits,
+    /// Durable signal intent. Survives a restart, unlike the in-memory
+    /// `AbortController`/`CancellationToken` each kind used before, and is
+    /// readable by a worker in another process — which is what makes an
+    /// out-of-process run signallable at all.
+    pub signal_intent: SignalIntent,
+    /// Why the most recent signal was asked for, as the caller stated it.
+    pub signal_reason: Option<String>,
+    pub signal_requested_at_ms: Option<i64>,
     /// Present if and only if `state == Exited`.
     pub exit: Option<ProcessExit>,
     pub created_at_ms: i64,
@@ -427,6 +495,106 @@ impl AdmitProcess {
     pub fn with_limits(mut self, limits: ProcessLimits) -> Self {
         self.limits = limits;
         self
+    }
+}
+
+/// A signal asked of a process.
+///
+/// Deliberately small and OS-shaped. Delivery is per kind and is *not* assumed:
+/// see [`ProcessKind::signal_support`], which either implements a signal or
+/// refuses it with a reason. A command that appeared to succeed and silently did
+/// nothing would be worse than one that says "chat turns cannot be suspended".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessSignal {
+    /// Wind down cooperatively at the next safe point, running whatever cleanup
+    /// the kind owes. Every kind honours this.
+    Stop,
+    /// Stop making progress but stay resumable, holding the process's place.
+    Suspend,
+    /// Undo a [`ProcessSignal::Suspend`].
+    Resume,
+    /// Terminate now, without waiting for a safe point. Only meaningful where
+    /// this app owns an OS process; elsewhere it is refused rather than quietly
+    /// downgraded to `Stop`, because a caller asking for `Kill` is asking for a
+    /// guarantee `Stop` does not give.
+    Kill,
+}
+
+impl ProcessSignal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessSignal::Stop => "stop",
+            ProcessSignal::Suspend => "suspend",
+            ProcessSignal::Resume => "resume",
+            ProcessSignal::Kill => "kill",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ProcessTableError> {
+        Ok(match value {
+            "stop" => ProcessSignal::Stop,
+            "suspend" => ProcessSignal::Suspend,
+            "resume" => ProcessSignal::Resume,
+            "kill" => ProcessSignal::Kill,
+            other => {
+                return Err(ProcessTableError::UnknownSignal {
+                    signal: other.to_string(),
+                })
+            }
+        })
+    }
+
+    pub const ALL: &'static [ProcessSignal] = &[
+        ProcessSignal::Stop,
+        ProcessSignal::Suspend,
+        ProcessSignal::Resume,
+        ProcessSignal::Kill,
+    ];
+}
+
+/// Whether a kind honours a signal, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+pub enum SignalSupport {
+    /// The kind delivers this signal.
+    Honoured,
+    /// The kind cannot deliver it. The reason is shown to the caller verbatim —
+    /// it is the whole value of refusing rather than no-opping.
+    Refused(&'static str),
+}
+
+impl SignalSupport {
+    pub fn is_honoured(self) -> bool {
+        matches!(self, SignalSupport::Honoured)
+    }
+
+    pub fn refusal(self) -> Option<&'static str> {
+        match self {
+            SignalSupport::Honoured => None,
+            SignalSupport::Refused(reason) => Some(reason),
+        }
+    }
+}
+
+/// A durable request for a signal, recorded on the process record.
+///
+/// Two independent latches rather than one "requested signal" field: a stop and
+/// a suspend are not alternatives. A process can be suspended and then asked to
+/// stop, and the stop must win without the suspend intent being lost from the
+/// audit trail. `Resume` clears the suspend latch; `Kill` sets the stop latch —
+/// the distinction between them lives in how the kind delivers it, not in what
+/// is recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalIntent {
+    pub stop_requested: bool,
+    pub suspend_requested: bool,
+}
+
+impl SignalIntent {
+    pub fn is_clear(&self) -> bool {
+        !self.stop_requested && !self.suspend_requested
     }
 }
 
@@ -572,6 +740,21 @@ pub enum ProcessTableError {
     UnknownExitStatus {
         status: String,
     },
+    UnknownSignal {
+        signal: String,
+    },
+    /// The kind does not honour this signal. Carries the reason so a caller can
+    /// show it rather than guessing.
+    SignalRefused {
+        process_id: String,
+        kind: ProcessKind,
+        signal: ProcessSignal,
+        reason: &'static str,
+    },
+    /// A signal was asked of a process that has already exited.
+    AlreadyExited {
+        process_id: String,
+    },
     NotFound {
         process_id: String,
     },
@@ -616,6 +799,24 @@ impl fmt::Display for ProcessTableError {
             ProcessTableError::UnknownExitStatus { status } => {
                 write!(f, "unknown process exit status \"{status}\"")
             }
+            ProcessTableError::UnknownSignal { signal } => {
+                write!(f, "unknown process signal \"{signal}\"")
+            }
+            ProcessTableError::SignalRefused {
+                process_id,
+                kind,
+                signal,
+                reason,
+            } => write!(
+                f,
+                "{} {process_id} does not honour {}: {reason}",
+                kind.as_str(),
+                signal.as_str()
+            ),
+            ProcessTableError::AlreadyExited { process_id } => write!(
+                f,
+                "process {process_id} has already exited; there is nothing to signal"
+            ),
             ProcessTableError::NotFound { process_id } => {
                 write!(f, "no process \"{process_id}\"")
             }
@@ -831,6 +1032,99 @@ impl<'a> ProcessTable<'a> {
             .ok_or_else(|| ProcessTableError::NotFound {
                 process_id: process_id.to_string(),
             })
+    }
+
+    /// Ask a process for a signal, durably.
+    ///
+    /// Records intent; does not deliver it. Delivery is the owning kind's job,
+    /// which reads the latch at its own safe point — that separation is what
+    /// makes a signal work across a process boundary and across a restart.
+    ///
+    /// Refuses rather than no-ops in two cases the caller genuinely needs
+    /// distinguished: a kind that cannot honour the signal
+    /// ([`ProcessTableError::SignalRefused`], carrying the reason), and a process
+    /// that has already exited ([`ProcessTableError::AlreadyExited`]).
+    ///
+    /// `Stop` and `Suspend` set independent latches, so asking a suspended
+    /// process to stop does not erase the record that it was suspended. `Resume`
+    /// clears only the suspend latch — it must never cancel a pending stop,
+    /// which would turn "stop this" into "keep going" on a race.
+    pub fn signal(
+        &self,
+        process_id: &str,
+        signal: ProcessSignal,
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> ProcessTableResult<ProcessRecord> {
+        let record = self
+            .get(process_id)?
+            .ok_or_else(|| ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            })?;
+
+        if record.state.is_terminal() {
+            return Err(ProcessTableError::AlreadyExited {
+                process_id: process_id.to_string(),
+            });
+        }
+        if let Some(refusal) = record.kind.signal_support(signal).refusal() {
+            return Err(ProcessTableError::SignalRefused {
+                process_id: process_id.to_string(),
+                kind: record.kind,
+                signal,
+                reason: refusal,
+            });
+        }
+
+        let (stop, suspend) = match signal {
+            // Kill and Stop both record "stop wanted". They differ in delivery
+            // urgency, which is the kind's concern, not this table's.
+            ProcessSignal::Stop | ProcessSignal::Kill => (true, record.signal_intent.suspend_requested),
+            ProcessSignal::Suspend => (record.signal_intent.stop_requested, true),
+            ProcessSignal::Resume => (record.signal_intent.stop_requested, false),
+        };
+
+        self.connection.execute(
+            "UPDATE agent_processes
+                SET stop_requested = ?2,
+                    suspend_requested = ?3,
+                    signal_reason = ?4,
+                    signal_requested_at_ms = ?5,
+                    updated_at_ms = ?5
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                i64::from(stop),
+                i64::from(suspend),
+                reason,
+                now_ms,
+            ],
+        )?;
+
+        self.get(process_id)?
+            .ok_or_else(|| ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            })
+    }
+
+    /// Live processes with a signal waiting to be delivered.
+    ///
+    /// What a worker polls at its safe point, and what a supervisor reads after a
+    /// restart to find work that was asked to stop before the app died.
+    pub fn pending_signals(
+        &self,
+        kinds: &[ProcessKind],
+    ) -> ProcessTableResult<Vec<ProcessRecord>> {
+        Ok(self
+            .list(&ProcessFilter {
+                kinds: kinds.to_vec(),
+                live_only: true,
+                limit: Some(MAX_LIST_LIMIT),
+                ..ProcessFilter::default()
+            })?
+            .into_iter()
+            .filter(|record| !record.signal_intent.is_clear())
+            .collect())
     }
 
     /// Record the OS process id once the kind has one. Separate from
@@ -1203,7 +1497,8 @@ impl ProcessProjector for LedgerProcessProjector {
 const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, external_id, state, \
      run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
-     updated_at_ms, started_at_ms, exited_at_ms FROM agent_processes";
+     updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
+     signal_reason, signal_requested_at_ms FROM agent_processes";
 
 /// Row → record. Returns a nested `Result` because a stored enum that fails to
 /// parse is a data error, not a SQLite error, and must not be reported as one.
@@ -1250,6 +1545,12 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
             max_child_processes: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
         },
         exit,
+        signal_intent: SignalIntent {
+            stop_requested: row.get::<_, i64>(21)? != 0,
+            suspend_requested: row.get::<_, i64>(22)? != 0,
+        },
+        signal_reason: row.get(23)?,
+        signal_requested_at_ms: row.get(24)?,
         created_at_ms: row.get(17)?,
         updated_at_ms: row.get(18)?,
         started_at_ms: row.get(19)?,
@@ -2096,6 +2397,255 @@ mod tests {
             ProcessKind::BackgroundShell => "background_shell.rs — emit_status",
             ProcessKind::SideTask => "src/lib/sideTaskRunner.ts — runSideTask",
         }
+    }
+
+    #[test]
+    fn stop_is_the_one_signal_every_kind_honours() {
+        // Every kind has a cancellation path, so nothing may refuse `stop`.
+        for kind in ProcessKind::ALL {
+            assert!(
+                kind.signal_support(ProcessSignal::Stop).is_honoured(),
+                "{} refuses stop, which no kind may do",
+                kind.as_str()
+            );
+            assert!(kind.honoured_signals().contains(&ProcessSignal::Stop));
+        }
+    }
+
+    #[test]
+    fn kill_is_refused_where_no_os_process_is_owned() {
+        // `Kill` promises immediate termination. Silently downgrading it to a
+        // cooperative `Stop` would answer a different question than the caller
+        // asked.
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::SideTask,
+            ProcessKind::WorkflowRun,
+            ProcessKind::WorkflowNode,
+        ] {
+            let refusal = kind
+                .signal_support(ProcessSignal::Kill)
+                .refusal()
+                .unwrap_or_else(|| panic!("{} must refuse kill", kind.as_str()));
+            assert!(refusal.contains("stop it instead"), "{refusal}");
+        }
+        for kind in [
+            ProcessKind::DaemonJob,
+            ProcessKind::BackgroundShell,
+            ProcessKind::RemoteRun,
+        ] {
+            assert!(kind.signal_support(ProcessSignal::Kill).is_honoured());
+        }
+    }
+
+    #[test]
+    fn suspend_is_honoured_only_where_a_pause_mechanism_actually_exists() {
+        // The finding this pins: suspend/resume exist in exactly two places —
+        // the daemon (real OS suspend of a child it owns, inherited by remote
+        // runs, which are daemon jobs) and side tasks (a cooperative `paused`
+        // status their loop already checks). Every other refusal names the
+        // missing mechanism so it reads as a boundary, not a TODO.
+        for kind in [
+            ProcessKind::DaemonJob,
+            ProcessKind::RemoteRun,
+            ProcessKind::SideTask,
+        ] {
+            for signal in [ProcessSignal::Suspend, ProcessSignal::Resume] {
+                assert!(
+                    kind.signal_support(signal).is_honoured(),
+                    "{} should honour {}",
+                    kind.as_str(),
+                    signal.as_str()
+                );
+            }
+        }
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::WorkflowRun,
+            ProcessKind::WorkflowNode,
+            ProcessKind::BackgroundShell,
+        ] {
+            for signal in [ProcessSignal::Suspend, ProcessSignal::Resume] {
+                let refusal = kind.signal_support(signal).refusal().unwrap_or_else(|| {
+                    panic!("{} claims to honour {}", kind.as_str(), signal.as_str())
+                });
+                assert!(
+                    !refusal.is_empty() && refusal.len() > 20,
+                    "{} gives a useless refusal for {}: {refusal}",
+                    kind.as_str(),
+                    signal.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_is_recorded_durably_and_survives_being_read_back() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-signal");
+        assert!(record.signal_intent.is_clear());
+
+        let signalled = table
+            .signal(
+                &record.process_id,
+                ProcessSignal::Stop,
+                Some("user pressed stop"),
+                T0 + 1,
+            )
+            .unwrap();
+        assert!(signalled.signal_intent.stop_requested);
+        assert!(!signalled.signal_intent.suspend_requested);
+        assert_eq!(signalled.signal_reason.as_deref(), Some("user pressed stop"));
+        assert_eq!(signalled.signal_requested_at_ms, Some(T0 + 1));
+
+        // Read back through a fresh view — the whole point is that it is on disk,
+        // not in a live handle that dies with the process that made it.
+        let reread = ProcessTable::new(ledger.connection())
+            .get(&record.process_id)
+            .unwrap()
+            .unwrap();
+        assert!(reread.signal_intent.stop_requested);
+    }
+
+    #[test]
+    fn resume_clears_a_suspend_but_never_cancels_a_pending_stop() {
+        // The race that matters: a process is suspended, then asked to stop, then
+        // a stale resume arrives. If resume cleared the stop latch, "stop this"
+        // would silently become "keep going".
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-race");
+
+        table
+            .signal(&record.process_id, ProcessSignal::Suspend, None, T0 + 1)
+            .unwrap();
+        let stopped = table
+            .signal(&record.process_id, ProcessSignal::Stop, None, T0 + 2)
+            .unwrap();
+        assert!(stopped.signal_intent.stop_requested);
+        assert!(
+            stopped.signal_intent.suspend_requested,
+            "a stop must not erase the record that it was suspended"
+        );
+
+        let resumed = table
+            .signal(&record.process_id, ProcessSignal::Resume, None, T0 + 3)
+            .unwrap();
+        assert!(!resumed.signal_intent.suspend_requested);
+        assert!(
+            resumed.signal_intent.stop_requested,
+            "resume cancelled a pending stop — the process would keep running"
+        );
+    }
+
+    #[test]
+    fn a_refused_signal_is_an_error_carrying_the_reason_not_a_silent_no_op() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ChatTurn, "turn-refuse");
+
+        let error = table
+            .signal(&record.process_id, ProcessSignal::Suspend, None, T0 + 1)
+            .expect_err("a chat turn cannot be suspended today");
+        match error {
+            ProcessTableError::SignalRefused {
+                kind, signal, reason, ..
+            } => {
+                assert_eq!(kind, ProcessKind::ChatTurn);
+                assert_eq!(signal, ProcessSignal::Suspend);
+                assert!(reason.contains("round boundary"), "{reason}");
+            }
+            other => panic!("wrong error: {other}"),
+        }
+
+        // And nothing was written — a refusal must not leave half a request.
+        let unchanged = table.get(&record.process_id).unwrap().unwrap();
+        assert!(unchanged.signal_intent.is_clear());
+        assert!(unchanged.signal_reason.is_none());
+    }
+
+    #[test]
+    fn signalling_a_process_that_already_exited_is_refused() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-gone");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::succeeded()),
+                T0 + 2,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            table.signal(&record.process_id, ProcessSignal::Stop, None, T0 + 3),
+            Err(ProcessTableError::AlreadyExited { .. })
+        ));
+    }
+
+    #[test]
+    fn pending_signals_finds_work_left_unstopped_by_a_previous_session() {
+        // What a supervisor reads after a restart, and what a worker in another
+        // process polls at its safe point.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let quiet = admit(&table, ProcessKind::DaemonJob, "job-quiet");
+        let asked = admit(&table, ProcessKind::DaemonJob, "job-asked");
+        let other_kind = admit(&table, ProcessKind::SideTask, "side-asked");
+        for record in [&quiet, &asked, &other_kind] {
+            table
+                .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+                .unwrap();
+        }
+        table
+            .signal(&asked.process_id, ProcessSignal::Stop, Some("shutdown"), T0 + 2)
+            .unwrap();
+        table
+            .signal(&other_kind.process_id, ProcessSignal::Suspend, None, T0 + 2)
+            .unwrap();
+
+        let daemon_pending = table.pending_signals(&[ProcessKind::DaemonJob]).unwrap();
+        assert_eq!(daemon_pending.len(), 1);
+        assert_eq!(daemon_pending[0].process_id, asked.process_id);
+
+        let all_pending = table.pending_signals(&[]).unwrap();
+        assert_eq!(all_pending.len(), 2, "an empty kind filter means every kind");
+
+        // An exited process is never pending, however it was signalled.
+        table
+            .transition(
+                &asked.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::cancelled("stopped")),
+                T0 + 3,
+            )
+            .unwrap();
+        assert_eq!(
+            table.pending_signals(&[ProcessKind::DaemonJob]).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn signal_parsing_rejects_unknown_values_and_round_trips_every_variant() {
+        assert!(matches!(
+            ProcessSignal::parse("detonate"),
+            Err(ProcessTableError::UnknownSignal { .. })
+        ));
+        for signal in ProcessSignal::ALL {
+            assert_eq!(ProcessSignal::parse(signal.as_str()).unwrap(), *signal);
+        }
+        assert_eq!(ProcessSignal::ALL.len(), 4);
     }
 
     #[test]

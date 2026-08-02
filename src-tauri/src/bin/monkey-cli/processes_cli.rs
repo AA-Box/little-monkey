@@ -5,15 +5,18 @@
 //! compatibility to free up three characters would be a bad trade. `proc` is
 //! accepted as a short alias.
 //!
-//! Read-only. Signals belong to K2 in `docs/agent-os-roadmap.md`, and today
-//! only the daemon can actually suspend or resume anything, so there is no
-//! `monkey processes stop` that would silently do nothing for most kinds.
+//! `processes signal` records a durable request that the owning kind delivers at
+//! its own safe point, so it reaches a process this app is not running — a
+//! daemon job, or work left behind by a previous session. A kind that cannot
+//! honour a signal refuses it *with a reason* rather than accepting a request it
+//! will never act on; `processes signals` prints that whole matrix, including
+//! why each refusal stands.
 
 use std::path::Path;
 
 use clap::Subcommand;
 use little_monkey_lib::process_table::{
-    ProcessFilter, ProcessKind, ProcessRecord, DEFAULT_LIST_LIMIT,
+    ProcessFilter, ProcessKind, ProcessRecord, ProcessSignal, DEFAULT_LIST_LIMIT,
 };
 use little_monkey_lib::run_ledger::RunLedger;
 
@@ -53,9 +56,35 @@ pub enum ProcessesCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Ask a process to stop, suspend, resume, or be killed.
+    ///
+    /// Records durable intent that the owning kind delivers at its own safe
+    /// point, so this works for a process in another process — a daemon job, or
+    /// a run started by a previous app session.
+    Signal {
+        process_id: String,
+        /// One of `stop`, `suspend`, `resume`, `kill`.
+        signal: String,
+        /// Why, recorded alongside the request.
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print which signals each kind honours, and why the rest are refused.
+    Signals {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
+    // The support matrix is static, so it answers without a ledger — useful on a
+    // machine where the app has never run.
+    if let ProcessesCmd::Signals { json } = action {
+        return print_signal_matrix(*json);
+    }
+
     let path = data_dir.join(LEDGER_FILE);
     if !path.exists() {
         // An app that has never run has no ledger. Say so rather than creating
@@ -121,6 +150,37 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
             }
             Ok(())
         }
+        ProcessesCmd::Signals { .. } => unreachable!("handled before the ledger is opened"),
+        ProcessesCmd::Signal {
+            process_id,
+            signal,
+            reason,
+            json,
+        } => {
+            let parsed = ProcessSignal::parse(signal).map_err(|error| error.to_string())?;
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "system clock is before the unix epoch".to_string())?
+                    .as_millis(),
+            )
+            .map_err(|_| "clock is beyond bounds".to_string())?;
+            let record = table
+                .signal(process_id, parsed, reason.as_deref(), now)
+                .map_err(|error| error.to_string())?;
+            if *json {
+                print_json(&record)?;
+            } else {
+                println!(
+                    "asked {} ({}) to {}",
+                    record.process_id,
+                    record.kind.as_str(),
+                    parsed.as_str()
+                );
+                print_detail(&record);
+            }
+            Ok(())
+        }
         ProcessesCmd::Count { json } => {
             let counts = table.live_counts().map_err(|error| error.to_string())?;
             if *json {
@@ -144,6 +204,68 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Prints which signals each kind honours, and the reason for each refusal.
+///
+/// The refusals are the useful half: they say whether a signal is missing a
+/// mechanism or is a design boundary, which is what a caller needs before
+/// deciding whether to wait or give up.
+fn print_signal_matrix(json: bool) -> Result<(), String> {
+    if json {
+        let rows: Vec<serde_json::Value> = ProcessKind::ALL
+            .iter()
+            .flat_map(|kind| {
+                ProcessSignal::ALL.iter().map(move |signal| {
+                    let support = kind.signal_support(*signal);
+                    serde_json::json!({
+                        "kind": kind.as_str(),
+                        "signal": signal.as_str(),
+                        "honoured": support.is_honoured(),
+                        "reason": support.refusal(),
+                    })
+                })
+            })
+            .collect();
+        return print_json(&rows);
+    }
+
+    println!(
+        "{:<18} {:<8} {:<8} {:<8} {}",
+        "KIND", "STOP", "SUSPEND", "RESUME", "KILL"
+    );
+    for kind in ProcessKind::ALL {
+        let mark = |signal: ProcessSignal| {
+            if kind.signal_support(signal).is_honoured() {
+                "yes"
+            } else {
+                "no"
+            }
+        };
+        println!(
+            "{:<18} {:<8} {:<8} {:<8} {}",
+            kind.as_str(),
+            mark(ProcessSignal::Stop),
+            mark(ProcessSignal::Suspend),
+            mark(ProcessSignal::Resume),
+            mark(ProcessSignal::Kill),
+        );
+    }
+
+    println!("\nwhy each refusal:");
+    let mut seen: Vec<&str> = Vec::new();
+    for kind in ProcessKind::ALL {
+        for signal in ProcessSignal::ALL {
+            if let Some(reason) = kind.signal_support(*signal).refusal() {
+                if seen.contains(&reason) {
+                    continue;
+                }
+                seen.push(reason);
+                println!("  {reason}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
