@@ -486,3 +486,9 @@ Security Doctor is a posture aid, not a replacement for operating-system updates
 - `extensions/little-monkey-vscode/` and `extensions/little-monkey-jetbrains/` — thin IDE clients.
 - `.github/actions/little-monkey-review/` — reusable PR-review action implementation and contract test.
 - `src-tauri/fixtures/` — deterministic browser and knowledge acceptance fixtures.
+
+## Contributing
+
+Bug reports, fixes, and feature proposals are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the development setup, the full check suite, what CI runs on each platform, and the invariants a change has to hold — honest capability claims, no fabricated runtime values, untrusted content that cannot approve its own operation, and unchanged permission and network boundaries.
+
+Pull requests target `develop`; `main` is the release branch. Security issues go through a [private advisory](https://github.com/AA-Box/little-monkey/security/advisories/new) rather than a public issue — see [SECURITY.md](SECURITY.md).

@@ -1,0 +1,19 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/AA-Box/little-monkey/security/advisories/new
+    about: >-
+      Do not open a public issue for security problems. Open a private
+      advisory instead — see SECURITY.md for scope.
+  - name: Question or idea
+    url: https://github.com/AA-Box/little-monkey/discussions
+    about: >-
+      Usage questions, setup help, and open-ended proposals belong in
+      Discussions.
+  - name: Planned but unbuilt work
+    url: https://github.com/AA-Box/little-monkey/blob/develop/ROADMAP.md
+    about: >-
+      Check ROADMAP.md before filing — router policies, benchmarking,
+      prompt/workflow version control, mobile offline mode, the fine-tune lab,
+      multi-GPU, and the updater are known-unbuilt with stated acceptance
+      boundaries.
