@@ -33,6 +33,8 @@ const MIGRATION_V3: i64 = 3;
 const MIGRATION_V3_CHECKSUM: &str = "run-archive-v3-2026-07-14";
 const MIGRATION_V4: i64 = 4;
 const MIGRATION_V4_CHECKSUM: &str = "approval-chains-v4-2026-07-16";
+const MIGRATION_V5: i64 = 5;
+const MIGRATION_V5_CHECKSUM: &str = "agent-process-table-v5-2026-08-02";
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -253,6 +255,16 @@ impl RunLedger {
     /// transaction spanning all of their normalized rows.
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+
+    /// A typed view of the unified agent process table on this connection.
+    ///
+    /// Public where [`Self::connection`] is not: `monkey processes` and the
+    /// daemon are separate binaries that need the process table, and handing
+    /// them a `ProcessTable` keeps the raw connection — and every invariant it
+    /// could bypass — crate-private.
+    pub fn process_table(&self) -> crate::process_table::ProcessTable<'_> {
+        crate::process_table::ProcessTable::new(&self.connection)
     }
 
     /// Submit an immutable run spec. Reusing an idempotency key succeeds only
@@ -767,7 +779,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V4 {
+        if version > MIGRATION_V5 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -777,6 +789,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V2, MIGRATION_V2_CHECKSUM),
         (MIGRATION_V3, MIGRATION_V3_CHECKSUM),
         (MIGRATION_V4, MIGRATION_V4_CHECKSUM),
+        (MIGRATION_V5, MIGRATION_V5_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -925,7 +938,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 4;")?;
+    let has_v5 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V5],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v5 {
+        transaction.execute_batch(MIGRATION_V5_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V5, MIGRATION_V5_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 5;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1464,6 +1494,85 @@ CREATE INDEX runs_archived_idx ON runs(archived_at_ms) WHERE archived_at_ms IS N
 // through `RunLedger::connection()`/`connection_mut()`, the same
 // "companion store sharing this database" pattern `profile_store.rs` already
 // uses for its own tables — see those methods' doc comments.
+/// The unified agent process table — see `process_table.rs` for the record it
+/// stores and why the five execution surfaces needed one.
+///
+/// Lives here, as a companion store sharing this database, for the same reason
+/// `approval_chain_runs` does: `DaemonStore::open` opens `RunLedger` first
+/// precisely so shared migrations apply once, which means the daemon gets this
+/// table without a second migration path of its own.
+///
+/// The two triggers are not belt-and-braces. `process_table.rs` validates the
+/// same rules in Rust, but companion stores reach this connection directly, and
+/// the whole point of this table is that a transition can no longer be applied
+/// by whoever happens to hold a handle — `DaemonStore::transition` is an
+/// unguarded `UPDATE … WHERE job_id = ?` with no from-state precondition, and
+/// that is the mistake being designed out.
+const MIGRATION_V5_SQL: &str = r#"
+CREATE TABLE agent_processes (
+    process_id TEXT PRIMARY KEY,
+    parent_process_id TEXT REFERENCES agent_processes(process_id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'chat_turn', 'daemon_job', 'subagent', 'crew_member', 'workflow_run',
+        'workflow_node', 'remote_run', 'background_shell', 'side_task'
+    )),
+    external_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('admitted', 'running', 'suspended', 'exited')),
+    run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    workspace TEXT,
+    profile TEXT,
+    native_pid INTEGER,
+    max_wall_ms INTEGER CHECK (max_wall_ms IS NULL OR max_wall_ms > 0),
+    max_memory_bytes INTEGER CHECK (max_memory_bytes IS NULL OR max_memory_bytes > 0),
+    max_output_bytes INTEGER CHECK (max_output_bytes IS NULL OR max_output_bytes > 0),
+    max_child_processes INTEGER CHECK (max_child_processes IS NULL OR max_child_processes > 0),
+    exit_status TEXT CHECK (exit_status IS NULL OR exit_status IN (
+        'succeeded', 'failed', 'cancelled', 'limit_exceeded', 'lost', 'needs_reconciliation'
+    )),
+    exit_code INTEGER,
+    exit_signal TEXT,
+    exit_reason TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    started_at_ms INTEGER CHECK (started_at_ms IS NULL OR started_at_ms > 0),
+    exited_at_ms INTEGER CHECK (exited_at_ms IS NULL OR exited_at_ms > 0),
+    CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
+    CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
+    UNIQUE(kind, external_id)
+) STRICT;
+
+CREATE INDEX agent_processes_live_idx ON agent_processes(created_at_ms DESC)
+    WHERE state <> 'exited';
+CREATE INDEX agent_processes_kind_idx ON agent_processes(kind, created_at_ms DESC);
+CREATE INDEX agent_processes_parent_idx ON agent_processes(parent_process_id)
+    WHERE parent_process_id IS NOT NULL;
+CREATE INDEX agent_processes_run_idx ON agent_processes(run_id)
+    WHERE run_id IS NOT NULL;
+CREATE INDEX agent_processes_workspace_idx ON agent_processes(workspace, created_at_ms DESC)
+    WHERE workspace IS NOT NULL;
+
+CREATE TRIGGER agent_processes_validate_transition
+BEFORE UPDATE OF state ON agent_processes
+WHEN OLD.state <> NEW.state AND NOT (
+       (OLD.state = 'admitted'  AND NEW.state IN ('running', 'exited'))
+    OR (OLD.state = 'running'   AND NEW.state IN ('suspended', 'exited'))
+    OR (OLD.state = 'suspended' AND NEW.state IN ('running', 'exited'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal agent process state transition');
+END;
+
+CREATE TRIGGER agent_processes_forbid_identity_update
+BEFORE UPDATE ON agent_processes
+WHEN OLD.process_id <> NEW.process_id
+  OR OLD.kind <> NEW.kind
+  OR OLD.external_id <> NEW.external_id
+  OR OLD.created_at_ms <> NEW.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent process identity is immutable');
+END;
+"#;
+
 const MIGRATION_V4_SQL: &str = r#"
 CREATE TABLE approval_chain_runs (
     chain_id TEXT PRIMARY KEY,
@@ -2871,10 +2980,10 @@ mod tests {
         let database = TempDb::new("migration");
         {
             let ledger = RunLedger::open(&database.path).unwrap();
-            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4]);
+            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5]);
         }
         let ledger = RunLedger::open(&database.path).unwrap();
-        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5]);
 
         let journal_mode = ledger
             .connection

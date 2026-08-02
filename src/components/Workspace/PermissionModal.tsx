@@ -67,6 +67,29 @@ function RiskAnnotation({ pending, t }: { pending: PermissionRequest; t: (key: s
 }
 
 /**
+ * Whether this prompt may offer "Allow for session".
+ *
+ * Two exclusions, both mirroring a backend rule rather than inventing one:
+ * - `run_shell` — the blast radius of unattended shell execution is too large
+ *   to pre-authorize off the back of approving one command. Backend side:
+ *   `src-tauri/src/permissions.rs::NO_SESSION_REMEMBER`.
+ * - A floored target (`.env`, `.github/workflows/*`, a package manifest, a
+ *   shell rc file, anything in `.git/`) — grants are keyed by tool name alone,
+ *   so remembering one would let this single approval stand in for every later
+ *   write to a sensitive path. Backend side: `respond_if_pending` stores
+ *   nothing for a floored prompt, and `evaluate_gate` refuses to honour a
+ *   pre-existing grant for one.
+ *
+ * Both are enforced in Rust regardless of what this returns — hiding the
+ * button only keeps the modal from offering something that would silently do
+ * nothing. Note the second rule keys on `risk_floored`, never on `risk_level`:
+ * a judge-supplied "high" is advisory and must not change what is offered.
+ */
+export function canRememberForSession(pending: PermissionRequest): boolean {
+  return pending.tool !== "run_shell" && !pending.risk_floored;
+}
+
+/**
  * Centered dialog shown whenever the agent needs the user's sign-off
  * before running a sensitive tool (write_file / edit_file / run_shell / remember / web_fetch / web_search).
  * Mirrors permissionStore.pending exactly — {id, tool, detail} | null.
@@ -111,12 +134,7 @@ export function PermissionModal() {
 
   if (!pending) return null;
 
-  // Shell commands are never eligible for "allow for session": the blast
-  // radius of unattended shell execution is too large to silently
-  // pre-authorize off the back of approving one command. Every run_shell
-  // call always prompts. See src-tauri/src/permissions.rs::NO_SESSION_REMEMBER
-  // for the backend-enforced (authoritative) side of this restriction.
-  const canRememberForSession = pending.tool !== "run_shell";
+  const showRememberButton = canRememberForSession(pending);
   const isMcpTool = pending.tool.startsWith("mcp:");
   const ToolIcon = isMcpTool ? Plug : TOOL_ICONS[pending.tool] ?? AlertTriangle;
   // `detail`'s first line is exactly "<server label> → <tool name>" (see
@@ -170,7 +188,11 @@ export function PermissionModal() {
           <div className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-surface-2 p-2.5 font-mono text-xs text-muted">
             {displayDetail}
           </div>
-          {!canRememberForSession && (
+          {/* Keyed on the tool, not on `showRememberButton`: a floored write
+              also has no "allow for session" button, but explaining it with
+              the shell-specific line would be wrong. That case is already
+              labelled by `RiskAnnotation`'s "sensitive path" text above. */}
+          {pending.tool === "run_shell" && (
             <p className="mt-2 text-xs text-faint">
               {t("PermissionModal.shellAlwaysConfirmText")}
             </p>
@@ -189,7 +211,7 @@ export function PermissionModal() {
           >
             {t("PermissionModal.allowOnceButton")}
           </Button>
-          {canRememberForSession && (
+          {showRememberButton && (
             <Button
               type="button"
               variant="secondary"

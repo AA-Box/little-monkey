@@ -2160,6 +2160,19 @@ async fn run_accept_loop(
     shutdown: Arc<Notify>,
     runtime: Arc<ServerRuntime>,
 ) {
+    // Bounded admission, shared with the compatibility listener. Before this,
+    // every connection here spawned an unbounded task with no permit, no
+    // in-flight accounting, and no cancellation reaching the upstream request —
+    // so a route on this listener bypassed admission control entirely, which is
+    // the D1 finding and the reason K4/K5 were blocked on it.
+    let admission = Arc::new(crate::http_policy::RequestAdmission::new(
+        crate::http_policy::MAX_ACTIVE_REQUESTS,
+    ));
+    // Cancelled when the loop exits, so every in-flight request is torn down
+    // rather than outliving the listener that accepted it.
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
+    let _shutdown_on_exit = server_shutdown.clone().drop_guard();
+
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -2171,17 +2184,35 @@ async fn run_accept_loop(
                 let io = TokioIo::new(stream);
                 let app_for_conn = app.clone();
                 let runtime_for_conn = runtime.clone();
+                let admission_for_conn = admission.clone();
+                let shutdown_for_conn = server_shutdown.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let app_for_req = app_for_conn.clone();
                         let deps = build_deps(&app_for_req, &runtime_for_conn);
+                        let admission_for_req = admission_for_conn.clone();
+                        let shutdown_for_req = shutdown_for_conn.clone();
                         async move {
+                            let Some(guard) = admission_for_req.try_admit(&shutdown_for_req) else {
+                                // Refused rather than queued without bound. Same
+                                // posture as the compatibility listener, and the
+                                // legacy OpenAI error envelope is preserved so
+                                // existing SDK clients still parse it.
+                                return Ok::<_, Infallible>(error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "The API server active-request quota is exhausted",
+                                    "server_busy",
+                                ));
+                            };
                             let (resp, matched_token_id) =
                                 serve_one_request(deps, req, Some(&app_for_req)).await?;
                             if let Some(token_id) = matched_token_id {
                                 record_token_used(&app_for_req, &token_id);
                             }
                             bump_request_count(&app_for_req);
+                            // Dropped here: releases the permit, decrements the
+                            // in-flight count, and cancels this request's token.
+                            drop(guard);
                             Ok::<_, Infallible>(resp)
                         }
                     });
@@ -2199,9 +2230,14 @@ async fn run_accept_loop(
 /// directly unit-testable without a `#[tauri::command]`/`AppHandle` — see
 /// `tests::bind_conflict_surfaces_as_status_error`.
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
-    TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("Failed to bind 127.0.0.1:{port} — {e}"))
+    TcpListener::bind(("127.0.0.1", port)).await.map_err(|error| {
+        crate::http_policy::describe_bind_error(
+            crate::http_policy::ListenerRole::LegacyProxy,
+            "127.0.0.1",
+            port,
+            &error,
+        )
+    })
 }
 
 fn record_bind_error(state: &mut ApiServerState, message: String) {

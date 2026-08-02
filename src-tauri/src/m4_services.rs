@@ -34,11 +34,15 @@ use crate::package_ecosystem::{
     SemanticVersion, SignatureVerifier, TrustEvidence, TrustStore, VerifiedPackage,
     VerifiedRegistryState,
 };
+use crate::process_table::{
+    ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessProjector, ProcessState,
+};
 use crate::workflow_core::{
     adapt_legacy_recipe, compile_workflow, plan_replay, reconcile_node, DaemonCapability,
-    HeadlessWorkflowExecutor, LegacyRecipeV1, NodeRunRecord, ReconciliationDecision, ReplayPlan,
-    WorkflowCapabilityCatalog, WorkflowClock, WorkflowDefinition, WorkflowError, WorkflowIr,
-    WorkflowNodeExecutor, WorkflowRunHistory, WorkflowRunRequest, WorkflowTrigger,
+    HeadlessWorkflowExecutor, LegacyRecipeV1, NodeRunRecord, NodeRunStatus, ReconciliationDecision,
+    ReplayPlan, WorkflowCapabilityCatalog, WorkflowClock, WorkflowDefinition, WorkflowError,
+    WorkflowIr, WorkflowNodeExecutor, WorkflowRunHistory, WorkflowRunRequest, WorkflowRunStatus,
+    WorkflowTrigger,
 };
 
 pub const M4_SERVICE_CONTRACT_VERSION: u32 = 1;
@@ -1804,12 +1808,151 @@ pub struct WorkflowService {
     cancellations: Mutex<HashMap<String, ActiveWorkflowRun>>,
     trigger_registrar: Option<Arc<dyn PersistentWorkflowTriggerRegistrar>>,
     approval_broker: Option<Arc<dyn WorkflowHumanApprovalBroker>>,
+    /// Sink for the unified process table, injected as a port rather than a
+    /// ledger handle so this service stays storage-agnostic: its own history is
+    /// a JSON file store, its unit tests must not need SQLite, and the same
+    /// projection has to reach the desktop, the CLI, and daemon-triggered runs.
+    /// `None` means "do not project" — a bare `monkey workflow` checkout and
+    /// every unit test construct this service without a ledger, and a workflow
+    /// must still run there.
+    process_projector: Option<Arc<dyn ProcessProjector>>,
 }
 
 #[derive(Clone)]
 struct ActiveWorkflowRun {
     workflow_id: String,
     cancellation: CancellationToken,
+}
+
+/// `WorkflowRunStatus` → a process projection.
+///
+/// `WorkflowRunStatus` has no queued or paused state — a run is `Running` from
+/// construction — so there is nothing that maps to `Admitted` or `Suspended`.
+fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjection> {
+    let (state, exit) = match &history.status {
+        WorkflowRunStatus::Running => (ProcessState::Running, None),
+        WorkflowRunStatus::Succeeded => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Succeeded,
+                code: None,
+                signal: None,
+                reason: None,
+            }),
+        ),
+        WorkflowRunStatus::Failed => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Failed,
+                code: None,
+                signal: None,
+                reason: None,
+            }),
+        ),
+        WorkflowRunStatus::Cancelled => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Cancelled,
+                code: None,
+                signal: None,
+                reason: None,
+            }),
+        ),
+        WorkflowRunStatus::NeedsReconciliation => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::NeedsReconciliation,
+                code: None,
+                signal: None,
+                reason: Some("workflow run left effects that cannot be safely undone".to_string()),
+            }),
+        ),
+    };
+
+    let mut projection = ProcessProjection::new(
+        ProcessKind::WorkflowRun,
+        history.run_id.clone(),
+        state,
+    );
+    projection.exit = exit;
+    Some(projection)
+}
+
+/// A node instance's globally unique surface id.
+///
+/// `node_id` is authored in the workflow definition and is unique only *within*
+/// that definition, so a node instance had no global identity at all. Qualifying
+/// it with the run id gives it one without inventing a second id scheme.
+fn workflow_node_external_id(run_id: &str, node_id: &str) -> String {
+    format!("{run_id}:{node_id}")
+}
+
+fn workflow_node_projection(
+    run_id: &str,
+    node_id: &str,
+    node: &NodeRunRecord,
+) -> ProcessProjection {
+    let (state, exit) = match &node.status {
+        NodeRunStatus::Pending => (ProcessState::Admitted, None),
+        NodeRunStatus::Running => (ProcessState::Running, None),
+        NodeRunStatus::Succeeded => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Succeeded,
+                code: None,
+                signal: None,
+                reason: None,
+            }),
+        ),
+        NodeRunStatus::Failed { class, message } => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Failed,
+                code: None,
+                signal: None,
+                reason: Some(format!("{class:?}: {message}")),
+            }),
+        ),
+        NodeRunStatus::Skipped { reason } => (
+            ProcessState::Exited,
+            // A skipped node did not fail — it was never meant to run on this
+            // path. `Succeeded` would claim it did work it did not do, so it
+            // exits as cancelled with the reason it was skipped.
+            Some(ProcessExit {
+                status: ExitStatus::Cancelled,
+                code: None,
+                signal: None,
+                reason: Some(format!("skipped: {reason}")),
+            }),
+        ),
+        NodeRunStatus::NeedsReconciliation { receipt } => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::NeedsReconciliation,
+                code: None,
+                signal: None,
+                reason: Some(format!("{receipt:?}")),
+            }),
+        ),
+        NodeRunStatus::Reused { source_run_id } => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Succeeded,
+                code: None,
+                signal: None,
+                reason: Some(format!("reused from run {source_run_id}")),
+            }),
+        ),
+    };
+
+    let mut projection = ProcessProjection::new(
+        ProcessKind::WorkflowNode,
+        workflow_node_external_id(run_id, node_id),
+        state,
+    )
+    .with_parent(ProcessKind::WorkflowRun, run_id.to_string());
+    projection.exit = exit;
+    projection
 }
 
 impl WorkflowService {
@@ -1850,7 +1993,18 @@ impl WorkflowService {
             cancellations: Mutex::new(HashMap::new()),
             trigger_registrar,
             approval_broker: None,
+            process_projector: None,
         })
+    }
+
+    /// Attaches the unified process table as a projection sink.
+    ///
+    /// Builder-style, matching how `approval_broker` is layered on after
+    /// [`Self::new`], so the three existing construction sites keep working and
+    /// a caller without a ledger simply does not call this.
+    pub fn with_process_projector(mut self, projector: Arc<dyn ProcessProjector>) -> Self {
+        self.process_projector = Some(projector);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2256,7 +2410,51 @@ impl WorkflowService {
             .root
             .join("history")
             .join(sha256(history.run_id.as_bytes()));
-        self.append_record(&directory, sequence, &record)
+        self.append_record(&directory, sequence, &record)?;
+        self.project_processes(history);
+        Ok(())
+    }
+
+    /// Projects a workflow run, and each of its node instances, onto the unified
+    /// process table.
+    ///
+    /// Placed here because `append_history` is the single choke point every run
+    /// state change flows through — the alternative, projecting at each call
+    /// site, misses daemon-triggered runs, which reach this service directly
+    /// rather than through `m4_commands.rs`.
+    ///
+    /// Fail-soft and deliberately not part of `append_history`'s `Result`: the
+    /// workflow's own durable history has already been written by this point,
+    /// and a projection failure must not turn a completed run into a reported
+    /// error.
+    fn project_processes(&self, history: &WorkflowRunHistory) {
+        let Some(projector) = self.process_projector.as_ref() else {
+            return;
+        };
+
+        let run_projection = match workflow_run_projection(history) {
+            Some(projection) => projection,
+            None => return,
+        };
+        if let Err(error) = projector.project(&run_projection) {
+            eprintln!(
+                "workflow service: could not project run {}: {error}",
+                history.run_id
+            );
+            // Nodes hang off the run, so a failed run projection makes their
+            // parent edge unresolvable. Stop rather than emit orphans.
+            return;
+        }
+
+        for (node_id, node) in &history.nodes {
+            let projection = workflow_node_projection(&history.run_id, node_id, node);
+            if let Err(error) = projector.project(&projection) {
+                eprintln!(
+                    "workflow service: could not project node {}:{node_id}: {error}",
+                    history.run_id
+                );
+            }
+        }
     }
 
     fn load_history_record_unlocked(
@@ -3245,6 +3443,196 @@ mod tests {
             registrar,
         )
         .unwrap()
+    }
+
+    /// Records projections instead of writing them, which is the whole reason
+    /// `WorkflowService` takes a port rather than a ledger: this test needs no
+    /// SQLite, no migrations, and no temp database.
+    #[derive(Default)]
+    struct RecordingProjector {
+        seen: Mutex<Vec<ProcessProjection>>,
+    }
+
+    impl RecordingProjector {
+        fn of_kind(&self, kind: ProcessKind) -> Vec<ProcessProjection> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|projection| projection.kind == kind)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl ProcessProjector for RecordingProjector {
+        fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+            self.seen.lock().unwrap().push(projection.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingProjector;
+
+    impl ProcessProjector for FailingProjector {
+        fn project(&self, _projection: &ProcessProjection) -> Result<(), String> {
+            Err("ledger is unavailable".to_string())
+        }
+    }
+
+    #[test]
+    fn a_workflow_run_and_every_node_are_projected_onto_the_process_table() {
+        let directory = TempDirectory::new("workflow-projection");
+        let projector = Arc::new(RecordingProjector::default());
+        let service = workflow_service(&directory.0, None, BTreeSet::new())
+            .with_process_projector(projector.clone());
+
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+        let history = service
+            .run_workflow(
+                &definition.workflow_id,
+                WorkflowRunRequest {
+                    run_id: "projected-run-1".to_string(),
+                    inputs: BTreeMap::new(),
+                    secret_bindings: BTreeMap::new(),
+                    trigger: WorkflowTrigger::Manual,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
+
+        let runs = projector.of_kind(ProcessKind::WorkflowRun);
+        assert_eq!(runs.len(), 1, "the run is projected exactly once per append");
+        assert_eq!(runs[0].external_id, "projected-run-1");
+        assert_eq!(runs[0].state, ProcessState::Exited);
+        assert_eq!(
+            runs[0].exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Succeeded)
+        );
+
+        let nodes = projector.of_kind(ProcessKind::WorkflowNode);
+        assert_eq!(nodes.len(), history.nodes.len());
+        for node in &nodes {
+            // A node id is unique only within its definition, so the surface id
+            // must be run-qualified or two runs of the same workflow would
+            // collide on one record.
+            assert!(
+                node.external_id.starts_with("projected-run-1:"),
+                "node surface id is not run-qualified: {}",
+                node.external_id
+            );
+            assert_eq!(
+                node.parent,
+                Some((ProcessKind::WorkflowRun, "projected-run-1".to_string())),
+                "every node must name its run as parent"
+            );
+            assert!(node.exit.is_some(), "a finished node must carry an exit");
+        }
+    }
+
+    #[test]
+    fn two_runs_of_the_same_workflow_do_not_collide_on_one_node_record() {
+        let directory = TempDirectory::new("workflow-projection-distinct");
+        let projector = Arc::new(RecordingProjector::default());
+        let service = workflow_service(&directory.0, None, BTreeSet::new())
+            .with_process_projector(projector.clone());
+
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+        for run_id in ["distinct-a", "distinct-b"] {
+            service
+                .run_workflow(
+                    &definition.workflow_id,
+                    WorkflowRunRequest {
+                        run_id: run_id.to_string(),
+                        inputs: BTreeMap::new(),
+                        secret_bindings: BTreeMap::new(),
+                        trigger: WorkflowTrigger::Manual,
+                    },
+                )
+                .unwrap();
+        }
+
+        let ids: BTreeSet<String> = projector
+            .of_kind(ProcessKind::WorkflowNode)
+            .into_iter()
+            .map(|projection| projection.external_id)
+            .collect();
+        let total = projector.of_kind(ProcessKind::WorkflowNode).len();
+        assert_eq!(
+            ids.len(),
+            total,
+            "node surface ids collided across two runs: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_run_still_succeeds_when_the_projection_cannot_be_written() {
+        // The run's own durable history is written before the projection is
+        // attempted, so a projection failure must never turn a completed run
+        // into a reported error.
+        let directory = TempDirectory::new("workflow-projection-fails");
+        let service = workflow_service(&directory.0, None, BTreeSet::new())
+            .with_process_projector(Arc::new(FailingProjector));
+
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+        let history = service
+            .run_workflow(
+                &definition.workflow_id,
+                WorkflowRunRequest {
+                    run_id: "projection-fails".to_string(),
+                    inputs: BTreeMap::new(),
+                    secret_bindings: BTreeMap::new(),
+                    trigger: WorkflowTrigger::Manual,
+                },
+            )
+            .expect("a projection failure must not fail the run");
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
+        // And the durable history is intact.
+        assert_eq!(
+            service.history("projection-fails").unwrap().status,
+            WorkflowRunStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn a_workflow_service_without_a_projector_runs_normally() {
+        // The CLI and every other unit test construct this service with no
+        // ledger; a workflow must still run there.
+        let directory = TempDirectory::new("workflow-no-projector");
+        let service = workflow_service(&directory.0, None, BTreeSet::new());
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+        let history = service
+            .run_workflow(
+                &definition.workflow_id,
+                WorkflowRunRequest {
+                    run_id: "no-projector".to_string(),
+                    inputs: BTreeMap::new(),
+                    secret_bindings: BTreeMap::new(),
+                    trigger: WorkflowTrigger::Manual,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
     }
 
     #[test]

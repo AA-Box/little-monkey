@@ -431,6 +431,15 @@ fn audit_mcp(
 /// are missing is corrupt relative to its own manifest. A stack that has
 /// simply never been indexed (`indexed_at` is `None`) is not a health
 /// problem — it's just unused.
+/// Whether a stack marked indexed actually has an index behind it.
+///
+/// `indexed_at` is set by *both* pipeline generations, so the presence of v1's
+/// `chunks.jsonl`/`vectors.bin` is not evidence either way on its own. A stack
+/// is healthy if either store has it; only a stack with neither is corrupt.
+fn stack_index_is_healthy(v1_files_present: bool, active_v2_generation: bool) -> bool {
+    v1_files_present || active_v2_generation
+}
+
 fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>) {
     let base = app_data.join("stacks");
     let stacks = match crate::stacks::list_impl(&base) {
@@ -448,6 +457,25 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
             return;
         }
     };
+    // A stack can be indexed by either generation of the pipeline, and
+    // `indexed_at` is set by both (`stacks::mark_v2_indexed_impl` sets it for a
+    // v2 index too). Checking only for v1's `chunks.jsonl`/`vectors.bin`
+    // therefore reported every v2-only stack as permanently corrupt — and the
+    // "safe fix" it offered, `stacks_reindex`, then failed with "No indexable
+    // files found" because a v2 stack has no v1 sources to walk. So ask both
+    // stores before calling anything corrupt.
+    let v2_indexes = app_data.join("knowledge-v2").join("indexes");
+    let v2_store = v2_indexes
+        .is_dir()
+        .then(|| crate::knowledge_pipeline::GenerationStore::new(&v2_indexes).ok())
+        .flatten();
+    let has_active_v2_generation = |stack_id: &str| -> bool {
+        v2_store
+            .as_ref()
+            .and_then(|store| store.active(stack_id).ok().flatten())
+            .is_some()
+    };
+
     let mut corrupt = Vec::new();
     let mut healthy = 0usize;
     for stack in &stacks {
@@ -455,9 +483,8 @@ fn audit_knowledge_index(app_data: &Path, findings: &mut Vec<DiagnosticFinding>)
             continue;
         }
         let dir = base.join(&stack.id);
-        let chunks_ok = dir.join("chunks.jsonl").is_file();
-        let vectors_ok = dir.join("vectors.bin").is_file();
-        if chunks_ok && vectors_ok {
+        let v1_ok = dir.join("chunks.jsonl").is_file() && dir.join("vectors.bin").is_file();
+        if stack_index_is_healthy(v1_ok, has_active_v2_generation(&stack.id)) {
             healthy += 1;
         } else {
             corrupt.push(stack);
@@ -1111,6 +1138,28 @@ mod tests {
         let finding = find(&report, &format!("knowledge_index.{stack_id}"));
         assert_eq!(finding.status, DiagnosticStatus::Critical);
         assert!(finding.fixable);
+    }
+
+    #[test]
+    fn a_stack_indexed_only_by_the_v2_pipeline_is_not_reported_corrupt() {
+        // The regression this replaces: `indexed_at` is set by
+        // `stacks::mark_v2_indexed_impl` too, so checking only for v1's files
+        // marked every v2-only stack Critical forever — and the "safe fix" it
+        // offered then failed with "No indexable files found", because a v2 stack
+        // has no v1 sources to walk. There was no way for a user to clear it.
+        assert!(
+            stack_index_is_healthy(false, true),
+            "a stack with a live v2 generation and no v1 files must be healthy"
+        );
+        assert!(
+            stack_index_is_healthy(true, false),
+            "a v1-only stack must stay healthy"
+        );
+        assert!(stack_index_is_healthy(true, true));
+        assert!(
+            !stack_index_is_healthy(false, false),
+            "a stack with neither index is genuinely corrupt and must still be reported"
+        );
     }
 
     #[test]

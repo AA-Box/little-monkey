@@ -46,6 +46,7 @@ import { requestRunCancellation } from "./runProtocol";
 import { registerRunCancellation } from "./runCancellationRegistry";
 import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from "./skills";
 import { protectKnowledgeNoticeForModel, protectToolResult, wrapUntrustedContent } from "./untrustedContent";
+import { admitProcess, exitProcess, markProcessRunning } from "./processTable";
 import { isBtwNotice } from "./slashCommands";
 import { errorMessage } from "./errors";
 
@@ -158,6 +159,24 @@ async function initializeActorRecorders(
     });
     if (!recorder) return;
     execution.recorders.set(actor.actorId, recorder);
+    // Projected onto the unified process table, keyed on the actor's durable run
+    // id (unique per attempt) rather than its `actorId`, which repeats when a
+    // crew is re-run and would collide with the previous run's record.
+    //
+    // No parent edge: the coordinator is initialized last and every actor is
+    // initialized concurrently, so a member's reference to it is not reliably
+    // resolvable. Crew actors are therefore siblings here, the same gap they
+    // already had in the ledger. Fail-soft — see `processTable.ts`.
+    void admitProcess({
+      kind: 'crew_member',
+      externalId: recorder.runId,
+      runId: recorder.runId,
+      profile: actor.name,
+    }).then(async (id) => {
+      if (!id) return;
+      crewActorProcesses.set(`${sessionId}:${actor.actorId}`, id);
+      await markProcessRunning(id);
+    });
     execution.cancellationDisposers.push(registerRunCancellation(recorder.runId, () => {
       execution.externallyRequestedRunIds.add(recorder.runId);
       execution.reason = "user";
@@ -166,12 +185,26 @@ async function initializeActorRecorders(
   }));
 }
 
+/** Process-table ids for live crew actors, keyed `sessionId:actorId` — the
+ * lookup `finalizeActorRecorder` needs to exit the right record. Mirrors
+ * `subagent.ts`'s `activeSubagentControllers`; entries are removed on finalize
+ * so the map only ever holds live actors. */
+const crewActorProcesses = new Map<string, string>();
+
 async function finalizeActorRecorder(
   sessionId: string,
   actorId: string,
   outcome: "completed" | "failed" | "cancelled",
   detail: string,
 ): Promise<void> {
+  const processKey = `${sessionId}:${actorId}`;
+  const processId = crewActorProcesses.get(processKey);
+  if (processId) {
+    crewActorProcesses.delete(processKey);
+    const exitStatus =
+      outcome === "completed" ? "succeeded" : outcome === "cancelled" ? "cancelled" : "failed";
+    await exitProcess(processId, exitStatus, outcome === "completed" ? null : detail);
+  }
   const execution = activeCrewExecutions.get(sessionId);
   if (!execution) return;
   const recorder = execution.recorders.get(actorId);

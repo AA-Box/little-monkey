@@ -67,6 +67,7 @@ import { usePermissionStore, type PermissionMode } from '../store/permissionStor
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
+import { admitProcess, exitProcess, exitStatusFor, markProcessRunning, reconcileProcess } from './processTable';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
   gatePrivacyWireMessages,
@@ -1553,6 +1554,19 @@ export async function runAgentTurn(
   useSessionStore.getState().markTurnRunning(sessionId, true);
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
+  // Project this turn onto the unified process table so it is visible alongside
+  // daemon jobs, subagents and workflow runs. Fail-soft by construction — see
+  // `processTable.ts`.
+  const processId = await admitProcess({
+    kind: 'chat_turn',
+    externalId: turnId,
+    workspace: primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null,
+    profile:
+      useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.personaId ??
+      null,
+  });
+  if (processId) await markProcessRunning(processId);
+  let turnError: unknown;
   try {
     const mutationRequired = requiresWorkspaceMutation(
       userText,
@@ -1610,6 +1624,9 @@ export async function runAgentTurn(
         mutationRequired,
       );
     }
+  } catch (error) {
+    turnError = error;
+    throw error;
   } finally {
     turnControllers.delete(sessionId);
     cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
@@ -1618,6 +1635,13 @@ export async function runAgentTurn(
     useSessionStore.getState().markTurnRunning(sessionId, false);
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
+    if (processId) {
+      const outcome = exitStatusFor({
+        aborted: controller.signal.aborted,
+        error: turnError,
+      });
+      await exitProcess(processId, outcome.status, outcome.reason);
+    }
   }
 }
 
@@ -1878,6 +1902,17 @@ async function runDaemonAgentTurn(
     attachments: frozenAttachments,
   });
   const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  // Create the daemon job's process record here, with this turn as its parent.
+  // The daemon's own per-tick reconcile then finds this record and only moves
+  // its state, which is how the lineage edge survives crossing the process
+  // boundary — the daemon has no way to know which turn queued a job.
+  void reconcileProcess({
+    kind: 'daemon_job',
+    externalId: queued.job_id,
+    state: 'admitted',
+    parentKind: 'chat_turn',
+    parentExternalId: turnId,
+  });
   if (resolvedTarget.kind === 'provider') {
     recordRequest(resolvedTarget.providerId);
   }

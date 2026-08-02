@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::{checkpoints, permissions, workspace, AppState};
 
@@ -204,7 +204,69 @@ fn append_bounded(buffer: &mut String, chunk: &str, truncated: &mut bool) -> usi
 }
 
 fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView) {
+    project_process(app, &view);
     let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
+}
+
+/// Projects a background shell onto the unified process table.
+///
+/// Hooked into [`emit_status`] because that is the single function every status
+/// change already funnels through — spawn, exit, kill, and error all call it, so
+/// there is no path that changes a shell's state without projecting it.
+///
+/// Fail-soft, like every other adopter: a shell must not fail to report its
+/// status because a bookkeeping row could not be written.
+fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView) {
+    use crate::process_table::{
+        ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
+    };
+
+    let (state, exit) = match view.status {
+        BackgroundShellStatus::Running => (ProcessState::Running, None),
+        BackgroundShellStatus::Exited => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                // A non-zero exit is `Error` in this module's own vocabulary, so
+                // reaching here means the command genuinely succeeded.
+                status: ExitStatus::Succeeded,
+                code: view.exit_code,
+                signal: None,
+                reason: None,
+            }),
+        ),
+        BackgroundShellStatus::Killed => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Cancelled,
+                code: view.exit_code,
+                signal: None,
+                reason: Some("killed".to_string()),
+            }),
+        ),
+        BackgroundShellStatus::Error => (
+            ProcessState::Exited,
+            Some(ProcessExit {
+                status: ExitStatus::Failed,
+                code: view.exit_code,
+                signal: None,
+                reason: None,
+            }),
+        ),
+    };
+
+    let mut projection =
+        ProcessProjection::new(ProcessKind::BackgroundShell, view.id.clone(), state)
+            .with_workspace(Some(view.cwd.clone()));
+    projection.exit = exit;
+
+    let state_handle = app.state::<crate::AppState>();
+    if let Err(error) = crate::process_commands::project_process_record(
+        app,
+        state_handle.inner(),
+        &projection,
+    ) {
+        eprintln!("background shell: could not project {}: {error}", view.id);
+    }
 }
 
 /// Streams one of the child's pipes into the shared bounded tail, emitting

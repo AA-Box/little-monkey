@@ -1126,7 +1126,16 @@ describe("runAgentTurn / workspace mutation preflight", () => {
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(messages[1]?.content).toContain("No files changed");
     expect(messages[1]?.content).toContain("folder picker");
-    expect(invokeMock).not.toHaveBeenCalled();
+
+    // The invariant is that a typed-path-only mutation request reaches no
+    // workspace, tool, or model surface — not that the turn is invisible.
+    // Projecting it onto the process table is exactly the bookkeeping that
+    // should happen for a turn that ran and exited, even one rejected by
+    // preflight, so allow `process_*` and assert nothing else was called.
+    const nonProjectionCalls = invokeMock.mock.calls
+      .map(([command]) => command as string)
+      .filter((command) => !command.startsWith("process_"));
+    expect(nonProjectionCalls).toEqual([]);
 
     // Drain sessionStore's debounced persistence so it cannot leak an IPC
     // call into a later test file sharing this worker.

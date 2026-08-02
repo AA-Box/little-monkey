@@ -21,6 +21,7 @@ mod modelfile;
 mod ollama_api;
 mod permission;
 mod plugins_cli;
+mod processes_cli;
 mod providers_cli;
 mod repl;
 mod security_cli;
@@ -397,6 +398,12 @@ enum Cmd {
     /// Inspect local security posture and apply narrowly-scoped safe fixes.
     #[command(subcommand)]
     Security(security_cli::SecurityCmd),
+    /// Inspect agent processes across every execution surface.
+    ///
+    /// Named `processes` because `monkey ps` is the Ollama-compatible
+    /// "list running models" command.
+    #[command(subcommand, alias = "proc")]
+    Processes(processes_cli::ProcessesCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1299,6 +1306,14 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                     let workspace = workspace.canonicalize().ok();
                     security_cli::run(action, &data_dir, workspace.as_deref())
                 }
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Processes(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => processes_cli::run(action, &data_dir),
                 Err(error) => Err(error),
             }
         }

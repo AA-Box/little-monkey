@@ -1753,30 +1753,76 @@ pub async fn stacks_query(
     let base = stacks_base_dir(&app)?;
     let registry = load_registry(&base)?;
     let k = k.unwrap_or(DEFAULT_QUERY_K as u32) as usize;
-    let mut results = Vec::new();
+    let cancel = CancellationToken::new();
+    let mut hybrid_groups: Vec<Vec<StackQueryResult>> = Vec::new();
     let mut legacy_ids = Vec::new();
     for id in &stack_ids {
         let stack = registry
             .iter()
             .find(|stack| &stack.id == id)
             .ok_or_else(|| format!("Stack '{id}' not found"))?;
-        match crate::knowledge_service::query_for_agent(&app, stack, &query, k).await? {
-            Some(mut hybrid) => results.append(&mut hybrid),
+        match crate::knowledge_service::query_for_agent(&app, stack, &query, k, &cancel).await? {
+            Some(hybrid) => hybrid_groups.push(hybrid),
             None => legacy_ids.push(id.clone()),
         }
     }
-    if !legacy_ids.is_empty() {
-        results.extend(query_impl(&base, state.inner(), &legacy_ids, &query, k).await?);
+    let legacy_group = if legacy_ids.is_empty() {
+        Vec::new()
+    } else {
+        query_impl(&base, state.inner(), &legacy_ids, &query, k).await?
+    };
+
+    Ok(merge_stack_results(hybrid_groups, legacy_group, k))
+}
+
+/// Merges per-stack result lists without comparing scores across index
+/// generations.
+///
+/// A v1 result's `score` is a cosine similarity; a v2 result's is a
+/// reciprocal-rank-fusion score. They are different quantities on different
+/// scales, so the previous behaviour — concatenate everything and sort by
+/// `score` descending — silently ranked one index above the other by an
+/// artefact of its scoring function rather than by relevance. Whichever family
+/// happened to produce larger numbers won.
+///
+/// Each stack's own ordering is authoritative and preserved; this only decides
+/// how the lists are woven together, round-robin, so no stack is starved and no
+/// cross-family comparison is made. Within one round, ties break on
+/// `source_path` for determinism.
+fn merge_stack_results(
+    hybrid_groups: Vec<Vec<StackQueryResult>>,
+    legacy_group: Vec<StackQueryResult>,
+    k: usize,
+) -> Vec<StackQueryResult> {
+    let mut groups: Vec<std::vec::IntoIter<StackQueryResult>> = hybrid_groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .map(Vec::into_iter)
+        .collect();
+    if !legacy_group.is_empty() {
+        groups.push(legacy_group.into_iter());
     }
-    results.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.source_path.cmp(&right.source_path))
-    });
-    results.truncate(k);
-    Ok(results)
+
+    let mut merged: Vec<StackQueryResult> = Vec::new();
+    while merged.len() < k {
+        let mut round: Vec<StackQueryResult> = Vec::new();
+        for group in groups.iter_mut() {
+            if let Some(result) = group.next() {
+                round.push(result);
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        round.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+        for result in round {
+            if merged.len() >= k {
+                break;
+            }
+            merged.push(result);
+        }
+    }
+    merged
 }
 
 // ---------------------------------------------------------------------
@@ -2026,30 +2072,26 @@ pub async fn tool_search_docs(
         ids
     };
 
-    let mut results = Vec::new();
+    let cancel = CancellationToken::new();
+    let mut hybrid_groups: Vec<Vec<StackQueryResult>> = Vec::new();
     let mut legacy_ids = Vec::new();
     for id in &stack_ids {
         let candidate = registry
             .iter()
             .find(|candidate| &candidate.id == id)
             .ok_or_else(|| format!("Stack '{id}' not found"))?;
-        match crate::knowledge_service::query_for_agent(&app, candidate, &query, k).await? {
-            Some(mut hybrid) => results.append(&mut hybrid),
+        match crate::knowledge_service::query_for_agent(&app, candidate, &query, k, &cancel).await? {
+            Some(hybrid) => hybrid_groups.push(hybrid),
             None => legacy_ids.push(id.clone()),
         }
     }
-    if !legacy_ids.is_empty() {
-        results.extend(query_impl(&base, state.inner(), &legacy_ids, &query, k).await?);
-    }
-    results.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.source_path.cmp(&right.source_path))
-    });
-    results.truncate(k);
-    Ok(results)
+    let legacy_group = if legacy_ids.is_empty() {
+        Vec::new()
+    } else {
+        query_impl(&base, state.inner(), &legacy_ids, &query, k).await?
+    };
+
+    Ok(merge_stack_results(hybrid_groups, legacy_group, k))
 }
 
 #[cfg(test)]
@@ -3182,5 +3224,118 @@ mod tests {
         let (_, text) =
             read_indexable_file(&pdf_path).expect("read_indexable_file must handle .pdf");
         assert!(text.contains("Hello World"));
+    }
+
+    // ---------------------------------------------------------------------
+    // merge_stack_results — v1 cosine scores and v2 RRF scores are different
+    // quantities on different scales, so they must never be compared.
+    // ---------------------------------------------------------------------
+
+    fn result(stack: &str, path: &str, score: f32) -> StackQueryResult {
+        StackQueryResult {
+            stack_id: stack.to_string(),
+            stack_name: stack.to_string(),
+            source_path: path.to_string(),
+            score,
+            text: format!("{path} body"),
+            heading: None,
+        }
+    }
+
+    #[test]
+    fn merging_never_lets_a_scoring_scale_starve_the_other_index() {
+        // The realistic shape of the bug: v1 cosine similarities sit near 0.8
+        // while v2 RRF scores sit near 0.016 (1/61 for a rank-1 hit with the
+        // usual k=60 constant). Sorting the concatenation by `score` put every
+        // v1 hit above every v2 hit regardless of relevance.
+        let v2 = vec![
+            result("v2", "a.md", 0.0163),
+            result("v2", "b.md", 0.0161),
+            result("v2", "c.md", 0.0159),
+        ];
+        let v1 = vec![
+            result("v1", "x.md", 0.87),
+            result("v1", "y.md", 0.85),
+            result("v1", "z.md", 0.83),
+        ];
+
+        let merged = merge_stack_results(vec![v2], v1, 6);
+        let stacks: Vec<&str> = merged.iter().map(|hit| hit.stack_id.as_str()).collect();
+
+        assert_eq!(merged.len(), 6);
+        assert!(
+            stacks.iter().take(2).any(|stack| *stack == "v2"),
+            "the v2 index was starved by v1's larger score scale: {stacks:?}"
+        );
+        // Round-robin: each index contributes one per round.
+        assert_eq!(stacks.iter().filter(|stack| **stack == "v1").count(), 3);
+        assert_eq!(stacks.iter().filter(|stack| **stack == "v2").count(), 3);
+    }
+
+    #[test]
+    fn merging_preserves_each_stacks_own_ordering() {
+        // A stack's own ranking is authoritative — this function decides only
+        // how lists interleave, never how they are ordered internally.
+        let first = vec![
+            result("s1", "1-best.md", 0.9),
+            result("s1", "2-mid.md", 0.5),
+            result("s1", "3-worst.md", 0.1),
+        ];
+        let merged = merge_stack_results(vec![first], Vec::new(), 3);
+        let paths: Vec<&str> = merged.iter().map(|hit| hit.source_path.as_str()).collect();
+        assert_eq!(paths, vec!["1-best.md", "2-mid.md", "3-worst.md"]);
+    }
+
+    #[test]
+    fn merging_respects_k_and_drains_uneven_groups() {
+        // Rebuilt per call rather than cloned: `StackQueryResult` is a wire type
+        // and does not need a `Clone` impl added for a test's convenience.
+        let long = || {
+            vec![
+                result("long", "l1", 0.9),
+                result("long", "l2", 0.8),
+                result("long", "l3", 0.7),
+                result("long", "l4", 0.6),
+            ]
+        };
+        let short = || vec![result("short", "s1", 0.5)];
+
+        let merged = merge_stack_results(vec![long(), short()], Vec::new(), 3);
+        assert_eq!(merged.len(), 3, "k must be respected exactly");
+
+        // With room for everything, the shorter group simply runs out and the
+        // longer one keeps contributing rather than the merge stopping early.
+        let all = merge_stack_results(vec![long(), short()], Vec::new(), 10);
+        assert_eq!(all.len(), 5);
+        assert_eq!(
+            all.iter().filter(|hit| hit.stack_id == "long").count(),
+            4,
+            "the longer group must not be truncated to the shorter one's length"
+        );
+    }
+
+    #[test]
+    fn merging_handles_empty_inputs_without_panicking() {
+        assert!(merge_stack_results(Vec::new(), Vec::new(), 5).is_empty());
+        assert!(merge_stack_results(vec![Vec::new(), Vec::new()], Vec::new(), 5).is_empty());
+        assert_eq!(
+            merge_stack_results(Vec::new(), vec![result("v1", "only.md", 0.4)], 5).len(),
+            1
+        );
+        // k = 0 asks for nothing and must return nothing, not everything.
+        assert!(merge_stack_results(vec![vec![result("v2", "a.md", 0.1)]], Vec::new(), 0).is_empty());
+    }
+
+    #[test]
+    fn merging_is_deterministic_for_a_tied_round() {
+        let a = || vec![result("a", "zeta.md", 0.5)];
+        let b = || vec![result("b", "alpha.md", 0.5)];
+        let first = merge_stack_results(vec![a(), b()], Vec::new(), 2);
+        let second = merge_stack_results(vec![a(), b()], Vec::new(), 2);
+        assert_eq!(
+            first.iter().map(|hit| hit.source_path.clone()).collect::<Vec<_>>(),
+            second.iter().map(|hit| hit.source_path.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(first[0].source_path, "alpha.md", "ties break on source_path");
     }
 }

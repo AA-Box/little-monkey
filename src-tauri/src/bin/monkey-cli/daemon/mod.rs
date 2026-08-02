@@ -561,6 +561,9 @@ pub(crate) fn queue_client_recipe(
     let options = QueueOptions {
         recipe: recipe_path.to_string_lossy().into_owned(),
         params: Vec::new(),
+        origin: QueueOrigin::Remote {
+            request_id: client_key.to_string(),
+        },
         deterministic_job_id: Some(format!(
             "job-{}",
             &sha256_hex(format!("protocol-client:{client_key}").as_bytes())[..32]
@@ -621,6 +624,9 @@ pub(crate) fn queue_mobile_chat_recipe(
     let options = QueueOptions {
         recipe: MOBILE_CHAT_RECIPE.to_string(),
         params: vec![format!("prompt={prompt}")],
+        origin: QueueOrigin::Remote {
+            request_id: client_key.to_string(),
+        },
         deterministic_job_id: Some(mobile_chat_job_id(client_key)),
         priority: 0,
         max_attempts: 1,
@@ -677,10 +683,30 @@ pub(crate) fn cancel_client_run(run_id: &str, reason: &str) -> Result<(), String
     Ok(())
 }
 
-#[derive(Clone)]
+/// Where a queued job came from, for the unified process table.
+///
+/// The daemon cannot infer this later — a job row looks identical whether a CLI,
+/// the desktop, or a paired phone queued it — so the enqueuer states it here and
+/// the projection is written while that knowledge is still in scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum QueueOrigin {
+    /// A local CLI or desktop enqueue. The desktop separately creates the job's
+    /// record with its own turn as parent (see `agentLoop.ts`), so nothing is
+    /// projected here for this case.
+    Local,
+    /// A paired remote controller or mobile device. Projected as a `remote_run`
+    /// parent with the daemon job as its child, which is what makes remote work
+    /// distinguishable from local work in the listing. The remote request and
+    /// the job it queued are genuinely two different things, so they are two
+    /// records rather than one relabelled kind.
+    Remote { request_id: String },
+}
+
 struct QueueOptions {
     recipe: String,
     params: Vec<String>,
+    origin: QueueOrigin,
     deterministic_job_id: Option<String>,
     priority: i32,
     max_attempts: u32,
@@ -728,8 +754,60 @@ impl QueueOptions {
             allow_create_pull_request: args.allow_create_pull_request,
             allow_review_comment: args.allow_review_comment,
             parent_run_id: None,
+            origin: QueueOrigin::Local,
             snapshot_is_frozen: false,
         }
+    }
+}
+
+/// Records a remotely-originated job's lineage: a `remote_run` for the request,
+/// and the daemon job as its child.
+///
+/// Fail-soft. The job is already queued and durable by the time this runs; a
+/// projection failure must not turn a successful enqueue into an error the
+/// caller sees.
+fn project_queue_origin(
+    shared: &SharedLedger,
+    origin: &QueueOrigin,
+    job_id: &str,
+    run_id: &str,
+) {
+    use little_monkey_lib::process_table::{ProcessKind, ProcessProjection, ProcessState};
+
+    let QueueOrigin::Remote { request_id } = origin else {
+        return;
+    };
+    let now_ms = match now_ms().and_then(|value| {
+        i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string())
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("monkey daemon: could not project remote origin: {error}");
+            return;
+        }
+    };
+
+    let table = shared.process_table();
+    if let Err(error) = table.reconcile(
+        &ProcessProjection::new(ProcessKind::RemoteRun, request_id, ProcessState::Running),
+        now_ms,
+    ) {
+        eprintln!("monkey daemon: could not project remote request {request_id}: {error}");
+        // Without the parent the edge is unresolvable, so admitting the child
+        // here would produce a parentless duplicate of what the engine tick will
+        // create anyway. Leave it to the tick.
+        return;
+    }
+
+    // Created with the parent edge before the engine's own tick reconciles this
+    // job: whoever gets there first admits, and the tick then only moves state.
+    if let Err(error) = table.reconcile(
+        &ProcessProjection::new(ProcessKind::DaemonJob, job_id, ProcessState::Admitted)
+            .with_parent(ProcessKind::RemoteRun, request_id)
+            .with_run(Some(run_id.to_string())),
+        now_ms,
+    ) {
+        eprintln!("monkey daemon: could not project remote job {job_id}: {error}");
     }
 }
 
@@ -868,6 +946,7 @@ fn enqueue(
             }
         };
     store.mark_queued(&job_id, &run_id, now_ms()?)?;
+    project_queue_origin(shared, &options.origin, &job_id, &run_id);
     if let Some(owned) = &worktree {
         shared.record_worktree_lease(
             &owned.lease_id,
@@ -1107,6 +1186,7 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         .join(format!("retry-source-{}.json", uuid::Uuid::new_v4()));
     write_snapshot(&retry_source, &recipe)?;
     let options = QueueOptions {
+        origin: QueueOrigin::Local,
         recipe: retry_source.to_string_lossy().to_string(),
         params: vec![],
         deterministic_job_id: None,
@@ -1805,6 +1885,7 @@ fn process_one_pending_delivery(
         &sha256_hex(format!("{}:{}", pending.trigger_id, pending.delivery_id).as_bytes())[..32]
     );
     let mut options = QueueOptions {
+        origin: QueueOrigin::Local,
         recipe: recipe_name.to_string(),
         params,
         deterministic_job_id: Some(deterministic_job_id),
