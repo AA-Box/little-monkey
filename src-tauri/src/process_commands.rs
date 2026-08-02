@@ -398,6 +398,62 @@ pub fn process_reconcile(
     Ok(record)
 }
 
+/// What signals a kind honours, so a UI can enable only the controls that work.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessSignalSupport {
+    pub kind: ProcessKind,
+    pub signal: crate::process_table::ProcessSignal,
+    pub honoured: bool,
+    /// Present when refused — shown to the user instead of a disabled control
+    /// with no explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// The full signal support matrix.
+///
+/// Exposed so a control can be disabled *with its reason* rather than a UI
+/// guessing, or worse, offering a button that silently does nothing.
+#[tauri::command]
+pub fn process_signal_support() -> Vec<ProcessSignalSupport> {
+    let mut out = Vec::new();
+    for kind in ProcessKind::ALL {
+        for signal in crate::process_table::ProcessSignal::ALL {
+            let support = kind.signal_support(*signal);
+            out.push(ProcessSignalSupport {
+                kind: *kind,
+                signal: *signal,
+                honoured: support.is_honoured(),
+                reason: support.refusal(),
+            });
+        }
+    }
+    out
+}
+
+/// Ask a process for a signal.
+///
+/// Records durable intent; the owning kind delivers it at its own safe point. A
+/// kind that does not honour the signal returns an error carrying the reason, so
+/// the caller can say why rather than appearing to succeed.
+#[tauri::command]
+pub fn process_signal(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    process_id: String,
+    signal: String,
+    reason: Option<String>,
+) -> Result<ProcessRecord, String> {
+    let signal = crate::process_table::ProcessSignal::parse(&signal).map_err(to_message)?;
+    let now = crate::run_commands::unix_time_ms()? as i64;
+    let record = with_process_table(&app, state.inner(), |table| {
+        table.signal(&process_id, signal, reason.as_deref(), now)
+    })?;
+    notify(&app, &record);
+    Ok(record)
+}
+
 /// Applies a projection through the shared reconcile, for native adopters that
 /// already hold an `AppHandle` and `AppState`.
 ///

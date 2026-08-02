@@ -175,23 +175,72 @@ produce context by different rules.
 
 # Phase 1 — Process and isolation kernel
 
-## K2. Signals, lifecycle, and restart policy
+## K2. Signals, lifecycle, and restart policy *(partially built)*
 
-**Today:** cancellation works and reaches outstanding Crew members and
-subagents; the daemon has pause/resume, retry, crash recovery, orphan
-detection, and a durable kill switch. But suspend is not resume-able mid-turn
-for a desktop turn, restart behavior is per-subsystem, and there is no
-uniform exit-status vocabulary.
+**Shipped — the signal contract and durable intent.** `ProcessSignal`
+(`stop` / `suspend` / `resume` / `kill`) with `ProcessKind::signal_support`, which
+for every kind either honours a signal or **refuses it with a reason**. Reachable
+as `process_signal` / `process_signal_support` and `monkey processes signal` /
+`monkey processes signals`.
 
-**Acceptance:** a documented signal set (`stop`, `suspend`, `resume`,
-`kill`) that every process kind implements or explicitly refuses with a
-reason; declarative restart policy (`never` / `on-failure` / bounded backoff)
-per process kind; a reaper that guarantees no process record stays in a
-running state after its worker is gone, verified by a crash-injection test per
-surface.
+Intent is recorded durably on the process record (`stop_requested`,
+`suspend_requested`, plus the caller's reason and timestamp — migration V6)
+rather than held in a live handle. That is what makes a signal reach a process
+this app is not running, and survive a restart: before this, only the daemon's
+cancel was durable, every other kind's stop was an in-memory `AbortController`
+or `CancellationToken`, and `m4_workflows_cancel` returned `false` for a run
+absent from its in-memory map — so a daemon-triggered workflow was simply
+uncancellable from the desktop.
 
-**Blocks:** K8 — preemption is suspend plus resume. Without K2 the scheduler
-can only kill.
+Two decisions worth knowing: `stop` and `suspend` are independent latches, so
+asking a suspended process to stop does not erase that it was suspended; and
+`resume` clears only the suspend latch, never a pending stop, because the
+alternative turns "stop this" into "keep going" on a race. Both are pinned by
+tests. `kill` is refused where this app owns no OS process rather than quietly
+downgraded to `stop`, since a caller asking for `kill` wants a guarantee `stop`
+does not give.
+
+The honest state of delivery, which the matrix now states rather than implies:
+
+| Kind | stop | suspend/resume | kill |
+| --- | --- | --- | --- |
+| daemon job, remote run | ✅ | ✅ OS suspend | ✅ |
+| side task | ✅ | ✅ cooperative | refused |
+| background shell | ✅ | refused | ✅ |
+| chat turn, subagent, crew member | ✅ | refused | refused |
+| workflow run/node | ✅ | refused | refused |
+
+**Remaining:**
+
+- **Cooperative pause in the five loops.** A chat turn, subagent, crew member
+  and workflow run would each yield at a round (or level) boundary. Feasible —
+  between rounds a turn holds no open provider stream, so there is nothing to
+  time out — with the caveat that pause latency is unbounded: a 20-minute
+  `run_shell` call means pause lands in 20 minutes. Worth pairing with SIGSTOP of
+  the child that tool spawned, and reporting `pause_pending` honestly meanwhile.
+- **Delivery for the refusals above**, which is what flips those cells.
+- **Workflow out-of-process cancel**, now that intent is durable: the executor
+  already observes cancellation at level boundaries, so it needs to read the
+  latch rather than an in-memory map. Workflow resume-by-replay is reachable too,
+  since replay-from-boundary already exists (`ReplayPlan`, `Reused`).
+- **Expose `RemoteAction::Pause`** — the daemon supports it locally; the remote
+  protocol simply has no action for it.
+- **Declarative restart policy** (`never` / `on-failure` / bounded backoff) per
+  kind, currently ad hoc per subsystem.
+- **A crash-injection test per surface**, which the acceptance names and nothing
+  has.
+- **Paused-across-restart for the cooperative kinds is deliberately out of
+  scope.** Durable *intent* survives; durable *execution* does not, because a
+  paused turn's loop lives in the WebView. That is K13, and a resume button on
+  something unresumable would be a lie. K2 should define paused + restart →
+  `exited(lost)`.
+
+Also open, and it lands on the scheduler rather than here: a suspended process
+still holds its reservations — resident model slot, worktree lease, workspace
+root. Whether suspending releases them is a K7/K8 decision.
+
+**Blocks:** K8 — preemption is suspend plus resume, and for five of the nine
+kinds suspend is still refused, so the scheduler can only stop them.
 
 ## K3. Isolation parity across platforms
 
