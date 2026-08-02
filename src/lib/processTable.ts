@@ -166,6 +166,41 @@ export function exitStatusFor(options: {
   return { status: "succeeded", reason: null };
 }
 
+export interface ReconcileProcessArgs {
+  kind: ProcessKind;
+  externalId: string;
+  state: ProcessState;
+  parentKind?: ProcessKind | null;
+  parentExternalId?: string | null;
+  runId?: string | null;
+  workspace?: string | null;
+  profile?: string | null;
+  exitStatus?: ProcessExitStatus | null;
+  exitReason?: string | null;
+}
+
+/**
+ * Idempotent projection. Unlike {@link admitProcess}, reconciling twice is a
+ * no-op rather than an error, so a caller that may not be first can still
+ * establish a record.
+ *
+ * Used where the frontend knows something the eventual owner does not — a turn
+ * routed to the resident runner creates the daemon job's record with the turn as
+ * its parent, and the daemon's own reconcile then finds that record and only
+ * moves its state. That is how the parent edge survives crossing the process
+ * boundary.
+ */
+export async function reconcileProcess(args: ReconcileProcessArgs): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    const record = await invoke<ProcessRecord>("process_reconcile", { args });
+    return record.processId;
+  } catch (error) {
+    warn(`reconcile ${args.kind} ${args.externalId}`, error);
+    return null;
+  }
+}
+
 export interface ProcessListFilter {
   kinds?: ProcessKind[];
   liveOnly?: boolean;

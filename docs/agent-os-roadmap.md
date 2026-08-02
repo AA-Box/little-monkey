@@ -92,66 +92,6 @@ produce context by different rules.
 
 # Phase 1 — Process and isolation kernel
 
-## K1. One agent process abstraction *(partially built)*
-
-**Shipped:** `process_table.rs` — one record with a stable self-describing id
-(`p-<kind>-<uuid>`, replacing seven schemes), a parent id that means hierarchy,
-the `admitted → running → suspended → exited` state machine with transitions
-refused rather than applied, owning workspace and profile as queryable columns,
-a declared limit set, and a structured exit (status/code/signal/reason). Stored
-as ledger migration V5, so the daemon shares it. Both invariants — legal
-transitions, and `exited` if and only if there is an exit status — are enforced
-in Rust *and* by SQL triggers, because companion stores reach the connection
-directly. `monkey processes` (alias `proc`) is the cross-surface listing.
-
-Adopters, all going through one shared `ProcessTable::reconcile` rather than
-composing admit-and-transition themselves — that composition is where the subtle
-mistakes live (a resume overwriting `started_at_ms`, a late projection after a
-terminal write treated as an error, a restart forking the record):
-
-- the desktop chat turn (`agentLoop.ts`)
-- the daemon job, reconciled once per engine tick so no state-change call site
-  can be missed
-- the `task`-tool subagent, as a child of its turn
-- the workflow run **and each of its node instances**, projected at
-  `append_history` — the single choke point every run state change flows
-  through, which is what makes daemon-triggered runs project too even though
-  they never reach `m4_commands.rs`. A node instance had no global identity at
-  all (`node_id` is unique only within its definition); its surface id is now
-  run-qualified, so two runs of one workflow cannot collide on a single record.
-
-`WorkflowService` takes a `ProcessProjector` **port**, not a ledger handle, so
-it stays storage-agnostic — its own history is a JSON file store and its unit
-tests use a recording fake rather than standing up SQLite. Every projection is
-fail-soft: a turn or a workflow never fails because its bookkeeping row could
-not be written, and tests assert both complete with the projector erroring on
-every call.
-
-**Remaining:**
-
-- **The other surfaces.** Crew members, background shells, and side tasks do not
-  create records. Remote-run work is projected as its underlying `daemon_job`,
-  so the `remote_run` kind exists but is unused, and a paired controller's run
-  is not distinguishable from a local one in the listing.
-- **Parent edges across the daemon boundary.** A chat turn that routes to the
-  resident runner produces two records — the turn and the daemon job — with no
-  edge between them.
-- **Acceptance for "a run without a process record is a bug".** Not assertable
-  until every surface adopts; there is no test that fails when a new execution
-  path forgets to admit one.
-
-**Also shipped since:** the startup reaper. `lib.rs`'s `setup` reaps every live
-process of a desktop-owned kind before any new turn can admit one, so a turn
-whose WebView died no longer leaves a `running` row behind. Scoped to
-`ProcessKind::DESKTOP_OWNED` rather than everything live, because the resident
-daemon outlives the app and an unscoped reap would declare live daemon work
-`lost`; the daemon reaps its own through its engine tick. A test asserts a live
-daemon job and workflow run survive a desktop reap.
-
-
-**Blocks:** everything in Phase 2 and 3. A scheduler needs something to
-schedule, and it cannot arbitrate between kinds that are not in the table.
-
 ## K2. Signals, lifecycle, and restart policy
 
 **Today:** cancellation works and reaches outstanding Crew members and
@@ -192,9 +132,19 @@ three platforms is a framework.
 
 ## K4. Enforced per-process resource limits
 
-**Today:** `rlimit` appears only in `browser_worker.rs`. Agent shell and tool
-execution inherits whatever the host allows. The offload planner reasons about
-memory *before* a load but does not bound a running process.
+**Today:** there is **no kernel-level resource enforcement anywhere** — no
+`setrlimit`, no cgroup, no job object, no `prctl`, no `seccomp`. An earlier draft
+of this file claimed `rlimit` was used in `browser_worker.rs`; that was a
+case-insensitive grep matching the `BrowserLimits` struct, which is cooperative
+userspace bookkeeping checked on each agent action (`begin_action`) with no
+watchdog — so an idle Chromium child is never checked at all. Agent shell and
+tool execution inherits whatever the host allows. The offload planner reasons
+about memory *before* a load but does not bound a running process.
+
+A process record now carries a **declared** limit set (`ProcessLimits`, K1), and
+the daemon populates it from its own `max_runtime_ms`/`max_memory_bytes`/
+`max_log_bytes`. Declaring is not enforcing, and the field docs say so rather
+than implying a guarantee that does not exist.
 
 **Acceptance:** a limit set attached to every process record — CPU time, RSS,
 open files, disk written, wall clock, and process count — enforced by cgroups
@@ -208,11 +158,23 @@ guess.
 
 ## K5. Per-process egress policy
 
-**Today:** `privacy_firewall.rs` policy is per **workspace**
-(`default_for(workspace_id)`), with real preview/prepare/execute gating on
-sends. Non-loopback serving has an exact-origin CORS allowlist. Browser
-verification enforces exact-origin grants with DNS rechecks. But a running
-agent process does not carry its own egress allowlist.
+**Today:** nothing gates outbound network by process. `privacy_firewall.rs` is a
+**content scanner plus a persisted per-workspace policy**, not a network gate: it
+has no HTTP, DNS, or socket code, it returns a redacted string rather than
+sending anything, and its only callers are in the frontend
+(`agentLoop.ts`/`turnEngine.ts`) for cloud-model chat dispatch — so any Rust call
+site bypasses it entirely, including `providers.rs`'s own chat request. An
+earlier draft of this file described it as gating sends; that was wrong.
+
+There are **23 `reqwest` client construction sites and no shared client
+factory** — 13 of them bare `reqwest::Client::new()` with no timeout, redirect
+policy, or resolver — so egress cannot be centralized without touching each one.
+Only `web.rs` has an SSRF-guarded resolver; `connectors.rs`,
+`knowledge_service.rs`, and `browser_worker.rs` pin DNS per request; everything
+else does no pinning. `browser_pane.rs` (user browsing) has a scheme filter and
+no origin policy at all, while `browser_worker.rs` (agent-driven) enforces exact
+origins with DNS rechecks. CORS and bind-interface restrictions are **inbound
+only**.
 
 **Acceptance:** each process record carries a deny-by-default egress policy —
 allowed hosts, ports, and protocols — that is narrower than or equal to its

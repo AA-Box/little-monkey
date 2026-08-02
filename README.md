@@ -160,6 +160,28 @@ a scope boundary stated where it matters.
 
 ### Runs, review, and cost
 
+- See everything the app is executing in one table. A chat turn, a daemon job,
+  a `task`-tool subagent, a Crew member, a workflow run, each of that run's
+  node instances, remote-queued work, a background shell, and a side task all
+  create a record in one process table with a shared id scheme
+  (`p-<kind>-<uuid>`), a parent id, one state machine
+  (`admitted → running → suspended → exited`), the owning workspace and profile
+  as queryable columns, a declared limit set, and a structured exit
+  (status/code/signal/reason). List it from the CLI with `monkey processes`
+  (`--kind`, `--all`, `--workspace`, `--parent`, `--json`), or `monkey
+  processes show <id>` for a process and its descendants. Named `processes`
+  because `monkey ps` is the Ollama-compatible "list running models".
+  Transitions are refused rather than silently applied, and both that rule and
+  "a row is `exited` if and only if it carries an exit status" are enforced in
+  Rust *and* by SQL triggers, because companion stores reach the shared ledger
+  connection directly. Stale records left by a killed app are reaped at
+  startup, scoped to the kinds the app owns so live daemon work is never
+  declared lost. Real limits: the table records what each kind reports, so a
+  declared memory or wall-clock limit is *not* enforced by any OS mechanism
+  yet; suspend/resume is only implemented by the daemon, so there is no
+  cross-kind signal command; a Crew member carries no edge to its coordinator
+  (actors initialize concurrently, coordinator last); and a retried daemon job
+  becomes a new process rather than inheriting the original's parent.
 - Approve, inspect, and replay from one place: the Agent Inbox and Run
   Dashboard put approvals from every source (desktop, daemon, remote
   controller) on a single screen with a per-run event timeline.

@@ -941,6 +941,7 @@ pub fn run() {
             process_commands::process_descendants,
             process_commands::process_live_counts,
             process_commands::process_admit,
+            process_commands::process_reconcile,
             process_commands::process_transition,
             process_commands::process_link_run,
             process_commands::process_reap_missing,

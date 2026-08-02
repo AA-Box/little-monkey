@@ -325,6 +325,96 @@ pub fn process_reap_missing(
     Ok(reaped)
 }
 
+/// Arguments for [`process_reconcile`].
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessReconcileArgs {
+    pub kind: String,
+    pub external_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub parent_kind: Option<String>,
+    #[serde(default)]
+    pub parent_external_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub exit_status: Option<String>,
+    #[serde(default)]
+    pub exit_reason: Option<String>,
+}
+
+/// Idempotent projection from the frontend.
+///
+/// Differs from [`process_admit`] in exactly the way that matters for a caller
+/// that may not be first: admitting twice is an error (so a surface cannot fork
+/// its own record), while reconciling twice is a no-op. A desktop turn routed to
+/// the resident runner uses this to create the daemon job's record with the turn
+/// as its parent — the daemon's own per-tick reconcile then finds that record and
+/// only moves its state, which is how the parent edge survives crossing the
+/// process boundary.
+#[tauri::command]
+pub fn process_reconcile(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    args: ProcessReconcileArgs,
+) -> Result<ProcessRecord, String> {
+    let kind = ProcessKind::parse(&args.kind).map_err(to_message)?;
+    let target = ProcessState::parse(&args.state).map_err(to_message)?;
+    let exit = match args.exit_status.as_deref() {
+        Some(raw) => Some(ProcessExit {
+            status: crate::process_table::ExitStatus::parse(raw).map_err(to_message)?,
+            code: None,
+            signal: None,
+            reason: args.exit_reason,
+        }),
+        None => None,
+    };
+    let parent = match (args.parent_kind.as_deref(), args.parent_external_id) {
+        (Some(raw), Some(external)) => {
+            Some((ProcessKind::parse(raw).map_err(to_message)?, external))
+        }
+        (None, Some(external)) => Some((ProcessKind::ChatTurn, external)),
+        _ => None,
+    };
+
+    let mut projection =
+        crate::process_table::ProcessProjection::new(kind, args.external_id, target);
+    projection.parent = parent;
+    projection.exit = exit;
+    projection.run_id = args.run_id;
+    projection.workspace = args.workspace;
+    projection.profile = args.profile;
+
+    let now = crate::run_commands::unix_time_ms()? as i64;
+    let record = with_process_table(&app, state.inner(), |table| {
+        table.reconcile(&projection, now).map(|(record, _)| record)
+    })?;
+    notify(&app, &record);
+    Ok(record)
+}
+
+/// Applies a projection through the shared reconcile, for native adopters that
+/// already hold an `AppHandle` and `AppState`.
+///
+/// The Tauri-side counterpart to `LedgerProcessProjector`: that one owns a path
+/// and its own connection, which is right for a service with no app handle;
+/// this one reuses the pooled ledger the rest of the app is already using.
+pub(crate) fn project_process_record<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    projection: &crate::process_table::ProcessProjection,
+) -> Result<(), String> {
+    let now = crate::run_commands::unix_time_ms()? as i64;
+    with_process_table(app, state, |table| {
+        table.reconcile(projection, now).map(|_| ())
+    })
+}
+
 /// Reaps desktop-owned processes at app startup.
 ///
 /// Called from `lib.rs`'s `setup` rather than from the frontend so it runs once

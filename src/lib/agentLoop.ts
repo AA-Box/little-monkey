@@ -67,7 +67,7 @@ import { usePermissionStore, type PermissionMode } from '../store/permissionStor
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
-import { admitProcess, exitProcess, exitStatusFor, markProcessRunning } from './processTable';
+import { admitProcess, exitProcess, exitStatusFor, markProcessRunning, reconcileProcess } from './processTable';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
   gatePrivacyWireMessages,
@@ -1902,6 +1902,17 @@ async function runDaemonAgentTurn(
     attachments: frozenAttachments,
   });
   const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  // Create the daemon job's process record here, with this turn as its parent.
+  // The daemon's own per-tick reconcile then finds this record and only moves
+  // its state, which is how the lineage edge survives crossing the process
+  // boundary — the daemon has no way to know which turn queued a job.
+  void reconcileProcess({
+    kind: 'daemon_job',
+    externalId: queued.job_id,
+    state: 'admitted',
+    parentKind: 'chat_turn',
+    parentExternalId: turnId,
+  });
   if (resolvedTarget.kind === 'provider') {
     recordRequest(resolvedTarget.providerId);
   }

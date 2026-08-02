@@ -2074,6 +2074,48 @@ mod tests {
         assert_eq!(updated.native_pid, Some(4321));
     }
 
+    /// Names the code that creates records for each kind.
+    ///
+    /// Exhaustive by construction: adding a [`ProcessKind`] variant fails to
+    /// compile until its adopter is named here. That is the closest this can get
+    /// to the acceptance criterion "a run that exists without a process record
+    /// is a bug" — it cannot catch a *new execution path* that reuses an
+    /// existing kind and forgets to project, which is stated as a remaining gap
+    /// in `docs/agent-os-roadmap.md` rather than pretended away.
+    fn adopter_for(kind: ProcessKind) -> &'static str {
+        match kind {
+            ProcessKind::ChatTurn => "src/lib/agentLoop.ts — runAgentTurn",
+            ProcessKind::DaemonJob => {
+                "bin/monkey-cli/daemon/engine.rs — sync_process_table, once per tick"
+            }
+            ProcessKind::Subagent => "src/lib/subagent.ts — runSubagentTask",
+            ProcessKind::CrewMember => "src/lib/crewRunner.ts — initializeActorRecorders",
+            ProcessKind::WorkflowRun => "m4_services.rs — WorkflowService::append_history",
+            ProcessKind::WorkflowNode => "m4_services.rs — WorkflowService::append_history",
+            ProcessKind::RemoteRun => "bin/monkey-cli/daemon/mod.rs — project_queue_origin",
+            ProcessKind::BackgroundShell => "background_shell.rs — emit_status",
+            ProcessKind::SideTask => "src/lib/sideTaskRunner.ts — runSideTask",
+        }
+    }
+
+    #[test]
+    fn every_kind_has_a_named_adopter() {
+        for kind in ProcessKind::ALL {
+            let adopter = adopter_for(*kind);
+            assert!(
+                !adopter.is_empty(),
+                "{} has no adopter named",
+                kind.as_str()
+            );
+        }
+        // `ALL` must itself be exhaustive, or the loop above proves nothing.
+        assert_eq!(
+            ProcessKind::ALL.len(),
+            9,
+            "ProcessKind::ALL is out of sync with the enum"
+        );
+    }
+
     #[test]
     fn the_transition_table_matches_the_documented_state_machine() {
         use ProcessState::*;
