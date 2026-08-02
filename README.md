@@ -178,10 +178,30 @@ a scope boundary stated where it matters.
   startup, scoped to the kinds the app owns so live daemon work is never
   declared lost. Real limits: the table records what each kind reports, so a
   declared memory or wall-clock limit is *not* enforced by any OS mechanism
-  yet; suspend/resume is only implemented by the daemon, so there is no
-  cross-kind signal command; a Crew member carries no edge to its coordinator
-  (actors initialize concurrently, coordinator last); and a retried daemon job
-  becomes a new process rather than inheriting the original's parent.
+  yet; a Crew member carries no edge to its coordinator (actors initialize
+  concurrently, coordinator last); and a retried daemon job becomes a new
+  process rather than inheriting the original's parent.
+- Stop or suspend anything from anywhere, including a terminal. `monkey
+  processes signal <id> stop|suspend|resume|kill` (and `monkey processes
+  signals` for the support matrix) records the request as durable intent on the
+  process row rather than in a live handle, which is what lets it reach work
+  this app is not running and survive a restart. A kind that cannot honour a
+  signal **refuses it with the reason** instead of appearing to succeed — `kill`
+  where the app owns no OS process, `suspend` where a loop has no pause point.
+  Delivery is per-owner: the daemon reads the latch once per tick and maps it
+  onto its own cancel/pause, and the desktop reads it through the
+  `processes://changed` event plus a 2s catch-up query (the CLI writes from a
+  different OS process and cannot emit an event), then hands it to the primitive
+  that kind already had — a chat turn's and Crew member's registered
+  `AbortController`, a subagent's or side task's own cancel, the commands
+  `background_shell_kill` and `m4_workflows_cancel`.
+  Real limits: `stop` and `kill` share one latch
+  column, so a reader cannot tell them apart (honest only while every kind that
+  honours `kill` delivers both identically); a workflow run started elsewhere
+  still cannot be cancelled, because `WorkflowService` resolves runs from an
+  in-memory registry; a workflow *node* has no cancellation of its own; pause
+  exists for side tasks only, and no paused work survives a restart — durable
+  intent does, durable execution does not, since these loops live in the WebView.
 - Approve, inspect, and replay from one place: the Agent Inbox and Run
   Dashboard put approvals from every source (desktop, daemon, remote
   controller) on a single screen with a per-run event timeline.
