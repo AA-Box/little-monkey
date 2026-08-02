@@ -226,27 +226,44 @@ const controllers = new Map<string, AbortController>();
  * effect at the next safe checkpoint, never mid-stream" posture the rest of
  * the app's cancellation already has (see `turnEngine.ts`'s
  * `executeToolCall` abort race) — pause is the same idea, just resumable
- * instead of terminal. */
-export function waitUntilResumed(taskId: string, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const stillPaused = () => useSideTaskStore.getState().tasks[taskId]?.status === 'paused';
-    if (signal.aborted || !stillPaused()) {
-      resolve();
-      return;
-    }
-    const unsubscribe = useSideTaskStore.subscribe(() => {
+ * instead of terminal.
+ *
+ * `processId` is optional (and may be a promise, since admission is
+ * fire-and-forget) so the process table's `state` stays honest around the
+ * wait — `suspended` only once actually parked here, `running` again only
+ * once actually resumed — instead of sitting at `running` forever while
+ * `signalIntent.suspendRequested` is latched, which was the gap between this
+ * kind's local `paused` status and the durable, cross-process signal. */
+export function waitUntilResumed(
+  taskId: string,
+  signal: AbortSignal,
+  processId?: string | null | Promise<string | null>,
+): Promise<void> {
+  const stillPaused = () => useSideTaskStore.getState().tasks[taskId]?.status === 'paused';
+  if (signal.aborted || !stillPaused()) return Promise.resolve();
+  return (async () => {
+    const id = processId != null ? await processId : null;
+    if (id) await markProcessSuspended(id);
+    await new Promise<void>((resolve) => {
       if (signal.aborted || !stillPaused()) {
-        unsubscribe();
-        signal.removeEventListener('abort', onAbort);
         resolve();
+        return;
       }
+      const unsubscribe = useSideTaskStore.subscribe(() => {
+        if (signal.aborted || !stillPaused()) {
+          unsubscribe();
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        }
+      });
+      const onAbort = () => {
+        unsubscribe();
+        resolve();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
     });
-    const onAbort = () => {
-      unsubscribe();
-      resolve();
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
+    if (id && !signal.aborted) await markProcessRunning(id);
+  })();
 }
 
 /** Cancels a side task's in-flight (or paused) attempt: aborts this
@@ -443,7 +460,7 @@ export async function runSideTask(taskId: string): Promise<void> {
     let messages: ChatMessage[] = initialTask.messages;
 
     for (let iteration = 0; iteration < MAX_SIDE_TASK_ITERATIONS; iteration++) {
-      await waitUntilResumed(taskId, controller.signal);
+      await waitUntilResumed(taskId, controller.signal, processIdPromise);
       if (controller.signal.aborted) return finishTerminal('cancelled', null, null);
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
@@ -476,7 +493,7 @@ export async function runSideTask(taskId: string): Promise<void> {
       useSideTaskStore.getState().appendMessage(taskId, assistantMessage);
 
       for (const toolCall of attempt.toolCalls) {
-        await waitUntilResumed(taskId, controller.signal);
+        await waitUntilResumed(taskId, controller.signal, processIdPromise);
         const aborted = controller.signal.aborted;
 
         useSideTaskStore.getState().recordToolProposed(taskId, {

@@ -203,8 +203,13 @@ fn append_bounded(buffer: &mut String, chunk: &str, truncated: &mut bool) -> usi
     cut
 }
 
-fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView) {
-    project_process(app, &view);
+/// `native_pid` is only ever `Some` at the spawn call site — every later
+/// status change (exit, kill, error) passes `None`, which `ProcessTable`'s
+/// reconcile treats as "leave whatever was already recorded alone" rather
+/// than clearing it (see `process_table.rs`'s `reconcile`: it writes
+/// `native_pid` only when the projection supplies `Some`).
+fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView, native_pid: Option<i64>) {
+    project_process(app, &view, native_pid);
     let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
 }
 
@@ -216,7 +221,7 @@ fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView) {
 ///
 /// Fail-soft, like every other adopter: a shell must not fail to report its
 /// status because a bookkeeping row could not be written.
-fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView) {
+fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pid: Option<i64>) {
     use crate::process_table::{
         ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
     };
@@ -256,7 +261,8 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView) {
 
     let mut projection =
         ProcessProjection::new(ProcessKind::BackgroundShell, view.id.clone(), state)
-            .with_workspace(Some(view.cwd.clone()));
+            .with_workspace(Some(view.cwd.clone()))
+            .with_native_pid(native_pid);
     projection.exit = exit;
 
     let state_handle = app.state::<crate::AppState>();
@@ -267,6 +273,54 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView) {
     ) {
         eprintln!("background shell: could not project {}: {error}", view.id);
     }
+}
+
+/// Delivers a real OS suspend/resume to a background shell's child,
+/// immediately — there is no safe point to wait for; the process either can
+/// be paused right now or it can't, unlike the cooperative kinds that check a
+/// latch at their own round boundary. Reflects the outcome directly in the
+/// process table's `state` rather than leaving it at "signal recorded" for
+/// some later poll to notice, since delivery here is synchronous with the
+/// caller.
+///
+/// Fail-soft only at the OS layer: if the child can no longer be found (it
+/// already exited, or this app instance never held it — e.g. after a
+/// restart, since `BackgroundShell` is desktop-owned and reaped at startup),
+/// the durable latch `ProcessTable::signal` already wrote is left as-is and
+/// this returns the record unchanged; a later reap resolves it honestly
+/// rather than this call guessing an outcome.
+pub(crate) fn deliver_os_signal<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    record: &crate::process_table::ProcessRecord,
+    signal: crate::process_table::ProcessSignal,
+) -> Result<crate::process_table::ProcessRecord, String> {
+    use crate::process_table::{ProcessSignal, ProcessState};
+
+    let Ok(process) = state.background_shell.get(&record.external_id) else {
+        return Ok(record.clone());
+    };
+    let Ok(child) = lock(&process.child) else {
+        return Ok(record.clone());
+    };
+    let pid = child.id();
+    drop(child);
+
+    match signal {
+        ProcessSignal::Suspend => crate::os_signal::suspend_process_group(pid)?,
+        ProcessSignal::Resume => crate::os_signal::resume_process_group(pid)?,
+        _ => return Ok(record.clone()),
+    }
+
+    let next_state = if signal == ProcessSignal::Suspend {
+        ProcessState::Suspended
+    } else {
+        ProcessState::Running
+    };
+    let now = crate::run_commands::unix_time_ms()? as i64;
+    crate::process_commands::with_process_table(app, state, |table| {
+        table.transition(&record.process_id, next_state, None, now)
+    })
 }
 
 /// Streams one of the child's pipes into the shared bounded tail, emitting
@@ -353,7 +407,7 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
                         view.exit_code = status.code();
                         view.finished_at_ms = now_ms().ok();
                     }
-                    emit_status(&app, view.clone());
+                    emit_status(&app, view.clone(), None);
                 }
                 break;
             }
@@ -366,7 +420,7 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
                         view.output_truncated = truncated;
                         view.finished_at_ms = now_ms().ok();
                     }
-                    emit_status(&app, view.clone());
+                    emit_status(&app, view.clone(), None);
                 }
                 break;
             }
@@ -431,15 +485,27 @@ pub async fn tool_run_shell_background(
     #[cfg(not(target_os = "windows"))]
     let (shell, shell_flag) = ("sh", "-c");
 
-    let mut child = Command::new(shell)
+    let mut command_builder = Command::new(shell);
+    command_builder
         .arg(shell_flag)
         .arg(&command)
         .current_dir(&cwd_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group, so a later suspend/resume/kill-by-group
+    // (`os_signal::suspend_process_group` et al.) targets exactly this
+    // command's tree rather than whatever group this app itself runs in —
+    // mirrors the daemon's own job spawn (`daemon/engine.rs`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command_builder.process_group(0);
+    }
+    let mut child = command_builder
         .spawn()
         .map_err(|error| format!("Failed to spawn shell: {error}"))?;
+    let native_pid = i64::try_from(child.id()).ok();
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -471,7 +537,7 @@ pub async fn tool_run_shell_background(
         spawn_reader(app.clone(), process.clone(), stderr);
     }
     spawn_exit_watcher(app.clone(), process);
-    emit_status(&app, view.clone());
+    emit_status(&app, view.clone(), native_pid);
     Ok(view)
 }
 
@@ -548,7 +614,7 @@ pub fn background_shell_kill(
         view.finished_at_ms = now_ms().ok();
         view.clone()
     };
-    emit_status(&app, view.clone());
+    emit_status(&app, view.clone(), None);
     Ok(view)
 }
 
@@ -597,5 +663,101 @@ mod tests {
         let pieces = split_event_chunks(&chunk);
         assert!(pieces.len() > 1);
         assert_eq!(pieces.concat(), chunk);
+    }
+
+    #[cfg(unix)]
+    fn process_state(pid: u32) -> String {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// End-to-end through the same path `process_signal` drives: a real
+    /// spawned child registered in `BackgroundShellManager`, a matching
+    /// process-table row admitted and moved to `Running` (mirroring the real
+    /// spawn -> `markProcessRunning` sequence), then `deliver_os_signal`
+    /// itself. Proves the whole plumbing — manager lookup, real SIGSTOP/
+    /// SIGCONT, and the process-table state transition — not just the bare
+    /// primitive (see `os_signal.rs`'s own test for that).
+    #[cfg(unix)]
+    #[test]
+    fn deliver_os_signal_suspends_and_resumes_the_real_child_and_updates_the_process_table() {
+        use crate::process_table::{AdmitProcess, ProcessKind, ProcessSignal, ProcessState};
+        use crate::run_ledger::RunLedger;
+        use std::os::unix::process::CommandExt;
+
+        let state = AppState::default();
+        // Pre-seed an in-memory ledger so `with_ledger` never resolves
+        // `mock_app()`'s real (unscoped) app-data directory on disk.
+        *state.run_ledger.lock().unwrap() = Some(RunLedger::open_in_memory().unwrap());
+        let handle = tauri::test::mock_app().handle().clone();
+
+        let shell_id = "bg-signal-test".to_string();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let view = BackgroundShellView {
+            id: shell_id.clone(),
+            command: "sleep 30".to_string(),
+            cwd: "/".to_string(),
+            status: BackgroundShellStatus::Running,
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            started_at_ms: 0,
+            finished_at_ms: None,
+        };
+        state
+            .background_shell
+            .insert(
+                shell_id.clone(),
+                Arc::new(BackgroundProcess {
+                    view: Mutex::new(view),
+                    child: Mutex::new(child),
+                    read_cursor: Mutex::new(0),
+                }),
+            )
+            .unwrap();
+
+        let record = crate::process_commands::with_process_table(&handle, &state, |table| {
+            table.admit(&AdmitProcess::new(ProcessKind::BackgroundShell, shell_id.clone()), 1_000)
+        })
+        .unwrap();
+        let record = crate::process_commands::with_process_table(&handle, &state, |table| {
+            table.transition(&record.process_id, ProcessState::Running, None, 1_001)
+        })
+        .unwrap();
+
+        let suspended = deliver_os_signal(&handle, &state, &record, ProcessSignal::Suspend)
+            .expect("suspend delivers");
+        assert_eq!(suspended.state, ProcessState::Suspended);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            process_state(pid).starts_with('T'),
+            "expected the real child to be OS-stopped, got {:?}",
+            process_state(pid)
+        );
+
+        let resumed = deliver_os_signal(&handle, &state, &suspended, ProcessSignal::Resume)
+            .expect("resume delivers");
+        assert_eq!(resumed.state, ProcessState::Running);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !process_state(pid).starts_with('T'),
+            "expected the real child to be running again, got {:?}",
+            process_state(pid)
+        );
+
+        let _ = state.background_shell.get(&shell_id).unwrap().child.lock().unwrap().kill();
     }
 }

@@ -29,6 +29,7 @@ import type { ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
 import { useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, markProcessRunning } from './processTable';
+import { honourPause, forgetPause } from './pauseRegistry';
 import { useSubagentStore } from '../store/subagentStore';
 import { useSessionStore } from '../store/sessionStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -338,6 +339,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
    * after a restart wipes the transient store. */
   const finish = (status: 'done' | 'error' | 'cancelled', result: string): string => {
     activeSubagentControllers.delete(taskId);
+    forgetPause(taskId);
     const live = useSubagentStore.getState().runs[storeKey];
     useSubagentStore.getState().finish(storeKey, status);
     useSessionStore.getState().setSubagentRun(
@@ -386,6 +388,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
     const resolvedTarget = resolveSubagentTarget(target, profile);
 
     for (let iteration = 0; iteration < MAX_SUBAGENT_ITERATIONS; iteration++) {
+      await honourPause(taskId, processIdPromise, signal);
       if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
 
       const wireHistory: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...messages];
@@ -516,6 +519,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         }
       }
 
+      await honourPause(taskId, processIdPromise, signal);
       if (signal.aborted) return finish('cancelled', CANCELLED_TOOL_RESULT);
       // Loop again: the child model gets its own tool results appended.
     }
