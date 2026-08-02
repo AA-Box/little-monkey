@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,12 +63,9 @@ const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResponseBody = BoxBody<Bytes, BoxError>;
 
-#[derive(Default)]
-struct ServerCounters {
-    request_count: AtomicU64,
-    active_requests: AtomicUsize,
-    last_request_at_ms: AtomicU64,
-}
+/// Re-exported from `http_policy` so both listeners share one implementation of
+/// the permit/counter/cancellation bookkeeping.
+use crate::http_policy::{AdmissionGuard, ServerCounters};
 
 struct ServerInner {
     status: String,
@@ -471,10 +468,11 @@ pub async fn m3_http_server_store_tls_identity(
     .map_err(|error| format!("M3 TLS keychain task failed: {error}"))?
 }
 
+/// m3's request guard: the shared [`AdmissionGuard`] plus this listener's own
+/// operation contract. The permit, counters and cancellation bookkeeping are the
+/// shared implementation; only `context()` is m3-specific.
 struct RequestGuard {
-    cancellation: CancellationToken,
-    counters: Arc<ServerCounters>,
-    _permit: OwnedSemaphorePermit,
+    inner: AdmissionGuard,
 }
 
 impl RequestGuard {
@@ -483,32 +481,16 @@ impl RequestGuard {
         permit: OwnedSemaphorePermit,
         server_shutdown: &CancellationToken,
     ) -> Self {
-        counters.active_requests.fetch_add(1, Ordering::Relaxed);
         Self {
-            cancellation: server_shutdown.child_token(),
-            counters,
-            _permit: permit,
+            inner: AdmissionGuard::new(counters, permit, server_shutdown),
         }
     }
 
     fn context(&self) -> M3OperationContext {
         M3OperationContext {
-            cancellation: self.cancellation.clone(),
+            cancellation: self.inner.cancellation(),
             timeout_ms: REQUEST_TIMEOUT_MS,
         }
-    }
-}
-
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        self.counters
-            .active_requests
-            .fetch_sub(1, Ordering::Relaxed);
-        self.counters.request_count.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .last_request_at_ms
-            .store(now_ms(), Ordering::Relaxed);
     }
 }
 

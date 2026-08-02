@@ -15,6 +15,11 @@
 //! reason.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 /// The port both listeners default to.
 ///
@@ -24,6 +29,12 @@ use std::io;
 /// HTML — see `local_apps.rs`), so this records the overlap rather than
 /// silently resolving it.
 pub const DEFAULT_HTTP_PORT: u16 = 1234;
+
+/// Maximum requests in flight per listener.
+///
+/// Shared so both listeners are bounded by the same number rather than one being
+/// bounded and the other unbounded — which is what they were.
+pub const MAX_ACTIVE_REQUESTS: usize = 64;
 
 /// Which listener is reporting a bind failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +109,110 @@ pub fn describe_bind_error(
     )
 }
 
+/// Live request counters for one listener.
+#[derive(Default)]
+pub struct ServerCounters {
+    pub request_count: AtomicU64,
+    pub active_requests: AtomicUsize,
+    pub last_request_at_ms: AtomicU64,
+}
+
+/// Held for the lifetime of one in-flight request.
+///
+/// Owns three things a route must not be able to skip: the concurrency permit
+/// (so the listener has a bounded number of requests in flight), the active/total
+/// counters, and a per-request [`CancellationToken`] derived from the server's
+/// shutdown token — so work started on behalf of a client that went away, or a
+/// server that is stopping, is actually cancelled rather than left running.
+///
+/// Shared between both listeners deliberately. `server.rs` had none of this: its
+/// accept loop spawned an unbounded task per connection with no permit, no
+/// counters, and no cancellation reaching its upstream `reqwest` calls, which is
+/// exactly the D1 finding that a route can bypass admission control — and the
+/// reason K4 and K5 were blocked on it.
+pub struct AdmissionGuard {
+    cancellation: CancellationToken,
+    counters: Arc<ServerCounters>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AdmissionGuard {
+    pub fn new(
+        counters: Arc<ServerCounters>,
+        permit: OwnedSemaphorePermit,
+        server_shutdown: &CancellationToken,
+    ) -> Self {
+        counters.active_requests.fetch_add(1, Ordering::Relaxed);
+        Self {
+            cancellation: server_shutdown.child_token(),
+            counters,
+            _permit: permit,
+        }
+    }
+
+    /// This request's cancellation token. Cancelled when the guard drops, and
+    /// when the server's shutdown token fires.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.counters.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.counters.request_count.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_request_at_ms
+            .store(unix_time_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Bounded admission for one listener: a permit pool plus the counters.
+pub struct RequestAdmission {
+    limit: Arc<Semaphore>,
+    counters: Arc<ServerCounters>,
+}
+
+impl RequestAdmission {
+    pub fn new(max_concurrent: usize) -> Self {
+        RequestAdmission {
+            limit: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            counters: Arc::new(ServerCounters::default()),
+        }
+    }
+
+    /// Admits a request, or `None` when the quota is exhausted — the caller then
+    /// owes the client a 503 rather than queueing without bound.
+    pub fn try_admit(&self, server_shutdown: &CancellationToken) -> Option<AdmissionGuard> {
+        let permit = self.limit.clone().try_acquire_owned().ok()?;
+        Some(AdmissionGuard::new(
+            self.counters.clone(),
+            permit,
+            server_shutdown,
+        ))
+    }
+
+    pub fn counters(&self) -> Arc<ServerCounters> {
+        self.counters.clone()
+    }
+
+    pub fn active_requests(&self) -> usize {
+        self.counters.active_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn request_count(&self) -> u64 {
+        self.counters.request_count.load(Ordering::Relaxed)
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn capitalize(value: &str) -> String {
     let mut chars = value.chars();
     match chars.next() {
@@ -159,6 +274,67 @@ mod tests {
         assert!(message.contains("8123"), "{message}");
         assert!(!message.contains("defaults to this port too"), "{message}");
         assert!(message.contains("Choose a different port"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn admission_bounds_concurrency_and_returns_the_permit_on_drop() {
+        let admission = RequestAdmission::new(2);
+        let shutdown = CancellationToken::new();
+
+        let first = admission.try_admit(&shutdown).expect("first admits");
+        let second = admission.try_admit(&shutdown).expect("second admits");
+        assert_eq!(admission.active_requests(), 2);
+        assert!(
+            admission.try_admit(&shutdown).is_none(),
+            "a third request must be refused, not queued without bound"
+        );
+
+        drop(first);
+        assert_eq!(admission.active_requests(), 1);
+        assert_eq!(admission.request_count(), 1, "a completed request is counted");
+        admission
+            .try_admit(&shutdown)
+            .expect("a freed permit admits again");
+
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn a_guard_cancels_its_request_when_dropped() {
+        // What makes an abandoned client actually stop upstream work.
+        let admission = RequestAdmission::new(1);
+        let shutdown = CancellationToken::new();
+        let guard = admission.try_admit(&shutdown).expect("admits");
+        let token = guard.cancellation();
+        assert!(!token.is_cancelled());
+        drop(guard);
+        assert!(token.is_cancelled(), "dropping the guard must cancel the request");
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_cancels_every_in_flight_request() {
+        let admission = RequestAdmission::new(4);
+        let shutdown = CancellationToken::new();
+        let one = admission.try_admit(&shutdown).expect("admits");
+        let two = admission.try_admit(&shutdown).expect("admits");
+        let tokens = [one.cancellation(), two.cancellation()];
+
+        shutdown.cancel();
+        for token in &tokens {
+            assert!(
+                token.is_cancelled(),
+                "stopping the server must cancel work already in flight"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_limit_still_admits_one_request() {
+        // A misconfigured zero would otherwise wedge the listener into refusing
+        // everything, which is worse than ignoring the value.
+        let admission = RequestAdmission::new(0);
+        let shutdown = CancellationToken::new();
+        assert!(admission.try_admit(&shutdown).is_some());
     }
 
     #[test]

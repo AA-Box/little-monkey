@@ -58,30 +58,113 @@ graph LR
 Not features. Each one means a kernel change has to be made twice, or can be
 made once and silently not take effect.
 
-## D1. One HTTP server
+## D1. One HTTP server *(partially built)*
 
 **Today:** `server.rs` (~4.6k lines, legacy proxy) and `m3_http_server.rs`
-(~2.1k) both serve live requests. `m3_http_server.rs` has the request
-semaphore; `server.rs` does not share it.
+(~2.1k) both still serve live requests.
 
-**Acceptance:** a single server owns every route. Admission control, rate
-limits, auth, CORS, and per-run resource limits are expressed once, and a
-route cannot exist that bypasses them. Deleting the other server is part of
-the acceptance, not a follow-up.
+**Shipped:** `http_policy.rs`, the shared module both listeners now draw from.
 
-**Blocks:** K4, K5, K7 — a resource limit that only one of two servers honors
-is not a limit.
+- **Admission control covers both listeners.** `AdmissionGuard` /
+  `RequestAdmission` own the concurrency permit, the in-flight and total
+  counters, and a per-request cancellation token derived from the server's
+  shutdown token. `server.rs`'s accept loop previously spawned an unbounded
+  task per connection with none of that; it now refuses past
+  `MAX_ACTIVE_REQUESTS` with a 503 in the legacy OpenAI error envelope rather
+  than queueing without bound. `m3_http_server.rs`'s `RequestGuard` is now a
+  thin wrapper over the same guard, so the bookkeeping has one implementation
+  rather than two. **This is the half of the acceptance that unblocks K4 and
+  K5** — a route on either listener can no longer bypass admission control.
+- **The port collision is diagnosable.** Both default to 1234, both bind
+  loopback, and both autostart independently from `setup` with no ordering and
+  no cross-check, so a user with `autostart` on *and* a persisted LAN policy has
+  two tasks racing for one socket. The shared `DEFAULT_HTTP_PORT` states the
+  overlap instead of it being a coincidence between two unrelated constants, and
+  a bind failure on that port now names the other listener and the panel that
+  fixes it. On a custom port, or any non-`AddrInUse` error, it reports what the
+  OS said rather than guessing.
+
+**Remaining — and why it is not one more coding session.** Three parts of this
+merge are blocked on decisions or on a release cycle, not on effort:
+
+- **Token unification cannot be a cutover.** Legacy tokens are `lmk-` + 32 hex;
+  the pairing store's are `lmk-lan-` + 64 hex and shape-checked, so it rejects a
+  legacy token before any lookup. Plaintexts are unrecoverable — only digests
+  reach disk — and `mint_local_app_token` tokens are **already baked into
+  published Local App HTML on users' machines**. The only safe path is: accept
+  both (pairing store first, legacy digest list as fallback, rate limiter on
+  both), deprecate the legacy mint flow in the UI, then delete the legacy branch
+  *a release later*. That last step is a calendar dependency.
+- **Model-id resolution is mutually exclusive.** `server.rs` treats any unknown
+  non-empty model id as an Ollama tag; m3 404s unless the model is installed or
+  an explicit runtime header is present. Both cannot hold for the same
+  `/v1/models` + `/v1/chat/completions` path. Someone has to pick and document
+  the break.
+- **Byte-level compatibility is load-bearing.** `Access-Control-Allow-Origin: *`
+  on every legacy response versus m3's deny-all default; `/health` returning
+  exactly `{"status":"ok"}`; the OpenAI error envelope real SDKs branch on;
+  `owned_by` values clients filter on; raw SSE passthrough versus m3's re-framed
+  frames; `OPTIONS` on `/v1/*` returning 204. A naive merge turns every
+  browser-based client into a 403. This needs the byte-level harness for the
+  legacy routes that does not exist yet — the one thing that would make the rest
+  of the merge safe to attempt.
+
+Also still open: `monkey-cli api-serve` is deliberately `AppHandle`-free while
+the merged server needs an `M3RuntimeHub` that today only exists under Tauri;
+and the five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
+`/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`, `/local-apps/{id}`) need m3's
+exact-match allowlist to grow a prefix tier without weakening the invariant
+`route_allowlist_never_exposes_agent_or_workspace_tools` asserts.
+
+**Blocks:** K7 still. K4 and K5 are unblocked by the admission work above.
 
 *Maps to: ROADMAP #9.*
 
-## D2. One knowledge index
+## D2. One knowledge index *(partially built)*
 
-**Today:** `stacks.rs` v1 (15 commands, still invoked) runs alongside
-Knowledge 2.0 (`knowledge_v*`).
+**Today:** `stacks.rs` v1 (11 commands, still invoked) runs alongside
+Knowledge 2.0 (16 `knowledge_v*` commands in `knowledge_service.rs`).
 
-**Acceptance:** one retrieval path. A user's results do not depend on which
-era their stack was created in, and a retrieval policy change cannot land in
-one path only.
+**Shipped — the divergence no longer produces wrong answers:**
+
+- **v1 and v2 scores are no longer compared.** `stacks_query` and
+  `tool_search_docs` concatenated hits from both and sorted by `score`. A v1
+  score is a cosine similarity (~0.8); a v2 score is reciprocal-rank fusion
+  (~0.016 for a rank-1 hit). Sorting them together ranked one index above the
+  other by an artefact of its scoring function, so v1 hits always won.
+  `merge_stack_results` now preserves each stack's own ordering and interleaves
+  round-robin, so neither index is starved and no cross-family comparison
+  happens.
+- **The agent and the inspector agree.** `query_for_agent` ran with no
+  reranker while `knowledge_v2_query` used `LocalOverlapReranker`, so the agent
+  and the panel's own "test search" box returned differently-ordered results for
+  the same query against the same index — and the panel was the one telling the
+  truth. It also minted its own `CancellationToken`, so a stopped turn left a
+  reranker and a vector scan running; the caller's token is threaded through now.
+- **v2-only stacks are no longer reported as corrupt.** `audit_knowledge_index`
+  flagged any stack with `indexed_at` set and no v1 `chunks.jsonl`/`vectors.bin`
+  as Critical. `mark_v2_indexed_impl` sets `indexed_at` too, so *every* v2-only
+  stack was permanently Critical — and the "safe fix" it offered then failed with
+  "No indexable files found", because a v2 stack has no v1 sources to walk. A
+  user had no way to clear it. The audit asks both stores now.
+
+**Remaining.** The collapse itself, whose load-bearing step is a **data
+migration over users' existing embedded vectors**:
+
+- Extract the shared registry and embedding core out of `stacks.rs` (pure moves,
+  ~9 call sites).
+- Port the two v1-only capabilities v2 lacks: source staleness, and the
+  query-path hot cache that keeps the test-search box at keystroke latency.
+- **Synthesize a v2 generation from each v1 index without re-embedding.**
+  Feasible — `vectors.bin` rows are already L2-normalized f32 at the stack's
+  dimension, `ChunkMeta` supplies text/heading/path/hash, and `file_index.json`
+  supplies per-file SHA-256 — but it has to satisfy `validate_chunk` and
+  `validate_generation_contents` exactly, and set a `"v1-import"`
+  `pipeline_fingerprint` sentinel so the first real refresh cleanly re-extracts
+  with true v2 chunk boundaries. Imported chunks are a bridge, not a permanent
+  lie. Alternative is forcing every user to re-embed their whole corpus.
+- Then route every read through v2, delete the v1 index, and collapse the two
+  panels.
 
 **Blocks:** K11 — context accounting cannot be honest while two systems
 produce context by different rules.
