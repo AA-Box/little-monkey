@@ -1,14 +1,16 @@
 //! IPC surface over [`crate::process_table`].
 //!
 //! Thin by design, matching `run_commands.rs`: every rule lives in the core
-//! module so the CLI (`monkey ps`) and the daemon reach the same
+//! module so the CLI (`monkey processes`) and the daemon reach the same
 //! implementation without going through Tauri.
 //!
-//! Note what is deliberately absent: there is no `process_signal` command yet.
-//! Suspending and resuming a process is K2 in `docs/agent-os-roadmap.md`, and
-//! only the daemon can actually do it today — exposing a signal command that
-//! silently did nothing for four of the nine kinds would be worse than not
-//! having one.
+//! `process_signal` records durable intent rather than delivering it, and
+//! `process_signal_support` exposes which kinds honour which signal so a caller
+//! can disable a control *with its reason* instead of offering a button that
+//! silently does nothing. Delivery belongs to the owning kind, which reads the
+//! latch at its own safe point — the daemon does this once per tick; the
+//! desktop-owned loops do not read it yet (see K2 in
+//! `docs/agent-os-roadmap.md`).
 
 use tauri::Emitter;
 

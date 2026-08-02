@@ -210,21 +210,62 @@ The honest state of delivery, which the matrix now states rather than implies:
 | chat turn, subagent, crew member | ✅ | refused | refused |
 | workflow run/node | ✅ | refused | refused |
 
+**Also shipped — the daemon honours the latch.** Its tick reads durable intent
+for every non-terminal job and translates it into the daemon's own
+`cancel_requested`/`pause_requested` bits, which `tick_active` already acts on. So
+`monkey processes signal`, another window, or a previous session can stop or
+suspend a live daemon job with no new IPC.
+
+The daemon store stays authoritative on purpose, and the reason is structural:
+`daemon_jobs` lives in `daemon-v1.sqlite3` and `agent_processes` in
+`profile-v1.sqlite3`, and ledger connections disable `ATTACH` outright, so no
+transaction, join, or compare-and-set spans the two — leaving both writable would
+be a two-writer race with no arbitration primitive. The ready-queue gate also
+filters on those bits in SQL *inside* the daemon's own database, which cannot
+reference a table in another file. Intent therefore flows one way, latch → daemon
+bits, and the daemon remains the single source of truth for what it will do.
+
+Two corrections that came out of building it: the intent read runs at the *top* of
+the tick, not with the projection at the end, or a latched stop waited a whole
+extra poll interval before anything happened; and `pending_signals` pushes its
+predicate into SQL rather than filtering a bounded `list`, which could otherwise
+hide a latched stop behind 5,000 quiet rows. State is the acknowledgement — a
+`suspend_requested` row already in `suspended` is not pending — mirroring the
+convention the daemon already used, so nothing re-delivers on an idle tick.
+
 **Remaining:**
 
+- **Desktop-owned loops do not read the latch yet.** The delivery design is
+  settled: latch as the durable record, the existing `processes://changed` event
+  as the fast path, and the loop's own `AbortController` as delivery — the same
+  shape `run_request_cancellation` already proved, so it is a fan-out table
+  rather than a second mechanism. No per-round polling. One caveat found while
+  designing it: `reap_desktop_processes_at_startup` already exits every live
+  desktop-owned row as `lost` before any window opens, so "a stop honoured after
+  a restart" is *moot* for those kinds rather than solved — the turn is already
+  gone. The startup pass matters only for daemon- and workflow-hosted work.
 - **Cooperative pause in the five loops.** A chat turn, subagent, crew member
   and workflow run would each yield at a round (or level) boundary. Feasible —
   between rounds a turn holds no open provider stream, so there is nothing to
   time out — with the caveat that pause latency is unbounded: a 20-minute
   `run_shell` call means pause lands in 20 minutes. Worth pairing with SIGSTOP of
   the child that tool spawned, and reporting `pause_pending` honestly meanwhile.
-- **Delivery for the refusals above**, which is what flips those cells.
-- **Workflow out-of-process cancel**, now that intent is durable: the executor
-  already observes cancellation at level boundaries, so it needs to read the
-  latch rather than an in-memory map. Workflow resume-by-replay is reachable too,
-  since replay-from-boundary already exists (`ReplayPlan`, `Reused`).
+- **Workflow out-of-process cancel.** Still the only surface that cannot be
+  cancelled from another process at all: `WorkflowService::cancel` returns `false`
+  when the run is absent from its in-memory registry. The executor already
+  observes cancellation at level boundaries, so it needs a read-side port
+  alongside the existing `ProcessProjector`. Note the daemon's own workflow-host
+  path is a *separate* read point from the job loop above and is not covered by
+  it.
 - **Expose `RemoteAction::Pause`** — the daemon supports it locally; the remote
-  protocol simply has no action for it.
+  protocol simply has no action for it. Also unverified: no adopter writes
+  `remote_run` rows yet, so that row of the support matrix is a claim about
+  intent rather than about shipped code.
+- **`kill` and `stop` are indistinguishable in the latch.** Both set
+  `stop_requested`; only the free-text reason survives. Honest today because the
+  only kinds honouring `kill` deliver both identically (the daemon maps each onto
+  `terminate_process_group`), but a UI offering two buttons would imply a
+  difference the schema cannot carry. Needs its own column before that happens.
 - **Declarative restart policy** (`never` / `on-failure` / bounded backoff) per
   kind, currently ad hoc per subsystem.
 - **A crash-injection test per surface**, which the acceptance names and nothing
