@@ -58,7 +58,12 @@ import {
 import { useSessionStore } from '../store/sessionStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { protectToolResult } from './untrustedContent';
-import { admitProcess, exitProcess, markProcessRunning } from './processTable';
+import {
+  admitProcess,
+  exitProcess,
+  markProcessRunning,
+  markProcessSuspended,
+} from './processTable';
 import { errorMessage } from "./errors";
 
 /** Hard cap on model/tool round trips for one side task attempt — same
@@ -256,12 +261,34 @@ export function cancelSideTask(taskId: string): void {
   controllers.get(taskId)?.abort();
 }
 
+/** Process-table ids for live attempts, keyed like `controllers`. Lets pause and
+ * resume project the state change, so the process table agrees with the store
+ * whichever way the pause arrived — the drawer's button or a delivered `suspend`
+ * signal (see `processSignalDelivery.ts`). Entries are removed on terminal. */
+const processIds = new Map<string, string>();
+
+/** Projects the store's *resulting* status, never the requested one.
+ *
+ * Both store actions are guarded no-ops — `pause` ignores a queued or terminal
+ * task, `resume` a task that is not paused — so projecting on request would make
+ * the process table claim a suspension that never happened, and leave the
+ * signal's latch acknowledged with nothing behind it. */
+function projectSideTaskStatus(taskId: string): void {
+  const processId = processIds.get(taskId);
+  if (!processId) return;
+  const status = useSideTaskStore.getState().tasks[taskId]?.status;
+  if (status === 'paused') void markProcessSuspended(processId);
+  else if (status === 'running') void markProcessRunning(processId);
+}
+
 export function pauseSideTask(taskId: string): void {
   useSideTaskStore.getState().pause(taskId);
+  projectSideTaskStatus(taskId);
 }
 
 export function resumeSideTask(taskId: string): void {
   useSideTaskStore.getState().resume(taskId);
+  projectSideTaskStatus(taskId);
 }
 
 /** Builds the "produced artifacts" list (acceptance criterion: outputs
@@ -342,7 +369,21 @@ export async function runSideTask(taskId: string): Promise<void> {
     externalId: taskId,
     profile: useSideTaskStore.getState().tasks[taskId]?.profile ?? null,
   }).then(async (id) => {
-    if (id) await markProcessRunning(id);
+    if (id) {
+      // `finishTerminal` may already have run — a task cancelled while the admit
+      // was still in flight — and it clears this map, so don't resurrect an entry
+      // it has cleaned up. `controllers` is the liveness test because it is set
+      // before the admit and cleared on the same terminal path.
+      if (controllers.has(taskId)) processIds.set(taskId, id);
+      await markProcessRunning(id);
+      // A pause that arrived while the admit was still in flight had no id to
+      // project with, so catch it here rather than leaving the record claiming to
+      // run — and leaving a delivered `suspend` unacknowledged, which would make
+      // every later sweep re-deliver it.
+      if (useSideTaskStore.getState().tasks[taskId]?.status === 'paused') {
+        projectSideTaskStatus(taskId);
+      }
+    }
     return id;
   });
 
@@ -356,6 +397,7 @@ export async function runSideTask(taskId: string): Promise<void> {
     if (task) store.setArtifacts(taskId, buildArtifacts(task.messages, mutatedPaths));
     store.finish(taskId, status, finalReport, error);
     controllers.delete(taskId);
+    processIds.delete(taskId);
     // Not awaited: this helper is synchronous and is the single terminal path
     // every outcome routes through, so blocking it on IPC would change the
     // loop's shape.

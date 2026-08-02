@@ -11,6 +11,10 @@
  * profile has no backend, and the loop it wraps still has to work there.
  */
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+/** Mirrors `process_commands.rs`'s `PROCESSES_CHANGED_EVENT`. */
+export const PROCESSES_CHANGED_EVENT = "processes://changed";
 
 export type ProcessKind =
   | "chat_turn"
@@ -47,6 +51,18 @@ export interface ProcessExit {
   reason?: string | null;
 }
 
+/**
+ * Durable signal intent, as two independent latches.
+ *
+ * Independent on purpose: asking a suspended process to stop must not erase that
+ * it was suspended, and `resume` clears only `suspendRequested` — never a
+ * pending stop, which would turn "stop this" into "keep going" on a race.
+ */
+export interface SignalIntent {
+  stopRequested: boolean;
+  suspendRequested: boolean;
+}
+
 export interface ProcessRecord {
   processId: string;
   parentProcessId: string | null;
@@ -58,6 +74,10 @@ export interface ProcessRecord {
   profile: string | null;
   nativePid: number | null;
   limits: ProcessLimits;
+  /** What has been asked of this process. Delivery is `processSignalDelivery.ts`. */
+  signalIntent: SignalIntent;
+  signalReason: string | null;
+  signalRequestedAtMs: number | null;
   exit: ProcessExit | null;
   createdAtMs: number;
   updatedAtMs: number;
@@ -241,6 +261,44 @@ export async function processLiveCounts(): Promise<ProcessLiveCount[]> {
   } catch (error) {
     warn("live counts", error);
     return [];
+  }
+}
+
+/**
+ * Every process of `kinds` whose signal intent has not been delivered yet.
+ *
+ * The catch-up read behind {@link onProcessesChanged}: that event only reaches
+ * windows of this app, so a `monkey processes signal` from a terminal — another
+ * OS process, no Tauri bus — is invisible to a listener and lands here instead.
+ */
+export async function pendingProcessSignals(kinds?: ProcessKind[]): Promise<ProcessRecord[]> {
+  if (!isTauri()) return [];
+  try {
+    return await invoke<ProcessRecord[]>("process_pending_signals", {
+      kinds: kinds ?? null,
+    });
+  } catch (error) {
+    warn("pending signals", error);
+    return [];
+  }
+}
+
+/**
+ * Fires for every process-table change, in every window — the same fan-out
+ * convention as `runs://changed`.
+ *
+ * Resolves to a no-op unlisten outside Tauri so a caller's cleanup path does not
+ * have to special-case the dev/browser profile.
+ */
+export async function onProcessesChanged(
+  handler: (record: ProcessRecord) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {};
+  try {
+    return await listen<ProcessRecord>(PROCESSES_CHANGED_EVENT, (event) => handler(event.payload));
+  } catch (error) {
+    warn("subscribe to changes", error);
+    return () => {};
   }
 }
 

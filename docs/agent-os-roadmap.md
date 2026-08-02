@@ -233,17 +233,44 @@ hide a latched stop behind 5,000 quiet rows. State is the acknowledgement — a
 `suspend_requested` row already in `suspended` is not pending — mirroring the
 convention the daemon already used, so nothing re-delivers on an idle tick.
 
+**Also shipped — the desktop delivers the latch too.** `processSignalDelivery.ts`
+is a fan-out table, not a second mechanism: every kind already had a working
+cancellation path, and this maps a latched intent onto the one that belongs to it
+— the shared `runCancellationRegistry` for a chat turn and a crew member,
+`cancelSubagentRun`, `cancelSideTask`/`pauseSideTask`, `background_shell_kill`,
+`m4_workflows_cancel`. Nothing is replaced, and there is no per-round polling.
+
+Three findings worth keeping:
+
+- **The event alone was not enough, and could not be.** `processes://changed`
+  covers a signal raised anywhere inside the app, but `monkey processes signal`
+  writes from a different OS process holding its own SQLite connection and cannot
+  emit a Tauri event, so no listener will ever hear it. A 2s catch-up read
+  (`process_pending_signals`, one indexed query over just the deliverable kinds)
+  is what makes the CLI half of "signals cross a process boundary" true in both
+  directions rather than only the daemon's.
+- **Every window subscribes, but only one delivers the Rust-owned kinds.** A chat
+  turn's `AbortController` lives in the WebView that started it, so main-only
+  delivery would strand a turn running in a session window; a miss elsewhere is a
+  map lookup with no IPC behind it. Background shells and workflow runs are the
+  opposite — reachable identically from any window, so exactly one delivers or
+  two invocations race over the same child.
+- **Which kinds deliver here is exhaustive at typecheck time**
+  (`satisfies Record<ProcessKind, boolean>`), so a tenth kind cannot be added
+  without a decision recorded about who signals it. Two entries are deliberate
+  `false`s: a workflow *node* has no cancellation primitive at any granularity
+  (cancelling one means cancelling its run, a different request), and `m4_workflows_cancel`
+  returning `false` is reported as a miss rather than a stop — it is the
+  out-of-process hole below, and hiding it would make the gap invisible.
+
+Confirmed while building it: `reap_desktop_processes_at_startup` exits every live
+desktop-owned row as `lost` before any window opens, so "a stop honoured after a
+restart" is *moot* for those kinds rather than solved — the turn is already gone.
+The startup sweep earns its place on workflow runs, which are not desktop-owned
+and so survive the reaper.
+
 **Remaining:**
 
-- **Desktop-owned loops do not read the latch yet.** The delivery design is
-  settled: latch as the durable record, the existing `processes://changed` event
-  as the fast path, and the loop's own `AbortController` as delivery — the same
-  shape `run_request_cancellation` already proved, so it is a fan-out table
-  rather than a second mechanism. No per-round polling. One caveat found while
-  designing it: `reap_desktop_processes_at_startup` already exits every live
-  desktop-owned row as `lost` before any window opens, so "a stop honoured after
-  a restart" is *moot* for those kinds rather than solved — the turn is already
-  gone. The startup pass matters only for daemon- and workflow-hosted work.
 - **Cooperative pause in the five loops.** A chat turn, subagent, crew member
   and workflow run would each yield at a round (or level) boundary. Feasible —
   between rounds a turn holds no open provider stream, so there is nothing to
@@ -252,11 +279,13 @@ convention the daemon already used, so nothing re-delivers on an idle tick.
   the child that tool spawned, and reporting `pause_pending` honestly meanwhile.
 - **Workflow out-of-process cancel.** Still the only surface that cannot be
   cancelled from another process at all: `WorkflowService::cancel` returns `false`
-  when the run is absent from its in-memory registry. The executor already
-  observes cancellation at level boundaries, so it needs a read-side port
-  alongside the existing `ProcessProjector`. Note the daemon's own workflow-host
-  path is a *separate* read point from the job loop above and is not covered by
-  it.
+  when the run is absent from its in-memory registry. The desktop now *attempts*
+  it on every latched stop and reports the `false` as a miss, so the gap is
+  observable rather than silent — but a run started by the daemon or left behind
+  by a restart still cannot be stopped. The executor already observes cancellation
+  at level boundaries, so it needs a read-side port alongside the existing
+  `ProcessProjector`. Note the daemon's own workflow-host path is a *separate*
+  read point from the job loop above and is not covered by it.
 - **Expose `RemoteAction::Pause`** — the daemon supports it locally; the remote
   protocol simply has no action for it. Also unverified: no adopter writes
   `remote_run` rows yet, so that row of the support matrix is a claim about

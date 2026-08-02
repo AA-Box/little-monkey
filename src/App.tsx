@@ -46,6 +46,12 @@ import {
 } from "./lib/shortcuts";
 import { onRunCancellationRequested } from "./lib/runProtocol";
 import { cancelRegisteredRun } from "./lib/runCancellationRegistry";
+import { onProcessesChanged } from "./lib/processTable";
+import {
+  PENDING_SIGNAL_SWEEP_INTERVAL_MS,
+  deliverProcessSignal,
+  sweepPendingProcessSignals,
+} from "./lib/processSignalDelivery";
 import { recoverDaemonDesktopTurns } from "./lib/agentLoop";
 import { paletteClient } from "./lib/paletteClient";
 import { featurePanelReducer, type FeaturePanelId } from "./lib/appShellPanels";
@@ -776,6 +782,44 @@ function App() {
     return () => {
       disposed = true;
       unlisten?.();
+    };
+  }, []);
+
+  // Durable signal intent (`process_signal`) reaches the desktop's own loops.
+  // Recording the intent and delivering it are deliberately separate — that is
+  // what lets a stop survive a restart and cross a process boundary — so
+  // something has to read the latch. The daemon does it once per tick for its
+  // jobs; this is the same read for everything the desktop owns.
+  //
+  // Every window subscribes, not just main: a chat turn's AbortController lives
+  // in the one WebView that started it, so only that window can deliver, and a
+  // miss elsewhere is a map lookup with no IPC behind it. The main window
+  // additionally owns the Rust-side kinds (background shells, workflow runs),
+  // which any window could reach and therefore exactly one should.
+  //
+  // The interval exists because `monkey processes signal` writes from a different
+  // OS process and cannot emit a Tauri event, so no listener will ever hear it —
+  // see `processSignalDelivery.ts` for why that is one indexed query rather than
+  // per-round polling.
+  useEffect(() => {
+    if (!isTauri()) return undefined;
+    const options = { ownsGlobalKinds: getCurrentWindow().label === "main" };
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void onProcessesChanged((record) => {
+      void deliverProcessSignal(record, options);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    void sweepPendingProcessSignals(options);
+    const timer = setInterval(() => {
+      void sweepPendingProcessSignals(options);
+    }, PENDING_SIGNAL_SWEEP_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      unlisten?.();
+      clearInterval(timer);
     };
   }, []);
 
