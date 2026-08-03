@@ -1301,7 +1301,7 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1380,7 +1380,9 @@ mod tests {
         }
     }
 
-    fn spec(run_id: &str, now: u64) -> RunSpec {
+    // Shared with `daemon::tests`, which needs a real durable run to satisfy
+    // `agent_processes.run_id`'s foreign key.
+    pub(in crate::daemon) fn spec(run_id: &str, now: u64) -> RunSpec {
         RunSpec {
             schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
             run_id: run_id.into(),

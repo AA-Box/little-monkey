@@ -204,18 +204,32 @@ The honest state of delivery, which the matrix now states rather than implies:
 
 | Kind | stop | suspend/resume | kill |
 | --- | --- | --- | --- |
-| daemon job, remote run | ✅ | ✅ OS suspend | ✅ |
+| daemon job | ✅ | ✅ OS suspend | ✅ |
 | background shell | ✅ | ✅ OS suspend | ✅ |
 | side task | ✅ | ✅ cooperative | refused |
 | chat turn, subagent, crew member | ✅ | ✅ cooperative | refused |
 | workflow run | ✅ | ✅ blocking wait | refused |
 | workflow node | ✅ | refused | refused |
+| remote run | terminal at birth | refused | refused |
 
-`workflow node` is the one remaining refusal, and deliberately so: a node has no
-independent safe point, and nothing in the codebase ever targets a node's own
-process id. Pausing operates at the owning run's level boundary, which is what
-its refusal reason now says. Claiming `Honoured` on a kind with no mechanism
-would be exactly the dishonesty the matrix exists to prevent.
+Two refusals, each naming the target that does work. A `workflow node` has no
+independent safe point and nothing ever targets a node's own process id, so
+pausing operates at the owning run's level boundary. A `remote run` records that
+a controller *asked* for work rather than the work itself; its row closes as
+soon as the job is queued, and the daemon job it spawned — its child in this
+table — is the process that can be suspended or killed.
+
+That second one was a live defect until now, and worth stating plainly because
+it is exactly what the matrix exists to catch. `remote_run` claimed `Honoured`
+for stop, suspend, resume and kill while **no delivery path for the kind existed
+anywhere**: the daemon's `apply_signal_intent` reads only `daemon_job` rows, and
+`processSignalDelivery.ts` has no `remote_run` case. Worse, the only writer
+(`project_queue_origin`) projected the row as `running` and nothing ever closed
+it — not the engine tick, which sweeps only `daemon_job`, and not the desktop
+reaper, which deliberately skips kinds it does not own. Every remote enqueue
+leaked a row asserting live work forever. The row is now terminal in the same
+write that creates it, so `signal` answers `AlreadyExited` rather than latching
+intent nobody will read.
 
 **Also shipped — the daemon honours the latch.** Its tick reads durable intent
 for every non-terminal job and translates it into the daemon's own
@@ -347,7 +361,8 @@ are worthless if the UI swallows them.
   process plus a durable description of it, and only `DaemonJob` has both. The
   rest say `Never` with a stated reason — a desktop kind's loop died with the
   window (K13), a workflow run's executor already owns per-node retry with its
-  own replay rules, and no adopter writes `remote_run` rows. `RestartPolicy` is
+  own replay rules, and a `remote_run` records a request rather than work that
+  could be re-run. `RestartPolicy` is
   bounded by construction with no `Always`, and the stricter of the job's own
   `max_attempts` and the kind's ceiling wins.
 - **Paused + restart is defined**, rather than falling out of `live_only` by
@@ -384,9 +399,13 @@ encodes rather than reading the column raw.
   the sweep is idempotent), and the daemon's test above now runs. Workflow runs
   are not: they are not desktop-owned, so the startup reaper deliberately leaves
   them alone, and nothing else sweeps them.
-- **`remote_run` is still unverified** — no adopter writes those rows, so that
-  row of the support matrix remains a claim about intent rather than about
-  shipped code.
+- **No manual round-trip against a live runtime.** Every path here is covered by
+  unit and integration tests, including the cross-process ones, but nobody has
+  yet started a real chat turn, run `monkey processes signal <id> suspend` from
+  another terminal, and watched it park — nor the same for a subagent, a crew
+  run, a workflow run and a background shell, checking the last with `ps`. The
+  tests are the reason to expect it works; they are not the same as having seen
+  it.
 
 Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace

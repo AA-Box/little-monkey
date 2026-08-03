@@ -137,25 +137,6 @@ impl ProcessKind {
         ProcessKind::SideTask,
     ];
 
-    /// Whether this kind honours `signal`, and if not, why.
-    ///
-    /// This is a statement about what the code does *today*, not an aspiration.
-    /// Suspend/resume now exist in three shapes: real OS suspend of a child
-    /// this app owns (`DaemonJob`, `RemoteRun`, `BackgroundShell`, via a
-    /// shared SIGSTOP/SIGCONT primitive — see `os_signal.rs`), a cooperative
-    /// durable latch a loop checks at its own safe point (`ChatTurn`,
-    /// `Subagent`, `CrewMember`, `SideTask`), and a blocking wait at a
-    /// coarse-grained boundary (`WorkflowRun`, at each level). `kill` is only
-    /// meaningful where this app owns an OS process.
-    ///
-    /// `WorkflowNode` is the one deliberate holdout: nothing ever signals a
-    /// node's own process id, and a node mid-execution has no yield point of
-    /// its own — the executor only observes intent at the *run's* level
-    /// boundary — so claiming `Honoured` there would be exactly the
-    /// dishonesty this function exists to prevent.
-    ///
-    /// Each refusal names the mechanism that is missing (or, for
-    /// `WorkflowNode`, the correct target to signal instead) rather than
     /// What happens to this kind when it exits without being asked to.
     ///
     /// Declared per kind for the same reason [`Self::signal_support`] is: the
@@ -185,8 +166,11 @@ impl ProcessKind {
             // be replayed. Restarting the whole run from out here would re-run
             // committed side effects that the executor deliberately did not.
             ProcessKind::WorkflowRun | ProcessKind::WorkflowNode => RestartPolicy::Never,
-            // No adopter writes these rows yet, so any policy would be a claim
-            // about code that does not exist.
+            // A remote run records that a remote controller *asked* for work,
+            // not the work itself — the daemon job it spawns is the process,
+            // and that job carries the restart policy. Restarting a request
+            // would mean submitting it a second time, which is the caller's
+            // decision and not this supervisor's.
             ProcessKind::RemoteRun => RestartPolicy::Never,
             // Desktop-owned: the loop died with the window. See above.
             ProcessKind::ChatTurn
@@ -197,18 +181,47 @@ impl ProcessKind {
         }
     }
 
-    /// saying "unsupported", because the caller's next question is always
-    /// "why not".
+    /// Whether this kind honours `signal`, and if not, why.
+    ///
+    /// This is a statement about what the code does *today*, not an aspiration.
+    /// Suspend/resume exist in three shapes: real OS suspend of a child this
+    /// app owns (`DaemonJob`, `BackgroundShell`, via a shared SIGSTOP/SIGCONT
+    /// primitive — see `os_signal.rs`), a cooperative durable latch a loop
+    /// checks at its own safe point (`ChatTurn`, `Subagent`, `CrewMember`,
+    /// `SideTask`), and a blocking wait at a coarse-grained boundary
+    /// (`WorkflowRun`, at each level). `kill` is only meaningful where this app
+    /// owns an OS process.
+    ///
+    /// Two deliberate holdouts. `WorkflowNode`: nothing ever signals a node's
+    /// own process id, and a node mid-execution has no yield point of its own —
+    /// the executor observes intent only at the *run's* level boundary.
+    /// `RemoteRun`: its row records that a remote controller asked for work,
+    /// and the only writer (`project_queue_origin`) closes it as soon as the
+    /// job is queued; the daemon job it spawned is the process that can be
+    /// suspended or killed. Claiming `Honoured` on either would be exactly the
+    /// dishonesty this function exists to prevent — and for `RemoteRun` it
+    /// briefly was: the matrix said `Honoured` while no delivery path for that
+    /// kind existed in the daemon or the desktop fan-out.
+    ///
+    /// Each refusal names the mechanism that is missing, or the correct target
+    /// to signal instead, rather than saying "unsupported" — because the
+    /// caller's next question is always "why not".
     pub fn signal_support(self, signal: ProcessSignal) -> SignalSupport {
         use ProcessKind as K;
         use ProcessSignal as S;
         match (self, signal) {
-            // Stop is universal: every kind has a cancellation path.
+            // Stop is universal: every kind has a cancellation path. A
+            // `RemoteRun` row is terminal from birth, so `signal` answers
+            // `AlreadyExited` before this is ever consulted for one.
             (_, S::Stop) => SignalSupport::Honoured,
 
             // Kill needs an OS process this app owns.
             (K::DaemonJob | K::BackgroundShell, S::Kill) => SignalSupport::Honoured,
-            (K::RemoteRun, S::Kill) => SignalSupport::Honoured,
+            (K::RemoteRun, S::Kill | S::Suspend | S::Resume) => SignalSupport::Refused(
+                "a remote run records the request, not the work: it owns no process of its \
+                 own and is closed as soon as the job is queued; signal the daemon job it \
+                 spawned, which is its child in this table",
+            ),
             (_, S::Kill) => SignalSupport::Refused(
                 "this kind owns no OS process to terminate; stop it instead, which winds it \
                  down at its next safe point",
@@ -217,7 +230,7 @@ impl ProcessKind {
             // Suspend/resume: real OS suspend where we own a child, cooperative
             // where the loop now checks a durable latch at a safe point, or a
             // blocking wait at a coarse boundary for a workflow run.
-            (K::DaemonJob | K::RemoteRun, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::DaemonJob, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::SideTask, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::ChatTurn | K::Subagent | K::CrewMember, S::Suspend | S::Resume) => {
@@ -2721,11 +2734,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} must refuse kill", kind.as_str()));
             assert!(refusal.contains("stop it instead"), "{refusal}");
         }
-        for kind in [
-            ProcessKind::DaemonJob,
-            ProcessKind::BackgroundShell,
-            ProcessKind::RemoteRun,
-        ] {
+
+        // `RemoteRun` refuses for a different reason, and says so: it owns no
+        // process because it is not one. Its refusal has to point at the child
+        // that is, or a caller learns only that the answer is no.
+        let refusal = ProcessKind::RemoteRun
+            .signal_support(ProcessSignal::Kill)
+            .refusal()
+            .expect("a remote run owns no process to kill");
+        assert!(refusal.contains("daemon job"), "{refusal}");
+
+        for kind in [ProcessKind::DaemonJob, ProcessKind::BackgroundShell] {
             assert!(kind.signal_support(ProcessSignal::Kill).is_honoured());
         }
     }
@@ -2733,16 +2752,19 @@ mod tests {
     #[test]
     fn suspend_is_honoured_only_where_a_pause_mechanism_actually_exists() {
         // The finding this pins: suspend/resume are honoured everywhere a real
-        // mechanism exists — real OS suspend (`DaemonJob`, `RemoteRun`,
-        // `BackgroundShell`), a cooperative durable latch a loop checks at its
-        // own safe point (`ChatTurn`, `Subagent`, `CrewMember`, `SideTask`), or
-        // a blocking wait at a coarse boundary (`WorkflowRun`). `WorkflowNode`
-        // is the one deliberate holdout: nothing ever signals a node's own
-        // process id, so it stays refused rather than claiming a mechanism it
-        // does not have.
+        // mechanism exists — real OS suspend (`DaemonJob`, `BackgroundShell`),
+        // a cooperative durable latch a loop checks at its own safe point
+        // (`ChatTurn`, `Subagent`, `CrewMember`, `SideTask`), or a blocking
+        // wait at a coarse boundary (`WorkflowRun`) — and nowhere else.
+        //
+        // Two holdouts, each pointing at the target that does work.
+        // `WorkflowNode`: nothing ever signals a node's own process id.
+        // `RemoteRun`: it records the request rather than the work, and
+        // regressed into claiming `Honoured` while no delivery path for the
+        // kind existed anywhere — not in the daemon's `apply_signal_intent`,
+        // which reads only `DaemonJob`, and not in the desktop fan-out.
         for kind in [
             ProcessKind::DaemonJob,
-            ProcessKind::RemoteRun,
             ProcessKind::SideTask,
             ProcessKind::BackgroundShell,
             ProcessKind::ChatTurn,
@@ -2759,7 +2781,10 @@ mod tests {
                 );
             }
         }
-        for kind in [ProcessKind::WorkflowNode] {
+        for (kind, target) in [
+            (ProcessKind::WorkflowNode, "owning workflow run"),
+            (ProcessKind::RemoteRun, "daemon job"),
+        ] {
             for signal in [ProcessSignal::Suspend, ProcessSignal::Resume] {
                 let refusal = kind.signal_support(signal).refusal().unwrap_or_else(|| {
                     panic!("{} claims to honour {}", kind.as_str(), signal.as_str())
@@ -2771,8 +2796,8 @@ mod tests {
                     signal.as_str()
                 );
                 assert!(
-                    refusal.contains("owning workflow run"),
-                    "{}'s refusal should name the correct target (the owning run), got: {refusal}",
+                    refusal.contains(target),
+                    "{}'s refusal should name the correct target ({target}), got: {refusal}",
                     kind.as_str()
                 );
             }
