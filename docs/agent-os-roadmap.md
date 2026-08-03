@@ -175,7 +175,7 @@ produce context by different rules.
 
 # Phase 1 — Process and isolation kernel
 
-## K2. Signals, lifecycle, and restart policy *(partially built)*
+## K2. Signals, lifecycle, and restart policy *(mostly built)*
 
 **Shipped — the signal contract and durable intent.** `ProcessSignal`
 (`stop` / `suspend` / `resume` / `kill`) with `ProcessKind::signal_support`, which
@@ -205,10 +205,17 @@ The honest state of delivery, which the matrix now states rather than implies:
 | Kind | stop | suspend/resume | kill |
 | --- | --- | --- | --- |
 | daemon job, remote run | ✅ | ✅ OS suspend | ✅ |
+| background shell | ✅ | ✅ OS suspend | ✅ |
 | side task | ✅ | ✅ cooperative | refused |
-| background shell | ✅ | refused | ✅ |
-| chat turn, subagent, crew member | ✅ | refused | refused |
-| workflow run/node | ✅ | refused | refused |
+| chat turn, subagent, crew member | ✅ | ✅ cooperative | refused |
+| workflow run | ✅ | ✅ blocking wait | refused |
+| workflow node | ✅ | refused | refused |
+
+`workflow node` is the one remaining refusal, and deliberately so: a node has no
+independent safe point, and nothing in the codebase ever targets a node's own
+process id. Pausing operates at the owning run's level boundary, which is what
+its refusal reason now says. Claiming `Honoured` on a kind with no mechanism
+would be exactly the dishonesty the matrix exists to prevent.
 
 **Also shipped — the daemon honours the latch.** Its tick reads durable intent
 for every non-terminal job and translates it into the daemon's own
@@ -255,13 +262,9 @@ Three findings worth keeping:
   map lookup with no IPC behind it. Background shells and workflow runs are the
   opposite — reachable identically from any window, so exactly one delivers or
   two invocations race over the same child.
-- **Which kinds deliver here is exhaustive at typecheck time**
-  (`satisfies Record<ProcessKind, boolean>`), so a tenth kind cannot be added
-  without a decision recorded about who signals it. Two entries are deliberate
-  `false`s: a workflow *node* has no cancellation primitive at any granularity
-  (cancelling one means cancelling its run, a different request), and `m4_workflows_cancel`
-  returning `false` is reported as a miss rather than a stop — it is the
-  out-of-process hole below, and hiding it would make the gap invisible.
+- **A workflow node is the one kind with no primitive at any granularity.**
+  Cancelling one means cancelling its run, which is a different request than the
+  caller made, so it is reported as `no-primitive` rather than quietly widened.
 
 Confirmed while building it: `reap_desktop_processes_at_startup` exits every live
 desktop-owned row as `lost` before any window opens, so "a stop honoured after a
@@ -269,23 +272,62 @@ restart" is *moot* for those kinds rather than solved — the turn is already go
 The startup sweep earns its place on workflow runs, which are not desktop-owned
 and so survive the reaper.
 
+**Also shipped — cooperative pause in the desktop loops.** The same fan-out
+carries suspend and resume, so there is still one delivery path rather than two:
+`pauseRegistry.ts` for chat turns, subagents and crew members, and
+`sideTaskRunner.ts`'s pre-existing store mechanism for side tasks, so no kind
+ends up with two competing latches. No per-round polling on the frontend. The
+`HeadlessWorkflowExecutor` does poll, at its level boundary, and that one is
+justified: `run_internal` is synchronous with no async runtime to hang a waiter
+off of.
+
+`pause_pending` is **derived, never stored**: `state == running &&
+signal_intent.suspend_requested`. A loop reports `suspended` only once it has
+actually parked at a safe point, which is what makes the unbounded pause latency
+honest instead of a lie — and it costs zero migrations, since `ProcessState`
+still has exactly its four variants and its SQL transition trigger is untouched.
+
+That derivation is also why the record's own state cannot be the acknowledgement
+for a resume, which is the subtlest thing here. A resume landing while a loop is
+still `pause_pending` clears `suspend_requested` with the row still `running`, so
+"no intent and not suspended" would read as nothing to deliver — and the
+in-process latch would stay set, parking the loop at its next checkpoint with
+nothing left to ever clear it. Delivery therefore treats a still-latched
+cooperative kind as a pending resume. Pinned by a test, because the failure mode
+is a silent hang rather than an error.
+
+The unbounded-latency caveat is now paired at the OS layer, as this section
+originally called for. A chat turn's foreground `run_shell` children are
+registered by process group (`AppState::shell_process_groups`), and suspending
+the turn SIGSTOPs them immediately rather than waiting out a twenty-minute
+command — with the command's own timeout counting only unsuspended wall time, so
+a pause cannot silently become a kill two minutes later. Backgrounded shells get
+the same treatment through `background_shell::deliver_os_signal`.
+
+**Also shipped — workflow out-of-process cancel.** The read-side port this
+called for (`SignalSource`, alongside the existing write-only `ProcessProjector`)
+now exists and is threaded through `WorkflowService` into the executor. The
+level boundary reads `stop_requested` as well as `suspend_requested`, so a run
+absent from `WorkflowService::cancel`'s in-memory registry — the daemon-hosted
+case, and the one left behind by a restart — is cancellable from anywhere that
+can write the latch. A stop latched while a run is parked wins immediately
+rather than waiting for a resume. `m4_workflows_cancel` returning `false` is
+still reported as a miss rather than a stop: it now means "not cancelled *in
+this process*", with the durable latch doing the work, and collapsing the two
+into one "stopped" would hide which path ran.
+
+**Also shipped — the desktop can see and signal the table.** Until now nothing
+in the frontend read `process_list` at all: each kind was visible only inside
+whichever panel happened to own it, and `monkey processes` was the only place
+the unified view existed. The Processes panel is that view — every live process
+across every kind, with pause/resume/stop per row — and it renders the derived
+state rather than the stored one, so `pause_pending` shows as "Pausing" (with
+why it may take a while) instead of being rounded to either "Running" or
+"Paused". A refused signal shows the kind's own refusal reason; typed refusals
+are worthless if the UI swallows them.
+
 **Remaining:**
 
-- **Cooperative pause in the five loops.** A chat turn, subagent, crew member
-  and workflow run would each yield at a round (or level) boundary. Feasible —
-  between rounds a turn holds no open provider stream, so there is nothing to
-  time out — with the caveat that pause latency is unbounded: a 20-minute
-  `run_shell` call means pause lands in 20 minutes. Worth pairing with SIGSTOP of
-  the child that tool spawned, and reporting `pause_pending` honestly meanwhile.
-- **Workflow out-of-process cancel.** Still the only surface that cannot be
-  cancelled from another process at all: `WorkflowService::cancel` returns `false`
-  when the run is absent from its in-memory registry. The desktop now *attempts*
-  it on every latched stop and reports the `false` as a miss, so the gap is
-  observable rather than silent — but a run started by the daemon or left behind
-  by a restart still cannot be stopped. The executor already observes cancellation
-  at level boundaries, so it needs a read-side port alongside the existing
-  `ProcessProjector`. Note the daemon's own workflow-host path is a *separate*
-  read point from the job loop above and is not covered by it.
 - **Expose `RemoteAction::Pause`** — the daemon supports it locally; the remote
   protocol simply has no action for it. Also unverified: no adopter writes
   `remote_run` rows yet, so that row of the support matrix is a claim about
@@ -309,8 +351,11 @@ Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace
 root. Whether suspending releases them is a K7/K8 decision.
 
-**Blocks:** K8 — preemption is suspend plus resume, and for five of the nine
-kinds suspend is still refused, so the scheduler can only stop them.
+**No longer blocks K8.** Preemption is suspend plus resume, and eight of the nine
+kinds now honour both, so the scheduler has a preemption primitive rather than
+only a stop. What K8 still needs from elsewhere is the reservation question
+above — a suspended process holds its resident model slot, worktree lease and
+workspace root — which is a K7/K8 decision, not a signals one.
 
 ## K3. Isolation parity across platforms
 

@@ -140,17 +140,24 @@ impl ProcessKind {
     /// Whether this kind honours `signal`, and if not, why.
     ///
     /// This is a statement about what the code does *today*, not an aspiration.
-    /// The shape of it is the finding: `suspend`/`resume` exist in exactly two
-    /// places — the daemon (real OS suspend of a child it owns) and side tasks
-    /// (a cooperative `paused` status its loop already checks) — and nowhere
-    /// else. `kill` is only meaningful where this app owns an OS process.
+    /// Suspend/resume now exist in three shapes: real OS suspend of a child
+    /// this app owns (`DaemonJob`, `RemoteRun`, `BackgroundShell`, via a
+    /// shared SIGSTOP/SIGCONT primitive — see `os_signal.rs`), a cooperative
+    /// durable latch a loop checks at its own safe point (`ChatTurn`,
+    /// `Subagent`, `CrewMember`, `SideTask`), and a blocking wait at a
+    /// coarse-grained boundary (`WorkflowRun`, at each level). `kill` is only
+    /// meaningful where this app owns an OS process.
     ///
-    /// Each refusal names the mechanism that is missing rather than saying
-    /// "unsupported", because the caller's next question is always "why not",
-    /// and for several of these the answer is a design boundary rather than an
-    /// unwritten feature: a chat turn's loop lives in the WebView, so suspending
-    /// it and surviving a restart are different problems (see K13 in
-    /// `docs/agent-os-roadmap.md`).
+    /// `WorkflowNode` is the one deliberate holdout: nothing ever signals a
+    /// node's own process id, and a node mid-execution has no yield point of
+    /// its own — the executor only observes intent at the *run's* level
+    /// boundary — so claiming `Honoured` there would be exactly the
+    /// dishonesty this function exists to prevent.
+    ///
+    /// Each refusal names the mechanism that is missing (or, for
+    /// `WorkflowNode`, the correct target to signal instead) rather than
+    /// saying "unsupported", because the caller's next question is always
+    /// "why not".
     pub fn signal_support(self, signal: ProcessSignal) -> SignalSupport {
         use ProcessKind as K;
         use ProcessSignal as S;
@@ -166,24 +173,20 @@ impl ProcessKind {
                  down at its next safe point",
             ),
 
-            // Suspend/resume: real where we own a child, cooperative where the
-            // loop already checks a paused state.
+            // Suspend/resume: real OS suspend where we own a child, cooperative
+            // where the loop now checks a durable latch at a safe point, or a
+            // blocking wait at a coarse boundary for a workflow run.
             (K::DaemonJob | K::RemoteRun, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::SideTask, S::Suspend | S::Resume) => SignalSupport::Honoured,
-            (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Refused(
-                "the child process is owned but not yet suspended by signal; killing it is the \
-                 only stop available today",
-            ),
             (K::ChatTurn | K::Subagent | K::CrewMember, S::Suspend | S::Resume) => {
-                SignalSupport::Refused(
-                    "this loop has no pause point yet: it would have to yield at a round \
-                     boundary, and a paused loop cannot survive an app restart because it lives \
-                     in the WebView",
-                )
+                SignalSupport::Honoured
             }
-            (K::WorkflowRun | K::WorkflowNode, S::Suspend | S::Resume) => SignalSupport::Refused(
-                "the workflow executor observes cancellation at level boundaries but has no \
-                 pause state; resuming would mean replaying from the last completed level",
+            (K::WorkflowRun, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::WorkflowNode, S::Suspend | S::Resume) => SignalSupport::Refused(
+                "a workflow node has no independent pause mechanism and no safe point of its \
+                 own; suspend the owning workflow run instead, which the executor observes at \
+                 each level boundary",
             ),
         }
     }
@@ -705,6 +708,52 @@ pub enum ReconcileOutcome {
 /// has the option.
 pub trait ProcessProjector: Send + Sync {
     fn project(&self, projection: &ProcessProjection) -> Result<(), String>;
+}
+
+/// A read port mirroring [`ProcessProjector`]'s shape in the opposite
+/// direction: "what does the process table currently want from this unit,"
+/// for a caller — the workflow executor — that has no SQLite connection and
+/// must not depend on storage directly.
+///
+/// `None` means "no intent recorded," which includes "the row does not exist
+/// yet" and "the lookup failed" — never an error the caller should fail its
+/// run over. That is the same fail-soft contract every [`ProcessProjector`]
+/// implementation already keeps, just for a read instead of a write.
+pub trait SignalSource: Send + Sync {
+    fn signal_intent(&self, kind: ProcessKind, external_id: &str) -> Option<SignalIntent>;
+}
+
+/// A [`SignalSource`] backed by the ledger at a path — the read-side twin of
+/// [`LedgerProcessProjector`], for the same reason: path-based rather than
+/// Tauri state, because the desktop, the CLI, and the daemon all need to
+/// read, and only one of them has an `AppHandle`.
+pub struct LedgerSignalSource {
+    path: std::path::PathBuf,
+    ledger: Mutex<Option<crate::run_ledger::RunLedger>>,
+}
+
+impl LedgerSignalSource {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        LedgerSignalSource {
+            path: path.into(),
+            ledger: Mutex::new(None),
+        }
+    }
+}
+
+impl SignalSource for LedgerSignalSource {
+    fn signal_intent(&self, kind: ProcessKind, external_id: &str) -> Option<SignalIntent> {
+        let mut slot = self.ledger.lock().ok()?;
+        if slot.is_none() {
+            *slot = Some(crate::run_ledger::RunLedger::open(&self.path).ok()?);
+        }
+        let ledger = slot.as_ref()?;
+        ledger
+            .process_table()
+            .find_by_external_id(kind, external_id)
+            .ok()?
+            .map(|record| record.signal_intent)
+    }
 }
 
 /// Filter for [`ProcessTable::list`].
@@ -2508,15 +2557,23 @@ mod tests {
 
     #[test]
     fn suspend_is_honoured_only_where_a_pause_mechanism_actually_exists() {
-        // The finding this pins: suspend/resume exist in exactly two places —
-        // the daemon (real OS suspend of a child it owns, inherited by remote
-        // runs, which are daemon jobs) and side tasks (a cooperative `paused`
-        // status their loop already checks). Every other refusal names the
-        // missing mechanism so it reads as a boundary, not a TODO.
+        // The finding this pins: suspend/resume are honoured everywhere a real
+        // mechanism exists — real OS suspend (`DaemonJob`, `RemoteRun`,
+        // `BackgroundShell`), a cooperative durable latch a loop checks at its
+        // own safe point (`ChatTurn`, `Subagent`, `CrewMember`, `SideTask`), or
+        // a blocking wait at a coarse boundary (`WorkflowRun`). `WorkflowNode`
+        // is the one deliberate holdout: nothing ever signals a node's own
+        // process id, so it stays refused rather than claiming a mechanism it
+        // does not have.
         for kind in [
             ProcessKind::DaemonJob,
             ProcessKind::RemoteRun,
             ProcessKind::SideTask,
+            ProcessKind::BackgroundShell,
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::WorkflowRun,
         ] {
             for signal in [ProcessSignal::Suspend, ProcessSignal::Resume] {
                 assert!(
@@ -2527,14 +2584,7 @@ mod tests {
                 );
             }
         }
-        for kind in [
-            ProcessKind::ChatTurn,
-            ProcessKind::Subagent,
-            ProcessKind::CrewMember,
-            ProcessKind::WorkflowRun,
-            ProcessKind::WorkflowNode,
-            ProcessKind::BackgroundShell,
-        ] {
+        for kind in [ProcessKind::WorkflowNode] {
             for signal in [ProcessSignal::Suspend, ProcessSignal::Resume] {
                 let refusal = kind.signal_support(signal).refusal().unwrap_or_else(|| {
                     panic!("{} claims to honour {}", kind.as_str(), signal.as_str())
@@ -2544,6 +2594,11 @@ mod tests {
                     "{} gives a useless refusal for {}: {refusal}",
                     kind.as_str(),
                     signal.as_str()
+                );
+                assert!(
+                    refusal.contains("owning workflow run"),
+                    "{}'s refusal should name the correct target (the owning run), got: {refusal}",
+                    kind.as_str()
                 );
             }
         }
@@ -2613,18 +2668,18 @@ mod tests {
     fn a_refused_signal_is_an_error_carrying_the_reason_not_a_silent_no_op() {
         let ledger = ledger();
         let table = ProcessTable::new(ledger.connection());
-        let record = admit(&table, ProcessKind::ChatTurn, "turn-refuse");
+        let record = admit(&table, ProcessKind::WorkflowNode, "node-refuse");
 
         let error = table
             .signal(&record.process_id, ProcessSignal::Suspend, None, T0 + 1)
-            .expect_err("a chat turn cannot be suspended today");
+            .expect_err("a workflow node cannot be suspended independently");
         match error {
             ProcessTableError::SignalRefused {
                 kind, signal, reason, ..
             } => {
-                assert_eq!(kind, ProcessKind::ChatTurn);
+                assert_eq!(kind, ProcessKind::WorkflowNode);
                 assert_eq!(signal, ProcessSignal::Suspend);
-                assert!(reason.contains("round boundary"), "{reason}");
+                assert!(reason.contains("owning workflow run"), "{reason}");
             }
             other => panic!("wrong error: {other}"),
         }
@@ -2758,5 +2813,60 @@ mod tests {
         }
         assert!(Exited.is_terminal());
         assert!(!Running.is_terminal());
+    }
+
+    fn temp_ledger_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lm-signal-source-test-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn signal_source_reports_none_for_an_unknown_process() {
+        let source = LedgerSignalSource::new(temp_ledger_path("unknown"));
+        assert!(source
+            .signal_intent(ProcessKind::ChatTurn, "no-such-turn")
+            .is_none());
+    }
+
+    #[test]
+    fn signal_source_reflects_suspend_and_resume_written_through_the_same_ledger() {
+        let path = temp_ledger_path("roundtrip");
+        let source = LedgerSignalSource::new(&path);
+
+        // Admit and signal through a direct `ProcessTable` handle on the same
+        // path, mirroring how the executor (reading) and the desktop/CLI/daemon
+        // (writing via `ProcessTable::signal`) are different processes sharing
+        // one file.
+        let ledger = RunLedger::open(&path).expect("ledger opens at the same path");
+        let table = ledger.process_table();
+        let record = admit(&table, ProcessKind::WorkflowRun, "wf-run-1");
+        assert_eq!(
+            source
+                .signal_intent(ProcessKind::WorkflowRun, "wf-run-1")
+                .expect("row exists once admitted"),
+            SignalIntent::default(),
+            "a freshly admitted process has no latched intent"
+        );
+
+        table
+            .signal(&record.process_id, ProcessSignal::Suspend, None, T0)
+            .expect("suspend is honoured for a workflow run");
+        assert!(
+            source
+                .signal_intent(ProcessKind::WorkflowRun, "wf-run-1")
+                .expect("row still exists")
+                .suspend_requested,
+            "the read port should see the suspend latch written by another handle"
+        );
+
+        table
+            .signal(&record.process_id, ProcessSignal::Resume, None, T0)
+            .expect("resume is honoured for a workflow run");
+        assert!(
+            !source
+                .signal_intent(ProcessKind::WorkflowRun, "wf-run-1")
+                .expect("row still exists")
+                .suspend_requested,
+            "resume should clear the latch as seen through the read port too"
+        );
     }
 }

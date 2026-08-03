@@ -36,6 +36,7 @@ use crate::package_ecosystem::{
 };
 use crate::process_table::{
     ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessProjector, ProcessState,
+    SignalSource,
 };
 use crate::workflow_core::{
     adapt_legacy_recipe, compile_workflow, plan_replay, reconcile_node, DaemonCapability,
@@ -1816,6 +1817,11 @@ pub struct WorkflowService {
     /// every unit test construct this service without a ledger, and a workflow
     /// must still run there.
     process_projector: Option<Arc<dyn ProcessProjector>>,
+    /// Read-side twin of `process_projector`: lets a running workflow ask the
+    /// process table whether it has been asked to pause, at its own level
+    /// boundary. Same "port, not a ledger handle" reasoning and the same
+    /// `None` meaning "no signal delivery" for a bare checkout or a unit test.
+    signal_source: Option<Arc<dyn SignalSource>>,
 }
 
 #[derive(Clone)]
@@ -1994,6 +2000,7 @@ impl WorkflowService {
             trigger_registrar,
             approval_broker: None,
             process_projector: None,
+            signal_source: None,
         })
     }
 
@@ -2004,6 +2011,14 @@ impl WorkflowService {
     /// a caller without a ledger simply does not call this.
     pub fn with_process_projector(mut self, projector: Arc<dyn ProcessProjector>) -> Self {
         self.process_projector = Some(projector);
+        self
+    }
+
+    /// Attaches the unified process table as a source of pause/stop intent,
+    /// read at each level boundary. Builder-style for the same reason as
+    /// [`Self::with_process_projector`].
+    pub fn with_signal_source(mut self, source: Arc<dyn SignalSource>) -> Self {
+        self.signal_source = Some(source);
         self
     }
 
@@ -2233,6 +2248,8 @@ impl WorkflowService {
             self.node_executor.as_ref(),
             self.clock.as_ref(),
         )
+        .with_signal_source(self.signal_source.as_deref())
+        .with_process_projector(self.process_projector.as_deref())
         .replay(&ir, request.clone(), &source, &plan, &cancel);
         lock(&self.cancellations, "workflow cancellations")?.remove(&request.run_id);
         let history = result?;
@@ -2372,6 +2389,8 @@ impl WorkflowService {
             self.node_executor.as_ref(),
             self.clock.as_ref(),
         )
+        .with_signal_source(self.signal_source.as_deref())
+        .with_process_projector(self.process_projector.as_deref())
         .run(&ir, request.clone(), &cancel);
         lock(&self.cancellations, "workflow cancellations")?.remove(&request.run_id);
         let history = result?;
@@ -2605,6 +2624,7 @@ fn sync_directory(path: &Path) -> Result<(), M4ServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_table::SignalIntent;
     use crate::mcp_app_core::{
         DeclaredHostAction, HostActionKind, OAuthCodeExchangeRequest, OAuthRefreshRequest,
         OAuthTokenSet, PkceMaterial, SecretMaterial, SecretReference,
@@ -3507,11 +3527,17 @@ mod tests {
         assert_eq!(history.status, WorkflowRunStatus::Succeeded);
 
         let runs = projector.of_kind(ProcessKind::WorkflowRun);
-        assert_eq!(runs.len(), 1, "the run is projected exactly once per append");
-        assert_eq!(runs[0].external_id, "projected-run-1");
-        assert_eq!(runs[0].state, ProcessState::Exited);
         assert_eq!(
-            runs[0].exit.as_ref().map(|exit| exit.status),
+            runs.len(),
+            2,
+            "the run is projected eagerly at start (running) and again at completion (exited)"
+        );
+        assert_eq!(runs[0].external_id, "projected-run-1");
+        assert_eq!(runs[0].state, ProcessState::Running);
+        assert_eq!(runs[1].external_id, "projected-run-1");
+        assert_eq!(runs[1].state, ProcessState::Exited);
+        assert_eq!(
+            runs[1].exit.as_ref().map(|exit| exit.status),
             Some(ExitStatus::Succeeded)
         );
 
@@ -3533,6 +3559,57 @@ mod tests {
             );
             assert!(node.exit.is_some(), "a finished node must carry an exit");
         }
+    }
+
+    /// Records every lookup instead of consulting a real ledger — proves the
+    /// port is reached, not what it returns.
+    #[derive(Default)]
+    struct RecordingSignalSource {
+        seen: Mutex<Vec<(ProcessKind, String)>>,
+    }
+
+    impl SignalSource for RecordingSignalSource {
+        fn signal_intent(&self, kind: ProcessKind, external_id: &str) -> Option<SignalIntent> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((kind, external_id.to_string()));
+            None
+        }
+    }
+
+    #[test]
+    fn with_signal_source_threads_through_the_service_into_the_executor() {
+        let directory = TempDirectory::new("workflow-signal-source");
+        let signal_source = Arc::new(RecordingSignalSource::default());
+        let service =
+            workflow_service(&directory.0, None, BTreeSet::new()).with_signal_source(signal_source.clone());
+
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+        let history = service
+            .run_workflow(
+                &definition.workflow_id,
+                WorkflowRunRequest {
+                    run_id: "signal-source-run".to_string(),
+                    inputs: BTreeMap::new(),
+                    secret_bindings: BTreeMap::new(),
+                    trigger: WorkflowTrigger::Manual,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
+
+        let seen = signal_source.seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(kind, id)| *kind == ProcessKind::WorkflowRun && id == "signal-source-run"),
+            "the executor should have consulted the signal source for this run's own id: {seen:?}"
+        );
     }
 
     #[test]

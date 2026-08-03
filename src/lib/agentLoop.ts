@@ -68,6 +68,7 @@ import { useStackStore, type StackQueryResult } from '../store/stackStore';
 import { useMcpStore } from '../store/mcpStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, exitStatusFor, markProcessRunning, reconcileProcess } from './processTable';
+import { honourPause, forgetPause } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
   gatePrivacyWireMessages,
@@ -1479,6 +1480,11 @@ export function toMessageContent(text: string, images: ResolvedImage[]): string 
 const turnControllers = new Map<string, AbortController>();
 const externallyRequestedCancellations = new Set<string>();
 const cancellationDisposers = new Map<AbortController, Array<() => void>>();
+/** This turn's process-table id, keyed by turn id — set once `admitProcess`
+ * resolves in `runAgentTurn`, read by `runAgentTurnBody`'s round-boundary
+ * pause checks so `honourPause` can mark the process `suspended`/`running`
+ * around the wait. */
+const chatTurnProcesses = new Map<string, string>();
 
 function registerDurableController(runId: string, controller: AbortController): void {
   const dispose = registerRunCancellation(runId, () => {
@@ -1565,7 +1571,10 @@ export async function runAgentTurn(
       useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.personaId ??
       null,
   });
-  if (processId) await markProcessRunning(processId);
+  if (processId) {
+    await markProcessRunning(processId);
+    chatTurnProcesses.set(turnId, processId);
+  }
   let turnError: unknown;
   try {
     const mutationRequired = requiresWorkspaceMutation(
@@ -1632,6 +1641,8 @@ export async function runAgentTurn(
     cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
     cancellationDisposers.delete(controller);
     externallyRequestedCancellations.delete(turnId);
+    chatTurnProcesses.delete(turnId);
+    forgetPause(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
@@ -2662,6 +2673,7 @@ async function runAgentTurnBody(
   let verifyRound = 0;
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
     // Stop button fired while a tool call was executing (between model
     // round trips, where there's no stream to abort) — don't start another.
     if (signal?.aborted) return;
@@ -3156,6 +3168,7 @@ async function runAgentTurnBody(
       }
     }
 
+    if (signal) await honourPause(turnId, chatTurnProcesses.get(turnId) ?? null, signal);
     if (signal?.aborted) return;
 
     // Loop again: the model gets the tool results appended to its history.

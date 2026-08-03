@@ -199,6 +199,9 @@ mod tools;
 // Long-running agent shell commands that outlive the turn that started them
 // (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
 pub mod background_shell;
+// Real OS suspend/resume of a process group this app owns, shared by the
+// daemon's job runner and by `background_shell.rs`.
+pub mod os_signal;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
@@ -366,6 +369,20 @@ pub struct AppState {
     /// the other pane's turn is still running.
     pub tool_cancel:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>,
+    /// Process-group ids of the foreground `tool_run_shell` children each turn
+    /// currently owns, keyed the same way `tool_cancel` is (the owning turn's
+    /// id, empty string for callers that don't thread one).
+    ///
+    /// This is what makes suspending a chat turn honest. The turn's own
+    /// cooperative pause only lands at the loop's next safe point, so a
+    /// twenty-minute `run_shell` would otherwise keep burning CPU for twenty
+    /// minutes after the user asked for a pause. Suspending the turn SIGSTOPs
+    /// these groups immediately, and resuming SIGCONTs them — see
+    /// `process_commands::process_signal`. Entries are removed the moment the
+    /// child is reaped, so a pid is never signalled after the kernel could
+    /// have reused it.
+    pub shell_process_groups:
+        std::sync::Mutex<std::collections::HashMap<String, tools::TurnShellGroups>>,
     /// Serializes `memories.json` read-modify-write cycles (see `memory.rs`)
     /// so two concurrent split-pane `tool_remember` calls can never race and
     /// clobber each other's fact — the whole file is rewritten on every add
@@ -596,6 +613,7 @@ impl Default for AppState {
             checkpoints: Default::default(),
             checkpoint_locks: Default::default(),
             tool_cancel: Default::default(),
+            shell_process_groups: Default::default(),
             memory_lock: Default::default(),
             mcp_config_lock: Default::default(),
             connectors_config_lock: Default::default(),

@@ -12,7 +12,16 @@
  * members, `cancelSubagentRun`, `cancelSideTask`, `background_shell_kill`,
  * `m4_workflows_cancel`. None of them is replaced. All this does is map a latched
  * intent onto the one that belongs to that kind, which is the same shape
- * `run_request_cancellation` → `cancelRegisteredRun` already proved.
+ * `run_request_cancellation` → `cancelRegisteredRun` already proved. The same
+ * holds for suspend/resume: `pauseRegistry` for the cooperative kinds, the side
+ * task store's own latch for side tasks, and nothing at all for the two kinds
+ * Rust delivers to itself — see {@link deliverPause}.
+ *
+ * The pause half is where "delivered" and "arrived" come apart, and the split is
+ * deliberate. A cooperative loop only parks at its next round boundary, so a
+ * latched-but-not-yet-parked process stays `running` with `suspendRequested`
+ * set — the derived `pause_pending` the Processes panel renders. Reporting
+ * `suspended` at delivery time would claim a park that has not happened.
  *
  * Two triggers, because one is not enough:
  *
@@ -34,6 +43,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { cancelRegisteredRun } from "./runCancellationRegistry";
 import { cancelSubagentRun } from "./subagent";
 import { cancelSideTask, pauseSideTask, resumeSideTask } from "./sideTaskRunner";
+import { isPauseRequested, setPauseRequested } from "./pauseRegistry";
 import { type ProcessKind, type ProcessRecord, pendingProcessSignals } from "./processTable";
 
 /**
@@ -75,6 +85,12 @@ const WINDOW_LOCAL_KINDS: readonly ProcessKind[] = [
  * child. The main window is that one (see `App.tsx`).
  */
 const PROCESS_GLOBAL_KINDS: readonly ProcessKind[] = ["background_shell", "workflow_run"];
+
+/**
+ * Kinds whose park is held in `pauseRegistry` rather than reflected in the
+ * record's own `state` until the loop actually reaches a safe point.
+ */
+const COOPERATIVE_PAUSE_KINDS: readonly ProcessKind[] = ["chat_turn", "subagent", "crew_member"];
 
 /** Every kind the desktop can deliver to, and therefore the sweep's scope. */
 export const DESKTOP_DELIVERABLE_KINDS: readonly ProcessKind[] = [
@@ -127,6 +143,15 @@ function pendingSignal(
     // rather than failing a transition forever.
     return record.state === "running" ? "suspend" : "too-early";
   }
+  // For a cooperative kind, the DB state is NOT the acknowledgement of a
+  // resume. The park lives in `pauseRegistry`, and a resume that lands before
+  // the loop reached its safe point clears `suspendRequested` while the record
+  // is still `running` — so the rule above would report nothing pending, the
+  // registry would stay latched, and the loop would park at its next checkpoint
+  // and never wake. A map lookup, no IPC.
+  if (COOPERATIVE_PAUSE_KINDS.includes(record.kind) && isPauseRequested(record.externalId)) {
+    return "resume";
+  }
   return record.state === "suspended" ? "resume" : null;
 }
 
@@ -161,10 +186,13 @@ async function deliverStop(record: ProcessRecord): Promise<ProcessSignalDelivery
     case "workflow_run":
       if (!isTauri()) return "no-live-target";
       try {
-        // `false` is meaningful rather than a failure: the run is absent from
-        // `WorkflowService`'s in-memory registry, which is exactly the
-        // out-of-process hole K2 still lists as open. Naming it `no-live-target`
-        // keeps that visible instead of reporting a stop that did not happen.
+        // `false` no longer means the stop was lost. The executor reads
+        // `stop_requested` from the durable latch at each level boundary
+        // (`SignalSource`), so a run absent from `WorkflowService`'s in-memory
+        // registry — the daemon-hosted case — still winds down; this call is
+        // the fast path for a run this process does hold. `no-live-target`
+        // records which of the two happened rather than claiming an in-process
+        // cancel that did not occur.
         const cancelled = await invoke<boolean>("m4_workflows_cancel", {
           runId: record.externalId,
         });
@@ -204,18 +232,60 @@ export async function deliverProcessSignal(
   if (processGlobal && !options.ownsGlobalKinds) return "delivered-elsewhere";
 
   if (signal === "stop") return deliverStop(record);
+  return deliverPause(record, signal);
+}
 
-  // Suspend and resume exist for exactly one desktop kind. `signal_support`
-  // refuses them for the rest, so `process_signal` rejects the request before it
-  // ever reaches a latch — this branch is unreachable for other kinds, and says
-  // so rather than guessing at a pause point that does not exist.
-  if (record.kind !== "side_task") return "no-primitive";
-  if (signal === "suspend") {
-    pauseSideTask(record.externalId);
-    return "suspended";
+/**
+ * Delivers a suspend or resume to the kind's own pause mechanism.
+ *
+ * Three shapes, matching `ProcessKind::signal_support`'s three honoured
+ * families:
+ *
+ * - **Side tasks** keep their own pre-existing store-driven latch
+ *   (`waitUntilResumed`), so an incoming signal does exactly what that panel's
+ *   own Pause button does. Converging on it beats adding a second latch for one
+ *   kind, which is how a resume through one ends up leaving the other holding.
+ * - **Chat turns, subagents and crew members** are cooperative: the loop reads
+ *   `pauseRegistry` at its next round boundary. Latency is unbounded and
+ *   deliberately not hidden — the record stays `running` with
+ *   `suspendRequested` latched (`pause_pending`) until the loop actually parks.
+ * - **Background shells and workflow runs** are delivered on the Rust side —
+ *   real SIGSTOP for the former (`background_shell::deliver_os_signal`, called
+ *   inline by `process_signal`), a blocking wait at the level boundary for the
+ *   latter. Nothing for this module to do but say who did it.
+ */
+function deliverPause(
+  record: ProcessRecord,
+  signal: "suspend" | "resume",
+): ProcessSignalDelivery {
+  switch (record.kind) {
+    case "side_task":
+      if (signal === "suspend") {
+        pauseSideTask(record.externalId);
+        return "suspended";
+      }
+      resumeSideTask(record.externalId);
+      return "resumed";
+    case "chat_turn":
+    case "subagent":
+    case "crew_member":
+      // Keyed by `externalId` — the same id the loop admitted under and the
+      // same one `registerRunCancellation` uses, so no translation table.
+      if (signal === "suspend") {
+        setPauseRequested(record.externalId, true);
+        return "suspended";
+      }
+      // Clears the latch and wakes anyone parked on it. The entry itself is
+      // dropped by the loop's own teardown (`forgetPause`), which is the only
+      // place that knows the turn is actually over — a resume just means keep
+      // going, not that this process is finished.
+      setPauseRequested(record.externalId, false);
+      return "resumed";
+    default:
+      // `background_shell` and `workflow_run` — already delivered in Rust by
+      // the time this record was emitted.
+      return "delivered-elsewhere";
   }
-  resumeSideTask(record.externalId);
-  return "resumed";
 }
 
 /**

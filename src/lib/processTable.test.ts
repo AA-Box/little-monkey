@@ -36,7 +36,7 @@ vi.mock("./llamaClient", async (importOriginal) => {
 });
 
 import { runAgentTurn, stopTurn } from "./agentLoop";
-import { exitStatusFor, admitProcess, listProcesses } from "./processTable";
+import { admitProcess, exitStatusFor, listProcesses } from "./processTable";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useWorkspaceStore } from "../store/workspaceStore";
 import { usePermissionStore } from "../store/permissionStore";

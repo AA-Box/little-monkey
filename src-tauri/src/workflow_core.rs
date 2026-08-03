@@ -12,6 +12,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::process_table::{
+    ProcessKind, ProcessProjection, ProcessProjector, ProcessState, SignalSource,
+};
+
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
 pub const WORKFLOW_IR_VERSION: u32 = 1;
 pub const WORKFLOW_RUN_HISTORY_VERSION: u32 = 1;
@@ -1639,7 +1643,17 @@ struct NodeCompletion {
 pub struct HeadlessWorkflowExecutor<'a> {
     node_executor: &'a dyn WorkflowNodeExecutor,
     clock: &'a dyn WorkflowClock,
+    signal_source: Option<&'a dyn SignalSource>,
+    process_projector: Option<&'a dyn ProcessProjector>,
 }
+
+/// How often [`HeadlessWorkflowExecutor::run_internal`]'s level boundary
+/// re-checks a latched suspend while parked. Coarse on purpose: this call is
+/// synchronous and has no async runtime to hang a waiter off of, unlike the
+/// desktop loops' purely event-driven, zero-poll pause delivery — polling
+/// here is justified because the level boundary is already a coarse blocking
+/// point, not a per-round hot path.
+const WORKFLOW_PAUSE_POLL_INTERVAL_MS: u64 = 500;
 
 struct WorkflowRunFinishGuard<'a> {
     executor: &'a dyn WorkflowNodeExecutor,
@@ -1657,7 +1671,25 @@ impl<'a> HeadlessWorkflowExecutor<'a> {
         Self {
             node_executor,
             clock,
+            signal_source: None,
+            process_projector: None,
         }
+    }
+
+    /// Attaches a read of the process table's pause/stop intent, consulted at
+    /// each level boundary. `None` (the default) means no pause delivery —
+    /// every existing test construction is unaffected.
+    pub fn with_signal_source(mut self, source: Option<&'a dyn SignalSource>) -> Self {
+        self.signal_source = source;
+        self
+    }
+
+    /// Attaches a sink for the run's own `Running`/`Suspended` state as the
+    /// pause loop actually parks and resumes it. `None` (the default) means
+    /// no projection — unaffected existing behaviour.
+    pub fn with_process_projector(mut self, projector: Option<&'a dyn ProcessProjector>) -> Self {
+        self.process_projector = projector;
+        self
     }
 
     pub fn run(
@@ -1698,6 +1730,17 @@ impl<'a> HeadlessWorkflowExecutor<'a> {
         validate_run_request(ir, &request)?;
         if cancel.is_cancelled() {
             return Err(WorkflowError::Cancelled);
+        }
+        // Eager, so a pause requested before this run finishes has a legal row
+        // to move `Running -> Suspended` on — without this the run stays
+        // invisible in the process table until `append_history`'s final
+        // projection, and `Admitted -> Suspended` is not a legal transition.
+        if let Some(projector) = self.process_projector {
+            let _ = projector.project(&ProcessProjection::new(
+                ProcessKind::WorkflowRun,
+                request.run_id.clone(),
+                ProcessState::Running,
+            ));
         }
         let _finish_guard = WorkflowRunFinishGuard {
             executor: self.node_executor,
@@ -1762,6 +1805,72 @@ impl<'a> HeadlessWorkflowExecutor<'a> {
                     self.clock.now_unix_ms(),
                 );
                 return Ok(history);
+            }
+            // The level boundary is this run's safe point for both durable
+            // signals. Polls rather than waiting on an event because this call
+            // is synchronous with no async runtime to hang a waiter off of —
+            // see `WORKFLOW_PAUSE_POLL_INTERVAL_MS`. `sleep_ms` itself wakes
+            // early on cancellation, so an in-process Stop still wins
+            // immediately even while parked.
+            if let Some(source) = self.signal_source {
+                let mut parked = false;
+                loop {
+                    let intent = source.signal_intent(ProcessKind::WorkflowRun, &request.run_id);
+                    let stop_requested = intent.is_some_and(|intent| intent.stop_requested);
+                    // A durable stop raised by *another* process. `cancel`
+                    // only carries a stop raised inside this one, which is why
+                    // a daemon-hosted run used to be uncancellable from the
+                    // desktop at all (`WorkflowService::cancel` returns false
+                    // for a run absent from its in-memory registry). Checked
+                    // before the pause below, and re-checked on every poll, so
+                    // a stop asked for while suspended is never swallowed by
+                    // the park — the two latches are independent.
+                    if stop_requested || cancel.is_cancelled() {
+                        finish_history(
+                            &mut history,
+                            WorkflowRunStatus::Cancelled,
+                            self.clock.now_unix_ms(),
+                        );
+                        return Ok(history);
+                    }
+                    if !intent.is_some_and(|intent| intent.suspend_requested) {
+                        break;
+                    }
+                    if !parked {
+                        if let Some(projector) = self.process_projector {
+                            let _ = projector.project(&ProcessProjection::new(
+                                ProcessKind::WorkflowRun,
+                                request.run_id.clone(),
+                                ProcessState::Suspended,
+                            ));
+                        }
+                        parked = true;
+                    }
+                    if self
+                        .clock
+                        .sleep_ms(WORKFLOW_PAUSE_POLL_INTERVAL_MS, cancel)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                if parked {
+                    if let Some(projector) = self.process_projector {
+                        let _ = projector.project(&ProcessProjection::new(
+                            ProcessKind::WorkflowRun,
+                            request.run_id.clone(),
+                            ProcessState::Running,
+                        ));
+                    }
+                }
+                if cancel.is_cancelled() {
+                    finish_history(
+                        &mut history,
+                        WorkflowRunStatus::Cancelled,
+                        self.clock.now_unix_ms(),
+                    );
+                    return Ok(history);
+                }
             }
             if self.clock.now_unix_ms().saturating_sub(started) > ir.budgets.maximum_wall_time_ms {
                 finish_history(
@@ -2687,6 +2796,7 @@ fn bounded_loop_fixture() -> WorkflowCoreFixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_table::SignalIntent;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -3332,5 +3442,212 @@ mod tests {
         )
         .is_err());
         validate_triggers(&webhook, &BTreeSet::from([DaemonCapability::SignedWebhook])).unwrap();
+    }
+
+    /// A [`SignalSource`] that reports `suspend_requested: true` for exactly
+    /// `remaining_true` polls, then `false` forever after — deterministic
+    /// stand-in for "another process resumed this run partway through,"
+    /// without any real threads or wall-clock timing (`TestClock::sleep_ms`
+    /// advances a virtual clock synchronously rather than actually sleeping).
+    #[derive(Default)]
+    struct FlagSignalSource {
+        remaining_true: AtomicUsize,
+        poll_count: AtomicUsize,
+    }
+
+    impl FlagSignalSource {
+        fn new(remaining_true: usize) -> Self {
+            Self {
+                remaining_true: AtomicUsize::new(remaining_true),
+                poll_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SignalSource for FlagSignalSource {
+        fn signal_intent(&self, _kind: ProcessKind, _external_id: &str) -> Option<SignalIntent> {
+            self.poll_count.fetch_add(1, Ordering::SeqCst);
+            let remaining = self.remaining_true.load(Ordering::SeqCst);
+            if remaining == 0 {
+                return Some(SignalIntent::default());
+            }
+            self.remaining_true.fetch_sub(1, Ordering::SeqCst);
+            Some(SignalIntent {
+                stop_requested: false,
+                suspend_requested: true,
+            })
+        }
+    }
+
+    /// A [`SignalSource`] that always reports suspended, and cancels a shared
+    /// token after `remaining_true` polls — deterministic stand-in for "the
+    /// user pressed Stop while this run was parked."
+    struct CancelWhileParkedSignalSource {
+        remaining_true: AtomicUsize,
+        cancel: CancellationToken,
+    }
+
+    impl SignalSource for CancelWhileParkedSignalSource {
+        fn signal_intent(&self, _kind: ProcessKind, _external_id: &str) -> Option<SignalIntent> {
+            if self.remaining_true.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.cancel.cancel();
+            }
+            Some(SignalIntent {
+                stop_requested: false,
+                suspend_requested: true,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSignalProjector {
+        seen: Mutex<Vec<ProcessProjection>>,
+    }
+
+    impl ProcessProjector for RecordingSignalProjector {
+        fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+            self.seen.lock().unwrap().push(projection.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cooperative_pause_blocks_at_a_level_boundary_and_projects_suspended_then_running() {
+        let fixture = prompt_fixture();
+        let ir = compile_fixture(&fixture);
+        let adapter = FixtureExecutor::new(TestBehavior::Normal, None);
+        let clock = TestClock::at(1_000);
+        let signal_source = FlagSignalSource::new(3);
+        let projector = RecordingSignalProjector::default();
+
+        let history = HeadlessWorkflowExecutor::new(&adapter, &clock)
+            .with_signal_source(Some(&signal_source))
+            .with_process_projector(Some(&projector))
+            .run(&ir, run_request("pause-run"), &CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
+        // 3 `true` polls each advance the virtual clock by one interval before
+        // the 4th (`false`) poll lets the level proceed.
+        assert_eq!(clock.now_unix_ms(), 1_000 + 3 * WORKFLOW_PAUSE_POLL_INTERVAL_MS);
+        assert_eq!(signal_source.poll_count.load(Ordering::SeqCst), 4);
+
+        let states: Vec<ProcessState> = projector
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|projection| projection.kind == ProcessKind::WorkflowRun)
+            .map(|projection| projection.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ProcessState::Running,   // eager, at run start
+                ProcessState::Suspended, // parked at the level boundary
+                ProcessState::Running,   // resumed once the latch cleared
+            ],
+            "expected eager-running, then parked, then resumed; got {states:?}"
+        );
+    }
+
+    #[test]
+    fn cooperative_pause_lets_stop_win_immediately_even_while_parked() {
+        let fixture = prompt_fixture();
+        let ir = compile_fixture(&fixture);
+        let adapter = FixtureExecutor::new(TestBehavior::Normal, None);
+        let cancel = CancellationToken::new();
+        let signal_source = CancelWhileParkedSignalSource {
+            remaining_true: AtomicUsize::new(2),
+            cancel: cancel.clone(),
+        };
+
+        let history = HeadlessWorkflowExecutor::new(&adapter, &TestClock::at(1_000))
+            .with_signal_source(Some(&signal_source))
+            .run(&ir, run_request("pause-then-stop-run"), &cancel)
+            .unwrap();
+
+        assert_eq!(
+            history.status,
+            WorkflowRunStatus::Cancelled,
+            "a stop requested while parked must win immediately, not wait for resume"
+        );
+        assert_eq!(adapter.call_count("prompt"), 0, "the node must never have run");
+    }
+
+    /// A [`SignalSource`] serving a fixed intent — the durable latch as another
+    /// process (the CLI, the daemon, another window) would have written it.
+    struct FixedSignalSource(SignalIntent);
+
+    impl SignalSource for FixedSignalSource {
+        fn signal_intent(&self, _kind: ProcessKind, _external_id: &str) -> Option<SignalIntent> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn a_durable_stop_cancels_a_run_this_process_never_started() {
+        // The out-of-process cancel gap: `WorkflowService::cancel` only knows
+        // runs in its own in-memory registry, so a daemon-hosted run could not
+        // be stopped from the desktop at all. An uncancelled token plus a
+        // latched `stop_requested` is exactly that situation.
+        let fixture = prompt_fixture();
+        let ir = compile_fixture(&fixture);
+        let adapter = FixtureExecutor::new(TestBehavior::Normal, None);
+        let signal_source = FixedSignalSource(SignalIntent {
+            stop_requested: true,
+            suspend_requested: false,
+        });
+
+        let history = HeadlessWorkflowExecutor::new(&adapter, &TestClock::at(1_000))
+            .with_signal_source(Some(&signal_source))
+            .run(&ir, run_request("durable-stop-run"), &CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(history.status, WorkflowRunStatus::Cancelled);
+        assert_eq!(adapter.call_count("prompt"), 0, "the node must never have run");
+    }
+
+    #[test]
+    fn a_durable_stop_wins_over_a_durable_suspend_rather_than_parking_forever() {
+        // Both latches set at once: `resume` clears only the suspend latch, so
+        // a stop must never be swallowed by the park it arrives during.
+        let fixture = prompt_fixture();
+        let ir = compile_fixture(&fixture);
+        let adapter = FixtureExecutor::new(TestBehavior::Normal, None);
+        let clock = TestClock::at(1_000);
+        let signal_source = FixedSignalSource(SignalIntent {
+            stop_requested: true,
+            suspend_requested: true,
+        });
+
+        let history = HeadlessWorkflowExecutor::new(&adapter, &clock)
+            .with_signal_source(Some(&signal_source))
+            .run(&ir, run_request("stop-and-suspend-run"), &CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(history.status, WorkflowRunStatus::Cancelled);
+        assert_eq!(
+            clock.now_unix_ms(),
+            1_000,
+            "the run must not have slept a single poll interval before stopping"
+        );
+    }
+
+    #[test]
+    fn a_clear_latch_leaves_a_run_completely_unaffected() {
+        let fixture = prompt_fixture();
+        let ir = compile_fixture(&fixture);
+        let adapter = FixtureExecutor::new(TestBehavior::Normal, None);
+        let clock = TestClock::at(1_000);
+        let signal_source = FixedSignalSource(SignalIntent::default());
+
+        let history = HeadlessWorkflowExecutor::new(&adapter, &clock)
+            .with_signal_source(Some(&signal_source))
+            .run(&ir, run_request("clear-latch-run"), &CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(history.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(clock.now_unix_ms(), 1_000, "no polling sleep on the clear path");
     }
 }

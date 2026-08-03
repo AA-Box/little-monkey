@@ -72,6 +72,11 @@ export const BackgroundTasksPanel = lazy(() =>
     default: BackgroundTasksPanel,
   })),
 );
+export const ProcessesPanel = lazy(() =>
+  import("../components/Processes/ProcessesPanel").then(({ ProcessesPanel }) => ({
+    default: ProcessesPanel,
+  })),
+);
 export const GlobalSearch = lazy(() =>
   import("../components/Search/GlobalSearch").then(({ GlobalSearch }) => ({ default: GlobalSearch })),
 );

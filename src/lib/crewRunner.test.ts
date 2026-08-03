@@ -331,7 +331,14 @@ describe("Crew execution", () => {
   it("cancel-all aborts every outstanding member and never starts the coordinator", async () => {
     mocks.attemptStream.mockImplementation(async (...args: unknown[]) => {
       const signal = args[3] as AbortSignal;
+      // Mirrors `turnEngine.ts`'s own `abortedPromise`: check `aborted` before
+      // subscribing, since a listener added after the event already fired
+      // (e.g. cancellation lands before this mock is even invoked) never fires.
       return await new Promise<AttemptResult>((resolve) => {
+        if (signal.aborted) {
+          resolve(success(""));
+          return;
+        }
         signal.addEventListener("abort", () => resolve(success("")), { once: true });
       });
     });

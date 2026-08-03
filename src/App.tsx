@@ -1,7 +1,7 @@
 import { Suspense, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
+import { Activity, Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import ChatSessionList from "./components/Chat/ChatSessionList";
 import ChatWindow from "./components/Chat/ChatWindow";
@@ -91,6 +91,7 @@ import {
   OnboardingWizard,
   PermissionModal,
   PmCopilotPanel,
+  ProcessesPanel,
   ProductionDebuggingPanel,
   RedTeamLabPanel,
   ReviewPanel,
@@ -138,6 +139,7 @@ type RightTabKind =
   | "terminal"
   | "files"
   | "backgroundTasks"
+  | "processes"
   | "browser"
   | "sideTasks";
 
@@ -149,6 +151,7 @@ const RIGHT_TAB_KINDS: readonly RightTabKind[] = [
   "sideTasks",
   "files",
   "backgroundTasks",
+  "processes",
 ];
 
 const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
@@ -159,6 +162,7 @@ const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
   sideTasks: "App.sideTaskPaneTitle",
   files: "App.rightPanelWorkspace",
   backgroundTasks: "App.rightPanelBackgroundTasks",
+  processes: "App.rightPanelProcesses",
 };
 
 /** Null for a tab with no dedicated accelerator — the picker just omits the
@@ -174,6 +178,7 @@ const RIGHT_TAB_SHORTCUT_IDS: Record<
   sideTasks: "openSideTaskPane",
   files: "openFiles",
   backgroundTasks: "openBackgroundTasksPanel",
+  processes: null,
 };
 
 function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
@@ -191,6 +196,8 @@ function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
       return <Columns2 size={size} className={className} />;
     case "files":
       return <FolderTree size={size} className={className} />;
+    case "processes":
+      return <Activity size={size} className={className} />;
     default:
       return <ListTodo size={size} className={className} />;
   }
@@ -1379,6 +1386,8 @@ function App() {
                       />
                     ) : kind === "backgroundTasks" ? (
                       <BackgroundTasksPanel sessionId={activeSessionId} onClose={() => closeRightTab("backgroundTasks")} />
+                    ) : kind === "processes" ? (
+                      <ProcessesPanel onClose={() => closeRightTab("processes")} />
                     ) : (
                       <div className={`flex h-full flex-col ${workspacePanelOpen ? "w-full" : "w-12"}`}>
                         <div className="flex h-9 shrink-0 items-center justify-between gap-1 border-b border-border px-3">
@@ -1525,6 +1534,19 @@ function App() {
               {runningBackgroundTaskCount > 9 ? "9+" : runningBackgroundTaskCount}
             </span>
           )}
+        </IconButton>
+        {/* Deliberately its own toggle rather than a section inside Background
+            tasks: that panel is scoped to what THIS session started, while the
+            process table is every kind across every window, the daemon, and the
+            CLI — the two answer different questions. */}
+        <IconButton
+          size="sm"
+          variant={rightTabShowing("processes") ? "active" : "ghost"}
+          onClick={() => toggleRightTab("processes")}
+          aria-label={rightTabShowing("processes") ? t("App.closeProcesses") : t("App.openProcesses")}
+          title={rightTabShowing("processes") ? t("App.closeProcesses") : t("App.openProcesses")}
+        >
+          <Activity size={15} />
         </IconButton>
         {/* Only present while the right region has something to fullscreen
             — mirrors the reference layout, where this button appears
