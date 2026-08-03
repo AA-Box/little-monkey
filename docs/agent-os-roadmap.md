@@ -430,19 +430,27 @@ delivers to itself` asserted `background_shell` defers) and failed the moment th
 code was fixed. It is rewritten rather than deleted: that assertion is why the
 assumption survived review.
 
-- **The Processes panel does not repaint on a CLI-originated signal.** Found by
-  hand, not by a test, and it is the same structural gap the delivery path
-  already documents one layer down: the store live-updates only from
-  `processes://changed` (`processStore.ts`), and the panel otherwise refreshes on
-  mount and on its own button (`ProcessesPanel.tsx`). `monkey processes signal`
-  writes SQLite from another OS process and cannot emit a Tauri event, so a row
-  suspended or resumed from the CLI keeps rendering its previous state, with its
-  age frozen, until something remounts the panel or the user hits refresh. The
-  2s `process_pending_signals` sweep does not help — it exists to *deliver*
-  intent to the kinds that own a loop, not to repaint a view. The fix is the
-  same shape as that sweep: a poll (or a store-level catch-up) behind the panel
-  while it is open. Not bundled here because it is a UI concern with its own
-  cost/refresh-rate tradeoff, and the durable state was correct throughout.
+- **The Processes panel did not repaint on a CLI-originated signal — now fixed.**
+  Found by hand, not by a test. The store live-updated only from
+  `processes://changed`, and `monkey processes signal` writes SQLite from
+  another OS process, so it cannot emit a Tauri event into the app: a row
+  suspended or resumed from the CLI kept rendering its previous state, with its
+  age frozen, until something remounted the panel. The durable state was
+  correct throughout; only the view lied. Polling is the only mechanism that
+  crosses a process boundary, so an open panel now runs `processStore.catchUp`
+  on the same 2s cadence as the `process_pending_signals` sweep — reading
+  faster would only render a latch sooner than the loop can act on it. It is
+  deliberately not `refresh`: it never toggles `loading`, it returns the state
+  object unchanged when the listing is unchanged (zustand's documented no-op,
+  so a quiet poll re-renders nothing), it compares every field the row draws
+  rather than trusting `updated_at_ms` (a signal writes that column from its
+  own timestamp, so two signals in one millisecond share a stamp), it stands
+  down while a signal is in flight, and it swallows read failures rather than
+  flashing a banner every tick. The same timer ticks a clock the rows age off,
+  which is a separate concern: the age is `Date.now()` at render, so it would
+  freeze on an idle panel even with a perfectly current listing. Verified by
+  hand, driving the app only from a terminal: `Running → Pausing` (carrying the
+  CLI's reason text) `→ Running → gone`, age advancing 10s → 32s → 54s.
 - **Manual round-trip: all seven kinds done.** Every signal below was sent
   with `monkey processes signal` from a *separate OS process* against a live
   desktop runtime or daemon — the durable-latch claim exercised for real rather
