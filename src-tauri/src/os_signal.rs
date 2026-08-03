@@ -7,6 +7,9 @@
 //! backgrounded `run_shell` command instead of duplicating the cfg'd
 //! shell-out pair.
 
+// Only the Windows path shells out now that unix signals through `killpg`;
+// the unix tests still spawn a real child to signal.
+#[cfg(any(windows, test))]
 use std::process::Command;
 
 pub fn suspend_process_group(pid: u32) -> Result<(), String> {
@@ -15,6 +18,30 @@ pub fn suspend_process_group(pid: u32) -> Result<(), String> {
 
 pub fn resume_process_group(pid: u32) -> Result<(), String> {
     signal_process_group(pid, false)
+}
+
+/// Terminates the group now, with no grace period.
+///
+/// The delivery a `kill` asks for and a `stop` does not. A cooperative stop
+/// sends TERM and gives the child time to wind down; this is what the caller
+/// gets when that promise is not good enough — a hung child that ignores TERM
+/// is exactly the case `kill` exists for.
+#[cfg(unix)]
+pub fn kill_process_group(pid: u32) -> Result<(), String> {
+    let group = i32::try_from(pid).map_err(|_| format!("Process id {pid} is not a valid pgid"))?;
+    if group <= 0 {
+        return Err(format!("Refusing to signal process group {group}"));
+    }
+    // Safe for the same reason as `signal_process_group` — two integers, no
+    // memory this owns, and a group id validated as positive above.
+    if unsafe { libc::killpg(group, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("Failed to kill process group {group}: {error}"))
 }
 
 /// Signals the process group led by `pid`.

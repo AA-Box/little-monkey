@@ -772,7 +772,9 @@ fn project_queue_origin(
     job_id: &str,
     run_id: &str,
 ) {
-    use little_monkey_lib::process_table::{ProcessKind, ProcessProjection, ProcessState};
+    use little_monkey_lib::process_table::{
+        ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
+    };
 
     let QueueOrigin::Remote { request_id } = origin else {
         return;
@@ -787,9 +789,28 @@ fn project_queue_origin(
         }
     };
 
+    // Closed in the same write that creates it, rather than left `running`.
+    //
+    // The request is what this row records, and the request is over: it was
+    // accepted and turned into a queued job. The work continues under that job,
+    // which is this row's child and has its own state, its own signals and its
+    // own restart policy. Projecting the request as `running` — which is what
+    // this did — left a row nothing would ever close, because no supervisor
+    // owns a request: not the engine tick, which sweeps `daemon_job` rows, and
+    // not the desktop reaper, which deliberately skips kinds it does not own.
+    // Every remote enqueue leaked one row that claimed to be live forever.
     let table = shared.process_table();
     if let Err(error) = table.reconcile(
-        &ProcessProjection::new(ProcessKind::RemoteRun, request_id, ProcessState::Running),
+        &ProcessProjection::exited(
+            ProcessKind::RemoteRun,
+            request_id,
+            ProcessExit {
+                status: ExitStatus::Succeeded,
+                code: None,
+                signal: None,
+                reason: Some("request accepted; the work continues as its daemon job".to_string()),
+            },
+        ),
         now_ms,
     ) {
         eprintln!("monkey daemon: could not project remote request {request_id}: {error}");
@@ -801,10 +822,19 @@ fn project_queue_origin(
 
     // Created with the parent edge before the engine's own tick reconciles this
     // job: whoever gets there first admits, and the tick then only moves state.
+    //
+    // Attempt 0 is not a guess. The only caller runs immediately after
+    // `insert_preparing` for a job id that `enqueue` has already established is
+    // new — an id that resolves to an existing job returns before reaching here
+    // — so this job has not started, let alone retried.
     if let Err(error) = table.reconcile(
-        &ProcessProjection::new(ProcessKind::DaemonJob, job_id, ProcessState::Admitted)
-            .with_parent(ProcessKind::RemoteRun, request_id)
-            .with_run(Some(run_id.to_string())),
+        &ProcessProjection::new(
+            ProcessKind::DaemonJob,
+            engine::process_external_id(job_id, 0),
+            ProcessState::Admitted,
+        )
+        .with_parent(ProcessKind::RemoteRun, request_id)
+        .with_run(Some(run_id.to_string())),
         now_ms,
     ) {
         eprintln!("monkey daemon: could not project remote job {job_id}: {error}");
@@ -2031,6 +2061,90 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
+
+    #[test]
+    fn a_remote_request_is_lineage_and_is_never_left_claiming_to_run() {
+        use little_monkey_lib::process_table::{
+            ExitStatus, ProcessFilter, ProcessKind, ProcessState,
+        };
+        use little_monkey_lib::run_ledger::RunLedger;
+
+        // The regression: `project_queue_origin` wrote this row as `running`,
+        // and nothing anywhere ever closed it. The engine tick sweeps
+        // `daemon_job` rows; the desktop reaper skips kinds it does not own.
+        // Every remote enqueue therefore leaked a row asserting live work.
+        let root =
+            std::env::temp_dir().join(format!("monkey_remote_origin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().unwrap();
+
+        // A real durable run: `agent_processes.run_id` is a foreign key, so the
+        // child's run link would be rejected against an invented id.
+        let run_id = "run-remoteorigin";
+        let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+        let (_recorder, _) = DurableRunRecorder::submit(
+            ledger,
+            &engine::tests::spec(run_id, 1_000),
+            "remote-origin-fixture".into(),
+        )
+        .unwrap();
+        let shared = SharedLedger::open(&paths.ledger_db).unwrap();
+
+        project_queue_origin(
+            &shared,
+            &QueueOrigin::Remote {
+                request_id: "req-remoteorigin".into(),
+            },
+            "job-remoteorigin",
+            run_id,
+        );
+
+        let table = shared.process_table();
+        let request = table
+            .find_by_external_id(ProcessKind::RemoteRun, "req-remoteorigin")
+            .unwrap()
+            .expect("a remote enqueue records the request");
+        assert_eq!(
+            request.state,
+            ProcessState::Exited,
+            "the request is over once it becomes a job; nothing supervises it"
+        );
+        assert_eq!(
+            request.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Succeeded),
+            "the request was accepted — the job carries whether the work succeeds"
+        );
+
+        // The lineage edge is the whole point of the row, and it has to resolve
+        // against a parent that is already closed.
+        let job = table
+            .find_by_external_id(
+                ProcessKind::DaemonJob,
+                &engine::process_external_id("job-remoteorigin", 0),
+            )
+            .unwrap()
+            .expect("the job is projected as the request's child");
+        assert_eq!(
+            job.parent_process_id.as_deref(),
+            Some(request.process_id.as_str())
+        );
+        assert!(!job.state.is_terminal(), "the work has not started yet");
+
+        let live = table
+            .list(&ProcessFilter {
+                kinds: vec![ProcessKind::RemoteRun],
+                live_only: true,
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert!(
+            live.is_empty(),
+            "a remote enqueue left a row claiming to be live: {live:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn user_run_key_is_hashed_into_job_id() {

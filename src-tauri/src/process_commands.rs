@@ -493,6 +493,103 @@ pub fn process_signal(
     Ok(record)
 }
 
+/// Bring a background shell's real OS state in line with its durable latch.
+///
+/// [`process_signal`] delivers the SIGSTOP/SIGCONT in the same call, which is
+/// right for a signal raised inside this app but covers only that origin. A
+/// `monkey processes signal` writes the latch from another OS process and exits;
+/// nothing in Rust runs on its behalf, and a background shell — unlike a
+/// workflow run, whose executor polls [`SignalSource`] at every level boundary,
+/// or a chat turn, whose loop checks its own registry — has no loop of its own
+/// to notice. Without this the desktop's catch-up sweep saw the latch, assumed
+/// Rust had already acted, and dropped it: the row said `suspend_requested` and
+/// the child kept running.
+///
+/// Deliberately delivery-only. It writes no intent, so the sweep that calls it
+/// cannot re-trigger itself through the event the write would emit, and calling
+/// it twice is a no-op. Direction comes from comparing the latch to the state,
+/// which is the same "state is the acknowledgement" rule the sweep's own
+/// predicate uses: a set latch on a row that is not yet `suspended` means
+/// suspend, a cleared latch on a row that still is means resume, and anything
+/// else means there is nothing to deliver.
+#[tauri::command]
+pub fn process_deliver_os_signal(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    process_id: String,
+) -> Result<Option<ProcessRecord>, String> {
+    let record = with_process_table(&app, state.inner(), |table| table.get(&process_id))?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if record.kind != ProcessKind::BackgroundShell {
+        return Ok(None);
+    }
+    let Some(signal) = owed_delivery(record.signal_intent.suspend_requested, record.state) else {
+        return Ok(None);
+    };
+
+    let delivered = crate::background_shell::deliver_os_signal(&app, state.inner(), &record, signal)
+        .unwrap_or(record);
+    notify(&app, &delivered);
+    Ok(Some(delivered))
+}
+
+/// Which OS signal, if any, a row's real state still owes its durable latch.
+///
+/// Split out from the command because it is the whole decision and the command
+/// around it needs an `AppHandle` to reach. `Exited` owes nothing in either
+/// direction — a reaped child cannot be stopped or continued, and asking would
+/// be signalling whatever pid the OS has since reused.
+fn owed_delivery(
+    suspend_requested: bool,
+    state: crate::process_table::ProcessState,
+) -> Option<crate::process_table::ProcessSignal> {
+    use crate::process_table::{ProcessSignal, ProcessState};
+    match (suspend_requested, state) {
+        (_, ProcessState::Exited) => None,
+        (true, ProcessState::Suspended) => None,
+        (true, _) => Some(ProcessSignal::Suspend),
+        (false, ProcessState::Suspended) => Some(ProcessSignal::Resume),
+        (false, _) => None,
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::owed_delivery;
+    use crate::process_table::{ProcessSignal, ProcessState};
+
+    #[test]
+    fn a_background_shell_owes_only_the_signal_its_state_disagrees_with() {
+        // Latched but not yet stopped: the CLI-originated case that used to be
+        // dropped on the floor.
+        assert_eq!(
+            owed_delivery(true, ProcessState::Running),
+            Some(ProcessSignal::Suspend)
+        );
+        assert_eq!(
+            owed_delivery(true, ProcessState::Admitted),
+            Some(ProcessSignal::Suspend)
+        );
+
+        // Un-latched but still stopped: the direction that stranded a child at
+        // `T` with nothing left to resume it.
+        assert_eq!(
+            owed_delivery(false, ProcessState::Suspended),
+            Some(ProcessSignal::Resume)
+        );
+
+        // Already agreeing — calling twice must not re-signal.
+        assert_eq!(owed_delivery(true, ProcessState::Suspended), None);
+        assert_eq!(owed_delivery(false, ProcessState::Running), None);
+
+        // Exited owes nothing either way; the pid may belong to someone else.
+        assert_eq!(owed_delivery(true, ProcessState::Exited), None);
+        assert_eq!(owed_delivery(false, ProcessState::Exited), None);
+    }
+}
+
 /// Every process with signal intent still waiting to be delivered.
 ///
 /// The catch-up read behind the `processes://changed` fast path. The event only
