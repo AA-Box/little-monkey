@@ -443,7 +443,7 @@ assumption survived review.
   same shape as that sweep: a poll (or a store-level catch-up) behind the panel
   while it is open. Not bundled here because it is a UI concern with its own
   cost/refresh-rate tradeoff, and the durable state was correct throughout.
-- **Manual round-trip: five of seven kinds done.** Every signal below was sent
+- **Manual round-trip: six of seven kinds done.** Every signal below was sent
   with `monkey processes signal` from a *separate OS process* against a live
   desktop runtime or daemon — the durable-latch claim exercised for real rather
   than simulated.
@@ -458,20 +458,27 @@ assumption survived review.
   - `side_task` — the full transition: `running` (pause_pending) at t+1s, then
     genuinely `suspended` at t+2s once the loop parked, and back to `running` on
     resume. The only kind observed making the whole journey by hand.
+  - `crew_member` — a member suspended mid-stream stayed honestly `running +
+    suspend_requested` until its model call returned, then went `suspended` at
+    the next safe point and made **no** further provider request while its
+    sibling ran on and exited; resume fired the next request immediately and put
+    the row back to `running`. The second kind observed making the whole journey
+    by hand.
   - `stop` was additionally verified from the CLI against a live chat turn,
     subagent and side task simultaneously.
-- **`crew_member` is blocked by a bug outside K2**, found while trying to verify
-  it. Every crew run fails before any member is admitted:
+- **Verifying `crew_member` first required fixing a bug outside K2.** Every crew
+  run with a workspace attached failed before any member was admitted:
   `invalid run protocol value: workspace.primary_root_id: must start and end
-  with an ASCII letter or digit`. `WorkspaceRoot::id` is documented as "the
-  canonicalized path string", and `workspaceToRunWire` passes it straight into
+  with an ASCII letter or digit`. `WorkspaceRootInfo.id` is documented as "the
+  canonicalized path string", and `workspaceToRunWire` passed it straight into
   `primary_root_id`, `roots[].root_id` and `repository_policy.root_id` — while
-  the sibling `workspace_id` on the same object *is* run through
+  the sibling `workspace_id` on the same object *was* run through
   `stableProtocolId`. A POSIX path starts with `/`, so `validate_protocol_id`
-  rejects it every time. Crew chats therefore cannot run at all with a workspace
-  attached, on any path, and the UI offers no way to detach one. Not fixed here:
-  it is run-protocol identity, not signals, and changing how root ids are
-  derived touches durable run records.
+  rejected it every time. Fixed by deriving all three with `stableProtocolId`;
+  the path is not lost, it travels beside the id in `canonical_path`, which is
+  what makes deriving the id safe. The fixture in `durableRun.test.ts` used
+  `root-1` — already id-shaped — which is exactly why nothing caught it; it now
+  uses a real path and asserts the shape of every id on the wire.
 - **`workflow_run` remains unverified by hand** — it needs a definition saved
   from the visual editor. It is the one kind whose pause is a Rust-side poll of
   `SignalSource` at each level boundary rather than a desktop-delivered latch,
