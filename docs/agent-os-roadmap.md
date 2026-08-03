@@ -443,7 +443,7 @@ assumption survived review.
   same shape as that sweep: a poll (or a store-level catch-up) behind the panel
   while it is open. Not bundled here because it is a UI concern with its own
   cost/refresh-rate tradeoff, and the durable state was correct throughout.
-- **Manual round-trip: six of seven kinds done.** Every signal below was sent
+- **Manual round-trip: all seven kinds done.** Every signal below was sent
   with `monkey processes signal` from a *separate OS process* against a live
   desktop runtime or daemon — the durable-latch claim exercised for real rather
   than simulated.
@@ -457,13 +457,22 @@ assumption survived review.
   - `subagent` — `pause_pending` with the reason carried through, then resumed.
   - `side_task` — the full transition: `running` (pause_pending) at t+1s, then
     genuinely `suspended` at t+2s once the loop parked, and back to `running` on
-    resume. The only kind observed making the whole journey by hand.
+    resume — the first kind observed making the whole journey by hand.
   - `crew_member` — a member suspended mid-stream stayed honestly `running +
     suspend_requested` until its model call returned, then went `suspended` at
     the next safe point and made **no** further provider request while its
     sibling ran on and exited; resume fired the next request immediately and put
-    the row back to `running`. The second kind observed making the whole journey
-    by hand.
+    the row back to `running`.
+  - `workflow_run` — the one kind whose pause is a Rust-side poll of
+    `SignalSource` rather than a desktop-delivered latch, and the only one
+    exercised against a run hosted in a *different process* from the signaller:
+    `monkey workflow run` in one terminal, `monkey processes signal` in
+    another, sharing nothing but the SQLite ledger. Suspended during level 0's
+    model call it stayed `running + suspend_requested`, parked `suspended` at
+    the level boundary, and level 1's model call did not fire for 80s; resume
+    fired it immediately and the run finished `succeeded` with 2 model calls.
+    This also exercises the eager start-of-run `Running` projection — without
+    it there is no row to transition `Suspended` from.
   - `stop` was additionally verified from the CLI against a live chat turn,
     subagent and side task simultaneously.
 - **Verifying `crew_member` first required fixing a bug outside K2.** Every crew
@@ -479,11 +488,6 @@ assumption survived review.
   what makes deriving the id safe. The fixture in `durableRun.test.ts` used
   `root-1` — already id-shaped — which is exactly why nothing caught it; it now
   uses a real path and asserts the shape of every id on the wire.
-- **`workflow_run` remains unverified by hand** — it needs a definition saved
-  from the visual editor. It is the one kind whose pause is a Rust-side poll of
-  `SignalSource` at each level boundary rather than a desktop-delivered latch,
-  which is exactly why the delivery fix above deliberately leaves it deferring.
-
 Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace
 root. Whether suspending releases them is a K7/K8 decision.
