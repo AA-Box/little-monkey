@@ -507,6 +507,15 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Move a job to `state`.
+    ///
+    /// `attempt` counts **attempts started**, so it moves only on the edge that
+    /// starts one: leaving the queue for `running`. It used to increment on every
+    /// arrival at `running`, which also caught resuming from `paused` and
+    /// returning from `waiting_approval` — neither of which is a new attempt.
+    /// That silently spent a job's retry budget: a job with `max_attempts: 3`
+    /// paused and resumed twice had no attempts left to fail with, and
+    /// `backoff_elapsed` charged it a retry backoff it had never earned.
     pub fn transition(
         &mut self,
         job_id: &str,
@@ -524,7 +533,9 @@ impl DaemonStore {
                      started_at_ms=CASE WHEN ?2='running' AND started_at_ms IS NULL THEN ?3 ELSE started_at_ms END,
                      finished_at_ms=CASE WHEN ?4=1 THEN ?3 ELSE finished_at_ms END,
                      process_id=?5,
-                     attempt=CASE WHEN ?2='running' THEN attempt + 1 ELSE attempt END,
+                     attempt=CASE
+                         WHEN ?2='running' AND state IN ('preparing','queued')
+                         THEN attempt + 1 ELSE attempt END,
                      last_error=COALESCE(?6, last_error)
                  WHERE job_id=?1",
                 params![

@@ -356,25 +356,34 @@ are worthless if the UI swallows them.
   for work that cannot come back is the dishonesty this table exists to remove.
   Restoring a live process is K13.
 
+**Also shipped — a retry is its own process.** A crash-injection test found a
+requeued daemon job's row stuck at `running` forever: recovery re-queues the
+job, `queued` projects as `admitted`, `running -> admitted` is illegal, and the
+projection failure is logged and swallowed — leaving a row indistinguishable
+from live work to every reader. The fix is the one the table's own model asked
+for: a `DaemonJob`'s `external_id` is now attempt-scoped (`<job id>#<attempt>`),
+so each attempt gets its own record, and the state machine keeps the backwards
+edge it was deliberately built to forbid. The superseded attempt is swept to
+`exited(failed)` carrying the error that triggered the retry, before its
+successor is admitted, so no reader ever sees two live rows for one job.
+
+Two things had to be true for that id to be stable, and one was not. `attempt`
+counts *starts*, but the store incremented it on every arrival at `running` —
+which also caught resuming from `paused` and returning from `waiting_approval`.
+That silently spent a job's retry budget (paused and resumed twice, a job with
+`max_attempts: 3` had none left to fail with) and would have moved a job's
+process row out from under it on a plain resume. It now moves only on the edge
+that starts an attempt: leaving the queue. The row's own attempt is therefore
+one behind the counter while that attempt runs, which is what `attempt_ordinal`
+encodes rather than reading the column raw.
+
 **Remaining:**
 
-- **A requeued daemon job's process row stays `running` forever.** Found by the
-  crash-injection test below, which is committed `#[ignore]`d rather than
-  deleted. After a crash, recovery re-queues the job; `queued` projects as
-  `admitted`; `running -> admitted` is an illegal transition, so the projection
-  fails, the error is logged and swallowed, and the row never leaves `running` —
-  indistinguishable from live work to every reader. The fix needs a decision
-  rather than a patch: a `DaemonJob`'s `external_id` is the job id, so a retry
-  cannot be a second process record (`UNIQUE(kind, external_id)`), yet the table
-  models *processes* and a retry genuinely is a new one. Either the id becomes
-  attempt-scoped, or the state machine admits a backwards edge it was
-  deliberately built to forbid. Now that restart policy is declared, this is the
-  first thing that has to be true for it to mean anything.
-- **A crash-injection test per surface** — the desktop-owned surfaces are
-  covered (every kind, including one suspended mid-pause, closes as
-  `exited(lost)`, and the sweep is idempotent). The daemon's is the ignored test
-  above. Workflow runs are not covered: they are not desktop-owned, so the
-  startup reaper deliberately leaves them alone, and nothing else sweeps them.
+- **Crash coverage for workflow runs.** The desktop-owned surfaces are covered
+  (every kind, including one suspended mid-pause, closes as `exited(lost)`, and
+  the sweep is idempotent), and the daemon's test above now runs. Workflow runs
+  are not: they are not desktop-owned, so the startup reaper deliberately leaves
+  them alone, and nothing else sweeps them.
 - **`remote_run` is still unverified** — no adopter writes those rows, so that
   row of the support matrix remains a claim about intent rather than about
   shipped code.

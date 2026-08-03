@@ -286,6 +286,57 @@ fn backoff_elapsed(job: &DaemonJob, now: u64) -> bool {
     now >= job.updated_at_ms.saturating_add(wait)
 }
 
+/// Which attempt of the job the row for its *current* state belongs to.
+///
+/// Not `job.attempt` directly, because that column counts **starts**: the store
+/// increments it on the transition into `running`, so a job that has never
+/// retried reads `0` while queued and `1` while running. Keying the process row
+/// off it raw would mint a fresh row every time a job merely started. What the
+/// row identifies is the attempt itself, which is one behind the counter once
+/// that attempt is underway, and equal to it while the next one is still
+/// waiting to start.
+///
+/// A `running` job with `attempt == 0` is not reachable through the store, but
+/// `saturating_sub` keeps a hand-edited or future-recovered row on attempt 0
+/// rather than panicking over it.
+fn attempt_ordinal(job: &DaemonJob) -> u32 {
+    match job.state {
+        // The attempt about to start.
+        JobState::Preparing | JobState::Queued => job.attempt,
+        // The attempt that started.
+        _ => job.attempt.saturating_sub(1),
+    }
+}
+
+/// The process-table identity of one attempt of a daemon job.
+///
+/// Attempt-scoped because `agent_processes` models *processes*, and a retry is a
+/// new one: a new spawn, a new pid, its own exit. The table enforces
+/// `UNIQUE(kind, external_id)` and `admit` refuses a second row under an id it
+/// already holds, so under a bare `job_id` a retry could never get its own row —
+/// it would keep reusing the first attempt's, which the state machine then
+/// refuses to move backwards from `running` to `admitted` when the job requeues.
+/// Scoping the id lets the retry be what it always was.
+pub(super) fn process_external_id(job_id: &str, attempt: u32) -> String {
+    format!("{job_id}#{attempt}")
+}
+
+/// Splits an external id back into `(job_id, attempt)`.
+///
+/// The attempt is `None` for a row that predates attempt scoping, and for a job
+/// id that happens to contain a `#` without a numeric tail — job ids are
+/// generated as `job-<uuid>` but `--job-id` lets a caller supply their own, so
+/// the suffix is only taken when it actually parses as an attempt number.
+fn split_external_id(external_id: &str) -> (&str, Option<u32>) {
+    match external_id.rsplit_once('#') {
+        Some((job_id, attempt)) => match attempt.parse::<u32>() {
+            Ok(attempt) => (job_id, Some(attempt)),
+            Err(_) => (external_id, None),
+        },
+        None => (external_id, None),
+    }
+}
+
 #[cfg(unix)]
 fn kill_process_group(process_id: u32) -> Result<(), String> {
     little_monkey_lib::os_signal::kill_process_group(process_id)
@@ -561,7 +612,10 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     continue;
                 }
                 let Some(record) = table
-                    .find_by_external_id(ProcessKind::DaemonJob, &job.job_id)
+                    .find_by_external_id(
+                        ProcessKind::DaemonJob,
+                        &process_external_id(&job.job_id, attempt_ordinal(job)),
+                    )
                     .map_err(|error| error.to_string())?
                 else {
                     continue;
@@ -607,13 +661,19 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
     fn sync_process_table_inner(&mut self, now: u64) -> Result<(), String> {
         use little_monkey_lib::process_table::{
-            ProcessExit, ProcessFilter, ProcessKind, ProcessLimits, ProcessProjection, ProcessState,
+            ExitStatus, ProcessExit, ProcessFilter, ProcessKind, ProcessLimits, ProcessProjection,
+            ProcessState,
         };
 
         let now_ms = i64::try_from(now).map_err(|_| "clock is beyond protocol bounds".to_string())?;
         let jobs = self.store.nonterminal_jobs()?;
 
-        let mut live_job_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Keyed by the attempt-scoped external id, not the job id: a job that has
+        // retried owns one row per attempt, and only the current one is live.
+        let live_external_ids: std::collections::HashSet<String> = jobs
+            .iter()
+            .map(|job| process_external_id(&job.job_id, attempt_ordinal(job)))
+            .collect();
 
         // Translate any durable signal intent recorded against this job's process
         // row into the daemon's own intent bits, which `tick_active` already
@@ -634,9 +694,70 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // extra read per tick on a connection already open.
         let table = self.shared.process_table();
 
-        for job in &jobs {
-            live_job_ids.insert(job.job_id.clone());
+        // The sweep runs before the projections below, not after, so a requeued
+        // job's superseded row is closed out before its successor is admitted.
+        // Both orders converge within the tick; this one never lets a reader
+        // observe two live rows for the same job.
+        //
+        // Anything this daemon still shows as live whose current attempt is not
+        // in the set above has finished — either the job went terminal, or it
+        // requeued and this row is the attempt that failed. Reading the job back
+        // gives the real outcome; a job pruned by retention before the
+        // projection caught up is `Lost`, which is the honest answer rather than
+        // a guessed success.
+        let live_records = table
+            .list(&ProcessFilter {
+                kinds: vec![ProcessKind::DaemonJob],
+                live_only: true,
+                ..ProcessFilter::default()
+            })
+            .map_err(|error| error.to_string())?;
 
+        for record in live_records {
+            if live_external_ids.contains(&record.external_id) {
+                continue;
+            }
+            let (job_id, attempt) = split_external_id(&record.external_id);
+            let exit = match self.store.get_job(job_id)? {
+                Some(job) if job.state.is_terminal() => {
+                    exit_for(job.state, job.last_error.as_deref())
+                }
+                // The job is still live, so this row is not the attempt it is
+                // living as. An attempt-scoped id means a real earlier attempt:
+                // it ran and failed, which is precisely why a later one exists,
+                // and `last_error` is the failure that triggered the retry.
+                Some(job) if attempt.is_some() => ProcessExit {
+                    status: ExitStatus::Failed,
+                    code: None,
+                    signal: None,
+                    reason: Some(job.last_error.clone().unwrap_or_else(|| {
+                        format!("superseded by attempt {}", attempt_ordinal(&job))
+                    })),
+                },
+                // No attempt in the id: a row written before attempt scoping.
+                // Nothing will ever update it again, and the one thing it must
+                // not do is keep claiming to be live.
+                Some(_) => ProcessExit {
+                    status: ExitStatus::Lost,
+                    code: None,
+                    signal: None,
+                    reason: Some(
+                        "process row predates attempt-scoped daemon job ids".to_string(),
+                    ),
+                },
+                None => ProcessExit {
+                    status: ExitStatus::Lost,
+                    code: None,
+                    signal: None,
+                    reason: Some("daemon job record is gone".to_string()),
+                },
+            };
+            table
+                .transition(&record.process_id, ProcessState::Exited, Some(exit), now_ms)
+                .map_err(|error| error.to_string())?;
+        }
+
+        for job in &jobs {
             // One `reconcile` call rather than a hand-rolled
             // find-or-admit-then-transition: the run id is allocated after the
             // job row exists (`mark_queued`) and the ledger enforces foreign
@@ -645,7 +766,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             // three cases so this loop does not re-derive them.
             let projection = ProcessProjection::new(
                 ProcessKind::DaemonJob,
-                &job.job_id,
+                process_external_id(&job.job_id, attempt_ordinal(job)),
                 process_state_for(job.state),
             )
             .with_run(job.run_id.clone())
@@ -657,39 +778,9 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 max_child_processes: None,
             });
             // A non-terminal job never carries an exit, so this cannot be a
-            // terminal projection — the terminal case is the sweep below.
+            // terminal projection — the terminal case is the sweep above.
             table
                 .reconcile(&projection, now_ms)
-                .map_err(|error| error.to_string())?;
-        }
-
-        // Anything this daemon still shows as live whose job has left the
-        // non-terminal set has finished. Reading the job back gives the real
-        // outcome; a job pruned by retention before the projection caught up is
-        // `Lost`, which is the honest answer rather than a guessed success.
-        let live_records = table
-            .list(&ProcessFilter {
-                kinds: vec![ProcessKind::DaemonJob],
-                live_only: true,
-                ..ProcessFilter::default()
-            })
-            .map_err(|error| error.to_string())?;
-
-        for record in live_records {
-            if live_job_ids.contains(&record.external_id) {
-                continue;
-            }
-            let exit = match self.store.get_job(&record.external_id)? {
-                Some(job) => exit_for(job.state, job.last_error.as_deref()),
-                None => ProcessExit {
-                    status: little_monkey_lib::process_table::ExitStatus::Lost,
-                    code: None,
-                    signal: None,
-                    reason: Some("daemon job record is gone".to_string()),
-                },
-            };
-            table
-                .transition(&record.process_id, ProcessState::Exited, Some(exit), now_ms)
                 .map_err(|error| error.to_string())?;
         }
 
@@ -1397,6 +1488,12 @@ mod tests {
         (paths, store, shared, recorder, run_id)
     }
 
+    /// The process-table id of a fixture job's first attempt — what every test
+    /// below is looking at, since `max_attempts: 1` leaves them no second one.
+    fn first_attempt_id(label: &str) -> String {
+        process_external_id(&format!("job-{label}"), 0)
+    }
+
     fn fake_adapter() -> FakeProcesses {
         FakeProcesses {
             spawns: Arc::new(Mutex::new(0)),
@@ -1540,7 +1637,7 @@ mod tests {
             let process_id = {
                 let table = engine.shared.process_table();
                 table
-                    .find_by_external_id(ProcessKind::DaemonJob, &format!("job-{label}"))
+                    .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id(label))
                     .unwrap()
                     .expect("the job is projected")
                     .process_id
@@ -1599,7 +1696,7 @@ mod tests {
         let record = {
             let table = engine.shared.process_table();
             table
-                .find_by_external_id(ProcessKind::DaemonJob, "job-processtable")
+                .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("processtable"))
                 .unwrap()
                 .expect("the daemon must project its job onto the process table")
         };
@@ -1702,7 +1799,7 @@ mod tests {
         {
             let table = engine.shared.process_table();
             let record = table
-                .find_by_external_id(ProcessKind::DaemonJob, "job-latch-stop")
+                .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("latch-stop"))
                 .unwrap()
                 .expect("the tick projected the job");
             table
@@ -1730,7 +1827,7 @@ mod tests {
 
         let table = engine.shared.process_table();
         let finished = table
-            .find_by_external_id(ProcessKind::DaemonJob, "job-latch-stop")
+            .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("latch-stop"))
             .unwrap()
             .unwrap();
         assert_eq!(finished.state, ProcessState::Exited);
@@ -1766,7 +1863,7 @@ mod tests {
         let process_id = {
             let table = engine.shared.process_table();
             table
-                .find_by_external_id(ProcessKind::DaemonJob, "job-latch-suspend")
+                .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("latch-suspend"))
                 .unwrap()
                 .unwrap()
                 .process_id
@@ -1839,6 +1936,19 @@ mod tests {
             table.get(&process_id).unwrap().unwrap().state,
             ProcessState::Running
         );
+        // Same process, same row: a resumed job is the attempt that was paused,
+        // not a new one. Counting it as a start would spend a retry the job
+        // never used, and would move its process row out from under this id.
+        assert_eq!(
+            engine
+                .store
+                .get_job("job-latch-suspend")
+                .unwrap()
+                .unwrap()
+                .attempt,
+            1,
+            "pausing and resuming spent an attempt"
+        );
     }
 
     #[test]
@@ -1887,11 +1997,121 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known bug this test found: a requeued job's process row stays \
-                `running` forever, because `queued` projects as `admitted` and \
-                `running -> admitted` is an illegal transition, so the sync \
-                fails and is swallowed. Fixing it needs a decision on whether a \
-                DaemonJob's external_id should be attempt-scoped — see the PR."]
+    fn an_external_id_round_trips_through_its_job_id_and_attempt() {
+        assert_eq!(process_external_id("job-a", 0), "job-a#0");
+        assert_eq!(split_external_id("job-a#0"), ("job-a", Some(0)));
+        assert_eq!(split_external_id("job-a#12"), ("job-a", Some(12)));
+
+        // A row written before attempt scoping carries no attempt, and must not
+        // be mistaken for one — the sweep treats the two differently.
+        assert_eq!(split_external_id("job-a"), ("job-a", None));
+
+        // `--job-id` lets a caller supply their own, so a `#` in the id is not
+        // proof of an attempt suffix. Only a numeric tail counts, and the real
+        // suffix still wins when both are present.
+        assert_eq!(split_external_id("job#a"), ("job#a", None));
+        assert_eq!(split_external_id("job#a#3"), ("job#a", Some(3)));
+
+        // Signed and overflowing tails are not attempts either.
+        assert_eq!(split_external_id("job-a#-1"), ("job-a#-1", None));
+        assert_eq!(
+            split_external_id("job-a#99999999999999999999"),
+            ("job-a#99999999999999999999", None)
+        );
+    }
+
+    #[test]
+    fn the_attempt_a_row_belongs_to_is_one_behind_the_start_counter() {
+        // `attempt` counts starts, so it moves at the transition into `running`
+        // — mid-attempt, not between attempts. The row's identity must not.
+        let ordinal = |state, attempt| {
+            let mut job = retry_job(attempt, 5, 1_000);
+            job.state = state;
+            attempt_ordinal(&job)
+        };
+
+        // First attempt: queued at 0, still the same attempt once running at 1.
+        assert_eq!(ordinal(JobState::Queued, 0), 0);
+        assert_eq!(ordinal(JobState::Running, 1), 0);
+        assert_eq!(ordinal(JobState::Failed, 1), 0);
+
+        // Requeued: the counter has not moved, but the attempt has.
+        assert_eq!(ordinal(JobState::Queued, 1), 1);
+        assert_eq!(ordinal(JobState::Running, 2), 1);
+
+        // A `running` job with a zero counter is not reachable through the
+        // store, but must not underflow if one is ever recovered.
+        assert_eq!(ordinal(JobState::Running, 0), 0);
+    }
+
+    #[test]
+    fn a_retried_job_gets_a_new_row_and_the_attempt_it_replaces_is_closed_as_failed() {
+        use little_monkey_lib::process_table::{ExitStatus, ProcessKind, ProcessState};
+
+        let (paths, store, shared, _recorder, _run_id) = fixture("retrysweep");
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            fake_adapter(),
+            FakeNotifier::default(),
+            clock,
+            "daemon-test-owner".into(),
+        );
+        engine.tick().unwrap();
+
+        // The requeue both retry branches perform: back to `queued`, carrying
+        // the error that caused it, with the start counter left alone.
+        engine
+            .store
+            .transition(
+                "job-retrysweep",
+                JobState::Queued,
+                3_000,
+                None,
+                Some("spawn failed: boom"),
+            )
+            .unwrap();
+        // The inner sync, not the wrapper: the wrapper logs and swallows, which
+        // is right in production and would hide the very failure this covers.
+        engine.sync_process_table_inner(3_000).unwrap();
+
+        let table = engine.shared.process_table();
+        let first = table
+            .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("retrysweep"))
+            .unwrap()
+            .expect("the interrupted attempt keeps its row");
+        assert_eq!(first.state, ProcessState::Exited);
+        let exit = first.exit.expect("an exited row carries its exit");
+        assert_eq!(
+            exit.status,
+            ExitStatus::Failed,
+            "a superseded attempt did not vanish — it failed, which is why there \
+             is another one"
+        );
+        assert_eq!(
+            exit.reason.as_deref(),
+            Some("spawn failed: boom"),
+            "the failure that triggered the retry is the honest exit reason"
+        );
+
+        let second = table
+            .find_by_external_id(
+                ProcessKind::DaemonJob,
+                &process_external_id("job-retrysweep", 1),
+            )
+            .unwrap()
+            .expect("the retry is admitted as its own process");
+        assert_eq!(second.state, ProcessState::Admitted);
+        assert_eq!(
+            second.run_id, first.run_id,
+            "a retry is a new process of the same durable run"
+        );
+    }
+
+    #[test]
     fn a_daemon_crash_leaves_no_process_row_claiming_to_be_running() {
         use little_monkey_lib::process_table::{ProcessKind, ProcessState};
 
@@ -1917,7 +2137,7 @@ mod tests {
         {
             let table = engine.shared.process_table();
             let record = table
-                .find_by_external_id(ProcessKind::DaemonJob, "job-crashdaemon")
+                .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("crashdaemon"))
                 .unwrap()
                 .expect("the job is projected while running");
             assert_eq!(record.state, ProcessState::Running);
@@ -1950,19 +2170,51 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let rows: Vec<_> = records
+        // Recovery found the run still queued and requeued the job, so the
+        // interrupted attempt is over and a second one is waiting. Nothing may
+        // still be claiming to run, on either row.
+        assert!(
+            records
+                .iter()
+                .all(|record| record.state != ProcessState::Running),
+            "a row left claiming to be running after a crash is a lie to every \
+             reader: {records:?}"
+        );
+
+        let first: Vec<_> = records
             .iter()
-            .filter(|record| record.external_id == "job-crashdaemon")
+            .filter(|record| record.external_id == first_attempt_id("crashdaemon"))
             .collect();
         assert_eq!(
-            rows.len(),
+            first.len(),
             1,
-            "recovery re-admitted the job instead of reconciling its existing record"
+            "recovery re-admitted the first attempt instead of reconciling its \
+             existing record"
+        );
+        assert_eq!(
+            first[0].state,
+            ProcessState::Exited,
+            "the attempt the crash interrupted has to be closed out, not left live"
+        );
+
+        // And the retry is its own process, not the dead one resurrected —
+        // which is the whole reason the id is attempt-scoped.
+        let second: Vec<_> = records
+            .iter()
+            .filter(|record| record.external_id == process_external_id("job-crashdaemon", 1))
+            .collect();
+        assert_eq!(
+            second.len(),
+            1,
+            "the requeued attempt has no row of its own: {records:?}"
+        );
+        assert!(
+            !second[0].state.is_terminal(),
+            "the retry is waiting to run, so its row must still be live"
         );
         assert_ne!(
-            rows[0].state,
-            ProcessState::Running,
-            "a row left claiming to be running after a crash is a lie to every reader"
+            first[0].process_id, second[0].process_id,
+            "two attempts sharing one process id is the bug this scoping removes"
         );
         assert!(engine.shared.load_run(&run_id).unwrap().is_some());
     }

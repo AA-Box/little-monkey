@@ -801,10 +801,19 @@ fn project_queue_origin(
 
     // Created with the parent edge before the engine's own tick reconciles this
     // job: whoever gets there first admits, and the tick then only moves state.
+    //
+    // Attempt 0 is not a guess. The only caller runs immediately after
+    // `insert_preparing` for a job id that `enqueue` has already established is
+    // new — an id that resolves to an existing job returns before reaching here
+    // — so this job has not started, let alone retried.
     if let Err(error) = table.reconcile(
-        &ProcessProjection::new(ProcessKind::DaemonJob, job_id, ProcessState::Admitted)
-            .with_parent(ProcessKind::RemoteRun, request_id)
-            .with_run(Some(run_id.to_string())),
+        &ProcessProjection::new(
+            ProcessKind::DaemonJob,
+            engine::process_external_id(job_id, 0),
+            ProcessState::Admitted,
+        )
+        .with_parent(ProcessKind::RemoteRun, request_id)
+        .with_run(Some(run_id.to_string())),
         now_ms,
     ) {
         eprintln!("monkey daemon: could not project remote job {job_id}: {error}");
