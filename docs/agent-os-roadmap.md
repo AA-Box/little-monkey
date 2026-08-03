@@ -204,18 +204,32 @@ The honest state of delivery, which the matrix now states rather than implies:
 
 | Kind | stop | suspend/resume | kill |
 | --- | --- | --- | --- |
-| daemon job, remote run | ✅ | ✅ OS suspend | ✅ |
+| daemon job | ✅ | ✅ OS suspend | ✅ |
 | background shell | ✅ | ✅ OS suspend | ✅ |
 | side task | ✅ | ✅ cooperative | refused |
 | chat turn, subagent, crew member | ✅ | ✅ cooperative | refused |
 | workflow run | ✅ | ✅ blocking wait | refused |
 | workflow node | ✅ | refused | refused |
+| remote run | terminal at birth | refused | refused |
 
-`workflow node` is the one remaining refusal, and deliberately so: a node has no
-independent safe point, and nothing in the codebase ever targets a node's own
-process id. Pausing operates at the owning run's level boundary, which is what
-its refusal reason now says. Claiming `Honoured` on a kind with no mechanism
-would be exactly the dishonesty the matrix exists to prevent.
+Two refusals, each naming the target that does work. A `workflow node` has no
+independent safe point and nothing ever targets a node's own process id, so
+pausing operates at the owning run's level boundary. A `remote run` records that
+a controller *asked* for work rather than the work itself; its row closes as
+soon as the job is queued, and the daemon job it spawned — its child in this
+table — is the process that can be suspended or killed.
+
+That second one was a live defect until now, and worth stating plainly because
+it is exactly what the matrix exists to catch. `remote_run` claimed `Honoured`
+for stop, suspend, resume and kill while **no delivery path for the kind existed
+anywhere**: the daemon's `apply_signal_intent` reads only `daemon_job` rows, and
+`processSignalDelivery.ts` has no `remote_run` case. Worse, the only writer
+(`project_queue_origin`) projected the row as `running` and nothing ever closed
+it — not the engine tick, which sweeps only `daemon_job`, and not the desktop
+reaper, which deliberately skips kinds it does not own. Every remote enqueue
+leaked a row asserting live work forever. The row is now terminal in the same
+write that creates it, so `signal` answers `AlreadyExited` rather than latching
+intent nobody will read.
 
 **Also shipped — the daemon honours the latch.** Its tick reads durable intent
 for every non-terminal job and translates it into the daemon's own
@@ -326,27 +340,162 @@ why it may take a while) instead of being rounded to either "Running" or
 "Paused". A refused signal shows the kind's own refusal reason; typed refusals
 are worthless if the UI swallows them.
 
+**Also shipped — the four items this section used to list as open.**
+
+- **`kill` is distinguishable, and delivered differently.** Migration V7 adds
+  `kill_requested`, with a SQL trigger enforcing that it never appears without
+  `stop_requested` — a kill IS a stop with a stronger delivery promise, which is
+  what lets every existing reader and the pending-signal index keep working
+  untouched. The daemon acts on the difference: `Stop` keeps the TERM-grace-KILL
+  wind-down, `Kill` goes straight to `killpg(SIGKILL)`, and the operator kill
+  switch takes the immediate path since an emergency stop that waits politely is
+  not one. Escalation is one-way — a later `stop` never downgrades a kill.
+- **`RemoteAction::Pause`** exposes pause and resume over the remote protocol,
+  with `monkey remote pause|resume` driving them. Its own action rather than
+  part of `Cancel`, because pause is strictly weaker and neither implies the
+  other — so it cannot widen a pairing that already had `cancel`, which is
+  asserted rather than argued.
+- **Declarative restart policy.** `ProcessKind::restart_policy()` states it per
+  kind the way `signal_support` does. Exactly one kind is restartable:
+  restarting means re-running the work, which needs a supervisor outliving the
+  process plus a durable description of it, and only `DaemonJob` has both. The
+  rest say `Never` with a stated reason — a desktop kind's loop died with the
+  window (K13), a workflow run's executor already owns per-node retry with its
+  own replay rules, and a `remote_run` records a request rather than work that
+  could be re-run. `RestartPolicy` is
+  bounded by construction with no `Always`, and the stricter of the job's own
+  `max_attempts` and the kind's ceiling wins.
+- **Paused + restart is defined**, rather than falling out of `live_only` by
+  accident: a suspended desktop-owned row is reaped as `exited(lost)`. Durable
+  *intent* survives a restart; durable *execution* does not, and offering Resume
+  for work that cannot come back is the dishonesty this table exists to remove.
+  Restoring a live process is K13.
+
+**Also shipped — a retry is its own process.** A crash-injection test found a
+requeued daemon job's row stuck at `running` forever: recovery re-queues the
+job, `queued` projects as `admitted`, `running -> admitted` is illegal, and the
+projection failure is logged and swallowed — leaving a row indistinguishable
+from live work to every reader. The fix is the one the table's own model asked
+for: a `DaemonJob`'s `external_id` is now attempt-scoped (`<job id>#<attempt>`),
+so each attempt gets its own record, and the state machine keeps the backwards
+edge it was deliberately built to forbid. The superseded attempt is swept to
+`exited(failed)` carrying the error that triggered the retry, before its
+successor is admitted, so no reader ever sees two live rows for one job.
+
+Two things had to be true for that id to be stable, and one was not. `attempt`
+counts *starts*, but the store incremented it on every arrival at `running` —
+which also caught resuming from `paused` and returning from `waiting_approval`.
+That silently spent a job's retry budget (paused and resumed twice, a job with
+`max_attempts: 3` had none left to fail with) and would have moved a job's
+process row out from under it on a plain resume. It now moves only on the edge
+that starts an attempt: leaving the queue. The row's own attempt is therefore
+one behind the counter while that attempt runs, which is what `attempt_ordinal`
+encodes rather than reading the column raw.
+
 **Remaining:**
 
-- **Expose `RemoteAction::Pause`** — the daemon supports it locally; the remote
-  protocol simply has no action for it. Also unverified: no adopter writes
-  `remote_run` rows yet, so that row of the support matrix is a claim about
-  intent rather than about shipped code.
-- **`kill` and `stop` are indistinguishable in the latch.** Both set
-  `stop_requested`; only the free-text reason survives. Honest today because the
-  only kinds honouring `kill` deliver both identically (the daemon maps each onto
-  `terminate_process_group`), but a UI offering two buttons would imply a
-  difference the schema cannot carry. Needs its own column before that happens.
-- **Declarative restart policy** (`never` / `on-failure` / bounded backoff) per
-  kind, currently ad hoc per subsystem.
-- **A crash-injection test per surface**, which the acceptance names and nothing
-  has.
-- **Paused-across-restart for the cooperative kinds is deliberately out of
-  scope.** Durable *intent* survives; durable *execution* does not, because a
-  paused turn's loop lives in the WebView. That is K13, and a resume button on
-  something unresumable would be a lie. K2 should define paused + restart →
-  `exited(lost)`.
+- **Crash coverage for workflow runs.** The desktop-owned surfaces are covered
+  (every kind, including one suspended mid-pause, closes as `exited(lost)`, and
+  the sweep is idempotent), and the daemon's test above now runs. Workflow runs
+  are not: they are not desktop-owned, so the startup reaper deliberately leaves
+  them alone, and nothing else sweeps them.
+**Also shipped — two defects the manual round trip found, and only it could.**
+Both were invisible to the whole test suite because every test signalled the way
+the app does, and both broke the same promise: `background_shell` says
+`Honoured` for suspend and resume, and one of the two documented callers
+silently did nothing.
 
+- **A CLI-originated suspend never reached a background shell.**
+  `process_signal` delivers the real SIGSTOP inline, so an in-app pause worked —
+  and the desktop fan-out assumed that was the only origin, returning "already
+  delivered in Rust" for the kind. `monkey processes signal` writes the latch
+  from another OS process and exits, and a background shell has no loop of its
+  own to notice: the sweep saw the latch and dropped it while the child kept
+  running. Proven by contrast on one pid — in-app pause gave `ps` state `T`, the
+  CLI gave `S` with the row still `running`. Fixed with a delivery-only
+  `process_deliver_os_signal`, which writes no intent (so the sweep calling it
+  cannot re-trigger itself) and is a no-op once the OS state agrees.
+  `workflow_run` genuinely does poll `SignalSource` at each level boundary, so it
+  still defers — the old shared comment hid that only one of the two kinds was
+  covered.
+- **`canResume` read the latch and not the state**, which stranded a process
+  outright. Suspend in the app, resume from the CLI: the resume clears
+  `suspend_requested` without delivering, leaving the row `suspended` with no
+  intent — so latch-only said "nothing to resume", the panel rendered Pause on a
+  stopped child, and nothing in either surface could recover it. Only an
+  out-of-band `kill -CONT` did. Both predicates now consider state as well.
+
+A test was pinning the first one (`defers suspend and resume for the kinds Rust
+delivers to itself` asserted `background_shell` defers) and failed the moment the
+code was fixed. It is rewritten rather than deleted: that assertion is why the
+assumption survived review.
+
+- **The Processes panel did not repaint on a CLI-originated signal — now fixed.**
+  Found by hand, not by a test. The store live-updated only from
+  `processes://changed`, and `monkey processes signal` writes SQLite from
+  another OS process, so it cannot emit a Tauri event into the app: a row
+  suspended or resumed from the CLI kept rendering its previous state, with its
+  age frozen, until something remounted the panel. The durable state was
+  correct throughout; only the view lied. Polling is the only mechanism that
+  crosses a process boundary, so an open panel now runs `processStore.catchUp`
+  on the same 2s cadence as the `process_pending_signals` sweep — reading
+  faster would only render a latch sooner than the loop can act on it. It is
+  deliberately not `refresh`: it never toggles `loading`, it returns the state
+  object unchanged when the listing is unchanged (zustand's documented no-op,
+  so a quiet poll re-renders nothing), it compares every field the row draws
+  rather than trusting `updated_at_ms` (a signal writes that column from its
+  own timestamp, so two signals in one millisecond share a stamp), it stands
+  down while a signal is in flight, and it swallows read failures rather than
+  flashing a banner every tick. The same timer ticks a clock the rows age off,
+  which is a separate concern: the age is `Date.now()` at render, so it would
+  freeze on an idle panel even with a perfectly current listing. Verified by
+  hand, driving the app only from a terminal: `Running → Pausing` (carrying the
+  CLI's reason text) `→ Running → gone`, age advancing 10s → 32s → 54s.
+- **Manual round-trip: all seven kinds done.** Every signal below was sent
+  with `monkey processes signal` from a *separate OS process* against a live
+  desktop runtime or daemon — the durable-latch claim exercised for real rather
+  than simulated.
+  - `daemon_job` — suspend took the child's process group to `ps` state `T` in
+    under a second, resume back to `S`, kill to `Z`, with the row ending
+    `exited/cancelled` and `kill_requested ∧ stop_requested` both set.
+  - `chat_turn` — `running + suspend_requested` (the derived `pause_pending`),
+    rendered as "Pausing / Lands at the next safe point" with the caller's
+    reason carried across the process boundary; resume cleared the latch.
+  - `background_shell` — `S` → `T` → `S`, the two defects above found here.
+  - `subagent` — `pause_pending` with the reason carried through, then resumed.
+  - `side_task` — the full transition: `running` (pause_pending) at t+1s, then
+    genuinely `suspended` at t+2s once the loop parked, and back to `running` on
+    resume — the first kind observed making the whole journey by hand.
+  - `crew_member` — a member suspended mid-stream stayed honestly `running +
+    suspend_requested` until its model call returned, then went `suspended` at
+    the next safe point and made **no** further provider request while its
+    sibling ran on and exited; resume fired the next request immediately and put
+    the row back to `running`.
+  - `workflow_run` — the one kind whose pause is a Rust-side poll of
+    `SignalSource` rather than a desktop-delivered latch, and the only one
+    exercised against a run hosted in a *different process* from the signaller:
+    `monkey workflow run` in one terminal, `monkey processes signal` in
+    another, sharing nothing but the SQLite ledger. Suspended during level 0's
+    model call it stayed `running + suspend_requested`, parked `suspended` at
+    the level boundary, and level 1's model call did not fire for 80s; resume
+    fired it immediately and the run finished `succeeded` with 2 model calls.
+    This also exercises the eager start-of-run `Running` projection — without
+    it there is no row to transition `Suspended` from.
+  - `stop` was additionally verified from the CLI against a live chat turn,
+    subagent and side task simultaneously.
+- **Verifying `crew_member` first required fixing a bug outside K2.** Every crew
+  run with a workspace attached failed before any member was admitted:
+  `invalid run protocol value: workspace.primary_root_id: must start and end
+  with an ASCII letter or digit`. `WorkspaceRootInfo.id` is documented as "the
+  canonicalized path string", and `workspaceToRunWire` passed it straight into
+  `primary_root_id`, `roots[].root_id` and `repository_policy.root_id` — while
+  the sibling `workspace_id` on the same object *was* run through
+  `stableProtocolId`. A POSIX path starts with `/`, so `validate_protocol_id`
+  rejected it every time. Fixed by deriving all three with `stableProtocolId`;
+  the path is not lost, it travels beside the id in `canonical_path`, which is
+  what makes deriving the id safe. The fixture in `durableRun.test.ts` used
+  `root-1` — already id-shaped — which is exactly why nothing caught it; it now
+  uses a real path and asserts the shape of every id on the wire.
 Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace
 root. Whether suspending releases them is a K7/K8 decision.

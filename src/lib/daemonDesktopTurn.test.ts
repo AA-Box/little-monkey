@@ -95,7 +95,13 @@ describe("daemon desktop turn snapshot", () => {
       submitted_at_ms: 123,
       history,
       target: { kind: "provider", endpoint: "https://api.example.test/v1", model: "gpt-test" },
-      workspace: { primary_root_id: "root-one" },
+      // Derived, not the raw root id: `WorkspaceRootInfo.id` is a path in
+      // production and the protocol requires an id that starts and ends
+      // alphanumeric. Shape-checked rather than pinned to a hash so the
+      // derivation can change without a meaningless test edit.
+      workspace: {
+        primary_root_id: expect.stringMatching(/^[A-Za-z0-9][A-Za-z0-9_.:-]*[A-Za-z0-9]$/),
+      },
       permission_policy: { mode: "smart", unattended: true, allow_network: false },
       generation: { effort: "xhigh", temperature: null, top_p: null },
       tool_profile: {

@@ -61,14 +61,24 @@ export function processDisplayState(record: ProcessRecord): ProcessDisplayState 
   return record.state;
 }
 
-/** Whether this record is in a state a resume would apply to. A process
- * already parked, or one still on its way there, can both be resumed — the
- * latch clears either way. */
+/** Whether this record is in a state a resume would apply to.
+ *
+ * Both the latch and the state count, and it has to be both. Reading only the
+ * latch was right for the cooperative kinds — where being parked *is* the latch,
+ * since the row stays `running` until the loop reaches its safe point — and
+ * wrong for a kind the OS actually stopped. A background shell that a resume has
+ * already un-latched but whose SIGCONT never landed sits at `suspended` with no
+ * intent: latch-only said "nothing to resume" and the panel offered Pause on a
+ * stopped process, leaving no way back short of `kill -CONT` from outside.
+ */
 export function canResume(record: ProcessRecord): boolean {
-  return record.state !== "exited" && record.signalIntent.suspendRequested;
+  if (record.state === "exited") return false;
+  return record.state === "suspended" || record.signalIntent.suspendRequested;
 }
 
-/** Whether asking for a suspend would say anything new. */
+/** Whether asking for a suspend would say anything new. Mirror of
+ * [`canResume`]: a row that is already parked has nothing to add either. */
 export function canSuspend(record: ProcessRecord): boolean {
-  return record.state !== "exited" && !record.signalIntent.suspendRequested;
+  if (record.state === "exited" || record.state === "suspended") return false;
+  return !record.signalIntent.suspendRequested;
 }

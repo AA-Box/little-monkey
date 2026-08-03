@@ -216,7 +216,7 @@ function actorSignal(actorId: string, suspendRequested: boolean): ProcessRecord 
     profile: null,
     nativePid: null,
     limits: {},
-    signalIntent: { stopRequested: false, suspendRequested },
+    signalIntent: { stopRequested: false, suspendRequested, killRequested: false },
     signalReason: suspendRequested ? "Paused from the CLI" : null,
     signalRequestedAtMs: suspendRequested ? 1 : null,
     exit: null,

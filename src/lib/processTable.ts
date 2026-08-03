@@ -61,6 +61,13 @@ export interface ProcessExit {
 export interface SignalIntent {
   stopRequested: boolean;
   suspendRequested: boolean;
+  /**
+   * Whether the stop must be delivered as an immediate termination rather than
+   * a cooperative wind-down. Never set without `stopRequested` — a kill IS a
+   * stop with a stronger promise about how — so any check that only asks "is
+   * this winding down?" stays correct without reading this at all.
+   */
+  killRequested: boolean;
 }
 
 export interface ProcessRecord {

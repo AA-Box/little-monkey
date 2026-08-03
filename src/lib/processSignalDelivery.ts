@@ -249,10 +249,18 @@ export async function deliverProcessSignal(
  *   `pauseRegistry` at its next round boundary. Latency is unbounded and
  *   deliberately not hidden — the record stays `running` with
  *   `suspendRequested` latched (`pause_pending`) until the loop actually parks.
- * - **Background shells and workflow runs** are delivered on the Rust side —
- *   real SIGSTOP for the former (`background_shell::deliver_os_signal`, called
- *   inline by `process_signal`), a blocking wait at the level boundary for the
- *   latter. Nothing for this module to do but say who did it.
+ * - **Workflow runs** are delivered on the Rust side and need nothing from here:
+ *   the executor polls `SignalSource` at every level boundary, so it reads the
+ *   durable latch regardless of which process wrote it.
+ * - **Background shells** need this module for the CLI half. `process_signal`
+ *   delivers the real SIGSTOP inline, which covers a signal raised inside this
+ *   app — and this arm used to assume that was the only origin, returning
+ *   "already delivered in Rust". It is not: `monkey processes signal` writes the
+ *   latch from another OS process and exits, and a background shell has no loop
+ *   of its own to notice. The latch was recorded, the sweep saw it, and the
+ *   child kept running. `process_deliver_os_signal` closes that gap — it writes
+ *   no intent, so it cannot re-trigger the sweep that called it, and it is a
+ *   no-op when the OS state already agrees with the latch.
  */
 function deliverPause(
   record: ProcessRecord,
@@ -281,9 +289,20 @@ function deliverPause(
       // going, not that this process is finished.
       setPauseRequested(record.externalId, false);
       return "resumed";
+    case "background_shell": {
+      // Fire-and-forget on purpose: the caller's answer is "who owns this", not
+      // "did the syscall land". A failure leaves the latch untouched, so the
+      // next sweep tries again rather than this one reporting a delivery it did
+      // not make.
+      if (!isTauri()) return "no-live-target";
+      void invoke("process_deliver_os_signal", { processId: record.processId }).catch(
+        () => undefined,
+      );
+      return signal === "suspend" ? "suspended" : "resumed";
+    }
     default:
-      // `background_shell` and `workflow_run` — already delivered in Rust by
-      // the time this record was emitted.
+      // `workflow_run` — the executor reads the durable latch itself at its
+      // next level boundary, whichever process wrote it.
       return "delivered-elsewhere";
   }
 }

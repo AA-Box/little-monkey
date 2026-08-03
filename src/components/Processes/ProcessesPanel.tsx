@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { Loader2, Pause, Play, RefreshCw, Square, X } from "lucide-react";
 
@@ -8,6 +8,7 @@ import type { ProcessKind, ProcessRecord } from "../../lib/processTable";
 import { canResume, canSuspend, processDisplayState } from "../../lib/processSignals";
 import {
   selectStateCounts,
+  startProcessCatchUp,
   subscribeToProcessChanges,
   useProcessStore,
 } from "../../store/processStore";
@@ -33,6 +34,14 @@ import { formatElapsed } from "../../lib/taskFormat";
  * Refusals are shown, not swallowed. A kind that does not honour a signal
  * returns the reason (`ProcessKind::signal_support`), and that reason is
  * exactly what the user needs to see instead of a button that appears to work.
+ *
+ * While it is open the panel polls, in addition to following
+ * `processes://changed`. The event only carries writes made in *this* OS
+ * process; `monkey processes signal` writes the same SQLite ledger from a
+ * terminal and has no way to emit into this one, so without the poll a row
+ * paused from the CLI keeps rendering "running" until a remount. The poll is
+ * also what keeps each row's age moving, since that is computed from
+ * `Date.now()` at render.
  */
 
 type Translate = ReturnType<typeof useT>["t"];
@@ -97,12 +106,15 @@ function stateLabel(t: Translate, record: ProcessRecord): string {
 /** One live process. The external id is shown verbatim rather than
  * prettified — it is what the user types into `monkey processes signal`, so a
  * paraphrase would make the panel and the CLI disagree. */
-function ProcessRow({ record }: { record: ProcessRecord }) {
+function ProcessRow({ record, now }: { record: ProcessRecord; now: number }) {
   const { t } = useT();
   const busy = useProcessStore((state) => state.pending[record.processId] === true);
   const signal = useProcessStore((state) => state.signal);
   const display = processDisplayState(record);
-  const elapsed = formatElapsed(Date.now() - (record.startedAtMs ?? record.createdAtMs));
+  // `now` is passed in rather than read here so every row ages off the same
+  // instant, and so the age advances on the panel's tick instead of freezing
+  // until some unrelated store write happens to re-render this row.
+  const elapsed = formatElapsed(now - (record.startedAtMs ?? record.createdAtMs));
 
   return (
     <div className="rounded-xl border border-border bg-surface-2 p-3">
@@ -176,10 +188,11 @@ export function ProcessesPanel({ onClose }: ProcessesPanelProps) {
   const counts = useMemo(() => selectStateCounts(records), [records]);
   const loading = useProcessStore((state) => state.loading);
   const error = useProcessStore((state) => state.error);
+  const [now, setNow] = useState(() => Date.now());
 
   // Rust owns the records, so read the current truth on mount rather than
-  // assuming this window started everything it can see — then follow the
-  // change event instead of polling.
+  // assuming this window started everything it can see — then follow the change
+  // event for this process's own writes, and poll for everyone else's.
   useEffect(() => {
     void useProcessStore.getState().refresh();
     let disposed = false;
@@ -188,8 +201,10 @@ export function ProcessesPanel({ onClose }: ProcessesPanelProps) {
       if (disposed) cleanup();
       else unlisten = cleanup;
     });
+    const stopCatchUp = startProcessCatchUp(() => setNow(Date.now()));
     return () => {
       disposed = true;
+      stopCatchUp();
       unlisten?.();
     };
   }, []);
@@ -249,7 +264,7 @@ export function ProcessesPanel({ onClose }: ProcessesPanelProps) {
         )}
 
         {records.map((record) => (
-          <ProcessRow key={record.processId} record={record} />
+          <ProcessRow key={record.processId} record={record} now={now} />
         ))}
       </div>
     </aside>
