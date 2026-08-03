@@ -50,6 +50,11 @@ import {
   clearRunCancellationRegistryForTests,
   registerRunCancellation,
 } from "./runCancellationRegistry";
+import {
+  clearPauseRegistryForTests,
+  isPauseRequested,
+  setPauseRequested,
+} from "./pauseRegistry";
 
 const MAIN = { ownsGlobalKinds: true };
 const SECONDARY = { ownsGlobalKinds: false };
@@ -89,6 +94,7 @@ beforeEach(() => {
   sideTaskMock.pause.mockReset();
   sideTaskMock.resume.mockReset();
   clearRunCancellationRegistryForTests();
+  clearPauseRegistryForTests();
 });
 
 describe("which signal is pending", () => {
@@ -310,5 +316,89 @@ describe("the catch-up sweep", () => {
   it("survives an unavailable backend without throwing", async () => {
     invokeMock.mockRejectedValue(new Error("no ledger"));
     await expect(sweepPendingProcessSignals(MAIN)).resolves.toEqual([]);
+  });
+});
+
+describe("cooperative pause delivery", () => {
+  const COOPERATIVE: ProcessKind[] = ["chat_turn", "subagent", "crew_member"];
+
+  it("latches a suspend onto the pause registry, keyed by externalId", async () => {
+    for (const kind of COOPERATIVE) {
+      const outcome = await deliverProcessSignal(
+        record({ kind, externalId: `ext-${kind}`, signalIntent: suspend }),
+        MAIN,
+      );
+      expect(outcome).toBe("suspended");
+      expect(isPauseRequested(`ext-${kind}`)).toBe(true);
+    }
+    // The cooperative kinds must never reach the side task's own latch.
+    expect(sideTaskMock.pause).not.toHaveBeenCalled();
+  });
+
+  it("clears the latch on a resume that lands BEFORE the loop parked", async () => {
+    // The deadlock this guards: `pause_pending` means the record is still
+    // `running` while the suspend is latched, so the record's own state cannot
+    // be the acknowledgement. Treating "no intent + running" as nothing-pending
+    // would leave the registry latched, and the loop would park at its next
+    // checkpoint and never wake.
+    setPauseRequested("ext-turn", true);
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-turn", state: "running" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("resumed");
+    expect(isPauseRequested("ext-turn")).toBe(false);
+  });
+
+  it("clears the latch on a resume that lands after the loop parked", async () => {
+    setPauseRequested("ext-turn", true);
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-turn", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("resumed");
+    expect(isPauseRequested("ext-turn")).toBe(false);
+  });
+
+  it("reports nothing pending for a cooperative kind with no latch either side", async () => {
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-quiet" }),
+      MAIN,
+    );
+    expect(outcome).toBe("nothing-pending");
+  });
+
+  it("leaves a stop to win over a pending suspend", async () => {
+    // Independent latches: honouring the suspend of a process also asked to
+    // stop would park it instead of winding it down.
+    const cancelled = registerRunCancellation("ext-both", () => {});
+    const outcome = await deliverProcessSignal(
+      record({
+        kind: "chat_turn",
+        externalId: "ext-both",
+        signalIntent: { stopRequested: true, suspendRequested: true },
+      }),
+      MAIN,
+    );
+    expect(outcome).toBe("stopped");
+    expect(isPauseRequested("ext-both")).toBe(false);
+    cancelled();
+  });
+
+  it("defers suspend and resume for the kinds Rust delivers to itself", async () => {
+    // A background shell gets a real SIGSTOP inline in `process_signal`, and a
+    // workflow run parks at its own level boundary. Nothing for this side to do.
+    for (const kind of ["background_shell", "workflow_run"] as ProcessKind[]) {
+      const outcome = await deliverProcessSignal(
+        record({ kind, externalId: `ext-${kind}`, signalIntent: suspend }),
+        MAIN,
+      );
+      expect(outcome).toBe("delivered-elsewhere");
+      expect(isPauseRequested(`ext-${kind}`)).toBe(false);
+    }
   });
 });

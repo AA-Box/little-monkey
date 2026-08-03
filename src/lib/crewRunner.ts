@@ -47,6 +47,7 @@ import { registerRunCancellation } from "./runCancellationRegistry";
 import { composeSkillSystemPrompt, type SkillInvocationSnapshot } from "./skills";
 import { protectKnowledgeNoticeForModel, protectToolResult, wrapUntrustedContent } from "./untrustedContent";
 import { admitProcess, exitProcess, markProcessRunning } from "./processTable";
+import { honourPause, forgetPause } from "./pauseRegistry";
 import { isBtwNotice } from "./slashCommands";
 import { errorMessage } from "./errors";
 
@@ -167,16 +168,16 @@ async function initializeActorRecorders(
     // initialized concurrently, so a member's reference to it is not reliably
     // resolvable. Crew actors are therefore siblings here, the same gap they
     // already had in the ledger. Fail-soft — see `processTable.ts`.
-    void admitProcess({
+    const processIdPromise = admitProcess({
       kind: 'crew_member',
       externalId: recorder.runId,
       runId: recorder.runId,
       profile: actor.name,
     }).then(async (id) => {
-      if (!id) return;
-      crewActorProcesses.set(`${sessionId}:${actor.actorId}`, id);
-      await markProcessRunning(id);
+      if (id) await markProcessRunning(id);
+      return id;
     });
+    crewActorProcesses.set(`${sessionId}:${actor.actorId}`, processIdPromise);
     execution.cancellationDisposers.push(registerRunCancellation(recorder.runId, () => {
       execution.externallyRequestedRunIds.add(recorder.runId);
       execution.reason = "user";
@@ -186,10 +187,15 @@ async function initializeActorRecorders(
 }
 
 /** Process-table ids for live crew actors, keyed `sessionId:actorId` — the
- * lookup `finalizeActorRecorder` needs to exit the right record. Mirrors
- * `subagent.ts`'s `activeSubagentControllers`; entries are removed on finalize
- * so the map only ever holds live actors. */
-const crewActorProcesses = new Map<string, string>();
+ * lookup `finalizeActorRecorder` needs to exit the right record, and
+ * `honourActorPause` needs to mark suspended/running around a pause. Holds
+ * the promise itself (set synchronously, before `admitProcess` resolves) so
+ * a pause or finalize racing in immediately after admission still finds an
+ * entry rather than nothing — `initializeActorRecorders`'s `Promise.all`
+ * does not wait for this chain to settle. Mirrors `subagent.ts`'s
+ * `activeSubagentControllers`; entries are removed on finalize so the map
+ * only ever holds live actors. */
+const crewActorProcesses = new Map<string, Promise<string | null>>();
 
 async function finalizeActorRecorder(
   sessionId: string,
@@ -198,12 +204,17 @@ async function finalizeActorRecorder(
   detail: string,
 ): Promise<void> {
   const processKey = `${sessionId}:${actorId}`;
-  const processId = crewActorProcesses.get(processKey);
-  if (processId) {
+  const processIdPromise = crewActorProcesses.get(processKey);
+  if (processIdPromise) {
     crewActorProcesses.delete(processKey);
-    const exitStatus =
-      outcome === "completed" ? "succeeded" : outcome === "cancelled" ? "cancelled" : "failed";
-    await exitProcess(processId, exitStatus, outcome === "completed" ? null : detail);
+    const pauseKey = actorRecorder(sessionId, actorId)?.runId;
+    if (pauseKey) forgetPause(pauseKey);
+    const processId = await processIdPromise;
+    if (processId) {
+      const exitStatus =
+        outcome === "completed" ? "succeeded" : outcome === "cancelled" ? "cancelled" : "failed";
+      await exitProcess(processId, exitStatus, outcome === "completed" ? null : detail);
+    }
   }
   const execution = activeCrewExecutions.get(sessionId);
   if (!execution) return;
@@ -540,7 +551,13 @@ async function budgetedAttempt(
   const reservation = reserveBudget(sessionId, gate, actor.modelTarget, messages);
   const callController = new AbortController();
   const abortChild = () => callController.abort();
-  parentSignal.addEventListener("abort", abortChild, { once: true });
+  // `parentSignal` may already be aborted by the time this runs (a cooperative
+  // pause's wait, or any other await, can push us past the moment cancel
+  // fired) — an `addEventListener` added after the event already happened
+  // never fires, which would leave `callController` (and anything waiting on
+  // it) hung forever. Same defensive check `abortedPromise` uses.
+  if (parentSignal.aborted) abortChild();
+  else parentSignal.addEventListener("abort", abortChild, { once: true });
   let outputLimitHit = false;
   try {
     const recorder = actorRecorder(sessionId, actor.actorId);
@@ -715,6 +732,19 @@ async function recordBlockedTool(
   );
 }
 
+/** Holds `runActorModel`/`repairActorEnvelope` at their existing
+ * `signal.aborted` checkpoints for as long as this actor's durable run id is
+ * latched paused. Keyed the same way `registerRunCancellation` already keys
+ * this actor (`recorder.runId`), so the same `processes://changed` fan-in
+ * that delivers a stop delivers a pause too. A no-op if the actor has no
+ * recorder yet (nothing latched, nothing to check). */
+async function honourActorPause(sessionId: string, actorId: string, signal: AbortSignal): Promise<void> {
+  const pauseKey = actorRecorder(sessionId, actorId)?.runId;
+  if (!pauseKey) return;
+  const processId = crewActorProcesses.get(`${sessionId}:${actorId}`) ?? null;
+  await honourPause(pauseKey, processId, signal);
+}
+
 async function runActorModel(
   sessionId: string,
   actor: CrewActorRun,
@@ -722,12 +752,15 @@ async function runActorModel(
   gate: BudgetGate,
   signal: AbortSignal,
 ): Promise<string> {
+  await honourActorPause(sessionId, actor.actorId, signal);
+  if (signal.aborted) throw new DOMException("Crew cancelled", "AbortError");
   preflightTarget(actor.modelTarget);
   const resolvedTarget = await resolveTarget(actor.modelTarget);
   const readOnlyTools = toolsForProfile("explore");
   let result = await budgetedAttempt(sessionId, actor, gate, resolvedTarget, messages, readOnlyTools, signal);
   appendTranscript(sessionId, actor.actorId, "model", result.content);
   if (result.streamError) throw new Error(result.streamError);
+  await honourActorPause(sessionId, actor.actorId, signal);
   if (signal.aborted) throw new DOMException("Crew cancelled", "AbortError");
   if (result.toolCalls.length === 0) return result.content;
 
@@ -838,6 +871,7 @@ async function runActorModel(
   if (blocked) {
     throw new Error("Actor attempted a tool outside its read-only profile. The request was recorded and blocked.");
   }
+  await honourActorPause(sessionId, actor.actorId, signal);
   if (signal.aborted) throw new DOMException("Crew cancelled", "AbortError");
 
   // Exactly one tool round. The follow-up receives no tool schema, and any
@@ -886,6 +920,8 @@ async function repairActorEnvelope(
   gate: BudgetGate,
   signal: AbortSignal,
 ): Promise<string> {
+  await honourActorPause(sessionId, actorId, signal);
+  if (signal.aborted) throw new DOMException("Crew cancelled", "AbortError");
   const actor = getActor(sessionId, actorId);
   if (actor.modelCalls >= MAX_MODEL_CALLS_PER_ACTOR) {
     throw new Error("Actor exhausted its two-call ceiling before producing a valid structured envelope.");

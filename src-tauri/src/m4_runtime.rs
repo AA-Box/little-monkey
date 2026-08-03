@@ -39,7 +39,7 @@ use crate::package_ecosystem::{
     signed_first_party_catalog, InstallEnvironment, InstallTrustPolicy, PackageLimits,
     RingEd25519SignatureVerifier, SemanticVersion, FIRST_PARTY_REGISTRY_GENERATED_UNIX_MS,
 };
-use crate::process_table::LedgerProcessProjector;
+use crate::process_table::{LedgerProcessProjector, LedgerSignalSource};
 use crate::workflow_core::{
     ArtifactReference, DaemonCapability, EffectClass, FailureClass, LegacyRecipeV1,
     NodeAdapterResult, NodeExecutionRequest, ResourceUsage, SecretBinding,
@@ -2222,6 +2222,13 @@ fn production_workflow_service_with_browser(
     // is what makes workflow runs and their node instances visible in the
     // unified process table rather than only in their own JSON history store.
     .with_process_projector(Arc::new(LedgerProcessProjector::new(
+        app_data_dir.join("profile-v1.sqlite3"),
+    )))
+    // Same reasoning as the projector above: every production path — desktop
+    // start, replay, and a daemon-hosted trigger delivery — reaches this
+    // service, so attaching the read port here is what lets a workflow run's
+    // level boundary see a pause requested from any of them.
+    .with_signal_source(Arc::new(LedgerSignalSource::new(
         app_data_dir.join("profile-v1.sqlite3"),
     )));
     let service = Arc::new(service);

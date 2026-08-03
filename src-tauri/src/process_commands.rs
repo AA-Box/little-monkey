@@ -453,6 +453,42 @@ pub fn process_signal(
     let record = with_process_table(&app, state.inner(), |table| {
         table.signal(&process_id, signal, reason.as_deref(), now)
     })?;
+    // A background shell has no safe-point loop to reach the durable latch
+    // itself, so deliver the real OS suspend/resume in this same call rather
+    // than waiting on a poll that doesn't exist for this kind. Falls back to
+    // the undelivered record on error — the latch is already written, and a
+    // later reap or retry resolves it rather than this call failing outright.
+    let record = if record.kind == ProcessKind::BackgroundShell
+        && matches!(
+            signal,
+            crate::process_table::ProcessSignal::Suspend
+                | crate::process_table::ProcessSignal::Resume
+        ) {
+        crate::background_shell::deliver_os_signal(&app, state.inner(), &record, signal)
+            .unwrap_or(record)
+    } else {
+        record
+    };
+    // A chat turn's own pause is cooperative and lands at the loop's next safe
+    // point, which for a long `run_shell` can be minutes away. Its foreground
+    // shell children are ordinary OS processes, so stop them now — that is
+    // what makes a paused turn stop consuming the machine rather than merely
+    // promising to at some unbounded later moment. Best-effort by design: a
+    // turn with no shell running signals nothing, which is not a failure, and
+    // the turn's own cooperative park is unaffected either way.
+    if record.kind == ProcessKind::ChatTurn {
+        match signal {
+            crate::process_table::ProcessSignal::Suspend => {
+                crate::tools::signal_turn_shells(state.inner(), &record.external_id, true);
+            }
+            crate::process_table::ProcessSignal::Resume => {
+                crate::tools::signal_turn_shells(state.inner(), &record.external_id, false);
+            }
+            // Stop/Kill already tear the child down through
+            // `tools_cancel_running`'s notify plus `kill_on_drop`.
+            _ => {}
+        }
+    }
     notify(&app, &record);
     Ok(record)
 }
