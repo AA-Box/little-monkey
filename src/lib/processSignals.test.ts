@@ -97,6 +97,28 @@ describe("canSuspend / canResume", () => {
     expect(canResume(parked)).toBe(true);
     expect(canResume(liveRecord())).toBe(false);
   });
+
+  it("offers resume for a process the OS stopped even with no latch left", () => {
+    // Found by hand, not by a test. A background shell suspended in-app and
+    // then resumed from `monkey processes signal` ends up `suspended` with the
+    // latch already cleared. Keying only on the latch called that "nothing to
+    // resume", so the panel rendered Pause on a stopped child and there was no
+    // way back short of `kill -CONT` from outside the app.
+    const strandedByClearedLatch = liveRecord({
+      state: "suspended",
+      signalIntent: { stopRequested: false, suspendRequested: false, killRequested: false },
+    });
+    expect(canResume(strandedByClearedLatch)).toBe(true);
+    expect(canSuspend(strandedByClearedLatch)).toBe(false);
+
+    // And an exited row offers neither, whatever the latch says.
+    const exited = liveRecord({
+      state: "exited",
+      signalIntent: { stopRequested: false, suspendRequested: true, killRequested: false },
+    });
+    expect(canResume(exited)).toBe(false);
+    expect(canSuspend(exited)).toBe(false);
+  });
 });
 
 describe("signalProcess", () => {

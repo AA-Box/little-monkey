@@ -399,13 +399,60 @@ encodes rather than reading the column raw.
   the sweep is idempotent), and the daemon's test above now runs. Workflow runs
   are not: they are not desktop-owned, so the startup reaper deliberately leaves
   them alone, and nothing else sweeps them.
-- **No manual round-trip against a live runtime.** Every path here is covered by
-  unit and integration tests, including the cross-process ones, but nobody has
-  yet started a real chat turn, run `monkey processes signal <id> suspend` from
-  another terminal, and watched it park — nor the same for a subagent, a crew
-  run, a workflow run and a background shell, checking the last with `ps`. The
-  tests are the reason to expect it works; they are not the same as having seen
-  it.
+**Also shipped — two defects the manual round trip found, and only it could.**
+Both were invisible to the whole test suite because every test signalled the way
+the app does, and both broke the same promise: `background_shell` says
+`Honoured` for suspend and resume, and one of the two documented callers
+silently did nothing.
+
+- **A CLI-originated suspend never reached a background shell.**
+  `process_signal` delivers the real SIGSTOP inline, so an in-app pause worked —
+  and the desktop fan-out assumed that was the only origin, returning "already
+  delivered in Rust" for the kind. `monkey processes signal` writes the latch
+  from another OS process and exits, and a background shell has no loop of its
+  own to notice: the sweep saw the latch and dropped it while the child kept
+  running. Proven by contrast on one pid — in-app pause gave `ps` state `T`, the
+  CLI gave `S` with the row still `running`. Fixed with a delivery-only
+  `process_deliver_os_signal`, which writes no intent (so the sweep calling it
+  cannot re-trigger itself) and is a no-op once the OS state agrees.
+  `workflow_run` genuinely does poll `SignalSource` at each level boundary, so it
+  still defers — the old shared comment hid that only one of the two kinds was
+  covered.
+- **`canResume` read the latch and not the state**, which stranded a process
+  outright. Suspend in the app, resume from the CLI: the resume clears
+  `suspend_requested` without delivering, leaving the row `suspended` with no
+  intent — so latch-only said "nothing to resume", the panel rendered Pause on a
+  stopped child, and nothing in either surface could recover it. Only an
+  out-of-band `kill -CONT` did. Both predicates now consider state as well.
+
+A test was pinning the first one (`defers suspend and resume for the kinds Rust
+delivers to itself` asserted `background_shell` defers) and failed the moment the
+code was fixed. It is rewritten rather than deleted: that assertion is why the
+assumption survived review.
+
+- **The Processes panel does not repaint on a CLI-originated signal.** Found by
+  hand, not by a test, and it is the same structural gap the delivery path
+  already documents one layer down: the store live-updates only from
+  `processes://changed` (`processStore.ts`), and the panel otherwise refreshes on
+  mount and on its own button (`ProcessesPanel.tsx`). `monkey processes signal`
+  writes SQLite from another OS process and cannot emit a Tauri event, so a row
+  suspended or resumed from the CLI keeps rendering its previous state, with its
+  age frozen, until something remounts the panel or the user hits refresh. The
+  2s `process_pending_signals` sweep does not help — it exists to *deliver*
+  intent to the kinds that own a loop, not to repaint a view. The fix is the
+  same shape as that sweep: a poll (or a store-level catch-up) behind the panel
+  while it is open. Not bundled here because it is a UI concern with its own
+  cost/refresh-rate tradeoff, and the durable state was correct throughout.
+- **Manual round-trip: chat turn done, four kinds to go.** A real turn was
+  started against a live desktop runtime, suspended with `monkey processes
+  signal <id> suspend` from a separate process, and observed as `running +
+  suspend_requested` — the derived `pause_pending` — rendering as "Pausing /
+  Lands at the next safe point" with the caller's reason carried across the
+  process boundary, then resumed with the latch cleared. The daemon job was
+  verified the same way, including real `SIGSTOP`/`SIGCONT`/`SIGKILL` against
+  its child's process group. Still unverified by hand: subagent, crew member,
+  side task, background shell (which needs `ps` to confirm the OS suspend), and
+  workflow run.
 
 Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace

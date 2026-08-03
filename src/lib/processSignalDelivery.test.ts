@@ -205,6 +205,41 @@ describe("fan-out to each kind's own primitive", () => {
     expect(invokeMock).toHaveBeenCalledWith("background_shell_kill", { id: "shell-2" });
   });
 
+  it("delivers a background shell's suspend and resume through Rust", async () => {
+    // The bug this pins was found by hand: `process_signal` delivers the real
+    // SIGSTOP inline, so an in-app pause worked and this arm assumed that was
+    // the only origin — returning "already delivered in Rust". A
+    // `monkey processes signal` writes the latch from another OS process and
+    // exits, and a background shell has no loop to notice, so the sweep saw the
+    // latch and dropped it while the child kept running.
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(null);
+
+    const suspended = await deliverProcessSignal(
+      record({ kind: "background_shell", processId: "p-sh-1", signalIntent: suspend }),
+      MAIN,
+    );
+    expect(suspended).toBe("suspended");
+    expect(invokeMock).toHaveBeenCalledWith("process_deliver_os_signal", {
+      processId: "p-sh-1",
+    });
+
+    invokeMock.mockClear();
+    const resumed = await deliverProcessSignal(
+      record({
+        kind: "background_shell",
+        processId: "p-sh-1",
+        state: "suspended",
+        signalIntent: { stopRequested: false, suspendRequested: false, killRequested: false },
+      }),
+      MAIN,
+    );
+    expect(resumed).toBe("resumed");
+    expect(invokeMock).toHaveBeenCalledWith("process_deliver_os_signal", {
+      processId: "p-sh-1",
+    });
+  });
+
   it("keeps a workflow run's absent registry entry visible as a miss", async () => {
     // `m4_workflows_cancel` returning false is the out-of-process hole K2 still
     // lists as open, not a transport failure — reporting it as `stopped` would
@@ -389,16 +424,20 @@ describe("cooperative pause delivery", () => {
     cancelled();
   });
 
-  it("defers suspend and resume for the kinds Rust delivers to itself", async () => {
-    // A background shell gets a real SIGSTOP inline in `process_signal`, and a
-    // workflow run parks at its own level boundary. Nothing for this side to do.
-    for (const kind of ["background_shell", "workflow_run"] as ProcessKind[]) {
-      const outcome = await deliverProcessSignal(
-        record({ kind, externalId: `ext-${kind}`, signalIntent: suspend }),
-        MAIN,
-      );
-      expect(outcome).toBe("delivered-elsewhere");
-      expect(isPauseRequested(`ext-${kind}`)).toBe(false);
-    }
+  it("defers suspend and resume only for the kind that truly polls the latch", async () => {
+    // This used to include `background_shell`, and that was the bug: a shell is
+    // signalled inline by `process_signal` only when the signal was raised in
+    // this app, so deferring stranded every CLI-originated one. A workflow run
+    // genuinely does poll — its executor reads `SignalSource` at each level
+    // boundary — so it needs nothing from this side whoever wrote the latch.
+    const outcome = await deliverProcessSignal(
+      record({ kind: "workflow_run", externalId: "ext-workflow_run", signalIntent: suspend }),
+      MAIN,
+    );
+    expect(outcome).toBe("delivered-elsewhere");
+    expect(isPauseRequested("ext-workflow_run")).toBe(false);
+
+    // And neither kind is ever routed through the cooperative registry.
+    expect(isPauseRequested("ext-background_shell")).toBe(false);
   });
 });
