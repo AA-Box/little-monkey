@@ -443,16 +443,39 @@ assumption survived review.
   same shape as that sweep: a poll (or a store-level catch-up) behind the panel
   while it is open. Not bundled here because it is a UI concern with its own
   cost/refresh-rate tradeoff, and the durable state was correct throughout.
-- **Manual round-trip: chat turn done, four kinds to go.** A real turn was
-  started against a live desktop runtime, suspended with `monkey processes
-  signal <id> suspend` from a separate process, and observed as `running +
-  suspend_requested` — the derived `pause_pending` — rendering as "Pausing /
-  Lands at the next safe point" with the caller's reason carried across the
-  process boundary, then resumed with the latch cleared. The daemon job was
-  verified the same way, including real `SIGSTOP`/`SIGCONT`/`SIGKILL` against
-  its child's process group. Still unverified by hand: subagent, crew member,
-  side task, background shell (which needs `ps` to confirm the OS suspend), and
-  workflow run.
+- **Manual round-trip: five of seven kinds done.** Every signal below was sent
+  with `monkey processes signal` from a *separate OS process* against a live
+  desktop runtime or daemon — the durable-latch claim exercised for real rather
+  than simulated.
+  - `daemon_job` — suspend took the child's process group to `ps` state `T` in
+    under a second, resume back to `S`, kill to `Z`, with the row ending
+    `exited/cancelled` and `kill_requested ∧ stop_requested` both set.
+  - `chat_turn` — `running + suspend_requested` (the derived `pause_pending`),
+    rendered as "Pausing / Lands at the next safe point" with the caller's
+    reason carried across the process boundary; resume cleared the latch.
+  - `background_shell` — `S` → `T` → `S`, the two defects above found here.
+  - `subagent` — `pause_pending` with the reason carried through, then resumed.
+  - `side_task` — the full transition: `running` (pause_pending) at t+1s, then
+    genuinely `suspended` at t+2s once the loop parked, and back to `running` on
+    resume. The only kind observed making the whole journey by hand.
+  - `stop` was additionally verified from the CLI against a live chat turn,
+    subagent and side task simultaneously.
+- **`crew_member` is blocked by a bug outside K2**, found while trying to verify
+  it. Every crew run fails before any member is admitted:
+  `invalid run protocol value: workspace.primary_root_id: must start and end
+  with an ASCII letter or digit`. `WorkspaceRoot::id` is documented as "the
+  canonicalized path string", and `workspaceToRunWire` passes it straight into
+  `primary_root_id`, `roots[].root_id` and `repository_policy.root_id` — while
+  the sibling `workspace_id` on the same object *is* run through
+  `stableProtocolId`. A POSIX path starts with `/`, so `validate_protocol_id`
+  rejects it every time. Crew chats therefore cannot run at all with a workspace
+  attached, on any path, and the UI offers no way to detach one. Not fixed here:
+  it is run-protocol identity, not signals, and changing how root ids are
+  derived touches durable run records.
+- **`workflow_run` remains unverified by hand** — it needs a definition saved
+  from the visual editor. It is the one kind whose pause is a Rust-side poll of
+  `SignalSource` at each level boundary rather than a desktop-delivered latch,
+  which is exactly why the delivery fix above deliberately leaves it deferring.
 
 Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace
