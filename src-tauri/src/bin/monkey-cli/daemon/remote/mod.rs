@@ -94,6 +94,11 @@ pub enum RemoteCmd {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Suspend a run without ending it. Strictly weaker than `cancel`: the run
+    /// keeps its place and can be resumed.
+    Pause { alias: String, run_id: String },
+    /// Undo a `pause`.
+    Resume { alias: String, run_id: String },
     /// Fetch one run-linked artifact with size and SHA-256 verification.
     Artifact {
         alias: String,
@@ -154,6 +159,7 @@ pub enum PairAction {
     ReadArtifacts,
     Approve,
     Cancel,
+    Pause,
     Kill,
     ControlDesktop,
 }
@@ -190,6 +196,7 @@ impl From<PairAction> for RemoteAction {
             PairAction::ReadArtifacts => Self::ReadArtifacts,
             PairAction::Approve => Self::Approve,
             PairAction::Cancel => Self::Cancel,
+            PairAction::Pause => Self::Pause,
             PairAction::Kill => Self::Kill,
             PairAction::ControlDesktop => Self::ControlDesktop,
         }
@@ -394,6 +401,28 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
                 .await?,
             )?;
         }
+        RemoteCmd::Pause { alias, run_id } => print_json(
+            client::call(
+                &paths,
+                alias,
+                Method::POST,
+                &format!("/v1/remote/runs/{}/pause", segment(run_id)?),
+                b"{}".to_vec(),
+                now_ms()?,
+            )
+            .await?,
+        )?,
+        RemoteCmd::Resume { alias, run_id } => print_json(
+            client::call(
+                &paths,
+                alias,
+                Method::POST,
+                &format!("/v1/remote/runs/{}/resume", segment(run_id)?),
+                b"{}".to_vec(),
+                now_ms()?,
+            )
+            .await?,
+        )?,
         RemoteCmd::Cancel {
             alias,
             run_id,
