@@ -27,7 +27,7 @@ function liveRecord(overrides: Partial<ProcessRecord> = {}): ProcessRecord {
     profile: null,
     nativePid: null,
     limits: {},
-    signalIntent: { stopRequested: false, suspendRequested: false },
+    signalIntent: { stopRequested: false, suspendRequested: false , killRequested: false,},
     signalReason: null,
     signalRequestedAtMs: null,
     exit: null,
@@ -50,14 +50,14 @@ describe("processDisplayState", () => {
     // The honest middle state: asked for, not arrived. Reporting `suspended`
     // here would claim a park that has not happened, and `running` would hide
     // that the user already asked.
-    const record = liveRecord({ signalIntent: { stopRequested: false, suspendRequested: true } });
+    const record = liveRecord({ signalIntent: { stopRequested: false, suspendRequested: true , killRequested: false,} });
     expect(processDisplayState(record)).toBe("pause_pending");
   });
 
   it("reports a process that has actually parked as suspended, not pause_pending", () => {
     const record = liveRecord({
       state: "suspended",
-      signalIntent: { stopRequested: false, suspendRequested: true },
+      signalIntent: { stopRequested: false, suspendRequested: true , killRequested: false,},
     });
     expect(processDisplayState(record)).toBe("suspended");
   });
@@ -65,14 +65,14 @@ describe("processDisplayState", () => {
   it("lets a pending stop outrank a pending pause", () => {
     // The two latches are independent — `resume` never clears a stop — so a
     // process on its way out must not read as merely pausing.
-    const record = liveRecord({ signalIntent: { stopRequested: true, suspendRequested: true } });
+    const record = liveRecord({ signalIntent: { stopRequested: true, suspendRequested: true , killRequested: false,} });
     expect(processDisplayState(record)).toBe("stopping");
   });
 
   it("reports an exited process as exited whatever is still latched on it", () => {
     const record = liveRecord({
       state: "exited",
-      signalIntent: { stopRequested: true, suspendRequested: true },
+      signalIntent: { stopRequested: true, suspendRequested: true , killRequested: false,},
     });
     expect(processDisplayState(record)).toBe("exited");
   });
@@ -82,16 +82,16 @@ describe("canSuspend / canResume", () => {
   it("offers suspend only where it would say something new", () => {
     expect(canSuspend(liveRecord())).toBe(true);
     expect(
-      canSuspend(liveRecord({ signalIntent: { stopRequested: false, suspendRequested: true } })),
+      canSuspend(liveRecord({ signalIntent: { stopRequested: false, suspendRequested: true , killRequested: false,} })),
     ).toBe(false);
     expect(canSuspend(liveRecord({ state: "exited" }))).toBe(false);
   });
 
   it("offers resume for a parked process and for one still on its way there", () => {
-    const pending = liveRecord({ signalIntent: { stopRequested: false, suspendRequested: true } });
+    const pending = liveRecord({ signalIntent: { stopRequested: false, suspendRequested: true , killRequested: false,} });
     const parked = liveRecord({
       state: "suspended",
-      signalIntent: { stopRequested: false, suspendRequested: true },
+      signalIntent: { stopRequested: false, suspendRequested: true , killRequested: false,},
     });
     expect(canResume(pending)).toBe(true);
     expect(canResume(parked)).toBe(true);

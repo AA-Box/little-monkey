@@ -3475,6 +3475,7 @@ mod tests {
             Some(SignalIntent {
                 stop_requested: false,
                 suspend_requested: true,
+                kill_requested: false,
             })
         }
     }
@@ -3495,6 +3496,7 @@ mod tests {
             Some(SignalIntent {
                 stop_requested: false,
                 suspend_requested: true,
+                kill_requested: false,
             })
         }
     }
@@ -3597,6 +3599,7 @@ mod tests {
         let signal_source = FixedSignalSource(SignalIntent {
             stop_requested: true,
             suspend_requested: false,
+            kill_requested: false,
         });
 
         let history = HeadlessWorkflowExecutor::new(&adapter, &TestClock::at(1_000))
@@ -3619,6 +3622,7 @@ mod tests {
         let signal_source = FixedSignalSource(SignalIntent {
             stop_requested: true,
             suspend_requested: true,
+            kill_requested: false,
         });
 
         let history = HeadlessWorkflowExecutor::new(&adapter, &clock)

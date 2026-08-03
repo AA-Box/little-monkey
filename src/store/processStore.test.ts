@@ -51,6 +51,7 @@ function record(overrides: {
     signalIntent: {
       stopRequested: overrides.stopRequested ?? false,
       suspendRequested: overrides.suspendRequested ?? false,
+      killRequested: false,
     },
     signalReason: null,
     signalRequestedAtMs: null,

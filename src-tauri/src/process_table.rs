@@ -585,19 +585,32 @@ impl SignalSupport {
 /// Two independent latches rather than one "requested signal" field: a stop and
 /// a suspend are not alternatives. A process can be suspended and then asked to
 /// stop, and the stop must win without the suspend intent being lost from the
-/// audit trail. `Resume` clears the suspend latch; `Kill` sets the stop latch —
-/// the distinction between them lives in how the kind delivers it, not in what
-/// is recorded.
+/// audit trail. `Resume` clears the suspend latch and nothing else, because the
+/// alternative turns "stop this" into "keep going" on a race.
+///
+/// `kill_requested` never appears without `stop_requested`. A kill IS a stop
+/// carrying a stronger delivery promise — terminate now, do not wait for a safe
+/// point — so a reader that only cares "is this winding down?" checks
+/// `stop_requested` and is right for both, while a supervisor deciding *how* to
+/// deliver reads `kill_requested` to tell them apart. Before this the two were
+/// indistinguishable once written, and only the free-text reason survived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalIntent {
     pub stop_requested: bool,
     pub suspend_requested: bool,
+    pub kill_requested: bool,
 }
 
 impl SignalIntent {
     pub fn is_clear(&self) -> bool {
-        !self.stop_requested && !self.suspend_requested
+        !self.stop_requested && !self.suspend_requested && !self.kill_requested
+    }
+
+    /// How a stop should be delivered, for a caller that can honour the
+    /// difference. `false` for a row with no stop pending at all.
+    pub fn wants_immediate_termination(&self) -> bool {
+        self.kill_requested
     }
 }
 
@@ -1125,18 +1138,37 @@ impl<'a> ProcessTable<'a> {
             });
         }
 
-        let (stop, suspend) = match signal {
-            // Kill and Stop both record "stop wanted", so **a reader cannot tell
-            // them apart from the latch** — only the free-text `signal_reason`
-            // survives. That is honest today because the only kinds honouring
-            // `kill` deliver both the same way: the daemon maps `Stop` and `Kill`
-            // alike onto `terminate_process_group` (TERM, wait, KILL), so there is
-            // no observable difference to record. If a kind ever delivers them
-            // differently, the distinction needs its own column rather than being
-            // inferred from `signal_reason`.
-            ProcessSignal::Stop | ProcessSignal::Kill => (true, record.signal_intent.suspend_requested),
-            ProcessSignal::Suspend => (record.signal_intent.stop_requested, true),
-            ProcessSignal::Resume => (record.signal_intent.stop_requested, false),
+        // Each arm states all three latches, so the interaction between them is
+        // readable in one place rather than inferred from what is missing.
+        //
+        // A `Kill` sets `stop` as well: killing IS stopping, with a stronger
+        // promise about how. Every reader that only asks "is this winding down?"
+        // therefore stays correct without knowing the distinction exists.
+        //
+        // Neither `Stop` nor `Kill` clears a pending suspend, and `Resume`
+        // clears neither of them. The latches are independent because the
+        // alternatives are both wrong: erasing the suspend would lose why the
+        // process stopped making progress, and letting a resume clear a stop
+        // would turn "stop this" into "keep going" on a race. A kill is never
+        // downgraded back to a plain stop either — a caller who escalated does
+        // not get un-escalated by a later, weaker request.
+        let (stop, suspend, kill) = match signal {
+            ProcessSignal::Stop => (
+                true,
+                record.signal_intent.suspend_requested,
+                record.signal_intent.kill_requested,
+            ),
+            ProcessSignal::Kill => (true, record.signal_intent.suspend_requested, true),
+            ProcessSignal::Suspend => (
+                record.signal_intent.stop_requested,
+                true,
+                record.signal_intent.kill_requested,
+            ),
+            ProcessSignal::Resume => (
+                record.signal_intent.stop_requested,
+                false,
+                record.signal_intent.kill_requested,
+            ),
         };
 
         self.connection.execute(
@@ -1145,7 +1177,8 @@ impl<'a> ProcessTable<'a> {
                     suspend_requested = ?3,
                     signal_reason = ?4,
                     signal_requested_at_ms = ?5,
-                    updated_at_ms = ?5
+                    updated_at_ms = ?5,
+                    kill_requested = ?6
               WHERE process_id = ?1",
             params![
                 process_id,
@@ -1153,6 +1186,7 @@ impl<'a> ProcessTable<'a> {
                 i64::from(suspend),
                 reason,
                 now_ms,
+                i64::from(kill),
             ],
         )?;
 
@@ -1582,7 +1616,7 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
-     signal_reason, signal_requested_at_ms FROM agent_processes";
+     signal_reason, signal_requested_at_ms, kill_requested FROM agent_processes";
 
 /// Row → record. Returns a nested `Result` because a stored enum that fails to
 /// parse is a data error, not a SQLite error, and must not be reported as one.
@@ -1632,6 +1666,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
         signal_intent: SignalIntent {
             stop_requested: row.get::<_, i64>(21)? != 0,
             suspend_requested: row.get::<_, i64>(22)? != 0,
+            kill_requested: row.get::<_, i64>(25)? != 0,
         },
         signal_reason: row.get(23)?,
         signal_requested_at_ms: row.get(24)?,
@@ -2171,6 +2206,58 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_suspended_desktop_process_is_reaped_as_lost_rather_than_surviving_a_restart() {
+        // K2's rule for paused + restart, made explicit rather than left to fall
+        // out of `live_only`.
+        //
+        // Durable *intent* survives a restart; durable *execution* does not. A
+        // paused chat turn's loop lives in the WebView, so once the app is gone
+        // there is nothing left to resume — and a `suspended` row that outlived
+        // its process would offer the user a Resume button for work that cannot
+        // come back. That is the exact dishonesty this table exists to remove,
+        // so the row is closed out as `lost` like any other abandoned process.
+        // Restoring a live process across a restart is K13, not this.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let turn = admit(&table, ProcessKind::ChatTurn, "turn-paused");
+        table
+            .transition(&turn.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .signal(&turn.process_id, ProcessSignal::Suspend, Some("user"), T0 + 2)
+            .unwrap();
+        table
+            .transition(&turn.process_id, ProcessState::Suspended, None, T0 + 3)
+            .unwrap();
+
+        let reaped = table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "the app restarted while this process was still running",
+                T0 + 9,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1, "a suspended row is still live work to reap");
+        let closed = table.get(&turn.process_id).unwrap().unwrap();
+        assert_eq!(closed.state, ProcessState::Exited);
+        assert_eq!(
+            closed.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Lost),
+            "a paused process that did not survive the restart is lost, not cancelled"
+        );
+        // The latch is left as it was: it records what was asked for, and the
+        // exit records what happened. Rewriting history to hide the pause would
+        // lose the reason this process stopped making progress.
+        assert!(closed.signal_intent.suspend_requested);
     }
 
     #[test]
@@ -2754,6 +2841,102 @@ mod tests {
         assert_eq!(
             table.pending_signals(&[ProcessKind::DaemonJob]).unwrap().len(),
             0
+        );
+    }
+
+    #[test]
+    fn kill_is_distinguishable_from_stop_in_the_latch() {
+        // The gap this closed: both used to set only `stop_requested`, so once
+        // written, a supervisor could not tell "wind down cleanly" from
+        // "terminate now" — the difference survived only in a free-text reason.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let stopped = admit(&table, ProcessKind::DaemonJob, "job-stop");
+        let killed = admit(&table, ProcessKind::DaemonJob, "job-kill");
+
+        let stopped = table
+            .signal(&stopped.process_id, ProcessSignal::Stop, None, T0 + 1)
+            .unwrap();
+        let killed = table
+            .signal(&killed.process_id, ProcessSignal::Kill, None, T0 + 1)
+            .unwrap();
+
+        assert!(stopped.signal_intent.stop_requested);
+        assert!(!stopped.signal_intent.kill_requested);
+        assert!(!stopped.signal_intent.wants_immediate_termination());
+
+        // A kill sets both: it IS a stop, so every reader that only checks
+        // `stop_requested` stays correct without knowing kill exists.
+        assert!(killed.signal_intent.stop_requested);
+        assert!(killed.signal_intent.kill_requested);
+        assert!(killed.signal_intent.wants_immediate_termination());
+    }
+
+    #[test]
+    fn a_kill_is_never_downgraded_by_a_later_weaker_signal() {
+        // Escalation is one-way. A caller who asked for a guaranteed
+        // termination does not get un-escalated because something later asked
+        // for a polite one, and `resume` must not clear either.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-escalated");
+
+        table
+            .signal(&record.process_id, ProcessSignal::Kill, Some("hung"), T0 + 1)
+            .unwrap();
+        let after_stop = table
+            .signal(&record.process_id, ProcessSignal::Stop, Some("polite"), T0 + 2)
+            .unwrap();
+        assert!(
+            after_stop.signal_intent.kill_requested,
+            "a stop must not downgrade a kill that was already asked for"
+        );
+
+        let after_resume = table
+            .signal(&record.process_id, ProcessSignal::Resume, None, T0 + 3)
+            .unwrap();
+        assert!(after_resume.signal_intent.kill_requested);
+        assert!(after_resume.signal_intent.stop_requested);
+    }
+
+    #[test]
+    fn a_killed_process_is_still_pending_for_a_reader_that_only_knows_stop() {
+        // The migration's cheapness rests on this: the pending-signal index and
+        // predicate were never rebuilt for `kill_requested`, which is only sound
+        // because a kill always carries a stop.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-killed-pending");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .signal(&record.process_id, ProcessSignal::Kill, None, T0 + 2)
+            .unwrap();
+
+        let pending = table.pending_signals(&[ProcessKind::DaemonJob]).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].signal_intent.kill_requested);
+    }
+
+    #[test]
+    fn the_ledger_refuses_a_kill_latch_without_its_stop() {
+        // The SQL trigger holds the invariant against a direct write, the same
+        // way the state machine's own trigger does — a companion store reaching
+        // this connection cannot record a kill that no `stop_requested` reader
+        // would ever see.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-direct-write");
+
+        let result = ledger.connection().execute(
+            "UPDATE agent_processes SET kill_requested = 1 WHERE process_id = ?1",
+            [&record.process_id],
+        );
+        assert!(
+            result.is_err(),
+            "a kill latch without a stop latch must be refused at the SQL layer"
         );
     }
 

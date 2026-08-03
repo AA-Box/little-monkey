@@ -104,7 +104,12 @@ fn command_ok(program: &str, args: &[&str]) -> Result<(), String> {
 pub enum ProcessSignal {
     Pause,
     Resume,
+    /// Cooperative wind-down: TERM, a grace period, then KILL if it is ignored.
     Terminate,
+    /// Immediate termination, no grace period — what a durable `kill` latch
+    /// asks for and a `stop` does not. Kept distinct from `Terminate` because
+    /// collapsing them is what made `kill` unobservable in the first place.
+    Kill,
 }
 
 pub trait ManagedProcess: Send {
@@ -217,6 +222,7 @@ impl ManagedProcess for RealManagedProcess {
             ProcessSignal::Pause => little_monkey_lib::os_signal::suspend_process_group(self.child.id()),
             ProcessSignal::Resume => little_monkey_lib::os_signal::resume_process_group(self.child.id()),
             ProcessSignal::Terminate => terminate_process_group(self.child.id()),
+            ProcessSignal::Kill => kill_process_group(self.child.id()),
         }
     }
 
@@ -246,6 +252,19 @@ fn terminate_process_group(process_id: u32) -> Result<(), String> {
 #[cfg(windows)]
 fn terminate_process_group(process_id: u32) -> Result<(), String> {
     command_ok("taskkill", &["/PID", &process_id.to_string(), "/T", "/F"])
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_id: u32) -> Result<(), String> {
+    little_monkey_lib::os_signal::kill_process_group(process_id)
+}
+
+/// Windows has no softer option to skip: `taskkill /F` is already immediate, so
+/// `Terminate` and `Kill` genuinely coincide here. Stated rather than left to
+/// look like an oversight.
+#[cfg(windows)]
+fn kill_process_group(process_id: u32) -> Result<(), String> {
+    terminate_process_group(process_id)
 }
 
 #[cfg(unix)]
@@ -340,6 +359,14 @@ pub struct DaemonEngine<P, N, C> {
     owner_id: String,
     active: HashMap<String, ActiveProcess>,
     last_retention_ms: u64,
+    /// Jobs whose durable latch asked for `kill` rather than `stop`, so the
+    /// terminator skips the grace period.
+    ///
+    /// In-memory on purpose. The latch in `agent_processes` is the durable
+    /// record; this is only the current tick's reading of it, refreshed by
+    /// `apply_signal_intent` every tick, so a restart re-derives it rather than
+    /// carrying a second copy that could drift from the one that matters.
+    immediate_termination: std::collections::HashSet<String>,
 }
 
 impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> {
@@ -365,6 +392,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             owner_id,
             active: HashMap::new(),
             last_retention_ms: 0,
+            immediate_termination: std::collections::HashSet::new(),
         }
     }
 
@@ -486,6 +514,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         }
 
         let mut decisions: Vec<(String, Intent)> = Vec::new();
+        let mut escalated: Vec<String> = Vec::new();
         {
             let table = self.shared.process_table();
             for job in jobs {
@@ -503,6 +532,11 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 // stop must not be left paused, because a paused child never
                 // reaches its own cancellation branch.
                 if record.signal_intent.stop_requested {
+                    // `kill` and `stop` both cancel; they differ in how the
+                    // child is torn down once cancellation reaches it.
+                    if record.signal_intent.kill_requested {
+                        escalated.push(job.job_id.clone());
+                    }
                     if !job.cancel_requested {
                         decisions.push((job.job_id.clone(), Intent::Cancel));
                     }
@@ -516,6 +550,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 }
             }
         }
+
+        self.immediate_termination.extend(escalated);
 
         for (job_id, intent) in decisions {
             match intent {
@@ -702,14 +738,30 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         }
 
         if job.cancel_requested || self.store.kill_switch()? {
+            // The kill switch is an operator's emergency stop, so it gets the
+            // same no-grace-period treatment as an explicit per-job `kill`.
+            let immediate =
+                self.immediate_termination.contains(job_id) || self.store.kill_switch()?;
+            let (signal, detail) = if immediate {
+                (
+                    ProcessSignal::Kill,
+                    "Termination reached the supervised task process",
+                )
+            } else {
+                (
+                    ProcessSignal::Terminate,
+                    "Cancellation reached the supervised task process",
+                )
+            };
             self.ensure_cancelling(run_id, "Cancellation requested by daemon controller")?;
             self.active
                 .get_mut(job_id)
                 .ok_or_else(|| "active process disappeared".to_string())?
                 .process
-                .signal(ProcessSignal::Terminate)?;
-            self.cancel_run(run_id, "Cancellation reached the supervised task process")?;
+                .signal(signal)?;
+            self.cancel_run(run_id, detail)?;
             self.finish_active(job_id, JobState::Cancelled, now, None)?;
+            self.immediate_termination.remove(job_id);
             return Ok(());
         }
 
@@ -1349,6 +1401,77 @@ mod tests {
             engine.shared.load_run(&run_id).unwrap().unwrap().status,
             RunStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn a_durable_kill_terminates_immediately_while_a_stop_winds_down() {
+        use little_monkey_lib::process_table::{ProcessKind, ProcessSignal as TableSignal};
+
+        // The whole point of giving `kill` its own latch: the daemon delivers
+        // the two differently, so recording them identically would have thrown
+        // away the caller's actual request.
+        for (signal, expected) in [
+            (TableSignal::Stop, ProcessSignal::Terminate),
+            (TableSignal::Kill, ProcessSignal::Kill),
+        ] {
+            let label = if signal == TableSignal::Kill { "kill" } else { "stop" };
+            let (paths, store, shared, _recorder, run_id) = fixture(label);
+            let adapter = fake_adapter();
+            let signals = adapter.signals.clone();
+            let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+            let mut engine = DaemonEngine::new(
+                store,
+                shared,
+                paths,
+                DaemonConfig::default(),
+                adapter,
+                FakeNotifier::default(),
+                clock.clone(),
+                "daemon-test-owner".into(),
+            );
+            engine.tick().unwrap();
+            assert_eq!(engine.active_count(), 1);
+
+            // Written to the durable latch only — never to the daemon's own
+            // store — so this exercises the same path a `monkey processes
+            // signal` from another process takes.
+            let process_id = {
+                let table = engine.shared.process_table();
+                table
+                    .find_by_external_id(ProcessKind::DaemonJob, &format!("job-{label}"))
+                    .unwrap()
+                    .expect("the job is projected")
+                    .process_id
+            };
+            {
+                let table = engine.shared.process_table();
+                table
+                    .signal(&process_id, signal, Some("from the table"), 2_001)
+                    .unwrap();
+            }
+
+            *clock.0.lock().unwrap() = 2_001;
+            engine.tick().unwrap();
+
+            let delivered = signals.lock().unwrap().clone();
+            assert!(
+                delivered.contains(&expected),
+                "{label} should deliver {expected:?}, got {delivered:?}"
+            );
+            let unexpected = if expected == ProcessSignal::Kill {
+                ProcessSignal::Terminate
+            } else {
+                ProcessSignal::Kill
+            };
+            assert!(
+                !delivered.contains(&unexpected),
+                "{label} must not deliver {unexpected:?}"
+            );
+            assert_eq!(
+                engine.shared.load_run(&run_id).unwrap().unwrap().status,
+                RunStatus::Cancelled
+            );
+        }
     }
 
     #[test]

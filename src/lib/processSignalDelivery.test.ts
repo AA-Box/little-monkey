@@ -70,7 +70,7 @@ function record(overrides: Partial<ProcessRecord> & { kind: ProcessKind }): Proc
     profile: null,
     nativePid: null,
     limits: {},
-    signalIntent: { stopRequested: false, suspendRequested: false },
+    signalIntent: { stopRequested: false, suspendRequested: false , killRequested: false,},
     signalReason: null,
     signalRequestedAtMs: null,
     exit: null,
@@ -82,8 +82,8 @@ function record(overrides: Partial<ProcessRecord> & { kind: ProcessKind }): Proc
   };
 }
 
-const stop = { stopRequested: true, suspendRequested: false };
-const suspend = { stopRequested: false, suspendRequested: true };
+const stop = { stopRequested: true, suspendRequested: false , killRequested: false,};
+const suspend = { stopRequested: false, suspendRequested: true , killRequested: false,};
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -117,7 +117,7 @@ describe("which signal is pending", () => {
     const outcome = await deliverProcessSignal(
       record({
         kind: "side_task",
-        signalIntent: { stopRequested: true, suspendRequested: true },
+        signalIntent: { stopRequested: true, suspendRequested: true , killRequested: false,},
       }),
       MAIN,
     );
@@ -380,7 +380,7 @@ describe("cooperative pause delivery", () => {
       record({
         kind: "chat_turn",
         externalId: "ext-both",
-        signalIntent: { stopRequested: true, suspendRequested: true },
+        signalIntent: { stopRequested: true, suspendRequested: true , killRequested: false,},
       }),
       MAIN,
     );
