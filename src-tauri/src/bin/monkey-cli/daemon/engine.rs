@@ -2046,7 +2046,9 @@ mod tests {
 
     #[test]
     fn a_retried_job_gets_a_new_row_and_the_attempt_it_replaces_is_closed_as_failed() {
-        use little_monkey_lib::process_table::{ExitStatus, ProcessKind, ProcessState};
+        use little_monkey_lib::process_table::{
+            ExitStatus, ProcessFilter, ProcessKind, ProcessState,
+        };
 
         let (paths, store, shared, _recorder, _run_id) = fixture("retrysweep");
         let clock = FakeClock(Arc::new(Mutex::new(2_000)));
@@ -2109,6 +2111,79 @@ mod tests {
             second.run_id, first.run_id,
             "a retry is a new process of the same durable run"
         );
+
+        // Exactly one live row per job once the sync returns. That the sweep
+        // runs ahead of the projections — so the window between the two is
+        // never observable to a reader on another connection — is not what
+        // this pins: swapping the two halves keeps every test in this suite
+        // green, because a single-threaded test can only look afterwards.
+        let live = table
+            .list(&ProcessFilter {
+                kinds: vec![ProcessKind::DaemonJob],
+                live_only: true,
+                ..ProcessFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            live.len(),
+            1,
+            "one job must never have two live rows: {live:?}"
+        );
+        assert_eq!(live[0].process_id, second.process_id);
+    }
+
+    #[test]
+    fn a_row_from_before_attempt_scoping_is_closed_as_lost_not_mislabelled_failed() {
+        use little_monkey_lib::process_table::{
+            AdmitProcess, ExitStatus, ProcessKind, ProcessState,
+        };
+
+        // An existing database can hold `daemon_job` rows keyed by the bare job
+        // id. Nothing will ever project onto one again, so the sweep has to
+        // close it — but it is not a failed attempt, and saying so would invent
+        // a failure that never happened.
+        let (paths, store, shared, _recorder, _run_id) = fixture("legacyid");
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            fake_adapter(),
+            FakeNotifier::default(),
+            clock,
+            "daemon-test-owner".into(),
+        );
+        let legacy = {
+            let table = engine.shared.process_table();
+            let record = table
+                .admit(
+                    &AdmitProcess::new(ProcessKind::DaemonJob, "job-legacyid"),
+                    1_500,
+                )
+                .unwrap();
+            table
+                .transition(&record.process_id, ProcessState::Running, None, 1_600)
+                .unwrap()
+        };
+
+        engine.sync_process_table_inner(2_000).unwrap();
+
+        let table = engine.shared.process_table();
+        let swept = table.get(&legacy.process_id).unwrap().unwrap();
+        assert_eq!(swept.state, ProcessState::Exited);
+        let exit = swept.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, ExitStatus::Lost);
+        assert_eq!(
+            exit.reason.as_deref(),
+            Some("process row predates attempt-scoped daemon job ids")
+        );
+
+        // And the job itself is unaffected — it gets its own attempt-scoped row.
+        assert!(table
+            .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("legacyid"))
+            .unwrap()
+            .is_some());
     }
 
     #[test]

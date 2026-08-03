@@ -1010,6 +1010,51 @@ mod tests {
     }
 
     #[test]
+    fn attempt_counts_starts_not_arrivals_at_running() {
+        let mut store = DaemonStore::open_in_memory().unwrap();
+        let mut job = new_job("counted", 1);
+        job.max_attempts = 5;
+        store.insert_preparing(&job, 8).unwrap();
+        store.mark_queued("counted", "run-counted", 1).unwrap();
+        let attempt = |store: &DaemonStore| store.get_job("counted").unwrap().unwrap().attempt;
+
+        assert_eq!(attempt(&store), 0, "a queued job has started nothing yet");
+
+        // Leaving the queue is the only edge that starts an attempt.
+        store
+            .transition("counted", JobState::Running, 2, Some(10), None)
+            .unwrap();
+        assert_eq!(attempt(&store), 1);
+
+        // Every other arrival at `running` is the same attempt resuming. This
+        // used to increment, which spent the job's retry budget without it ever
+        // failing, and charged it a `backoff_elapsed` wait it never earned.
+        for interrupted in [JobState::Paused, JobState::WaitingApproval] {
+            store
+                .transition("counted", interrupted, 3, Some(10), None)
+                .unwrap();
+            store
+                .transition("counted", JobState::Running, 4, Some(10), None)
+                .unwrap();
+            assert_eq!(
+                attempt(&store),
+                1,
+                "returning from {interrupted:?} is not a new attempt"
+            );
+        }
+
+        // A real retry does count: back to the queue, then out of it again.
+        store
+            .transition("counted", JobState::Queued, 5, None, Some("boom"))
+            .unwrap();
+        assert_eq!(attempt(&store), 1, "requeueing is not itself a start");
+        store
+            .transition("counted", JobState::Running, 6, Some(11), None)
+            .unwrap();
+        assert_eq!(attempt(&store), 2);
+    }
+
+    #[test]
     fn ready_queue_orders_priority_then_age() {
         let mut store = DaemonStore::open_in_memory().unwrap();
         for (id, now, priority) in [("old", 1, 0), ("high", 2, 9), ("low", 3, -1)] {
