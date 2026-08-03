@@ -1201,23 +1201,59 @@ mod shell_suspend_tests {
         process_state(pid).starts_with('T')
     }
 
-    /// Spawns a real child in its own process group, exactly as
-    /// `tool_run_shell` does, and registers it under `turn`.
-    fn spawn_registered(state: &AppState, turn: &str) -> (std::process::Child, u32) {
-        use std::os::unix::process::CommandExt;
-        let mut command = Command::new("sleep");
-        command.arg("30").stdin(Stdio::null()).stdout(Stdio::null());
-        command.process_group(0);
-        let child = command.spawn().expect("sleep spawns");
-        let pgid = child.id();
-        assert!(register_shell_process_group(state, turn, pgid));
-        (child, pgid)
+    /// A real child in its own process group, registered under `turn` exactly
+    /// as `tool_run_shell` registers one.
+    ///
+    /// Two details here are load-bearing, and both were learned from a CI
+    /// hang rather than guessed:
+    ///
+    /// 1. **Every stdio handle is `null`.** A child that inherits the test
+    ///    harness's stderr keeps that pipe open for as long as it lives, and
+    ///    `cargo test` does not finish until the pipe reaches EOF.
+    /// 2. **Teardown runs on drop, not at the end of the test body.** A failed
+    ///    assertion panics and unwinds straight past any explicit `kill`. Leak
+    ///    a *running* child and the pipe closes when it exits 30s later; leak a
+    ///    *stopped* one and it never exits, never closes the pipe, and the job
+    ///    hangs until its timeout. That is precisely what happened: 48 minutes
+    ///    on Linux for an assertion that failed in milliseconds on macOS.
+    struct TestShell {
+        child: std::process::Child,
+        pgid: u32,
+    }
+
+    impl TestShell {
+        fn spawn(state: &AppState, turn: &str) -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut command = Command::new("sleep");
+            command
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.process_group(0);
+            let child = command.spawn().expect("sleep spawns");
+            let pgid = child.id();
+            assert!(register_shell_process_group(state, turn, pgid));
+            Self { child, pgid }
+        }
+    }
+
+    impl Drop for TestShell {
+        fn drop(&mut self) {
+            // Resumed before killing. SIGKILL does terminate a stopped process,
+            // but this is the one path where being wrong about that costs a
+            // hung CI job rather than a failed assertion.
+            let _ = crate::os_signal::resume_process_group(self.pgid);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 
     #[test]
     fn suspending_a_turn_stops_its_foreground_shell_and_resuming_starts_it_again() {
         let state = AppState::default();
-        let (mut child, pgid) = spawn_registered(&state, "turn-1");
+        let shell = TestShell::spawn(&state, "turn-1");
+        let pgid = shell.pgid;
         std::thread::sleep(Duration::from_millis(100));
         assert!(!is_stopped(pgid), "child should start out running");
 
@@ -1234,8 +1270,6 @@ mod shell_suspend_tests {
         assert!(!is_stopped(pgid), "resume must restart the child");
 
         forget_shell_process_group(&state, "turn-1", pgid);
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[test]
@@ -1245,7 +1279,8 @@ mod shell_suspend_tests {
         let state = AppState::default();
         assert_eq!(signal_turn_shells(&state, "turn-2", true), 0);
 
-        let (mut child, pgid) = spawn_registered(&state, "turn-2");
+        let shell = TestShell::spawn(&state, "turn-2");
+        let pgid = shell.pgid;
         std::thread::sleep(Duration::from_millis(100));
         assert!(is_stopped(pgid), "ps said {}", process_state(pgid));
 
@@ -1254,15 +1289,14 @@ mod shell_suspend_tests {
         assert!(!is_stopped(pgid));
 
         forget_shell_process_group(&state, "turn-2", pgid);
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[test]
     fn one_turns_pause_never_touches_another_turns_shell() {
         let state = AppState::default();
-        let (mut paused, paused_pgid) = spawn_registered(&state, "turn-a");
-        let (mut running, running_pgid) = spawn_registered(&state, "turn-b");
+        let paused = TestShell::spawn(&state, "turn-a");
+        let running = TestShell::spawn(&state, "turn-b");
+        let (paused_pgid, running_pgid) = (paused.pgid, running.pgid);
         std::thread::sleep(Duration::from_millis(100));
 
         signal_turn_shells(&state, "turn-a", true);
@@ -1276,10 +1310,6 @@ mod shell_suspend_tests {
         signal_turn_shells(&state, "turn-a", false);
         forget_shell_process_group(&state, "turn-a", paused_pgid);
         forget_shell_process_group(&state, "turn-b", running_pgid);
-        let _ = paused.kill();
-        let _ = paused.wait();
-        let _ = running.kill();
-        let _ = running.wait();
     }
 
     #[test]
@@ -1288,9 +1318,10 @@ mod shell_suspend_tests {
         // free to reuse it, and a stale entry would eventually SIGSTOP an
         // unrelated process.
         let state = AppState::default();
-        let (mut child, pgid) = spawn_registered(&state, "turn-3");
-        let _ = child.kill();
-        let _ = child.wait();
+        let pgid = {
+            let shell = TestShell::spawn(&state, "turn-3");
+            shell.pgid
+        };
 
         forget_shell_process_group(&state, "turn-3", pgid);
         assert!(
@@ -1309,10 +1340,11 @@ mod shell_suspend_tests {
         // that arrives after the child was reaped still clears the flag rather
         // than leaving the next command to be stopped on arrival.
         let state = AppState::default();
-        let (mut child, pgid) = spawn_registered(&state, "turn-4");
-        signal_turn_shells(&state, "turn-4", true);
-        let _ = child.kill();
-        let _ = child.wait();
+        let pgid = {
+            let shell = TestShell::spawn(&state, "turn-4");
+            signal_turn_shells(&state, "turn-4", true);
+            shell.pgid
+        };
         forget_shell_process_group(&state, "turn-4", pgid);
 
         assert!(

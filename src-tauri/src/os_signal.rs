@@ -17,11 +17,35 @@ pub fn resume_process_group(pid: u32) -> Result<(), String> {
     signal_process_group(pid, false)
 }
 
+/// Signals the process group led by `pid`.
+///
+/// A direct `killpg(2)` rather than shelling out to `kill`. The subprocess form
+/// looked simpler and was not: `kill -STOP -1234` means "signal process group
+/// 1234" to a POSIX/BSD `kill`, but procps-ng's `kill` (the Linux default) reads
+/// a leading `-` argument as an option, so the same command is not portable
+/// across the platforms this ships on. It also depended on `PATH` and paid a
+/// fork+exec per signal. `killpg` has none of those properties and is the call
+/// the shell-out was standing in for.
 #[cfg(unix)]
 fn signal_process_group(pid: u32, stop: bool) -> Result<(), String> {
-    let signal = if stop { "STOP" } else { "CONT" };
-    let group = format!("-{pid}");
-    command_ok("kill", &[&format!("-{signal}"), &group])
+    let signal = if stop { libc::SIGSTOP } else { libc::SIGCONT };
+    // Safe: `killpg` takes two integers and touches no memory this owns. A
+    // negative or zero pgid would be meaningful (0 = "our own group"), so it is
+    // rejected before the call rather than signalling this process by accident.
+    let group = i32::try_from(pid).map_err(|_| format!("Process id {pid} is not a valid pgid"))?;
+    if group <= 0 {
+        return Err(format!("Refusing to signal process group {group}"));
+    }
+    if unsafe { libc::killpg(group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // The group is already gone — it exited between the caller's read and this
+    // call. Not a failure: the caller wanted it not running, and it is not.
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("Failed to signal process group {group}: {error}"))
 }
 
 #[cfg(windows)]
@@ -34,6 +58,10 @@ fn signal_process_group(pid: u32, stop: bool) -> Result<(), String> {
     )
 }
 
+/// Windows only — unix signals through `killpg` above. Windows has no
+/// process-group stop, so PowerShell's `Suspend-Process` is the actual
+/// mechanism rather than a stand-in for a syscall.
+#[cfg(windows)]
 fn command_ok(program: &str, args: &[&str]) -> Result<(), String> {
     Command::new(program)
         .args(args)
