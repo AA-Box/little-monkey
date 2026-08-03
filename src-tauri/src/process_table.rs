@@ -3079,6 +3079,77 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_closes_out_every_desktop_surface_rather_than_leaving_it_running() {
+        // Crash injection for the desktop-owned surfaces. The invariant is one
+        // sentence: after an abrupt death, nothing still claims to be running.
+        // A row stuck at `running` is indistinguishable from live work to every
+        // reader — the listing, a future scheduler, and the user deciding
+        // whether to start more.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let mut admitted = Vec::new();
+        for (index, kind) in ProcessKind::DESKTOP_OWNED.iter().enumerate() {
+            let record = admit(&table, *kind, &format!("external-{index}"));
+            table
+                .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+                .unwrap();
+            admitted.push(record);
+        }
+        // One of them was mid-pause when the app died, which must not change
+        // the answer.
+        table
+            .transition(&admitted[0].process_id, ProcessState::Suspended, None, T0 + 2)
+            .unwrap();
+
+        // The crash: nothing this instance owned is accounted for, because its
+        // workers died with the process.
+        let reaped = table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "the app restarted while this process was still running",
+                T0 + 9,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), ProcessKind::DESKTOP_OWNED.len());
+        for record in &admitted {
+            let closed = table.get(&record.process_id).unwrap().unwrap();
+            assert_eq!(
+                closed.state,
+                ProcessState::Exited,
+                "{:?} was left claiming to be live after a crash",
+                closed.kind
+            );
+            assert_eq!(
+                closed.exit.as_ref().map(|exit| exit.status),
+                Some(ExitStatus::Lost),
+                "an abandoned process is lost — not succeeded, and not cancelled \
+                 as though someone asked for it"
+            );
+        }
+
+        // And the sweep is idempotent: a second startup finds nothing to do
+        // rather than rewriting terminal rows.
+        assert!(table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "second startup",
+                T0 + 10,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn signal_parsing_rejects_unknown_values_and_round_trips_every_variant() {
         assert!(matches!(
             ProcessSignal::parse("detonate"),

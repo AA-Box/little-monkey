@@ -1887,6 +1887,87 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known bug this test found: a requeued job's process row stays \
+                `running` forever, because `queued` projects as `admitted` and \
+                `running -> admitted` is an illegal transition, so the sync \
+                fails and is swallowed. Fixing it needs a decision on whether a \
+                DaemonJob's external_id should be attempt-scoped — see the PR."]
+    fn a_daemon_crash_leaves_no_process_row_claiming_to_be_running() {
+        use little_monkey_lib::process_table::{ProcessKind, ProcessState};
+
+        // Crash injection for the daemon surface. K2's acceptance names a test
+        // per surface and none existed: the invariant is that an abrupt death
+        // never leaves the process table asserting live work, because a row
+        // stuck at `running` is indistinguishable from real work to every
+        // reader — the scheduler, the listing, and the user.
+        let (paths, store, shared, _recorder, run_id) = fixture("crashdaemon");
+        let adapter = fake_adapter();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths.clone(),
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            clock.clone(),
+            "daemon-test-owner".into(),
+        );
+        engine.tick().unwrap();
+        {
+            let table = engine.shared.process_table();
+            let record = table
+                .find_by_external_id(ProcessKind::DaemonJob, "job-crashdaemon")
+                .unwrap()
+                .expect("the job is projected while running");
+            assert_eq!(record.state, ProcessState::Running);
+        }
+
+        // The crash: the engine is dropped without any terminal transition, and
+        // a fresh one comes up on the same durable state — exactly what a
+        // `kill -9` of the daemon looks like to the next start.
+        drop(engine);
+        let restarted_store = DaemonStore::open(&paths).unwrap();
+        let restarted_shared = SharedLedger::open(&paths.ledger_db).unwrap();
+        *clock.0.lock().unwrap() = 5_000;
+        let mut engine = DaemonEngine::new(
+            restarted_store,
+            restarted_shared,
+            paths,
+            DaemonConfig::default(),
+            fake_adapter(),
+            FakeNotifier::default(),
+            clock,
+            "daemon-test-owner".into(),
+        );
+        engine.recover().unwrap();
+        engine.tick().unwrap();
+
+        let table = engine.shared.process_table();
+        let records = table
+            .list(&little_monkey_lib::process_table::ProcessFilter {
+                kinds: vec![ProcessKind::DaemonJob],
+                ..Default::default()
+            })
+            .unwrap();
+        let rows: Vec<_> = records
+            .iter()
+            .filter(|record| record.external_id == "job-crashdaemon")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "recovery re-admitted the job instead of reconciling its existing record"
+        );
+        assert_ne!(
+            rows[0].state,
+            ProcessState::Running,
+            "a row left claiming to be running after a crash is a lie to every reader"
+        );
+        assert!(engine.shared.load_run(&run_id).unwrap().is_some());
+    }
+
+    #[test]
     fn recovery_never_replays_a_confirmed_mutation() {
         let (paths, mut store, shared, recorder, run_id) = fixture("confirmed");
         recorder

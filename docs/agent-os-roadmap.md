@@ -326,26 +326,58 @@ why it may take a while) instead of being rounded to either "Running" or
 "Paused". A refused signal shows the kind's own refusal reason; typed refusals
 are worthless if the UI swallows them.
 
+**Also shipped — the four items this section used to list as open.**
+
+- **`kill` is distinguishable, and delivered differently.** Migration V7 adds
+  `kill_requested`, with a SQL trigger enforcing that it never appears without
+  `stop_requested` — a kill IS a stop with a stronger delivery promise, which is
+  what lets every existing reader and the pending-signal index keep working
+  untouched. The daemon acts on the difference: `Stop` keeps the TERM-grace-KILL
+  wind-down, `Kill` goes straight to `killpg(SIGKILL)`, and the operator kill
+  switch takes the immediate path since an emergency stop that waits politely is
+  not one. Escalation is one-way — a later `stop` never downgrades a kill.
+- **`RemoteAction::Pause`** exposes pause and resume over the remote protocol,
+  with `monkey remote pause|resume` driving them. Its own action rather than
+  part of `Cancel`, because pause is strictly weaker and neither implies the
+  other — so it cannot widen a pairing that already had `cancel`, which is
+  asserted rather than argued.
+- **Declarative restart policy.** `ProcessKind::restart_policy()` states it per
+  kind the way `signal_support` does. Exactly one kind is restartable:
+  restarting means re-running the work, which needs a supervisor outliving the
+  process plus a durable description of it, and only `DaemonJob` has both. The
+  rest say `Never` with a stated reason — a desktop kind's loop died with the
+  window (K13), a workflow run's executor already owns per-node retry with its
+  own replay rules, and no adopter writes `remote_run` rows. `RestartPolicy` is
+  bounded by construction with no `Always`, and the stricter of the job's own
+  `max_attempts` and the kind's ceiling wins.
+- **Paused + restart is defined**, rather than falling out of `live_only` by
+  accident: a suspended desktop-owned row is reaped as `exited(lost)`. Durable
+  *intent* survives a restart; durable *execution* does not, and offering Resume
+  for work that cannot come back is the dishonesty this table exists to remove.
+  Restoring a live process is K13.
+
 **Remaining:**
 
-- **Expose `RemoteAction::Pause`** — the daemon supports it locally; the remote
-  protocol simply has no action for it. Also unverified: no adopter writes
-  `remote_run` rows yet, so that row of the support matrix is a claim about
-  intent rather than about shipped code.
-- **`kill` and `stop` are indistinguishable in the latch.** Both set
-  `stop_requested`; only the free-text reason survives. Honest today because the
-  only kinds honouring `kill` deliver both identically (the daemon maps each onto
-  `terminate_process_group`), but a UI offering two buttons would imply a
-  difference the schema cannot carry. Needs its own column before that happens.
-- **Declarative restart policy** (`never` / `on-failure` / bounded backoff) per
-  kind, currently ad hoc per subsystem.
-- **A crash-injection test per surface**, which the acceptance names and nothing
-  has.
-- **Paused-across-restart for the cooperative kinds is deliberately out of
-  scope.** Durable *intent* survives; durable *execution* does not, because a
-  paused turn's loop lives in the WebView. That is K13, and a resume button on
-  something unresumable would be a lie. K2 should define paused + restart →
-  `exited(lost)`.
+- **A requeued daemon job's process row stays `running` forever.** Found by the
+  crash-injection test below, which is committed `#[ignore]`d rather than
+  deleted. After a crash, recovery re-queues the job; `queued` projects as
+  `admitted`; `running -> admitted` is an illegal transition, so the projection
+  fails, the error is logged and swallowed, and the row never leaves `running` —
+  indistinguishable from live work to every reader. The fix needs a decision
+  rather than a patch: a `DaemonJob`'s `external_id` is the job id, so a retry
+  cannot be a second process record (`UNIQUE(kind, external_id)`), yet the table
+  models *processes* and a retry genuinely is a new one. Either the id becomes
+  attempt-scoped, or the state machine admits a backwards edge it was
+  deliberately built to forbid. Now that restart policy is declared, this is the
+  first thing that has to be true for it to mean anything.
+- **A crash-injection test per surface** — the desktop-owned surfaces are
+  covered (every kind, including one suspended mid-pause, closes as
+  `exited(lost)`, and the sweep is idempotent). The daemon's is the ignored test
+  above. Workflow runs are not covered: they are not desktop-owned, so the
+  startup reaper deliberately leaves them alone, and nothing else sweeps them.
+- **`remote_run` is still unverified** — no adopter writes those rows, so that
+  row of the support matrix remains a claim about intent rather than about
+  shipped code.
 
 Also open, and it lands on the scheduler rather than here: a suspended process
 still holds its reservations — resident model slot, worktree lease, workspace
