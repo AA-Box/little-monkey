@@ -25,6 +25,11 @@ pub enum RemoteAction {
     ReadArtifacts,
     Approve,
     Cancel,
+    /// Suspend and resume a run without ending it. Separate from `Cancel`
+    /// because it is strictly weaker — a paused run keeps its place and can be
+    /// resumed — so a controller trusted to pause is not thereby trusted to
+    /// destroy work.
+    Pause,
     Kill,
     /// Drive the runner's real keyboard/mouse through the gated
     /// `little_monkey_lib::desktop_control` core. Distinct from every other
@@ -46,6 +51,7 @@ pub enum DeviceCapability {
     ReadArtifacts,
     Approve,
     Cancel,
+    Pause,
     Kill,
     ControlDesktop,
     ViewSessions,
@@ -64,6 +70,7 @@ impl DeviceCapability {
             RemoteAction::ReadArtifacts => Self::ReadArtifacts,
             RemoteAction::Approve => Self::Approve,
             RemoteAction::Cancel => Self::Cancel,
+            RemoteAction::Pause => Self::Pause,
             RemoteAction::Kill => Self::Kill,
             RemoteAction::ControlDesktop => Self::ControlDesktop,
         }
@@ -151,6 +158,13 @@ impl RemoteScopes {
             && !self.actions.contains(&RemoteAction::ViewRuns)
         {
             return Err("Artifact scope also requires view_runs".to_string());
+        }
+        // Same rule the other run-targeting actions carry: a controller that
+        // cannot see which runs exist has no business suspending one.
+        if self.actions.contains(&RemoteAction::Pause)
+            && !self.actions.contains(&RemoteAction::ViewRuns)
+        {
+            return Err("Pause scope also requires view_runs".to_string());
         }
         Ok(())
     }

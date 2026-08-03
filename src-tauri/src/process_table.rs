@@ -137,37 +137,91 @@ impl ProcessKind {
         ProcessKind::SideTask,
     ];
 
+    /// What happens to this kind when it exits without being asked to.
+    ///
+    /// Declared per kind for the same reason [`Self::signal_support`] is: the
+    /// answer differs by kind, and the honest answer for most of them is
+    /// "nothing". Stating it here makes that a decision rather than an
+    /// omission, and gives a supervisor one place to read instead of each
+    /// subsystem inventing its own retry rule — which is what it did before.
+    ///
+    /// Restarting means *re-running the work*, which requires a supervisor that
+    /// outlives the process and a durable description of what to run. Only the
+    /// daemon has both. A desktop-owned kind's loop lives in the WebView, so
+    /// after a crash there is no loop left to restart and no supervisor awake to
+    /// do it — hence [`RestartPolicy::Never`], not as a limitation to fix here
+    /// but as the truth about what this process is. Making those restartable is
+    /// K13 (freeze and restore), a different capability entirely.
+    pub fn restart_policy(self) -> RestartPolicy {
+        match self {
+            // The one kind with a real supervisor: the daemon ticks
+            // independently of any window, and a job carries a durable recipe
+            // snapshot that fully describes how to run it again.
+            ProcessKind::DaemonJob => RestartPolicy::OnFailure {
+                max_attempts: 3,
+                base_backoff_ms: 1_000,
+            },
+            // A workflow run owns per-node retry inside the executor, with its
+            // own budgets and its own idempotency rules about which effects may
+            // be replayed. Restarting the whole run from out here would re-run
+            // committed side effects that the executor deliberately did not.
+            ProcessKind::WorkflowRun | ProcessKind::WorkflowNode => RestartPolicy::Never,
+            // A remote run records that a remote controller *asked* for work,
+            // not the work itself — the daemon job it spawns is the process,
+            // and that job carries the restart policy. Restarting a request
+            // would mean submitting it a second time, which is the caller's
+            // decision and not this supervisor's.
+            ProcessKind::RemoteRun => RestartPolicy::Never,
+            // Desktop-owned: the loop died with the window. See above.
+            ProcessKind::ChatTurn
+            | ProcessKind::Subagent
+            | ProcessKind::CrewMember
+            | ProcessKind::BackgroundShell
+            | ProcessKind::SideTask => RestartPolicy::Never,
+        }
+    }
+
     /// Whether this kind honours `signal`, and if not, why.
     ///
     /// This is a statement about what the code does *today*, not an aspiration.
-    /// Suspend/resume now exist in three shapes: real OS suspend of a child
-    /// this app owns (`DaemonJob`, `RemoteRun`, `BackgroundShell`, via a
-    /// shared SIGSTOP/SIGCONT primitive — see `os_signal.rs`), a cooperative
-    /// durable latch a loop checks at its own safe point (`ChatTurn`,
-    /// `Subagent`, `CrewMember`, `SideTask`), and a blocking wait at a
-    /// coarse-grained boundary (`WorkflowRun`, at each level). `kill` is only
-    /// meaningful where this app owns an OS process.
+    /// Suspend/resume exist in three shapes: real OS suspend of a child this
+    /// app owns (`DaemonJob`, `BackgroundShell`, via a shared SIGSTOP/SIGCONT
+    /// primitive — see `os_signal.rs`), a cooperative durable latch a loop
+    /// checks at its own safe point (`ChatTurn`, `Subagent`, `CrewMember`,
+    /// `SideTask`), and a blocking wait at a coarse-grained boundary
+    /// (`WorkflowRun`, at each level). `kill` is only meaningful where this app
+    /// owns an OS process.
     ///
-    /// `WorkflowNode` is the one deliberate holdout: nothing ever signals a
-    /// node's own process id, and a node mid-execution has no yield point of
-    /// its own — the executor only observes intent at the *run's* level
-    /// boundary — so claiming `Honoured` there would be exactly the
-    /// dishonesty this function exists to prevent.
+    /// Two deliberate holdouts. `WorkflowNode`: nothing ever signals a node's
+    /// own process id, and a node mid-execution has no yield point of its own —
+    /// the executor observes intent only at the *run's* level boundary.
+    /// `RemoteRun`: its row records that a remote controller asked for work,
+    /// and the only writer (`project_queue_origin`) closes it as soon as the
+    /// job is queued; the daemon job it spawned is the process that can be
+    /// suspended or killed. Claiming `Honoured` on either would be exactly the
+    /// dishonesty this function exists to prevent — and for `RemoteRun` it
+    /// briefly was: the matrix said `Honoured` while no delivery path for that
+    /// kind existed in the daemon or the desktop fan-out.
     ///
-    /// Each refusal names the mechanism that is missing (or, for
-    /// `WorkflowNode`, the correct target to signal instead) rather than
-    /// saying "unsupported", because the caller's next question is always
-    /// "why not".
+    /// Each refusal names the mechanism that is missing, or the correct target
+    /// to signal instead, rather than saying "unsupported" — because the
+    /// caller's next question is always "why not".
     pub fn signal_support(self, signal: ProcessSignal) -> SignalSupport {
         use ProcessKind as K;
         use ProcessSignal as S;
         match (self, signal) {
-            // Stop is universal: every kind has a cancellation path.
+            // Stop is universal: every kind has a cancellation path. A
+            // `RemoteRun` row is terminal from birth, so `signal` answers
+            // `AlreadyExited` before this is ever consulted for one.
             (_, S::Stop) => SignalSupport::Honoured,
 
             // Kill needs an OS process this app owns.
             (K::DaemonJob | K::BackgroundShell, S::Kill) => SignalSupport::Honoured,
-            (K::RemoteRun, S::Kill) => SignalSupport::Honoured,
+            (K::RemoteRun, S::Kill | S::Suspend | S::Resume) => SignalSupport::Refused(
+                "a remote run records the request, not the work: it owns no process of its \
+                 own and is closed as soon as the job is queued; signal the daemon job it \
+                 spawned, which is its child in this table",
+            ),
             (_, S::Kill) => SignalSupport::Refused(
                 "this kind owns no OS process to terminate; stop it instead, which winds it \
                  down at its next safe point",
@@ -176,7 +230,7 @@ impl ProcessKind {
             // Suspend/resume: real OS suspend where we own a child, cooperative
             // where the loop now checks a durable latch at a safe point, or a
             // blocking wait at a coarse boundary for a workflow run.
-            (K::DaemonJob | K::RemoteRun, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::DaemonJob, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::SideTask, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::ChatTurn | K::Subagent | K::CrewMember, S::Suspend | S::Resume) => {
@@ -585,19 +639,79 @@ impl SignalSupport {
 /// Two independent latches rather than one "requested signal" field: a stop and
 /// a suspend are not alternatives. A process can be suspended and then asked to
 /// stop, and the stop must win without the suspend intent being lost from the
-/// audit trail. `Resume` clears the suspend latch; `Kill` sets the stop latch —
-/// the distinction between them lives in how the kind delivers it, not in what
-/// is recorded.
+/// audit trail. `Resume` clears the suspend latch and nothing else, because the
+/// alternative turns "stop this" into "keep going" on a race.
+///
+/// `kill_requested` never appears without `stop_requested`. A kill IS a stop
+/// carrying a stronger delivery promise — terminate now, do not wait for a safe
+/// point — so a reader that only cares "is this winding down?" checks
+/// `stop_requested` and is right for both, while a supervisor deciding *how* to
+/// deliver reads `kill_requested` to tell them apart. Before this the two were
+/// indistinguishable once written, and only the free-text reason survived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalIntent {
     pub stop_requested: bool,
     pub suspend_requested: bool,
+    pub kill_requested: bool,
 }
 
 impl SignalIntent {
     pub fn is_clear(&self) -> bool {
-        !self.stop_requested && !self.suspend_requested
+        !self.stop_requested && !self.suspend_requested && !self.kill_requested
+    }
+
+    /// How a stop should be delivered, for a caller that can honour the
+    /// difference. `false` for a row with no stop pending at all.
+    pub fn wants_immediate_termination(&self) -> bool {
+        self.kill_requested
+    }
+}
+
+/// Whether a kind's process is re-run after an unrequested exit, and how often.
+///
+/// Bounded by construction: there is no "always" variant. An unbounded restart
+/// loop is how a crashing process becomes a resource leak that survives every
+/// attempt to stop it, and nothing in this system needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RestartPolicy {
+    /// Never re-run. Either nothing can restart this kind, or something else
+    /// already owns its retry — [`ProcessKind::restart_policy`] says which.
+    Never,
+    /// Re-run after a failure, up to `max_attempts` total attempts, waiting
+    /// longer after each one.
+    #[serde(rename_all = "camelCase")]
+    OnFailure {
+        max_attempts: u32,
+        base_backoff_ms: u64,
+    },
+}
+
+impl RestartPolicy {
+    /// Whether an exit with `attempt` attempts already spent earns another try.
+    ///
+    /// `attempt` counts attempts *completed*, so the first failure arrives with
+    /// `attempt == 0` and a `max_attempts` of 3 permits two retries.
+    pub fn permits_retry(self, attempt: u32) -> bool {
+        match self {
+            RestartPolicy::Never => false,
+            RestartPolicy::OnFailure { max_attempts, .. } => attempt.saturating_add(1) < max_attempts,
+        }
+    }
+
+    /// How long to wait before the next attempt — exponential in the number
+    /// already spent, and capped so a late attempt cannot park a job for hours.
+    pub fn backoff_ms(self, attempt: u32) -> u64 {
+        const MAX_BACKOFF_MS: u64 = 60_000;
+        match self {
+            RestartPolicy::Never => 0,
+            RestartPolicy::OnFailure {
+                base_backoff_ms, ..
+            } => base_backoff_ms
+                .saturating_mul(1_u64 << attempt.min(16))
+                .min(MAX_BACKOFF_MS),
+        }
     }
 }
 
@@ -1125,18 +1239,37 @@ impl<'a> ProcessTable<'a> {
             });
         }
 
-        let (stop, suspend) = match signal {
-            // Kill and Stop both record "stop wanted", so **a reader cannot tell
-            // them apart from the latch** — only the free-text `signal_reason`
-            // survives. That is honest today because the only kinds honouring
-            // `kill` deliver both the same way: the daemon maps `Stop` and `Kill`
-            // alike onto `terminate_process_group` (TERM, wait, KILL), so there is
-            // no observable difference to record. If a kind ever delivers them
-            // differently, the distinction needs its own column rather than being
-            // inferred from `signal_reason`.
-            ProcessSignal::Stop | ProcessSignal::Kill => (true, record.signal_intent.suspend_requested),
-            ProcessSignal::Suspend => (record.signal_intent.stop_requested, true),
-            ProcessSignal::Resume => (record.signal_intent.stop_requested, false),
+        // Each arm states all three latches, so the interaction between them is
+        // readable in one place rather than inferred from what is missing.
+        //
+        // A `Kill` sets `stop` as well: killing IS stopping, with a stronger
+        // promise about how. Every reader that only asks "is this winding down?"
+        // therefore stays correct without knowing the distinction exists.
+        //
+        // Neither `Stop` nor `Kill` clears a pending suspend, and `Resume`
+        // clears neither of them. The latches are independent because the
+        // alternatives are both wrong: erasing the suspend would lose why the
+        // process stopped making progress, and letting a resume clear a stop
+        // would turn "stop this" into "keep going" on a race. A kill is never
+        // downgraded back to a plain stop either — a caller who escalated does
+        // not get un-escalated by a later, weaker request.
+        let (stop, suspend, kill) = match signal {
+            ProcessSignal::Stop => (
+                true,
+                record.signal_intent.suspend_requested,
+                record.signal_intent.kill_requested,
+            ),
+            ProcessSignal::Kill => (true, record.signal_intent.suspend_requested, true),
+            ProcessSignal::Suspend => (
+                record.signal_intent.stop_requested,
+                true,
+                record.signal_intent.kill_requested,
+            ),
+            ProcessSignal::Resume => (
+                record.signal_intent.stop_requested,
+                false,
+                record.signal_intent.kill_requested,
+            ),
         };
 
         self.connection.execute(
@@ -1145,7 +1278,8 @@ impl<'a> ProcessTable<'a> {
                     suspend_requested = ?3,
                     signal_reason = ?4,
                     signal_requested_at_ms = ?5,
-                    updated_at_ms = ?5
+                    updated_at_ms = ?5,
+                    kill_requested = ?6
               WHERE process_id = ?1",
             params![
                 process_id,
@@ -1153,6 +1287,7 @@ impl<'a> ProcessTable<'a> {
                 i64::from(suspend),
                 reason,
                 now_ms,
+                i64::from(kill),
             ],
         )?;
 
@@ -1582,7 +1717,7 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
-     signal_reason, signal_requested_at_ms FROM agent_processes";
+     signal_reason, signal_requested_at_ms, kill_requested FROM agent_processes";
 
 /// Row → record. Returns a nested `Result` because a stored enum that fails to
 /// parse is a data error, not a SQLite error, and must not be reported as one.
@@ -1632,6 +1767,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
         signal_intent: SignalIntent {
             stop_requested: row.get::<_, i64>(21)? != 0,
             suspend_requested: row.get::<_, i64>(22)? != 0,
+            kill_requested: row.get::<_, i64>(25)? != 0,
         },
         signal_reason: row.get(23)?,
         signal_requested_at_ms: row.get(24)?,
@@ -2174,6 +2310,58 @@ mod tests {
     }
 
     #[test]
+    fn a_suspended_desktop_process_is_reaped_as_lost_rather_than_surviving_a_restart() {
+        // K2's rule for paused + restart, made explicit rather than left to fall
+        // out of `live_only`.
+        //
+        // Durable *intent* survives a restart; durable *execution* does not. A
+        // paused chat turn's loop lives in the WebView, so once the app is gone
+        // there is nothing left to resume — and a `suspended` row that outlived
+        // its process would offer the user a Resume button for work that cannot
+        // come back. That is the exact dishonesty this table exists to remove,
+        // so the row is closed out as `lost` like any other abandoned process.
+        // Restoring a live process across a restart is K13, not this.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let turn = admit(&table, ProcessKind::ChatTurn, "turn-paused");
+        table
+            .transition(&turn.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .signal(&turn.process_id, ProcessSignal::Suspend, Some("user"), T0 + 2)
+            .unwrap();
+        table
+            .transition(&turn.process_id, ProcessState::Suspended, None, T0 + 3)
+            .unwrap();
+
+        let reaped = table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "the app restarted while this process was still running",
+                T0 + 9,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1, "a suspended row is still live work to reap");
+        let closed = table.get(&turn.process_id).unwrap().unwrap();
+        assert_eq!(closed.state, ProcessState::Exited);
+        assert_eq!(
+            closed.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::Lost),
+            "a paused process that did not survive the restart is lost, not cancelled"
+        );
+        // The latch is left as it was: it records what was asked for, and the
+        // exit records what happened. Rewriting history to hide the pause would
+        // lose the reason this process stopped making progress.
+        assert!(closed.signal_intent.suspend_requested);
+    }
+
+    #[test]
     fn reaping_never_touches_a_kind_the_caller_does_not_own() {
         // The desktop app reaps at startup. The resident daemon outlives it, so
         // a daemon job that is genuinely still running must survive — declaring
@@ -2546,11 +2734,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} must refuse kill", kind.as_str()));
             assert!(refusal.contains("stop it instead"), "{refusal}");
         }
-        for kind in [
-            ProcessKind::DaemonJob,
-            ProcessKind::BackgroundShell,
-            ProcessKind::RemoteRun,
-        ] {
+
+        // `RemoteRun` refuses for a different reason, and says so: it owns no
+        // process because it is not one. Its refusal has to point at the child
+        // that is, or a caller learns only that the answer is no.
+        let refusal = ProcessKind::RemoteRun
+            .signal_support(ProcessSignal::Kill)
+            .refusal()
+            .expect("a remote run owns no process to kill");
+        assert!(refusal.contains("daemon job"), "{refusal}");
+
+        for kind in [ProcessKind::DaemonJob, ProcessKind::BackgroundShell] {
             assert!(kind.signal_support(ProcessSignal::Kill).is_honoured());
         }
     }
@@ -2558,16 +2752,19 @@ mod tests {
     #[test]
     fn suspend_is_honoured_only_where_a_pause_mechanism_actually_exists() {
         // The finding this pins: suspend/resume are honoured everywhere a real
-        // mechanism exists — real OS suspend (`DaemonJob`, `RemoteRun`,
-        // `BackgroundShell`), a cooperative durable latch a loop checks at its
-        // own safe point (`ChatTurn`, `Subagent`, `CrewMember`, `SideTask`), or
-        // a blocking wait at a coarse boundary (`WorkflowRun`). `WorkflowNode`
-        // is the one deliberate holdout: nothing ever signals a node's own
-        // process id, so it stays refused rather than claiming a mechanism it
-        // does not have.
+        // mechanism exists — real OS suspend (`DaemonJob`, `BackgroundShell`),
+        // a cooperative durable latch a loop checks at its own safe point
+        // (`ChatTurn`, `Subagent`, `CrewMember`, `SideTask`), or a blocking
+        // wait at a coarse boundary (`WorkflowRun`) — and nowhere else.
+        //
+        // Two holdouts, each pointing at the target that does work.
+        // `WorkflowNode`: nothing ever signals a node's own process id.
+        // `RemoteRun`: it records the request rather than the work, and
+        // regressed into claiming `Honoured` while no delivery path for the
+        // kind existed anywhere — not in the daemon's `apply_signal_intent`,
+        // which reads only `DaemonJob`, and not in the desktop fan-out.
         for kind in [
             ProcessKind::DaemonJob,
-            ProcessKind::RemoteRun,
             ProcessKind::SideTask,
             ProcessKind::BackgroundShell,
             ProcessKind::ChatTurn,
@@ -2584,7 +2781,10 @@ mod tests {
                 );
             }
         }
-        for kind in [ProcessKind::WorkflowNode] {
+        for (kind, target) in [
+            (ProcessKind::WorkflowNode, "owning workflow run"),
+            (ProcessKind::RemoteRun, "daemon job"),
+        ] {
             for signal in [ProcessSignal::Suspend, ProcessSignal::Resume] {
                 let refusal = kind.signal_support(signal).refusal().unwrap_or_else(|| {
                     panic!("{} claims to honour {}", kind.as_str(), signal.as_str())
@@ -2596,8 +2796,8 @@ mod tests {
                     signal.as_str()
                 );
                 assert!(
-                    refusal.contains("owning workflow run"),
-                    "{}'s refusal should name the correct target (the owning run), got: {refusal}",
+                    refusal.contains(target),
+                    "{}'s refusal should name the correct target ({target}), got: {refusal}",
                     kind.as_str()
                 );
             }
@@ -2755,6 +2955,223 @@ mod tests {
             table.pending_signals(&[ProcessKind::DaemonJob]).unwrap().len(),
             0
         );
+    }
+
+    #[test]
+    fn kill_is_distinguishable_from_stop_in_the_latch() {
+        // The gap this closed: both used to set only `stop_requested`, so once
+        // written, a supervisor could not tell "wind down cleanly" from
+        // "terminate now" — the difference survived only in a free-text reason.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let stopped = admit(&table, ProcessKind::DaemonJob, "job-stop");
+        let killed = admit(&table, ProcessKind::DaemonJob, "job-kill");
+
+        let stopped = table
+            .signal(&stopped.process_id, ProcessSignal::Stop, None, T0 + 1)
+            .unwrap();
+        let killed = table
+            .signal(&killed.process_id, ProcessSignal::Kill, None, T0 + 1)
+            .unwrap();
+
+        assert!(stopped.signal_intent.stop_requested);
+        assert!(!stopped.signal_intent.kill_requested);
+        assert!(!stopped.signal_intent.wants_immediate_termination());
+
+        // A kill sets both: it IS a stop, so every reader that only checks
+        // `stop_requested` stays correct without knowing kill exists.
+        assert!(killed.signal_intent.stop_requested);
+        assert!(killed.signal_intent.kill_requested);
+        assert!(killed.signal_intent.wants_immediate_termination());
+    }
+
+    #[test]
+    fn a_kill_is_never_downgraded_by_a_later_weaker_signal() {
+        // Escalation is one-way. A caller who asked for a guaranteed
+        // termination does not get un-escalated because something later asked
+        // for a polite one, and `resume` must not clear either.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-escalated");
+
+        table
+            .signal(&record.process_id, ProcessSignal::Kill, Some("hung"), T0 + 1)
+            .unwrap();
+        let after_stop = table
+            .signal(&record.process_id, ProcessSignal::Stop, Some("polite"), T0 + 2)
+            .unwrap();
+        assert!(
+            after_stop.signal_intent.kill_requested,
+            "a stop must not downgrade a kill that was already asked for"
+        );
+
+        let after_resume = table
+            .signal(&record.process_id, ProcessSignal::Resume, None, T0 + 3)
+            .unwrap();
+        assert!(after_resume.signal_intent.kill_requested);
+        assert!(after_resume.signal_intent.stop_requested);
+    }
+
+    #[test]
+    fn a_killed_process_is_still_pending_for_a_reader_that_only_knows_stop() {
+        // The migration's cheapness rests on this: the pending-signal index and
+        // predicate were never rebuilt for `kill_requested`, which is only sound
+        // because a kill always carries a stop.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-killed-pending");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .signal(&record.process_id, ProcessSignal::Kill, None, T0 + 2)
+            .unwrap();
+
+        let pending = table.pending_signals(&[ProcessKind::DaemonJob]).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].signal_intent.kill_requested);
+    }
+
+    #[test]
+    fn the_ledger_refuses_a_kill_latch_without_its_stop() {
+        // The SQL trigger holds the invariant against a direct write, the same
+        // way the state machine's own trigger does — a companion store reaching
+        // this connection cannot record a kill that no `stop_requested` reader
+        // would ever see.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::DaemonJob, "job-direct-write");
+
+        let result = ledger.connection().execute(
+            "UPDATE agent_processes SET kill_requested = 1 WHERE process_id = ?1",
+            [&record.process_id],
+        );
+        assert!(
+            result.is_err(),
+            "a kill latch without a stop latch must be refused at the SQL layer"
+        );
+    }
+
+    #[test]
+    fn restart_is_declared_per_kind_and_only_where_a_supervisor_exists() {
+        // The honest shape: exactly one kind can be restarted, because exactly
+        // one has a supervisor that outlives the process plus a durable
+        // description of the work. Every other kind says `Never` for a stated
+        // reason rather than by omission.
+        assert!(matches!(
+            ProcessKind::DaemonJob.restart_policy(),
+            RestartPolicy::OnFailure { .. }
+        ));
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::BackgroundShell,
+            ProcessKind::SideTask,
+            ProcessKind::WorkflowRun,
+            ProcessKind::WorkflowNode,
+            ProcessKind::RemoteRun,
+        ] {
+            assert_eq!(
+                kind.restart_policy(),
+                RestartPolicy::Never,
+                "{kind:?} claims a restart policy nothing implements"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_policy_is_bounded_and_backs_off() {
+        let policy = RestartPolicy::OnFailure {
+            max_attempts: 3,
+            base_backoff_ms: 1_000,
+        };
+        // `attempt` counts attempts already spent, so 3 permits two retries.
+        assert!(policy.permits_retry(0));
+        assert!(policy.permits_retry(1));
+        assert!(!policy.permits_retry(2), "the ceiling is a ceiling");
+        assert!(!policy.permits_retry(u32::MAX), "no overflow past the bound");
+
+        assert_eq!(policy.backoff_ms(0), 1_000);
+        assert_eq!(policy.backoff_ms(1), 2_000);
+        assert_eq!(policy.backoff_ms(2), 4_000);
+        // Capped, so a late attempt cannot park a job for hours.
+        assert_eq!(policy.backoff_ms(30), 60_000);
+
+        assert!(!RestartPolicy::Never.permits_retry(0));
+        assert_eq!(RestartPolicy::Never.backoff_ms(5), 0);
+    }
+
+    #[test]
+    fn a_crash_closes_out_every_desktop_surface_rather_than_leaving_it_running() {
+        // Crash injection for the desktop-owned surfaces. The invariant is one
+        // sentence: after an abrupt death, nothing still claims to be running.
+        // A row stuck at `running` is indistinguishable from live work to every
+        // reader — the listing, a future scheduler, and the user deciding
+        // whether to start more.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let mut admitted = Vec::new();
+        for (index, kind) in ProcessKind::DESKTOP_OWNED.iter().enumerate() {
+            let record = admit(&table, *kind, &format!("external-{index}"));
+            table
+                .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+                .unwrap();
+            admitted.push(record);
+        }
+        // One of them was mid-pause when the app died, which must not change
+        // the answer.
+        table
+            .transition(&admitted[0].process_id, ProcessState::Suspended, None, T0 + 2)
+            .unwrap();
+
+        // The crash: nothing this instance owned is accounted for, because its
+        // workers died with the process.
+        let reaped = table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "the app restarted while this process was still running",
+                T0 + 9,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), ProcessKind::DESKTOP_OWNED.len());
+        for record in &admitted {
+            let closed = table.get(&record.process_id).unwrap().unwrap();
+            assert_eq!(
+                closed.state,
+                ProcessState::Exited,
+                "{:?} was left claiming to be live after a crash",
+                closed.kind
+            );
+            assert_eq!(
+                closed.exit.as_ref().map(|exit| exit.status),
+                Some(ExitStatus::Lost),
+                "an abandoned process is lost — not succeeded, and not cancelled \
+                 as though someone asked for it"
+            );
+        }
+
+        // And the sweep is idempotent: a second startup finds nothing to do
+        // rather than rewriting terminal rows.
+        assert!(table
+            .reap_missing(
+                &ProcessFilter {
+                    kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &[],
+                "second startup",
+                T0 + 10,
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

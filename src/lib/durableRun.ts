@@ -295,6 +295,20 @@ export function modelTargetToRunWire(target: ModelTargetSnapshot): ModelTargetSn
   };
 }
 
+/** The protocol id for one attached root.
+ *
+ * `WorkspaceRootInfo.id` is the canonicalized *path* (see `workspace.rs`), and
+ * the wire's `root_id` is an identifier, not a location — the path travels
+ * beside it in `canonical_path`. Passing the path through raw made every run
+ * carrying a workspace fail `validate_protocol_id`, which requires an id to
+ * start and end alphanumeric: a POSIX path starts with `/`. The sibling
+ * `workspace_id` on this same object was already derived this way; the root ids
+ * were simply missed.
+ */
+function protocolRootId(root: WorkspaceRootInfo): string {
+  return stableProtocolId("root", root.id);
+}
+
 export function workspaceToRunWire(
   roots: readonly WorkspaceRootInfo[],
   access: "read_only" | "read_write" = "read_write",
@@ -303,15 +317,15 @@ export function workspaceToRunWire(
   if (!primary) return null;
   return {
     workspace_id: stableProtocolId("workspace", primary.path),
-    primary_root_id: primary.id,
+    primary_root_id: protocolRootId(primary),
     roots: roots.map((root) => ({
-      root_id: root.id,
+      root_id: protocolRootId(root),
       canonical_path: root.path,
       access,
       allow_symlinks_within_root: false,
     })),
     repository_policy: {
-      root_id: primary.id,
+      root_id: protocolRootId(primary),
       owned_worktree_required: false,
       allowed_remote_names: [],
       allowed_branch_prefixes: [],
