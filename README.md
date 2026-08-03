@@ -21,6 +21,7 @@ The current working tree includes the shipped foundations described below. Some 
 
 ### Workspace: files, review, terminal, and browser
 
+- Reopen the app into the folders you were working in: the attached set (primary plus any secondary folders) is snapshotted on every change and reattached at launch, so a session resumed after a restart can still read, edit, and review its files without re-picking the folder. Folders that were deleted or moved since the last run are dropped instead of blocking the restore, and permission grants are still session-scoped — restoring a workspace never restores its grants.
 - Work across five right-sidebar tabs — workspace files, code review, terminal, in-app browser, and background tasks — opened as chips that all stay mounted, so switching tabs never loses state. A region-wide fullscreen toggle and one shared, drag-resizable, persisted width apply to the whole tab strip, and each tab has its own keyboard shortcut.
 - Review changes in a git-backed panel (real `git` porcelain output) listing every changed file with a per-file diff view, PR-aware.
 - Run a real terminal: keystrokes go straight to the PTY through an embedded xterm.js emulator, so the actual shell supplies its own prompt, colors, line editing, history, and completions instead of a simulated line-output view. A session auto-starts per workspace, and the panel supports dock-right, drag-to-resize, and fullscreen.

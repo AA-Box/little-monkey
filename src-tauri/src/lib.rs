@@ -1044,6 +1044,7 @@ pub fn run() {
             workspace::add_secondary_workspace_root,
             workspace::remove_secondary_workspace_root,
             workspace::get_workspace_roots,
+            workspace::restore_workspace_roots,
             workspace::get_recent_workspaces,
             git::git_status,
             git::git_commit,
