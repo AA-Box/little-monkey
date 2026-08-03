@@ -254,6 +254,38 @@ fn terminate_process_group(process_id: u32) -> Result<(), String> {
     command_ok("taskkill", &["/PID", &process_id.to_string(), "/T", "/F"])
 }
 
+/// Whether this job has another attempt coming, per its kind's declared policy.
+///
+/// Two things had to agree and did not: the daemon's own `max_attempts` column
+/// (per job, set at submission) and `ProcessKind::restart_policy` (per kind, the
+/// declared rule). The stricter of the two wins, so a job cannot out-live the
+/// kind's ceiling by asking for more attempts at submission, and the kind cannot
+/// force retries onto a job explicitly submitted with `max_attempts: 1`.
+fn retry_permitted(job: &DaemonJob) -> bool {
+    use little_monkey_lib::process_table::ProcessKind;
+    ProcessKind::DaemonJob.restart_policy().permits_retry(job.attempt)
+        && job.attempt.saturating_add(1) < job.max_attempts
+}
+
+/// Whether a queued retry has waited out its backoff.
+///
+/// Derived from `updated_at_ms` rather than a new column: a retry transitions
+/// the job to `queued` and stamps that field, and nothing else touches a queued
+/// job except a pause or cancel request — both of which are read before this
+/// point anyway. That keeps bounded backoff free of a daemon-store schema
+/// change, at the cost of a pause/resume during backoff restarting the wait,
+/// which is harmless.
+fn backoff_elapsed(job: &DaemonJob, now: u64) -> bool {
+    use little_monkey_lib::process_table::ProcessKind;
+    if job.attempt == 0 {
+        return true;
+    }
+    let wait = ProcessKind::DaemonJob
+        .restart_policy()
+        .backoff_ms(job.attempt.saturating_sub(1));
+    now >= job.updated_at_ms.saturating_add(wait)
+}
+
 #[cfg(unix)]
 fn kill_process_group(process_id: u32) -> Result<(), String> {
     little_monkey_lib::os_signal::kill_process_group(process_id)
@@ -447,6 +479,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     .store
                     .ready_jobs(u32::try_from(available).unwrap_or(u32::MAX))?
                 {
+                    // A retry waits out its backoff. Skipping rather than
+                    // sleeping keeps the tick non-blocking, so one backing-off
+                    // job never delays every other queued one — it is simply
+                    // passed over until a later tick.
+                    if !backoff_elapsed(&job, now) {
+                        continue;
+                    }
                     self.start_job(job, now)?;
                 }
             }
@@ -689,7 +728,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             }
             Err(error) => {
                 let _ = self.shared.release_lease(&lease);
-                if job.attempt.saturating_add(1) < job.max_attempts {
+                if retry_permitted(&job) {
                     self.store
                         .transition(&job.job_id, JobState::Queued, now, None, Some(&error))
                 } else {
@@ -840,9 +879,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 let state = map_run_status(stored.status);
                 self.finish_active(job_id, state, now, None)?;
                 self.notify_terminal(run_id, state);
-            } else if stored.status == RunStatus::Queued
-                && exit_code != 0
-                && job.attempt < job.max_attempts
+            } else if stored.status == RunStatus::Queued && exit_code != 0 && retry_permitted(&job)
             {
                 // No Started event means the child proved no tool could have
                 // executed. This is the only automatic retry boundary.
@@ -1401,6 +1438,71 @@ mod tests {
             engine.shared.load_run(&run_id).unwrap().unwrap().status,
             RunStatus::Cancelled
         );
+    }
+
+    fn retry_job(attempt: u32, max_attempts: u32, updated_at_ms: u64) -> DaemonJob {
+        DaemonJob {
+            job_id: "job-retry".into(),
+            run_id: Some("run-retry".into()),
+            recipe_snapshot: std::path::PathBuf::from("/tmp/none.json"),
+            state: JobState::Queued,
+            priority: 0,
+            attempt,
+            max_attempts,
+            created_at_ms: 1_000,
+            updated_at_ms,
+            started_at_ms: None,
+            finished_at_ms: None,
+            process_id: None,
+            max_runtime_ms: 60_000,
+            max_memory_bytes: None,
+            max_log_bytes: DEFAULT_MAX_LOG_BYTES,
+            pause_requested: false,
+            cancel_requested: false,
+            repository_policy_json: None,
+            worktree_json: None,
+            parent_run_id: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn the_stricter_of_the_job_and_the_kind_bounds_retries() {
+        // Two ceilings had to agree and previously did not: the per-job
+        // `max_attempts` set at submission, and the per-kind declared policy.
+        // Neither may override the other upward.
+        //
+        // The kind permits 3 attempts, so a job asking for 10 still stops at 3.
+        assert!(retry_permitted(&retry_job(0, 10, 1_000)));
+        assert!(retry_permitted(&retry_job(1, 10, 1_000)));
+        assert!(
+            !retry_permitted(&retry_job(2, 10, 1_000)),
+            "a job cannot out-live the kind's ceiling by asking for more attempts"
+        );
+
+        // And a job submitted with a single attempt is not given more by the
+        // kind's policy.
+        assert!(
+            !retry_permitted(&retry_job(0, 1, 1_000)),
+            "the kind must not force retries onto a job that asked for one attempt"
+        );
+    }
+
+    #[test]
+    fn a_retry_waits_out_its_backoff_before_being_dispatched() {
+        // A first attempt never waits.
+        assert!(backoff_elapsed(&retry_job(0, 3, 10_000), 10_000));
+
+        // After one spent attempt the base backoff applies, measured from the
+        // transition that re-queued the job.
+        let job = retry_job(1, 3, 10_000);
+        assert!(!backoff_elapsed(&job, 10_500), "dispatched during backoff");
+        assert!(backoff_elapsed(&job, 11_000), "still waiting after backoff");
+
+        // And it grows with the attempts already spent.
+        let later = retry_job(2, 3, 10_000);
+        assert!(!backoff_elapsed(&later, 11_000));
+        assert!(backoff_elapsed(&later, 12_000));
     }
 
     #[test]

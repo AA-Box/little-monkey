@@ -156,6 +156,47 @@ impl ProcessKind {
     ///
     /// Each refusal names the mechanism that is missing (or, for
     /// `WorkflowNode`, the correct target to signal instead) rather than
+    /// What happens to this kind when it exits without being asked to.
+    ///
+    /// Declared per kind for the same reason [`Self::signal_support`] is: the
+    /// answer differs by kind, and the honest answer for most of them is
+    /// "nothing". Stating it here makes that a decision rather than an
+    /// omission, and gives a supervisor one place to read instead of each
+    /// subsystem inventing its own retry rule — which is what it did before.
+    ///
+    /// Restarting means *re-running the work*, which requires a supervisor that
+    /// outlives the process and a durable description of what to run. Only the
+    /// daemon has both. A desktop-owned kind's loop lives in the WebView, so
+    /// after a crash there is no loop left to restart and no supervisor awake to
+    /// do it — hence [`RestartPolicy::Never`], not as a limitation to fix here
+    /// but as the truth about what this process is. Making those restartable is
+    /// K13 (freeze and restore), a different capability entirely.
+    pub fn restart_policy(self) -> RestartPolicy {
+        match self {
+            // The one kind with a real supervisor: the daemon ticks
+            // independently of any window, and a job carries a durable recipe
+            // snapshot that fully describes how to run it again.
+            ProcessKind::DaemonJob => RestartPolicy::OnFailure {
+                max_attempts: 3,
+                base_backoff_ms: 1_000,
+            },
+            // A workflow run owns per-node retry inside the executor, with its
+            // own budgets and its own idempotency rules about which effects may
+            // be replayed. Restarting the whole run from out here would re-run
+            // committed side effects that the executor deliberately did not.
+            ProcessKind::WorkflowRun | ProcessKind::WorkflowNode => RestartPolicy::Never,
+            // No adopter writes these rows yet, so any policy would be a claim
+            // about code that does not exist.
+            ProcessKind::RemoteRun => RestartPolicy::Never,
+            // Desktop-owned: the loop died with the window. See above.
+            ProcessKind::ChatTurn
+            | ProcessKind::Subagent
+            | ProcessKind::CrewMember
+            | ProcessKind::BackgroundShell
+            | ProcessKind::SideTask => RestartPolicy::Never,
+        }
+    }
+
     /// saying "unsupported", because the caller's next question is always
     /// "why not".
     pub fn signal_support(self, signal: ProcessSignal) -> SignalSupport {
@@ -611,6 +652,53 @@ impl SignalIntent {
     /// difference. `false` for a row with no stop pending at all.
     pub fn wants_immediate_termination(&self) -> bool {
         self.kill_requested
+    }
+}
+
+/// Whether a kind's process is re-run after an unrequested exit, and how often.
+///
+/// Bounded by construction: there is no "always" variant. An unbounded restart
+/// loop is how a crashing process becomes a resource leak that survives every
+/// attempt to stop it, and nothing in this system needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RestartPolicy {
+    /// Never re-run. Either nothing can restart this kind, or something else
+    /// already owns its retry — [`ProcessKind::restart_policy`] says which.
+    Never,
+    /// Re-run after a failure, up to `max_attempts` total attempts, waiting
+    /// longer after each one.
+    #[serde(rename_all = "camelCase")]
+    OnFailure {
+        max_attempts: u32,
+        base_backoff_ms: u64,
+    },
+}
+
+impl RestartPolicy {
+    /// Whether an exit with `attempt` attempts already spent earns another try.
+    ///
+    /// `attempt` counts attempts *completed*, so the first failure arrives with
+    /// `attempt == 0` and a `max_attempts` of 3 permits two retries.
+    pub fn permits_retry(self, attempt: u32) -> bool {
+        match self {
+            RestartPolicy::Never => false,
+            RestartPolicy::OnFailure { max_attempts, .. } => attempt.saturating_add(1) < max_attempts,
+        }
+    }
+
+    /// How long to wait before the next attempt — exponential in the number
+    /// already spent, and capped so a late attempt cannot park a job for hours.
+    pub fn backoff_ms(self, attempt: u32) -> u64 {
+        const MAX_BACKOFF_MS: u64 = 60_000;
+        match self {
+            RestartPolicy::Never => 0,
+            RestartPolicy::OnFailure {
+                base_backoff_ms, ..
+            } => base_backoff_ms
+                .saturating_mul(1_u64 << attempt.min(16))
+                .min(MAX_BACKOFF_MS),
+        }
     }
 }
 
@@ -2938,6 +3026,56 @@ mod tests {
             result.is_err(),
             "a kill latch without a stop latch must be refused at the SQL layer"
         );
+    }
+
+    #[test]
+    fn restart_is_declared_per_kind_and_only_where_a_supervisor_exists() {
+        // The honest shape: exactly one kind can be restarted, because exactly
+        // one has a supervisor that outlives the process plus a durable
+        // description of the work. Every other kind says `Never` for a stated
+        // reason rather than by omission.
+        assert!(matches!(
+            ProcessKind::DaemonJob.restart_policy(),
+            RestartPolicy::OnFailure { .. }
+        ));
+        for kind in [
+            ProcessKind::ChatTurn,
+            ProcessKind::Subagent,
+            ProcessKind::CrewMember,
+            ProcessKind::BackgroundShell,
+            ProcessKind::SideTask,
+            ProcessKind::WorkflowRun,
+            ProcessKind::WorkflowNode,
+            ProcessKind::RemoteRun,
+        ] {
+            assert_eq!(
+                kind.restart_policy(),
+                RestartPolicy::Never,
+                "{kind:?} claims a restart policy nothing implements"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_policy_is_bounded_and_backs_off() {
+        let policy = RestartPolicy::OnFailure {
+            max_attempts: 3,
+            base_backoff_ms: 1_000,
+        };
+        // `attempt` counts attempts already spent, so 3 permits two retries.
+        assert!(policy.permits_retry(0));
+        assert!(policy.permits_retry(1));
+        assert!(!policy.permits_retry(2), "the ceiling is a ceiling");
+        assert!(!policy.permits_retry(u32::MAX), "no overflow past the bound");
+
+        assert_eq!(policy.backoff_ms(0), 1_000);
+        assert_eq!(policy.backoff_ms(1), 2_000);
+        assert_eq!(policy.backoff_ms(2), 4_000);
+        // Capped, so a late attempt cannot park a job for hours.
+        assert_eq!(policy.backoff_ms(30), 60_000);
+
+        assert!(!RestartPolicy::Never.permits_retry(0));
+        assert_eq!(RestartPolicy::Never.backoff_ms(5), 0);
     }
 
     #[test]
