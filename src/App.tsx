@@ -251,7 +251,7 @@ function App() {
   );
   const closeSplit = useSessionStore((s) => s.closeSplit);
   const rootsVersion = useWorkspaceStore((s) => s.rootsVersion);
-  const refreshRoots = useWorkspaceStore((s) => s.refreshRoots);
+  const restoreRoots = useWorkspaceStore((s) => s.restoreRoots);
   const refreshRecent = useWorkspaceStore((s) => s.refreshRecent);
   const refreshModels = useModelStore((s) => s.refresh);
   const refreshOllama = useModelStore((s) => s.refreshOllama);
@@ -739,13 +739,16 @@ function App() {
     };
   }, [openCommandPalette]);
 
+  // Boot: reattach the folders that were open at last quit rather than just
+  // reading the (empty at process start) in-memory root list, so a session
+  // resumed after a restart can still read and edit its workspace files.
   useEffect(() => {
-    void refreshRoots();
+    void restoreRoots().catch(() => undefined);
     void refreshRecent();
     void refreshModels();
     void refreshOllama();
     void refreshProviders();
-  }, [refreshRoots, refreshRecent, refreshModels, refreshOllama, refreshProviders]);
+  }, [restoreRoots, refreshRecent, refreshModels, refreshOllama, refreshProviders]);
 
   useEffect(() => {
     void refreshRecipes();
