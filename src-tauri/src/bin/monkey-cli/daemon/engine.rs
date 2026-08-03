@@ -214,8 +214,8 @@ impl ManagedProcess for RealManagedProcess {
 
     fn signal(&mut self, signal: ProcessSignal) -> Result<(), String> {
         match signal {
-            ProcessSignal::Pause => signal_process(self.child.id(), "STOP"),
-            ProcessSignal::Resume => signal_process(self.child.id(), "CONT"),
+            ProcessSignal::Pause => little_monkey_lib::os_signal::suspend_process_group(self.child.id()),
+            ProcessSignal::Resume => little_monkey_lib::os_signal::resume_process_group(self.child.id()),
             ProcessSignal::Terminate => terminate_process_group(self.child.id()),
         }
     }
@@ -227,26 +227,6 @@ impl ManagedProcess for RealManagedProcess {
 
 fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(128)
-}
-
-#[cfg(unix)]
-fn signal_process(process_id: u32, signal: &str) -> Result<(), String> {
-    let group = format!("-{process_id}");
-    command_ok("kill", &[&format!("-{signal}"), &group])
-}
-
-#[cfg(windows)]
-fn signal_process(process_id: u32, signal: &str) -> Result<(), String> {
-    let verb = match signal {
-        "STOP" => "Suspend-Process",
-        "CONT" => "Resume-Process",
-        _ => return Err(format!("Unsupported process signal '{signal}'")),
-    };
-    let script = format!("{verb} -Id {process_id} -ErrorAction Stop");
-    command_ok(
-        "powershell",
-        &["-NoProfile", "-NonInteractive", "-Command", &script],
-    )
 }
 
 #[cfg(unix)]

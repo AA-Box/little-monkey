@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { errorMessage } from "./errors";
 
 const invokeMock = vi.fn();
@@ -28,6 +28,7 @@ vi.mock("./turnEngine", () => ({
 }));
 
 import { MAX_SUBAGENT_ITERATIONS, runSubagentTask, type RunSubagentTaskParams } from "./subagent";
+import { clearPauseRegistryForTests, setPauseRequested } from "./pauseRegistry";
 import type { ResolvedTarget, RiskAnnotationContext } from "./turnEngine";
 import type { ToolCall } from "./llamaClient";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
@@ -176,6 +177,54 @@ describe("runSubagentTask / cancellation", () => {
 
     expect(result).toBe(JSON.stringify({ error: "Cancelled by the user" }));
     expect(attemptStreamMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("runSubagentTask / cooperative pause", () => {
+  beforeEach(() => {
+    attemptStreamMock.mockReset();
+    executeToolCallMock.mockReset();
+    invokeMock.mockReset();
+  });
+
+  afterEach(() => {
+    invokeMock.mockReset();
+    clearPauseRegistryForTests();
+  });
+
+  // The pause latch here is set directly via `pauseRegistry.ts`'s
+  // `setPauseRequested`, standing in for the real path: `App.tsx`'s
+  // `processes://changed` listener calling it once an inbound
+  // `process_signal` suspend is delivered. Proves the wiring `subagent.ts`
+  // adds (the right key, the right process id, the right transitions) — the
+  // wait/latch mechanics themselves are covered by `pauseRegistry.test.ts`.
+  it("holds before the first model call while paused, marks the process suspended, then continues once resumed", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "process_admit") return { processId: "p-subagent-test" };
+      return undefined;
+    });
+    attemptStreamMock.mockResolvedValue({ content: "done", toolCalls: [], streamError: null, contentStarted: true });
+
+    setPauseRequested("child-turn-1", true);
+    const resultPromise = runSubagentTask(baseParams());
+
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "process_transition",
+        expect.objectContaining({ args: expect.objectContaining({ processId: "p-subagent-test", state: "suspended" }) }),
+      ),
+    );
+    expect(attemptStreamMock).not.toHaveBeenCalled();
+
+    setPauseRequested("child-turn-1", false);
+    const result = await resultPromise;
+
+    expect(result).toBe("done");
+    expect(attemptStreamMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "process_transition",
+      expect.objectContaining({ args: expect.objectContaining({ processId: "p-subagent-test", state: "running" }) }),
+    );
   });
 });
 
