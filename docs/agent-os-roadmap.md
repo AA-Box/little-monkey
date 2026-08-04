@@ -712,6 +712,29 @@ the wall-clock default is seven days — but the mechanism exists and works. Wha
 was missing is enforcement at the *tool* level, and the honest summary is
 "cooperative bounds, scattered and partial" rather than "none".
 
+**Shipped — the memory budget measures the process tree.** That watchdog sampled
+`ps -o rss= -p <pid>`: the direct child only. For an agent job the direct child is
+a shell, so the process actually consuming memory — a build, a model server — is
+its grandchild, and the only memory enforcement in the product was evadable by the
+normal case rather than by a trick. The job's child is already spawned with
+`process_group(0)` and every *signal* path already treats its pid as a group id;
+only the measurement did not.
+
+- **`ps -eo pgid=,rss=` filtered in Rust, not `ps -g <pgid>`.** `-g` selects by
+  process group on BSD and by *effective group* on procps, so the obvious command
+  would have silently measured something unrelated on Linux. Same fork cost.
+- **Windows walks the tree by parent**, having no process group, and iterates to a
+  fixed point rather than recursing: pid reuse can produce a cycle in reported
+  parent ids, and Windows reports pid 0 as its own parent. Both have tests.
+- **The summing is pure Rust and the platform command only produces rows.** That
+  is a direct response to the previous slice reaching CI with a Windows-only
+  break: this machine has Homebrew Rust rather than rustup, so the Windows target
+  cannot be added and `cfg(windows)` code cannot be typechecked locally at all.
+  The tree walk is therefore compiled and tested on *every* platform, with only
+  the PowerShell invocation string unverified outside CI.
+- **An exited group reads as `None`, never `Some(0)`.** Zero bytes is a budget
+  trivially satisfied forever; "nothing to measure" is what an exited job is.
+
 **Shipped — a bound now applies to the process tree, not to the one pid we
 spawned.** Every timeout in the app was `kill_on_drop`, which SIGKILLs exactly one
 process, so a 120s `SHELL_TIMEOUT` on `sh -c "cargo build"` reaped the shell and
