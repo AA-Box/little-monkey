@@ -873,6 +873,48 @@ and asserts the kernel killed the writer; its counterpart writes 2 KiB under the
 same ceiling and must succeed, so a limit set low enough to kill everything cannot
 pass.
 
+**Shipped — every kind declares the bounds it is actually subject to, and one row
+stopped lying.** `ProcessLimits` was populated by exactly one writer: the daemon.
+The other eight kinds recorded all-`None`, which reads as "unbounded" and was
+indistinguishable from "nobody looked". `ProcessKind::default_limits()` now seeds
+both `AdmitProcess::new` and `ProcessProjection::new` — the second matters as much
+as the first, because `reconcile` admits through a projection, so the desktop kinds
+never touch `AdmitProcess` at all. This is the acceptance's "limits are set from
+the process's class, not hardcoded", using the same per-kind-policy shape as
+`restart_policy()` and `signal_support()` rather than a new mechanism.
+
+- **`background_shell` was the row that was wrong, not merely silent.** Its output
+  tail has always been front-truncated at `MAX_OUTPUT_BYTES` (256 KiB) — real,
+  enforced — while its process record declared no output ceiling. `monkey processes
+  show` printed `limits none declared` for a process that had one.
+- **The subsystem's constant is referenced, not copied.** That puts a dependency
+  from the generic ledger onto one subsystem, which is the lesser evil: a second
+  copy could drift from the code that enforces it, and a declaration that
+  disagrees with its enforcement is worse than an untidy dependency.
+- **`None` is the finding, not an unfinished cell.** Exactly one kind carries a
+  class-level bound, and a test asserts that *shape* — so gaining or losing one
+  forces the field docs and this entry to move with it. The desktop kinds have
+  per-*tool* timeouts (`SHELL_TIMEOUT`, `DEFAULT_VERIFY_TIMEOUT_SECS`) and no
+  budget on the process that issues them, so a turn is unbounded however many
+  tools it runs. No wall-clock or memory number was invented per kind: that would
+  be a guess presented as policy, and `os_limits` above is where this slice
+  learned that choosing one is a judgement about what the process is *for*.
+- **The daemon stays unbounded *by class*** and keeps writing its own per-job
+  values, which are truer because they came from the job's recipe. A class default
+  would be overwritten on the next projection and would only mislead a reader in
+  between.
+- Three sabotage checks, each failing a different test: dropping the declared cap
+  (`left: [] / right: [BackgroundShell]`), unseeding `AdmitProcess::new`
+  (`output_bytes: None` vs `Some(262144)`), and unseeding
+  `ProcessProjection::new`.
+
+**Correction found while doing it:** `ProcessLimits`' own field docs claimed "no
+platform mechanism reads it yet — there is no `setrlimit`, cgroup or job object
+anywhere in this app today". The `setrlimit` half went stale the moment the slice
+above landed. The docs now say per field which limits are backed by something and
+which are declaration only, and name the specific reason each unbacked one cannot
+simply be wired to `rlimit`.
+
 **Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
 is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
