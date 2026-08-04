@@ -330,6 +330,18 @@ pub struct AppState {
     /// the same server slot. See `llama::embed_server_start`.
     pub embed_llama: std::sync::Mutex<llama::LlamaState>,
     pub ollama: std::sync::Mutex<ollama::OllamaState>,
+    /// In-flight `ollama pull`/`ollama create` child processes, keyed by tag
+    /// (or short name) — lets `ollama::ollama_cancel_pull` kill a pull the
+    /// user started. See `ollama::ollama_pull_model`.
+    pub ollama_pulls: std::sync::Mutex<std::collections::HashMap<String, tokio::process::Child>>,
+    /// Cancellation handles for in-flight `models_download` calls, keyed by
+    /// the destination file name — mirrors `index_cancels`/`ollama_pulls`,
+    /// but a `CancellationToken` rather than a killable child process since
+    /// the download is an in-process `reqwest` stream. See
+    /// `models::models_cancel_download`.
+    pub model_downloads: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    >,
     /// Attached workspace folders, primary first. Empty means no workspace
     /// is open. See `workspace.rs`.
     pub workspace_roots: std::sync::Mutex<Vec<workspace::WorkspaceRoot>>,
@@ -605,6 +617,8 @@ impl Default for AppState {
             llama: Default::default(),
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
+            ollama_pulls: Default::default(),
+            model_downloads: Default::default(),
             workspace_roots: Default::default(),
             terminal: Default::default(),
             background_shell: Default::default(),
@@ -923,6 +937,7 @@ pub fn run() {
             ollama::ollama_unload_model,
             ollama::ollama_example_cloud_tags,
             ollama::ollama_pull_model,
+            ollama::ollama_cancel_pull,
             ollama::ollama_import_model,
             ollama::ollama_create_from_modelfile,
             ollama::ollama_remove_model,
@@ -953,6 +968,7 @@ pub fn run() {
             models::models_list_curated,
             models::models_list_installed,
             models::models_download,
+            models::models_cancel_download,
             models::models_resolve_reference,
             models::models_install_reference,
             models::models_delete,

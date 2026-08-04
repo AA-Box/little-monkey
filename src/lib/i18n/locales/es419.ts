@@ -1048,6 +1048,8 @@ export const es419: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Adjunto",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Vista previa",
+  "MessageBubble.copyButton": "Copiar código",
+  "MessageBubble.copiedLabel": "Copiado",
   "WorkspaceImage.loading": "Cargando imagen…",
   "WorkspaceImage.error": "Imagen no disponible: {{error}}",
   "WorkspaceImage.generatedAlt": "Imagen generada",

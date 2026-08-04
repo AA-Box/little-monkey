@@ -1047,6 +1047,8 @@ export const ja: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "添付画像",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "プレビュー",
+  "MessageBubble.copyButton": "コードをコピー",
+  "MessageBubble.copiedLabel": "コピーしました",
   "WorkspaceImage.loading": "画像を読み込み中…",
   "WorkspaceImage.error": "画像を利用できません: {{error}}",
   "WorkspaceImage.generatedAlt": "生成された画像",

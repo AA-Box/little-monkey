@@ -579,22 +579,17 @@ fn validate_tag(tag: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Spawns `child` (already configured with piped stdout/stderr) and streams
-/// its combined output line-by-line as `ollama://pull-progress` events
-/// tagged with `tag` — shared by both `ollama_pull_model` (`ollama pull`)
-/// and `ollama_import_model` (`ollama create`), since the frontend's
-/// progress/error UI treats "getting a model named `tag` ready" identically
-/// regardless of which CLI subcommand produced it. On failure, the error is
-/// the last ~20 output lines joined, so auth/validation errors (e.g. "you
-/// are not signed in") surface verbatim.
-async fn stream_ollama_progress(
+/// Streams `stdout`/`stderr`'s combined output line-by-line as
+/// `ollama://pull-progress` events tagged with `tag`, returning the last ~20
+/// lines seen once both streams reach EOF — for composing a failure message.
+/// Does not wait on the child itself; callers own that (see
+/// [`stream_ollama_progress`] and [`ollama_pull_model`]).
+async fn stream_process_output(
     app: &AppHandle,
-    mut child: tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
     tag: &str,
-) -> Result<(), String> {
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
+) -> std::collections::VecDeque<String> {
     let last_lines = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::<
         String,
     >::with_capacity(21)));
@@ -645,6 +640,32 @@ async fn stream_ollama_progress(
         let _ = task.await;
     }
 
+    let result = last_lines.lock().await.clone();
+    result
+}
+
+/// Spawns `child` (already configured with piped stdout/stderr) and streams
+/// its combined output line-by-line as `ollama://pull-progress` events
+/// tagged with `tag` — shared by `ollama_import_model` and
+/// `ollama_create_from_modelfile` (both `ollama create`), since the
+/// frontend's progress/error UI treats "getting a model named `tag` ready"
+/// identically regardless of which CLI subcommand produced it. On failure,
+/// the error is the last ~20 output lines joined, so auth/validation errors
+/// (e.g. "you are not signed in") surface verbatim.
+///
+/// `ollama_pull_model` doesn't use this: it needs the `Child` reachable from
+/// `state.ollama_pulls` for cancellation, so it calls
+/// [`stream_process_output`] directly and waits on the child itself.
+async fn stream_ollama_progress(
+    app: &AppHandle,
+    mut child: tokio::process::Child,
+    tag: &str,
+) -> Result<(), String> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let last_lines = stream_process_output(app, stdout, stderr, tag).await;
+
     let status = child
         .wait()
         .await
@@ -653,8 +674,7 @@ async fn stream_ollama_progress(
     if status.success() {
         Ok(())
     } else {
-        let buf = last_lines.lock().await;
-        let joined = buf.iter().cloned().collect::<Vec<_>>().join("\n");
+        let joined = last_lines.iter().cloned().collect::<Vec<_>>().join("\n");
         Err(if joined.is_empty() {
             format!("Failed (exit status: {status})")
         } else {
@@ -667,14 +687,23 @@ async fn stream_ollama_progress(
 /// stdout+stderr line-by-line as `ollama://pull-progress` events. Errors
 /// (including auth-required errors like "you are not signed in") surface
 /// verbatim via the last captured output lines.
+///
+/// Unlike [`stream_ollama_progress`]'s other two callers, this keeps the
+/// spawned child in `state.ollama_pulls` (keyed by `tag`) for the duration of
+/// the pull, so [`ollama_cancel_pull`] can kill it from a separate command
+/// invocation — the frontend's Cancel button while a pull is in flight.
 #[tauri::command]
-pub async fn ollama_pull_model(app: AppHandle, tag: String) -> Result<(), String> {
+pub async fn ollama_pull_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tag: String,
+) -> Result<(), String> {
     validate_tag(&tag)?;
     let tag = tag.trim().to_string();
 
     let binary = find_ollama_binary().unwrap_or_else(|| "ollama".to_string());
 
-    let child = tokio::process::Command::new(&binary)
+    let mut child = tokio::process::Command::new(&binary)
         .arg("pull")
         .arg(&tag)
         .stdin(Stdio::null())
@@ -683,7 +712,63 @@ pub async fn ollama_pull_model(app: AppHandle, tag: String) -> Result<(), String
         .spawn()
         .map_err(|e| format!("Failed to spawn `ollama pull {tag}`: {e}"))?;
 
-    stream_ollama_progress(&app, child, &tag).await
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    {
+        let mut pulls = state.ollama_pulls.lock().map_err(|e| e.to_string())?;
+        pulls.insert(tag.clone(), child);
+    }
+
+    let last_lines = stream_process_output(&app, stdout, stderr, &tag).await;
+
+    // If `ollama_cancel_pull` already removed and killed this entry, there's
+    // nothing left to wait on — report the cancellation rather than a
+    // misleading "Failed" from a status this task never observed.
+    let removed = {
+        let mut pulls = state.ollama_pulls.lock().map_err(|e| e.to_string())?;
+        pulls.remove(&tag)
+    };
+    let Some(mut child) = removed else {
+        return Err("Cancelled".to_string());
+    };
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        let joined = last_lines.iter().cloned().collect::<Vec<_>>().join("\n");
+        Err(if joined.is_empty() {
+            format!("Failed (exit status: {status})")
+        } else {
+            joined
+        })
+    }
+}
+
+/// Cancels an in-flight [`ollama_pull_model`] pull for `tag`, if one is
+/// running — kills the underlying `ollama pull` child process. A no-op
+/// (`Ok`) if no pull for this tag is currently tracked, e.g. it already
+/// finished or was already cancelled.
+#[tauri::command]
+pub async fn ollama_cancel_pull(state: State<'_, AppState>, tag: String) -> Result<(), String> {
+    let tag = tag.trim().to_string();
+    let child = {
+        let mut pulls = state.ollama_pulls.lock().map_err(|e| e.to_string())?;
+        pulls.remove(&tag)
+    };
+    let Some(mut child) = child else {
+        return Ok(());
+    };
+    child
+        .start_kill()
+        .map_err(|e| format!("Failed to cancel pull: {e}"))?;
+    let _ = child.wait().await;
+    Ok(())
 }
 
 /// Import a local model — either a single `.gguf` file or a directory of

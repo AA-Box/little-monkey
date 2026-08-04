@@ -82,6 +82,33 @@ fn chat_server_args(
     args
 }
 
+/// Floor/ceiling for the auto-detected chat context size: the floor matches
+/// what every "Start" click used to hardcode, so a model whose GGUF metadata
+/// is missing or unreadable is never worse off than before; the ceiling
+/// stops a model with a huge (128K+) trained context from ballooning the
+/// KV-cache RAM footprint by default when nobody asked for that.
+const AUTO_CTX_SIZE_FLOOR: u32 = 4_096;
+const AUTO_CTX_SIZE_CEILING: u32 = 32_768;
+
+/// Picks the context size to launch the chat `llama-server` with. An
+/// explicit `requested` value (e.g. a future manual override) always wins;
+/// otherwise this reads the model's own `<arch>.context_length` GGUF
+/// metadata (see `quantization::sniff_gguf_header`) and clamps it to
+/// `[AUTO_CTX_SIZE_FLOOR, AUTO_CTX_SIZE_CEILING]`, falling back to the floor
+/// when that metadata can't be read at all. Automatic, per-model, and never
+/// requires the user to pick a number themselves.
+fn resolve_ctx_size(requested: Option<u32>, model_path: &Path) -> u32 {
+    if let Some(value) = requested {
+        return value;
+    }
+    crate::quantization::sniff_gguf_file(model_path)
+        .ok()
+        .and_then(|header| header.context_length)
+        .map(|trained| u32::try_from(trained).unwrap_or(u32::MAX))
+        .map(|trained| trained.clamp(AUTO_CTX_SIZE_FLOOR, AUTO_CTX_SIZE_CEILING))
+        .unwrap_or(AUTO_CTX_SIZE_FLOOR)
+}
+
 /// Builds the embeddings-only `llama-server` process's argument list for
 /// `model_path` — factored out of [`embed_server_start`] so `monkey-cli`'s
 /// `embed_cli::start` (RAG design doc slice 4 CLI parity: see that module's
@@ -457,16 +484,21 @@ async fn spawn_and_wait_healthy(
 }
 
 /// Start the chat `llama-server` process for the given model, waiting for it
-/// to report healthy (or fail/time out).
+/// to report healthy (or fail/time out). `ctx_size` is optional — omit it
+/// (as every normal "Start" click does) to auto-size the context window from
+/// the model's own GGUF metadata via [`resolve_ctx_size`] instead of one
+/// fixed number for every model. Returns the context size it actually
+/// launched with, so the caller can reflect the real limit (not a guess) in
+/// its own UI.
 #[tauri::command]
 pub async fn llama_start(
     app: AppHandle,
     state: State<'_, AppState>,
     model_path: String,
-    ctx_size: u32,
+    ctx_size: Option<u32>,
     gpu_layers: i32,
     embeddings: bool,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let verification_path = PathBuf::from(&model_path);
     tokio::task::spawn_blocking(move || {
         crate::model_sources::verify_managed_model_for_runtime(&verification_path)
@@ -482,11 +514,12 @@ pub async fn llama_start(
         guard.embeddings_enabled = embeddings;
     }
 
+    let resolved_ctx_size = resolve_ctx_size(ctx_size, Path::new(&model_path));
     let startup_alias = fresh_server_alias();
     let args = chat_server_args(
         &model_path,
         port,
-        ctx_size,
+        resolved_ctx_size,
         gpu_layers,
         embeddings,
         &startup_alias,
@@ -502,7 +535,9 @@ pub async fn llama_start(
         &model_path,
         &startup_alias,
     )
-    .await
+    .await?;
+
+    Ok(resolved_ctx_size)
 }
 
 /// Kill the managed chat `llama-server` process, if any, and mark it stopped.
@@ -743,5 +778,85 @@ mod tests {
         assert!(second.starts_with("little-monkey-"));
         assert_ne!(first, second);
         assert!(!first.contains('/') && !first.contains('\\'));
+    }
+
+    #[test]
+    fn resolve_ctx_size_prefers_an_explicit_value_over_auto_detection() {
+        assert_eq!(
+            resolve_ctx_size(Some(8_192), Path::new("/does/not/exist.gguf")),
+            8_192
+        );
+    }
+
+    #[test]
+    fn resolve_ctx_size_falls_back_to_the_floor_when_the_model_cant_be_read() {
+        assert_eq!(
+            resolve_ctx_size(None, Path::new("/does/not/exist.gguf")),
+            AUTO_CTX_SIZE_FLOOR
+        );
+    }
+
+    /// Writes a minimal, real GGUF v3 file with only `general.architecture`
+    /// and `<architecture>.context_length` metadata — just enough for
+    /// `quantization::sniff_gguf_file` to parse, mirroring
+    /// `quantization::tests::build_minimal_gguf_full` without depending on
+    /// that module's private test helpers.
+    fn write_minimal_gguf_with_context_length(path: &std::path::Path, architecture: &str, context_length: u32) {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"GGUF");
+        buffer.extend_from_slice(&3_u32.to_le_bytes()); // version
+        buffer.extend_from_slice(&0_u64.to_le_bytes()); // tensor_count
+        buffer.extend_from_slice(&2_u64.to_le_bytes()); // metadata_kv_count
+
+        let write_string = |buffer: &mut Vec<u8>, value: &str| {
+            buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            buffer.extend_from_slice(value.as_bytes());
+        };
+
+        write_string(&mut buffer, "general.architecture");
+        buffer.extend_from_slice(&8_u32.to_le_bytes()); // GGUF_TYPE_STRING
+        write_string(&mut buffer, architecture);
+
+        write_string(&mut buffer, &format!("{architecture}.context_length"));
+        buffer.extend_from_slice(&4_u32.to_le_bytes()); // GGUF_TYPE_UINT32
+        buffer.extend_from_slice(&context_length.to_le_bytes());
+
+        std::fs::write(path, buffer).expect("write fixture GGUF");
+    }
+
+    #[test]
+    fn resolve_ctx_size_auto_detects_from_the_models_trained_context() {
+        let dir = std::env::temp_dir().join(format!("llama-rs-ctx-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("model.gguf");
+        write_minimal_gguf_with_context_length(&path, "qwen2", 8_192);
+
+        assert_eq!(resolve_ctx_size(None, &path), 8_192);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_ctx_size_clamps_a_huge_trained_context_to_the_ceiling() {
+        let dir = std::env::temp_dir().join(format!("llama-rs-ctx-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("model.gguf");
+        write_minimal_gguf_with_context_length(&path, "llama", 1_048_576);
+
+        assert_eq!(resolve_ctx_size(None, &path), AUTO_CTX_SIZE_CEILING);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_ctx_size_raises_a_tiny_trained_context_to_the_floor() {
+        let dir = std::env::temp_dir().join(format!("llama-rs-ctx-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("model.gguf");
+        write_minimal_gguf_with_context_length(&path, "gpt2", 1_024);
+
+        assert_eq!(resolve_ctx_size(None, &path), AUTO_CTX_SIZE_FLOOR);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
