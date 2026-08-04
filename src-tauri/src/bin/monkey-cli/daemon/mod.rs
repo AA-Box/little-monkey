@@ -1665,6 +1665,39 @@ fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Closes workflow rows whose host process is gone, once, before the first tick.
+///
+/// The daemon's own crash coverage is the engine tick, which sweeps `daemon_job`
+/// and nothing else; the desktop's is a startup reap scoped to the kinds it owns.
+/// A workflow run belongs to neither — both processes host runs through the same
+/// service into the same ledger — so it had none. Host liveness answers it for
+/// both, and running the pass here as well as in the app means a headless machine
+/// that never opens the desktop still gets cleaned up.
+///
+/// Logged and swallowed: a stale row is not a reason to refuse to serve.
+fn reap_dead_workflow_hosts(shared: &SharedLedger) {
+    let now = match now_ms().and_then(|value| {
+        i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string())
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("monkey daemon: workflow host reap skipped: {error}");
+            return;
+        }
+    };
+    match little_monkey_lib::process_table::reap_processes_whose_host_died(
+        &shared.process_table(),
+        now,
+    ) {
+        Ok(reaped) if !reaped.is_empty() => eprintln!(
+            "monkey daemon: reaped {} workflow process(es) whose host is gone",
+            reaped.len()
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!("monkey daemon: workflow host reap failed: {error}"),
+    }
+}
+
 async fn serve(cli: &crate::Cli) -> Result<(), String> {
     let paths = DaemonPaths::resolve()?;
     let config = DaemonConfig::load(&paths)?;
@@ -1690,6 +1723,7 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         owner_id,
     );
     engine.recover()?;
+    reap_dead_workflow_hosts(&engine.shared);
     // One machine-wide desktop-control runtime, shared with the remote API so
     // the serve loop can enforce revoke / kill-switch / escape-hatch stops on
     // the very same live sessions the API creates.

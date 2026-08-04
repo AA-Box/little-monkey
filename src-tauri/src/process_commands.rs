@@ -675,4 +675,22 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
         Ok(_) => {}
         Err(error) => eprintln!("process table: startup reap failed: {error}"),
     }
+
+    // Runs are not desktop-owned — the daemon hosts them too — so the pass above
+    // deliberately skips them and they were the last kinds with no crash
+    // coverage at all. They are swept by host liveness instead, which also
+    // cleans up after a daemon that crashed and never restarted.
+    let hosted = with_process_table(app, state, |table| {
+        crate::process_table::reap_processes_whose_host_died(table, now)
+    });
+    match hosted {
+        Ok(reaped) if !reaped.is_empty() => {
+            eprintln!(
+                "process table: reaped {} workflow process(es) whose host is gone",
+                reaped.len()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("process table: host-liveness reap failed: {error}"),
+    }
 }

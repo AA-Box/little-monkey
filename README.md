@@ -177,7 +177,14 @@ a scope boundary stated where it matters.
   Rust *and* by SQL triggers, because companion stores reach the shared ledger
   connection directly. Stale records left by a killed app are reaped at
   startup, scoped to the kinds the app owns so live daemon work is never
-  declared lost. Real limits: the table records what each kind reports, so a
+  declared lost — and work with no fixed owner, which is any workflow run since
+  the app and `monkey workflow run` both host them, is reaped by whether the
+  process that recorded itself as its host still exists. Whichever host starts
+  next cleans up after whichever died, so a daemon that crashes and never
+  restarts no longer leaves rows only it could have closed. A row that recorded
+  no host is never reaped: pid reuse can only leave a stale row alive longer,
+  never close one whose work is still running. Real limits: the table records
+  what each kind reports, so a
   declared memory or wall-clock limit is *not* enforced by any OS mechanism
   yet; a Crew member carries no edge to its coordinator (actors initialize
   concurrently, coordinator last); and a retried daemon job becomes a new

@@ -12,6 +12,70 @@
 #[cfg(any(windows, test))]
 use std::process::Command;
 
+/// Whether `pid` names a process that still exists.
+///
+/// Used to decide whether a process row's *host* is gone, which is the one
+/// question the process table could not answer: a workflow run is executed by
+/// whichever process started it, and after a crash nothing distinguished "still
+/// running over there" from "died with its host". See
+/// [`crate::process_table::ProcessTable::reap_dead_hosts`].
+///
+/// **Pid reuse is a real limit and the failure direction is deliberate.** The OS
+/// may hand a dead host's pid to an unrelated process, and this then reports the
+/// host as alive — so a stale row survives longer than it should. The inverse
+/// error, declaring a live host dead, would close a row for work that is still
+/// running and is the one outcome worth engineering against; nothing here can
+/// produce it. Narrowing reuse further needs the host's start time, which has no
+/// portable source across the platforms this ships on.
+#[cfg(unix)]
+pub fn process_is_alive(pid: u32) -> bool {
+    let Ok(target) = i32::try_from(pid) else {
+        return false;
+    };
+    if target <= 0 {
+        // 0 means "our own process group" and negatives name a group, so neither
+        // is a question about one process. Refuse rather than answer wrongly.
+        return false;
+    }
+    // Safe: two integers, no memory this owns. Signal 0 performs the permission
+    // and existence checks without delivering anything.
+    if unsafe { libc::kill(target, 0) } == 0 {
+        return true;
+    }
+    // EPERM means the process exists and belongs to another user — which is
+    // still "alive", and the answer this function is asked for.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// See the unix version for the pid-reuse caveat, which applies identically.
+#[cfg(windows)]
+pub fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    // Safe: opens a handle by id and touches no memory this owns. A null handle
+    // means the process could not be opened, which for a nonexistent pid is the
+    // answer we want.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // `WaitForSingleObject` with no timeout rather than `GetExitCodeProcess`:
+    // a process is free to exit with code 259, which is indistinguishable from
+    // `STILL_ACTIVE`. A timeout here means the handle is not signalled, so the
+    // process has genuinely not exited.
+    let alive = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+    unsafe {
+        CloseHandle(handle);
+    }
+    alive
+}
+
 pub fn suspend_process_group(pid: u32) -> Result<(), String> {
     signal_process_group(pid, true)
 }
@@ -116,6 +180,35 @@ mod tests {
             .output()
             .expect("ps runs");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn liveness_distinguishes_a_running_child_from_a_reaped_one() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        sleep(Duration::from_millis(50));
+        assert!(process_is_alive(pid), "a running child reported as gone");
+
+        child.kill().expect("kill succeeds");
+        // The wait matters: between `kill` and the parent reaping it, the child
+        // is a zombie — which still *exists*, so `kill(pid, 0)` succeeds and this
+        // correctly reports it alive. Only after the wait is the pid free.
+        child.wait().expect("child is reaped");
+        assert!(!process_is_alive(pid), "a reaped child reported as alive");
+    }
+
+    #[test]
+    fn liveness_reports_this_process_and_refuses_a_non_process_id() {
+        assert!(process_is_alive(std::process::id()));
+        // 0 means "our own process group" to `kill(2)`, so it is not a question
+        // about one process and must not answer as though it were.
+        assert!(!process_is_alive(0));
     }
 
     #[test]
