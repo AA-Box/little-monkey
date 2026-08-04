@@ -231,6 +231,14 @@ pub async fn run_command_impl(
     // leaves the test runner alive. Mirrors `tools.rs`'s own spawn.
     #[cfg(unix)]
     command_builder.process_group(0);
+    // Kernel-held bounds that outlive this app's supervision — see `os_limits`
+    // for why only core dumps are refused and not CPU time or memory. A verify
+    // command that segfaults mid-build should not leave gigabytes of core in the
+    // repository it was checking.
+    crate::os_limits::apply(
+        crate::os_limits::ChildLimits::baseline(),
+        &mut command_builder,
+    );
 
     let timeout = Duration::from_secs(
         cmd.timeout_secs
