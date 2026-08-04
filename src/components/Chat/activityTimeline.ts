@@ -432,6 +432,21 @@ export function activityCallLabel(name: string): string {
   }
 }
 
+/** The one-line command a call is shown as inside an expanded step — a shell
+ * call reads as the command itself (`$ …`), anything else as its human label
+ * plus subject. */
+export function activityCallCommandLine(call: ActivityCall): string {
+  const subject = activityCallSubject(call);
+  return call.name === "run_shell" ? `$ ${subject}` : `${activityCallLabel(call.name)} ${subject}`;
+}
+
+/** Plain text a step's copy button puts on the clipboard: the command line,
+ * then whatever the call returned. */
+export function activityCallCopyText(call: ActivityCall): string {
+  const command = activityCallCommandLine(call);
+  return call.result === undefined ? command : `${command}\n\n${formatActivityResult(call.result).text}`;
+}
+
 export interface ActivityDiff {
   kind: "edit" | "write";
   state: "applied" | "attempted" | "proposed";

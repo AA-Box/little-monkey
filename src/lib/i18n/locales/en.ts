@@ -656,6 +656,8 @@ export const en: Record<string, string> = {
   "SubagentRow.toolCallCountOne": "1 tool call",
   "SubagentRow.toolCallCountMany": "{{count}} tool calls",
   "SubagentRow.noActivity": "No tool calls yet",
+  "ToolStepRow.copy": "Copy step",
+  "ToolStepRow.copied": "Copied",
   "SubagentRow.reportLabel": "Report",
   "SubagentRow.tokenUsage": "{{count}} tokens",
   "MessageList.emptyStateTitle": "Nothing here yet",
