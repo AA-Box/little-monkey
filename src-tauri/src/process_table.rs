@@ -126,9 +126,8 @@ impl ProcessKind {
     ///
     /// [`ProcessKind::WorkflowRun`]/[`ProcessKind::WorkflowNode`] are excluded
     /// for the same reason — a workflow can be hosted by the daemon via a
-    /// trigger — even though a desktop-started one does die with the app. That
-    /// costs a stale row on the rarer path and never a wrong reap on the
-    /// dangerous one.
+    /// trigger — even though a desktop-started one does die with the app. Those
+    /// are swept by host liveness instead: see [`Self::HOST_RECORDED`].
     pub const DESKTOP_OWNED: &'static [ProcessKind] = &[
         ProcessKind::ChatTurn,
         ProcessKind::Subagent,
@@ -136,6 +135,22 @@ impl ProcessKind {
         ProcessKind::BackgroundShell,
         ProcessKind::SideTask,
     ];
+
+    /// Kinds that record their host's pid, and are therefore swept by whether
+    /// that host is still alive rather than by who is asking.
+    ///
+    /// These are the kinds with no fixed owner. Any process can host a workflow
+    /// run — the desktop app and `monkey workflow run` both do, through the same
+    /// `WorkflowService` and into the same ledger — so neither existing reaper
+    /// could touch them: [`ProcessTable::reap_missing`] needs a caller that can
+    /// enumerate its own live work, and the daemon's engine tick sweeps only
+    /// `daemon_job`. They were the one gap left in crash coverage.
+    ///
+    /// Liveness also has a property ownership does not: a *dead* host's rows can
+    /// be reaped by whoever starts next, so a daemon that crashes and is never
+    /// restarted no longer leaves rows that only it could have cleaned up.
+    pub const HOST_RECORDED: &'static [ProcessKind] =
+        &[ProcessKind::WorkflowRun, ProcessKind::WorkflowNode];
 
     /// What happens to this kind when it exits without being asked to.
     ///
@@ -1660,6 +1675,121 @@ impl<'a> ProcessTable<'a> {
         }
         Ok(reaped)
     }
+
+    /// Mark every live process in `scope` whose *host process* is gone as
+    /// [`ExitStatus::Lost`].
+    ///
+    /// The companion to [`Self::reap_missing`], for work whose owner is not the
+    /// caller. That one asks "what can I still account for", which only answers
+    /// for kinds the caller itself runs — which is why it is scoped to
+    /// [`ProcessKind::DESKTOP_OWNED`] at startup and deliberately leaves a live
+    /// daemon job alone. A workflow run has neither property: any process can
+    /// host one, so no caller can enumerate the live set, and nothing swept them
+    /// at all. A crashed host left its run `running` forever.
+    ///
+    /// The liveness question is answered from `native_pid`, which the host
+    /// records when it projects. Two rules matter:
+    ///
+    /// - A row with **no** pid is never reaped. An adopter that records no host
+    ///   has said nothing about liveness, and reading that silence as "dead"
+    ///   would close rows for work that is running fine.
+    /// - `host_is_alive` is injected rather than called directly so the rule is
+    ///   testable without spawning and killing real processes, and so a caller
+    ///   can scope it (the daemon and the desktop pass the same
+    ///   `os_signal::process_is_alive`).
+    ///
+    /// Pid reuse can only make this reap *less* than it should — see
+    /// `os_signal::process_is_alive`.
+    pub fn reap_dead_hosts(
+        &self,
+        scope: &ProcessFilter,
+        host_is_alive: &dyn Fn(i64) -> bool,
+        reason: &str,
+        now_ms: i64,
+    ) -> ProcessTableResult<Vec<ProcessRecord>> {
+        let candidates = self.list(&ProcessFilter {
+            live_only: true,
+            limit: Some(MAX_LIST_LIMIT),
+            ..scope.clone()
+        })?;
+
+        let mut reaped = Vec::new();
+        for candidate in candidates {
+            let Some(pid) = candidate.native_pid else {
+                continue;
+            };
+            if host_is_alive(pid) {
+                continue;
+            }
+            reaped.push(self.transition(
+                &candidate.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit {
+                    status: ExitStatus::Lost,
+                    code: None,
+                    signal: None,
+                    reason: Some(reason.to_string()),
+                }),
+                now_ms,
+            )?);
+        }
+        Ok(reaped)
+    }
+}
+
+/// The pid to record as this work's host, for a projection in `state`.
+///
+/// The one fact that made workflow runs unreapable. Both existing reapers work by
+/// ownership — the daemon sweeps its own `daemon_job` rows each tick, the desktop
+/// its own kinds at startup — and a workflow run belongs to neither: the desktop
+/// app and `monkey workflow run` both host runs, through the same
+/// `WorkflowService`, into the same ledger. A crashed host left its row `running`
+/// with nothing able to tell that from work still going on in the other process.
+///
+/// `std::process::id()` is the right answer in every host precisely because this
+/// is library code: whichever process is executing the work is the one calling it.
+///
+/// `None` once the state is terminal. Reconcile only overwrites a pid it is
+/// given, so an exited row keeps the host that ran it; writing one for a state
+/// nothing will ever sweep would invite a liveness read that means nothing.
+pub fn hosting_pid(state: ProcessState) -> Option<i64> {
+    if state.is_terminal() {
+        return None;
+    }
+    Some(i64::from(std::process::id()))
+}
+
+/// Closes rows whose host process no longer exists, for the kinds that record
+/// one ([`ProcessKind::HOST_RECORDED`]).
+///
+/// The single entry point both hosts call at startup — the desktop app from
+/// `lib.rs`'s setup, the daemon before its first tick — so the rule, the scope
+/// and the reason text live in one place instead of being restated per binary.
+/// Whichever starts first cleans up after whichever died, including the case
+/// neither existing reaper could reach: a host that crashed and never came back.
+///
+/// The clock and the liveness syscall are the impure parts, which is why they are
+/// here rather than in [`ProcessTable::reap_dead_hosts`].
+pub fn reap_processes_whose_host_died(
+    table: &ProcessTable<'_>,
+    now_ms: i64,
+) -> ProcessTableResult<Vec<ProcessRecord>> {
+    table.reap_dead_hosts(
+        &ProcessFilter {
+            kinds: ProcessKind::HOST_RECORDED.to_vec(),
+            ..ProcessFilter::default()
+        },
+        &|pid| {
+            u32::try_from(pid)
+                // A pid that does not fit the OS type was never written by
+                // `hosting_pid`; treating it as dead would reap a row on the
+                // strength of a value we cannot interpret.
+                .map(crate::os_signal::process_is_alive)
+                .unwrap_or(true)
+        },
+        "the process hosting this run exited without closing it",
+        now_ms,
+    )
 }
 
 /// A [`ProcessProjector`] backed by the ledger at a path.
@@ -2305,6 +2435,245 @@ mod tests {
                 "again",
                 T0 + 6
             )
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Puts a workflow row in `state` with `pid` as its recorded host.
+    fn hosted(
+        table: &ProcessTable<'_>,
+        kind: ProcessKind,
+        external: &str,
+        pid: Option<i64>,
+        state: ProcessState,
+    ) -> ProcessRecord {
+        let mut projection = ProcessProjection::new(kind, external, state);
+        projection.native_pid = pid;
+        if state.is_terminal() {
+            projection.exit = Some(ProcessExit {
+                status: ExitStatus::Succeeded,
+                code: None,
+                signal: None,
+                reason: None,
+            });
+        }
+        table.reconcile(&projection, T0).unwrap().0
+    }
+
+    #[test]
+    fn a_dead_hosts_rows_are_reaped_and_a_live_hosts_are_left_alone() {
+        // The gap this closes: a workflow run is executed by whichever process
+        // started it, so neither reaper could touch it. `reap_missing` needs a
+        // caller able to enumerate its own live work, and the daemon's tick
+        // sweeps only `daemon_job`.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let dead = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-dead-host",
+            Some(4242),
+            ProcessState::Running,
+        );
+        let live = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-live-host",
+            Some(777),
+            ProcessState::Running,
+        );
+
+        let reaped = table
+            .reap_dead_hosts(
+                &ProcessFilter {
+                    kinds: ProcessKind::HOST_RECORDED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &|pid| pid == 777,
+                "the process hosting this run exited without closing it",
+                T0 + 5,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].process_id, dead.process_id);
+        assert_eq!(reaped[0].exit.as_ref().unwrap().status, ExitStatus::Lost);
+        assert_eq!(
+            table.get(&live.process_id).unwrap().unwrap().state,
+            ProcessState::Running,
+            "a run still executing in another live process was declared lost"
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_recorded_host_is_never_reaped_by_liveness() {
+        // Silence is not death. An adopter that records no host has said nothing
+        // about whether its work is running, and reading that as "dead" would
+        // close rows for work that is fine — the one error worth engineering
+        // against, since the opposite merely leaves a stale row.
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let unknown = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-no-host",
+            None,
+            ProcessState::Running,
+        );
+
+        let reaped = table
+            .reap_dead_hosts(
+                &ProcessFilter {
+                    kinds: ProcessKind::HOST_RECORDED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                // Every pid is dead — the row must survive on the missing pid
+                // alone, not on the liveness answer.
+                &|_| false,
+                "host gone",
+                T0 + 5,
+            )
+            .unwrap();
+
+        assert!(reaped.is_empty());
+        assert_eq!(
+            table.get(&unknown.process_id).unwrap().unwrap().state,
+            ProcessState::Running
+        );
+    }
+
+    #[test]
+    fn host_liveness_reaping_stays_inside_its_scope_and_skips_terminal_rows() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        // A daemon job records a pid too, and the daemon's tick owns it. A
+        // liveness pass scoped to workflows must not close it.
+        let job = hosted(
+            &table,
+            ProcessKind::DaemonJob,
+            "job-1#0",
+            Some(4242),
+            ProcessState::Running,
+        );
+        let finished = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-finished",
+            Some(4242),
+            ProcessState::Running,
+        );
+        table
+            .transition(
+                &finished.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit {
+                    status: ExitStatus::Succeeded,
+                    code: None,
+                    signal: None,
+                    reason: None,
+                }),
+                T0 + 1,
+            )
+            .unwrap();
+        // Crashing while paused is still a crash: `suspended` is live.
+        let paused = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-paused",
+            Some(4242),
+            ProcessState::Running,
+        );
+        table
+            .transition(&paused.process_id, ProcessState::Suspended, None, T0 + 2)
+            .unwrap();
+
+        let reaped = table
+            .reap_dead_hosts(
+                &ProcessFilter {
+                    kinds: ProcessKind::HOST_RECORDED.to_vec(),
+                    ..ProcessFilter::default()
+                },
+                &|_| false,
+                "host gone",
+                T0 + 5,
+            )
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].process_id, paused.process_id);
+        assert_eq!(
+            table.get(&job.process_id).unwrap().unwrap().state,
+            ProcessState::Running
+        );
+        assert_eq!(
+            table
+                .get(&finished.process_id)
+                .unwrap()
+                .unwrap()
+                .exit
+                .unwrap()
+                .status,
+            ExitStatus::Succeeded,
+            "a completed run was overwritten as lost"
+        );
+    }
+
+    /// Crash injection: a real host process, really gone.
+    ///
+    /// The unit tests above inject liveness, which pins the rule but not the
+    /// syscall. This spawns a process, waits for it to exit, and uses its pid —
+    /// so the row is reaped because the OS says that pid is gone, and the live
+    /// row survives because this test process really is running.
+    #[cfg(unix)]
+    #[test]
+    fn a_crashed_host_is_detected_through_the_real_liveness_check() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("`true` spawns");
+        let dead_pid = i64::from(child.id());
+        child.wait().expect("`true` exits");
+
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let crashed = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-crashed",
+            Some(dead_pid),
+            ProcessState::Running,
+        );
+        let ours = hosted(
+            &table,
+            ProcessKind::WorkflowRun,
+            "run-ours",
+            Some(i64::from(std::process::id())),
+            ProcessState::Running,
+        );
+        let node = hosted(
+            &table,
+            ProcessKind::WorkflowNode,
+            "run-crashed:node-a",
+            Some(dead_pid),
+            ProcessState::Running,
+        );
+
+        let reaped = reap_processes_whose_host_died(&table, T0 + 5).unwrap();
+
+        let reaped_ids: Vec<&str> = reaped.iter().map(|r| r.process_id.as_str()).collect();
+        assert!(reaped_ids.contains(&crashed.process_id.as_str()));
+        assert!(
+            reaped_ids.contains(&node.process_id.as_str()),
+            "a node stranded by the same crash was left running"
+        );
+        assert_eq!(
+            table.get(&ours.process_id).unwrap().unwrap().state,
+            ProcessState::Running,
+            "the running test process was reported dead"
+        );
+        // Idempotent: the reaped rows are no longer live.
+        assert!(reap_processes_whose_host_died(&table, T0 + 6)
             .unwrap()
             .is_empty());
     }

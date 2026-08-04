@@ -35,8 +35,8 @@ use crate::package_ecosystem::{
     VerifiedRegistryState,
 };
 use crate::process_table::{
-    ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessProjector, ProcessState,
-    SignalSource,
+    hosting_pid, ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessProjector,
+    ProcessState, SignalSource,
 };
 use crate::workflow_core::{
     adapt_legacy_recipe, compile_workflow, plan_replay, reconcile_node, DaemonCapability,
@@ -1880,9 +1880,11 @@ fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjec
         history.run_id.clone(),
         state,
     );
+    projection.native_pid = hosting_pid(state);
     projection.exit = exit;
     Some(projection)
 }
+
 
 /// A node instance's globally unique surface id.
 ///
@@ -1957,6 +1959,9 @@ fn workflow_node_projection(
         state,
     )
     .with_parent(ProcessKind::WorkflowRun, run_id.to_string());
+    // A node runs inside the same host as its run, and is reaped by the same
+    // pass — a crash that strands the run strands every node it was executing.
+    projection.native_pid = hosting_pid(state);
     projection.exit = exit;
     projection
 }
@@ -3559,6 +3564,67 @@ mod tests {
             );
             assert!(node.exit.is_some(), "a finished node must carry an exit");
         }
+    }
+
+    #[test]
+    fn a_live_run_records_its_host_pid_and_a_finished_one_does_not() {
+        // The fact that makes a workflow run reapable after a crash. Any process
+        // can host one — the desktop app and `monkey workflow run` both do,
+        // through this service — so neither existing reaper could tell "still
+        // running over there" from "died with its host", and workflow runs were
+        // the last kinds with no crash coverage. See
+        // `process_table::reap_processes_whose_host_died`.
+        let directory = TempDirectory::new("workflow-host-pid");
+        let projector = Arc::new(RecordingProjector::default());
+        let service = workflow_service(&directory.0, None, BTreeSet::new())
+            .with_process_projector(projector.clone());
+
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+        service
+            .run_workflow(
+                &definition.workflow_id,
+                WorkflowRunRequest {
+                    run_id: "hosted-run-1".to_string(),
+                    inputs: BTreeMap::new(),
+                    secret_bindings: BTreeMap::new(),
+                    trigger: WorkflowTrigger::Manual,
+                },
+            )
+            .unwrap();
+
+        let host = i64::from(std::process::id());
+        let runs = projector.of_kind(ProcessKind::WorkflowRun);
+        assert_eq!(
+            runs[0].native_pid,
+            Some(host),
+            "a running run must name the process executing it"
+        );
+        assert_eq!(
+            runs[1].native_pid, None,
+            "an exited run keeps the host it already recorded; writing one again \
+             would invite a liveness read on a row nothing will sweep"
+        );
+
+        // Nodes cannot be stranded, and the reason is worth stating: they are
+        // projected only from `append_history`, which runs once the run is over,
+        // so a host that crashes mid-run leaves no node row at all — not a live
+        // one. Every node projection is therefore terminal and records no host.
+        // `workflow_node_projection` still asks for one, and `HOST_RECORDED`
+        // still covers the kind, so a future live node projection is swept
+        // rather than becoming the same gap again.
+        let nodes = projector.of_kind(ProcessKind::WorkflowNode);
+        assert!(!nodes.is_empty());
+        assert!(
+            nodes
+                .iter()
+                .all(|node| node.native_pid.is_none() && node.state.is_terminal()),
+            "a node was projected live, which needs a host pid to be reapable"
+        );
     }
 
     /// Records every lookup instead of consulting a real ledger — proves the

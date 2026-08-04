@@ -175,7 +175,7 @@ produce context by different rules.
 
 # Phase 1 — Process and isolation kernel
 
-## K2. Signals, lifecycle, and restart policy *(mostly built)*
+## K2. Signals, lifecycle, and restart policy *(built)*
 
 **Shipped — the signal contract and durable intent.** `ProcessSignal`
 (`stop` / `suspend` / `resume` / `kill`) with `ProcessKind::signal_support`, which
@@ -392,13 +392,41 @@ that starts an attempt: leaving the queue. The row's own attempt is therefore
 one behind the counter while that attempt runs, which is what `attempt_ordinal`
 encodes rather than reading the column raw.
 
-**Remaining:**
+**Also shipped — crash coverage for workflow runs, the last kinds with none.**
+Both existing reapers work by *ownership*: the daemon's tick sweeps its own
+`daemon_job` rows, the desktop's startup pass its own kinds. A workflow run
+belongs to neither — the app and `monkey workflow run` both host runs, through the
+same `WorkflowService`, into the same ledger — so `reap_missing` could not be used
+(it needs a caller able to enumerate its own live work) and a crashed host left
+its row `running` forever.
 
-- **Crash coverage for workflow runs.** The desktop-owned surfaces are covered
-  (every kind, including one suspended mid-pause, closes as `exited(lost)`, and
-  the sweep is idempotent), and the daemon's test above now runs. Workflow runs
-  are not: they are not desktop-owned, so the startup reaper deliberately leaves
-  them alone, and nothing else sweeps them.
+The missing fact was *who is executing this*. A live run now records
+`native_pid` — `std::process::id()`, correct in every host precisely because it is
+library code — and `reap_dead_hosts` closes any live row in
+`ProcessKind::HOST_RECORDED` whose pid is gone, as `exited(lost)`. Called by both
+hosts at startup, so a headless machine that never opens the app is still cleaned
+up.
+
+Liveness turns out to be *better* than ownership here, not merely a workaround:
+whoever starts next can reap a **dead** host's rows, so a daemon that crashes and
+is never restarted no longer leaves rows only it could have cleaned. Three
+decisions worth keeping:
+
+- **A row with no recorded pid is never reaped.** Silence is not death — an
+  adopter that records no host has said nothing about liveness, and reading it as
+  dead would close rows for work that is running fine. Pid reuse can therefore
+  only make this reap *less* than it should; declaring a live host dead, the one
+  error worth engineering against, is unreachable. Narrowing reuse further needs
+  the host's start time, which has no portable source across these platforms.
+- **The liveness check is injected**, so the rule is pinned by unit tests without
+  spawning and killing processes — plus one real crash-injection test that
+  spawns a process, waits for it to exit, and reaps on its pid.
+- **Nodes cannot be stranded, for a reason worth writing down.** They are
+  projected only from `append_history`, which runs after the run is over, so a
+  host that dies mid-run leaves no node row at all rather than a live one. The
+  kind is still in `HOST_RECORDED` and the projection still asks for a host, so a
+  future live node projection is swept instead of becoming this gap again.
+
 **Also shipped — two defects the manual round trip found, and only it could.**
 Both were invisible to the whole test suite because every test signalled the way
 the app does, and both broke the same promise: `background_shell` says
