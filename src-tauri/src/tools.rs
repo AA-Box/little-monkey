@@ -851,6 +851,7 @@ pub async fn tool_run_shell(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    full_output: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
     permissions::request_permission(
@@ -997,11 +998,67 @@ pub async fn tool_run_shell(
     }
 
     let output = outcome?;
+    // Both streams were unbounded from the child's pipes all the way into the
+    // model's context. Of the app's command-running paths this was the only
+    // uncapped one, and the only one whose output a model reads directly:
+    // `verify.rs` and `background_shell.rs` have always capped theirs.
+    //
+    // `full_output` exists for callers that parse the result as a *document*
+    // rather than showing it to a model. `securityAutofix.ts` is the case that
+    // forced it: it runs `pnpm audit --json` and `JSON.parse`s stdout, so a
+    // truncated tail is not a shorter answer but an unparseable one — and its
+    // failure mode is reporting zero vulnerabilities, a silent false negative in
+    // a security tool. That output never reaches a model; only the parsed
+    // findings do.
+    //
+    // Deliberately a flag and not a byte count: nothing needs a *different*
+    // ceiling, and `Some(0)` meaning "unlimited" would be exactly the
+    // zero-versus-absent overloading this codebase avoids elsewhere.
+    let cap = stream_cap(full_output);
+    let (stdout, stdout_truncated) = cap_stream(&output.stdout, cap);
+    let (stderr, stderr_truncated) = cap_stream(&output.stderr, cap);
     Ok(serde_json::json!({
-        "stdout": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
+        "stdout": stdout,
+        "stderr": stderr,
         "code": output.status.code(),
+        // Additive, so existing readers are unaffected. Reported separately from
+        // the in-text marker because a command is free to print that text itself,
+        // and a caller deciding whether it holds a whole document needs an answer
+        // it does not have to pattern-match prose for.
+        "stdoutTruncated": stdout_truncated,
+        "stderrTruncated": stderr_truncated,
     }))
+}
+
+/// The ceiling one `run_shell` call's streams are held to.
+///
+/// Split out so the *default* is assertable: the whole point is that a caller who
+/// says nothing gets the cap, since every model-initiated call says nothing. An
+/// inverted default would be invisible in a passing shell command and would only
+/// show up as a flooded context window.
+fn stream_cap(full_output: Option<bool>) -> Option<usize> {
+    if full_output.unwrap_or(false) {
+        None
+    } else {
+        Some(crate::output_cap::MODEL_OUTPUT_CAP)
+    }
+}
+
+/// Decodes one captured stream and applies `cap`, if any.
+///
+/// `None` means the caller asked for the whole thing. Note what this does *not*
+/// fix: `wait_with_output` has already materialized both streams in full by the
+/// time this runs, so the app's own heap stays unbounded even when the returned
+/// tail is capped. Bounding the read itself means draining both pipes
+/// concurrently with the wait — which is the service `wait_with_output` currently
+/// performs, and getting it wrong deadlocks a chatty-stderr child once the pipe
+/// buffer fills. That is a separate change, not a line to smuggle in here.
+fn cap_stream(raw: &[u8], cap: Option<usize>) -> (String, bool) {
+    let decoded = String::from_utf8_lossy(raw).to_string();
+    match cap {
+        Some(cap) => crate::output_cap::cap_tail(decoded, cap),
+        None => (decoded, false),
+    }
 }
 
 /// Save a short durable fact about the current project/user preferences to
@@ -1398,6 +1455,64 @@ mod shell_suspend_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The shell tool was the only command-running path in this app with no
+    /// output bound, and the only one whose output a model reads directly.
+    ///
+    /// Asserted on `stream_cap` rather than on `tool_run_shell`, which needs a
+    /// `tauri::State` and an `AppHandle` — the same reason `verify.rs` tests its
+    /// `run_command_impl` core instead of its command wrapper.
+    #[test]
+    fn a_caller_that_says_nothing_gets_the_model_output_cap() {
+        use crate::output_cap::MODEL_OUTPUT_CAP;
+
+        // Every model-initiated call is this case: the tool schema shown to models
+        // sets `additionalProperties: false` and does not list the flag, so a model
+        // cannot ask for the uncapped form.
+        assert_eq!(super::stream_cap(None), Some(MODEL_OUTPUT_CAP));
+        assert_eq!(super::stream_cap(Some(false)), Some(MODEL_OUTPUT_CAP));
+
+        // The opt-out exists for callers that parse the result as a document.
+        // `securityAutofix.ts` runs `pnpm audit --json` and `JSON.parse`s stdout,
+        // where a truncated tail is unparseable rather than merely shorter, and the
+        // parse failure would read as zero vulnerabilities.
+        assert_eq!(super::stream_cap(Some(true)), None);
+    }
+
+    #[test]
+    fn a_capped_stream_keeps_its_tail_and_reports_that_it_was_cut() {
+        let raw = b"0123456789";
+
+        let (value, truncated) = super::cap_stream(raw, Some(4));
+        assert!(truncated, "a cut stream must say so on the wire");
+        assert!(
+            value.ends_with("6789"),
+            "the tail is what a failing command puts its diagnostic in, got {value:?}"
+        );
+
+        let (value, truncated) = super::cap_stream(raw, Some(64));
+        assert_eq!(value, "0123456789");
+        assert!(!truncated, "output inside the cap is not truncated");
+
+        let (value, truncated) = super::cap_stream(raw, None);
+        assert_eq!(value, "0123456789");
+        assert!(
+            !truncated,
+            "an uncapped stream is whole, so nothing was dropped"
+        );
+    }
+
+    /// Command output is bytes, not text, and a stream cut mid-codepoint by the
+    /// child itself must not lose the rest of the output.
+    #[test]
+    fn invalid_utf8_in_a_stream_is_replaced_rather_than_dropped() {
+        let (value, truncated) = super::cap_stream(&[b'o', b'k', 0xff, b'!'], Some(64));
+        assert!(!truncated);
+        assert!(
+            value.starts_with("ok") && value.ends_with('!'),
+            "the surrounding bytes must survive a lossy decode, got {value:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

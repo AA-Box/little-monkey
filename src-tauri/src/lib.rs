@@ -207,6 +207,10 @@ pub mod os_signal;
 // are the same concern from opposite ends: one bounds a child the kernel holds to
 // it, the other ends one this app is still watching.
 pub mod os_limits;
+// One bound on how much captured subprocess output may reach a model. Shared by
+// `tools.rs` and `verify.rs` so the two command runners cannot drift on the
+// number, the truncation direction, or the marker.
+pub mod output_cap;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
