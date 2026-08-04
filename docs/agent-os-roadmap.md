@@ -816,9 +816,19 @@ that K4 is about.
 `rlimit` can actually deliver.** `os_limits::apply` installs limits through
 `pre_exec`, so they are in force between `fork` and `exec` — the target program
 never runs unbounded, and everything it spawns inherits them, which is how this
-reaches the grandchildren a supervisor cannot see. Wired into all three app-side
-spawn sites (`tools.rs`, `verify.rs`, `sandbox.rs`), each of which already put its
-child in a process group and had nothing else holding it.
+reaches the grandchildren a supervisor cannot see. Wired into all four app-side
+spawn sites (`tools.rs`, `verify.rs`, `sandbox.rs`, `background_shell.rs`), each of
+which already put its child in a process group and had nothing else holding it.
+
+`background_shell.rs` needed a second entry point rather than a second call:
+it builds a `std::process::Command`, because its child is deliberately not
+`kill_on_drop`, and std and tokio each carry their own `pre_exec` with no trait
+covering both. `apply_std` is that entry point, and both it and `apply` install
+the same private `install` body — a site that cannot use tokio's builder must not
+be a site with weaker limits. It takes the baseline and nothing more: no
+file-size or descriptor ceiling, because a command whose whole purpose is to
+outlive the call that started it is exactly the case where a number would be a
+judgement about what the child is *for*.
 
 The valuable part of this slice is what it found out *not* to do. The acceptance
 paragraph below named six resources as if `setrlimit` covered them; it covers far
@@ -871,7 +881,9 @@ and watching it still pass. It now asserts on `ulimit -f`, which defaults to
 ran. The enforcement test writes 64 KiB past a 4 KiB ceiling with nothing watching
 and asserts the kernel killed the writer; its counterpart writes 2 KiB under the
 same ceiling and must succeed, so a limit set low enough to kill everything cannot
-pass.
+pass. `apply_std` carries its own copy of the `-f` assertion for the same reason:
+deleting its `apply_std` call fails on `-f` and leaves `-c` passing, which is what
+proves the new path is covered rather than merely exercised.
 
 **Shipped — every kind declares the bounds it is actually subject to, and one row
 stopped lying.** `ProcessLimits` was populated by exactly one writer: the daemon.
@@ -915,14 +927,96 @@ above landed. The docs now say per field which limits are backed by something an
 which are declaration only, and name the specific reason each unbacked one cannot
 simply be wired to `rlimit`.
 
+**Shipped — two places where a bound fired and the teardown did not finish.** Both
+found by auditing the enforcement that already existed rather than by adding more.
+A bound that triggers and then fails to complete its own cleanup is worse than no
+bound: it reports success while leaking exactly the thing it was meant to reclaim.
+
+- **The browser action quota cancelled a session without killing Chromium.** The
+  session-time and disk quotas in `begin_action` both latch `cancelled` *and* call
+  `stop()`; the action quota only latched. That was not a harmless omission,
+  because the first thing `begin_action` does is return early when `cancelled` is
+  set — so no later call could ever reach `stop()`. The child was left idle **and**
+  unreachable, held open only by the `Arc` in the session map, collectable by
+  nothing short of an explicit `browser_stop`. Asserted on the real child rather
+  than on the flag, since the flag was the part already working.
+- **A workflow run killed by its wall budget was left claiming to be running.**
+  The executor projects `Running` eagerly at the start, but terminal projection
+  hangs off `append_history`, and `let history = result?;` short-circuited past it
+  on every executor error. So the one in-app kind with a genuinely enforced wall
+  budget leaked a live row *every time that budget fired*, and nothing reclaimed
+  it — the host-death reaper only helps once the process exits, so a long-lived app
+  accumulated them. The sabotage check prints the whole story: `rows: [Running]`.
+- **That path now records `limit_exceeded`**, matching what the daemon's budget
+  path already does, so a workflow killed for exceeding its wall clock stays
+  distinguishable from one whose work genuinely broke. `Cancelled` and
+  `NeedsReconciliation` map across too, and everything else is `Failed`.
+- No node rows leaked alongside it, and that is checked rather than assumed: the
+  executor only ever projects the run itself, so nodes are written solely through
+  `append_history` and none existed on the failing path.
+
+**Corrections — five claims in this file and the README were verified false, and
+four of them were written by earlier slices of this same item.**
+
+- "No declared caps for `background_shell`" and "limits are still not derived from
+  a process class": both went stale when the class-limits slice landed.
+  `ProcessKind::default_limits` exists and `background_shell` declares its real
+  256 KiB output ceiling.
+- "No wall-clock budget for the in-app kinds" is false for two of the six.
+  `workflow_run` has an enforced 24-hour wall budget in the executor, and
+  `workflow_node` has a per-node `timeout_ms` that definition validation refuses
+  to accept above that budget. The four genuinely unbounded kinds are `chat_turn`,
+  `subagent`, `crew_member` and `side_task`.
+- The README's "no cgroup, job object or `setrlimit` anywhere" lost its `setrlimit`
+  third when `os_limits` landed.
+- **"All three app-side spawn sites" undercounts: there are four.**
+  `background_shell.rs` spawns a shell with `process_group(0)` and no `os_limits`
+  wiring at all. It was left unwired here rather than fixed in passing because it
+  needs an API addition, not a one-line call: it uses `std::process::Command` while
+  `apply` takes `&mut tokio::process::Command`, and the two `pre_exec` methods
+  share no trait. Filed separately.
+- `verify.rs`'s output cap documents itself as bounding "chars" while measuring
+  `s.len()` bytes.
+
 **Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
 is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
 unix, bounding committed memory, CPU time and process count for a whole tree. The
-daemon's memory watchdog is still cooperative userspace. No wall-clock budget for
-the in-app kinds, no declared caps for `background_shell`, no cap on foreground
-shell output, no browser-worker watchdog, and limits are still not derived from a
-process class because no process class exists yet.
+daemon's memory watchdog is still cooperative userspace, and it runs in a different
+OS process from the app-side children, so it cannot simply be extended to cover
+them. RSS is nowhere kernel-enforced on any platform.
+
+Still genuinely missing, after the corrections above narrowed the list:
+
+- **No wall-clock budget for the four WebView-hosted kinds** — `chat_turn`,
+  `subagent`, `crew_member`, `side_task`. The mechanism is within reach (the 2 s
+  sweep, `max_wall_ms`, and the durable stop latch all exist) but a precondition
+  does not: `ProcessState` cannot distinguish a turn that is working from one
+  parked on an unanswered permission prompt, so any default budget would kill a
+  turn for the user's own slowness. Suspended time also counts, since
+  `started_at_ms` deliberately survives resume and nothing accumulates
+  suspended-ms. And such a budget is a floor, not a ceiling: a turn inside a 120 s
+  shell timeout cannot observe the latch until that tool returns.
+- **No cap on foreground shell output.** Checked and true — of the four
+  command-running paths, `tools.rs` is the only uncapped one and the only one
+  whose output goes straight into the model's context.
+- **No browser-worker watchdog.** `begin_action` is reachable only from `with_cdp`,
+  so an idle session is never re-examined; child liveness is never checked at all,
+  and the pid is never recorded, so nothing outside the owning process can even
+  name the child. `browser_worker.rs` is also the one app-side spawn site with no
+  `process_group(0)`, so Chromium's renderer and GPU children are exactly the
+  surviving-grandchild case the process-tree slices claim to have closed.
+- **No `ProcessKind` for a foreground shell or a browser session**, so neither gets
+  a row and neither's per-call bounds can be declared in the table. Adding a
+  browser kind needs a numbered SQLite migration to relax the `CHECK` on
+  `agent_processes.kind`.
+- **Two acceptance resources are unachievable as written** and the criteria should
+  be amended rather than left standing: "open files" has no Windows job-object
+  equivalent, so it is permanently unix-only; and "disk written" cannot come from
+  `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, which has no such field. A job-object
+  committed-memory limit also makes allocations *fail* rather than terminating the
+  process, so that leg would not deliver "terminates with a distinguishable exit
+  status" even once built.
 
 **Acceptance:** a limit set attached to every process record — CPU time, RSS,
 open files, disk written, wall clock, and process count — enforced by cgroups
