@@ -11,7 +11,8 @@ export type BuiltInSlashCommandName =
   | "stop"
   | "usage"
   | "learn"
-  | "btw";
+  | "btw"
+  | "pm-plan";
 
 export interface BuiltInSlashCommand {
   command: BuiltInSlashCommandName;
@@ -32,6 +33,7 @@ export const BUILT_IN_SLASH_COMMANDS: readonly BuiltInSlashCommand[] = [
   { command: "usage", name: "Usage", description: "Show real token usage reported for this chat.", usage: "/usage" },
   { command: "learn", name: "Learn skill", description: "Create a quarantined skill proposal for review.", usage: "/learn command | instructions" },
   { command: "btw", name: "Side question", description: "Open the Side Chat panel to ask a quick question without adding to the conversation.", usage: "/btw [question]" },
+  { command: "pm-plan", name: "Product plan", description: "Draft a scoped, testable product plan from a goal, then edit and save it in Product Manager Copilot.", usage: "/pm-plan <product goal>" },
 ] as const;
 
 const BUILT_IN_BY_NAME = new Map(BUILT_IN_SLASH_COMMANDS.map((entry) => [entry.command, entry]));

@@ -49,6 +49,7 @@ interface PmCopilotStoreState {
 
   setGoal: (goal: string) => void;
   setSlug: (slug: string) => void;
+  startFromGoal: (goal: string) => Promise<void>;
   generate: () => Promise<void>;
   cancelGenerate: () => void;
 
@@ -108,6 +109,19 @@ export const usePmCopilotStore = create<PmCopilotStoreState>((set, get) => ({
     })),
 
   setSlug: (slug) => set({ slug, slugTouched: true }),
+
+  /**
+   * The only way a goal enters this store: `/pm-plan <goal>` in chat (see
+   * `ChatWindow.executeBuiltIn`). Discards any previous draft — a new goal is
+   * a new draft, same as `reset()` — then generates. The panel itself only
+   * edits, regenerates, and saves; the chat composer is the single place a
+   * goal is typed, so the panel never duplicates the chat input.
+   */
+  startFromGoal: async (goal) => {
+    get().reset();
+    get().setGoal(goal);
+    await get().generate();
+  },
 
   generate: async () => {
     const { draftId, goal } = get();
