@@ -2075,6 +2075,38 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
 
+    /// A child that stays alive long enough to be observed, then killed.
+    ///
+    /// Per platform because there is no portable `sleep`: an earlier version of
+    /// this helper spawned `sleep 30` unconditionally and failed on Windows, where
+    /// no such executable exists. `timeout` is deliberately not the Windows
+    /// substitute — it refuses to run with redirected stdin, which these tests
+    /// always use — so `ping` against loopback is the sleep that survives having no
+    /// console.
+    fn long_lived_child() -> Child {
+        // `ping` is invoked directly rather than through `cmd /C`: Rust's argument
+        // quoting for `cmd.exe` is a known trap, and `ping` is a real executable on
+        // PATH that needs no shell.
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("ping");
+            command.args(["-n", "31", "127.0.0.1"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the stand-in child spawns")
+    }
+
     /// Builds a session around a real but trivial child, so the quota branches in
     /// `begin_action` can be exercised without Chromium.
     ///
@@ -2095,13 +2127,7 @@ mod tests {
         let stream = std::net::TcpStream::connect(address).unwrap();
         let _server_side = accepted.join().unwrap();
 
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("the stand-in child spawns");
+        let child = long_lived_child();
         let pid = child.id();
 
         let grant = ValidatedGrant::new(BrowserGrant {
