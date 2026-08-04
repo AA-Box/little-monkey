@@ -1171,6 +1171,7 @@ pub fn run() {
             run_commands::run_events,
             run_commands::run_integrity_check,
             sandbox::sandbox_run,
+            sandbox::sandbox_enforcement_probe,
             sandbox::sandbox_list,
             sandbox::sandbox_diff,
             sandbox::sandbox_prepare_promote,

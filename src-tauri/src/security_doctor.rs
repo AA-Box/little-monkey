@@ -28,6 +28,8 @@ use uuid::Uuid;
 #[cfg(unix)]
 use walkdir::WalkDir;
 
+use crate::sandbox::SandboxEnforcement;
+
 pub const SECURITY_AUDIT_SCHEMA_VERSION: u32 = 1;
 const MAX_DEEP_PATHS: usize = 8_192;
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
@@ -152,6 +154,7 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
     audit_native_skills(&request.runtime, &mut findings);
     audit_runtime_grants(&request.runtime, &mut findings);
     audit_workspace_skill_root(request.workspace.as_deref(), &mut findings);
+    audit_sandbox_enforcement(&mut findings);
 
     let summary = summarize(&findings);
     Ok(SecurityAuditReport {
@@ -1055,6 +1058,71 @@ fn audit_workspace_skill_root(workspace: Option<&Path>, findings: &mut Vec<Secur
     }
 }
 
+/// Reports whether this machine can actually enforce the sandbox it offers.
+///
+/// K3's acceptance says "a platform without enforcement reports itself as
+/// unenforced in Security Doctor", and nothing did: the audit had no isolation
+/// check of any kind. Post-run reporting was already honest — a run comes back
+/// labelled `ProcessOnly` — but that is after the fact, and the one place a user
+/// goes to ask "what is protecting me" said nothing about the boundary that is
+/// absent on two of three platforms.
+///
+/// A `Warning` and not `Critical`: the sandbox is opt-in, so a machine with no
+/// kernel boundary is a real limit on a feature the user chose to invoke rather
+/// than a live compromise. It is also not `Info`, because
+/// `probeGeneratedMcpArtifact` runs **model-authored** MCP server code through
+/// this path — the case where the difference between a scrubbed environment and a
+/// kernel boundary matters most.
+fn audit_sandbox_enforcement(findings: &mut Vec<SecurityFinding>) {
+    match crate::sandbox::sandbox_enforcement() {
+        SandboxEnforcement::OsEnforced => findings.push(finding(
+            "isolation.os_enforced",
+            "isolation",
+            "Sandboxed runs are confined by the OS",
+            "Sandbox runs execute under a generated macOS Seatbelt profile: deny-by-default, \
+             writes confined to the run directory, and network denied unless the run opts in. \
+             The agent's own shell tool is a separate path and is not sandboxed.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        )),
+        SandboxEnforcement::ProcessOnly => findings.push(finding(
+            "isolation.process_only",
+            "isolation",
+            "This platform has no OS sandbox",
+            "Sandbox runs get a copied workspace, a restricted working directory and a scrubbed \
+             environment, but no kernel boundary — a command can still read or write your real \
+             files by absolute path. Generated MCP server code is probed through this path, so \
+             treat a sandboxed run here as untrusted-code-with-guardrails, not as containment.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some(
+                "Review commands and generated MCP servers before running them here. OS \
+                 enforcement on this platform (Landlock and seccomp on Linux, a restricted token \
+                 and job object on Windows) is not implemented yet — see K3 in \
+                 docs/agent-os-roadmap.md.",
+            ),
+        )),
+        SandboxEnforcement::Unavailable => findings.push(finding(
+            "isolation.unavailable",
+            "isolation",
+            "The OS sandbox mechanism is missing",
+            "This platform sandboxes through /usr/bin/sandbox-exec and it is not present, so a \
+             sandboxed run will fail to start rather than run unconfined. Nothing runs with less \
+             isolation than it reports.",
+            FindingStatus::Warning,
+            false,
+            Some("/usr/bin/sandbox-exec"),
+            Some(
+                "Restore the system binary. Until then the Sandbox panel cannot run; the agent's \
+                 own tools are unaffected because they never used it.",
+            ),
+        )),
+    }
+}
+
 fn insecure_mcp_reason(raw: &str) -> Option<String> {
     let url = match Url::parse(raw) {
         Ok(url) => url,
@@ -1309,6 +1377,47 @@ mod tests {
             deep: false,
             fix: false,
             runtime: SecurityRuntimeSnapshot::default(),
+        }
+    }
+
+    /// K3's acceptance clause, which nothing implemented: "a platform without
+    /// enforcement reports itself as unenforced in Security Doctor". The audit had
+    /// no isolation check at all — post-run labelling was honest, but the one
+    /// screen a user consults to ask what is protecting them said nothing about a
+    /// boundary that is absent on two of three platforms.
+    #[test]
+    fn the_audit_reports_this_platforms_isolation_and_matches_the_probe() {
+        let temp = TestDirectory::new("isolation");
+        let report = run_security_audit(&request(&temp.0)).unwrap();
+
+        let isolation: Vec<&SecurityFinding> = report
+            .findings
+            .iter()
+            .filter(|item| item.category == "isolation")
+            .collect();
+        assert_eq!(
+            isolation.len(),
+            1,
+            "exactly one isolation finding, whatever the platform"
+        );
+        let finding = isolation[0];
+
+        // Tied to the probe rather than to a hardcoded platform expectation, so
+        // the audit and the Sandbox panel cannot drift into disagreeing about the
+        // same machine.
+        let (expected_id, expected_status) = match crate::sandbox::sandbox_enforcement() {
+            SandboxEnforcement::OsEnforced => ("isolation.os_enforced", FindingStatus::Pass),
+            SandboxEnforcement::ProcessOnly => ("isolation.process_only", FindingStatus::Warning),
+            SandboxEnforcement::Unavailable => ("isolation.unavailable", FindingStatus::Warning),
+        };
+        assert_eq!(finding.id, expected_id);
+        assert_eq!(finding.status, expected_status);
+
+        // A warning with no remediation is a dead end for the user, and the
+        // unenforced states are precisely the ones that need one.
+        if expected_status == FindingStatus::Warning {
+            assert!(finding.remediation.is_some());
+            assert_eq!(report.summary.warnings.min(1), 1);
         }
     }
 
