@@ -2398,9 +2398,71 @@ impl WorkflowService {
         .with_process_projector(self.process_projector.as_deref())
         .run(&ir, request.clone(), &cancel);
         lock(&self.cancellations, "workflow cancellations")?.remove(&request.run_id);
-        let history = result?;
+        let history = match result {
+            Ok(history) => history,
+            Err(error) => {
+                // `append_history` is the choke point every state change of a
+                // *successful* run flows through, and projection hangs off it —
+                // so an executor error arrived here having projected nothing
+                // terminal, while the eager `Running` row the executor wrote at
+                // the start stayed live forever.
+                //
+                // That made the one in-app kind with a genuinely enforced wall
+                // budget the one kind that leaked a live row every single time
+                // its budget fired. Nothing reclaimed it either: the host-death
+                // reaper only helps once this process exits, so in a long-lived
+                // app the row simply accumulated.
+                self.project_run_failure(&request.run_id, &error);
+                return Err(error.into());
+            }
+        };
         self.append_history(&history)?;
         Ok(history)
+    }
+
+    /// Close out a run's process row when the executor failed before there was
+    /// any history to project from.
+    ///
+    /// Deliberately narrower than [`Self::project_processes`]: with no history
+    /// there are no node instances to close, and none leaked — the executor only
+    /// ever projects the run itself, so nodes are written solely through
+    /// `append_history` and none exists on this path.
+    ///
+    /// A budget kill records as [`ExitStatus::LimitExceeded`] rather than
+    /// `Failed`, matching what the daemon's budget path already does: a run
+    /// terminated for exceeding its wall clock is the system working, and it must
+    /// stay distinguishable from a run whose work genuinely failed.
+    ///
+    /// Fail-soft for the same reason `project_processes` is: the caller is already
+    /// returning an error, and a projection problem must not replace it with a
+    /// different one.
+    fn project_run_failure(&self, run_id: &str, error: &WorkflowError) {
+        let Some(projector) = self.process_projector.as_ref() else {
+            return;
+        };
+        let status = match error {
+            WorkflowError::BudgetExceeded(_) => ExitStatus::LimitExceeded,
+            WorkflowError::Cancelled => ExitStatus::Cancelled,
+            // An interrupted run that left effects behind is the one case where
+            // "failed" would understate what a reader has to go and check.
+            WorkflowError::NeedsReconciliation(_) => ExitStatus::NeedsReconciliation,
+            _ => ExitStatus::Failed,
+        };
+        let projection = ProcessProjection::exited(
+            ProcessKind::WorkflowRun,
+            run_id.to_string(),
+            ProcessExit {
+                status,
+                code: None,
+                signal: None,
+                reason: Some(error.to_string()),
+            },
+        );
+        if let Err(projection_error) = projector.project(&projection) {
+            eprintln!(
+                "workflow service: could not close out failed run {run_id}: {projection_error}"
+            );
+        }
     }
 
     fn ensure_new_run(&self, run_id: &str) -> Result<(), M4ServiceError> {
@@ -3502,6 +3564,147 @@ mod tests {
     impl ProcessProjector for FailingProjector {
         fn project(&self, _projection: &ProcessProjection) -> Result<(), String> {
             Err("ledger is unavailable".to_string())
+        }
+    }
+
+    /// Leaps far enough on every reading that the executor's wall-budget check
+    /// fires on its first evaluation, so the test does not race a real clock.
+    #[derive(Default)]
+    struct LeapingClock(AtomicU64);
+
+    impl WorkflowClock for LeapingClock {
+        fn now_unix_ms(&self) -> u64 {
+            // Eleven days per reading, against a default 24-hour budget.
+            self.0.fetch_add(1_000_000_000, Ordering::SeqCst)
+        }
+
+        fn sleep_ms(&self, _duration_ms: u64, cancel: &CancellationToken) -> Result<(), String> {
+            if cancel.is_cancelled() {
+                return Err("cancelled".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    /// A run whose budget fires must not be left claiming to be running.
+    ///
+    /// The executor projects `Running` eagerly at the start, but terminal
+    /// projection hung off `append_history`, which the `?` on the executor's
+    /// result short-circuited past. So the one in-app kind with a genuinely
+    /// enforced wall budget leaked a live row every time that budget fired, and
+    /// nothing reclaimed it: the host-death reaper only helps once this process
+    /// exits, so a long-lived app simply accumulated them.
+    #[test]
+    fn a_run_killed_by_its_wall_budget_is_closed_out_as_limit_exceeded() {
+        let directory = TempDirectory::new("workflow-budget-projection");
+        let projector = Arc::new(RecordingProjector::default());
+        let service = WorkflowService::new(
+            &directory.0,
+            BTreeSet::new(),
+            workflow_core_fixture_capabilities(),
+            Arc::new(IdentityExecutor),
+            Arc::new(LeapingClock::default()),
+            None,
+        )
+        .unwrap()
+        .with_process_projector(projector.clone());
+
+        let definition = workflow_core_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "parallel-transform")
+            .unwrap()
+            .workflow;
+        service.create(definition.clone()).unwrap();
+
+        let error = service
+            .run_workflow(
+                &definition.workflow_id,
+                WorkflowRunRequest {
+                    run_id: "budget-run-1".to_string(),
+                    inputs: BTreeMap::new(),
+                    secret_bindings: BTreeMap::new(),
+                    trigger: WorkflowTrigger::Manual,
+                },
+            )
+            .expect_err("the wall budget must stop this run");
+        assert!(
+            error.to_string().contains("budget"),
+            "expected a budget failure, got {error}"
+        );
+
+        let runs = projector.of_kind(ProcessKind::WorkflowRun);
+        assert_eq!(
+            runs.first().map(|run| run.state),
+            Some(ProcessState::Running),
+            "the run is still projected as running when it starts"
+        );
+        let last = runs.last().expect("the run is projected at least once");
+        assert_eq!(
+            last.state,
+            ProcessState::Exited,
+            "a run whose budget fired must not be left live — rows: {:?}",
+            runs.iter().map(|run| run.state).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            last.exit.as_ref().map(|exit| exit.status),
+            Some(ExitStatus::LimitExceeded),
+            "a budget kill recorded as a plain failure is indistinguishable from \
+             work that genuinely broke"
+        );
+        assert!(
+            last.exit
+                .as_ref()
+                .and_then(|exit| exit.reason.as_deref())
+                .is_some_and(|reason| reason.contains("budget")),
+            "the exit must name what stopped the run"
+        );
+
+        // No node rows leaked, because the executor only ever projects the run
+        // itself — nodes are written solely through `append_history`, which this
+        // path never reached.
+        assert!(projector.of_kind(ProcessKind::WorkflowNode).is_empty());
+    }
+
+    /// The mapping on its own, so each error class is pinned without needing a
+    /// workflow that fails in that particular way.
+    #[test]
+    fn a_failed_runs_exit_status_distinguishes_a_budget_kill_from_a_broken_run() {
+        let directory = TempDirectory::new("workflow-failure-mapping");
+        let projector = Arc::new(RecordingProjector::default());
+        let service = workflow_service(&directory.0, None, BTreeSet::new())
+            .with_process_projector(projector.clone());
+
+        for (error, expected) in [
+            (
+                WorkflowError::BudgetExceeded("wall".to_string()),
+                ExitStatus::LimitExceeded,
+            ),
+            (WorkflowError::Cancelled, ExitStatus::Cancelled),
+            (
+                WorkflowError::NeedsReconciliation("half-applied".to_string()),
+                ExitStatus::NeedsReconciliation,
+            ),
+            (
+                WorkflowError::Execution("node blew up".to_string()),
+                ExitStatus::Failed,
+            ),
+            (
+                WorkflowError::InvalidDefinition("bad".to_string()),
+                ExitStatus::Failed,
+            ),
+        ] {
+            service.project_run_failure("mapping-run", &error);
+            let last = projector
+                .of_kind(ProcessKind::WorkflowRun)
+                .last()
+                .cloned()
+                .expect("a failure is projected");
+            assert_eq!(last.state, ProcessState::Exited);
+            assert_eq!(
+                last.exit.as_ref().map(|exit| exit.status),
+                Some(expected),
+                "{error:?} mapped to the wrong exit status"
+            );
         }
     }
 
