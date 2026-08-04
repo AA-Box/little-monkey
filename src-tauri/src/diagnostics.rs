@@ -35,13 +35,14 @@ const KEYCHAIN_SERVICE: &str = "com.littlemonkey.app";
 /// random probe value, and is deleted again before the probe returns.
 const KEYCHAIN_PROBE_ACCOUNT: &str = "diagnostics:keychain-probe";
 
-/// Context size/GPU-layer defaults used when restarting the chat
-/// `llama-server` instance — mirrors `src/store/modelStore.ts`'s own
-/// `DEFAULT_CTX_SIZE`/`DEFAULT_GPU_LAYERS` exactly (the same values a normal
-/// "Start" click in Settings > Local models already launches with), so a
-/// diagnostics-triggered restart behaves identically to a manual one rather
-/// than inventing a second, potentially-drifting default.
-const LLAMA_RESTART_CTX_SIZE: u32 = 4096;
+/// GPU-layer default used when restarting the chat `llama-server` instance —
+/// mirrors `src/store/modelStore.ts`'s own `DEFAULT_GPU_LAYERS` exactly (the
+/// same value a normal "Start" click in Settings > Local models already
+/// launches with), so a diagnostics-triggered restart behaves identically to
+/// a manual one rather than inventing a second, potentially-drifting
+/// default. Context size isn't listed here: both paths pass `None` and let
+/// `llama::llama_start`'s own `resolve_ctx_size` auto-detect it from the
+/// model's GGUF metadata, so there's only one place that decision is made.
 const LLAMA_RESTART_GPU_LAYERS: i32 = 999;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -772,7 +773,7 @@ pub async fn diagnostics_apply_fix(
                 app.clone(),
                 state.clone(),
                 model_path,
-                LLAMA_RESTART_CTX_SIZE,
+                None,
                 LLAMA_RESTART_GPU_LAYERS,
                 false,
             )

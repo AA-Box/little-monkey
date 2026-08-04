@@ -1,4 +1,4 @@
-import { Children, isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
@@ -8,6 +8,10 @@ import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../li
 import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
 import WorkspaceImagePreview from "./WorkspaceImagePreview";
 import { useArtifactStore } from "../../store/artifactStore";
+// Lazy: `CodeBlock` pulls in `react-syntax-highlighter`'s Prism bundle, the
+// same heavy dependency `ArtifactPane.tsx` keeps out of the main entry chunk
+// via `lazyComponents.tsx` — see `CodeBlock.tsx`'s doc comment.
+const CodeBlock = lazy(() => import("./CodeBlock"));
 import { useT } from "../../lib/i18n";
 import {
   cancelTranslation,
@@ -166,7 +170,19 @@ function buildAssistantMarkdownComponents(
       const body = codeProps ? flattenToString(codeProps.children).replace(/\n$/, "") : "";
       const kind = codeProps ? detectFenceKind(lang, body) : null;
 
-      if (!kind) return <pre>{children}</pre>;
+      if (!codeProps) return <pre>{children}</pre>;
+
+      // Suspense's fallback is the same plain `<pre>` this fence rendered as
+      // before `CodeBlock` existed — the lazy chunk is small and typically
+      // cached after the first fence in a session, so this is a rare,
+      // brief flash rather than the normal path.
+      if (!kind) {
+        return (
+          <Suspense fallback={<pre>{children}</pre>}>
+            <CodeBlock lang={lang} body={body} />
+          </Suspense>
+        );
+      }
 
       const ref: ArtifactRef = {
         messageIndex,
@@ -176,20 +192,22 @@ function buildAssistantMarkdownComponents(
       previewableIndex += 1;
 
       return (
-        <div>
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="font-mono text-[11px] uppercase tracking-wide text-faint">{lang}</span>
-            <button
-              type="button"
-              onClick={() => useArtifactStore.getState().open(sessionId, ref)}
-              className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-muted transition-colors hover:bg-surface-2 hover:text-foreground"
-            >
-              <Eye size={12} />
-              {t("MessageBubble.previewButton")}
-            </button>
-          </div>
-          <pre>{children}</pre>
-        </div>
+        <Suspense fallback={<pre>{children}</pre>}>
+          <CodeBlock
+            lang={lang}
+            body={body}
+            headerExtra={
+              <button
+                type="button"
+                onClick={() => useArtifactStore.getState().open(sessionId, ref)}
+                className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                <Eye size={12} />
+                {t("MessageBubble.previewButton")}
+              </button>
+            }
+          />
+        </Suspense>
       );
     },
   };

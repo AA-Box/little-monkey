@@ -69,22 +69,21 @@ describe("modelStore.embeddingsEnabled", () => {
 });
 
 describe("modelStore.start", () => {
-  it("passes the current embeddingsEnabled preference to llama_start", async () => {
+  it("passes the current embeddingsEnabled preference to llama_start, leaving ctx sizing to the backend", async () => {
     useModelStore.getState().setEmbeddingsEnabled(true);
-    invokeMock.mockResolvedValueOnce(undefined);
+    invokeMock.mockResolvedValueOnce(8_192);
 
     await useModelStore.getState().start(makeModel());
 
     expect(invokeMock).toHaveBeenCalledWith("llama_start", {
       modelPath: "/models/qwen2.5-7b-instruct.gguf",
-      ctxSize: 4096,
       gpuLayers: 999,
       embeddings: true,
     });
   });
 
   it("passes embeddings: false when the preference is off", async () => {
-    invokeMock.mockResolvedValueOnce(undefined);
+    invokeMock.mockResolvedValueOnce(4_096);
 
     await useModelStore.getState().start(makeModel());
 
@@ -92,6 +91,15 @@ describe("modelStore.start", () => {
       "llama_start",
       expect.objectContaining({ embeddings: false }),
     );
+  });
+
+  it("sets the usage-store context limit to whatever llama_start actually resolved, not a fixed guess", async () => {
+    invokeMock.mockResolvedValueOnce(16_384);
+
+    await useModelStore.getState().start(makeModel());
+
+    const { useUsageStore } = await import("./usageStore");
+    expect(useUsageStore.getState().contextLimit).toBe(16_384);
   });
 
   it("throws for a model with no path, without calling llama_start", async () => {
@@ -180,6 +188,33 @@ describe("modelStore model reference install", () => {
       downloaded: 500,
       total: 1_000,
     });
+  });
+});
+
+describe("modelStore.cancelDownload", () => {
+  it("invokes models_cancel_download with the model's file", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const model = makeModel({ file: "qwen2.5-14b-instruct.gguf", installed: false });
+
+    await useModelStore.getState().cancelDownload(model);
+
+    expect(invokeMock).toHaveBeenCalledWith("models_cancel_download", {
+      file: "qwen2.5-14b-instruct.gguf",
+    });
+  });
+});
+
+describe("modelStore.download", () => {
+  it("clears the file's downloadProgress entry when the backend call rejects (e.g. cancelled)", async () => {
+    const model = makeModel({ file: "qwen2.5-14b-instruct.gguf", installed: false });
+    useModelStore.setState({
+      downloadProgress: { [model.file]: { downloaded: 500, total: 1_000 } },
+    });
+    invokeMock.mockRejectedValue(new Error("Download cancelled"));
+
+    await expect(useModelStore.getState().download(model)).rejects.toThrow("Download cancelled");
+
+    expect(useModelStore.getState().downloadProgress[model.file]).toBeUndefined();
   });
 });
 
