@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::process_table::{
-    ProcessKind, ProcessProjection, ProcessProjector, ProcessState, SignalSource,
+    hosting_pid, ProcessKind, ProcessProjection, ProcessProjector, ProcessState, SignalSource,
 };
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
@@ -1736,11 +1736,17 @@ impl<'a> HeadlessWorkflowExecutor<'a> {
         // invisible in the process table until `append_history`'s final
         // projection, and `Admitted -> Suspended` is not a legal transition.
         if let Some(projector) = self.process_projector {
-            let _ = projector.project(&ProcessProjection::new(
+            // The host pid is what makes this row reapable if this process dies
+            // mid-run: nothing else could tell a crashed host from a run still
+            // executing in the other one. See
+            // `process_table::reap_processes_whose_host_died`.
+            let mut projection = ProcessProjection::new(
                 ProcessKind::WorkflowRun,
                 request.run_id.clone(),
                 ProcessState::Running,
-            ));
+            );
+            projection.native_pid = hosting_pid(ProcessState::Running);
+            let _ = projector.project(&projection);
         }
         let _finish_guard = WorkflowRunFinishGuard {
             executor: self.node_executor,
@@ -1838,11 +1844,16 @@ impl<'a> HeadlessWorkflowExecutor<'a> {
                     }
                     if !parked {
                         if let Some(projector) = self.process_projector {
-                            let _ = projector.project(&ProcessProjection::new(
+                            // A suspended run is still live, so it still names its
+                            // host: crashing while paused is a crash, and the row
+                            // must be reapable exactly as a running one is.
+                            let mut projection = ProcessProjection::new(
                                 ProcessKind::WorkflowRun,
                                 request.run_id.clone(),
                                 ProcessState::Suspended,
-                            ));
+                            );
+                            projection.native_pid = hosting_pid(ProcessState::Suspended);
+                            let _ = projector.project(&projection);
                         }
                         parked = true;
                     }
@@ -1856,11 +1867,13 @@ impl<'a> HeadlessWorkflowExecutor<'a> {
                 }
                 if parked {
                     if let Some(projector) = self.process_projector {
-                        let _ = projector.project(&ProcessProjection::new(
+                        let mut projection = ProcessProjection::new(
                             ProcessKind::WorkflowRun,
                             request.run_id.clone(),
                             ProcessState::Running,
-                        ));
+                        );
+                        projection.native_pid = hosting_pid(ProcessState::Running);
+                        let _ = projector.project(&projection);
                     }
                 }
                 if cancel.is_cancelled() {
