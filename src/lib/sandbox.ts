@@ -2,6 +2,22 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type SandboxIsolation = "os_sandboxed" | "process_only";
 
+/**
+ * What this machine can enforce, answerable before a run.
+ *
+ * Distinct from {@link SandboxIsolation}, which reports what a run *got* — true,
+ * but only after the command has already executed. The panel offers the same Run
+ * button everywhere, and generated MCP server code is probed through it, so the
+ * answer is needed while the user is still deciding.
+ *
+ * `unavailable` is its own state: on macOS the sandbox binary is spawned
+ * unconditionally, so if it is missing the run fails rather than silently
+ * downgrading — a different problem from having no sandbox at all.
+ */
+export type SandboxEnforcement = "os_enforced" | "process_only" | "unavailable";
+
+export const sandboxEnforcement = () => invoke<SandboxEnforcement>("sandbox_enforcement_probe");
+
 export interface SandboxRunSummary {
   runId: string;
   isolation: SandboxIsolation;

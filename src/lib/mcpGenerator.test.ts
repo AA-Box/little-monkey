@@ -217,6 +217,23 @@ describe("generated artifact verification", () => {
     expect(command).toMatch(/^node -e /);
   });
 
+  it("does not call a process-only probe isolated", async () => {
+    // This executes model-authored code. On Windows and Linux the sandbox has no
+    // kernel boundary, and the summary used to say "in an isolated local probe"
+    // on every platform — the one claim in this report worth being exact about.
+    const runner = vi.fn().mockResolvedValue({
+      runId: "run-3",
+      isolation: "process_only",
+      passed: true,
+      stdoutExcerpt: "LITTLE_MONKEY_MCP_TYPECHECK_OK\nLITTLE_MONKEY_MCP_PROBE_OK:1\n",
+      stderrExcerpt: "",
+    });
+    const report = await probeGeneratedMcpArtifact(executableArtifact, validSpec(), runner);
+    expect(report.clean).toBe(true);
+    expect(report.summary).toContain("no OS sandbox on this platform");
+    expect(report.summary).not.toMatch(/\bisolated\b/);
+  });
+
   it("does not accept a sandbox success without typecheck and runtime probe evidence", async () => {
     const runner = vi.fn().mockResolvedValue({
       runId: "run-1", isolation: "os_sandboxed", passed: true,
@@ -236,6 +253,7 @@ describe("generated artifact verification", () => {
     const report = await probeGeneratedMcpArtifact(executableArtifact, validSpec(), runner);
     expect(report.clean).toBe(true);
     expect(report.probedToolCount).toBe(1);
+    expect(report.summary).toContain("OS-sandboxed");
     expect(runner).toHaveBeenCalledWith(expect.any(String), {
       timeoutMs: 45_000,
       allowNetwork: false,

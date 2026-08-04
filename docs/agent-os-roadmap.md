@@ -579,7 +579,7 @@ only a stop. What K8 still needs from elsewhere is the reservation question
 above — a suspended process holds its resident model slot, worktree lease and
 workspace root — which is a K7/K8 decision, not a signals one.
 
-## K3. Isolation parity across platforms
+## K3. Isolation parity across platforms *(partially built)*
 
 **Today:** real Seatbelt (`sandbox-exec`) confinement on macOS, with an
 integration test asserting a sandboxed command cannot read or write the real
@@ -587,17 +587,65 @@ workspace with or without network (`sandbox.rs`). On Windows and Linux the
 same call falls back to a restricted cwd and scrubbed environment — that is
 app-level policy, not kernel-enforced isolation.
 
-**Acceptance:** platform-enforced confinement on all three. Linux: Landlock
-filesystem rules plus a seccomp-BPF syscall filter, with user namespaces where
-available. Windows: a restricted token with a job object, and AppContainer
-where the payload allows it. Each platform has the *same* integration test as
-macOS — a command that tries to read and write the real workspace, with and
-without network, and fails. A platform without enforcement reports itself as
-unenforced in Security Doctor rather than presenting a sandbox that is not
-one.
+**Scope correction, because the sentence above invites a bigger reading than it
+should.** `execute_in_sandbox` has exactly one non-test caller — `sandbox_run`,
+behind the Sandbox panel and `probeGeneratedMcpArtifact`. It is an opt-in feature,
+*not* the app's execution boundary: the agent's own shell tool spawns `sh -c` /
+`cmd /C` with the workspace as cwd and does not even `env_clear()`, on every
+platform including macOS. So "Seatbelt confinement on macOS" describes one
+feature, and no reader should take it as a statement about how agent tools run.
+
+**Shipped — enforcement is reported before it is relied on, and the one
+enforcement claim that had no test now has one.**
+
+- **Security Doctor reports isolation.** This was an acceptance clause below with
+  nothing behind it: the audit had no isolation check of any kind. `isolation`
+  findings now come from `sandbox_enforcement()` — `Pass` when Seatbelt is
+  available, `Warning` naming the consequence otherwise. Warning rather than
+  Critical because the sandbox is opt-in, and not Info because the code probed
+  through it is *model-authored*.
+- **Three states, not two.** `SandboxEnforcement::Unavailable` is distinct from
+  `ProcessOnly` on purpose: on macOS `execute_in_sandbox` spawns `sandbox-exec`
+  unconditionally, so a missing binary makes a run *fail* rather than silently
+  degrade. Collapsing that into "no OS sandbox" would send the user after the
+  wrong problem. It is a probe rather than a `cfg!` for the same reason —
+  answering `OsEnforced` from the target triple alone is precisely the kind of
+  claim this exists to stop making.
+- **A pre-run warning in the Sandbox panel.** Post-run labelling was already
+  honest, and arrives after the command has executed. The panel offers the same
+  Run button on every platform, so the warning belongs above it. The probe is
+  fail-quiet: a failed IPC call warns about nothing, because it knows nothing.
+- **`(deny network*)` is now actually exercised.** It was asserted only as profile
+  *text*: one test compares two generated strings, and the live Seatbelt test
+  loops over `allow_network` while running a command that never opens a socket —
+  proving the filesystem rules survive the toggle, not that the toggle does
+  anything. A denied-network sandbox was a security claim with no test behind it.
+  The new test asserts a **contrast** against a loopback listener it owns: the
+  allow arm must connect for the deny arm to mean anything, since "the connection
+  failed" is also what a machine with no network produces. Verified load-bearing
+  by making the clause always permit — the test fails with the connection
+  succeeding. The answer, for the record: Seatbelt does deny it, loopback
+  included.
+
+**Remaining — and it is platform work, not reporting work.** Platform-enforced
+confinement on all three. Linux: Landlock filesystem rules plus a seccomp-BPF
+syscall filter, with user namespaces where available. Windows: a restricted token
+with a job object, and AppContainer where the payload allows it. Each platform
+needs the *same* integration test as macOS — a command that tries to read and
+write the real workspace, with and without network, and fails — plus the network
+contrast test above. None of those primitives exists anywhere in the crate today
+and no dependency supplies one, so this is genuinely unbuilt rather than
+half-built.
+
+Also worth doing and much smaller: the agent's own shell tool has no `env_clear()`
+on any platform, so a tool call inherits the full parent environment including
+secrets. That is a hardening fix independent of kernel isolation, and it is
+cheaper than any of the above.
 
 **Blocks:** the claim itself. An OS whose isolation is advisory on two of
-three platforms is a framework.
+three platforms is a framework. Also K21 concretely — its conformance suite must
+cover the isolation guarantees, which cannot be asserted uniformly while two
+platforms have none.
 
 ## K4. Enforced per-process resource limits
 
