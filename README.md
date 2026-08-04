@@ -237,6 +237,19 @@ a scope boundary stated where it matters.
   a no-op on macOS — so resident memory stays with the daemon's watchdog. On
   Windows this does nothing at all; the equivalent is a job object and it is not
   built yet.
+- Shell output that reaches a model is bounded. Each of stdout and stderr from the
+  shell tool is capped at 20,000 bytes, keeping the end — where a failing command
+  puts its diagnostic — and saying on the wire whether anything was dropped. Of the
+  app's four command-running paths this was the only uncapped one and the only one
+  a model reads directly, so a single chatty command could fill most of a local
+  model's context window. The number is the one verification commands already used,
+  not the far larger one the terminal panel uses for human scrollback, because a
+  model's context is the tighter constraint. Callers that parse output as a
+  document rather than showing it to a model can ask for all of it — the dependency
+  audit does, since a truncated JSON report would not be a shorter answer but an
+  unreadable one, and would have quietly reported no vulnerabilities. Real limit:
+  the cap applies to what is returned, not to how much is read, so a command that
+  writes gigabytes still buffers them in memory for up to its 120-second timeout.
 - A budget that fires finishes its own cleanup. Two places where it did not, both
   found by auditing the enforcement already in place rather than adding more. A
   browser session that hit its action quota was marked cancelled but its Chromium

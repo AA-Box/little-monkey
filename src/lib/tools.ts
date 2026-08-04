@@ -152,7 +152,7 @@ export const TOOLS: ToolDef[] = [
     function: {
       name: 'run_shell',
       description:
-        'Run a shell command via `sh -c` in the workspace (or a subdirectory of it), with a 120 second timeout. Returns stdout, stderr, and exit code. Set run_in_background for a command that should outlive this tool call (a dev server, a file watcher, a long build) — it returns a task id immediately instead of waiting, and the command keeps running until it exits or shell_kill stops it. Requires user permission.',
+        'Run a shell command via `sh -c` in the workspace (or a subdirectory of it), with a 120 second timeout. Returns stdout, stderr, and exit code. Each of stdout and stderr is capped at 20,000 bytes, keeping the END of the output and prefixing "… (truncated)" — so if you need a specific earlier part of a chatty command, filter or paginate it in the command itself (grep, tail, head, sed -n) rather than expecting the whole stream. stdoutTruncated and stderrTruncated say whether anything was dropped. Set run_in_background for a command that should outlive this tool call (a dev server, a file watcher, a long build) — it returns a task id immediately instead of waiting, and the command keeps running until it exits or shell_kill stops it. Requires user permission.',
       parameters: {
         type: 'object',
         properties: {
