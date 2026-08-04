@@ -978,6 +978,45 @@ four of them were written by earlier slices of this same item.**
 - `verify.rs`'s output cap documents itself as bounding "chars" while measuring
   `s.len()` bytes.
 
+**Shipped — the shell tool's output no longer floods the context it feeds.** Of the
+app's four command-running paths, `tools.rs` was the only uncapped one *and* the
+only one whose output a model reads directly: `verify.rs` and
+`background_shell.rs` have always capped theirs. Both streams ran unbounded from
+the child's pipes into the model's context window.
+
+- **Reuses `verify.rs`'s 20 KB rather than `background_shell`'s 256 KiB**, because
+  the consumer picks the ceiling. 256 KiB is right for a human-facing scrollback
+  tail; at the context trimmer's own four-bytes-per-token estimate it is roughly
+  65k tokens, so one tool call would consume most of a typical local model's
+  window. `verify.rs` had already chosen the correct number for this consumer.
+- **No fourth truncation helper.** This codebase already had three, with three
+  directions and three markers. `verify.rs`'s implementation moved into
+  `output_cap` and both runners now share the number, the direction and the
+  marker, so a model cannot tell the two apart. Its doc claimed to bound "chars"
+  while measuring bytes; corrected on the way.
+- **Tail kept, head dropped**, because a failing command prints its diagnostic
+  last — a compiler emits thousands of progress lines and then the errors. The
+  counter-case, a command whose answer is its first line, is short and never
+  reaches the cap.
+- **A blanket cap would have broken a security tool, and that is why the flag
+  exists.** `securityAutofix.ts` runs `pnpm audit --json` and `JSON.parse`s
+  stdout; a truncated tail there is not a shorter answer but an unparseable one,
+  and the parse failure surfaces as **zero findings** — a silent "no
+  vulnerabilities" from a vulnerability scan. It now asks for the full output
+  explicitly, and both halves of that are tested.
+- **The opt-out is a flag, not a byte count.** Nothing needs a *different*
+  ceiling, and `Some(0)` meaning "unlimited" would be the zero-versus-absent
+  overloading this codebase avoids. A model cannot reach it either: the schema
+  shown to models sets `additionalProperties: false` and does not list it.
+- **The truncation flags are on the wire, not only in the text.** A command is
+  free to print the marker's own wording, so a caller deciding whether it holds a
+  whole document gets `stdoutTruncated`/`stderrTruncated` rather than having to
+  pattern-match prose. The model's tool description now also states the cap and
+  says to filter or paginate in the command itself.
+- The default is asserted directly, because an inverted one is invisible in a
+  passing shell command and would only show up later as a flooded context.
+  Sabotage: flipping it fails with `left: None / right: Some(20000)`.
+
 **Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
 is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
@@ -997,9 +1036,15 @@ Still genuinely missing, after the corrections above narrowed the list:
   `started_at_ms` deliberately survives resume and nothing accumulates
   suspended-ms. And such a budget is a floor, not a ceiling: a turn inside a 120 s
   shell timeout cannot observe the latch until that tool returns.
-- **No cap on foreground shell output.** Checked and true — of the four
-  command-running paths, `tools.rs` is the only uncapped one and the only one
-  whose output goes straight into the model's context.
+- The foreground shell's **intermediate heap buffer** is still unbounded even
+  though its returned output is now capped (see below): `wait_with_output`
+  materializes both streams in full before any cap applies, so
+  `sh -c 'cat /dev/urandom | base64'` still gets the whole 120 s timeout to grow
+  the app's own heap. Bounding the read means draining both pipes concurrently
+  with the wait, which is the service `wait_with_output` performs today — get it
+  wrong and a chatty-stderr child deadlocks once the 64 KiB pipe buffer fills,
+  turning a working command into a timeout. Its own slice, not a line to smuggle
+  into the cap.
 - **No browser-worker watchdog.** `begin_action` is reachable only from `with_cdp`,
   so an idle session is never re-examined; child liveness is never checked at all,
   and the pid is never recorded, so nothing outside the owning process can even
