@@ -195,6 +195,20 @@ a scope boundary stated where it matters.
   a Crew member carries no edge to its coordinator (actors initialize
   concurrently, coordinator last); and a retried daemon job becomes a new
   process rather than inheriting the original's parent.
+- A job killed for exceeding a budget is recorded as `limit_exceeded`, not as a
+  plain cancel. All three daemon budgets — wall clock, memory, log size — tear the
+  child down by cancelling its run, so until now a job killed for holding 700 MiB
+  and a job someone pressed Stop on left the same row: "the system worked" and
+  "someone changed their mind" were indistinguishable after the fact. The exit now
+  names which limit fired and what the measurement was ("held 8192 bytes against a
+  4096 byte budget"), so a reader can tell whether the budget was wrong or the job
+  was. Real limit: the run ledger itself still shows the run as cancelled, because
+  `RunStatus` has no limit status and adding a terminal status to the event
+  protocol is a compatibility change — the distinguishable exit is on the process
+  record. The marker that carries the fact through the daemon's own database
+  currently rides in that row's error text rather than a typed column, because the
+  daemon store has no migration framework to add one; it is confined to two
+  functions so that stays a contained shortcut rather than a spreading convention.
 - A timeout ends the whole process tree, not just the command that was spawned.
   Shell tools, verify commands and sandboxed runs each get their own process
   group, and a timeout or Stop terminates that group — TERM first, so a build can
