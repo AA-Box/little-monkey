@@ -133,14 +133,21 @@ pub struct ServerCounters {
 /// `hold_permit_until_body_ends`. The legacy listener did the wrong one until the
 /// guard-lifetime fix.
 ///
-/// **What the token does *not* yet do**, stated because the earlier version of
-/// this comment claimed otherwise: on the compatibility listener it reaches the
-/// work, via `RequestGuard::context` into `M3OperationContext`. On the legacy
-/// listener nothing reads it — `AdmissionGuard::cancellation` has no caller in
-/// `server.rs`, and the upstream calls there are bare `reqwest::Client`s with no
-/// timeout — so a legacy client that goes away still leaves its upstream request
-/// running to completion. Wiring that is its own change; the type carrying a
-/// token is not the same as a route honouring it.
+/// **What the token is for is server shutdown**, which is worth stating because an
+/// earlier version of this comment claimed it covered a client going away, and
+/// that part was never the gap: a disconnecting client is already handled by drop,
+/// since hyper drops the service future and the in-flight `reqwest` future with
+/// it. Stopping the server was the hole. `server.rs`'s `stop_server_core` awaits
+/// only the accept loop's task, while every connection is a separate
+/// `tokio::spawn` that nothing joins — so requests it had already accepted kept
+/// streaming from upstream after the UI reported "stopped".
+///
+/// Both listeners now honour it. The compatibility listener threads it through
+/// `RequestGuard::context` into `M3OperationContext`; the legacy listener carries
+/// it on `ServerDeps` and races every upstream call against it, and its streaming
+/// bodies end in an **error** rather than a clean close, because a truncated SSE
+/// stream that closes successfully is indistinguishable to a client from a
+/// complete one that happens to lack `[DONE]`.
 pub struct AdmissionGuard {
     cancellation: CancellationToken,
     counters: Arc<ServerCounters>,

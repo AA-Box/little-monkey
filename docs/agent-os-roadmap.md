@@ -95,13 +95,42 @@ made once and silently not take effect.
     away — both are tested, the second because leaking a permit per abandoned
     stream would wedge the listener at its quota with nothing running, which is
     strictly worse than the unbounded behaviour it replaced.
-  - **Cancellation is still not wired on the legacy listener**, and the claim
-    that it was is now corrected in `http_policy.rs` too. The guard carries a
-    token; `AdmissionGuard::cancellation` has no caller in `server.rs`, and the
-    upstream calls there are bare `reqwest::Client`s with no timeout. m3 does
-    thread it, via `RequestGuard::context` into `M3OperationContext`. A type that
-    carries a token is not a route that honours one, so a legacy client that goes
-    away still leaves its upstream request running. That is its own change.
+  - **Cancellation was claimed, then found unwired, and is now actually wired** —
+    in that order, and the middle step is why the third one describes a different
+    defect than the first one did. The guard carried a token that
+    `AdmissionGuard::cancellation` had no caller for in `server.rs`.
+
+    Wiring it turned up that **the claimed motivation was wrong**. "A client that
+    went away leaves work running" is already handled by drop: hyper drops the
+    service future and the in-flight `reqwest` future with it. The real hole was
+    **stopping the server** — `stop_server_core` awaits only the accept loop's
+    task, and every connection is a separate `tokio::spawn` that nothing joins, so
+    requests already accepted kept streaming from upstream after the UI said
+    "stopped".
+
+    The token now rides on `ServerDeps`, so no handler signature had to learn that
+    cancellation exists, and it is supplied by `serve_with_admission`'s closure
+    parameter — deps cannot be constructed without one. Both upstream `send`s and
+    both body reads race it; `reqwest` has no cancel method, so cancellation is a
+    race whose loser is dropped. A cut stream ends in an **error**, never a clean
+    close: a truncated SSE stream that closes successfully is indistinguishable to
+    a client from a complete one that happens to lack `[DONE]`, and it would read
+    a partial answer as the whole answer.
+
+    The sharp edge, which one test exists only to catch: `AdmissionGuard::drop`
+    cancels the token and the guard lives inside the stream's own state, so a
+    naive race would turn every *successful* stream into an error. It is safe only
+    because the token cannot fire from that stream's own teardown while it is
+    still being polled — so cancellation there always means the parent fired.
+
+    One test flaked before it stabilised, and the fix is the interesting part: it
+    cancelled after a fixed 50ms, passed locally, then returned `502` once because
+    the fake upstream had closed its socket before cancellation won. A re-run went
+    green with no code change, which is exactly what a race looks like when you
+    would rather believe it is fixed. It now cancels on an explicit "the upstream
+    has the connection" signal and holds the socket open until the assertions
+    finish, so neither side can end the request first — 8 consecutive runs, no
+    variance.
 
   Also corrected: the 503 refusal body is now byte-asserted. It was the one
   response on this listener with no test at all, and an SDK client branches on
@@ -637,10 +666,21 @@ contrast test above. None of those primitives exists anywhere in the crate today
 and no dependency supplies one, so this is genuinely unbuilt rather than
 half-built.
 
-Also worth doing and much smaller: the agent's own shell tool has no `env_clear()`
-on any platform, so a tool call inherits the full parent environment including
-secrets. That is a hardening fix independent of kernel isolation, and it is
-cheaper than any of the above.
+Also open, and deliberately **not** treated as a quick win after checking it: the
+agent's own shell tool has no `env_clear()` on any platform, so a tool call
+inherits the app's full parent environment. The tempting framing is "it leaks
+secrets", and that overstates it — there is no production `std::env::set_var`
+anywhere in the crate and no provider key is injected into any child's
+environment, so what a tool call inherits is whatever launched the app: close to
+nothing from Finder, and a developer's own exports when started from a terminal.
+
+The reason this is not a one-line fix is that the obvious fix is wrong. A blanket
+`env_clear()` would strip `PATH`, `HOME`, toolchain and proxy variables from every
+tool call, and an allowlist narrow enough to be safe breaks the same commands —
+`sandbox.rs`'s `allowlisted_env` can be that strict only because it serves a
+disposable probe, not the user's real workspace. What tool calls should inherit is
+a policy decision that belongs with K5's egress work, not a hardening tweak to
+smuggle in here.
 
 **Blocks:** the claim itself. An OS whose isolation is advisory on two of
 three platforms is a framework. Also K21 concretely — its conformance suite must
