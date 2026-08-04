@@ -119,17 +119,28 @@ pub struct ServerCounters {
 
 /// Held for the lifetime of one in-flight request.
 ///
-/// Owns three things a route must not be able to skip: the concurrency permit
-/// (so the listener has a bounded number of requests in flight), the active/total
-/// counters, and a per-request [`CancellationToken`] derived from the server's
-/// shutdown token — so work started on behalf of a client that went away, or a
-/// server that is stopping, is actually cancelled rather than left running.
+/// Owns the concurrency permit (so the listener has a bounded number of requests
+/// in flight), the active/total counters, and a per-request
+/// [`CancellationToken`] derived from the server's shutdown token.
 ///
-/// Shared between both listeners deliberately. `server.rs` had none of this: its
-/// accept loop spawned an unbounded task per connection with no permit, no
-/// counters, and no cancellation reaching its upstream `reqwest` calls, which is
-/// exactly the D1 finding that a route can bypass admission control — and the
-/// reason K4 and K5 were blocked on it.
+/// **Lifetime is the whole point and is easy to get wrong.** Releasing the permit
+/// when the *handler returns* rather than when the *response body ends* bounds
+/// time-to-first-header instead of time in flight, which for a streaming route
+/// bounds nothing: the handler returns as soon as upstream headers arrive, with
+/// the body not yet read. Both listeners now hold the guard until the body is
+/// finished or dropped — `m3_http_server.rs` by moving it into `sse_body`'s
+/// unfold state, `server.rs` by wrapping the response body in
+/// `hold_permit_until_body_ends`. The legacy listener did the wrong one until the
+/// guard-lifetime fix.
+///
+/// **What the token does *not* yet do**, stated because the earlier version of
+/// this comment claimed otherwise: on the compatibility listener it reaches the
+/// work, via `RequestGuard::context` into `M3OperationContext`. On the legacy
+/// listener nothing reads it — `AdmissionGuard::cancellation` has no caller in
+/// `server.rs`, and the upstream calls there are bare `reqwest::Client`s with no
+/// timeout — so a legacy client that goes away still leaves its upstream request
+/// running to completion. Wiring that is its own change; the type carrying a
+/// token is not the same as a route honouring it.
 pub struct AdmissionGuard {
     cancellation: CancellationToken,
     counters: Arc<ServerCounters>,
