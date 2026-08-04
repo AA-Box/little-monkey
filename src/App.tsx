@@ -7,6 +7,7 @@ import ChatSessionList from "./components/Chat/ChatSessionList";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
 import { AppMenu } from "./components/AppMenu";
+import { UpdateCard } from "./components/Update";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useBrowserPaneStore } from "./store/browserPaneStore";
 import { useApprovalChainStore } from "./store/approvalChainStore";
@@ -35,6 +36,8 @@ import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
 import { startBackupScheduler } from "./lib/backupScheduler";
+import { startUpdateWatcher } from "./lib/appUpdater";
+import { useUpdateStore } from "./store/updateStore";
 import { startSyntheticMonitoringScheduler } from "./store/syntheticMonitoringStore";
 import { useT } from "./lib/i18n";
 import {
@@ -770,9 +773,13 @@ function App() {
       startScheduler();
       const stopBackupScheduler = startBackupScheduler();
       const stopSyntheticMonitoringScheduler = startSyntheticMonitoringScheduler();
+      // Same main-window-only reasoning: a second window sharing this install
+      // would download and install the identical bundle again.
+      const stopUpdateWatcher = startUpdateWatcher(useUpdateStore.getState().check);
       return () => {
         stopBackupScheduler();
         stopSyntheticMonitoringScheduler();
+        stopUpdateWatcher();
       };
     }
     return undefined;
@@ -943,8 +950,14 @@ function App() {
           above the chat input (see ChatWindow). */}
       <aside className="app-session-sidebar flex shrink-0 flex-col border-r border-border bg-surface">
         <div data-tauri-drag-region className="h-11 shrink-0" />
-        <div className="min-h-0 flex-1 overflow-y-auto [overscroll-behavior:contain]">
-          <ChatSessionList />
+        {/* `relative` so the update card can float over the bottom of the
+            session list (Claude Desktop places it exactly there) instead of
+            pushing the list up when an update lands mid-scroll. */}
+        <div className="relative min-h-0 flex-1">
+          <div className="h-full overflow-y-auto [overscroll-behavior:contain]">
+            <ChatSessionList />
+          </div>
+          <UpdateCard />
         </div>
         <AppMenu
           onOpenSettings={() => openFeaturePanel("settings")}

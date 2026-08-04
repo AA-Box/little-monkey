@@ -33,6 +33,16 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-window-state = "2"
+# In-app updates (docs/auto-update.md): background check against the signed
+# `latest.json` published by the release workflow, silent download+install on
+# macOS/Linux, and a "Relaunch to update" card. With an empty
+# `plugins.updater.pubkey` every check fails signature verification and the
+# frontend swallows it, so an unconfigured build behaves as if updates didn't
+# exist.
+tauri-plugin-updater = "2.10.1"
+# Only used for `relaunch()` after an update installs — the second half of the
+# "Relaunch to update" click. Separate crate from the updater itself.
+tauri-plugin-process = "2.3.1"
 # hosted_oauth.rs: receives the littlemonkey:// deep link Cloudflare Worker
 # redirects to after a Slack/Google OAuth exchange (see
 # Cargo.toml's own `reqwest`/`rmcp` comments for why the *loopback* OAuth

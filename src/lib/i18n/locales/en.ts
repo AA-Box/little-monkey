@@ -1875,5 +1875,8 @@ export const en: Record<string, string> = {
   "DesktopControlPanel.keyPlaceholder": "e.g. a, enter, tab",
   "DesktopControlPanel.sendActionButton": "Send action",
   "DesktopControlPanel.actionExecuted": "Action executed.",
-  "DesktopControlPanel.actionNotExecuted": "Action did not execute."
+  "DesktopControlPanel.actionNotExecuted": "Action did not execute.",
+  "Update.relaunchToUpdate": "Relaunch to update",
+  "Update.installUpdate": "Install update",
+  "Update.applying": "Updating…"
 };
