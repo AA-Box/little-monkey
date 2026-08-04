@@ -361,20 +361,17 @@ function AssistantMessage({
   const components = buildAssistantMarkdownComponents(sessionId, index, t);
   return (
     <div className="group relative w-full min-w-0">
-      <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted">
-        {t("MessageBubble.assistantName")}
-        {onStartSideTask && (
-          <button
-            type="button"
-            onClick={onStartSideTask}
-            aria-label="Start side task from this message"
-            title="Start side task from this message"
-            className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-          >
-            <Split size={12} />
-          </button>
-        )}
-      </div>
+      {onStartSideTask && (
+        <button
+          type="button"
+          onClick={onStartSideTask}
+          aria-label="Start side task from this message"
+          title="Start side task from this message"
+          className="absolute -top-1 right-0 flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-faint opacity-0 transition-all duration-150 hover:bg-surface-2 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+        >
+          <Split size={12} />
+        </button>
+      )}
       <div className={PROSE_CLASSES}>
         <ReactMarkdown components={components}>{content}</ReactMarkdown>
       </div>

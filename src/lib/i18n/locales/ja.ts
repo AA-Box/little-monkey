@@ -1045,7 +1045,6 @@ export const ja: Record<string, string> = {
   "MessageBubble.saveAndSubmitButton": "保存して送信",
   "MessageBubble.editMessageAriaLabel": "メッセージを編集",
   "MessageBubble.attachedImageAlt": "添付画像",
-  "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "プレビュー",
   "MessageBubble.copyButton": "コードをコピー",
   "MessageBubble.copiedLabel": "コピーしました",

@@ -531,7 +531,6 @@ export const en: Record<string, string> = {
   "MessageBubble.saveAndSubmitButton": "Save & submit",
   "MessageBubble.editMessageAriaLabel": "Edit message",
   "MessageBubble.attachedImageAlt": "Attached",
-  "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Preview",
   "MessageBubble.copyButton": "Copy code",
   "MessageBubble.copiedLabel": "Copied",

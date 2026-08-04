@@ -1045,7 +1045,6 @@ export const hi: Record<string, string> = {
   "MessageBubble.saveAndSubmitButton": "सहेजें और सबमिट करें",
   "MessageBubble.editMessageAriaLabel": "संदेश संपादित करें",
   "MessageBubble.attachedImageAlt": "अटैच किया गया",
-  "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "पूर्वावलोकन",
   "MessageBubble.copyButton": "कोड कॉपी करें",
   "MessageBubble.copiedLabel": "कॉपी हो गया",

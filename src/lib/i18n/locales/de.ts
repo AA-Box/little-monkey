@@ -1046,7 +1046,6 @@ export const de: Record<string, string> = {
   "MessageBubble.saveAndSubmitButton": "Speichern & senden",
   "MessageBubble.editMessageAriaLabel": "Nachricht bearbeiten",
   "MessageBubble.attachedImageAlt": "Angehängt",
-  "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Vorschau",
   "MessageBubble.copyButton": "Code kopieren",
   "MessageBubble.copiedLabel": "Kopiert",
