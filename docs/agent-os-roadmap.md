@@ -772,6 +772,52 @@ Three findings, in the order they turned up:
 validated helper, so the rule that a pgid of `0` means "our own group" and must be
 refused cannot drift between the signals that depend on it.
 
+**Shipped — a limit kill is no longer indistinguishable from someone pressing
+Stop.** `ExitStatus::LimitExceeded` and its SQL `CHECK` existed from K1 and were
+never written by anything. All three daemon budgets tore the child down by
+cancelling the run, so a job killed for holding 700 MiB and a job a user stopped
+produced the same `cancelled` row — "the system worked" and "someone changed
+their mind" were the same fact. The acceptance below names this explicitly.
+
+- **The fact has to survive a database round-trip**, which is what made this more
+  than a one-line mapping. The projection reads the job back with `get_job`
+  *after* the kill is written, so nothing of the kill is in memory when the exit
+  status is chosen. `daemon_jobs` offers only `state`, `CHECK`-constrained to a
+  fixed list, and `last_error`, free text.
+- **So the marker lives in `last_error`, and that is a deliberate second-best.**
+  A typed column is the right home; it is not used because the daemon store has
+  no migration framework at all — `DAEMON_SCHEMA` is one
+  `CREATE TABLE IF NOT EXISTS` with no version key, so neither a new state nor a
+  new column can be added without first building one. That is its own change.
+  The encoding is confined to two private functions so the future move replaces
+  them rather than a convention spread through the file.
+- **Two spellings, because there are two readers.** The run ledger gets prose,
+  since its events are shown to whoever launched the job; `last_error` gets the
+  marked form the projection parses. The marker can never leak into a
+  human-facing reason, and a test asserts it.
+- **Each budget now reports the measurement that tripped it** — "held 8192 bytes
+  against a 4096 byte budget" rather than "memory budget exceeded" — which is the
+  difference between knowing the budget was wrong and knowing the job was.
+- **The limit names are the unified `ProcessLimits` fields**, not the daemon's own
+  column names, because the string is read from `agent_processes`. A destructuring
+  test makes a rename in `ProcessLimits` a compile error here.
+- **Both halves were sabotage-verified independently**: removing the mapping fails
+  both tests with `left: Cancelled / right: LimitExceeded`, and writing the
+  unmarked prose into `last_error` fails only the end-to-end test, on the missing
+  marker. The counter-test — that an ordinary stop is still `Cancelled` — is what
+  stops "everything is a limit kill" from passing.
+
+The run protocol is untouched: `RunStatus` has no `LimitExceeded`, so the run is
+still `Cancelled` there. Adding a terminal status to the event protocol is a
+compatibility change, and the distinguishable exit belongs on the process record
+that K4 is about.
+
+**Still open in K4:** no kernel enforcement (`setrlimit` via `pre_exec`, cgroups,
+job objects) — the watchdog is still cooperative userspace. No wall-clock budget
+for the in-app kinds, no declared caps for `background_shell`, no cap on
+foreground shell output, no browser-worker watchdog, and limits are not derived
+from a process class because no process class exists yet.
+
 **Acceptance:** a limit set attached to every process record — CPU time, RSS,
 open files, disk written, wall clock, and process count — enforced by cgroups
 v2 on Linux, job objects on Windows, and `rlimit` plus a supervising watchdog

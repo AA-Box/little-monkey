@@ -502,6 +502,79 @@ fn process_state_for(state: JobState) -> little_monkey_lib::process_table::Proce
     }
 }
 
+/// Which declared budget a job blew.
+///
+/// The daemon enforces three of the four limits the unified process table
+/// declares. All three tear the child down by cancelling the run, so without
+/// this distinction a budget kill and a user pressing Stop are the same row: one
+/// of them means the system worked and the other means someone changed their
+/// mind, and an operator reading the ledger could not tell which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetLimit {
+    Wall,
+    Memory,
+    Output,
+}
+
+impl BudgetLimit {
+    /// The [`ProcessLimits`] field this maps to.
+    ///
+    /// The unified vocabulary is used rather than the daemon's own column names
+    /// (`max_runtime_ms`, `max_log_bytes`), because this string ends up in
+    /// `ProcessExit::reason`, whose documented contract is to name the limit
+    /// that fired — and the reader of that field is looking at
+    /// `agent_processes`, not at `daemon_jobs`.
+    ///
+    /// [`ProcessLimits`]: little_monkey_lib::process_table::ProcessLimits
+    const fn field(self) -> &'static str {
+        match self {
+            BudgetLimit::Wall => "max_wall_ms",
+            BudgetLimit::Memory => "max_memory_bytes",
+            BudgetLimit::Output => "max_output_bytes",
+        }
+    }
+
+    /// What to call this budget in text meant for whoever launched the job.
+    const fn label(self) -> &'static str {
+        match self {
+            BudgetLimit::Wall => "runtime",
+            BudgetLimit::Memory => "memory",
+            BudgetLimit::Output => "log",
+        }
+    }
+}
+
+/// Marker stamped into `daemon_jobs.last_error` so that a budget kill survives
+/// the round-trip through the daemon database.
+///
+/// It has to survive one: the projection reads the job back with `get_job`
+/// after the kill has already been written, so nothing of the kill is left in
+/// memory by the time an exit status is chosen. The only two columns available
+/// are `state`, which is CHECK-constrained to a fixed list, and `last_error`,
+/// which is free text.
+///
+/// A typed column would be the better home. It is not used because the daemon
+/// store has no migration framework at all — `DAEMON_SCHEMA` is one
+/// `CREATE TABLE IF NOT EXISTS` with no version key, so neither a new state nor
+/// a new column can be added without first building one, which is a change of
+/// its own and not this one. To keep that future move cheap the encoding is
+/// private to this module: [`limit_exceeded_reason`] is the only writer and
+/// [`parse_limit_exceeded`] the only reader, so a real column replaces two
+/// functions rather than a convention spread across the file.
+const LIMIT_EXCEEDED_PREFIX: &str = "limit_exceeded:";
+
+/// Encode a budget kill for storage in `last_error`.
+fn limit_exceeded_reason(limit: BudgetLimit, detail: &str) -> String {
+    format!("{LIMIT_EXCEEDED_PREFIX}{}: {detail}", limit.field())
+}
+
+/// The inverse: `Some` for a budget kill, carrying the reason with the marker
+/// stripped but the limit name kept, which is what `ProcessExit::reason` owes
+/// its reader.
+fn parse_limit_exceeded(last_error: &str) -> Option<&str> {
+    last_error.strip_prefix(LIMIT_EXCEEDED_PREFIX)
+}
+
 /// Terminal `JobState` → the unified exit. A non-terminal state reaching here
 /// means the job vanished from the non-terminal set without a terminal state,
 /// which is exactly what `Lost` is for.
@@ -510,9 +583,14 @@ fn exit_for(
     last_error: Option<&str>,
 ) -> little_monkey_lib::process_table::ProcessExit {
     use little_monkey_lib::process_table::{ExitStatus, ProcessExit};
+    let limit = last_error.and_then(parse_limit_exceeded);
     let status = match state {
         JobState::Succeeded => ExitStatus::Succeeded,
         JobState::Failed => ExitStatus::Failed,
+        // A budget kill cancels the run, because cancelling is how the child is
+        // torn down, so it arrives here as `Cancelled` like any other stop. The
+        // marker is the only thing that separates the two.
+        JobState::Cancelled if limit.is_some() => ExitStatus::LimitExceeded,
         JobState::Cancelled => ExitStatus::Cancelled,
         JobState::NeedsReconciliation => ExitStatus::NeedsReconciliation,
         _ => ExitStatus::Lost,
@@ -521,7 +599,9 @@ fn exit_for(
         status,
         code: None,
         signal: None,
-        reason: last_error.map(str::to_string),
+        // `limit` first so the marker never leaks into a human-facing reason,
+        // whatever state it was found on.
+        reason: limit.or(last_error).map(str::to_string),
     }
 }
 
@@ -1021,31 +1101,61 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 .transition(job_id, JobState::Running, now, Some(process_id), None)?;
         }
 
+        // Each of the three budgets reports the measurement that tripped it, not
+        // only that something did: "held 700 MiB against a 512 MiB budget" tells
+        // whoever reads the exit whether the budget was wrong or the job was.
         if let Some(started) = job.started_at_ms {
-            if now.saturating_sub(started) > job.max_runtime_ms {
-                self.cancel_for_budget(job_id, run_id, now, "daemon runtime budget exceeded")?;
+            let elapsed = now.saturating_sub(started);
+            if elapsed > job.max_runtime_ms {
+                self.cancel_for_budget(
+                    job_id,
+                    run_id,
+                    now,
+                    BudgetLimit::Wall,
+                    &format!(
+                        "ran for {elapsed} ms against a {} ms budget",
+                        job.max_runtime_ms
+                    ),
+                )?;
                 return Ok(());
             }
         }
         if let Some(max_memory) = job.max_memory_bytes {
-            if self
+            let used = self
                 .active
                 .get(job_id)
                 .ok_or_else(|| "active process disappeared".to_string())?
                 .process
-                .memory_bytes()?
-                .is_some_and(|used| used > max_memory)
-            {
-                self.cancel_for_budget(job_id, run_id, now, "daemon memory budget exceeded")?;
+                .memory_bytes()?;
+            if let Some(used) = used.filter(|used| *used > max_memory) {
+                self.cancel_for_budget(
+                    job_id,
+                    run_id,
+                    now,
+                    BudgetLimit::Memory,
+                    &format!(
+                        "the process group held {used} bytes against a {max_memory} byte budget"
+                    ),
+                )?;
                 return Ok(());
             }
         }
         let log_path = self.paths.logs.join(format!("{}.log", job.job_id));
-        if std::fs::metadata(log_path)
-            .map(|metadata| metadata.len() > job.max_log_bytes)
-            .unwrap_or(false)
+        if let Some(written) = std::fs::metadata(log_path)
+            .ok()
+            .map(|metadata| metadata.len())
+            .filter(|written| *written > job.max_log_bytes)
         {
-            self.cancel_for_budget(job_id, run_id, now, "daemon log budget exceeded")?;
+            self.cancel_for_budget(
+                job_id,
+                run_id,
+                now,
+                BudgetLimit::Output,
+                &format!(
+                    "the log reached {written} bytes against a {} byte budget",
+                    job.max_log_bytes
+                ),
+            )?;
             return Ok(());
         }
 
@@ -1098,19 +1208,33 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         Ok(())
     }
 
+    /// Tear a job down for blowing one of its budgets.
+    ///
+    /// Two spellings of the same fact, because they have different readers. The
+    /// run ledger gets prose, since its events are shown to whoever launched the
+    /// job. `daemon_jobs.last_error` gets the marked form, because the
+    /// projection reads that column back and has to recover *which* limit fired
+    /// — see [`limit_exceeded_reason`].
     fn cancel_for_budget(
         &mut self,
         job_id: &str,
         run_id: &str,
         now: u64,
-        reason: &str,
+        limit: BudgetLimit,
+        detail: &str,
     ) -> Result<(), String> {
-        self.ensure_cancelling(run_id, reason)?;
+        let announced = format!("daemon {} budget exceeded: {detail}", limit.label());
+        self.ensure_cancelling(run_id, &announced)?;
         if let Some(active) = self.active.get_mut(job_id) {
             active.process.signal(ProcessSignal::Terminate)?;
         }
-        self.cancel_run(run_id, reason)?;
-        self.finish_active(job_id, JobState::Cancelled, now, Some(reason))
+        self.cancel_run(run_id, &announced)?;
+        self.finish_active(
+            job_id,
+            JobState::Cancelled,
+            now,
+            Some(&limit_exceeded_reason(limit, detail)),
+        )
     }
 
     fn finish_active(
@@ -1506,6 +1630,9 @@ pub(super) mod tests {
         id: u32,
         exits: Arc<Mutex<VecDeque<Option<i32>>>>,
         signals: Arc<Mutex<Vec<ProcessSignal>>>,
+        /// What this process claims to be using. Shared with the adapter so a
+        /// test can move it after the process is spawned.
+        memory: Arc<Mutex<Option<u64>>>,
     }
     impl ManagedProcess for FakeProcess {
         fn id(&self) -> u32 {
@@ -1519,7 +1646,7 @@ pub(super) mod tests {
             Ok(())
         }
         fn memory_bytes(&self) -> Result<Option<u64>, String> {
-            Ok(Some(1024))
+            Ok(*self.memory.lock().unwrap())
         }
     }
 
@@ -1528,6 +1655,7 @@ pub(super) mod tests {
         spawns: Arc<Mutex<u32>>,
         exits: Arc<Mutex<VecDeque<Option<i32>>>>,
         signals: Arc<Mutex<Vec<ProcessSignal>>>,
+        memory: Arc<Mutex<Option<u64>>>,
     }
     impl ProcessAdapter for FakeProcesses {
         fn spawn(
@@ -1540,6 +1668,7 @@ pub(super) mod tests {
                 id: 42,
                 exits: self.exits.clone(),
                 signals: self.signals.clone(),
+                memory: self.memory.clone(),
             }))
         }
         fn terminate_orphan(&self, _process_id: u32) -> Result<(), String> {
@@ -1618,6 +1747,21 @@ pub(super) mod tests {
         Arc<DurableRunRecorder>,
         String,
     ) {
+        fixture_with_memory_budget(label, None)
+    }
+
+    /// `fixture`, but with a declared memory ceiling — the one budget a test can
+    /// trip on demand, since the fake process reports whatever it is told to.
+    fn fixture_with_memory_budget(
+        label: &str,
+        max_memory_bytes: Option<u64>,
+    ) -> (
+        DaemonPaths,
+        DaemonStore,
+        SharedLedger,
+        Arc<DurableRunRecorder>,
+        String,
+    ) {
         let root = std::env::temp_dir().join(format!(
             "little-monkey-daemon-engine-{label}-{}",
             uuid::Uuid::new_v4()
@@ -1642,7 +1786,7 @@ pub(super) mod tests {
                     max_attempts: 1,
                     created_at_ms: 1_000,
                     max_runtime_ms: 60_000,
-                    max_memory_bytes: None,
+                    max_memory_bytes,
                     max_log_bytes: DEFAULT_MAX_LOG_BYTES,
                     repository_policy_json: None,
                     worktree_json: None,
@@ -1669,6 +1813,7 @@ pub(super) mod tests {
             spawns: Arc::new(Mutex::new(0)),
             exits: Arc::new(Mutex::new(VecDeque::from([None, None]))),
             signals: Arc::new(Mutex::new(Vec::new())),
+            memory: Arc::new(Mutex::new(Some(1024))),
         }
     }
 
@@ -2164,6 +2309,159 @@ pub(super) mod tests {
         );
         // A non-terminal state reaching the exit mapper means the job vanished.
         assert_eq!(exit_for(JobState::Running, None).status, ExitStatus::Lost);
+    }
+
+    /// The marker is the whole mechanism: it is what a budget kill leaves behind
+    /// in a column that survives the daemon, and what tells the projection that a
+    /// `Cancelled` job was not a person changing their mind.
+    #[test]
+    fn a_budget_kill_round_trips_through_last_error_and_a_plain_cancel_does_not() {
+        use little_monkey_lib::process_table::{ExitStatus, ProcessLimits};
+
+        // Compile-time proof that `field()` names fields that exist: rename one
+        // in `ProcessLimits` and this destructuring stops building.
+        let ProcessLimits {
+            max_wall_ms,
+            max_memory_bytes,
+            max_output_bytes,
+            max_child_processes: _,
+        } = ProcessLimits::default();
+        assert_eq!(max_wall_ms, None);
+        assert_eq!(max_memory_bytes, None);
+        assert_eq!(max_output_bytes, None);
+        assert_eq!(BudgetLimit::Wall.field(), stringify!(max_wall_ms));
+        assert_eq!(BudgetLimit::Memory.field(), stringify!(max_memory_bytes));
+        assert_eq!(BudgetLimit::Output.field(), stringify!(max_output_bytes));
+
+        for limit in [BudgetLimit::Wall, BudgetLimit::Memory, BudgetLimit::Output] {
+            let stored = limit_exceeded_reason(limit, "held 9 bytes against 4");
+            let exit = exit_for(JobState::Cancelled, Some(&stored));
+            assert_eq!(
+                exit.status,
+                ExitStatus::LimitExceeded,
+                "{limit:?} must not be projected as an ordinary cancel"
+            );
+            let reason = exit.reason.expect("a limit kill must name its limit");
+            assert!(
+                reason.starts_with(limit.field()),
+                "the reason must name the limit that fired, got {reason:?}"
+            );
+            assert!(
+                reason.ends_with("held 9 bytes against 4"),
+                "the measurement must survive, got {reason:?}"
+            );
+            assert!(
+                !reason.contains(LIMIT_EXCEEDED_PREFIX),
+                "the storage marker must not leak into a human-facing reason"
+            );
+        }
+
+        // The other half: an ordinary stop is still an ordinary stop. Without
+        // this, "everything is a limit kill" would pass the assertions above.
+        let stopped = exit_for(JobState::Cancelled, Some("stopped by the user"));
+        assert_eq!(stopped.status, ExitStatus::Cancelled);
+        assert_eq!(stopped.reason.as_deref(), Some("stopped by the user"));
+    }
+
+    /// End to end, through the two databases: a job that blows its memory budget
+    /// is killed, and the process row says the system worked rather than that
+    /// someone pressed Stop.
+    #[test]
+    fn a_memory_budget_kill_is_projected_as_limit_exceeded_not_as_a_cancel() {
+        use little_monkey_lib::process_table::{ExitStatus, ProcessKind, ProcessState};
+
+        let (paths, store, shared, _recorder, run_id) =
+            fixture_with_memory_budget("membudget", Some(4_096));
+        let adapter = fake_adapter();
+        let clock = FakeClock(Arc::new(Mutex::new(2_000)));
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter.clone(),
+            FakeNotifier::default(),
+            clock.clone(),
+            "daemon-test-owner".into(),
+        );
+
+        // First tick spawns and projects while the job is inside its budget.
+        engine.tick().unwrap();
+        let process_id = {
+            let table = engine.shared.process_table();
+            table
+                .find_by_external_id(ProcessKind::DaemonJob, &first_attempt_id("membudget"))
+                .unwrap()
+                .expect("the job is projected")
+                .process_id
+        };
+        assert_eq!(
+            engine
+                .shared
+                .process_table()
+                .get(&process_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ProcessState::Running,
+            "a job inside its budget must not be killed"
+        );
+
+        // Now the group grows past the ceiling.
+        *adapter.memory.lock().unwrap() = Some(8_192);
+        *clock.0.lock().unwrap() = 2_001;
+        engine.tick().unwrap();
+
+        assert!(
+            adapter
+                .signals
+                .lock()
+                .unwrap()
+                .contains(&ProcessSignal::Terminate),
+            "blowing the budget must actually tear the child down"
+        );
+
+        // The daemon's own row carries the marked reason...
+        let job = engine
+            .store
+            .get_job(&format!("job-{}", "membudget"))
+            .unwrap()
+            .expect("the job row survives its kill");
+        assert_eq!(job.state, JobState::Cancelled);
+        let last_error = job.last_error.expect("a budget kill records why");
+        assert_eq!(
+            parse_limit_exceeded(&last_error),
+            Some("max_memory_bytes: the process group held 8192 bytes against a 4096 byte budget"),
+            "got {last_error:?}"
+        );
+
+        // ...and the unified table shows the distinguishable exit.
+        let finished = {
+            let table = engine.shared.process_table();
+            table.get(&process_id).unwrap().unwrap()
+        };
+        assert_eq!(finished.state, ProcessState::Exited);
+        let exit = finished.exit.expect("an exited row carries its exit");
+        assert_eq!(
+            exit.status,
+            ExitStatus::LimitExceeded,
+            "a budget kill recorded as `Cancelled` is indistinguishable from a user pressing Stop"
+        );
+        let reason = exit.reason.expect("a limit kill must name its limit");
+        assert!(
+            reason.starts_with("max_memory_bytes:")
+                && reason.contains("8192")
+                && reason.contains("4096"),
+            "the exit must name the limit and both measurements, got {reason:?}"
+        );
+
+        // The run ledger has no `limit_exceeded` status, so the run is cancelled
+        // there. That is honest rather than a silent protocol change, and the
+        // prose event is what the person who launched the job reads.
+        assert_eq!(
+            engine.shared.load_run(&run_id).unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
     }
 
     #[test]
