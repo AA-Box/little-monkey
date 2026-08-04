@@ -2120,7 +2120,10 @@ impl Default for LanServerPolicy {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1".to_string(),
-            port: 1_234,
+            // Same shared constant the legacy listener uses — see
+            // `server::DEFAULT_PORT`. Both listeners defaulting to one port is why
+            // `http_policy::describe_bind_error` can name the other one.
+            port: crate::http_policy::DEFAULT_HTTP_PORT,
             require_authentication: true,
             pairing_required: true,
             tls: TlsPolicy::Disabled,

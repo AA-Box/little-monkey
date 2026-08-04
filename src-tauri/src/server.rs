@@ -125,7 +125,13 @@ use crate::{ollama, providers, AppState};
 
 /// LM Studio-compatible default port, so drop-in clients that hardcode 1234
 /// need no configuration at all.
-const DEFAULT_PORT: u16 = 1234;
+///
+/// Drawn from `http_policy` rather than repeating the literal: that module's
+/// bind-error message branches on `port == DEFAULT_HTTP_PORT` to name the *other*
+/// listener as the likely conflict, so a listener with its own copy of the number
+/// could be moved off 1234 and silently make that diagnosis wrong. The shared
+/// constant is what makes the collision a stated fact instead of a coincidence.
+const DEFAULT_PORT: u16 = crate::http_policy::DEFAULT_HTTP_PORT;
 
 /// Prefix on every generated bearer token, so a leaked token is
 /// self-describing (`lmk-<32 hex chars>`) the same way e.g. GitHub's
@@ -157,6 +163,80 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// [`handle_request`] can return one concrete type regardless of which route
 /// it took.
 type ResponseBody = BoxBody<Bytes, BoxError>;
+
+/// Keeps an [`AdmissionGuard`] alive until the response body it belongs to is
+/// finished or the client stops reading it.
+///
+/// The bug this fixes: the accept loop dropped its guard as soon as
+/// `serve_one_request` *returned a `Response`*, which for the dominant traffic
+/// shape is far too early. A streaming `/v1/chat/completions` returns as soon as
+/// upstream headers arrive and hands back a [`StreamBody`] wrapping reqwest's
+/// `bytes_stream` — not one byte of which has been read yet. So the permit was
+/// released before the request did any of its work, and concurrent SSE streams
+/// were not bounded by [`http_policy::MAX_ACTIVE_REQUESTS`] at all: the counter
+/// measured time-to-first-header, not time in flight.
+///
+/// Wrapping the body rather than threading the guard into each handler is
+/// deliberate. The guard belongs to the accept loop, the body is built deep
+/// inside a route, and every route already funnels through one `Response` — so
+/// this attaches at the one place both facts are available, and no handler
+/// signature has to learn that admission control exists. `m3_http_server.rs`
+/// reaches the same end by moving its guard into `sse_body`'s unfold state; it
+/// can, because it constructs its own stream and has exactly one streaming shape.
+///
+/// [`http_body_util::BodyStream`] rather than `into_data_stream` so trailers
+/// survive: nothing legacy sends them today, and a wrapper that silently ate
+/// them would be a trap for whatever does first.
+fn hold_permit_until_body_ends(
+    body: ResponseBody,
+    guard: crate::http_policy::AdmissionGuard,
+) -> ResponseBody {
+    // The guard lives in the unfold state, so it drops when the stream finishes
+    // *or* when hyper drops the body because the client went away — which is the
+    // release this needs, and the reason there is no explicit drop below.
+    let stream = futures_util::stream::unfold(
+        (http_body_util::BodyStream::new(body), guard),
+        |(mut frames, guard)| async move {
+            frames.next().await.map(|frame| (frame, (frames, guard)))
+        },
+    );
+    BodyExt::boxed(StreamBody::new(stream))
+}
+
+/// The one implementation of "this listener admits a request".
+///
+/// Both accept loops call it, which is the point: the legacy listener had two
+/// serving paths and only one of them was admitted. `run_cli_server`
+/// (`monkey-cli api-serve`) spawned an unbounded task per connection with no
+/// permit, no counters and no cancellation, serving the *identical* route set
+/// through the same `serve_one_request` — so every legacy route stayed reachable
+/// with admission control fully bypassed, while the doc comment above
+/// [`run_accept_loop`]'s admission claimed a route could no longer do that.
+///
+/// `serve` returns the response *and* performs the per-request bookkeeping each
+/// loop does differently (token-used records, request logging), so the two loops
+/// share the rule without sharing their `ServerDeps` construction.
+async fn serve_with_admission<Fut>(
+    admission: &crate::http_policy::RequestAdmission,
+    server_shutdown: &tokio_util::sync::CancellationToken,
+    serve: impl FnOnce() -> Fut,
+) -> Response<ResponseBody>
+where
+    Fut: std::future::Future<Output = Response<ResponseBody>>,
+{
+    let Some(guard) = admission.try_admit(server_shutdown) else {
+        // Refused rather than queued without bound. The legacy OpenAI error
+        // envelope is preserved so existing SDK clients still parse it.
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The API server active-request quota is exhausted",
+            "server_busy",
+        );
+    };
+    serve()
+        .await
+        .map(|body| hold_permit_until_body_ends(body, guard))
+}
 
 /// In-memory lifecycle state for the managed API server process — mirrors
 /// `llama::LlamaState` field-for-field. No token material lives here as of
@@ -2160,11 +2240,15 @@ async fn run_accept_loop(
     shutdown: Arc<Notify>,
     runtime: Arc<ServerRuntime>,
 ) {
-    // Bounded admission, shared with the compatibility listener. Before this,
-    // every connection here spawned an unbounded task with no permit, no
-    // in-flight accounting, and no cancellation reaching the upstream request —
-    // so a route on this listener bypassed admission control entirely, which is
-    // the D1 finding and the reason K4/K5 were blocked on it.
+    // Bounded admission, shared with the compatibility listener and with
+    // `run_cli_server` — see [`serve_with_admission`], which is the whole rule.
+    // Before this, every connection here spawned an unbounded task with no permit
+    // and no in-flight accounting.
+    //
+    // The permit is now held until the response *body* ends rather than until the
+    // handler returns, so the bound covers streaming requests. Cancellation is a
+    // separate matter and is still not wired: the guard carries a token, and no
+    // legacy handler reads it — see [`serve_with_admission`].
     let admission = Arc::new(crate::http_policy::RequestAdmission::new(
         crate::http_policy::MAX_ACTIVE_REQUESTS,
     ));
@@ -2193,27 +2277,28 @@ async fn run_accept_loop(
                         let admission_for_req = admission_for_conn.clone();
                         let shutdown_for_req = shutdown_for_conn.clone();
                         async move {
-                            let Some(guard) = admission_for_req.try_admit(&shutdown_for_req) else {
-                                // Refused rather than queued without bound. Same
-                                // posture as the compatibility listener, and the
-                                // legacy OpenAI error envelope is preserved so
-                                // existing SDK clients still parse it.
-                                return Ok::<_, Infallible>(error_response(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "The API server active-request quota is exhausted",
-                                    "server_busy",
-                                ));
-                            };
-                            let (resp, matched_token_id) =
-                                serve_one_request(deps, req, Some(&app_for_req)).await?;
-                            if let Some(token_id) = matched_token_id {
-                                record_token_used(&app_for_req, &token_id);
-                            }
-                            bump_request_count(&app_for_req);
-                            // Dropped here: releases the permit, decrements the
-                            // in-flight count, and cancels this request's token.
-                            drop(guard);
-                            Ok::<_, Infallible>(resp)
+                            let response = serve_with_admission(
+                                &admission_for_req,
+                                &shutdown_for_req,
+                                || async move {
+                                    let (resp, matched_token_id) =
+                                        match serve_one_request(deps, req, Some(&app_for_req)).await
+                                        {
+                                            Ok(pair) => pair,
+                                            // `serve_one_request`'s error type is
+                                            // `Infallible`, so this arm is
+                                            // unreachable rather than swallowed.
+                                            Err(never) => match never {},
+                                        };
+                                    if let Some(token_id) = matched_token_id {
+                                        record_token_used(&app_for_req, &token_id);
+                                    }
+                                    bump_request_count(&app_for_req);
+                                    resp
+                                },
+                            )
+                            .await;
+                            Ok::<_, Infallible>(response)
                         }
                     });
                     let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -2295,6 +2380,22 @@ pub async fn run_cli_server(
     // temp+rename write in `save_config_impl` bounds it to "last writer
     // wins", never a torn file.
     let cli_state = Arc::new(AppState::default());
+    // The same bound the GUI loop has, for the same routes. This loop serves the
+    // identical route set through the same `serve_one_request`, so without this
+    // every legacy route was reachable with admission control bypassed simply by
+    // running `monkey-cli api-serve` — which is what made the GUI loop's "a route
+    // on this listener can no longer bypass admission control" untrue.
+    //
+    // Constructed once, out here: a `RequestAdmission` created inside the
+    // connection task would bound each connection separately, which looks correct
+    // and bounds nothing.
+    let admission = Arc::new(crate::http_policy::RequestAdmission::new(
+        crate::http_policy::MAX_ACTIVE_REQUESTS,
+    ));
+    // This loop owns its process, so its shutdown token is only ever cancelled by
+    // the process ending. It exists because a guard's token is derived from one;
+    // it is not a claim that `api-serve` has a graceful stop.
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -2307,6 +2408,8 @@ pub async fn run_cli_server(
         let request_count = request_count.clone();
         let load_custom_providers = load_custom_providers.clone();
         let cli_state = cli_state.clone();
+        let admission_for_conn = admission.clone();
+        let shutdown_for_conn = server_shutdown.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
@@ -2315,7 +2418,13 @@ pub async fn run_cli_server(
                 let request_count = request_count.clone();
                 let load_custom_providers = load_custom_providers.clone();
                 let cli_state = cli_state.clone();
+                let admission_for_req = admission_for_conn.clone();
+                let shutdown_for_req = shutdown_for_conn.clone();
                 async move {
+                    let response = serve_with_admission(
+                        &admission_for_req,
+                        &shutdown_for_req,
+                        || async move {
                     let config = load_config_impl(&config_path).unwrap_or_default();
                     let (llama_ready, llama_model_stem) =
                         probe_llama_server(&client, llama_port).await;
@@ -2339,17 +2448,27 @@ pub async fn run_cli_server(
                         client,
                     };
 
-                    let (resp, matched_token_id) = serve_one_request(deps, req, None).await?;
-                    let n = request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if let Some(token_id) = &matched_token_id {
-                        record_token_used_with_state(&cli_state, &config_path, token_id);
-                    }
-                    eprintln!(
-                        "[api-serve] request #{n} {} -> {}",
-                        req_log_hint(matched_token_id.as_deref()),
-                        resp.status()
-                    );
-                    Ok::<_, Infallible>(resp)
+                            let (resp, matched_token_id) =
+                                match serve_one_request(deps, req, None).await {
+                                    Ok(pair) => pair,
+                                    // `Infallible`: unreachable, not swallowed.
+                                    Err(never) => match never {},
+                                };
+                            let n =
+                                request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if let Some(token_id) = &matched_token_id {
+                                record_token_used_with_state(&cli_state, &config_path, token_id);
+                            }
+                            eprintln!(
+                                "[api-serve] request #{n} {} -> {}",
+                                req_log_hint(matched_token_id.as_deref()),
+                                resp.status()
+                            );
+                            resp
+                        },
+                    )
+                    .await;
+                    Ok::<_, Infallible>(response)
                 }
             });
             let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -4642,6 +4761,201 @@ mod tests {
             assert!(
                 rebound.is_ok(),
                 "rebinding after joining the accept loop's task must succeed, not race the old listener's teardown: {rebound:?}"
+            );
+        }
+    }
+    /// The admission rule, tested where it actually lives.
+    ///
+    /// `serve_with_admission` exists as its own function precisely so this is
+    /// reachable without 65 sockets and without standing up either accept loop:
+    /// the loops differ only in how they build `ServerDeps`, and they must not
+    /// differ in whether a request is admitted. That difference is what the bug
+    /// was — `run_cli_server` served the identical route set with no permit at
+    /// all — so the rule being one function is part of the fix, not a test
+    /// convenience.
+    mod admission {
+        use super::*;
+        use crate::http_policy::RequestAdmission;
+        use tokio_util::sync::CancellationToken;
+
+        /// A body that yields its frames only when the test releases them, so a
+        /// response can be "returned but still streaming" — the exact state the
+        /// old `drop(guard)` mishandled.
+        fn gated_body(release: tokio::sync::oneshot::Receiver<()>) -> ResponseBody {
+            let stream = futures_util::stream::unfold(Some(release), |release| async move {
+                let release = release?;
+                let _ = release.await;
+                Some((
+                    Ok::<Frame<Bytes>, BoxError>(Frame::data(Bytes::from_static(b"data: [DONE]\n\n"))),
+                    None,
+                ))
+            });
+            BodyExt::boxed(StreamBody::new(stream))
+        }
+
+        #[tokio::test]
+        async fn a_refusal_uses_the_legacy_error_envelope_verbatim() {
+            // Byte-asserted rather than status-asserted: an SDK client parses
+            // this shape, and the refusal is the one response on this listener
+            // that no test covered.
+            let admission = RequestAdmission::new(1);
+            let shutdown = CancellationToken::new();
+            let held = admission.try_admit(&shutdown).expect("first request admits");
+
+            let refused = serve_with_admission(&admission, &shutdown, || async {
+                panic!("the handler must not run once the quota is exhausted")
+            })
+            .await;
+
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(refused).await).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "error": {
+                        "message": "The API server active-request quota is exhausted",
+                        "type": "invalid_request_error",
+                        "code": "server_busy",
+                    }
+                })
+            );
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn the_permit_is_held_until_a_streaming_body_ends_not_until_the_handler_returns() {
+            // The defect this closes. A streaming `/v1/chat/completions` returns
+            // as soon as upstream headers arrive, so releasing the permit there
+            // measured time-to-first-header and bounded nothing: any number of
+            // concurrent SSE streams could be in flight against a pool of one.
+            let admission = Arc::new(RequestAdmission::new(1));
+            let shutdown = CancellationToken::new();
+            let (release, wait_for_release) = tokio::sync::oneshot::channel();
+
+            let streaming = serve_with_admission(&admission, &shutdown, || async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(streaming.status(), StatusCode::OK);
+            assert_eq!(
+                admission.active_requests(),
+                1,
+                "the handler returned, but its body has not produced a byte — the request is still in flight"
+            );
+
+            let refused = serve_with_admission(&admission, &shutdown, || async {
+                panic!("a second request must not be admitted while the first is still streaming")
+            })
+            .await;
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            release.send(()).unwrap();
+            let bytes = body_bytes(streaming).await;
+            assert_eq!(&bytes[..], b"data: [DONE]\n\n");
+            assert_eq!(
+                admission.active_requests(),
+                0,
+                "the permit must be released when the body ends"
+            );
+
+            let admitted_again = serve_with_admission(&admission, &shutdown, || async {
+                Response::builder().status(StatusCode::OK).body(full_body("ok")).unwrap()
+            })
+            .await;
+            assert_eq!(admitted_again.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_client_that_goes_away_mid_stream_releases_its_permit() {
+            // Otherwise the pool leaks one permit per abandoned stream and the
+            // listener wedges at the quota with nothing running — strictly worse
+            // than the unbounded behaviour it replaced.
+            let admission = Arc::new(RequestAdmission::new(1));
+            let shutdown = CancellationToken::new();
+            let (_release, wait_for_release) = tokio::sync::oneshot::channel();
+
+            let streaming = serve_with_admission(&admission, &shutdown, || async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(admission.active_requests(), 1);
+
+            // What hyper does when the connection dies: it drops the body without
+            // ever polling it to completion.
+            drop(streaming);
+
+            assert_eq!(
+                admission.active_requests(),
+                0,
+                "dropping the response body must release the permit"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_buffered_response_survives_the_wrapper_byte_for_byte() {
+            // Every non-streaming route is now wrapped too, so the wrapper must
+            // be transparent — including for a body that is already complete.
+            let admission = RequestAdmission::new(4);
+            let shutdown = CancellationToken::new();
+
+            let response = serve_with_admission(&admission, &shutdown, || async {
+                json_response(StatusCode::OK, json!({"object": "list", "data": []}))
+            })
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            assert_eq!(
+                &body_bytes(response).await[..],
+                br#"{"data":[],"object":"list"}"#
+            );
+        }
+
+        /// Structural: both accept loops must reach `serve_one_request` through
+        /// the admission helper.
+        ///
+        /// A behavioural test cannot cover this — it would have to bind a socket
+        /// per loop and saturate a pool — and the defect was exactly a *second*
+        /// serving path that looked fine in isolation. Asserting on the source is
+        /// the cheap guard that a third path cannot be added silently.
+        #[test]
+        fn no_serving_path_reaches_a_route_without_admission() {
+            let source = include_str!("server.rs");
+            let production = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map(|(before, _)| before)
+                .expect("server.rs has a #[cfg(test)] module");
+
+            assert_eq!(
+                production.matches("serve_one_request(").count(),
+                3,
+                "production `serve_one_request` sites changed: one definition plus one \
+                 call per accept loop. A new call site must go through \
+                 `serve_with_admission`, or that loop bypasses the quota exactly as \
+                 `run_cli_server` used to."
+            );
+            assert!(production.contains("async fn serve_with_admission<Fut>("));
+            assert_eq!(
+                // The definition is generic, so its name is followed by `<Fut>`
+                // and is not counted here — this is calls only, one per loop.
+                production.matches("serve_with_admission(").count(),
+                2,
+                "one call per accept loop"
+            );
+            assert!(
+                !production.contains("drop(guard)"),
+                "the guard must be owned by the response body, not dropped when the \
+                 handler returns — see `hold_permit_until_body_ends`"
             );
         }
     }
