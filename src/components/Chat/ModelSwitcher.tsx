@@ -36,8 +36,13 @@ function retirementTooltip(
  * installed local (llama.cpp) model and a pulled Ollama tag. Rendered in
  * ChatWindow's bottom input row, mirroring ModeSelector's floating-panel
  * idiom (absolute dropdown, outside-pointerdown-to-close).
+ *
+ * `placement` defaults to "up" for that bottom-row use; panels that render it
+ * near the TOP of a scroll container (e.g. `PmCopilotPanel`, whose generation
+ * runs against this same active target) pass "down" so the dropdown isn't
+ * clipped by the container's overflow.
  */
-export function ModelSwitcher() {
+export function ModelSwitcher({ placement = "up" }: { placement?: "up" | "down" } = {}) {
   const installed = useModelStore((s) => s.installed);
   const ollamaModels = useModelStore((s) => s.ollamaModels);
   const active = useModelStore((s) => s.active);
@@ -131,7 +136,11 @@ export function ModelSwitcher() {
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 z-20 mb-1 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg">
+        <div
+          className={`absolute right-0 z-20 max-h-[70vh] w-64 overflow-y-auto rounded-lg border border-border bg-background py-1 shadow-lg ${
+            placement === "down" ? "top-full mt-1" : "bottom-full mb-1"
+          }`}
+        >
           {installedChatModels.length > 0 && (
             <>
               <p className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("ModelSwitcher.localSectionLabel")}</p>

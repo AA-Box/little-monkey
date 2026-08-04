@@ -27,6 +27,16 @@ describe("built-in slash commands", () => {
     });
   });
 
+  // The hyphen matters: the parser's name pattern has to accept it, or
+  // `/pm-plan …` silently falls through to the model as ordinary chat text.
+  it("parses /pm-plan with the product goal as arguments", () => {
+    expect(parseBuiltInSlashCommand("/pm-plan let users export their data as CSV")).toMatchObject({
+      definition: { command: "pm-plan" },
+      arguments: "let users export their data as CSV",
+    });
+    expect(parseBuiltInSlashCommand("/pm-plan")).toMatchObject({ definition: { command: "pm-plan" }, arguments: "" });
+  });
+
   it("round-trips visible host command notices", () => {
     const content = formatCommandNotice({ command: "status", text: "Ready", ok: true });
     expect(parseCommandNotice({ role: "system", content })).toEqual({ command: "status", text: "Ready", ok: true });
