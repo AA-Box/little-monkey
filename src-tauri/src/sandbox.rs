@@ -833,6 +833,11 @@ pub async fn execute_in_sandbox(
     // no remaining supervisor.
     #[cfg(unix)]
     command.process_group(0);
+    // Kernel-held bounds, which matter most here: on the platforms with no
+    // Seatbelt this is `Isolation::ProcessOnly`, so `os_limits` is the only
+    // enforcement the OS applies to the child at all. Inherited across the
+    // `sandbox-exec` exec, so it reaches the sandboxed program itself.
+    crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
 
     let child = command.spawn()?;
     // Captured before `wait_with_output` consumes the child; with

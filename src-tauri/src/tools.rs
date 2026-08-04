@@ -900,6 +900,20 @@ pub async fn tool_run_shell(
     // `std::os::unix::process::CommandExt` import needed.)
     #[cfg(unix)]
     command_builder.process_group(0);
+    // Kernel-held bounds, in contrast to everything else here: the timeout above
+    // and the group termination below both need this app alive to enforce them.
+    // Not under `cfg(unix)` — `apply` is a documented no-op on Windows, whose
+    // equivalent is a job object and is not built.
+    //
+    // Only the baseline. A file-size or descriptor ceiling would be a guess about
+    // what an agent shell is for — this is the site that legitimately downloads a
+    // 40 GB model — and `os_limits` explains why the tempting resources
+    // (`RLIMIT_CPU`, `NPROC`, `RSS`, `AS`) are the wrong tool. Real per-kind
+    // values need the process class K4 still lacks.
+    crate::os_limits::apply(
+        crate::os_limits::ChildLimits::baseline(),
+        &mut command_builder,
+    );
 
     let child = command_builder
         .spawn()

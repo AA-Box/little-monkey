@@ -216,6 +216,22 @@ a scope boundary stated where it matters.
   ignored it. Before this, a 120-second shell timeout reaped the shell and left
   the compiler it started running, still consuming the machine after the tool
   reported that it had timed out.
+- Tool children carry a bound the kernel holds them to, not only one this app
+  supervises. Shell tools, verify commands and sandboxed runs get their resource
+  limits installed between `fork` and `exec`, so the program never runs unbounded
+  and everything it spawns inherits them — which reaches the grandchildren a
+  watchdog cannot see. Real limits, and they are the honest majority of this: what
+  is enabled today is refusing core dumps, because that is the only ceiling with a
+  real hazard behind it (a crashing build dropping gigabytes into your workspace)
+  and no value that breaks working code. File-size and descriptor ceilings are
+  implemented and tested but left unset, since picking a number is a judgement
+  about what the child is for — the agent shell is the same site that legitimately
+  downloads a 40 GB model. CPU time is deliberately not capped: it accumulates per
+  core, so a cap matching the 120-second wall timeout would kill `cargo build -j8`
+  after about 15 seconds. Memory is not capped here either — the relevant limit is
+  a no-op on macOS — so resident memory stays with the daemon's watchdog. On
+  Windows this does nothing at all; the equivalent is a job object and it is not
+  built yet.
 - Stop or suspend anything from anywhere, including a terminal. `monkey
   processes signal <id> stop|suspend|resume|kill` (and `monkey processes
   signals` for the support matrix) records the request as durable intent on the
