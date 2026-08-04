@@ -37,6 +37,11 @@
  * (`agent_processes_pending_signal_idx`) over the deliverable kinds, and the
  * listener does no IPC at all for the overwhelmingly common case of a record
  * with no intent set.
+ *
+ * The sweep is also where wall budgets are enforced (`processWallBudget.ts`),
+ * because a budget kill *is* a latched stop — raising one on the timer that
+ * already delivers them means no second timer, no second delivery path, and a
+ * kill that reaches a turn running in another window for free.
  */
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
@@ -44,6 +49,7 @@ import { cancelRegisteredRun } from "./runCancellationRegistry";
 import { cancelSubagentRun } from "./subagent";
 import { cancelSideTask, pauseSideTask, resumeSideTask } from "./sideTaskRunner";
 import { isPauseRequested, setPauseRequested } from "./pauseRegistry";
+import { enforceWallBudgets } from "./processWallBudget";
 import { type ProcessKind, type ProcessRecord, pendingProcessSignals } from "./processTable";
 
 /**
@@ -316,6 +322,13 @@ function deliverPause(
 export async function sweepPendingProcessSignals(
   options: DeliveryOptions,
 ): Promise<ProcessSignalDelivery[]> {
+  // Wall budgets are enforced by *raising* a stop, so they belong before the
+  // read that delivers one: a row that trips now is latched, comes back in this
+  // same read, and is delivered in this same tick rather than waiting two
+  // seconds for the next one. It returns its own verdicts rather than folding
+  // them into the delivery outcomes below — a budget decision is not a delivery
+  // — and swallows its own failures, so this await cannot cost the sweep.
+  await enforceWallBudgets(options);
   const pending = await pendingProcessSignals([...DESKTOP_DELIVERABLE_KINDS]);
   const outcomes: ProcessSignalDelivery[] = [];
   for (const record of pending) {

@@ -31,6 +31,20 @@ const MAX_SELECTOR_BYTES: usize = 8 * 1024;
 const MAX_TYPE_BYTES: usize = 256 * 1024;
 const MAX_ALLOWED_ORIGINS: usize = 32;
 
+/// How often the watchdog re-examines live sessions.
+///
+/// A cadence, not a budget — the distinction is why this has a value while
+/// `max_session_ms` keeps its own user-facing default. *How long* a session may
+/// live is policy; *how promptly* an expired one is noticed is an implementation
+/// detail, and leaving it unset would mean the sweep never runs at all, which is
+/// not a bound.
+///
+/// Thirty seconds against a ten-minute default budget bounds reclaim latency at
+/// five percent of the budget, and the sweep is cheap by construction: it reads
+/// two integers and calls `try_wait` per session, and deliberately never walks a
+/// profile directory (see [`sweep_verdict`]).
+pub const BROWSER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserLimits {
@@ -106,6 +120,36 @@ impl Default for BrowserViewport {
     }
 }
 
+/// What ended a session, so a reclaim is distinguishable from a caller pressing
+/// stop. `cancelled` alone could not answer that: every teardown path set the
+/// same bool, so a Chromium the watchdog took back and one the user closed were
+/// indistinguishable afterwards.
+///
+/// Named after the bound that fired rather than after the code that noticed it,
+/// which is how [`crate::process_table::ProcessExit::reason`] already reports
+/// this ("for `LimitExceeded` this must name the limit that fired"). That is why
+/// [`Self::SessionClock`] is shared by the action path and the sweep: it is one
+/// bound with two enforcement points, and splitting it would imply the session
+/// died of different causes depending on who happened to look. The watchdog's own
+/// record of what it took is its return value,
+/// [`BrowserCommandState::sweep_expired_sessions`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserCancelReason {
+    /// A caller asked: `browser_stop`, the workflow `stop` action, run shutdown,
+    /// or application exit.
+    Stopped,
+    /// The per-session action budget ran out.
+    ActionQuota,
+    /// The session wall clock ran out.
+    SessionClock,
+    /// The profile-plus-artifact disk budget ran out.
+    DiskQuota,
+    /// Chromium ended on its own and nothing here asked it to. Only the sweep can
+    /// ever report this — the action path never asked the question.
+    ChildExited,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSessionView {
@@ -115,6 +159,10 @@ pub struct BrowserSessionView {
     pub started_at_ms: u64,
     pub action_count: u64,
     pub cancelled: bool,
+    /// Set whenever `cancelled` is, and never overwritten afterwards, so the
+    /// first cause to fire is the one reported rather than the last teardown to
+    /// run over it.
+    pub cancel_reason: Option<BrowserCancelReason>,
     pub viewport: BrowserViewport,
 }
 
@@ -265,6 +313,103 @@ impl BrowserCommandState {
         stop_browsers(browsers)
     }
 
+    /// One watchdog pass over the registry: re-examines every live session and
+    /// takes back the ones that are past their session clock or whose Chromium is
+    /// already gone.
+    ///
+    /// This exists because every bound in this module was enforced from
+    /// [`OwnedBrowser::begin_action`], which is reachable only through `with_cdp`
+    /// — that is, only when something drives the session. An idle session was
+    /// never re-examined, so its clock could not fire while nothing touched it,
+    /// and child liveness was never asked at all: `try_wait` appeared only inside
+    /// `stop()` and at launch, so a Chromium that died on its own left a session
+    /// still reporting itself alive and still holding its profile.
+    ///
+    /// **The clock is applied to every session, including one a human has open.**
+    /// Nothing here can tell a Workbench tab from a workflow step: both the
+    /// human-driven surfaces (Workbench, Visual Edit) and the automated ones
+    /// (synthetic monitors, workflow replay) go through the same `browser_start`
+    /// into this same registry, and `run_id` is caller-supplied free text, so
+    /// there is no field to filter on. The conservative reading is nonetheless to
+    /// apply it, because `begin_action` *already* enforces this exact bound with
+    /// this exact limit: an idle tab past `max_session_ms` was going to die on the
+    /// user's next click either way. The sweep changes only *when* Chromium is
+    /// released, never *whether* a session survives its next action — the one case
+    /// it genuinely changes is the leak it is here to fix, a session nobody ever
+    /// touches again.
+    ///
+    /// The cadence is not decided here; see [`run_browser_watchdog`].
+    ///
+    /// Reclaiming goes through the ordinary `stop()` teardown rather than a second
+    /// kill path, so profile removal and the marker check stay in one place. The
+    /// registry is drained before any `stop()` runs, for the reason
+    /// [`Self::shutdown_run`] gives: `stop()` can block for up to two seconds
+    /// waiting on the child, and a concurrent list or action must not be able to
+    /// retain an already-reclaimed browser during it.
+    pub fn sweep_expired_sessions(&self) -> Result<Vec<BrowserSweepOutcome>, String> {
+        self.sweep_sessions(&|browser| browser.child_exited())
+    }
+
+    /// [`Self::sweep_expired_sessions`] with the liveness probe injected, for the
+    /// reason [`crate::process_table::ProcessTable::reap_dead_hosts`] injects
+    /// `host_is_alive`: the rule is then testable without a process whose liveness
+    /// the test has to arrange. That matters more here than there, because this
+    /// module has no portable long-lived stand-in child — see `observable_child` in
+    /// the tests, where two attempts at one failed on Windows.
+    fn sweep_sessions(
+        &self,
+        child_exited: &dyn Fn(&OwnedBrowser) -> bool,
+    ) -> Result<Vec<BrowserSweepOutcome>, String> {
+        // Copied out before any per-session lock is taken, exactly as
+        // `security_grants` does: the liveness probe reaches into the child lock,
+        // and holding the global registry lock across that would let one session's
+        // teardown block every list and every action.
+        let live = self
+            .sessions
+            .lock()
+            .map_err(|_| "Browser session lock is poisoned".to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut condemned = Vec::new();
+        for browser in live {
+            match browser.sweep_verdict_now(child_exited(&browser)) {
+                SweepVerdict::Keep => {}
+                SweepVerdict::Reclaim(reason) => condemned.push((browser, Some(reason))),
+                SweepVerdict::Evict => condemned.push((browser, None)),
+            }
+        }
+
+        let mut outcomes = Vec::with_capacity(condemned.len());
+        let mut reclaimed = Vec::with_capacity(condemned.len());
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "Browser session lock is poisoned".to_string())?;
+            for (browser, reason) in condemned {
+                // Absent means a concurrent `browser_stop` won the race and owns
+                // the teardown; session ids are fresh uuids, so this can never be
+                // a different session that took the same key.
+                if sessions.remove(&browser.session_id).is_none() {
+                    continue;
+                }
+                if let Some(reason) = reason {
+                    browser.record_cancel_reason(reason);
+                }
+                outcomes.push(BrowserSweepOutcome {
+                    session_id: browser.session_id.clone(),
+                    run_id: browser.run_id.clone(),
+                    reason: browser.cancel_reason(),
+                });
+                reclaimed.push(browser);
+            }
+        }
+        stop_browsers(reclaimed)?;
+        Ok(outcomes)
+    }
+
     /// Returns the active, exact origin grants for local posture inspection.
     /// The session map is copied before any CDP lock is taken so an audit
     /// never holds the global browser lock while waiting for an action.
@@ -293,6 +438,108 @@ impl BrowserCommandState {
         }
         grants.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         Ok(grants)
+    }
+}
+
+/// What one watchdog pass decided about one session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepVerdict {
+    /// Live and inside its bounds. Leave it in the registry, untouched.
+    Keep,
+    /// Take it out of the registry, run the ordinary `stop()` teardown, and record
+    /// `reason` as what ended it.
+    Reclaim(BrowserCancelReason),
+    /// Already cancelled, and still in the registry because nothing removes a
+    /// session there except `browser_stop`: the quota paths latch `cancelled` and
+    /// tear the child down in place. Evict it without attributing a new cause —
+    /// the reason it already recorded is the true one.
+    Evict,
+}
+
+/// The whole watchdog rule, with no clock, no registry and no Chromium in it.
+///
+/// Ordering is the substance of this function:
+///
+/// - `cancelled` wins outright. A cancelled session has already been torn down by
+///   whichever bound fired, so asking anything else about it can only overwrite a
+///   specific cause ("action quota") with a vaguer one that merely happens to also
+///   be true by now ("session clock").
+/// - `child_exited` beats the clock. If Chromium is gone the session is unusable
+///   whatever its clock says, and "the child exited" is the more specific fact.
+/// - The clock uses the same strict `>` as [`OwnedBrowser::begin_action`], so the
+///   two enforcement points agree exactly at the boundary instead of the sweep
+///   reclaiming a session the next action would have allowed.
+///
+/// **The disk quota is deliberately absent.** `owned_directory_size` walks the
+/// whole profile tree and stats every entry, up to a 250,000-entry ceiling. That
+/// cost is acceptable once per action, when a caller is already waiting on
+/// Chromium; paying it for every live session on a timer is not, and nothing about
+/// an idle session makes its profile grow. Disk stays where it is: checked when an
+/// action or an artifact write is about to add to it.
+fn sweep_verdict(
+    elapsed_ms: u64,
+    limits: &BrowserLimits,
+    child_exited: bool,
+    cancelled: bool,
+) -> SweepVerdict {
+    if cancelled {
+        return SweepVerdict::Evict;
+    }
+    if child_exited {
+        return SweepVerdict::Reclaim(BrowserCancelReason::ChildExited);
+    }
+    if elapsed_ms > limits.max_session_ms {
+        return SweepVerdict::Reclaim(BrowserCancelReason::SessionClock);
+    }
+    SweepVerdict::Keep
+}
+
+/// One session the watchdog took back, and why.
+///
+/// This is the record that distinguishes a reclaim from a caller-initiated stop:
+/// a `browser_stop` produces no outcome here at all.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSweepOutcome {
+    pub session_id: String,
+    pub run_id: String,
+    /// For an eviction this is the cause the session had already recorded, not one
+    /// the sweep invented. `None` only if it latched `cancelled` with no reason,
+    /// which no path in this module does.
+    pub reason: Option<BrowserCancelReason>,
+}
+
+/// Drives [`BrowserCommandState::sweep_expired_sessions`] on `interval` until
+/// `stop` is set, handing every pass to `observe`. Blocking: the caller owns the
+/// thread, so the caller also owns whether a shutdown joins it.
+///
+/// **`interval` has no default anywhere in this module and no caller is wired up
+/// here.** How promptly an idle Chromium should be released is a trade between
+/// reclaim latency and timer cost — a judgement about what this app is for, which
+/// this file cannot derive. The sweep is cheap by construction (no directory walk;
+/// see [`sweep_verdict`]), so there is no technical value that falls out either.
+/// Shipping the mechanism with the cadence unset is the point, not an oversight.
+///
+/// A sweep error does not end the loop. A poisoned registry lock is the realistic
+/// cause, and ending the watchdog on it would turn one panic elsewhere into a
+/// permanent leak of every session opened afterwards. `observe` sees the error;
+/// logging belongs to the caller, not to this module.
+///
+/// `stop` is re-read after each pass so a shutdown does not wait out a whole
+/// interval it is already known to be pointless — but a long `interval` still
+/// delays the check, which is the other reason the thread is the caller's.
+pub fn run_browser_watchdog(
+    state: &BrowserCommandState,
+    interval: Duration,
+    stop: &AtomicBool,
+    mut observe: impl FnMut(Result<Vec<BrowserSweepOutcome>, String>),
+) {
+    while !stop.load(Ordering::SeqCst) {
+        observe(state.sweep_expired_sessions());
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(interval);
     }
 }
 
@@ -459,6 +706,10 @@ struct OwnedBrowser {
     artifacts: ArtifactStore,
     limits: BrowserLimits,
     cancelled: AtomicBool,
+    /// Why `cancelled` was set. Not an `AtomicU8`-flavoured enum because the
+    /// first-writer-wins rule needs a compare-and-set anyway, and a `Mutex` states
+    /// it without hand-rolling one.
+    cancel_reason: Mutex<Option<BrowserCancelReason>>,
     action_count: AtomicU64,
     artifact_bytes: AtomicU64,
     started: Instant,
@@ -578,6 +829,7 @@ impl OwnedBrowser {
             artifacts,
             limits: request.limits,
             cancelled: AtomicBool::new(false),
+            cancel_reason: Mutex::new(None),
             action_count: AtomicU64::new(0),
             artifact_bytes: AtomicU64::new(0),
             started: Instant::now(),
@@ -604,6 +856,7 @@ impl OwnedBrowser {
             started_at_ms: self.started_at_ms,
             action_count: self.action_count.load(Ordering::SeqCst),
             cancelled: self.cancelled.load(Ordering::SeqCst),
+            cancel_reason: self.cancel_reason(),
             viewport: self
                 .viewport
                 .lock()
@@ -612,12 +865,66 @@ impl OwnedBrowser {
         }
     }
 
+    fn cancel_reason(&self) -> Option<BrowserCancelReason> {
+        self.cancel_reason.lock().ok().and_then(|value| *value)
+    }
+
+    /// First writer wins. Every teardown path ends at `stop()`, which records
+    /// [`BrowserCancelReason::Stopped`], so last-writer-wins would relabel every
+    /// quota trip and every reclaim as an ordinary caller-initiated stop — losing
+    /// exactly the distinction the reason exists to make.
+    fn record_cancel_reason(&self, reason: BrowserCancelReason) {
+        if let Ok(mut current) = self.cancel_reason.lock() {
+            current.get_or_insert(reason);
+        }
+    }
+
+    /// Whether Chromium ended without anything here asking it to.
+    ///
+    /// `try_wait` is the only non-blocking answer available, and it also reaps: once
+    /// it reports an exit the status is cached, so the `stop()` that follows still
+    /// completes promptly instead of blocking on a child that is already gone.
+    ///
+    /// An empty child slot is *not* reported as exited. `stop()` is the only thing
+    /// that empties it, so such a session is already torn down and `cancelled`
+    /// describes it — answering "exited" here would attribute a spontaneous crash to
+    /// a teardown this module performed.
+    fn child_exited(&self) -> bool {
+        match self.child.lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                None => false,
+            },
+            // A poisoned child lock cannot be inspected. Reading that as "exited"
+            // would reclaim a live session on the strength of an unrelated panic,
+            // so it reads as live and the session keeps its next action.
+            Err(_) => false,
+        }
+    }
+
+    /// The impure half of the watchdog rule: reads the clock and the cancelled
+    /// latch, and hands them plus `child_exited` to [`sweep_verdict`], which
+    /// decides. Nothing is enforced here — this only gathers.
+    fn sweep_verdict_now(&self, child_exited: bool) -> SweepVerdict {
+        sweep_verdict(
+            self.started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            &self.limits,
+            child_exited,
+            self.cancelled.load(Ordering::SeqCst),
+        )
+    }
+
     fn begin_action(&self) -> Result<(), String> {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err("Browser session is cancelled".to_string());
         }
         if self.started.elapsed() > Duration::from_millis(self.limits.max_session_ms) {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::SessionClock);
             let _ = self.stop();
             return Err("Browser session time quota exceeded".to_string());
         }
@@ -626,12 +933,14 @@ impl OwnedBrowser {
             > self.limits.max_disk_bytes
         {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::DiskQuota);
             let _ = self.stop();
             return Err("Browser session disk quota exceeded".to_string());
         }
         let next = self.action_count.fetch_add(1, Ordering::SeqCst) + 1;
         if next > self.limits.max_actions {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::ActionQuota);
             // The same teardown the two quotas above perform, and its absence
             // here was not a shortcut but a leak: the `cancelled` gate at the top
             // of this function makes every later call return early, so nothing
@@ -650,6 +959,7 @@ impl OwnedBrowser {
         if let Err(error) = reserve_quota(&self.artifact_bytes, artifact_limit, bytes.len() as u64)
         {
             self.cancelled.store(true, Ordering::SeqCst);
+            self.record_cancel_reason(BrowserCancelReason::DiskQuota);
             let _ = self.stop();
             return Err(error);
         }
@@ -1028,8 +1338,13 @@ impl OwnedBrowser {
         })
     }
 
+    /// The single teardown path. Reclaims reuse it rather than adding a second kill
+    /// path, so the marker-checked profile removal stays in one place; they only
+    /// record their reason first, and [`Self::record_cancel_reason`] keeps that
+    /// first cause from being relabelled `Stopped` here.
     fn stop(&self) -> Result<(), String> {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.record_cancel_reason(BrowserCancelReason::Stopped);
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut child) = child.take() {
                 let _ = child.kill();
@@ -2117,11 +2432,22 @@ mod tests {
     /// The child is a plain `sleep`: `stop()` only kills and reaps whatever is in
     /// `self.child`, and never asks what program it is.
     fn quota_session(max_actions: u64) -> (Arc<OwnedBrowser>, u32) {
+        quota_session_with(BrowserLimits {
+            max_actions,
+            ..BrowserLimits::default()
+        })
+    }
+
+    /// The same fixture with the whole limit set open, for the bounds the action
+    /// count is not the subject of. Session ids are unique per fixture so several
+    /// of these can share one `BrowserCommandState`, which the sweep needs.
+    fn quota_session_with(limits: BrowserLimits) -> (Arc<OwnedBrowser>, u32) {
         let root = std::env::temp_dir().join(format!("lm-browser-quota-{}", uuid::Uuid::new_v4()));
         let profiles = root.join("profiles");
-        let profile = profiles.join("session");
+        let session_id = format!("quota-session-{}", uuid::Uuid::new_v4());
+        let profile = profiles.join(&session_id);
         ensure_private_directory(&profile).unwrap();
-        std::fs::write(profile.join(PROFILE_MARKER), b"quota-session").ok();
+        std::fs::write(profile.join(PROFILE_MARKER), session_id.as_bytes()).ok();
         let artifacts = ArtifactStore::new(root.join("artifacts")).unwrap();
 
         // A CdpConnection needs a real socket; nothing in this test speaks to it.
@@ -2142,7 +2468,7 @@ mod tests {
 
         (
             Arc::new(OwnedBrowser {
-                session_id: "quota-session".to_string(),
+                session_id,
                 run_id: "quota-run".to_string(),
                 profile_root: profiles,
                 profile,
@@ -2156,11 +2482,9 @@ mod tests {
                     security_error: None,
                 }),
                 artifacts,
-                limits: BrowserLimits {
-                    max_actions,
-                    ..BrowserLimits::default()
-                },
+                limits,
                 cancelled: AtomicBool::new(false),
+                cancel_reason: Mutex::new(None),
                 action_count: AtomicU64::new(0),
                 artifact_bytes: AtomicU64::new(0),
                 started: Instant::now(),
@@ -2234,6 +2558,329 @@ mod tests {
         );
         let _ = pid;
         browser.stop().ok();
+    }
+
+    /// The whole watchdog rule, with no registry, no Chromium and no timer.
+    ///
+    /// Every bound is asserted with its counterpart immediately beside it, because
+    /// each of these branches passes trivially against a rule that fires on
+    /// everything: a sweep that reclaimed unconditionally would satisfy the
+    /// reclaim cases and destroy every live session.
+    #[test]
+    fn the_sweep_rule_bounds_the_clock_and_liveness_and_nothing_else() {
+        let limits = BrowserLimits {
+            max_session_ms: 10 * 60_000,
+            ..BrowserLimits::default()
+        };
+
+        // Live, inside the clock: untouched.
+        assert_eq!(sweep_verdict(0, &limits, false, false), SweepVerdict::Keep);
+        assert_eq!(
+            sweep_verdict(10 * 60_000 - 1, &limits, false, false),
+            SweepVerdict::Keep
+        );
+        // Exactly at the budget is still inside it, matching `begin_action`'s
+        // strict `>`. If the two disagreed here the sweep would reclaim sessions
+        // the next action would have allowed.
+        assert_eq!(
+            sweep_verdict(10 * 60_000, &limits, false, false),
+            SweepVerdict::Keep
+        );
+
+        // One millisecond past it: reclaimed, and named after the clock.
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, false, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::SessionClock)
+        );
+
+        // A child that ended on its own is reclaimed even with the clock nowhere
+        // near its budget — the liveness question `begin_action` never asked.
+        assert_eq!(
+            sweep_verdict(0, &limits, true, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::ChildExited)
+        );
+        // ...and it outranks the clock when both are true, because a gone Chromium
+        // is the more specific fact about why the session is finished.
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, true, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::ChildExited)
+        );
+
+        // Already cancelled: evicted, never re-attributed. Both other conditions
+        // hold here, so a rule that checked them first would overwrite the real
+        // cause (say, the action quota) with one that is merely also true by now.
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, true, true),
+            SweepVerdict::Evict
+        );
+        assert_eq!(sweep_verdict(0, &limits, false, true), SweepVerdict::Evict);
+
+        // The disk budget is not part of this rule and has no way to become part
+        // of it: a session with a 1 MiB ceiling and a clock to spare is kept, so
+        // no sweep can trigger the profile walk that `owned_directory_size` is.
+        let tiny_disk = BrowserLimits {
+            max_disk_bytes: 1024 * 1024,
+            ..limits.clone()
+        };
+        assert_eq!(
+            sweep_verdict(0, &tiny_disk, false, false),
+            SweepVerdict::Keep
+        );
+    }
+
+    /// The registry half: the sweep must take the condemned session *out* of the
+    /// map and run the ordinary `stop()` teardown on it, and must leave everything
+    /// else exactly where it was.
+    ///
+    /// Liveness is injected (`|_| false` — every child running) so this asserts the
+    /// clock branch on every platform. The fixture has no long-lived Windows child,
+    /// so a real probe would read every session there as crashed and this could
+    /// never reach the clock at all.
+    #[test]
+    fn the_sweep_reclaims_an_idle_expired_session_and_leaves_a_live_one() {
+        let root = std::env::temp_dir().join(format!("lm-browser-sweep-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+
+        // Zero means "already past its budget on the first tick", which is the
+        // only way to age a session without sleeping. It is a test input, not a
+        // proposed default — see the counterpart below, which is what stops a
+        // sweep that reclaims everything from passing this.
+        let (expired, _) = quota_session_with(BrowserLimits {
+            max_session_ms: 0,
+            ..BrowserLimits::default()
+        });
+        let (live, _) = quota_session_with(BrowserLimits::default());
+        state.insert(expired.clone()).unwrap();
+        state.insert(live.clone()).unwrap();
+
+        let outcomes = state.sweep_sessions(&|_| false).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "got {outcomes:?}");
+        assert_eq!(outcomes[0].session_id, expired.session_id);
+        assert_eq!(outcomes[0].run_id, expired.run_id);
+        assert_eq!(
+            outcomes[0].reason,
+            Some(BrowserCancelReason::SessionClock),
+            "a reclaim must name the bound that fired, not the caller-stop reason"
+        );
+
+        assert!(
+            expired.child.lock().unwrap().is_none(),
+            "the reclaim must go through stop(), which takes the child, rather than \
+             only dropping the session out of the registry"
+        );
+        assert!(
+            state.get(&expired.session_id).is_err(),
+            "a reclaimed session must be gone from the registry, not left in it \
+             reporting itself alive"
+        );
+
+        // The counterpart. Without it, a sweep that reclaimed unconditionally
+        // would satisfy every assertion above while destroying working sessions.
+        assert!(
+            state.get(&live.session_id).is_ok(),
+            "a session inside its clock must stay in the registry"
+        );
+        assert!(
+            live.child.lock().unwrap().is_some(),
+            "a session inside its clock must keep its child"
+        );
+        assert_eq!(live.view().cancel_reason, None);
+        assert!(!live.view().cancelled);
+
+        live.stop().ok();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Chromium that died on its own left a session that still reported itself
+    /// alive: `try_wait` appeared only inside `stop()` and at launch, so nothing
+    /// ever asked. Here the clock has 10 minutes to spare, so liveness is the only
+    /// thing that can reclaim it.
+    #[test]
+    fn the_sweep_reclaims_a_session_whose_chromium_died_on_its_own() {
+        let root = std::env::temp_dir().join(format!("lm-browser-dead-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let (browser, _) = quota_session_with(BrowserLimits::default());
+        state.insert(browser.clone()).unwrap();
+
+        let outcomes = state.sweep_sessions(&|_| true).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "got {outcomes:?}");
+        assert_eq!(
+            outcomes[0].reason,
+            Some(BrowserCancelReason::ChildExited),
+            "a session reclaimed because its browser is gone must not be reported \
+             as a caller-initiated stop"
+        );
+        assert!(state.get(&browser.session_id).is_err());
+        assert!(browser.child.lock().unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `child_exited` answers about the process, and the two answers it must not
+    /// confuse are "ended on its own" and "we ended it".
+    ///
+    /// The reaped case is arranged by this test rather than waited for, so it does
+    /// not depend on any external process's lifetime: `wait()` caches the status,
+    /// which is what `try_wait` then reports.
+    #[test]
+    fn a_stopped_child_is_not_reported_as_having_exited_on_its_own() {
+        let (browser, _) = quota_session_with(BrowserLimits::default());
+
+        // A live child, where one is available. On Windows the stand-in exits
+        // immediately (see `observable_child`), so this is the OS-level claim that
+        // cannot be made portably — and the reason the sweep injects liveness.
+        #[cfg(unix)]
+        assert!(
+            !browser.child_exited(),
+            "a running child must not read as having exited"
+        );
+
+        {
+            let mut slot = browser.child.lock().unwrap();
+            let child = slot.as_mut().expect("the fixture holds a child");
+            let _ = child.kill();
+            child.wait().expect("the stand-in child is reaped");
+        }
+        assert!(
+            browser.child_exited(),
+            "a child that is gone while still in the session must read as exited"
+        );
+
+        // After `stop()` the slot is empty, which is *this module's* teardown and
+        // not a spontaneous exit. Reporting it as one would make every stopped
+        // session look like a crash.
+        browser.stop().ok();
+        assert!(
+            !browser.child_exited(),
+            "a session whose child stop() already took must not read as crashed"
+        );
+    }
+
+    /// A session that a quota already cancelled is still in the registry, because
+    /// nothing removes one there except `browser_stop`. The sweep evicts it — and
+    /// must not relabel it, which is the whole reason the reason exists.
+    #[test]
+    fn the_sweep_evicts_an_already_cancelled_session_without_relabelling_it() {
+        let root = std::env::temp_dir().join(format!("lm-browser-evict-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let (browser, _) = quota_session_with(BrowserLimits {
+            max_actions: 1,
+            ..BrowserLimits::default()
+        });
+        state.insert(browser.clone()).unwrap();
+
+        browser.begin_action().expect("the first action is allowed");
+        browser
+            .begin_action()
+            .expect_err("the second exceeds a quota of one");
+        assert_eq!(
+            browser.view().cancel_reason,
+            Some(BrowserCancelReason::ActionQuota)
+        );
+
+        // `stop()` has already emptied the child slot, so the probe is forced to
+        // "exited" to give the sweep a competing condition: a rule that checked
+        // liveness before the cancelled latch would relabel this a crash. The clock
+        // ordering cannot be staged here — a session past its clock never reaches
+        // the action quota — and is covered by the rule test instead.
+        let outcomes = state.sweep_sessions(&|_| true).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "got {outcomes:?}");
+        assert_eq!(
+            outcomes[0].reason,
+            Some(BrowserCancelReason::ActionQuota),
+            "the sweep must report the cause the session already recorded, not \
+             re-attribute it to whatever is also true by the time it looks"
+        );
+        assert_eq!(
+            browser.view().cancel_reason,
+            Some(BrowserCancelReason::ActionQuota),
+            "the recorded cause must survive the reclaim's own stop()"
+        );
+        assert!(state.get(&browser.session_id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The sweep deliberately excludes the disk quota, because
+    /// `owned_directory_size` walks the whole profile and stats every entry. This
+    /// asserts the exclusion where it would actually be reintroduced: a session
+    /// already over its disk budget is left alone by the sweep while the action
+    /// path still refuses it, so the two cannot be quietly merged.
+    #[test]
+    fn the_sweep_does_not_walk_the_profile_for_the_disk_quota() {
+        let (browser, _) = quota_session_with(BrowserLimits {
+            max_disk_bytes: 1024,
+            ..BrowserLimits::default()
+        });
+        std::fs::write(browser.profile.join("bulk"), vec![0_u8; 8 * 1024]).unwrap();
+
+        assert_eq!(
+            browser.sweep_verdict_now(false),
+            SweepVerdict::Keep,
+            "the sweep must not enforce the disk quota; it runs on a timer over \
+             every live session and the profile walk is unbounded work"
+        );
+        assert!(
+            browser
+                .begin_action()
+                .expect_err("the action path still owns the disk quota")
+                .contains("disk quota"),
+            "excluding disk from the sweep must not stop the action path enforcing it"
+        );
+        browser.stop().ok();
+    }
+
+    /// The driver contract: it keeps sweeping, and `stop` ends it.
+    #[test]
+    fn the_watchdog_loop_runs_until_it_is_stopped() {
+        let root = std::env::temp_dir().join(format!("lm-browser-loop-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut passes = 0_usize;
+
+        // A zero interval keeps the test off the clock entirely; the cadence is a
+        // caller's parameter precisely so nothing here has to pick one.
+        run_browser_watchdog(&state, Duration::ZERO, &stop, |outcomes| {
+            outcomes.expect("an empty registry sweeps cleanly");
+            passes += 1;
+            if passes == 3 {
+                stop.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert_eq!(
+            passes, 3,
+            "the loop must keep sweeping until stopped, not sweep once and return"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other half of the driver contract, and the reason `stop` is re-read
+    /// after each pass rather than only at the top: a shutdown must not have to
+    /// wait out a whole interval that is already known to be pointless. Timed
+    /// rather than structural because the delay *is* the defect — the loop
+    /// terminates either way.
+    #[test]
+    fn stopping_the_watchdog_does_not_wait_out_its_interval() {
+        let root = std::env::temp_dir().join(format!("lm-browser-prompt-{}", uuid::Uuid::new_v4()));
+        let state = BrowserCommandState::production(&root).unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+
+        // Long enough that sleeping through it is unmistakable, and never actually
+        // slept when the loop is correct.
+        run_browser_watchdog(&state, Duration::from_secs(5), &stop, |outcomes| {
+            outcomes.expect("an empty registry sweeps cleanly");
+            stop.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the loop slept out its interval after stop was set; took {:?}",
+            started.elapsed()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
