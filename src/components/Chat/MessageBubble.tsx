@@ -1,15 +1,17 @@
-import { Children, isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
+import { Children, isValidElement, lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import oneDark from "react-syntax-highlighter/dist/esm/styles/prism/one-dark";
-import { Check, Copy, Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
+import { Eye, Languages, LoaderCircle, Pencil, Split, X } from "lucide-react";
 
 import { textContent, type ChatContentPart, type ChatMessage } from "../../lib/llamaClient";
 import { detectFenceKind, fingerprintArtifact, type ArtifactRef } from "../../lib/artifacts";
 import { isWorkspaceImageSrc } from "../../lib/imageGeneration";
 import WorkspaceImagePreview from "./WorkspaceImagePreview";
 import { useArtifactStore } from "../../store/artifactStore";
+// Lazy: `CodeBlock` pulls in `react-syntax-highlighter`'s Prism bundle, the
+// same heavy dependency `ArtifactPane.tsx` keeps out of the main entry chunk
+// via `lazyComponents.tsx` — see `CodeBlock.tsx`'s doc comment.
+const CodeBlock = lazy(() => import("./CodeBlock"));
 import { useT } from "../../lib/i18n";
 import {
   cancelTranslation,
@@ -88,66 +90,6 @@ function flattenToString(node: ReactNode): string {
   if (Array.isArray(node)) return node.map(flattenToString).join("");
   if (isValidElement(node)) return flattenToString((node.props as { children?: ReactNode }).children);
   return "";
-}
-
-/** Fence language token -> display label shown in a `CodeBlock`'s header
- * (e.g. `bash` -> `Bash`). Falls back to capitalizing the raw token, and to
- * "Text" when a fence has no language at all. */
-function displayLangLabel(lang: string): string {
-  if (!lang) return "Text";
-  return lang.charAt(0).toUpperCase() + lang.slice(1);
-}
-
-/**
- * Renders a single fenced code block in a chat message: a header bar (language
- * label, optional extra action, copy button) over syntax-highlighted source —
- * shared by both previewable fences (html/svg/mermaid, which also get a
- * Preview button via `headerExtra`) and plain ones, so every code block in
- * the transcript looks and behaves the same way. A stable, module-level
- * component (not created fresh per render like the `pre` override that uses
- * it) so its `copied` state behaves predictably within a single mount.
- */
-function CodeBlock({ lang, body, headerExtra }: { lang: string; body: string; headerExtra?: ReactNode }) {
-  const { t } = useT();
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(body);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard permission denied/unavailable — nothing more to do than
-      // silently leave the button unclicked; there's no destructive fallback.
-    }
-  };
-
-  return (
-    <div className="my-2 overflow-hidden rounded-lg border border-border bg-[#282c34] not-prose">
-      <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-black/20 px-3 py-1.5">
-        <span className="font-mono text-[11px] uppercase tracking-wide text-white/50">{displayLangLabel(lang)}</span>
-        <div className="flex items-center gap-1">
-          {headerExtra}
-          <button
-            type="button"
-            onClick={() => void handleCopy()}
-            aria-label={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyButton")}
-            title={copied ? t("MessageBubble.copiedLabel") : t("MessageBubble.copyButton")}
-            className="flex cursor-pointer items-center justify-center rounded-md p-1 text-white/50 transition-colors hover:bg-white/10 hover:text-white"
-          >
-            {copied ? <Check size={13} /> : <Copy size={13} />}
-          </button>
-        </div>
-      </div>
-      <SyntaxHighlighter
-        language={lang || "text"}
-        style={oneDark}
-        customStyle={{ margin: 0, padding: "0.75rem", background: "transparent", fontSize: "12px" }}
-      >
-        {body}
-      </SyntaxHighlighter>
-    </div>
-  );
 }
 
 /**
@@ -230,7 +172,17 @@ function buildAssistantMarkdownComponents(
 
       if (!codeProps) return <pre>{children}</pre>;
 
-      if (!kind) return <CodeBlock lang={lang} body={body} />;
+      // Suspense's fallback is the same plain `<pre>` this fence rendered as
+      // before `CodeBlock` existed — the lazy chunk is small and typically
+      // cached after the first fence in a session, so this is a rare,
+      // brief flash rather than the normal path.
+      if (!kind) {
+        return (
+          <Suspense fallback={<pre>{children}</pre>}>
+            <CodeBlock lang={lang} body={body} />
+          </Suspense>
+        );
+      }
 
       const ref: ArtifactRef = {
         messageIndex,
@@ -240,20 +192,22 @@ function buildAssistantMarkdownComponents(
       previewableIndex += 1;
 
       return (
-        <CodeBlock
-          lang={lang}
-          body={body}
-          headerExtra={
-            <button
-              type="button"
-              onClick={() => useArtifactStore.getState().open(sessionId, ref)}
-              className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-white/50 transition-colors hover:bg-white/10 hover:text-white"
-            >
-              <Eye size={12} />
-              {t("MessageBubble.previewButton")}
-            </button>
-          }
-        />
+        <Suspense fallback={<pre>{children}</pre>}>
+          <CodeBlock
+            lang={lang}
+            body={body}
+            headerExtra={
+              <button
+                type="button"
+                onClick={() => useArtifactStore.getState().open(sessionId, ref)}
+                className="flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-xs text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                <Eye size={12} />
+                {t("MessageBubble.previewButton")}
+              </button>
+            }
+          />
+        </Suspense>
       );
     },
   };
