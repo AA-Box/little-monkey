@@ -3,7 +3,6 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use little_monkey_lib::run_protocol::{
