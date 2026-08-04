@@ -1047,6 +1047,8 @@ export const ko: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "첨부됨",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "미리보기",
+  "MessageBubble.copyButton": "코드 복사",
+  "MessageBubble.copiedLabel": "복사됨",
   "WorkspaceImage.loading": "이미지 로드 중…",
   "WorkspaceImage.error": "이미지를 사용할 수 없습니다: {{error}}",
   "WorkspaceImage.generatedAlt": "생성된 이미지",

@@ -1048,6 +1048,8 @@ export const id: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Terlampir",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Pratinjau",
+  "MessageBubble.copyButton": "Salin kode",
+  "MessageBubble.copiedLabel": "Disalin",
   "WorkspaceImage.loading": "Gambar sedang dimuat…",
   "WorkspaceImage.error": "Gambar tidak tersedia: {{error}}",
   "WorkspaceImage.generatedAlt": "Gambar yang dihasilkan",

@@ -1047,6 +1047,8 @@ export const hi: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "अटैच किया गया",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "पूर्वावलोकन",
+  "MessageBubble.copyButton": "कोड कॉपी करें",
+  "MessageBubble.copiedLabel": "कॉपी हो गया",
   "WorkspaceImage.loading": "इमेज लोड हो रही है…",
   "WorkspaceImage.error": "इमेज उपलब्ध नहीं है: {{error}}",
   "WorkspaceImage.generatedAlt": "जनरेट की गई इमेज",
