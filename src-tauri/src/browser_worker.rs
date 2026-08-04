@@ -1529,7 +1529,12 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_private_v6(ip: Ipv6Addr) -> bool {
-    ip.is_unspecified()
+    // `classify_ip` checks `is_loopback` before reaching here, so `::1` is already
+    // handled — but `::127.0.0.1` is not loopback by that predicate and is not what
+    // `to_ipv4_mapped` matches, so it classified as Public. See
+    // `egress::is_ipv4_compatible`.
+    crate::egress::is_ipv4_compatible(&ip)
+        || ip.is_unspecified()
         || ip.is_multicast()
         || (ip.segments()[0] & 0xfe00) == 0xfc00
         || (ip.segments()[0] & 0xffc0) == 0xfe80
@@ -2505,6 +2510,28 @@ mod tests {
     ///
     /// Asserted on the child rather than on a flag, because the flag was exactly
     /// what was already being set correctly.
+    /// `classify_ip` catches `::1` up front, but `::127.0.0.1` is not loopback by
+    /// that predicate and is not what `to_ipv4_mapped()` matches — so an
+    /// agent-driven navigation to it classified as `Public` and needed no grant.
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_is_not_a_public_navigation_target() {
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::10.0.0.1"] {
+            let address = IpAddr::V6(Ipv6Addr::from_str(text).unwrap());
+            assert_ne!(
+                classify_ip(address),
+                IpClass::Public,
+                "{text} must not classify as public"
+            );
+        }
+        assert_eq!(
+            classify_ip(IpAddr::V6(
+                Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
+            )),
+            IpClass::Public
+        );
+    }
+
     #[test]
     fn tripping_the_action_quota_kills_the_child_it_cancels() {
         let (browser, pid) = quota_session(1);

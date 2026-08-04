@@ -1199,15 +1199,67 @@ sending anything, and its only callers are in the frontend
 site bypasses it entirely, including `providers.rs`'s own chat request. An
 earlier draft of this file described it as gating sends; that was wrong.
 
-There are **23 `reqwest` client construction sites and no shared client
-factory** — 13 of them bare `reqwest::Client::new()` with no timeout, redirect
-policy, or resolver — so egress cannot be centralized without touching each one.
-Only `web.rs` has an SSRF-guarded resolver; `connectors.rs`,
-`knowledge_service.rs`, and `browser_worker.rs` pin DNS per request; everything
-else does no pinning. `browser_pane.rs` (user browsing) has a scheme filter and
-no origin policy at all, while `browser_worker.rs` (agent-driven) enforces exact
-origins with DNS rechecks. CORS and bind-interface restrictions are **inbound
-only**.
+There is **no shared client factory**, which is true, and the numbers this section
+used to give for it were wrong. Counted: **53 `reqwest` client construction sites**
+across 29 files, 43 of them outside `#[cfg(test)]`; **21 bare
+`reqwest::Client::new()`**, 15 in production. The old figures (23 sites, 13 bare)
+match nothing — not sites, not production sites, not files.
+
+**"Egress cannot be centralized without touching each one" was also false**, and it
+is the claim that most distorted the shape of this item. Two funnels already exist:
+`monkey-cli` builds one client in `main.rs` and threads `&reqwest::Client` through
+about forty signatures, so one edit hardens nearly the whole CLI; and
+`providers.rs`'s `build_chat_request` already *accepts* an injected client — its
+callers each construct their own only by convention. Hardening every credentialed
+remote path is roughly eight edits, not forty-three.
+
+What the defaults actually are, since "no redirect policy" understated it: reqwest
+defaults to `Policy::limited(10)`, so the 25 production sites that set no policy
+**follow up to ten hops to arbitrary hosts** rather than following none. 22 set no
+client-level timeout. 42 say nothing about proxying and so inherit `HTTP(S)_PROXY`
+from the environment. 39 do not pin DNS.
+
+**There are four independent SSRF guards, not one, and `web.rs`'s is the
+narrowest.** The old text credited `web.rs` alone; in fact `knowledge_pipeline.rs`
+(broadest), `browser_worker.rs`, and `model_sources.rs` each have their own, with
+four different blocklists — so which guard a request happens to hit decides what
+leaks. `web.rs` misses CGNAT, IPv4 multicast and broadcast, TEST-NET, `240/4` and
+IPv6 `ff00::/8`, all of which `knowledge_pipeline.rs` blocks. `web.rs` is the only
+one with a custom *resolver*, which is all the original claim was true about.
+
+`browser_worker.rs` was also undersold rather than oversold: it pins once per
+Chromium launch via `--host-resolver-rules` and re-resolves and re-classifies on
+every navigation, which is the closest thing in the tree to this item's own
+"DNS answers are pinned for the process's lifetime". It holds no `reqwest` client at
+all, so no client factory can reach it.
+
+`browser_pane.rs` (user browsing) has a scheme filter and no origin policy — and
+makes its own outbound requests, fetching `https://{host}/favicon.ico` for any host
+from the page URL plus a third-party icon service, with an 8-second timeout and
+default redirects. CORS and bind-interface restrictions remain **inbound only**;
+there is no outbound gate anywhere.
+
+**Shipped — the deprecated IPv4-compatible form no longer walks past any of the four
+guards.** All four unwrapped v4-in-v6 with `to_ipv4_mapped()`, which by design
+matches only `::ffff:a.b.c.d`. So `::127.0.0.1` fell through every branch of every
+guard — not `::1`, not unspecified, not `fc00::/7`, not `fe80::/10` — and was
+classified as an ordinary public address by three of them and as a public navigation
+target by the fourth.
+
+- **The obvious one-word fix is worse than the bug, and a test now pins that.**
+  Swapping `to_ipv4_mapped()` for `to_ipv4()` matches both forms, but maps `::1` to
+  `0.0.0.1`, which is not loopback, private, link-local or unspecified — so in the
+  two guards where the unwrap branch returns early it would have made **loopback
+  allowed**. The fix rejects the whole `::/96` range instead.
+- **One shared predicate in a new `egress.rs`**, because this is the narrow case
+  where all four guards agreed *and were wrong the same way*. Unifying their
+  blocklists is deliberately **not** part of it: the broadest blocks CGNAT
+  (`100.64/10`), which is Tailscale's default range and live on some consumer ISPs,
+  so adopting it everywhere would newly refuse fetches that work today.
+- `::` and `::1` are left to the rules that already name them, so a denial still
+  says which rule fired rather than collapsing three causes into one.
+- Each guard has its own test plus a counter-test that a real public address is
+  still reachable; sabotaging the shared predicate fails all four independently.
 
 **Acceptance:** each process record carries a deny-by-default egress policy —
 allowed hosts, ports, and protocols — that is narrower than or equal to its

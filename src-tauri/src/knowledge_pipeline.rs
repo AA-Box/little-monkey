@@ -710,6 +710,9 @@ fn is_non_public_address(address: IpAddr) -> bool {
             address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
+                // `::a.b.c.d` is not what `to_ipv4_mapped` matches, so without
+                // this it read as public. See `egress::is_ipv4_compatible`.
+                || crate::egress::is_ipv4_compatible(&address)
                 || is_ipv6_unique_local(address)
                 || is_ipv6_link_local(address)
                 || address
@@ -4589,6 +4592,24 @@ mod tests {
             chunks: vec![chunk],
             vectors: vec![vector],
         }
+    }
+
+    /// This is the broadest of the four SSRF guards and it had the same hole:
+    /// `::127.0.0.1` is not what `to_ipv4_mapped()` matches, so a knowledge source
+    /// URL resolving there was accepted as public.
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_is_non_public() {
+        use std::net::Ipv6Addr;
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::192.168.1.1"] {
+            assert!(
+                is_non_public_address(IpAddr::V6(Ipv6Addr::from_str(text).unwrap())),
+                "{text} must be non-public"
+            );
+        }
+        assert!(!is_non_public_address(IpAddr::V6(
+            Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
+        )));
     }
 
     #[test]

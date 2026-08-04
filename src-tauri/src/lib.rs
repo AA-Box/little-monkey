@@ -211,6 +211,11 @@ pub mod os_limits;
 // `tools.rs` and `verify.rs` so the two command runners cannot drift on the
 // number, the truncation direction, or the marker.
 pub mod output_cap;
+// Shared outbound-network primitives. Small on purpose: four independent SSRF
+// guards already exist, and this holds only the narrow rules all four need to
+// agree on. See `egress.rs` for why unifying their blocklists is a separate,
+// riskier change.
+pub mod egress;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
