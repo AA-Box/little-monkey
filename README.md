@@ -237,6 +237,28 @@ a scope boundary stated where it matters.
   a no-op on macOS — so resident memory stays with the daemon's watchdog. On
   Windows this does nothing at all; the equivalent is a job object and it is not
   built yet.
+- Browser sessions nothing is driving are reclaimed. A session used to be checked
+  only while an agent was actively driving the page, so an abandoned Chromium was
+  never looked at again — its time limit could not fire, and one that had crashed on
+  its own still reported itself as running. A sweep every 30 seconds now retires
+  sessions past their time limit or whose browser has died, and records which bound
+  fired rather than logging them all as "stopped". Real limits: nothing can tell a
+  browser tab you are still reading from one an agent abandoned, so the time limit
+  applies to both — an idle tab past its 10-minute default loses its session. The
+  disk limit is deliberately left out of the sweep, since measuring a profile
+  directory on a timer is expensive and an idle session's profile does not grow. And
+  the browser's process id is still not recorded anywhere, so a crash of this app can
+  still orphan a Chromium that nothing is able to kill.
+- Chat turns, subagents, crew members, and side tasks can carry a wall-clock time
+  budget, enforced by the same 2-second sweep that already delivers stop and pause,
+  and recorded as a limit being exceeded rather than as someone pressing Stop. Real
+  limit, and it is the main one: **no default budget is set, so today this fires for
+  nobody.** That is deliberate — a turn waiting on an unanswered permission prompt
+  looks exactly like a turn that is working, so any default would kill turns for
+  being slow to answer. Two further honest bounds: a budget is a floor rather than a
+  ceiling, because a turn inside a 120-second shell command cannot notice it until
+  that command returns; and time spent paused still counts, so a long-paused turn
+  trips its budget as soon as it resumes.
 - Shell output that reaches a model is bounded. Each of stdout and stderr from the
   shell tool is capped at 20,000 bytes, keeping the end — where a failing command
   puts its diagnostic — and saying on the wire whether anything was dropped. Of the

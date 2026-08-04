@@ -889,6 +889,48 @@ pub fn run() {
                 process_commands::reap_desktop_processes_at_startup(&reap_app, reap_state.inner());
             }
 
+            // Reclaim browser sessions nothing is driving any more. Before this,
+            // a session was bounded only inside `begin_action`, which an agent
+            // reaches only while it is actively driving the page — so an
+            // abandoned Chromium was never re-examined, its session clock could
+            // not fire, and a Chromium that died on its own left a session still
+            // reporting itself alive.
+            //
+            // `spawn_blocking` because the loop sleeps between passes. The stop
+            // flag is a `static` rather than app state: this is process-lifetime
+            // work, and the flag exists so the loop can be ended in a test
+            // without waiting out an interval.
+            {
+                static BROWSER_WATCHDOG_STOP: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let watchdog_app = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let state = watchdog_app.state::<browser_worker::BrowserCommandState>();
+                    browser_worker::run_browser_watchdog(
+                        state.inner(),
+                        browser_worker::BROWSER_WATCHDOG_INTERVAL,
+                        &BROWSER_WATCHDOG_STOP,
+                        |result| match result {
+                            // Reclaiming is the system working, so it is worth a
+                            // line: a user whose browser tab vanished should be
+                            // able to find out why from the log.
+                            Ok(reclaimed) => {
+                                for outcome in reclaimed {
+                                    eprintln!(
+                                        "browser watchdog: reclaimed session {} of run {} ({:?})",
+                                        outcome.session_id, outcome.run_id, outcome.reason
+                                    );
+                                }
+                            }
+                            // Never fatal to the loop. A poisoned registry lock
+                            // that ended the watchdog would leak every session
+                            // opened afterwards.
+                            Err(error) => eprintln!("browser watchdog: sweep failed: {error}"),
+                        },
+                    );
+                });
+            }
+
             // A persisted M3 policy represents an explicit user opt-in. Start
             // its separate, capability-scoped compatibility listener without
             // blocking app launch; failures remain visible in Runtime Hub.

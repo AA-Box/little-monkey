@@ -466,6 +466,47 @@ impl ExitStatus {
     }
 }
 
+/// The prefix a wall-budget stop carries in `signal_reason`.
+///
+/// The durable channel for "this stop came from a budget, not a person". Same
+/// shape, and the same reason, as the daemon's marked `last_error`: the row is
+/// written by whoever latches the stop and read back later by whoever records the
+/// exit, with nothing in memory connecting the two.
+///
+/// **This constant is the authority and `processWallBudget.ts` mirrors it.** The
+/// enforcer that writes the reason runs in the WebView and cannot import a Rust
+/// const, so the literal exists on both sides; the TypeScript copy names this one
+/// and a test on each side pins the string. A generated shared constant would be
+/// better and is not worth a codegen step for one string.
+pub const WALL_BUDGET_REASON_PREFIX: &str = "wall budget exceeded: max_wall_ms";
+
+/// Reclassify a `cancelled` exit as [`ExitStatus::LimitExceeded`] when the stop
+/// that caused it was a budget kill.
+///
+/// Only ever *upgrades*, and only from `Cancelled`. A `Failed` or `Succeeded` exit
+/// is the work's own verdict and a pending budget stop does not override it — a
+/// turn that failed on its own while a budget stop was in flight failed, and
+/// relabelling that would hide a real error behind a limit.
+///
+/// The reason is replaced too, not just the status: the loops write "stopped by
+/// the user", which for a budget kill is not merely imprecise but false.
+fn upgrade_a_budget_kill(
+    exit: Option<ProcessExit>,
+    signal_reason: Option<&str>,
+) -> Option<ProcessExit> {
+    let exit = exit?;
+    let is_budget_kill =
+        signal_reason.is_some_and(|reason| reason.starts_with(WALL_BUDGET_REASON_PREFIX));
+    if exit.status != ExitStatus::Cancelled || !is_budget_kill {
+        return Some(exit);
+    }
+    Some(ProcessExit {
+        status: ExitStatus::LimitExceeded,
+        reason: signal_reason.map(str::to_string),
+        ..exit
+    })
+}
+
 /// The limit set attached to a process.
 ///
 /// `None` means "not bounded by this process record" — honest, and different
@@ -1265,6 +1306,14 @@ impl<'a> ProcessTable<'a> {
             });
         }
 
+        // A budget kill and a user pressing Stop tear a turn down through the
+        // identical path — one cancellation, one `cancelled` exit — so without
+        // this the ledger cannot tell "the system worked" from "someone changed
+        // their mind". Upgraded here rather than at each loop's own `finally`
+        // because this is the one place every host passes through: the four
+        // WebView loops, the daemon, and `monkey processes` alike.
+        let exit = upgrade_a_budget_kill(exit, current.signal_reason.as_deref());
+
         // First entry into `running` is what `started_at_ms` records; a
         // resume from `suspended` must not overwrite it.
         let started_at_ms = match (current.started_at_ms, next) {
@@ -2049,6 +2098,124 @@ mod tests {
         assert_eq!(json["externalId"], "task-wire");
         assert_eq!(json["kind"], "side_task");
         assert_eq!(json["state"], "admitted");
+    }
+
+    /// The frontend enforcer writes this reason and Rust reads it back, so the two
+    /// literals have to agree. Pinned here; `processWallBudget.test.ts` pins the
+    /// other side.
+    #[test]
+    fn the_wall_budget_marker_is_the_string_the_frontend_writes() {
+        assert_eq!(
+            WALL_BUDGET_REASON_PREFIX,
+            "wall budget exceeded: max_wall_ms"
+        );
+    }
+
+    /// Without this, a turn killed for exceeding its budget is indistinguishable
+    /// from one a user stopped — and its recorded reason says "stopped by the
+    /// user", which is not imprecise but false.
+    #[test]
+    fn a_wall_budget_stop_is_recorded_as_limit_exceeded_and_an_ordinary_stop_is_not() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let budgeted = admit(&table, ProcessKind::ChatTurn, "turn-budget");
+        table
+            .transition(&budgeted.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("a turn starts running");
+        let reason = format!("{WALL_BUDGET_REASON_PREFIX}=1000ms, ran 2000ms");
+        table
+            .signal(
+                &budgeted.process_id,
+                ProcessSignal::Stop,
+                Some(&reason),
+                T0 + 2,
+            )
+            .expect("the budget latches a stop");
+        let exited = table
+            .transition(
+                &budgeted.process_id,
+                ProcessState::Exited,
+                // What every loop writes today, budget kill or not.
+                Some(ProcessExit::cancelled("stopped by the user")),
+                T0 + 3,
+            )
+            .expect("the turn winds down");
+        let exit = exited.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, ExitStatus::LimitExceeded);
+        assert_eq!(
+            exit.reason.as_deref(),
+            Some(reason.as_str()),
+            "the false \"stopped by the user\" reason must be replaced, not kept"
+        );
+
+        // The counter-test: an ordinary stop stays an ordinary stop. Without it,
+        // upgrading everything would pass the assertions above.
+        let stopped = admit(&table, ProcessKind::ChatTurn, "turn-user-stop");
+        table
+            .transition(&stopped.process_id, ProcessState::Running, None, T0 + 1)
+            .unwrap();
+        table
+            .signal(
+                &stopped.process_id,
+                ProcessSignal::Stop,
+                Some("stopped by the user"),
+                T0 + 2,
+            )
+            .unwrap();
+        let exit = table
+            .transition(
+                &stopped.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::cancelled("stopped by the user")),
+                T0 + 3,
+            )
+            .unwrap()
+            .exit
+            .expect("an exited row carries its exit");
+        assert_eq!(exit.status, ExitStatus::Cancelled);
+    }
+
+    /// A budget stop in flight must not relabel a failure. The work's own verdict
+    /// wins, or a real error would hide behind a limit.
+    #[test]
+    fn a_pending_budget_stop_does_not_relabel_a_failure_or_a_success() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let reason = format!("{WALL_BUDGET_REASON_PREFIX}=1000ms, ran 2000ms");
+
+        for (external, exit, expected) in [
+            (
+                "turn-failed",
+                ProcessExit::failed("the tool blew up"),
+                ExitStatus::Failed,
+            ),
+            (
+                "turn-succeeded",
+                ProcessExit::succeeded(),
+                ExitStatus::Succeeded,
+            ),
+        ] {
+            let record = admit(&table, ProcessKind::ChatTurn, external);
+            table
+                .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+                .unwrap();
+            table
+                .signal(
+                    &record.process_id,
+                    ProcessSignal::Stop,
+                    Some(&reason),
+                    T0 + 2,
+                )
+                .unwrap();
+            let actual = table
+                .transition(&record.process_id, ProcessState::Exited, Some(exit), T0 + 3)
+                .unwrap()
+                .exit
+                .expect("an exited row carries its exit")
+                .status;
+            assert_eq!(actual, expected, "{external} was relabelled");
+        }
     }
 
     /// The declaration must match what the app really enforces, so this asserts
