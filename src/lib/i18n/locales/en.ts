@@ -792,6 +792,7 @@ export const en: Record<string, string> = {
   "OllamaPanel.modelfileStudioLabel": "Modelfile Studio",
   "OllamaPullForm.tagInputPlaceholder": "e.g. gpt-oss:120b-cloud",
   "OllamaPullForm.pullButton": "Pull",
+  "OllamaPullForm.cancelButton": "Cancel",
   "OllamaPullForm.examplesHint": "Examples — browse more at ollama.com/search?c=cloud",
   "OllamaPullForm.signInButton": "Sign in to ollama.com",
   "ProviderModelList.noCloudModelsEmptyState": "No cloud models yet — add an API key in Settings.",

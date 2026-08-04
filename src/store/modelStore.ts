@@ -307,6 +307,8 @@ export interface ModelStore {
   startOllama: () => Promise<void>;
   /** Pull a model tag via the Ollama CLI, tracking progress/errors for it. */
   pullOllamaModel: (tag: string) => Promise<void>;
+  /** Cancel an in-flight `pullOllamaModel` pull for `tag` — kills the underlying `ollama pull` process. */
+  cancelOllamaPull: (tag: string) => Promise<void>;
   /** Import a local `.gguf` file or Safetensors model directory into Ollama under `name` (via `ollama create`), tracking progress/errors the same way as `pullOllamaModel`. */
   importOllamaModel: (name: string, path: string) => Promise<void>;
   /** Create a model from a full, user-authored Modelfile via Modelfile Studio's hardened `ollama_create_from_modelfile` command — re-parses/re-validates `modelfileText` server-side regardless of any prior preview, then streams `ollama create` output the same way as `pullOllamaModel`/`importOllamaModel` (keyed by `shortName`). */
@@ -473,12 +475,22 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
     }
     set({ active: model, llamaStatus: "starting", activeProvider: "local" });
-    await invoke("llama_start", {
-      modelPath: model.path,
-      ctxSize: DEFAULT_CTX_SIZE,
-      gpuLayers: DEFAULT_GPU_LAYERS,
-      embeddings: get().embeddingsEnabled,
-    });
+    try {
+      await invoke("llama_start", {
+        modelPath: model.path,
+        ctxSize: DEFAULT_CTX_SIZE,
+        gpuLayers: DEFAULT_GPU_LAYERS,
+        embeddings: get().embeddingsEnabled,
+      });
+    } catch (err) {
+      // `llama_start` can reject before ever spawning the process (e.g.
+      // model verification or runtime binary resolution failure) — those
+      // paths never emit a `llama://status` event, so without this the
+      // optimistic "starting" set above would never be corrected and the
+      // UI would be stuck showing "Starting..." indefinitely.
+      set({ llamaStatus: "error" });
+      throw err;
+    }
     // The context limit for a local model is exactly the ctx_size it was
     // started with.
     useUsageStore.getState().setContextLimit(DEFAULT_CTX_SIZE);
@@ -544,6 +556,10 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       }));
       throw err;
     }
+  },
+
+  cancelOllamaPull: async (tag) => {
+    await invoke("ollama_cancel_pull", { tag });
   },
 
   importOllamaModel: async (name, path) => {
