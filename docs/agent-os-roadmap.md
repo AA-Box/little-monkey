@@ -812,11 +812,75 @@ still `Cancelled` there. Adding a terminal status to the event protocol is a
 compatibility change, and the distinguishable exit belongs on the process record
 that K4 is about.
 
-**Still open in K4:** no kernel enforcement (`setrlimit` via `pre_exec`, cgroups,
-job objects) — the watchdog is still cooperative userspace. No wall-clock budget
-for the in-app kinds, no declared caps for `background_shell`, no cap on
-foreground shell output, no browser-worker watchdog, and limits are not derived
-from a process class because no process class exists yet.
+**Shipped — the first kernel-held bound on a tool child, and a correction to what
+`rlimit` can actually deliver.** `os_limits::apply` installs limits through
+`pre_exec`, so they are in force between `fork` and `exec` — the target program
+never runs unbounded, and everything it spawns inherits them, which is how this
+reaches the grandchildren a supervisor cannot see. Wired into all three app-side
+spawn sites (`tools.rs`, `verify.rs`, `sandbox.rs`), each of which already put its
+child in a process group and had nothing else holding it.
+
+The valuable part of this slice is what it found out *not* to do. The acceptance
+paragraph below named six resources as if `setrlimit` covered them; it covers far
+less, and setting the tempting ones naively would break working code:
+
+- **`RLIMIT_CPU` is now nearly redundant, and dangerous set naively.** Shell tools
+  carry a 120 s wall-clock timeout that, since the process-group slice above, ends
+  the whole tree — so the escape CPU-time would close is already closed.
+  CPU-seconds also accumulate *per core*, so a 120 s CPU cap kills
+  `cargo build -j8` after roughly 15 s of wall time. An honest cap is
+  `wall x cores x headroom`, which bounds almost nothing the timeout does not.
+- **`RLIMIT_NPROC` is per real uid, not per process tree.** A fixed low value
+  counts every process the login user already has, including this app and their
+  browser, so it fails spuriously on a busy desktop. A tool child that cannot fork
+  because the user opened Chrome is a worse bug than an unbounded fork.
+- **`RLIMIT_RSS` is a no-op on Darwin** and advisory on Linux; **`RLIMIT_AS`
+  bounds virtual address space, not resident memory**, and Go, the JVM, sanitizers
+  and thread stacks reserve enormous ranges — so an AS cap either kills healthy
+  processes or is set high enough to bound nothing.
+- **`RLIMIT_FSIZE` is a per-file cap, not a disk quota.** It stops one runaway
+  file, not a million small ones.
+
+So what ships enabled is the baseline: **core dumps refused**, the one bound with
+no value that breaks working code and a real hazard behind it (a crashing build
+dropping gigabytes into the workspace). `max_file_bytes` and `max_open_files`
+exist, are tested, and are left unset, because choosing a number for them is a
+judgement about what the child is *for* — the agent shell is the site that
+legitimately downloads a 40 GB model — and that is the process class K4 still
+lacks. Inventing per-site constants now would be the hardcoding the acceptance
+already forbids.
+
+Two implementation rules that a passing spawn cannot reveal, both tested:
+
+- **A hard limit can never be raised by an unprivileged process.** Requesting more
+  than was inherited fails with `EPERM` and takes the whole spawn down instead of
+  bounding anything, so `resolve_target` clamps to the inherited hard limit and a
+  loosening is silently declined in favour of the stricter ceiling.
+- **Soft and hard are set together.** Leaving the hard limit alone would let the
+  child restore its own headroom with a `setrlimit` of its own, which makes the
+  bound advice rather than enforcement.
+- The `pre_exec` closure must be async-signal-safe, which is why `ChildLimits` is
+  `Copy` and the closure captures plain integers — no allocation, no lock, no
+  state shared with the parent.
+
+**One test was found to be false comfort and replaced.** Asserting the child
+reports `ulimit -c` of 0 passes on macOS whether or not this module does anything,
+because that is already the platform default — proven by deleting the `apply` call
+and watching it still pass. It now asserts on `ulimit -f`, which defaults to
+`unlimited` everywhere this ships and so can only read as a number if `pre_exec`
+ran. The enforcement test writes 64 KiB past a 4 KiB ceiling with nothing watching
+and asserts the kernel killed the writer; its counterpart writes 2 KiB under the
+same ceiling and must succeed, so a limit set low enough to kill everything cannot
+pass.
+
+**Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
+is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
+`JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
+unix, bounding committed memory, CPU time and process count for a whole tree. The
+daemon's memory watchdog is still cooperative userspace. No wall-clock budget for
+the in-app kinds, no declared caps for `background_shell`, no cap on foreground
+shell output, no browser-worker watchdog, and limits are still not derived from a
+process class because no process class exists yet.
 
 **Acceptance:** a limit set attached to every process record — CPU time, RSS,
 open files, disk written, wall clock, and process count — enforced by cgroups
@@ -824,6 +888,16 @@ v2 on Linux, job objects on Windows, and `rlimit` plus a supervising watchdog
 on macOS. Exceeding a limit terminates the process with a distinguishable exit
 status and a ledger event naming the limit, never a generic failure. Limits
 are set from the process's class, not hardcoded.
+
+**Correction to that acceptance, from building against it.** Three of those six
+resources cannot come from `rlimit` at all on macOS: RSS is a no-op there, process
+count is per-uid rather than per-tree, and wall clock is already delivered by the
+timeouts. So "`rlimit` plus a supervising watchdog on macOS" understates how much
+of the macOS story has to be the watchdog, and the Linux/Windows legs (cgroups v2,
+job objects) are carrying more of this item than the wording implies. The
+distinguishable-exit half is done (see the `limit_exceeded` slice above); the
+enforcement half is mostly still ahead, and it is platform work rather than
+`rlimit` work.
 
 **Blocks:** K7, K8 — admission control that cannot bound what it admits is a
 guess.
