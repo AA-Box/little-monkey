@@ -186,7 +186,9 @@ a scope boundary stated where it matters.
   never close one whose work is still running. Real limits: the table records
   what each kind reports, so a
   declared memory or wall-clock limit is *not* enforced by any OS mechanism
-  yet — there is no cgroup, job object or `setrlimit` anywhere; what enforcement
+  yet — there is no cgroup and no Windows job object, and `setrlimit` reaches only
+  tool children (see below), never memory, which the relevant limit cannot bound on
+  macOS at all; what enforcement
   exists is a userspace watchdog over daemon jobs plus per-tool timeouts. That
   watchdog measures a job's memory across its whole process group, so work moved
   into a grandchild is still counted, but the memory budget is opt-in
@@ -217,8 +219,10 @@ a scope boundary stated where it matters.
   the compiler it started running, still consuming the machine after the tool
   reported that it had timed out.
 - Tool children carry a bound the kernel holds them to, not only one this app
-  supervises. Shell tools, background commands, verify commands and sandboxed runs
+  supervises — three of the app's four spawn sites, the exception being a
   — all four places this app starts a process — get their resource
+  backgrounded shell, which is still unwired. Shell tools, verify commands and
+  sandboxed runs get their resource
   limits installed between `fork` and `exec`, so the program never runs unbounded
   and everything it spawns inherits them — which reaches the grandchildren a
   watchdog cannot see. Real limits, and they are the honest majority of this: what
@@ -233,6 +237,18 @@ a scope boundary stated where it matters.
   a no-op on macOS — so resident memory stays with the daemon's watchdog. On
   Windows this does nothing at all; the equivalent is a job object and it is not
   built yet.
+- A budget that fires finishes its own cleanup. Two places where it did not, both
+  found by auditing the enforcement already in place rather than adding more. A
+  browser session that hit its action quota was marked cancelled but its Chromium
+  was never killed — and because a cancelled session refuses every later call,
+  nothing could reach the shutdown path again, so the browser was left running,
+  idle, and reachable only by an explicit stop. Separately, a workflow run killed
+  for exceeding its wall clock stayed recorded as *running* forever: the run's
+  outcome was written by the same step that saves its history, and an aborted run
+  never reached that step. So the one kind of work with a real enforced time budget
+  leaked a live record every single time the budget worked. That record now also
+  says the budget was what stopped it, rather than reading as though the work
+  itself broke.
 - Every process kind declares the bounds it is actually subject to, derived from
   its kind rather than restated by each subsystem. This fixed a record that was
   wrong rather than merely quiet: a backgrounded shell's output has always been
