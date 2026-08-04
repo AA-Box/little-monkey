@@ -502,6 +502,19 @@ pub async fn tool_run_shell_background(
         use std::os::unix::process::CommandExt;
         command_builder.process_group(0);
     }
+    // Core dumps refused and nothing else, installed between `fork` and `exec`
+    // like the other three spawn sites — `apply_std` because this builder is
+    // `std::process::Command`, not tokio's. No file-size or descriptor ceiling
+    // here on purpose: this child is *meant* to outlive the call that spawned it,
+    // so a number for either would be a judgement about what a command nobody
+    // has classified is for, which is the process class K4 still lacks. Refusing
+    // core dumps carries no such judgement — a dev server that segfaults should
+    // not drop gigabytes into the workspace it was started in, and unlike the
+    // foreground tool there is no timeout here to end it.
+    crate::os_limits::apply_std(
+        crate::os_limits::ChildLimits::baseline(),
+        &mut command_builder,
+    );
     let mut child = command_builder
         .spawn()
         .map_err(|error| format!("Failed to spawn shell: {error}"))?;

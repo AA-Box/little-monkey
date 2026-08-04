@@ -217,7 +217,8 @@ a scope boundary stated where it matters.
   the compiler it started running, still consuming the machine after the tool
   reported that it had timed out.
 - Tool children carry a bound the kernel holds them to, not only one this app
-  supervises. Shell tools, verify commands and sandboxed runs get their resource
+  supervises. Shell tools, background commands, verify commands and sandboxed runs
+  — all four places this app starts a process — get their resource
   limits installed between `fork` and `exec`, so the program never runs unbounded
   and everything it spawns inherits them — which reaches the grandchildren a
   watchdog cannot see. Real limits, and they are the honest majority of this: what

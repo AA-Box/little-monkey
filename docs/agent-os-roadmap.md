@@ -816,9 +816,19 @@ that K4 is about.
 `rlimit` can actually deliver.** `os_limits::apply` installs limits through
 `pre_exec`, so they are in force between `fork` and `exec` — the target program
 never runs unbounded, and everything it spawns inherits them, which is how this
-reaches the grandchildren a supervisor cannot see. Wired into all three app-side
-spawn sites (`tools.rs`, `verify.rs`, `sandbox.rs`), each of which already put its
-child in a process group and had nothing else holding it.
+reaches the grandchildren a supervisor cannot see. Wired into all four app-side
+spawn sites (`tools.rs`, `verify.rs`, `sandbox.rs`, `background_shell.rs`), each of
+which already put its child in a process group and had nothing else holding it.
+
+`background_shell.rs` needed a second entry point rather than a second call:
+it builds a `std::process::Command`, because its child is deliberately not
+`kill_on_drop`, and std and tokio each carry their own `pre_exec` with no trait
+covering both. `apply_std` is that entry point, and both it and `apply` install
+the same private `install` body — a site that cannot use tokio's builder must not
+be a site with weaker limits. It takes the baseline and nothing more: no
+file-size or descriptor ceiling, because a command whose whole purpose is to
+outlive the call that started it is exactly the case where a number would be a
+judgement about what the child is *for*.
 
 The valuable part of this slice is what it found out *not* to do. The acceptance
 paragraph below named six resources as if `setrlimit` covered them; it covers far
@@ -871,7 +881,9 @@ and watching it still pass. It now asserts on `ulimit -f`, which defaults to
 ran. The enforcement test writes 64 KiB past a 4 KiB ceiling with nothing watching
 and asserts the kernel killed the writer; its counterpart writes 2 KiB under the
 same ceiling and must succeed, so a limit set low enough to kill everything cannot
-pass.
+pass. `apply_std` carries its own copy of the `-f` assertion for the same reason:
+deleting its `apply_std` call fails on `-f` and leaves `-c` passing, which is what
+proves the new path is covered rather than merely exercised.
 
 **Shipped — every kind declares the bounds it is actually subject to, and one row
 stopped lying.** `ProcessLimits` was populated by exactly one writer: the daemon.
