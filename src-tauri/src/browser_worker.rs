@@ -2075,22 +2075,26 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
 
-    /// A child that stays alive long enough to be observed, then killed.
+    /// A child for the quota tests to observe.
     ///
-    /// Per platform because there is no portable `sleep`: an earlier version of
-    /// this helper spawned `sleep 30` unconditionally and failed on Windows, where
-    /// no such executable exists. `timeout` is deliberately not the Windows
-    /// substitute — it refuses to run with redirected stdin, which these tests
-    /// always use — so `ping` against loopback is the sleep that survives having no
-    /// console.
-    fn long_lived_child() -> Child {
-        // `ping` is invoked directly rather than through `cmd /C`: Rust's argument
-        // quoting for `cmd.exe` is a known trap, and `ping` is a real executable on
-        // PATH that needs no shell.
+    /// There is no portable long-lived child, and two attempts at one both failed
+    /// only on Windows CI: `sleep 30` does not exist there at all, and `ping -n 31`
+    /// exited immediately on the runner. `timeout` is not the answer either — it
+    /// refuses to run with redirected stdin, which these tests always use.
+    ///
+    /// So the tests no longer depend on one. The load-bearing assertion is the
+    /// portable invariant that `stop()` *takes* the child out of the session, which
+    /// holds whether or not the child is still running — and since the defect was
+    /// precisely that `stop()` was never called, that is the right thing to assert.
+    /// Unix additionally gets a real `sleep`, so there the process death is checked
+    /// at the OS level as well.
+    fn observable_child() -> Child {
         #[cfg(windows)]
         let mut command = {
-            let mut command = std::process::Command::new("ping");
-            command.args(["-n", "31", "127.0.0.1"]);
+            // Only ever inspected as a handle, never waited on, so its lifetime
+            // does not matter here.
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "exit"]);
             command
         };
         #[cfg(unix)]
@@ -2127,7 +2131,7 @@ mod tests {
         let stream = std::net::TcpStream::connect(address).unwrap();
         let _server_side = accepted.join().unwrap();
 
-        let child = long_lived_child();
+        let child = observable_child();
         let pid = child.id();
 
         let grant = ValidatedGrant::new(BrowserGrant {
@@ -2175,8 +2179,8 @@ mod tests {
     /// return early — so nothing could ever reach `stop()` again. The child was
     /// left idle *and* unreachable.
     ///
-    /// Asserted on the real child rather than on a flag, because a flag was
-    /// exactly what was already being set correctly.
+    /// Asserted on the child rather than on a flag, because the flag was exactly
+    /// what was already being set correctly.
     #[test]
     fn tripping_the_action_quota_kills_the_child_it_cancels() {
         let (browser, pid) = quota_session(1);
@@ -2185,8 +2189,8 @@ mod tests {
             .begin_action()
             .expect("the first action is inside the quota");
         assert!(
-            crate::os_signal::process_is_alive(pid),
-            "the child must still be running while the session is under quota"
+            browser.child.lock().unwrap().is_some(),
+            "the session must still hold its child while it is under quota"
         );
 
         let error = browser
@@ -2195,14 +2199,22 @@ mod tests {
         assert!(error.contains("action quota"), "got {error:?}");
 
         assert!(
-            !crate::os_signal::process_is_alive(pid),
-            "the child outlived the quota that cancelled its session, and no later \
-             call can reach stop() once `cancelled` is latched"
+            browser.child.lock().unwrap().is_none(),
+            "the quota cancelled the session without tearing its child down, and no \
+             later call can reach stop() once `cancelled` is latched"
         );
+        // Where a genuinely long-lived stand-in is available, check the stronger
+        // claim too: the process is gone, not merely disowned.
+        #[cfg(unix)]
+        assert!(
+            !crate::os_signal::process_is_alive(pid),
+            "the child outlived the quota that cancelled its session"
+        );
+        let _ = pid;
     }
 
     /// The counterpart: a session inside its quota must not be torn down. Without
-    /// this, killing the child unconditionally would pass the test above.
+    /// this, tearing the child down unconditionally would pass the test above.
     #[test]
     fn a_session_inside_its_action_quota_keeps_its_child() {
         let (browser, pid) = quota_session(8);
@@ -2212,9 +2224,15 @@ mod tests {
         }
 
         assert!(
+            browser.child.lock().unwrap().is_some(),
+            "a session under its quota must keep its child"
+        );
+        #[cfg(unix)]
+        assert!(
             crate::os_signal::process_is_alive(pid),
             "a session under its quota must keep running"
         );
+        let _ = pid;
         browser.stop().ok();
     }
 
