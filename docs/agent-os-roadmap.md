@@ -687,30 +687,32 @@ three platforms is a framework. Also K21 concretely — its conformance suite mu
 cover the isolation guarantees, which cannot be asserted uniformly while two
 platforms have none.
 
-## K4. Enforced per-process resource limits
+## K4. Enforced per-process resource limits *(userspace built; platform legs deferred)*
 
-**Today:** there is **no kernel-level resource enforcement anywhere** — no
-`setrlimit`, no cgroup, no job object, no `prctl`, no `seccomp`. An earlier draft
-of this file claimed `rlimit` was used in `browser_worker.rs`; that was a
-case-insensitive grep matching the `BrowserLimits` struct, which is cooperative
-userspace bookkeeping checked on each agent action (`begin_action`) with no
-watchdog — so an idle Chromium child is never checked at all. Agent shell and
-tool execution inherits whatever the host allows. The offload planner reasons
-about memory *before* a load but does not bound a running process.
+**Where this stands.** Every bound this app can enforce without a platform
+mechanism is built, and the entries below are the record of each slice. What
+remains is two per-platform mechanisms, and auditing them established that
+**neither should be built as this item's acceptance describes** — see *Deferred,
+with reasons* at the end. So K4 is not "half done"; its userspace half is
+finished and its platform half has been re-scoped rather than skipped.
 
-A process record now carries a **declared** limit set (`ProcessLimits`, K1), and
-the daemon populates it from its own `max_runtime_ms`/`max_memory_bytes`/
-`max_log_bytes`. Declaring is not enforcing, and the field docs say so rather
-than implying a guarantee that does not exist.
+What is enforced today: kernel-held `setrlimit` bounds on all four app-side spawn
+sites, process-group termination on every timeout, a sampling watchdog over daemon
+jobs that measures memory across the whole process group, a per-kind declared limit
+set, a bounded cap on the shell output that reaches a model, a browser-session
+watchdog, and a wall-clock budget mechanism for the four WebView kinds. A limit kill
+records as `limit_exceeded` rather than as an indistinguishable cancel, on every
+host.
 
-**Correction to the "Today" above, found by auditing it rather than re-reading
-it.** "No enforcement anywhere" was wrong in the other direction: there *is* a
-working userspace watchdog, in the daemon's job runner, killing on wall clock, on
-RSS sampled every 100–1000 ms, and on log-file size. Two things kept that from
-being visible — the memory budget is opt-in (`--max-memory-mb`, no default) and
-the wall-clock default is seven days — but the mechanism exists and works. What
-was missing is enforcement at the *tool* level, and the honest summary is
-"cooperative bounds, scattered and partial" rather than "none".
+**Two earlier drafts of this section were wrong in opposite directions**, which is
+worth keeping as a caution about how this file gets written. The first claimed
+`rlimit` was already used in `browser_worker.rs` — that was a case-insensitive grep
+matching the `BrowserLimits` struct, which is cooperative userspace bookkeeping. The
+second over-corrected to "no kernel-level resource enforcement anywhere, and no
+enforcement at all", which missed a working userspace watchdog in the daemon's job
+runner that had been killing on wall clock, sampled RSS, and log size the whole
+time. The honest summary before this item's work began was "cooperative bounds,
+scattered and partial" — neither "already handled" nor "none".
 
 **Shipped — the memory budget measures the process tree.** That watchdog sampled
 `ps -o rss= -p <pid>`: the direct child only. For an agent job the direct child is
@@ -1090,15 +1092,40 @@ same tick by the existing fan-out.
   `started_at_ms` deliberately survives resume and there is no accumulated-suspended
   column — a long-parked turn trips the moment it resumes.
 
-**Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
-is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
-`JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
-unix, bounding committed memory, CPU time and process count for a whole tree. The
-daemon's memory watchdog is still cooperative userspace, and it runs in a different
-OS process from the app-side children, so it cannot simply be extended to cover
-them. RSS is nowhere kernel-enforced on any platform.
+### Deferred, with reasons — the two platform legs
 
-Still genuinely missing, after the corrections above narrowed the list:
+Both are named in the acceptance below. Auditing them established that neither is
+"the remaining coding work", so they are recorded here rather than left implying a
+sprint's worth of effort.
+
+**Linux cgroups v2 — likely unobtainable in the target environment, not merely
+unbuilt.** An unprivileged desktop app cannot count on a writable, controller-enabled
+cgroup: `/sys/fs/cgroup` is root-owned, the no-internal-process rule forces the app
+to migrate its *own* process into a sibling leaf before it can enable controllers,
+the parent scope belongs to `systemd --user`, and delegation is only sanctioned under
+`Delegate=yes` — which a `.desktop` launch does not have. It fails outright on
+v1/hybrid hosts, without systemd, and in containers. The route that *does* work is a
+**systemd transient scope over D-Bus**, which is a different mechanism than this leg
+describes. It also has no honest CI story: GitHub's ubuntu runner has no
+`systemd --user` session (this repo's own `ci.yml` has to `dbus-launch` its own bus).
+A `sudo` variant would test the Linux kernel, which nobody doubts, and prove nothing
+about whether the app can obtain a cgroup; a probe-and-skip test would be green while
+asserting nothing, which reads as coverage. **If wanted, file the transient-scope
+route as its own item with an `Unavailable(reason)` surfaced to the user.**
+
+**Windows job objects — real and CI-testable, but the sharpest asymmetric hazard in
+this item.** `KILL_ON_JOB_CLOSE` makes a dropped guard tear down the whole tree on
+Windows while being a silent no-op on macOS: invisible on the machine the code is
+written on, fatal on the platform that cannot be typechecked there (Homebrew rustc,
+`aarch64-apple-darwin` only). `background_shell.rs` is exactly the wrong-owner case —
+its child is *meant* to outlive the spawning call — so a misplaced guard would kill
+every Windows background shell instantly. It also needs a signature change, since
+`apply` returns `()` while a job handle is an owned resource whose lifetime must span
+the child, plus four call-site changes. **It is not the fill-in-the-no-op the
+acceptance wording implies, and it should be built with CI in the loop from the first
+commit rather than written blind.**
+
+### Still genuinely missing, after the corrections above narrowed the list
 
 - The four WebView kinds' wall budget is **enforced but unset** (see below): the
   mechanism fires for nobody until a number is configured, and choosing that number
@@ -1143,10 +1170,21 @@ resources cannot come from `rlimit` at all on macOS: RSS is a no-op there, proce
 count is per-uid rather than per-tree, and wall clock is already delivered by the
 timeouts. So "`rlimit` plus a supervising watchdog on macOS" understates how much
 of the macOS story has to be the watchdog, and the Linux/Windows legs (cgroups v2,
-job objects) are carrying more of this item than the wording implies. The
-distinguishable-exit half is done (see the `limit_exceeded` slice above); the
-enforcement half is mostly still ahead, and it is platform work rather than
-`rlimit` work.
+job objects) are carrying more of this item than the wording implies — and both of
+those are now deferred with reasons above, so the wording is carrying weight nothing
+is going to pick up soon.
+
+**Amend the acceptance rather than leaving it standing.** Of its six resources, three
+cannot be delivered by the mechanism it names: RSS is nowhere kernel-enforced on any
+platform, "open files" has no Windows job-object equivalent so it is permanently
+unix-only, and "disk written" has no field in
+`JOBOBJECT_EXTENDED_LIMIT_INFORMATION` at all. A job-object committed-memory limit
+also makes allocations *fail* rather than terminating the process, so it would not
+satisfy "terminates the process with a distinguishable exit status" even once built.
+The distinguishable-exit half of the acceptance **is** met, on every host. What the
+criteria should say is that CPU time, wall clock and captured output are bounded,
+that memory is bounded by a sampling watchdog rather than by the kernel, and that
+process count and disk written need a mechanism this app does not have.
 
 **Blocks:** K7, K8 — admission control that cannot bound what it admits is a
 guess.
