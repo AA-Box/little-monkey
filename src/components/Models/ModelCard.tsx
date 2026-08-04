@@ -1,4 +1,4 @@
-import { AlertTriangle, Download, Play, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, Download, Play, Square, Trash2, X } from "lucide-react";
 import type { ModelInfo } from "../../lib/modelRegistry";
 import { formatBytes, formatSizeGb } from "../../lib/modelRegistry";
 import { useT } from "../../lib/i18n";
@@ -22,6 +22,7 @@ export interface ModelCardProps {
   /** Present while `model.file` is being downloaded. */
   downloadProgress?: DownloadProgress;
   onInstall: () => void;
+  onCancelDownload: () => void;
   onDelete: () => void;
   onStart: () => void;
   onStop: () => void;
@@ -40,6 +41,7 @@ export function ModelCard({
   llamaStatus,
   downloadProgress,
   onInstall,
+  onCancelDownload,
   onDelete,
   onStart,
   onStop,
@@ -88,20 +90,31 @@ export function ModelCard({
 
       <div className="flex shrink-0 items-center gap-2">
         {isDownloading && downloadProgress ? (
-          <div className="flex flex-col items-end gap-1">
-            <div className="h-1.5 w-28 overflow-hidden rounded-full bg-surface-2">
-              <div
-                className="h-full rounded-full bg-accent transition-[width] duration-300"
-                style={{ width: `${progressPct}%` }}
-              />
+          <div className="flex items-center gap-2">
+            <div className="flex flex-col items-end gap-1">
+              <div className="h-1.5 w-28 overflow-hidden rounded-full bg-surface-2">
+                <div
+                  className="h-full rounded-full bg-accent transition-[width] duration-300"
+                  style={{ width: `${progressPct}%` }}
+                />
+              </div>
+              <span className="text-xs text-muted">
+                {t("ModelCard.downloadProgressLabel", {
+                  downloaded: formatBytes(downloadProgress.downloaded),
+                  total: formatBytes(downloadProgress.total),
+                  pct: progressPct,
+                })}
+              </span>
             </div>
-            <span className="text-xs text-muted">
-              {t("ModelCard.downloadProgressLabel", {
-                downloaded: formatBytes(downloadProgress.downloaded),
-                total: formatBytes(downloadProgress.total),
-                pct: progressPct,
-              })}
-            </span>
+            <IconButton
+              variant="ghost"
+              size="sm"
+              aria-label={t("ModelCard.cancelDownloadAriaLabel")}
+              title={t("ModelCard.cancelDownloadAriaLabel")}
+              onClick={onCancelDownload}
+            >
+              <X size={14} />
+            </IconButton>
           </div>
         ) : !model.installed ? (
           <Button variant="secondary" size="sm" onClick={onInstall}>

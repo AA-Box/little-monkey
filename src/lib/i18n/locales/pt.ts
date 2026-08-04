@@ -1048,6 +1048,8 @@ export const pt: Record<string, string> = {
   "MessageBubble.attachedImageAlt": "Anexado",
   "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Visualização",
+  "MessageBubble.copyButton": "Copiar código",
+  "MessageBubble.copiedLabel": "Copiado",
   "WorkspaceImage.loading": "Carregando imagem…",
   "WorkspaceImage.error": "Imagem indisponível: {{error}}",
   "WorkspaceImage.generatedAlt": "Imagem gerada",
