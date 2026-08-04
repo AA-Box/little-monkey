@@ -944,6 +944,23 @@ pub async fn tool_run_shell(
         }
     };
 
+    // A timeout or a Stop must end the whole tree, not the shell we spawned.
+    //
+    // `kill_on_drop` (set above) SIGKILLs exactly one pid, so `sh -c "cargo
+    // build"` reaped the shell and left the compiler running — consuming the
+    // machine long after the tool reported "timed out after 120 seconds". The pgid
+    // was already known here and used for suspend/resume; it simply was not used
+    // for the kill. TERM first, so a build can flush and clean up its temp files.
+    if outcome.is_err() {
+        if let Some(pgid) = registered_pgid {
+            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                // Swallowed: `kill_on_drop` still reaps the direct child below, so
+                // the worst case is the orphan this used to leave every time.
+                eprintln!("run_shell: could not terminate process group {pgid}: {error}");
+            }
+        }
+    }
+
     if let Some(pgid) = registered_pgid {
         forget_shell_process_group(state.inner(), &cancel_key, pgid);
     }

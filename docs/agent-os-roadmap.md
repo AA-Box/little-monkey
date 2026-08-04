@@ -703,6 +703,52 @@ the daemon populates it from its own `max_runtime_ms`/`max_memory_bytes`/
 `max_log_bytes`. Declaring is not enforcing, and the field docs say so rather
 than implying a guarantee that does not exist.
 
+**Correction to the "Today" above, found by auditing it rather than re-reading
+it.** "No enforcement anywhere" was wrong in the other direction: there *is* a
+working userspace watchdog, in the daemon's job runner, killing on wall clock, on
+RSS sampled every 100–1000 ms, and on log-file size. Two things kept that from
+being visible — the memory budget is opt-in (`--max-memory-mb`, no default) and
+the wall-clock default is seven days — but the mechanism exists and works. What
+was missing is enforcement at the *tool* level, and the honest summary is
+"cooperative bounds, scattered and partial" rather than "none".
+
+**Shipped — a bound now applies to the process tree, not to the one pid we
+spawned.** Every timeout in the app was `kill_on_drop`, which SIGKILLs exactly one
+process, so a 120s `SHELL_TIMEOUT` on `sh -c "cargo build"` reaped the shell and
+left the compiler running — consuming the machine long after the tool reported
+"timed out". A wall-clock bound that leaves the work running is not a bound.
+`tools.rs` already knew its pgid and used it for suspend/resume; it simply never
+used it for the kill. `verify.rs` and `sandbox.rs` did not even put their children
+in a process group, so they had no pgid to use.
+
+Three findings, in the order they turned up:
+
+- **The Windows tree-kill primitive already existed** — `taskkill /T /F` — as a
+  private function inside the daemon *binary*, which the app cannot link to. That
+  is precisely why the app leaked orphans there. So this is a consolidation:
+  `os_signal::terminate_process_group` owns TERM → grace → KILL on both platforms,
+  and the daemon calls it instead of its own copy. That copy also polled
+  `kill -0` up to forty times per terminate — around forty fork+execs, now one
+  syscall each.
+- **The poll-until-gone loop can never fire early, and both implementations had
+  it.** The group leader is a child of the calling process that has not been
+  reaped yet, so after TERM it lingers as a zombie — and a zombie still exists as
+  far as `kill(pid, 0)` is concerned. So the "return as soon as it is gone" check
+  never succeeds, and every terminate paid the entire grace period, on a tokio
+  worker thread, at a timeout boundary. Measured at 2.02s per call before the fix
+  and 0.27s after. The grace is now a flat 250 ms, sized for what it actually
+  protects: a build flushing output and removing temp files takes milliseconds,
+  and anything still alive afterwards was ignoring TERM anyway.
+- **The test had to assert on a grandchild.** Killing the direct child was never
+  the broken part, so a test that checked the child would have passed against the
+  old code *and* hidden the stall above. Verified load-bearing by signalling the
+  pid instead of the group, which reproduces the old behaviour: "the grandchild
+  survived its group being terminated".
+
+`os_signal` also had three near-identical `killpg` call sites; they now share one
+validated helper, so the rule that a pgid of `0` means "our own group" and must be
+refused cannot drift between the signals that depend on it.
+
 **Acceptance:** a limit set attached to every process record — CPU time, RSS,
 open files, disk written, wall clock, and process count — enforced by cgroups
 v2 on Linux, job objects on Windows, and `rlimit` plus a supervising watchdog

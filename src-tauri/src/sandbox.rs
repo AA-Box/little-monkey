@@ -826,10 +826,27 @@ pub async fn execute_in_sandbox(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Its own process group, so the timeout below ends the whole tree. Without it
+    // `kill_on_drop` reaps only `sandbox-exec` (or the bare `sh` on the platforms
+    // with no Seatbelt), and a sandboxed command that spawns a build leaves that
+    // build running — with write access to the sandbox copy of the workspace and
+    // no remaining supervisor.
+    #[cfg(unix)]
+    command.process_group(0);
 
     let child = command.spawn()?;
+    // Captured before `wait_with_output` consumes the child; with
+    // `process_group(0)` the child's own pid is also its group id.
+    let child_pgid = child.id();
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if result.is_err() {
+        if let Some(pgid) = child_pgid {
+            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+            }
+        }
+    }
 
     match result {
         Ok(Ok(output)) => Ok(SandboxExecOutcome {
