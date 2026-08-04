@@ -232,6 +232,17 @@ a scope boundary stated where it matters.
   a no-op on macOS — so resident memory stays with the daemon's watchdog. On
   Windows this does nothing at all; the equivalent is a job object and it is not
   built yet.
+- Every process kind declares the bounds it is actually subject to, derived from
+  its kind rather than restated by each subsystem. This fixed a record that was
+  wrong rather than merely quiet: a backgrounded shell's output has always been
+  truncated at 256 KiB, but its row declared no output ceiling, so `monkey
+  processes show` printed `limits none declared` for a process that had one. Real
+  limit, and it is most of the table: exactly one kind carries a bound at this
+  level. A chat turn, subagent or crew member runs an unbounded number of
+  individually-bounded tool calls, so nothing caps the turn itself — and no
+  wall-clock or memory number was invented to fill the gap, because that would be
+  a guess presented as policy. Daemon jobs stay bounded by their own recipe rather
+  than by their kind, which is a truer number than any class default.
 - Stop or suspend anything from anywhere, including a terminal. `monkey
   processes signal <id> stop|suspend|resume|kill` (and `monkey processes
   signals` for the support matrix) records the request as durable intent on the

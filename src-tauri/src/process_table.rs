@@ -282,6 +282,76 @@ impl ProcessKind {
         ProcessKind::BackgroundShell,
         ProcessKind::SideTask,
     ];
+
+    /// The bounds a process of this kind is *actually* subject to, seeded into
+    /// every [`AdmitProcess`] and [`ProcessProjection`] so a row carries its
+    /// class's declaration without each adopter restating it — K4's "limits are
+    /// set from the process's class, not hardcoded".
+    ///
+    /// Declared per kind for the same reason [`Self::restart_policy`] is: the
+    /// answer differs by kind, and stating it in one place makes it a decision
+    /// rather than an omission. Before this, only the daemon populated a limit
+    /// set at all, so the other eight kinds recorded all-`None` — which reads as
+    /// "unbounded" and was indistinguishable from "nobody looked".
+    ///
+    /// # `None` is a finding, not an unfinished cell
+    ///
+    /// A `None` here means this app genuinely does not bound that resource for
+    /// that kind, and the row should say so rather than carry a number nothing
+    /// enforces. That is most of this table, and it is the honest state of K4:
+    /// the desktop-owned kinds have per-*tool* timeouts (`SHELL_TIMEOUT`,
+    /// `DEFAULT_VERIFY_TIMEOUT_SECS`) but no budget on the process that issues
+    /// them, so the turn itself is unbounded however many tools it runs.
+    ///
+    /// Deliberately not invented here: a wall-clock or memory number per kind
+    /// would be a guess presented as policy. Kernel enforcement now exists for
+    /// tool children ([`crate::os_limits`]), and what it taught is that choosing
+    /// a value is a judgement about what the process is *for* — see that module
+    /// for why `RLIMIT_CPU`, `NPROC`, `RSS` and `AS` are the wrong instruments.
+    pub fn default_limits(self) -> ProcessLimits {
+        match self {
+            // The one desktop kind with a real, enforced ceiling: a backgrounded
+            // shell keeps a front-truncated output tail bounded by
+            // `background_shell::MAX_OUTPUT_BYTES`. That bound has always been
+            // enforced while the row claimed `None`, so the record was actively
+            // wrong rather than merely silent.
+            //
+            // The subsystem's constant is referenced rather than copied. It puts
+            // a dependency from the generic ledger onto one subsystem, which is
+            // the lesser evil: a second copy of the number could drift from the
+            // code that enforces it, and a declaration that disagrees with the
+            // enforcement is worse than a slightly untidy dependency.
+            ProcessKind::BackgroundShell => ProcessLimits {
+                max_output_bytes: Some(
+                    u64::try_from(crate::background_shell::MAX_OUTPUT_BYTES).unwrap_or(u64::MAX),
+                ),
+                // No wall bound on purpose: a background shell is meant to
+                // outlive the turn that started it, so it is spawned with
+                // neither a timeout nor `kill_on_drop`.
+                ..ProcessLimits::default()
+            },
+            // The daemon writes its own per-job `max_runtime_ms`/
+            // `max_memory_bytes`/`max_log_bytes` onto the row, which are truer
+            // than any class default because they came from the job's own
+            // recipe. A non-empty default here would be overwritten on the next
+            // projection anyway, so claiming one would only mislead a reader
+            // between admission and the first tick.
+            ProcessKind::DaemonJob => ProcessLimits::default(),
+            // Nothing bounds these per process. A chat turn, a subagent and a
+            // crew member each run an unbounded number of bounded tool calls; a
+            // workflow run and node carry the executor's own per-node budgets,
+            // which are not these fields; and a remote run records that a
+            // controller *asked* for work rather than the work itself, so the
+            // daemon job it spawns is what carries limits.
+            ProcessKind::ChatTurn
+            | ProcessKind::Subagent
+            | ProcessKind::CrewMember
+            | ProcessKind::WorkflowRun
+            | ProcessKind::WorkflowNode
+            | ProcessKind::RemoteRun
+            | ProcessKind::SideTask => ProcessLimits::default(),
+        }
+    }
 }
 
 /// The one state vocabulary, replacing four incompatible ones.
@@ -399,23 +469,40 @@ impl ExitStatus {
 /// The limit set attached to a process.
 ///
 /// `None` means "not bounded by this process record" — honest, and different
-/// from zero. Nothing in this module enforces these; they are the declaration a
-/// scheduler and the platform enforcement in K4 read. Recording them here does
-/// not make them enforced, and the field docs say so rather than implying a
-/// guarantee that does not exist yet.
+/// from zero. Nothing in *this module* enforces these; it records them.
+/// [`ProcessKind::default_limits`] is where each kind's set comes from, and the
+/// enforcement, where it exists, lives with whoever owns the process.
+///
+/// Recording a value here still does not make it enforced. The field docs below
+/// say which are backed by something and which are declaration only, rather than
+/// implying a uniform guarantee that does not exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessLimits {
-    /// Wall-clock budget. The daemon already enforces its own equivalent
-    /// (`max_runtime_ms`); no other kind enforces anything.
+    /// Wall-clock budget. Enforced only for `daemon_job`, whose watchdog kills on
+    /// its own `max_runtime_ms`. No other kind bounds its own wall time — the
+    /// desktop kinds have per-*tool* timeouts, not a budget on the process that
+    /// issues the tools.
     pub max_wall_ms: Option<u64>,
-    /// Resident memory ceiling. Declared only; no platform mechanism reads it
-    /// yet (see K4 — there is no `setrlimit`, cgroup or job object anywhere in
-    /// this app today).
+    /// Resident memory ceiling. Enforced only for `daemon_job`, by a sampling
+    /// watchdog that measures the whole process group.
+    ///
+    /// Deliberately *not* enforced by `setrlimit`, which does exist now for tool
+    /// children ([`crate::os_limits`]): `RLIMIT_RSS` is a no-op on Darwin and
+    /// advisory on Linux, and `RLIMIT_AS` bounds virtual address space rather than
+    /// resident memory. Bounding this per process needs cgroups v2 or a Windows
+    /// job object, neither of which is built.
     pub max_memory_bytes: Option<u64>,
-    /// Captured output ceiling.
+    /// Captured output ceiling. Enforced for `daemon_job` (log-file size) and for
+    /// `background_shell`, whose in-memory tail is front-truncated at this many
+    /// bytes.
     pub max_output_bytes: Option<u64>,
-    /// Child-process ceiling.
+    /// Child-process ceiling. Declaration only, for every kind.
+    ///
+    /// `RLIMIT_NPROC` cannot deliver this: it counts processes per real uid rather
+    /// than per tree, so a value low enough to matter fails whenever the user's
+    /// own session is busy. This needs the cgroup `pids` controller or a job
+    /// object.
     pub max_child_processes: Option<u32>,
 }
 
@@ -540,7 +627,11 @@ impl AdmitProcess {
             run_id: None,
             workspace: None,
             profile: None,
-            limits: ProcessLimits::default(),
+            // Seeded from the class, so a row is never accidentally declared
+            // unbounded just because its adopter did not think about limits.
+            // `with_limits` still overrides, which is how the daemon supplies its
+            // truer per-job values.
+            limits: kind.default_limits(),
         }
     }
 
@@ -767,7 +858,11 @@ impl ProcessProjection {
             workspace: None,
             profile: None,
             native_pid: None,
-            limits: ProcessLimits::default(),
+            // Same seeding as `AdmitProcess::new`, and it has to be here too:
+            // `reconcile` admits through a projection, so a kind whose only
+            // adopter projects (every desktop kind) would otherwise never pick up
+            // its class's limits at all.
+            limits: kind.default_limits(),
         }
     }
 
@@ -1954,6 +2049,115 @@ mod tests {
         assert_eq!(json["externalId"], "task-wire");
         assert_eq!(json["kind"], "side_task");
         assert_eq!(json["state"], "admitted");
+    }
+
+    /// The declaration must match what the app really enforces, so this asserts
+    /// the *shape of the honesty*: exactly one kind carries a bound, and its
+    /// number is the constant the enforcing code uses.
+    #[test]
+    fn every_kind_declares_the_bounds_it_is_actually_subject_to() {
+        let bounded: Vec<ProcessKind> = ProcessKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| !kind.default_limits().is_unbounded())
+            .collect();
+        assert_eq!(
+            bounded,
+            vec![ProcessKind::BackgroundShell],
+            "a kind gained or lost a class-level bound; if that is intended, the \
+             field docs on ProcessLimits and the K4 roadmap entry have to move with it"
+        );
+
+        let shell = ProcessKind::BackgroundShell.default_limits();
+        assert_eq!(
+            shell.max_output_bytes,
+            Some(u64::try_from(crate::background_shell::MAX_OUTPUT_BYTES).unwrap()),
+            "the declared output ceiling must be the one the tail truncation uses"
+        );
+        // A background shell is meant to outlive its turn, so it is spawned with
+        // no timeout at all. Declaring a wall bound here would be a lie.
+        assert_eq!(shell.max_wall_ms, None);
+        assert_eq!(shell.max_memory_bytes, None);
+
+        // The daemon is bounded, but by its own per-job recipe rather than by its
+        // class — a class default would be overwritten on the next projection and
+        // would only mislead a reader in between.
+        assert!(ProcessKind::DaemonJob.default_limits().is_unbounded());
+    }
+
+    /// The seeding has to reach the stored row, not just the builder, and it has
+    /// to lose to an explicit value — which is how the daemon supplies its truer
+    /// per-job numbers.
+    #[test]
+    fn a_row_carries_its_class_limits_unless_the_caller_states_better_ones() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let shell = admit(&table, ProcessKind::BackgroundShell, "shell-classlimits");
+        assert_eq!(
+            shell.limits,
+            ProcessKind::BackgroundShell.default_limits(),
+            "an adopter that never mentions limits must still record its class's"
+        );
+        assert_eq!(
+            table
+                .get(&shell.process_id)
+                .expect("the row reads back")
+                .expect("the row exists")
+                .limits,
+            ProcessKind::BackgroundShell.default_limits(),
+            "the class limits must survive the round-trip through SQL"
+        );
+
+        // A turn declares nothing, and that has to stay visible as nothing rather
+        // than inheriting another kind's ceiling.
+        let turn = admit(&table, ProcessKind::ChatTurn, "turn-classlimits");
+        assert!(turn.limits.is_unbounded());
+
+        let explicit = ProcessLimits {
+            max_wall_ms: Some(30_000),
+            max_output_bytes: Some(64),
+            ..ProcessLimits::default()
+        };
+        let overridden = table
+            .admit(
+                &AdmitProcess::new(ProcessKind::BackgroundShell, "shell-override")
+                    .with_limits(explicit),
+                T0,
+            )
+            .expect("admit succeeds");
+        assert_eq!(
+            overridden.limits, explicit,
+            "an explicit limit set must win over the class default"
+        );
+    }
+
+    /// `reconcile` admits through a projection, so the desktop kinds — whose only
+    /// adopters project rather than admit — would miss their class limits
+    /// entirely if only `AdmitProcess` were seeded.
+    #[test]
+    fn a_projected_row_also_carries_its_class_limits() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+
+        let (record, _outcome) = table
+            .reconcile(
+                &ProcessProjection::new(
+                    ProcessKind::BackgroundShell,
+                    "shell-projected",
+                    ProcessState::Running,
+                ),
+                T0,
+            )
+            .expect("a projection admits the row it describes");
+
+        assert_eq!(
+            record.limits.max_output_bytes,
+            ProcessKind::BackgroundShell
+                .default_limits()
+                .max_output_bytes,
+            "a projected shell must declare the ceiling its tail truncation enforces"
+        );
     }
 
     #[test]
