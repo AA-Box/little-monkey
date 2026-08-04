@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 // top comments on `parseTaskArgs`/`resolveSubagentStatus` for the same note.
 import {
   extractChildToolCalls,
+  groupChildToolCalls,
   parseTaskArgs,
   resolveSubagentStatus,
   statusLabelKey,
@@ -122,6 +123,15 @@ describe("extractChildToolCalls", () => {
     ]);
   });
 
+  it("flattens every group's calls, in order", () => {
+    const messages: ChatMessage[] = [
+      { role: "assistant", content: "looking", tool_calls: [{ id: "call-1", type: "function", function: { name: "grep", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call-1", content: "hit" },
+      { role: "assistant", content: "reading", tool_calls: [{ id: "call-2", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+    ];
+    expect(extractChildToolCalls(messages).map((row) => row.key)).toEqual(["call-1", "call-2"]);
+  });
+
   it("leaves result undefined for a tool call still in flight (no matching tool message yet)", () => {
     const messages: ChatMessage[] = [
       {
@@ -133,5 +143,65 @@ describe("extractChildToolCalls", () => {
     const rows = extractChildToolCalls(messages);
     expect(rows).toHaveLength(1);
     expect(rows[0].result).toBeUndefined();
+  });
+});
+
+describe("groupChildToolCalls", () => {
+  it("makes one titled group per assistant round, taking the round's own narration", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: "audit the runtime" },
+      {
+        role: "assistant",
+        content: "Found binary download machinery\nand a checksum helper",
+        tool_calls: [
+          { id: "call-1", type: "function", function: { name: "grep", arguments: '{"pattern":"sha256"}' } },
+          { id: "call-2", type: "function", function: { name: "read_file", arguments: '{"path":"a.rs"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call-1", content: "3 matches" },
+      { role: "tool", tool_call_id: "call-2", content: "file contents" },
+      {
+        role: "assistant",
+        content: "Checked licenses",
+        tool_calls: [{ id: "call-3", type: "function", function: { name: "read_file", arguments: '{"path":"LICENSE"}' } }],
+      },
+    ];
+
+    const groups = groupChildToolCalls(messages);
+    expect(groups).toHaveLength(2);
+    // Only the first line of a multi-line narration becomes the header.
+    expect(groups[0].title).toBe("Found binary download machinery");
+    expect(groups[0].key).toBe("call-1");
+    expect(groups[0].calls.map((call) => call.key)).toEqual(["call-1", "call-2"]);
+    expect(groups[0].calls[0].result).toBe("3 matches");
+    expect(groups[1].title).toBe("Checked licenses");
+    expect(groups[1].calls).toHaveLength(1);
+  });
+
+  it("carries a text-only round's narration forward to the next round that calls tools, once", () => {
+    const messages: ChatMessage[] = [
+      { role: "assistant", content: "Next I'll inspect the manifest" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call-1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+      { role: "assistant", content: "", tool_calls: [{ id: "call-2", type: "function", function: { name: "grep", arguments: "{}" } }] },
+    ];
+
+    const groups = groupChildToolCalls(messages);
+    expect(groups.map((group) => group.title)).toEqual(["Next I'll inspect the manifest", null]);
+  });
+
+  it("leaves a round untitled when the child said nothing, and caps a long narration", () => {
+    const long = "x".repeat(150);
+    const messages: ChatMessage[] = [
+      { role: "assistant", content: "   ", tool_calls: [{ id: "call-1", type: "function", function: { name: "grep", arguments: "{}" } }] },
+      { role: "assistant", content: long, tool_calls: [{ id: "call-2", type: "function", function: { name: "grep", arguments: "{}" } }] },
+    ];
+
+    const groups = groupChildToolCalls(messages);
+    expect(groups[0].title).toBeNull();
+    expect(groups[1].title).toBe(`${"x".repeat(99)}…`);
+  });
+
+  it("ignores rounds with no tool calls at all", () => {
+    expect(groupChildToolCalls([{ role: "assistant", content: "Found 3 callers of X." }])).toEqual([]);
   });
 });
