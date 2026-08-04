@@ -2277,6 +2277,11 @@ fn public_ipv4(address: Ipv4Addr) -> bool {
 }
 
 fn public_ipv6(address: Ipv6Addr) -> bool {
+    // Checked before the mapped unwrap: `::a.b.c.d` is not `::ffff:a.b.c.d`, and
+    // without this it was reported as public. See `egress::is_ipv4_compatible`.
+    if crate::egress::is_ipv4_compatible(&address) {
+        return false;
+    }
     if let Some(address) = address.to_ipv4_mapped() {
         return public_ipv4(address);
     }
@@ -2589,6 +2594,26 @@ mod tests {
             "little-monkey-model-source-{label}-{}",
             Uuid::new_v4().simple()
         ))
+    }
+
+    /// The same deprecated form that fooled the other three guards reported
+    /// `::127.0.0.1` as a *public* address here, which is what gates a model
+    /// download URL.
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_is_not_public() {
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::10.0.0.1"] {
+            assert!(
+                !public_ipv6(Ipv6Addr::from_str(text).expect("parses")),
+                "{text} must not be treated as public"
+            );
+        }
+        assert!(public_ipv6(
+            Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
+        ));
+        assert!(!public_ipv6(
+            Ipv6Addr::from_str("::ffff:127.0.0.1").unwrap()
+        ));
     }
 
     #[test]
