@@ -339,36 +339,141 @@ fn kill_process_group(process_id: u32) -> Result<(), String> {
     terminate_process_group(process_id)
 }
 
+/// Sums the RSS of every process in the group, given `ps` output of
+/// `pgid rss` rows.
+///
+/// Pure so the rule is testable without spawning a process tree: the platform
+/// command only produces rows, and the arithmetic that decides whether a budget
+/// was exceeded lives here.
+///
+/// `None` when the group has no rows at all — it has exited, which is not the same
+/// answer as "using zero bytes" and must not read as a budget satisfied.
+fn sum_group_rss_kib(ps_output: &str, process_group_id: u32) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in ps_output.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pgid), Some(rss)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if pgid.parse::<u32>().ok() != Some(process_group_id) {
+            continue;
+        }
+        let Ok(kib) = rss.parse::<u64>() else {
+            continue;
+        };
+        total = Some(total.unwrap_or(0).saturating_add(kib));
+    }
+    total
+}
+
+/// The job's memory, measured across its whole process group.
+///
+/// Was `ps -o rss= -p <pid>`, the direct child only — so a job whose child spawned
+/// the actual work escaped its own memory budget entirely, which is the normal
+/// case rather than an edge one: the child is a shell, and `cargo build` or a
+/// model server is its grandchild. Every other signal on this process already
+/// treats the pid as a group id (`process_group(0)` at spawn); only the
+/// measurement did not.
+///
+/// `ps -eo pgid=,rss=` and filter in Rust, rather than `ps -g <pgid>`: `-g` selects
+/// by process group on BSD but by *effective group* on procps, so the same command
+/// would silently measure something else on Linux. This form uses only portable
+/// `-o` keywords and costs one fork either way.
 #[cfg(unix)]
-fn process_memory_bytes(process_id: u32) -> Result<Option<u64>, String> {
+fn process_memory_bytes(process_group_id: u32) -> Result<Option<u64>, String> {
     let output = Command::new("ps")
-        .args(["-o", "rss=", "-p", &process_id.to_string()])
+        .args(["-eo", "pgid=,rss="])
         .output()
         .map_err(|error| format!("Failed to inspect process memory: {error}"))?;
     if !output.status.success() {
         return Ok(None);
     }
-    let kib = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok();
+    let kib = sum_group_rss_kib(&String::from_utf8_lossy(&output.stdout), process_group_id);
     Ok(kib.and_then(|value| value.checked_mul(1024)))
 }
 
+/// Sums the working set of `root` and every descendant, given rows of
+/// `pid parent_pid working_set_bytes`.
+///
+/// Windows has no process group to select on, so the tree is walked by parent.
+/// Kept pure for the same reason as [`sum_group_rss_kib`], and more so: this is the
+/// arm that cannot be exercised on a macOS or Linux developer machine, so the walk
+/// being ordinary Rust is what makes it testable at all. Only the PowerShell
+/// invocation itself goes unverified outside CI.
+///
+/// Iterates to a fixed point rather than recursing, so a cycle in reported parent
+/// ids cannot hang the watchdog — pid reuse can legitimately produce one.
+///
+/// Compiled on every platform on purpose, not behind `cfg(windows)`: this machine
+/// cannot build the Windows target, so gating it would leave the logic neither
+/// typechecked nor tested until CI — which is exactly how the last Windows-only
+/// break got there. The allow marks that the non-Windows build has no caller.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sum_process_tree_working_set(rows: &str, root: u32) -> Option<u64> {
+    struct Row {
+        pid: u32,
+        parent: u32,
+        bytes: u64,
+    }
+    let parsed: Vec<Row> = rows
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let bytes = fields.next()?.parse().ok()?;
+            Some(Row { pid, parent, bytes })
+        })
+        .collect();
+
+    let mut members: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    if parsed.iter().any(|row| row.pid == root) {
+        members.insert(root);
+    }
+    loop {
+        let before = members.len();
+        for row in &parsed {
+            // `row.pid != row.parent` guards the self-parent case, which would
+            // otherwise make any process its own descendant.
+            if row.pid != row.parent && members.contains(&row.parent) {
+                members.insert(row.pid);
+            }
+        }
+        if members.len() == before {
+            break;
+        }
+    }
+    if members.is_empty() {
+        return None;
+    }
+    Some(
+        parsed
+            .iter()
+            .filter(|row| members.contains(&row.pid))
+            .fold(0u64, |total, row| total.saturating_add(row.bytes)),
+    )
+}
+
+/// See the unix version: this measures the job's whole tree, not just the child
+/// the daemon spawned.
 #[cfg(windows)]
 fn process_memory_bytes(process_id: u32) -> Result<Option<u64>, String> {
-    let script = format!("(Get-Process -Id {process_id} -ErrorAction Stop).WorkingSet64");
+    // One row per process, so the tree walk and the arithmetic stay in Rust where
+    // they are tested. `Format-Table -HideTableHeaders` would still pad and wrap;
+    // an explicit joined string does not.
+    let script = "Get-CimInstance Win32_Process | ForEach-Object { \
+        \"$($_.ProcessId) $($_.ParentProcessId) $($_.WorkingSetSize)\" }";
     let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|error| format!("Failed to inspect process memory: {error}"))?;
     if !output.status.success() {
         return Ok(None);
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok())
+    Ok(sum_process_tree_working_set(
+        &String::from_utf8_lossy(&output.stdout),
+        process_id,
+    ))
 }
 
 struct ActiveProcess {
@@ -1292,6 +1397,80 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// The escape this closes: a job's memory budget measured only the process the
+    /// daemon spawned, which for an agent job is a shell. The work that consumes
+    /// memory — a build, a model server — is its grandchild, so the budget was
+    /// evadable by the normal case rather than by a trick.
+    mod memory_is_measured_across_the_group {
+        use super::*;
+
+        // `ps -eo pgid=,rss=`: process group id, then resident set in KiB.
+        const PS: &str = "  100  1000\n  200  2000\n  200  3000\n  200   500\n  300  9999\n";
+
+        #[test]
+        fn every_process_in_the_group_counts_and_others_do_not() {
+            // 2000 + 3000 + 500. The old behaviour reported one row, so the
+            // assertion that matters is that this exceeds any single member.
+            assert_eq!(sum_group_rss_kib(PS, 200), Some(5500));
+            assert!(sum_group_rss_kib(PS, 200).unwrap() > 3000);
+            assert_eq!(sum_group_rss_kib(PS, 100), Some(1000));
+        }
+
+        #[test]
+        fn a_group_with_no_processes_reads_as_gone_not_as_zero() {
+            // `Some(0)` would be a budget trivially satisfied forever; `None` means
+            // there is nothing to measure, which is what an exited job is.
+            assert_eq!(sum_group_rss_kib(PS, 999), None);
+        }
+
+        #[test]
+        fn malformed_and_short_rows_are_skipped_rather_than_poisoning_the_total() {
+            // `ps` output can carry a header, a warning line, or a truncated final
+            // line; none of those may make a live job look like it used nothing.
+            let noisy = "PGID RSS\n  200  2000\nnot-a-row\n  200\n  200  abc\n  200  1000\n";
+            assert_eq!(sum_group_rss_kib(noisy, 200), Some(3000));
+        }
+    }
+
+    /// Windows has no process group, so the tree is walked by parent. Tested here
+    /// rather than only on CI because this machine cannot build that target at all.
+    mod windows_tree_walk {
+        use super::*;
+
+        // pid parent working_set_bytes
+        const ROWS: &str = "10 1 100\n11 10 200\n12 11 400\n20 1 800\n";
+
+        #[test]
+        fn the_root_and_every_descendant_count_transitively() {
+            // 100 + 200 + 400; the grandchild (12) is the case a single
+            // `Get-Process -Id` missed.
+            assert_eq!(sum_process_tree_working_set(ROWS, 10), Some(700));
+            assert_eq!(sum_process_tree_working_set(ROWS, 11), Some(600));
+            assert_eq!(sum_process_tree_working_set(ROWS, 20), Some(800));
+        }
+
+        #[test]
+        fn an_absent_root_reads_as_gone() {
+            assert_eq!(sum_process_tree_working_set(ROWS, 999), None);
+        }
+
+        #[test]
+        fn a_parent_cycle_terminates_instead_of_hanging_the_watchdog() {
+            // Pid reuse can legitimately produce a cycle in reported parents. The
+            // fixed-point loop must stop; a recursive walk would not.
+            let cyclic = "10 12 100\n11 10 200\n12 11 400\n";
+            assert_eq!(sum_process_tree_working_set(cyclic, 10), Some(700));
+        }
+
+        #[test]
+        fn a_self_parented_process_does_not_adopt_the_whole_machine() {
+            // Windows reports pid 0 as its own parent; without the guard, every
+            // process whose parent is itself would pull in unrelated trees.
+            let self_parented = "4 4 100\n10 4 200\n99 1 400\n";
+            assert_eq!(sum_process_tree_working_set(self_parented, 4), Some(300));
+        }
+    }
     use std::collections::VecDeque;
     use std::sync::Mutex;
 

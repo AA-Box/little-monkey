@@ -187,7 +187,11 @@ a scope boundary stated where it matters.
   what each kind reports, so a
   declared memory or wall-clock limit is *not* enforced by any OS mechanism
   yet — there is no cgroup, job object or `setrlimit` anywhere; what enforcement
-  exists is a userspace watchdog over daemon jobs plus per-tool timeouts;
+  exists is a userspace watchdog over daemon jobs plus per-tool timeouts. That
+  watchdog measures a job's memory across its whole process group, so work moved
+  into a grandchild is still counted, but the memory budget is opt-in
+  (`--max-memory-mb`) and the wall-clock default is seven days, so both are off in
+  practice unless a job asks for them;
   a Crew member carries no edge to its coordinator (actors initialize
   concurrently, coordinator last); and a retried daemon job becomes a new
   process rather than inheriting the original's parent.
