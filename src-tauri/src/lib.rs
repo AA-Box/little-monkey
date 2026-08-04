@@ -202,6 +202,11 @@ pub mod background_shell;
 // Real OS suspend/resume of a process group this app owns, shared by the
 // daemon's job runner and by `background_shell.rs`.
 pub mod os_signal;
+// Kernel-enforced ceilings on a spawned child (`setrlimit` via `pre_exec`), as
+// opposed to `os_signal`'s cooperative teardown. Sits beside it because the two
+// are the same concern from opposite ends: one bounds a child the kernel holds to
+// it, the other ends one this app is still watching.
+pub mod os_limits;
 // `pub` (unlike `sessions`/`tools`/`system`/`models`/`git`/`llama` above) so
 // `monkey-cli` (Plan/Act + risk-adaptive permissions design doc, phase 4) can
 // call `permissions::path_risk_floor` directly for its own floor-only
