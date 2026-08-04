@@ -19,15 +19,15 @@ close the app to replace locked files, so that step waits for the click.
 
 ## Turning it on
 
-Updates are wired up but **inert** until the release feed is signed. With the
-default empty `pubkey` in `src-tauri/tauri.conf.json`, every check fails
-signature verification and is swallowed, so the app behaves as if the feature
-didn't exist. That is the current state of the repo — it is also why
-`https://github.com/AA-Box/little-monkey/releases/latest/download/latest.json`
-returns 404 and why past releases carry no `.sig` assets.
+Signing is set up as of 2026-08-04: the keypair exists, `plugins.updater.pubkey`
+holds the public half, and `TAURI_SIGNING_PRIVATE_KEY` is a repository secret.
+Two things still gate a working update — the key password secret, and
+publishing the draft release.
+
+To (re)do the setup from scratch:
 
 1. Generate a signing keypair (keep the password somewhere safe — it is
-   needed by CI, and the key cannot be recovered):
+   needed by CI, and neither key nor password can be recovered):
 
    ```bash
    pnpm tauri signer generate -w ~/.tauri/little-monkey.key
@@ -39,13 +39,14 @@ returns 404 and why past releases carry no `.sig` assets.
 3. Add the **private** key and its password as repository secrets:
 
    ```bash
-   gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/little-monkey.key
-   gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+   gh secret set TAURI_SIGNING_PRIVATE_KEY -R AA-Box/little-monkey < ~/.tauri/little-monkey.key
+   gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R AA-Box/little-monkey
    ```
 
    The release workflow already passes both to `tauri-action`, which then
    signs each updater artifact and publishes `latest.json`
-   (`includeUpdaterJson: true`).
+   (`includeUpdaterJson: true`). A missing password secret fails the signing
+   step, so both are required.
 
 4. **Publish the release.** The workflow creates it as a draft
    (`releaseDraft: true`), and GitHub does not serve draft assets — the
