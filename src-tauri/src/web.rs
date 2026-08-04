@@ -357,6 +357,13 @@ fn is_blocked_ipv4(ip: &Ipv4Addr) -> bool {
 /// so a v4-mapped private (or unspecified) address can't slip past a
 /// v6-only check.
 fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
+    // Before the mapped unwrap, because the deprecated IPv4-*compatible* form
+    // (`::a.b.c.d`) is not what `to_ipv4_mapped` matches and fell through every
+    // branch below. See `egress::is_ipv4_compatible` for why this is a rejection
+    // rather than a second unwrap.
+    if crate::egress::is_ipv4_compatible(ip) {
+        return true;
+    }
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_blocked_ipv4(&v4);
     }
@@ -1312,6 +1319,28 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    /// `::127.0.0.1` walked past this guard entirely: not `::1`, not unspecified,
+    /// not `fc00::/7`, not `fe80::/10`, and `to_ipv4_mapped()` returns `None` for
+    /// the deprecated compatible form, so it read as an ordinary public address —
+    /// a loopback SSRF target on a guard whose whole job is refusing those.
+    #[test]
+    fn the_deprecated_ipv4_compatible_form_cannot_smuggle_loopback_past_this_guard() {
+        use std::str::FromStr;
+        for text in ["::127.0.0.1", "::10.0.0.1", "::169.254.1.1"] {
+            let address = Ipv6Addr::from_str(text).expect("parses");
+            assert!(is_blocked_ipv6(&address), "{text} must be blocked");
+        }
+        // Counter-test: a real public v6 is still reachable, so this did not just
+        // block everything.
+        assert!(!is_blocked_ipv6(
+            &Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
+        ));
+        // And the mapped form still works, which is the branch that already existed.
+        assert!(is_blocked_ipv6(
+            &Ipv6Addr::from_str("::ffff:127.0.0.1").unwrap()
+        ));
     }
 
     #[test]
