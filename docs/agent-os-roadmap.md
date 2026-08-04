@@ -65,24 +65,61 @@ made once and silently not take effect.
 
 **Shipped:** `http_policy.rs`, the shared module both listeners now draw from.
 
-- **Admission control covers both listeners.** `AdmissionGuard` /
-  `RequestAdmission` own the concurrency permit, the in-flight and total
-  counters, and a per-request cancellation token derived from the server's
-  shutdown token. `server.rs`'s accept loop previously spawned an unbounded
-  task per connection with none of that; it now refuses past
-  `MAX_ACTIVE_REQUESTS` with a 503 in the legacy OpenAI error envelope rather
-  than queueing without bound. `m3_http_server.rs`'s `RequestGuard` is now a
-  thin wrapper over the same guard, so the bookkeeping has one implementation
-  rather than two. **This is the half of the acceptance that unblocks K4 and
-  K5** — a route on either listener can no longer bypass admission control.
+- **Admission control covers every serving path, and now actually bounds it.**
+  `AdmissionGuard` / `RequestAdmission` own the concurrency permit and the
+  in-flight and total counters; `m3_http_server.rs`'s `RequestGuard` is a thin
+  wrapper over the same guard, so the bookkeeping has one implementation rather
+  than two. `serve_with_admission` is the single implementation of the rule, and
+  both legacy accept loops call it.
+
+  **An earlier version of this bullet claimed all of that was already true, and
+  three parts of it were not.** Recorded because the corrections are the
+  interesting content:
+
+  - **There were three serving paths, not two.** `run_cli_server`, behind
+    `monkey-cli api-serve`, spawned an unbounded task per connection with no
+    permit and no counters, serving the *identical* route set through the same
+    `serve_one_request`. So "a route on either listener can no longer bypass
+    admission control" was false in the plainest way: every legacy route stayed
+    reachable with the quota bypassed, by running one command. It now admits
+    through the same helper, and a source-level test pins that a *fourth* path
+    cannot be added silently — a behavioural test cannot cover it, since the
+    defect was precisely a second path that looked fine in isolation.
+  - **The permit was released before the request did any work.** The loop dropped
+    its guard as soon as `serve_one_request` returned a `Response`, which for a
+    streaming route is when upstream *headers* arrive — the `StreamBody` wrapping
+    reqwest's `bytes_stream` has not produced a byte. The bound therefore measured
+    time-to-first-header, and concurrent SSE streams were not bounded at all. The
+    guard now lives in the response body (`hold_permit_until_body_ends`), so it is
+    released when the body ends *or* when hyper drops it because the client went
+    away — both are tested, the second because leaking a permit per abandoned
+    stream would wedge the listener at its quota with nothing running, which is
+    strictly worse than the unbounded behaviour it replaced.
+  - **Cancellation is still not wired on the legacy listener**, and the claim
+    that it was is now corrected in `http_policy.rs` too. The guard carries a
+    token; `AdmissionGuard::cancellation` has no caller in `server.rs`, and the
+    upstream calls there are bare `reqwest::Client`s with no timeout. m3 does
+    thread it, via `RequestGuard::context` into `M3OperationContext`. A type that
+    carries a token is not a route that honours one, so a legacy client that goes
+    away still leaves its upstream request running. That is its own change.
+
+  Also corrected: the 503 refusal body is now byte-asserted. It was the one
+  response on this listener with no test at all, and an SDK client branches on
+  its shape.
 - **The port collision is diagnosable.** Both default to 1234, both bind
   loopback, and both autostart independently from `setup` with no ordering and
   no cross-check, so a user with `autostart` on *and* a persisted LAN policy has
-  two tasks racing for one socket. The shared `DEFAULT_HTTP_PORT` states the
-  overlap instead of it being a coincidence between two unrelated constants, and
-  a bind failure on that port now names the other listener and the panel that
-  fixes it. On a custom port, or any non-`AddrInUse` error, it reports what the
-  OS said rather than guessing.
+  two tasks racing for one socket. A bind failure on that port now names the other
+  listener and the panel that fixes it; on a custom port, or any non-`AddrInUse`
+  error, it reports what the OS said rather than guessing.
+
+  The shared `DEFAULT_HTTP_PORT` was also claimed to state the overlap, and until
+  now it did not: both listeners kept their own `1234` literal and nothing outside
+  `http_policy.rs` referenced the constant, so it was a third copy of the number
+  with a comment about the other two. Both defaults now derive from it — which
+  matters beyond tidiness, because the bind-error message branches on
+  `port == DEFAULT_HTTP_PORT` to name the other listener, so a listener holding
+  its own copy could be moved off 1234 and silently make that diagnosis wrong.
 
 **Remaining — and why it is not one more coding session.** Three parts of this
 merge are blocked on decisions or on a release cycle, not on effort:
@@ -116,7 +153,15 @@ and the five host routes (`/v1/knowledge/query`, `/v1/local-apps/{id}/run`,
 exact-match allowlist to grow a prefix tier without weakening the invariant
 `route_allowlist_never_exposes_agent_or_workspace_tools` asserts.
 
-**Blocks:** K7 still. K4 and K5 are unblocked by the admission work above.
+**Blocks:** K7 still.
+
+The claim that "K4 and K5 are unblocked by the admission work above" was wrong in
+kind, not just in degree, so it is withdrawn rather than adjusted. Per-HTTP-request
+admission bounds how many requests one listener serves at once. K4 is per-*process*
+resource enforcement (wall clock, memory, child count) and K5 is per-*process*
+egress policy; neither is expressible in terms of a request permit, and no part of
+`http_policy.rs` touches either. What D1 genuinely blocks is having *one* place to
+attach a policy later — useful, and not the same as unblocking.
 
 *Maps to: ROADMAP #9.*
 
