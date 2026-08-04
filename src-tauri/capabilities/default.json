@@ -11,6 +11,8 @@
     "dialog:default",
     "fs:default",
     "deep-link:default",
+    "updater:default",
+    "process:allow-restart",
     {
       "identifier": "fs:allow-write-text-file",
       "allow": [{ "path": "$TEMP/**" }]
