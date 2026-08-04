@@ -75,6 +75,7 @@ import {
   activityCallDiff,
   activityCallLabel,
   activityCallSubject,
+  activityDiffStat,
   activityProgress,
   formatActivityResult,
   groupAssistantRound,
@@ -465,48 +466,35 @@ const ActivityRow = memo(function ActivityRow({ calls }: { calls: ActivityCall[]
   const detailsId = useId();
   const summary = summarizeActivity(calls);
   const progress = activityProgress(calls);
-  const ProgressIcon = progress.status === "running"
-    ? LoaderCircle
-    : progress.status === "failed"
-      ? TriangleAlert
-      : CheckCircle2;
+  const { added, removed } = activityDiffStat(calls);
 
   return (
     <div className="flex justify-start">
-      <div className="w-full max-w-[92%] min-w-0">
+      <div className="w-full min-w-0">
         <button
           type="button"
           aria-expanded={open}
           aria-controls={detailsId}
           onClick={() => setOpen((prev) => !prev)}
-          className="flex min-h-11 w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-reduce:transition-none"
+          className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-[13px] text-muted transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent motion-reduce:transition-none"
         >
+          <span className="min-w-0 truncate">{summary}</span>
+          {added > 0 && <span className="shrink-0 text-success">+{added}</span>}
+          {removed > 0 && <span className="shrink-0 text-danger">-{removed}</span>}
+          {progress.status === "running" && (
+            <LoaderCircle size={12} className="shrink-0 animate-spin text-faint motion-reduce:animate-none" aria-hidden />
+          )}
+          {progress.status === "failed" && (
+            <span className="shrink-0 text-danger">{progress.label}</span>
+          )}
           <ChevronRight
             size={13}
             className={`shrink-0 text-faint transition-transform duration-150 motion-reduce:transition-none ${open ? "rotate-90" : ""}`}
             aria-hidden
           />
-          <ListChecks size={15} className="shrink-0 text-faint" aria-hidden />
-          <span className="min-w-0 truncate font-medium text-foreground">{summary}</span>
-          <span
-            className={`ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium ${
-              progress.status === "failed"
-                ? "text-danger"
-                : progress.status === "running"
-                  ? "text-warning"
-                  : "text-success"
-            }`}
-          >
-            <ProgressIcon
-              size={12}
-              className={progress.status === "running" ? "animate-spin motion-reduce:animate-none" : ""}
-              aria-hidden
-            />
-            {progress.label}
-          </span>
         </button>
         {open && (
-          <div id={detailsId} className="ml-5 border-l border-border py-2 pl-4">
+          <div id={detailsId} className="mt-1 border-l border-border py-2 pl-4">
             <ol className="space-y-2">
               {calls.map((call) => (
                 <ActivityCallDetail key={call.id} call={call} />
@@ -1196,8 +1184,10 @@ export default function MessageList({
               );
             }
             if (item.kind === "activity") {
+              // An activity line belongs to the answer around it, so it sits
+              // 8px from both neighbours rather than the list's own 24px.
               return (
-                <div key={item.key} className="space-y-3">
+                <div key={item.key} className="-mt-4 -mb-4 space-y-3">
                   <ActivityRow calls={item.calls} />
                   {item.calls.map((call) => {
                     if (call.name !== "generate_image") return null;
@@ -1268,7 +1258,7 @@ export default function MessageList({
               and "thinking…" would be wrong during a verify command. */}
           {turnStatus && !runningVerifyLabel && <TurnStatusLine status={turnStatus} />}
           {showRetry && (
-            <div className="flex justify-start">
+            <div className="-mt-4 flex justify-start">
               <button
                 type="button"
                 onClick={onRetry}
