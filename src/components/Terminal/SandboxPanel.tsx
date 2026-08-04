@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Box, PlayCircle, RefreshCw, Trash2, X } from "lucide-react";
 
 import { useT } from "../../lib/i18n";
+import { sandboxEnforcement, type SandboxEnforcement } from "../../lib/sandbox";
 import { useSandboxStore } from "../../store/sandboxStore";
 import { Button, IconButton, StatusPill } from "../ui";
 import type { PillTone } from "../ui";
@@ -39,6 +40,10 @@ export function SandboxPanel({ initialCommand, onClose }: SandboxPanelProps) {
 
   const [command, setCommand] = useState(initialCommand ?? "");
   const [allowNetwork, setAllowNetwork] = useState(false);
+  // `null` until the probe answers, so an unenforced platform is never announced
+  // before it is known — and a probe failure stays silent rather than claiming a
+  // boundary is missing on the strength of a broken IPC call.
+  const [enforcement, setEnforcement] = useState<SandboxEnforcement | null>(null);
   const [confirmation, setConfirmation] = useState("");
   const [discarding, setDiscarding] = useState(false);
 
@@ -47,6 +52,20 @@ export function SandboxPanel({ initialCommand, onClose }: SandboxPanelProps) {
   const diffBusy = busy.diff;
   const prepareBusy = busy.preparePromote;
   const executeBusy = busy.executePromote;
+
+  useEffect(() => {
+    let disposed = false;
+    void sandboxEnforcement()
+      .then((value) => {
+        if (!disposed) setEnforcement(value);
+      })
+      // Swallowed on purpose: the panel's job here is to warn when it *knows*
+      // enforcement is missing. A failed probe knows nothing.
+      .catch(() => {});
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   const runCommand = useCallback(async () => {
     if (!command.trim() || runBusy) return;
@@ -125,6 +144,27 @@ export function SandboxPanel({ initialCommand, onClose }: SandboxPanelProps) {
               <button type="button" onClick={clearMessages} className="shrink-0 underline">
                 {t("SandboxPanel.dismiss")}
               </button>
+            </div>
+          )}
+
+          {/*
+            What this machine can enforce, shown *before* the Run button rather
+            than only as a label on a finished run. The isolation pill below is
+            accurate but arrives after the command has executed, and the panel
+            offers the same button on every platform — including for generated MCP
+            server code, which is probed through this exact path. On a platform
+            with no kernel boundary a command can still read and write the real
+            workspace by absolute path, which is worth knowing first.
+          */}
+          {enforcement !== null && enforcement !== "os_enforced" && (
+            <div
+              className="mb-3 flex items-start gap-2 rounded-md border border-warning bg-warning-soft px-3 py-1.5 text-xs text-warning"
+              role="status"
+            >
+              <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+              <span className="min-w-0 break-words">
+                {t(`SandboxPanel.enforcement.${enforcement}`)}
+              </span>
             </div>
           )}
 
