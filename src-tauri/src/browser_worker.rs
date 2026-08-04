@@ -632,6 +632,13 @@ impl OwnedBrowser {
         let next = self.action_count.fetch_add(1, Ordering::SeqCst) + 1;
         if next > self.limits.max_actions {
             self.cancelled.store(true, Ordering::SeqCst);
+            // The same teardown the two quotas above perform, and its absence
+            // here was not a shortcut but a leak: the `cancelled` gate at the top
+            // of this function makes every later call return early, so nothing
+            // could ever reach `stop()` again. Chromium stayed alive, idle, and
+            // unreachable by anything except `browser_stop` — held open only by
+            // the `Arc` in the session map.
+            let _ = self.stop();
             return Err("Browser action quota exceeded".to_string());
         }
         Ok(())
@@ -2067,6 +2074,123 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
+
+    /// Builds a session around a real but trivial child, so the quota branches in
+    /// `begin_action` can be exercised without Chromium.
+    ///
+    /// The child is a plain `sleep`: `stop()` only kills and reaps whatever is in
+    /// `self.child`, and never asks what program it is.
+    fn quota_session(max_actions: u64) -> (Arc<OwnedBrowser>, u32) {
+        let root = std::env::temp_dir().join(format!("lm-browser-quota-{}", uuid::Uuid::new_v4()));
+        let profiles = root.join("profiles");
+        let profile = profiles.join("session");
+        ensure_private_directory(&profile).unwrap();
+        std::fs::write(profile.join(PROFILE_MARKER), b"quota-session").ok();
+        let artifacts = ArtifactStore::new(root.join("artifacts")).unwrap();
+
+        // A CdpConnection needs a real socket; nothing in this test speaks to it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap().0);
+        let stream = std::net::TcpStream::connect(address).unwrap();
+        let _server_side = accepted.join().unwrap();
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the stand-in child spawns");
+        let pid = child.id();
+
+        let grant = ValidatedGrant::new(BrowserGrant {
+            allowed_origins: vec!["http://127.0.0.1:1".to_string()],
+            allow_loopback: true,
+        })
+        .unwrap();
+
+        (
+            Arc::new(OwnedBrowser {
+                session_id: "quota-session".to_string(),
+                run_id: "quota-run".to_string(),
+                profile_root: profiles,
+                profile,
+                child: Mutex::new(Some(child)),
+                cdp: Mutex::new(CdpConnection {
+                    stream,
+                    buffered: VecDeque::new(),
+                    next_id: 1,
+                    events: VecDeque::new(),
+                    grant,
+                    security_error: None,
+                }),
+                artifacts,
+                limits: BrowserLimits {
+                    max_actions,
+                    ..BrowserLimits::default()
+                },
+                cancelled: AtomicBool::new(false),
+                action_count: AtomicU64::new(0),
+                artifact_bytes: AtomicU64::new(0),
+                started: Instant::now(),
+                started_at_ms: 1_800_000_000_000,
+                current_url: Mutex::new(String::new()),
+                console: Mutex::new(Vec::new()),
+                network: Mutex::new(Vec::new()),
+                viewport: Mutex::new(BrowserViewport::default()),
+            }),
+            pid,
+        )
+    }
+
+    /// The action quota latched `cancelled` without killing Chromium, and the
+    /// `cancelled` check at the top of `begin_action` then made every later call
+    /// return early — so nothing could ever reach `stop()` again. The child was
+    /// left idle *and* unreachable.
+    ///
+    /// Asserted on the real child rather than on a flag, because a flag was
+    /// exactly what was already being set correctly.
+    #[test]
+    fn tripping_the_action_quota_kills_the_child_it_cancels() {
+        let (browser, pid) = quota_session(1);
+
+        browser
+            .begin_action()
+            .expect("the first action is inside the quota");
+        assert!(
+            crate::os_signal::process_is_alive(pid),
+            "the child must still be running while the session is under quota"
+        );
+
+        let error = browser
+            .begin_action()
+            .expect_err("the second action exceeds a quota of one");
+        assert!(error.contains("action quota"), "got {error:?}");
+
+        assert!(
+            !crate::os_signal::process_is_alive(pid),
+            "the child outlived the quota that cancelled its session, and no later \
+             call can reach stop() once `cancelled` is latched"
+        );
+    }
+
+    /// The counterpart: a session inside its quota must not be torn down. Without
+    /// this, killing the child unconditionally would pass the test above.
+    #[test]
+    fn a_session_inside_its_action_quota_keeps_its_child() {
+        let (browser, pid) = quota_session(8);
+
+        for _ in 0..4 {
+            browser.begin_action().expect("still inside the quota");
+        }
+
+        assert!(
+            crate::os_signal::process_is_alive(pid),
+            "a session under its quota must keep running"
+        );
+        browser.stop().ok();
+    }
 
     #[test]
     fn websocket_accept_matches_rfc_fixture() {
