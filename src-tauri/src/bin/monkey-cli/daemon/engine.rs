@@ -4,7 +4,6 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 #[cfg(unix)]
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use little_monkey_lib::run_protocol::{
@@ -235,23 +234,14 @@ fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(128)
 }
 
-#[cfg(unix)]
+/// The daemon's own copy of this lived here, as `kill -TERM -<pgid>` plus up to
+/// forty `kill -0` liveness polls — around forty fork+execs per terminate, and a
+/// second implementation of a rule the library already owned. Its Windows arm was
+/// also the only tree-kill primitive in the codebase, and the app could not reach
+/// it, which is why the app's own timeouts leaked orphans. One implementation now,
+/// in `os_signal`, syscall-based on unix.
 fn terminate_process_group(process_id: u32) -> Result<(), String> {
-    let group = format!("-{process_id}");
-    let _ = command_ok("kill", &["-TERM", &group]);
-    for _ in 0..40 {
-        if !super::service::process_alive(process_id) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = command_ok("kill", &["-KILL", &group]);
-    Ok(())
-}
-
-#[cfg(windows)]
-fn terminate_process_group(process_id: u32) -> Result<(), String> {
-    command_ok("taskkill", &["/PID", &process_id.to_string(), "/T", "/F"])
+    little_monkey_lib::os_signal::terminate_process_group(process_id)
 }
 
 /// Whether this job has another attempt coming, per its kind's declared policy.

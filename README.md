@@ -186,9 +186,18 @@ a scope boundary stated where it matters.
   never close one whose work is still running. Real limits: the table records
   what each kind reports, so a
   declared memory or wall-clock limit is *not* enforced by any OS mechanism
-  yet; a Crew member carries no edge to its coordinator (actors initialize
+  yet — there is no cgroup, job object or `setrlimit` anywhere; what enforcement
+  exists is a userspace watchdog over daemon jobs plus per-tool timeouts;
+  a Crew member carries no edge to its coordinator (actors initialize
   concurrently, coordinator last); and a retried daemon job becomes a new
   process rather than inheriting the original's parent.
+- A timeout ends the whole process tree, not just the command that was spawned.
+  Shell tools, verify commands and sandboxed runs each get their own process
+  group, and a timeout or Stop terminates that group — TERM first, so a build can
+  flush its output and clean up its temp files, then KILL for anything that
+  ignored it. Before this, a 120-second shell timeout reaped the shell and left
+  the compiler it started running, still consuming the machine after the tool
+  reported that it had timed out.
 - Stop or suspend anything from anywhere, including a terminal. `monkey
   processes signal <id> stop|suspend|resume|kill` (and `monkey processes
   signals` for the support matrix) records the request as durable intent on the

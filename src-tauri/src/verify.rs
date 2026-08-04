@@ -226,6 +226,11 @@ pub async fn run_command_impl(
         // the in-flight `wait_with_output` future (and the child with it) —
         // without this, the spawned process would keep running orphaned.
         .kill_on_drop(true);
+    // Its own process group, so a timeout can end the whole tree rather than the
+    // shell alone — `kill_on_drop` reaps one pid, which for `sh -c "npm test"`
+    // leaves the test runner alive. Mirrors `tools.rs`'s own spawn.
+    #[cfg(unix)]
+    command_builder.process_group(0);
 
     let timeout = Duration::from_secs(
         cmd.timeout_secs
@@ -260,6 +265,10 @@ pub async fn run_command_impl(
             .clone()
     });
 
+    // Captured before `wait_with_output` consumes the child; with
+    // `process_group(0)` above, the child's own pid is also its group id.
+    let child_pgid = child.id();
+
     let (outcome, timed_out): (Result<std::process::Output, String>, bool) = match &cancel {
         Some(cancel) => tokio::select! {
             result = child.wait_with_output() => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
@@ -273,6 +282,18 @@ pub async fn run_command_impl(
             _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
         },
     };
+
+    // End the tree on a timeout or a cancel. A verify command is typically a
+    // build or a test runner, so the process that matters is almost always a
+    // grandchild of the `sh -c` this spawned — exactly the process `kill_on_drop`
+    // does not touch.
+    if outcome.is_err() {
+        if let Some(pgid) = child_pgid {
+            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
+                eprintln!("verify: could not terminate process group {pgid}: {error}");
+            }
+        }
+    }
 
     // Drop this turn's channel once no other verify/shell command of the
     // same turn still holds it — same strong-count cleanup as
