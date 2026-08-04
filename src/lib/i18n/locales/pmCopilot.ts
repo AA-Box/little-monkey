@@ -20,6 +20,11 @@ export const pmCopilotLocale: Record<string, string> = {
   "PmCopilotPanel.cancelButton": "Cancel",
   "PmCopilotPanel.generationError": "Couldn't generate a plan: {{error}}",
   "PmCopilotPanel.emptyState": "Enter a product goal above and generate a plan to see a PRD summary, user stories, acceptance criteria, risks, and milestones here.",
+  // The panel no longer takes a goal of its own — `/pm-plan <goal>` in chat is
+  // the single input surface (see `PmCopilotPanel.tsx`), so these replace the
+  // `emptyState`/`goalPlaceholder` pair the old in-panel textarea used.
+  "PmCopilotPanel.chatOnlyEmptyState": "Type /pm-plan followed by your product goal in chat. The drafted plan lands here as a PRD summary, user stories, acceptance criteria, risks, and milestones you can edit and save.",
+  "PmCopilotPanel.noGoal": "No goal yet",
   "PmCopilotPanel.prdSummaryLabel": "PRD summary",
   "PmCopilotPanel.userStoriesLabel": "User stories",
   "PmCopilotPanel.userStoriesHint": "As a [who], I want [what], so that [why] — edit any field before saving.",

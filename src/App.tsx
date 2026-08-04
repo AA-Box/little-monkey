@@ -1181,6 +1181,7 @@ function App() {
                 onOpenSettingsTab={openSettingsTab}
                 headerActionsSlot={chatHeaderActionsEl}
                 onOpenBackgroundTasks={openBackgroundTasksPanel}
+                onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
               />
             )}
           </Suspense>
@@ -1217,6 +1218,7 @@ function App() {
                   onManagePrompts={handleManagePrompts}
                   onOpenSettingsTab={openSettingsTab}
                   onOpenBackgroundTasks={openBackgroundTasksPanel}
+                  onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
                 />
               )}
             </Suspense>

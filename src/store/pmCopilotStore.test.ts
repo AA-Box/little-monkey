@@ -181,6 +181,34 @@ describe("pmCopilotStore", () => {
     expect(api.savePmPlanToWorkspace).not.toHaveBeenCalled();
   });
 
+  it("startFromGoal() discards the previous draft and generates against the new goal", async () => {
+    api.generatePmPlan.mockResolvedValue({ plan: PLAN, target: TARGET });
+    usePmCopilotStore.getState().setGoal("An older goal");
+    usePmCopilotStore.setState({ plan: PLAN, savedPath: "docs/product/an-older-goal.md", saveStatus: "saved" });
+    const originalDraftId = usePmCopilotStore.getState().draftId;
+
+    await usePmCopilotStore.getState().startFromGoal("Export data as CSV");
+
+    const state = usePmCopilotStore.getState();
+    expect(state.draftId).not.toBe(originalDraftId);
+    expect(state.goal).toBe("Export data as CSV");
+    expect(state.slug).toBe("export-data-as-csv");
+    expect(state.savedPath).toBeNull();
+    expect(state.saveStatus).toBe("idle");
+    expect(state.status).toBe("ready");
+    expect(api.generatePmPlan).toHaveBeenCalledWith(state.draftId, "Export data as CSV");
+  });
+
+  it("startFromGoal() records a generation failure instead of throwing, so the caller can report it", async () => {
+    api.generatePmPlan.mockRejectedValue(new Error("Select and connect a chat model before generating a plan."));
+
+    await expect(usePmCopilotStore.getState().startFromGoal("Export data as CSV")).resolves.toBeUndefined();
+
+    const state = usePmCopilotStore.getState();
+    expect(state.status).toBe("error");
+    expect(state.error).toBe("Select and connect a chat model before generating a plan.");
+  });
+
   it("reset() clears the draft and mints a new draft id", () => {
     const originalDraftId = usePmCopilotStore.getState().draftId;
     usePmCopilotStore.getState().setGoal("Something");
