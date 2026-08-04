@@ -1017,6 +1017,79 @@ the child's pipes into the model's context window.
   passing shell command and would only show up later as a flooded context.
   Sabotage: flipping it fails with `left: None / right: Some(20000)`.
 
+**Shipped — the last two userspace bounds K4 was missing.** Both built in parallel
+because they share no source and no toolchain, then integrated together.
+
+**A watchdog now re-examines browser sessions nothing is driving.** Before this a
+session was bounded only inside `begin_action`, which an agent reaches only while
+actively driving the page — so an abandoned Chromium was never looked at again, its
+session clock could not fire, and a Chromium that died on its own left a session
+still reporting itself alive. `try_wait` appeared only in `stop()` and at launch.
+
+- **The rule is a pure function** (`sweep_verdict`) over elapsed time, limits, child
+  liveness and the cancelled flag, so the whole decision table is asserted with no
+  Chromium and no timers. Ordering is the substance: `cancelled` wins outright so a
+  session already killed by the action quota is never relabelled, liveness beats the
+  clock because a gone Chromium is the more specific fact, and the clock uses the
+  same strict `>` as `begin_action` so the two enforcement points agree exactly at
+  the boundary.
+- **The disk quota is excluded from the timer, structurally.** `owned_directory_size`
+  may stat a very large profile; that is affordable once per action with a caller
+  already waiting on Chromium, and not affordable per session per tick. Nothing about
+  an idle session makes its profile grow. A test asserts the sweep and the action
+  path deliberately *disagree* here, so they cannot be quietly merged later.
+- **A cancel reason now names the bound that fired** (`ActionQuota`, `SessionClock`,
+  `ChildExited`, …), recorded first-writer-wins. Last-writer-wins would relabel every
+  quota trip as `Stopped`, because every path ends at `stop()`.
+- **An empty child slot reads as "not exited", not as a crash**, since only `stop()`
+  empties it, and a poisoned lock reads as live — so an unrelated panic cannot cause
+  a reclaim.
+- **The 30-second cadence is chosen, unlike the budget values elsewhere in K4.** The
+  distinction is real: how long a session may live is policy, but how promptly an
+  expired one is noticed is an implementation detail, and leaving it unset would mean
+  the sweep never ran at all, which is not a bound. The sweep loop was delivered with
+  no call site; wiring it was part of integrating this.
+- **Sessions cannot be told apart by whether a human is attached**, so the clock
+  applies to all of them. That is the conservative reading rather than an invented
+  distinction, and it is a real limitation: an idle Workbench tab past its budget
+  loses its session.
+
+**A wall-clock budget is now enforced for the four kinds that had none** —
+`chat_turn`, `subagent`, `crew_member`, `side_task` — entirely by reuse. No new timer
+and no new delivery path: the existing 2-second sweep reads the live rows of those
+kinds, and a row past its budget gets the existing durable stop latch, delivered the
+same tick by the existing fan-out.
+
+- **Shipped enforced but *unset*, and that is the honest state rather than an
+  unfinished one.** `ProcessState` has no state for "parked on an unanswered
+  permission prompt" — such a turn reads as `Running` — so any default budget would
+  kill a turn for the user's own slowness. The mechanism is live and fires for
+  nobody; the number is a settings decision this work does not make.
+- **`workflow_node` is excluded by an allow-list, not by omission.**
+  `deliverProcessSignal` answers `"no-primitive"` for it and `signal_support` refuses
+  suspend/resume on the documented grounds that a node has no independent pause
+  mechanism, so a latch there would be committed and never delivered — leaving the row
+  reading as stopping forever. A test asserts the node kind is not in the list.
+- **The exit classification lives in Rust, not the frontend, and that was a
+  correction during integration.** The first draft classified it in TypeScript, which
+  would have been a second mechanism covering only the four loops and only after four
+  separate adoptions. `ProcessTable::transition` already reads the row's
+  `signal_reason` on its way to writing the exit, so one upgrade there covers every
+  host — the loops, the daemon, and `monkey processes` alike. It only ever upgrades a
+  `cancelled`: a turn that failed on its own while a budget stop was in flight
+  failed, and relabelling that would hide a real error behind a limit.
+- **The marker crosses a language boundary with no compiler to check it.** The
+  enforcer runs in the WebView and cannot import a Rust const, so the literal exists
+  on both sides with `process_table.rs` as the authority and a test pinning the string
+  on each — renaming either would otherwise silently stop budget kills being recorded
+  as `limit_exceeded`.
+- **Known limits, stated at the definitions rather than discovered later.** A budget
+  is a floor, not a ceiling: a turn inside a 120-second shell timeout cannot observe
+  the latch until that tool returns, so the real bound is the budget plus the longest
+  in-flight tool timeout. And suspended time counts against it, because
+  `started_at_ms` deliberately survives resume and there is no accumulated-suspended
+  column — a long-parked turn trips the moment it resumes.
+
 **Still open in K4:** no cgroups v2, no Windows job objects — `os_limits::apply`
 is a documented no-op on Windows, whose equivalent (`SetInformationJobObject` with
 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) would cover *more* than `setrlimit` does on
@@ -1027,15 +1100,9 @@ them. RSS is nowhere kernel-enforced on any platform.
 
 Still genuinely missing, after the corrections above narrowed the list:
 
-- **No wall-clock budget for the four WebView-hosted kinds** — `chat_turn`,
-  `subagent`, `crew_member`, `side_task`. The mechanism is within reach (the 2 s
-  sweep, `max_wall_ms`, and the durable stop latch all exist) but a precondition
-  does not: `ProcessState` cannot distinguish a turn that is working from one
-  parked on an unanswered permission prompt, so any default budget would kill a
-  turn for the user's own slowness. Suspended time also counts, since
-  `started_at_ms` deliberately survives resume and nothing accumulates
-  suspended-ms. And such a budget is a floor, not a ceiling: a turn inside a 120 s
-  shell timeout cannot observe the latch until that tool returns.
+- The four WebView kinds' wall budget is **enforced but unset** (see below): the
+  mechanism fires for nobody until a number is configured, and choosing that number
+  is blocked on a precondition, not on effort.
 - The foreground shell's **intermediate heap buffer** is still unbounded even
   though its returned output is now capped (see below): `wait_with_output`
   materializes both streams in full before any cap applies, so
@@ -1045,12 +1112,13 @@ Still genuinely missing, after the corrections above narrowed the list:
   wrong and a chatty-stderr child deadlocks once the 64 KiB pipe buffer fills,
   turning a working command into a timeout. Its own slice, not a line to smuggle
   into the cap.
-- **No browser-worker watchdog.** `begin_action` is reachable only from `with_cdp`,
-  so an idle session is never re-examined; child liveness is never checked at all,
-  and the pid is never recorded, so nothing outside the owning process can even
-  name the child. `browser_worker.rs` is also the one app-side spawn site with no
-  `process_group(0)`, so Chromium's renderer and GPU children are exactly the
-  surviving-grandchild case the process-tree slices claim to have closed.
+- The browser worker's **pid is still not recorded**, so nothing outside the owning
+  process can name its Chromium — a crash still leaves an orphan that a startup
+  sweep can collect the profile of but never kill. `browser_worker.rs` also remains
+  the one app-side spawn site with no `process_group(0)`, so Chromium's renderer and
+  GPU children are exactly the surviving-grandchild case the process-tree slices
+  claim to have closed. The watchdog below reclaims sessions this app still knows
+  about; it does not solve either of these.
 - **No `ProcessKind` for a foreground shell or a browser session**, so neither gets
   a row and neither's per-call bounds can be declared in the table. Adding a
   browser kind needs a numbered SQLite migration to relax the `CHECK` on
