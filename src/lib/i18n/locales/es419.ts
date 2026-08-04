@@ -1046,7 +1046,6 @@ export const es419: Record<string, string> = {
   "MessageBubble.saveAndSubmitButton": "Guardar y enviar",
   "MessageBubble.editMessageAriaLabel": "Editar mensaje",
   "MessageBubble.attachedImageAlt": "Adjunto",
-  "MessageBubble.assistantName": "Little Monkey",
   "MessageBubble.previewButton": "Vista previa",
   "MessageBubble.copyButton": "Copiar código",
   "MessageBubble.copiedLabel": "Copiado",
