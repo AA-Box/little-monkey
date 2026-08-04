@@ -149,39 +149,68 @@ fn set_limit(resource: Resource, value: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The whole body of the `pre_exec` closure, shared by [`apply`] and
+/// [`apply_std`].
+///
+/// Shared rather than duplicated so the two command types cannot drift into
+/// installing different bounds: a site that has to use std's builder must not be
+/// a site with weaker limits.
+///
+/// A failure here fails the spawn rather than silently producing an unbounded
+/// child. That is the right direction: a tool that will not start is visible, and
+/// a tool that quietly lost its bounds is not.
+///
+/// # Safety-relevant constraints
+///
+/// Runs in the forked child, so it must be async-signal-safe: it touches nothing
+/// but `getrlimit`/`setrlimit` over its own stack. `ChildLimits` is `Copy`, which
+/// is what lets the closure capture plain integers — no allocation, no lock, and
+/// no state shared with the parent.
+#[cfg(unix)]
+fn install(limits: ChildLimits) -> std::io::Result<()> {
+    if limits.deny_core_dumps {
+        set_limit(libc::RLIMIT_CORE, 0)?;
+    }
+    if let Some(bytes) = limits.max_file_bytes {
+        set_limit(libc::RLIMIT_FSIZE, bytes)?;
+    }
+    if let Some(files) = limits.max_open_files {
+        set_limit(libc::RLIMIT_NOFILE, files)?;
+    }
+    Ok(())
+}
+
 /// Install `limits` on `command`'s child.
 ///
 /// The child is bounded from its first instruction: `pre_exec` runs after `fork`
 /// and before `exec`, so the target program never executes unbounded, and the
 /// limits are inherited by everything it spawns in turn — which is what makes
 /// this reach the grandchildren a supervisor cannot see.
-///
-/// A failure inside the closure fails the spawn rather than silently producing an
-/// unbounded child. That is the right direction: a tool that will not start is
-/// visible, and a tool that quietly lost its bounds is not.
 #[cfg(unix)]
 pub fn apply(limits: ChildLimits, command: &mut tokio::process::Command) {
     // `pre_exec` is an inherent method on `tokio::process::Command` under
     // `cfg(unix)`, so std's `CommandExt` is not imported here.
     //
-    // Safe: the closure runs in the forked child and touches nothing but
-    // `getrlimit`/`setrlimit` over its own stack. `ChildLimits` is `Copy`, so the
-    // closure captures plain integers — no allocation, no lock, and no state
-    // shared with the parent, which is what `pre_exec`'s async-signal-safety
-    // requirement demands.
+    // Safe: see `install`, which carries the async-signal-safety argument.
     unsafe {
-        command.pre_exec(move || {
-            if limits.deny_core_dumps {
-                set_limit(libc::RLIMIT_CORE, 0)?;
-            }
-            if let Some(bytes) = limits.max_file_bytes {
-                set_limit(libc::RLIMIT_FSIZE, bytes)?;
-            }
-            if let Some(files) = limits.max_open_files {
-                set_limit(libc::RLIMIT_NOFILE, files)?;
-            }
-            Ok(())
-        });
+        command.pre_exec(move || install(limits));
+    }
+}
+
+/// [`apply`] for a `std::process::Command`.
+///
+/// A second function rather than one generic one because the two command types
+/// share no `pre_exec`: std's arrives through
+/// [`std::os::unix::process::CommandExt`], tokio's is an inherent method under
+/// `cfg(unix)`, and there is no trait covering both. The limits installed are
+/// identical — both go through [`install`].
+#[cfg(unix)]
+pub fn apply_std(limits: ChildLimits, command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // Safe: the same closure `apply` installs — see `install`.
+    unsafe {
+        command.pre_exec(move || install(limits));
     }
 }
 
@@ -195,6 +224,10 @@ pub fn apply(limits: ChildLimits, command: &mut tokio::process::Command) {
 /// is recorded in the roadmap instead of being hidden behind a silent success.
 #[cfg(windows)]
 pub fn apply(_limits: ChildLimits, _command: &mut tokio::process::Command) {}
+
+/// No-op on Windows for the same reason as [`apply`].
+#[cfg(windows)]
+pub fn apply_std(_limits: ChildLimits, _command: &mut std::process::Command) {}
 
 #[cfg(test)]
 mod tests {
@@ -339,6 +372,43 @@ mod tests {
         );
 
         let output = command.output().await.expect("the child must spawn");
+        let reported = String::from_utf8_lossy(&output.stdout);
+        let mut lines = reported.lines();
+        let file_size = lines.next().unwrap_or_default().trim();
+        let core = lines.next().unwrap_or_default().trim();
+
+        assert_ne!(
+            file_size, "unlimited",
+            "the child inherited no file-size ceiling, so pre_exec did not run"
+        );
+        assert!(
+            file_size.parse::<u64>().is_ok_and(|blocks| blocks > 0),
+            "expected a finite block count, got {file_size:?}"
+        );
+        assert_eq!(core, "0", "core dumps must be refused");
+    }
+
+    /// The same proof for [`apply_std`], which reaches `pre_exec` through std's
+    /// `CommandExt` rather than tokio's inherent method — a different code path,
+    /// so the test above cannot cover it.
+    ///
+    /// Load-bearing on `ulimit -f` for the reason spelled out above: deleting the
+    /// `apply_std` call below leaves the `-c` assertion passing on macOS and fails
+    /// only on `-f`.
+    #[cfg(unix)]
+    #[test]
+    fn apply_std_installs_the_same_limits_through_stds_pre_exec() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("ulimit -f; ulimit -c")
+            .stdin(std::process::Stdio::null());
+        apply_std(
+            ChildLimits::baseline().with_max_file_bytes(8_192),
+            &mut command,
+        );
+
+        let output = command.output().expect("the child must spawn");
         let reported = String::from_utf8_lossy(&output.stdout);
         let mut lines = reported.lines();
         let file_size = lines.next().unwrap_or_default().trim();

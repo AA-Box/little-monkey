@@ -220,6 +220,7 @@ a scope boundary stated where it matters.
   reported that it had timed out.
 - Tool children carry a bound the kernel holds them to, not only one this app
   supervises — three of the app's four spawn sites, the exception being a
+  — all four places this app starts a process — get their resource
   backgrounded shell, which is still unwired. Shell tools, verify commands and
   sandboxed runs get their resource
   limits installed between `fork` and `exec`, so the program never runs unbounded
