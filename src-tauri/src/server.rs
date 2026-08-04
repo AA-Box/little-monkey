@@ -191,16 +191,68 @@ fn hold_permit_until_body_ends(
     body: ResponseBody,
     guard: crate::http_policy::AdmissionGuard,
 ) -> ResponseBody {
+    // Racing the guard's own token here is safe, and the ordering is the reason:
+    // the token is cancelled by `AdmissionGuard::drop`, and the guard lives in
+    // this stream's state — so it cannot fire from this stream's own teardown
+    // while the stream is still being polled. It fires only from the *parent*
+    // token, which the accept loop cancels when it exits. That is a stopping
+    // server, and this is where a stream in flight finds out about it.
+    let cancel = guard.cancellation();
     // The guard lives in the unfold state, so it drops when the stream finishes
     // *or* when hyper drops the body because the client went away — which is the
     // release this needs, and the reason there is no explicit drop below.
     let stream = futures_util::stream::unfold(
-        (http_body_util::BodyStream::new(body), guard),
-        |(mut frames, guard)| async move {
-            frames.next().await.map(|frame| (frame, (frames, guard)))
+        (http_body_util::BodyStream::new(body), guard, cancel, false),
+        |(mut frames, guard, cancel, done)| async move {
+            if done {
+                return None;
+            }
+            tokio::select! {
+                frame = frames.next() => frame.map(|frame| (frame, (frames, guard, cancel, false))),
+                _ = cancel.cancelled() => {
+                    // An error, not a clean end. A truncated SSE stream that
+                    // closes successfully is indistinguishable to the client from
+                    // a completed one that happens to lack `[DONE]` — it would
+                    // read a partial answer as the whole answer. `done` ends the
+                    // stream on the next poll so the error is emitted exactly
+                    // once.
+                    let error: BoxError = Box::new(std::io::Error::other(
+                        "The API server stopped while this response was streaming",
+                    ));
+                    Some((Err(error), (frames, guard, cancel, true)))
+                }
+            }
         },
     );
     BodyExt::boxed(StreamBody::new(stream))
+}
+
+/// Awaits `work` unless this request is cancelled first.
+///
+/// `reqwest` has no cancel method, so cancellation is a race against the request
+/// future — dropping the loser is what aborts the connection. `None` means
+/// cancelled, and callers owe the client an answer that says so rather than a
+/// `502` blaming the upstream for a stop this app initiated.
+async fn unless_cancelled<T>(
+    cancel: &tokio_util::sync::CancellationToken,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        value = work => Some(value),
+        _ = cancel.cancelled() => None,
+    }
+}
+
+/// The answer a request gets when the server stops mid-flight.
+///
+/// `503` and not `502`: the upstream did nothing wrong, and a client that retries
+/// on `502` would be retrying against a listener that is gone.
+fn cancelled_response() -> Response<ResponseBody> {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The API server stopped before this request completed",
+        "server_stopping",
+    )
 }
 
 /// The one implementation of "this listener admits a request".
@@ -215,11 +267,14 @@ fn hold_permit_until_body_ends(
 ///
 /// `serve` returns the response *and* performs the per-request bookkeeping each
 /// loop does differently (token-used records, request logging), so the two loops
-/// share the rule without sharing their `ServerDeps` construction.
+/// share the rule without sharing their `ServerDeps` construction. It receives the
+/// guard's cancellation token, which is how that token reaches `ServerDeps` — a
+/// handler cannot be written that silently ignores it, because there is no way to
+/// build the deps without one.
 async fn serve_with_admission<Fut>(
     admission: &crate::http_policy::RequestAdmission,
     server_shutdown: &tokio_util::sync::CancellationToken,
-    serve: impl FnOnce() -> Fut,
+    serve: impl FnOnce(tokio_util::sync::CancellationToken) -> Fut,
 ) -> Response<ResponseBody>
 where
     Fut: std::future::Future<Output = Response<ResponseBody>>,
@@ -233,7 +288,7 @@ where
             "server_busy",
         );
     };
-    serve()
+    serve(guard.cancellation())
         .await
         .map(|body| hold_permit_until_body_ends(body, guard))
 }
@@ -924,6 +979,21 @@ pub struct ServerDeps {
     pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
     pub client: reqwest::Client,
+    /// This request's cancellation token, from its [`http_policy::AdmissionGuard`].
+    ///
+    /// A field rather than a parameter so no handler signature has to learn that
+    /// cancellation exists — handlers already receive `&ServerDeps`.
+    ///
+    /// **What this is actually for is server shutdown, not client disconnect.**
+    /// A disconnecting client is already handled by drop: hyper drops the service
+    /// future, which drops the reqwest future with it. Stopping the API server was
+    /// the real hole — `stop_server_core` awaits only the accept loop's task, and
+    /// every connection is a separate `tokio::spawn` that nothing joins, so
+    /// requests it already accepted kept streaming from upstream after the user
+    /// pressed Stop and the UI said "stopped". The accept loop's drop-guard
+    /// cancels the parent token on exit, and every guard's token is a child of it,
+    /// so honouring this is what makes that stop real.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// A decoded HTTP request. Deliberately not `hyper::Request<Incoming>`
@@ -1342,7 +1412,10 @@ async fn handle_chat_completions(
         ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let upstream = match request_builder.send().await {
+    let Some(sent) = unless_cancelled(&deps.cancel, request_builder.send()).await else {
+        return cancelled_response();
+    };
+    let upstream = match sent {
         Ok(resp) => resp,
         Err(e) => {
             return error_response(
@@ -1380,7 +1453,12 @@ async fn handle_chat_completions(
                 "building a streaming response from an upstream status + content-type never fails",
             )
     } else {
-        match upstream.bytes().await {
+        // Reading the body is where a slow upstream actually spends its time, so
+        // cancelling only the send would leave the request running past a stop.
+        let Some(read) = unless_cancelled(&deps.cancel, upstream.bytes()).await else {
+            return cancelled_response();
+        };
+        match read {
             Ok(bytes) => Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, content_type)
@@ -1491,14 +1569,16 @@ async fn handle_embeddings(
         ModelRoute::Providers { .. } | ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let upstream = match deps
+    let request = deps
         .client
         .post(&upstream_url)
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
-        .send()
-        .await
-    {
+        .send();
+    let Some(sent) = unless_cancelled(&deps.cancel, request).await else {
+        return cancelled_response();
+    };
+    let upstream = match sent {
         Ok(resp) => resp,
         Err(e) => {
             return error_response(
@@ -1511,7 +1591,10 @@ async fn handle_embeddings(
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    match upstream.bytes().await {
+    let Some(read) = unless_cancelled(&deps.cancel, upstream.bytes()).await else {
+        return cancelled_response();
+    };
+    match read {
         Ok(bytes) => Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
@@ -2007,7 +2090,11 @@ fn tokens_from_config(config: &ApiServerConfig) -> Vec<StoredToken> {
         .collect()
 }
 
-fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
+fn build_deps(
+    app: &AppHandle,
+    runtime: &ServerRuntime,
+    cancel: tokio_util::sync::CancellationToken,
+) -> ServerDeps {
     let state = app.state::<AppState>();
     let (llama_port, llama_ready, llama_model_stem, llama_embeddings_enabled) = {
         let llama = state.llama.lock().unwrap();
@@ -2043,6 +2130,7 @@ fn build_deps(app: &AppHandle, runtime: &ServerRuntime) -> ServerDeps {
         providers: build_provider_catalog(app),
         tokens,
         client: runtime.client.clone(),
+        cancel,
     }
 }
 
@@ -2273,14 +2361,19 @@ async fn run_accept_loop(
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let app_for_req = app_for_conn.clone();
-                        let deps = build_deps(&app_for_req, &runtime_for_conn);
+                        let runtime_for_req = runtime_for_conn.clone();
                         let admission_for_req = admission_for_conn.clone();
                         let shutdown_for_req = shutdown_for_conn.clone();
                         async move {
                             let response = serve_with_admission(
                                 &admission_for_req,
                                 &shutdown_for_req,
-                                || async move {
+                                |cancel| async move {
+                                    // Built inside, so the deps carry this
+                                    // request's token; there is no way to
+                                    // construct them without one.
+                                    let deps =
+                                        build_deps(&app_for_req, &runtime_for_req, cancel);
                                     let (resp, matched_token_id) =
                                         match serve_one_request(deps, req, Some(&app_for_req)).await
                                         {
@@ -2424,29 +2517,30 @@ pub async fn run_cli_server(
                     let response = serve_with_admission(
                         &admission_for_req,
                         &shutdown_for_req,
-                        || async move {
-                    let config = load_config_impl(&config_path).unwrap_or_default();
-                    let (llama_ready, llama_model_stem) =
-                        probe_llama_server(&client, llama_port).await;
-                    let deps = ServerDeps {
-                        llama_port,
-                        llama_ready,
-                        llama_model_stem,
-                        // The CLI can't know whether the GUI started
-                        // llama-server with `--embeddings` (that flag lives
-                        // only in the GUI's in-memory `LlamaState`, not on
-                        // disk) — conservatively `false`, so
-                        // `POST /v1/embeddings` 501s with a clear message
-                        // instead of guessing.
-                        llama_embeddings_enabled: false,
-                        ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
-                        require_token: config.require_token,
-                        expose_ollama: config.expose_ollama,
-                        expose_providers: config.expose_providers,
-                        providers: provider_catalog_from(load_custom_providers()),
-                        tokens: tokens_from_config(&config),
-                        client,
-                    };
+                        |cancel| async move {
+                            let config = load_config_impl(&config_path).unwrap_or_default();
+                            let (llama_ready, llama_model_stem) =
+                                probe_llama_server(&client, llama_port).await;
+                            let deps = ServerDeps {
+                                llama_port,
+                                llama_ready,
+                                llama_model_stem,
+                                // The CLI can't know whether the GUI started
+                                // llama-server with `--embeddings` (that flag lives
+                                // only in the GUI's in-memory `LlamaState`, not on
+                                // disk) — conservatively `false`, so
+                                // `POST /v1/embeddings` 501s with a clear message
+                                // instead of guessing.
+                                llama_embeddings_enabled: false,
+                                ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
+                                require_token: config.require_token,
+                                expose_ollama: config.expose_ollama,
+                                expose_providers: config.expose_providers,
+                                providers: provider_catalog_from(load_custom_providers()),
+                                tokens: tokens_from_config(&config),
+                                client,
+                                cancel,
+                            };
 
                             let (resp, matched_token_id) =
                                 match serve_one_request(deps, req, None).await {
@@ -2898,6 +2992,20 @@ mod tests {
             ],
             tokens: Vec::new(),
             client: reqwest::Client::new(),
+            // Never cancelled, so every existing test keeps asserting the
+            // uncancelled path. The cancellation tests build their own token.
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// `test_deps` with a token the caller controls, for the cancellation paths.
+    fn test_deps_cancelled_by(
+        ollama_base_url: String,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ServerDeps {
+        ServerDeps {
+            cancel,
+            ..test_deps(ollama_base_url)
         }
     }
 
@@ -2945,6 +3053,23 @@ mod tests {
 
     async fn body_bytes(resp: Response<ResponseBody>) -> Bytes {
         resp.into_body().collect().await.unwrap().to_bytes()
+    }
+
+    /// A body that yields its frame only when the test releases it, so a response
+    /// can be "returned but still streaming" — the state the old `drop(guard)`
+    /// mishandled, and the state a shutdown has to cut without looking clean.
+    /// Shared by the `admission` and `cancellation` modules, which assert opposite
+    /// halves of the same lifetime.
+    fn gated_body(release: tokio::sync::oneshot::Receiver<()>) -> ResponseBody {
+        let stream = futures_util::stream::unfold(Some(release), |release| async move {
+            let release = release?;
+            let _ = release.await;
+            Some((
+                Ok::<Frame<Bytes>, BoxError>(Frame::data(Bytes::from_static(b"data: [DONE]\n\n"))),
+                None,
+            ))
+        });
+        BodyExt::boxed(StreamBody::new(stream))
     }
 
     fn temp_config_path() -> PathBuf {
@@ -4778,21 +4903,6 @@ mod tests {
         use crate::http_policy::RequestAdmission;
         use tokio_util::sync::CancellationToken;
 
-        /// A body that yields its frames only when the test releases them, so a
-        /// response can be "returned but still streaming" — the exact state the
-        /// old `drop(guard)` mishandled.
-        fn gated_body(release: tokio::sync::oneshot::Receiver<()>) -> ResponseBody {
-            let stream = futures_util::stream::unfold(Some(release), |release| async move {
-                let release = release?;
-                let _ = release.await;
-                Some((
-                    Ok::<Frame<Bytes>, BoxError>(Frame::data(Bytes::from_static(b"data: [DONE]\n\n"))),
-                    None,
-                ))
-            });
-            BodyExt::boxed(StreamBody::new(stream))
-        }
-
         #[tokio::test]
         async fn a_refusal_uses_the_legacy_error_envelope_verbatim() {
             // Byte-asserted rather than status-asserted: an SDK client parses
@@ -4802,7 +4912,7 @@ mod tests {
             let shutdown = CancellationToken::new();
             let held = admission.try_admit(&shutdown).expect("first request admits");
 
-            let refused = serve_with_admission(&admission, &shutdown, || async {
+            let refused = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 panic!("the handler must not run once the quota is exhausted")
             })
             .await;
@@ -4833,7 +4943,7 @@ mod tests {
             let shutdown = CancellationToken::new();
             let (release, wait_for_release) = tokio::sync::oneshot::channel();
 
-            let streaming = serve_with_admission(&admission, &shutdown, || async {
+            let streaming = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 Response::builder()
                     .status(StatusCode::OK)
                     .body(gated_body(wait_for_release))
@@ -4847,7 +4957,7 @@ mod tests {
                 "the handler returned, but its body has not produced a byte — the request is still in flight"
             );
 
-            let refused = serve_with_admission(&admission, &shutdown, || async {
+            let refused = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 panic!("a second request must not be admitted while the first is still streaming")
             })
             .await;
@@ -4862,7 +4972,7 @@ mod tests {
                 "the permit must be released when the body ends"
             );
 
-            let admitted_again = serve_with_admission(&admission, &shutdown, || async {
+            let admitted_again = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 Response::builder().status(StatusCode::OK).body(full_body("ok")).unwrap()
             })
             .await;
@@ -4878,7 +4988,7 @@ mod tests {
             let shutdown = CancellationToken::new();
             let (_release, wait_for_release) = tokio::sync::oneshot::channel();
 
-            let streaming = serve_with_admission(&admission, &shutdown, || async {
+            let streaming = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 Response::builder()
                     .status(StatusCode::OK)
                     .body(gated_body(wait_for_release))
@@ -4905,7 +5015,7 @@ mod tests {
             let admission = RequestAdmission::new(4);
             let shutdown = CancellationToken::new();
 
-            let response = serve_with_admission(&admission, &shutdown, || async {
+            let response = serve_with_admission(&admission, &shutdown, |_cancel| async {
                 json_response(StatusCode::OK, json!({"object": "list", "data": []}))
             })
             .await;
@@ -4956,6 +5066,235 @@ mod tests {
                 !production.contains("drop(guard)"),
                 "the guard must be owned by the response body, not dropped when the \
                  handler returns — see `hold_permit_until_body_ends`"
+            );
+        }
+    }
+    /// Cancellation, which the guard carried and nothing read.
+    ///
+    /// The target is **server shutdown**, not client disconnect. A disconnecting
+    /// client is already handled by drop — hyper drops the service future and the
+    /// reqwest future with it. Stopping the server was the hole:
+    /// `stop_server_core` awaits only the accept loop's task, while every
+    /// connection is a separate `tokio::spawn` nothing joins, so requests already
+    /// accepted kept streaming from upstream after the UI said "stopped".
+    mod cancellation {
+        use super::*;
+        use crate::http_policy::RequestAdmission;
+        use tokio_util::sync::CancellationToken;
+
+        /// An upstream that accepts a connection, announces it, and then says
+        /// nothing until the test releases it.
+        ///
+        /// The announcement is the point. A first version cancelled after a fixed
+        /// 50ms and passed locally, then failed once with `502` — the fake upstream
+        /// had closed its socket first, so `send()` errored before cancellation
+        /// won. That is a race, and a loaded CI runner would lose it more often
+        /// than a laptop. `connected` makes the ordering explicit: the test cancels
+        /// *because* the request is in flight, not after a duration guessed to
+        /// coincide with it, and `release` keeps the socket open until the
+        /// assertions are done so the upstream can never end the request first.
+        struct SilentUpstream {
+            base_url: String,
+            release: std::sync::mpsc::Sender<()>,
+            handle: std::thread::JoinHandle<()>,
+        }
+
+        impl SilentUpstream {
+            /// Returns the upstream and its "a client connected" signal separately,
+            /// so a test can move the signal into a waiter task and still own the
+            /// upstream for `finish`.
+            fn start() -> (Self, std::sync::mpsc::Receiver<()>) {
+                let listener =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+                listener
+                    .set_nonblocking(true)
+                    .expect("upstream listener goes non-blocking");
+                let addr = listener.local_addr().expect("upstream address");
+                let (connected_tx, connected) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                // Non-blocking with a deadline rather than a plain `accept()`: one
+                // of these tests asserts that *nothing ever connects*, and a
+                // blocking accept would never return, so joining would hang the
+                // very test it is meant to prove.
+                let handle = std::thread::spawn(move || {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut accepted = None;
+                    while std::time::Instant::now() < deadline {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let _ = connected_tx.send(());
+                                accepted = Some(stream);
+                                break;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if release_rx.try_recv().is_ok() {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    if accepted.is_some() {
+                        // Never answered, and never closed early — the request can
+                        // only end by being cancelled.
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                    }
+                });
+                (
+                    SilentUpstream {
+                        base_url: format!("http://{addr}"),
+                        release,
+                        handle,
+                    },
+                    connected,
+                )
+            }
+
+            fn finish(self) {
+                let _ = self.release.send(());
+                let _ = self.handle.join();
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stopping_server_answers_an_in_flight_request_instead_of_hanging_on_upstream() {
+            let (upstream, connected) = SilentUpstream::start();
+            let cancel = CancellationToken::new();
+            let deps = test_deps_cancelled_by(upstream.base_url.clone(), cancel.clone());
+
+            // Cancels once the upstream has the connection, so this asserts
+            // "cancellation beats an in-flight request" rather than "cancellation
+            // beats a 50ms sleep" — which is the race that flaked.
+            let cancel_on_connect = cancel.clone();
+            let waiter = tokio::task::spawn_blocking(move || {
+                let _ = connected.recv_timeout(std::time::Duration::from_secs(5));
+                cancel_on_connect.cancel();
+            });
+
+            let (resp, _) = handle_request(
+                &deps,
+                post_request(
+                    "/v1/chat/completions",
+                    r#"{"model":"llama3.1:8b","stream":false}"#,
+                ),
+            )
+            .await;
+
+            // 503 and not 502: the upstream did nothing wrong, and a client that
+            // retries on 502 would retry against a listener that is gone.
+            let status = resp.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+            assert_eq!(body["error"]["code"], "server_stopping");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            let _ = waiter.await;
+            upstream.finish();
+        }
+
+        #[tokio::test]
+        async fn an_already_cancelled_request_never_reaches_upstream_at_all() {
+            // The upstream here would block for its full sleep if contacted, so
+            // returning promptly *is* the assertion that no connection was made.
+            let (upstream, _connected) = SilentUpstream::start();
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let deps = test_deps_cancelled_by(upstream.base_url.clone(), cancel);
+
+            let started = std::time::Instant::now();
+            let (resp, _) = handle_request(
+                &deps,
+                post_request("/v1/embeddings", r#"{"model":"llama3.1:8b","input":"hi"}"#),
+            )
+            .await;
+
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(400),
+                "a cancelled request waited on upstream anyway: {:?}",
+                started.elapsed()
+            );
+            upstream.finish();
+        }
+
+        #[tokio::test]
+        async fn a_stream_cut_short_by_shutdown_ends_in_an_error_not_a_clean_close() {
+            // The important half. A truncated SSE stream that closes *successfully*
+            // is indistinguishable to a client from a complete one that happens to
+            // lack `[DONE]` — it would read a partial answer as the whole answer.
+            let admission = RequestAdmission::new(2);
+            let server_shutdown = CancellationToken::new();
+            let (_release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+
+            let streaming = serve_with_admission(&admission, &server_shutdown, |_cancel| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(streaming.status(), StatusCode::OK);
+
+            // What stopping the server does: the accept loop's drop-guard cancels
+            // the parent, and every guard's token is a child of it.
+            server_shutdown.cancel();
+
+            let collected = streaming.into_body().collect().await;
+            let error = collected.err().expect("a cut stream must not collect cleanly");
+            assert!(
+                error.to_string().contains("stopped while this response was streaming"),
+                "unexpected stream error: {error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_completed_stream_is_not_reported_as_cut_by_its_own_guard_dropping() {
+            // `AdmissionGuard::drop` cancels the token, and the guard lives in the
+            // stream's own state — so a naive implementation would race its own
+            // teardown and turn every successful stream into an error.
+            let admission = RequestAdmission::new(2);
+            let server_shutdown = CancellationToken::new();
+            let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+
+            let streaming = serve_with_admission(&admission, &server_shutdown, |_cancel| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(gated_body(wait_for_release))
+                    .unwrap()
+            })
+            .await;
+            release.send(()).unwrap();
+
+            let bytes = body_bytes(streaming).await;
+            assert_eq!(&bytes[..], b"data: [DONE]\n\n");
+        }
+
+        #[tokio::test]
+        async fn the_token_handed_to_a_handler_is_a_child_of_the_servers() {
+            // The link that makes one stop reach every request. Asserted because
+            // the guard could be built from a fresh token and every test above
+            // would still pass.
+            let admission = RequestAdmission::new(2);
+            let server_shutdown = CancellationToken::new();
+            let seen: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+                Arc::new(std::sync::Mutex::new(None));
+
+            let captured = seen.clone();
+            let response = serve_with_admission(&admission, &server_shutdown, |cancel| async move {
+                *captured.lock().unwrap() = Some(cancel);
+                json_response(StatusCode::OK, json!({"ok": true}))
+            })
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let token = seen.lock().unwrap().clone().expect("handler received a token");
+            assert!(!token.is_cancelled());
+            server_shutdown.cancel();
+            assert!(
+                token.is_cancelled(),
+                "cancelling the server must reach a request's own token"
             );
         }
     }
