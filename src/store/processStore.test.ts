@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+
 const mocks = vi.hoisted(() => ({
   listProcesses: vi.fn(),
   signalProcess: vi.fn(),
@@ -22,8 +23,10 @@ vi.mock("../lib/processSignals", async (importOriginal) => {
 });
 
 import {
+  PROCESS_CATCH_UP_INTERVAL_MS,
   selectLiveProcessCount,
   selectStateCounts,
+  startProcessCatchUp,
   subscribeToProcessChanges,
   useProcessStore,
 } from "./processStore";
@@ -34,6 +37,7 @@ function record(overrides: {
   kind?: ProcessKind;
   state?: ProcessState;
   createdAtMs?: number;
+  updatedAtMs?: number;
   stopRequested?: boolean;
   suspendRequested?: boolean;
 }): ProcessRecord {
@@ -51,12 +55,13 @@ function record(overrides: {
     signalIntent: {
       stopRequested: overrides.stopRequested ?? false,
       suspendRequested: overrides.suspendRequested ?? false,
+      killRequested: false,
     },
     signalReason: null,
     signalRequestedAtMs: null,
     exit: null,
     createdAtMs: overrides.createdAtMs ?? 1_000,
-    updatedAtMs: 1_000,
+    updatedAtMs: overrides.updatedAtMs ?? 1_000,
     startedAtMs: null,
     exitedAtMs: null,
   };
@@ -95,6 +100,122 @@ describe("processStore.refresh", () => {
 
     expect(useProcessStore.getState().loading).toBe(false);
     expect(useProcessStore.getState().error).toContain("ledger locked");
+  });
+});
+
+describe("processStore.catchUp", () => {
+  // The gap this closes: `monkey processes signal` writes the same SQLite
+  // ledger from another OS process and cannot emit `processes://changed` into
+  // this one, so the event path alone leaves a CLI-paused row rendering its
+  // previous state until the panel is remounted.
+  it("picks up a suspend written by another OS process", async () => {
+    useProcessStore.setState({ records: [record({ processId: "a" })] });
+    mocks.listProcesses.mockResolvedValue([
+      record({ processId: "a", suspendRequested: true, updatedAtMs: 2_000 }),
+    ]);
+
+    await useProcessStore.getState().catchUp();
+
+    expect(useProcessStore.getState().records[0].signalIntent.suspendRequested).toBe(true);
+  });
+
+  it("leaves the records array untouched when nothing changed, so a quiet poll costs no re-render", async () => {
+    const before = [record({ processId: "a" }), record({ processId: "b", createdAtMs: 5 })];
+    useProcessStore.setState({ records: [...before].sort((x, y) => y.createdAtMs - x.createdAtMs) });
+    const identity = useProcessStore.getState().records;
+    // Fresh objects with identical field values: a shallow identity check on
+    // the records would call this a change, which is the trap being pinned.
+    mocks.listProcesses.mockResolvedValue([
+      record({ processId: "a" }),
+      record({ processId: "b", createdAtMs: 5 }),
+    ]);
+    const listener = vi.fn();
+    const unsubscribe = useProcessStore.subscribe(listener);
+
+    await useProcessStore.getState().catchUp();
+    unsubscribe();
+
+    expect(useProcessStore.getState().records).toBe(identity);
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("notices a state change that leaves the row count and stamp alone", async () => {
+    // `updated_at_ms` is written from the signal's own timestamp, so two
+    // signals inside one millisecond share a stamp; the comparison has to look
+    // at what the row draws, not only at the clock.
+    useProcessStore.setState({ records: [record({ processId: "a", suspendRequested: true })] });
+    mocks.listProcesses.mockResolvedValue([
+      record({ processId: "a", state: "suspended", suspendRequested: true }),
+    ]);
+
+    await useProcessStore.getState().catchUp();
+
+    expect(useProcessStore.getState().records[0].state).toBe("suspended");
+  });
+
+  it("never toggles loading, and hides a read failure rather than banner-flashing every tick", async () => {
+    useProcessStore.setState({ records: [record({ processId: "a" })] });
+    mocks.listProcesses.mockRejectedValue(new Error("ledger locked"));
+
+    await useProcessStore.getState().catchUp();
+
+    expect(useProcessStore.getState().loading).toBe(false);
+    expect(useProcessStore.getState().error).toBeNull();
+    // The last good listing stays on screen instead of emptying out.
+    expect(useProcessStore.getState().records).toHaveLength(1);
+  });
+
+  it("stands down while a signal is in flight so the row does not flick back", async () => {
+    useProcessStore.setState({
+      records: [record({ processId: "a", suspendRequested: true })],
+      pending: { a: true },
+    });
+    mocks.listProcesses.mockResolvedValue([record({ processId: "a" })]);
+
+    await useProcessStore.getState().catchUp();
+
+    expect(mocks.listProcesses).not.toHaveBeenCalled();
+    expect(useProcessStore.getState().records[0].signalIntent.suspendRequested).toBe(true);
+  });
+});
+
+describe("startProcessCatchUp", () => {
+  it("ticks the clock and reads the ledger on every interval, and stops on cleanup", () => {
+    vi.useFakeTimers();
+    try {
+      const tick = vi.fn();
+      const stop = startProcessCatchUp(tick);
+
+      vi.advanceTimersByTime(PROCESS_CATCH_UP_INTERVAL_MS * 2);
+      expect(tick).toHaveBeenCalledTimes(2);
+      expect(mocks.listProcesses).toHaveBeenCalledTimes(2);
+
+      stop();
+      vi.advanceTimersByTime(PROCESS_CATCH_UP_INTERVAL_MS * 3);
+      expect(tick).toHaveBeenCalledTimes(2);
+      expect(mocks.listProcesses).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ticks the clock even when the listing is unchanged, so a row's age keeps moving", () => {
+    // The age is `Date.now()` at render. A poll that only wrote the store when
+    // something changed would leave every age frozen on an idle panel.
+    vi.useFakeTimers();
+    try {
+      const tick = vi.fn();
+      useProcessStore.setState({ records: [record({ processId: "a" })] });
+      mocks.listProcesses.mockResolvedValue([record({ processId: "a" })]);
+
+      const stop = startProcessCatchUp(tick);
+      vi.advanceTimersByTime(PROCESS_CATCH_UP_INTERVAL_MS * 3);
+      stop();
+
+      expect(tick).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

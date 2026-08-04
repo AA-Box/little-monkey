@@ -37,6 +37,8 @@ const MIGRATION_V5: i64 = 5;
 const MIGRATION_V5_CHECKSUM: &str = "agent-process-table-v5-2026-08-02";
 const MIGRATION_V6: i64 = 6;
 const MIGRATION_V6_CHECKSUM: &str = "process-signal-intent-v6-2026-08-02";
+const MIGRATION_V7: i64 = 7;
+const MIGRATION_V7_CHECKSUM: &str = "process-kill-intent-v7-2026-08-03";
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -781,7 +783,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
             row.get::<_, Option<i64>>(0)
         })?
     {
-        if version > MIGRATION_V6 {
+        if version > MIGRATION_V7 {
             return Err(LedgerError::MigrationConflict { version });
         }
     }
@@ -793,6 +795,7 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         (MIGRATION_V4, MIGRATION_V4_CHECKSUM),
         (MIGRATION_V5, MIGRATION_V5_CHECKSUM),
         (MIGRATION_V6, MIGRATION_V6_CHECKSUM),
+        (MIGRATION_V7, MIGRATION_V7_CHECKSUM),
     ] {
         if let Some(checksum) = connection
             .query_row(
@@ -975,7 +978,24 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    transaction.execute_batch("PRAGMA user_version = 6;")?;
+    let has_v7 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V7],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v7 {
+        transaction.execute_batch(MIGRATION_V7_SQL)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![MIGRATION_V7, MIGRATION_V7_CHECKSUM, now_ms_i64()?],
+        )?;
+    }
+
+    transaction.execute_batch("PRAGMA user_version = 7;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -1527,6 +1547,34 @@ CREATE INDEX runs_archived_idx ON runs(archived_at_ms) WHERE archived_at_ms IS N
 /// Recording intent separately from delivery is also what lets a signal be
 /// *refused with a reason*: a kind that cannot honour `suspend` says so, instead
 /// of a command that appears to succeed and silently does nothing.
+/// `kill` stops being indistinguishable from `stop` in the latch.
+///
+/// Both used to set `stop_requested` alone, so a reader could not tell which was
+/// asked for — only the free-text `signal_reason` survived. That was honest
+/// while the only kinds honouring `kill` delivered it identically to `stop`, but
+/// it means a UI offering two buttons would imply a difference the schema could
+/// not carry, and a supervisor could not tell "wind down cleanly" from
+/// "terminate now" after a restart.
+///
+/// `kill_requested` never appears without `stop_requested` — a kill IS a stop
+/// with a stronger delivery promise — and the trigger below enforces that rather
+/// than trusting every writer to remember it. That invariant is what keeps this
+/// migration cheap: every reader already checking `stop_requested` keeps working
+/// untouched, no existing query changes meaning, and the
+/// `agent_processes_pending_signal_idx` partial index still covers a killed row
+/// without being rebuilt, because such a row always has `stop_requested = 1`.
+const MIGRATION_V7_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN kill_requested INTEGER NOT NULL DEFAULT 0
+    CHECK (kill_requested IN (0, 1));
+
+CREATE TRIGGER agent_processes_kill_implies_stop
+BEFORE UPDATE OF kill_requested ON agent_processes
+WHEN NEW.kill_requested = 1 AND NEW.stop_requested <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'kill_requested implies stop_requested');
+END;
+"#;
+
 const MIGRATION_V6_SQL: &str = r#"
 ALTER TABLE agent_processes ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0
     CHECK (stop_requested IN (0, 1));
@@ -3026,10 +3074,10 @@ mod tests {
         let database = TempDb::new("migration");
         {
             let ledger = RunLedger::open(&database.path).unwrap();
-            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+            assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
         }
         let ledger = RunLedger::open(&database.path).unwrap();
-        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(ledger.applied_migrations().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
 
         let journal_mode = ledger
             .connection
