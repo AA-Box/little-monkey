@@ -159,6 +159,60 @@ pub enum Isolation {
     ProcessOnly,
 }
 
+/// Path to the only OS enforcement mechanism this app has.
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// What isolation this machine can actually apply, answerable *before* a run.
+///
+/// [`Isolation`] reports what a run got, which is honest but arrives too late to
+/// inform the decision to start one. The Sandbox panel offers the same button on
+/// every platform, and `probeGeneratedMcpArtifact` sends **model-authored MCP
+/// server code** through it — so on Windows and Linux that code runs with a
+/// restricted cwd and a scrubbed environment and no kernel boundary, free to read
+/// or write the real workspace by absolute path. That is worth knowing first.
+///
+/// `Unavailable` is a third state, not a pessimistic reading of `ProcessOnly`: on
+/// macOS `execute_in_sandbox` spawns `sandbox-exec` unconditionally, so if the
+/// binary is missing the run fails outright rather than degrading. A user who sees
+/// only "no OS sandbox" would go looking for the wrong problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEnforcement {
+    /// A kernel-enforced boundary applies: macOS Seatbelt via `sandbox-exec`.
+    OsEnforced,
+    /// Restricted cwd and allowlisted environment only. No kernel boundary.
+    ProcessOnly,
+    /// This platform has an enforcement mechanism and it is not usable here, so a
+    /// sandboxed run will fail rather than run unconfined.
+    Unavailable,
+}
+
+/// This machine's enforcement capability.
+///
+/// Deliberately a probe rather than a constant. On macOS the answer depends on
+/// `sandbox-exec` being present, which a `cfg!` cannot know — and reporting
+/// `OsEnforced` from the target triple alone is exactly the kind of claim this
+/// function exists to stop making.
+pub fn sandbox_enforcement() -> SandboxEnforcement {
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new(SANDBOX_EXEC).is_file() {
+            SandboxEnforcement::OsEnforced
+        } else {
+            SandboxEnforcement::Unavailable
+        }
+    }
+    // Windows and Linux have no enforcement path in this app at all — no
+    // Landlock, seccomp, namespace, job object, restricted token or AppContainer
+    // anywhere in the crate — so there is nothing to probe for. `Unavailable`
+    // would imply a mechanism that failed; `ProcessOnly` is the accurate answer.
+    #[cfg(not(target_os = "macos"))]
+    {
+        SandboxEnforcement::ProcessOnly
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CopyStats {
     pub files_copied: u64,
@@ -735,7 +789,7 @@ pub async fn execute_in_sandbox(
         let profile = build_seatbelt_profile(&sandbox_root, &readable_roots, allow_network);
         fs::write(profile_path, profile)?;
         (
-            "/usr/bin/sandbox-exec".to_string(),
+            SANDBOX_EXEC.to_string(),
             vec![
                 "-f".to_string(),
                 profile_path.to_string_lossy().to_string(),
@@ -1413,6 +1467,17 @@ pub fn sandbox_diff(
     diff_sandbox_against_workspace(&workspace_dir, &root)
 }
 
+/// What this machine can enforce, asked *before* a run rather than reported after.
+///
+/// The Sandbox panel shows the same Run button on every platform, and the isolation
+/// label only appears once a run has already executed — which is the wrong order
+/// for a decision about running untrusted code. This is the same probe Security
+/// Doctor uses, so the panel and the audit cannot disagree.
+#[tauri::command]
+pub fn sandbox_enforcement_probe() -> SandboxEnforcement {
+    sandbox_enforcement()
+}
+
 #[tauri::command]
 pub fn sandbox_prepare_promote(
     app: tauri::AppHandle,
@@ -1819,6 +1884,124 @@ mod tests {
             allowed.replace("(allow network*)", ""),
             "network permission must not alter any file-read rule"
         );
+    }
+
+    /// The network clause, actually exercised.
+    ///
+    /// Everything else about `(deny network*)` was asserted as profile *text*: the
+    /// sibling test above compares two generated strings, and the live Seatbelt
+    /// test loops over `allow_network` while running a command that never opens a
+    /// socket — so it proved the filesystem rules survive the toggle, not that the
+    /// toggle does anything. A denied-network sandbox was a security claim with no
+    /// test behind it.
+    ///
+    /// Asserted as a **contrast**, and that is the whole design: "the connection
+    /// failed" is also what a machine with no network produces, so a one-armed
+    /// test would pass vacuously in exactly the environment where it is least
+    /// informative. The allow arm must succeed for the deny arm to mean anything,
+    /// and if it does not, the test says so rather than reporting a pass.
+    ///
+    /// The target is a listener this test owns on loopback. Reaching the real
+    /// internet would make a unit test depend on egress, and loopback is the
+    /// stricter check anyway: a boundary that stops a connection to `127.0.0.1`
+    /// is not merely failing to resolve DNS.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_denies_a_real_connection_when_network_is_not_allowed() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping Seatbelt network test: sandbox-exec is unavailable");
+            return;
+        }
+        if !Path::new("/usr/bin/nc").is_file() {
+            eprintln!("skipping Seatbelt network test: /usr/bin/nc is unavailable");
+            return;
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("listener address").port();
+        let accepting = std::thread::spawn(move || {
+            // Two arms, so two connection attempts at most; the deny arm never
+            // arrives, and the accept loop ends with the listener's drop.
+            for _ in 0..2 {
+                match listener.accept() {
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let sandbox_root = temp_dir("seatbelt-network");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("seatbelt-network-real");
+        // `-z` scans without sending data and `-w 2` bounds the wait, so a denied
+        // connection fails fast instead of hanging until the run times out.
+        let command = format!("/usr/bin/nc -w 2 -z 127.0.0.1 {port}");
+
+        let mut outcomes = Vec::new();
+        for allow_network in [true, false] {
+            let profile_path = sandbox_root.join(format!("network-{allow_network}.sb"));
+            let outcome = execute_in_sandbox(
+                &sandbox_root,
+                &workspace_dir,
+                &real_workspace,
+                &profile_path,
+                &command,
+                Duration::from_secs(10),
+                allow_network,
+                &[],
+            )
+            .await
+            .expect("sandbox-exec launches");
+            outcomes.push((allow_network, outcome));
+        }
+
+        let (_, allowed) = &outcomes[0];
+        let (_, denied) = &outcomes[1];
+        assert_eq!(
+            allowed.exit_code,
+            Some(0),
+            "a network-allowed sandbox could not reach a loopback listener, so this \
+             environment cannot tell enforcement from absent networking; stderr={}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert_ne!(
+            denied.exit_code,
+            Some(0),
+            "`(deny network*)` did not stop a connection the same sandbox makes \
+             successfully when network is allowed; stderr={}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        assert!(!denied.timed_out, "the denied connection hung instead of failing");
+
+        drop(accepting);
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    #[test]
+    fn the_enforcement_probe_answers_for_this_platform_and_never_guesses_from_the_target() {
+        let enforcement = sandbox_enforcement();
+
+        #[cfg(target_os = "macos")]
+        {
+            // The distinction this exists for: `OsEnforced` is a claim about the
+            // machine, not about the target triple, so it must track whether the
+            // binary is actually there.
+            let expected = if Path::new(SANDBOX_EXEC).is_file() {
+                SandboxEnforcement::OsEnforced
+            } else {
+                SandboxEnforcement::Unavailable
+            };
+            assert_eq!(enforcement, expected);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Not `Unavailable`: that would imply a mechanism this app has and
+            // could not use, and there is no Landlock, seccomp, job object or
+            // restricted token anywhere in the crate.
+            assert_eq!(enforcement, SandboxEnforcement::ProcessOnly);
+        }
     }
 
     #[test]
