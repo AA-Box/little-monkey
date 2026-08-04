@@ -334,6 +334,14 @@ pub struct AppState {
     /// (or short name) — lets `ollama::ollama_cancel_pull` kill a pull the
     /// user started. See `ollama::ollama_pull_model`.
     pub ollama_pulls: std::sync::Mutex<std::collections::HashMap<String, tokio::process::Child>>,
+    /// Cancellation handles for in-flight `models_download` calls, keyed by
+    /// the destination file name — mirrors `index_cancels`/`ollama_pulls`,
+    /// but a `CancellationToken` rather than a killable child process since
+    /// the download is an in-process `reqwest` stream. See
+    /// `models::models_cancel_download`.
+    pub model_downloads: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    >,
     /// Attached workspace folders, primary first. Empty means no workspace
     /// is open. See `workspace.rs`.
     pub workspace_roots: std::sync::Mutex<Vec<workspace::WorkspaceRoot>>,
@@ -610,6 +618,7 @@ impl Default for AppState {
             embed_llama: std::sync::Mutex::new(llama::LlamaState::for_embeddings()),
             ollama: Default::default(),
             ollama_pulls: Default::default(),
+            model_downloads: Default::default(),
             workspace_roots: Default::default(),
             terminal: Default::default(),
             background_shell: Default::default(),
@@ -959,6 +968,7 @@ pub fn run() {
             models::models_list_curated,
             models::models_list_installed,
             models::models_download,
+            models::models_cancel_download,
             models::models_resolve_reference,
             models::models_install_reference,
             models::models_delete,

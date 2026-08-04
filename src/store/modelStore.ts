@@ -204,8 +204,6 @@ export interface CloudModelRetirementWarning {
   replacement_note: string;
 }
 
-/** Context window size used when starting llama-server. */
-const DEFAULT_CTX_SIZE = 4096;
 /** GPU layers to offload to the GPU; a large value offloads the full model. */
 const DEFAULT_GPU_LAYERS = 999;
 
@@ -268,6 +266,8 @@ export interface ModelStore {
   refresh: () => Promise<void>;
   /** Download a curated model's GGUF weights, then refresh the installed list. */
   download: (model: ModelInfo) => Promise<void>;
+  /** Cancel an in-flight `download()` for `model.file` — interrupts the backend stream and clears its progress entry. */
+  cancelDownload: (model: ModelInfo) => Promise<void>;
   /** Resolve an Ollama tag or Hugging Face reference into a verified public GGUF artifact. */
   resolveModelReference: (reference: string) => Promise<ResolvedModelReference>;
   /** Install a previously-resolved artifact and refresh the installed model list. */
@@ -451,11 +451,27 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   },
 
   download: async (model) => {
-    await invoke<string>("models_download", {
-      repo: model.repo,
-      file: model.file,
-    });
+    try {
+      await invoke<string>("models_download", {
+        repo: model.repo,
+        file: model.file,
+      });
+    } catch (error) {
+      // A cancelled or failed download must not leave a stale progress
+      // entry behind — `isDownloading` in ModelCard keys off its presence,
+      // so without this the card would be stuck showing a progress bar
+      // (with no Pull button to retry) forever.
+      set((state) => {
+        const { [model.file]: _removed, ...rest } = state.downloadProgress;
+        return { downloadProgress: rest };
+      });
+      throw error;
+    }
     await get().refresh();
+  },
+
+  cancelDownload: async (model) => {
+    await invoke("models_cancel_download", { file: model.file });
   },
 
   resolveModelReference: async (reference) =>
@@ -475,10 +491,14 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       throw new Error(`Model "${model.name}" has not been downloaded yet`);
     }
     set({ active: model, llamaStatus: "starting", activeProvider: "local" });
+    let resolvedCtxSize: number;
     try {
-      await invoke("llama_start", {
+      // `ctxSize` is omitted so the backend auto-sizes the context window
+      // from the model's own GGUF metadata (`llama.rs::resolve_ctx_size`)
+      // instead of one fixed guess for every model — it returns whatever it
+      // actually launched with.
+      resolvedCtxSize = await invoke<number>("llama_start", {
         modelPath: model.path,
-        ctxSize: DEFAULT_CTX_SIZE,
         gpuLayers: DEFAULT_GPU_LAYERS,
         embeddings: get().embeddingsEnabled,
       });
@@ -493,7 +513,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     }
     // The context limit for a local model is exactly the ctx_size it was
     // started with.
-    useUsageStore.getState().setContextLimit(DEFAULT_CTX_SIZE);
+    useUsageStore.getState().setContextLimit(resolvedCtxSize);
   },
 
   stop: async () => {
