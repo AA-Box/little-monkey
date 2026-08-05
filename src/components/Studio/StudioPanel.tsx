@@ -199,6 +199,14 @@ export function StudioPanel() {
     () => visible.find((model) => model.id === selectedId) ?? null,
     [visible, selectedId],
   );
+  // This tab's results, newest first: the newest fills the canvas, the rest is
+  // the strip under it.
+  const shownGallery = useMemo(
+    () => gallery.filter((entry) => tasksFor(mode).includes(entry.task)),
+    [gallery, mode],
+  );
+  const shown = shownGallery[0] ?? null;
+  const shownHistory = shownGallery.slice(1);
 
   const refresh = useCallback(async () => {
     try {
@@ -291,10 +299,10 @@ export function StudioPanel() {
     [previews],
   );
 
+  // The canvas has to have something in it the moment a tab opens.
   useEffect(() => {
-    const newest = gallery[0];
-    if (newest) void loadPreview(newest);
-  }, [gallery, loadPreview]);
+    if (shown) void loadPreview(shown);
+  }, [shown, loadPreview]);
 
   const download = async (model: GenerationModel) => {
     setError(null);
@@ -430,7 +438,11 @@ export function StudioPanel() {
     (!needsInitImage(task) || !!initImage);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
+    <div
+      className={`flex min-h-0 flex-1 flex-col p-4 ${
+        mode === "models" ? "overflow-y-auto" : "overflow-hidden"
+      }`}
+    >
       <Tabs
         active={mode}
         onChange={(next) => setMode(next as StudioMode)}
@@ -604,10 +616,13 @@ export function StudioPanel() {
         </section>
       )}
 
+      {/* The shape every local generation tool settles on: a narrow rail of
+          controls that scrolls on its own, and a canvas that keeps the prompt,
+          the button and the result together where the work happens. */}
       {mode !== "models" && (
-      <div className="grid items-start gap-4 lg:grid-cols-2">
+      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden">
         {selected && (
-        <section className="grid gap-3">
+        <aside className="grid w-72 shrink-0 content-start gap-3 overflow-y-auto pb-4 pr-1">
           <div className="flex flex-wrap gap-1.5">
             {selected.tasks
               .filter((entry) => tasksFor(mode).includes(entry))
@@ -622,21 +637,6 @@ export function StudioPanel() {
               </Button>
             ))}
           </div>
-
-          <textarea
-            className="min-h-20 w-full rounded border border-border bg-background p-2 text-xs"
-            placeholder={t("Studio.promptPlaceholder")}
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-          />
-          {!isSpeechTask(task) && (
-            <input
-              className="w-full rounded border border-border bg-background p-2 text-xs"
-              placeholder={t("Studio.negativePlaceholder")}
-              value={negativePrompt}
-              onChange={(event) => setNegativePrompt(event.target.value)}
-            />
-          )}
 
           {isSpeechTask(task) && (
             <div className="grid gap-3 sm:grid-cols-[2fr_1fr]">
@@ -723,8 +723,11 @@ export function StudioPanel() {
           {/* Every one of these is a per-run choice, not a property of the
               model — the library entry only supplies the starting values. */}
           {settings && !isSpeechTask(task) && (
-            <div className="grid gap-3 rounded border border-border p-3">
-              <span className="text-xs font-medium">{t("Studio.settings")}</span>
+            <details open className="rounded border border-border p-3">
+              <summary className="cursor-pointer text-xs font-medium">
+                {t("Studio.settings")}
+              </summary>
+              <div className="mt-3 grid gap-3">
 
               <div className="grid gap-1 text-[11px] text-muted">
                 {t("Studio.aspect")}
@@ -968,25 +971,52 @@ export function StudioPanel() {
                   </>
                 )}
               </div>
-            </div>
+              </div>
+            </details>
           )}
 
           {!isSpeechTask(task) && (
-            <LoraStack
-              loras={loras}
-              onChange={setLoras}
-              showHighNoise={selected.components.some(
-                (component) => component.slot === "high_noise_diffusion_model",
-              )}
+            <details className="rounded border border-border p-3">
+              <summary className="cursor-pointer text-xs font-medium">
+                {t("Studio.lora.title")}
+              </summary>
+              <div className="mt-3">
+                <LoraStack
+                  loras={loras}
+                  onChange={setLoras}
+                  showHighNoise={selected.components.some(
+                    (component) => component.slot === "high_noise_diffusion_model",
+                  )}
+                />
+              </div>
+            </details>
+          )}
+
+        </aside>
+        )}
+
+        <section className="flex min-h-0 flex-1 flex-col gap-2">
+          <textarea
+            className="min-h-16 w-full shrink-0 rounded border border-border bg-background p-2 text-xs"
+            placeholder={t("Studio.promptPlaceholder")}
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+          />
+          {!isSpeechTask(task) && (
+            <input
+              className="w-full shrink-0 rounded border border-border bg-background p-2 text-xs"
+              placeholder={t("Studio.negativePlaceholder")}
+              value={negativePrompt}
+              onChange={(event) => setNegativePrompt(event.target.value)}
             />
           )}
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <Button variant="primary" disabled={!canGenerate} onClick={() => void generate()}>
               {busy ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
               {t("Studio.generate")}
             </Button>
-            {phase && <span className="text-[11px] text-muted">{phase}</span>}
+            {phase && <span className="shrink-0 text-[11px] text-muted">{phase}</span>}
             {busy && (
               <span className="flex min-w-0 flex-1 items-center gap-2">
                 <span className="h-1 min-w-16 flex-1 overflow-hidden rounded-full bg-surface-2">
@@ -1006,71 +1036,81 @@ export function StudioPanel() {
               <Button
                 size="sm"
                 variant="secondary"
+                className="ml-auto"
                 onClick={() => void studioClient.unloadEngine().then(refresh)}
               >
                 {t("Studio.unload")}
               </Button>
             )}
           </div>
-        </section>
-        )}
 
-        <section>
-        <h2 className="mb-2 text-xs font-medium text-muted">{t("Studio.gallery")}</h2>
-        {gallery.length === 0 ? (
-          <p className="text-xs text-faint">{t("Studio.galleryEmpty")}</p>
-        ) : (
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {gallery
-              .filter((entry) => tasksFor(mode).includes(entry.task))
-              .map((entry) => {
-              const preview = previews[entry.artifactId];
-              if (!preview) {
-                return (
-                  <Button
-                    key={entry.entryId}
-                    size="sm"
-                    variant="secondary"
-                    className="h-24"
-                    onClick={() => void loadPreview(entry)}
-                  >
-                    {t("Studio.loadPreview")}
-                  </Button>
-                );
-              }
-              // A player is already small and already interactive; enlarging it
-              // would only show the same controls bigger.
-              if (entry.mediaType.startsWith("audio/")) {
-                return (
-                  <figure
-                    key={entry.entryId}
-                    className="col-span-2 rounded border border-border p-2 sm:col-span-3"
-                  >
-                    <audio controls src={preview} className="w-full" />
-                    <figcaption className="mt-1 line-clamp-1 text-[11px] text-muted">
-                      {entry.prompt}
-                    </figcaption>
-                  </figure>
-                );
-              }
-              return (
+          {/* The canvas: whatever was made last, as large as the pane allows.
+              It is the thing being worked on, so it gets the space. */}
+          <div className="grid min-h-0 flex-1 place-items-center overflow-hidden rounded border border-border bg-background/40 p-2">
+            {shown && previews[shown.artifactId] ? (
+              shown.mediaType.startsWith("audio/") ? (
+                <audio controls src={previews[shown.artifactId]} className="w-full max-w-md" />
+              ) : (
                 <button
-                  key={entry.entryId}
                   type="button"
-                  title={entry.prompt}
-                  className="overflow-hidden rounded border border-border transition hover:border-accent"
-                  onClick={() => setLightbox(entry)}
+                  className="grid min-h-0 place-items-center"
+                  title={t("Studio.result.expand")}
+                  onClick={() => setLightbox(shown)}
                 >
-                  {entry.mediaType.startsWith("video/") ? (
-                    <video src={preview} muted className="h-24 w-full bg-black object-cover" />
+                  {shown.mediaType.startsWith("video/") ? (
+                    <video
+                      controls
+                      loop
+                      src={previews[shown.artifactId]}
+                      className="max-h-full rounded bg-black object-contain"
+                    />
                   ) : (
-                    <img src={preview} alt={entry.prompt} className="h-24 w-full object-cover" />
+                    <img
+                      src={previews[shown.artifactId]}
+                      alt={shown.prompt}
+                      className="max-h-full rounded object-contain"
+                    />
                   )}
                 </button>
-              );
-            })}
+              )
+            ) : (
+              <p className="text-xs text-faint">
+                {busy ? t("Studio.phase.running") : t("Studio.galleryEmpty")}
+              </p>
+            )}
           </div>
-        )}
+
+          {/* Everything made before, as a strip rather than a wall. */}
+          {shownHistory.length > 0 && (
+            <div className="flex shrink-0 gap-2 overflow-x-auto pb-1">
+              {shownHistory.map((entry) => {
+                const preview = previews[entry.artifactId];
+                return (
+                  <button
+                    key={entry.entryId}
+                    type="button"
+                    title={entry.prompt}
+                    className="h-16 w-16 shrink-0 overflow-hidden rounded border border-border transition hover:border-accent"
+                    onClick={() => (preview ? setLightbox(entry) : void loadPreview(entry))}
+                  >
+                    {!preview ? (
+                      <span className="grid h-full place-items-center text-[10px] text-faint">
+                        {t("Studio.loadPreview")}
+                      </span>
+                    ) : entry.mediaType.startsWith("video/") ? (
+                      <video src={preview} muted className="h-full w-full bg-black object-cover" />
+                    ) : entry.mediaType.startsWith("audio/") ? (
+                      <span className="grid h-full place-items-center text-[10px] text-faint">
+                        ♪
+                      </span>
+                    ) : (
+                      <img src={preview} alt={entry.prompt} className="h-full w-full object-cover" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </section>
       </div>
       )}
