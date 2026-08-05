@@ -5223,7 +5223,12 @@ mod tests {
             "the timer path must name its reason where the unscoped call left a blank"
         );
 
-        fs::remove_dir_all(app_data).unwrap();
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
     }
 
     /// A stack whose one enabled source is a URL source pointing at `refused_host`,
@@ -5359,7 +5364,12 @@ mod tests {
             "the Refresh button must name its reason where the unscoped call left a blank"
         );
 
-        fs::remove_dir_all(app_data).unwrap();
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
     }
 
     /// The folder watcher's half: a refusal during a debounce-triggered refresh
@@ -5419,7 +5429,12 @@ mod tests {
             "the reason must survive the spawn the watcher's refresh runs in"
         );
 
-        fs::remove_dir_all(app_data).unwrap();
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
     }
 
     /// The OCR sidecar download is the one [`fetch_http`] caller outside a refresh, so
@@ -5484,7 +5499,12 @@ mod tests {
             "clicking Install must name its reason rather than leaving the column blank"
         );
 
-        fs::remove_dir_all(app_data).unwrap();
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
     }
 
     #[test]
