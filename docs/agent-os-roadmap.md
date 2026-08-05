@@ -330,8 +330,33 @@ attributed to another, which under a per-run allowlist is the wrong policy again
 wrong host. Verified by sabotage: dropping the `scoped` wrapper turns all three red and
 leaves the file's other nine tests green.
 
-**Still to do:** `browser_worker.rs`'s per-subresource decisions are untouched, and the
-remaining client sites still record `None`.
+### `browser_worker.rs` — adopted, and `spawn_blocking` decided the shape
+
+The highest-volume egress decision in the tree, and the reason it needed a second entry
+point rather than a `scoped` call. Every browser action reaches this file through
+`tokio::task::spawn_blocking`, which does **not** inherit a task-local — the same
+property this module's own test pins for `tokio::spawn`. So no scope set at a command
+boundary can reach `handle_event`'s per-subresource decisions, and an adoption that
+relied on the ambient scope would have recorded a blank *while looking instrumented*.
+Sabotage confirms it: dropping the scope entry fails with `left: None` where the run id
+should be.
+
+Two pieces. `run_scope::scoped_sync` wraps tokio's own `LocalKey::sync_scope`, which
+exists for exactly this case, so D3 is usable from blocking code at all — this will not
+be the last such site. And `ValidatedGrant` gains the scope as a field, because it was
+already the per-run object: its entire purpose is holding what one run was granted, and
+its refusals already said "outside this run's grant". The id was the one part of the run
+it did not keep.
+
+The two recording wrappers **enter** the scope rather than forwarding a run id, and that
+is the part worth defending. `denial_sink::record` already resolves both arms from the
+ambient scope, so entering it keeps a run's id *and* an unattributed grant's coded
+reason. Passing `run_id: Some(..)` would have carried the first and silently flattened
+the second into the blank the whole two-armed design exists to distinguish from it. Both
+arms are asserted.
+
+**Still to do:** the remaining client sites still record `None`, and `mcp.rs` is
+deliberately deferred for the reason below.
 
 ### `mcp.rs` is harder than "a cached client", and is deliberately not adopted yet
 
