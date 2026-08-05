@@ -962,8 +962,18 @@ fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
     }
     // A mapped address reports whichever v4 rule its inner address trips rather
     // than a rule of its own: `::ffff:10.0.0.1` is a private address, and calling
-    // it anything else would hide that from whoever reads the denial.
-    address.to_ipv4_mapped().and_then(non_public_ipv4_rule)
+    // it anything else would hide that from whoever reads the denial. NAT64 is the
+    // third spelling of the same thing and gets the same treatment — this guard is
+    // the broadest of the four, so it is the one where letting `64:ff9b::7f00:1`
+    // through as public would have been least defensible.
+    //
+    // Delegating rather than refusing the prefix also keeps this guard's breadth its
+    // own: it blocks CGNAT, so it blocks `64:ff9b::64.64.0.1` too, and a narrower
+    // guard delegating to *its* v4 rule will not.
+    address
+        .to_ipv4_mapped()
+        .or_else(|| crate::egress::nat64_embedded_ipv4(&address))
+        .and_then(non_public_ipv4_rule)
 }
 
 fn is_ipv6_unique_local(address: Ipv6Addr) -> bool {
@@ -4914,6 +4924,31 @@ mod tests {
     /// This is the broadest of the four SSRF guards and it had the same hole:
     /// `::127.0.0.1` is not what `to_ipv4_mapped()` matches, so a knowledge source
     /// URL resolving there was accepted as public.
+    /// Proves this guard *delegates* NAT64 to its own v4 rule — and this is the guard
+    /// where letting `64:ff9b::7f00:1` through was least defensible, since it is
+    /// documented as the broadest of the four.
+    ///
+    /// The CGNAT row is what shows delegation preserves that breadth rather than
+    /// flattening the four guards into one: only this guard refuses `100.64/10`, so
+    /// only this guard refuses the NAT64 spelling of it. The public row is the
+    /// counter-test against refusing the prefix outright.
+    #[test]
+    fn nat64_reaches_this_guards_own_ipv4_rule() {
+        use std::str::FromStr;
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", Some(EgressRule::Loopback)),
+            ("64:ff9b::a00:1", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::6440:1", Some(EgressRule::Cgnat)),
+            ("64:ff9b::5db8:d822", None),
+        ] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                expected,
+                "{text} must report whichever v4 rule its embedded address trips"
+            );
+        }
+    }
+
     #[test]
     fn the_deprecated_ipv4_compatible_form_is_non_public() {
         use std::net::Ipv6Addr;

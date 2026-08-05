@@ -21,7 +21,7 @@
 //! only a sentence. See its doc comment for what could not be done without it.
 
 use std::fmt;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use reqwest::Url;
@@ -418,6 +418,56 @@ pub fn is_ipv4_compatible(address: &Ipv6Addr) -> bool {
     segments[0..6].iter().all(|segment| *segment == 0)
         && !address.is_unspecified()
         && !address.is_loopback()
+}
+
+/// The IPv4 address a NAT64 prefix (`64:ff9b::/96`) embeds, if `address` is one.
+///
+/// # Why this is here and not in one guard
+///
+/// Sibling of [`is_ipv4_compatible`], found the same way and belonging here for the
+/// same reason this module's doc gives: the narrow subset where the guards were all
+/// wrong the *same* way. `64:ff9b::7f00:1` **is** `127.0.0.1` on any host with a
+/// NAT64/CLAT path — which is every modern iOS device and a growing share of mobile
+/// networks — and three of the four guards classified it as an ordinary public
+/// address. `browser_worker.rs` is the exception, and only since its `2000::/3`
+/// allowlist tail landed.
+///
+/// So this is another *spelling* of the addresses those guards already refuse, not a
+/// new class. That distinction is what keeps this inside the shared subset rather
+/// than making it the wholesale blocklist unification this module deliberately does
+/// not do: nothing here decides whether `127.0.0.1` is refused, only that
+/// `64:ff9b::7f00:1` is the same place.
+///
+/// # Why an unwrap where `::/96` is a rejection
+///
+/// [`is_ipv4_compatible`] rejects its whole range because RFC 4291 deprecated the
+/// format and nothing legitimate uses it. NAT64 is the opposite: RFC 6052 defines it,
+/// it is live, and `64:ff9b::` plus a *public* v4 address is a perfectly ordinary way
+/// to reach a v4-only server from a v6-only network. Refusing the range outright
+/// would break that. So each caller unwraps and re-checks against its **own** v4
+/// blocklist, which preserves the divergence the four guards keep on purpose — a
+/// guard that permits CGNAT keeps permitting `64:ff9b::64.64.0.1`.
+///
+/// Only the well-known prefix is recognised. RFC 6052 also allows network-specific
+/// prefixes of several lengths, which cannot be detected from an address alone —
+/// discovering them needs RFC 7050's DNS lookup, and a guard that consulted the
+/// network to decide policy would be taking instructions from the thing it guards
+/// against.
+#[must_use]
+pub fn nat64_embedded_ipv4(address: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = address.segments();
+    // 64:ff9b:0:0:0:0 — the well-known prefix, with the low 32 bits carrying the
+    // address. `0..6` and not `0..2`, because the well-known prefix is /96: bits 48
+    // through 95 must be zero too, or this is some other address that merely starts
+    // the same way.
+    if segments[0] != 0x0064 || segments[1] != 0xff9b {
+        return None;
+    }
+    if segments[2..6].iter().any(|segment| *segment != 0) {
+        return None;
+    }
+    let [.., a, b, c, d] = address.octets();
+    Some(Ipv4Addr::new(a, b, c, d))
 }
 
 /// How long a connection may take to establish. Matches `model_sources.rs`'s
@@ -1004,6 +1054,70 @@ mod tests {
             assert!(
                 !is_ipv4_compatible(&address),
                 "{text} must not be treated as IPv4-compatible"
+            );
+        }
+    }
+
+    /// `64:ff9b::7f00:1` is `127.0.0.1`, and three of the four guards called it public.
+    ///
+    /// Asserted as an *unwrap* and not as a refusal, which is the difference from
+    /// [`is_ipv4_compatible`]: the caller re-checks the extracted address against its
+    /// own v4 blocklist, so this predicate must hand back the right v4 address rather
+    /// than a verdict. Every embedded form the guards already refuse is listed, because
+    /// the claim is that NAT64 is a *spelling* of them and not a new class.
+    #[test]
+    fn the_nat64_prefix_yields_the_address_it_embeds() {
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", "127.0.0.1"),
+            ("64:ff9b::a00:1", "10.0.0.1"),
+            ("64:ff9b::c0a8:101", "192.168.1.1"),
+            ("64:ff9b::a9fe:a9fe", "169.254.169.254"),
+            ("64:ff9b::", "0.0.0.0"),
+            // A public one, which must unwrap just the same — the caller's own v4
+            // rule is what decides, and for this address it decides "allowed". If
+            // this predicate refused its range instead, this is the case that would
+            // break a v6-only network reaching a v4-only host.
+            ("64:ff9b::5db8:d822", "93.184.216.34"),
+        ] {
+            let address = Ipv6Addr::from_str(text).expect("parses");
+            assert_eq!(
+                nat64_embedded_ipv4(&address),
+                Some(Ipv4Addr::from_str(expected).expect("parses")),
+                "{text} embeds {expected}"
+            );
+        }
+    }
+
+    /// The counter-test, and the reason the prefix check is a full /96 rather than the
+    /// first two segments: "starts with `64:ff9b`" is not the same as "is the
+    /// well-known NAT64 prefix", and a predicate that confused them would hand a
+    /// caller four bytes taken from the middle of an unrelated global-unicast address
+    /// and let its v4 blocklist decide policy on them.
+    #[test]
+    fn addresses_that_merely_resemble_the_nat64_prefix_are_not_unwrapped() {
+        for text in [
+            // Right first two segments, non-zero in bits 48..96 — a network-specific
+            // prefix shape, which cannot be recognised from the address alone.
+            "64:ff9b:0:0:1::7f00:1",
+            "64:ff9b::1:7f00:1",
+            // One segment off in each direction.
+            "64:ff9a::7f00:1",
+            "65:ff9b::7f00:1",
+            // The forms handled by their own branches, which must not be claimed here.
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "::1",
+            "::",
+            // Ordinary addresses.
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            let address = Ipv6Addr::from_str(text).expect("parses");
+            assert_eq!(
+                nat64_embedded_ipv4(&address),
+                None,
+                "{text} is not the well-known NAT64 prefix"
             );
         }
     }

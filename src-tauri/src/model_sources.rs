@@ -2572,6 +2572,13 @@ fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
         // rather than both being some v6-flavoured approximation.
         return non_public_ipv4_rule(address);
     }
+    // The third spelling, handled the same way: `64:ff9b::7f00:1` is `127.0.0.1`
+    // wherever a NAT64/CLAT path exists. Unwrapped rather than refused as a range,
+    // because `64:ff9b::` plus a public v4 address is a legitimate way to reach a
+    // v4-only model host from a v6-only network. See `egress::nat64_embedded_ipv4`.
+    if let Some(address) = crate::egress::nat64_embedded_ipv4(&address) {
+        return non_public_ipv4_rule(address);
+    }
     let segments = address.segments();
     if address.is_loopback() {
         return Some(EgressRule::Loopback);
@@ -2993,6 +3000,35 @@ mod tests {
     /// way that matters: `::10.0.0.1` must be refused as `Ipv4Compatible` — the
     /// wrapper — and not as `PrivateV4`, because a wrapper carrying a *public* v4
     /// address has to be refused too and a v4 blocklist would let that through.
+    /// Proves this guard *delegates* NAT64 to its own v4 rule. The shared predicate's
+    /// own tests pin what `64:ff9b::/96` embeds; only this pins that this file asks.
+    ///
+    /// The public row is the load-bearing counter-test: refusing the whole prefix would
+    /// satisfy every other row here and break a v6-only network reaching a v4-only
+    /// model host.
+    #[test]
+    fn nat64_reaches_this_guards_own_ipv4_rule() {
+        use std::str::FromStr;
+        for (text, expected) in [
+            ("64:ff9b::7f00:1", Some(EgressRule::Loopback)),
+            ("64:ff9b::a00:1", Some(EgressRule::PrivateV4)),
+            ("64:ff9b::a9fe:a9fe", Some(EgressRule::LinkLocal)),
+            // The divergence proof, and the reason this delegates rather than
+            // importing a shared blocklist: `100.64.0.1` is CGNAT, which only the
+            // broadest guard refuses. This one must still allow it, in either
+            // spelling — a shared blocklist would refuse it here and newly break
+            // Tailscale users.
+            ("64:ff9b::6440:1", None),
+            ("64:ff9b::5db8:d822", None),
+        ] {
+            assert_eq!(
+                non_public_ipv6_rule(Ipv6Addr::from_str(text).expect("parses")),
+                expected,
+                "{text} must report whichever v4 rule its embedded address trips"
+            );
+        }
+    }
+
     #[test]
     fn the_deprecated_ipv4_compatible_form_is_not_public() {
         use std::str::FromStr;
