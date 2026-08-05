@@ -1081,6 +1081,12 @@ mod tests {
             /// which the client reports as a connection error, and the test
             /// could then pass without any read timeout existing.
             Silence,
+            /// Write the head, then one body byte every `gap` until `chunks` have
+            /// gone out. Never silent for longer than `gap`, so a read budget
+            /// wider than `gap` must let the whole body through however long the
+            /// transfer takes in total — which is precisely what a *total*
+            /// deadline does not do.
+            Trickle { chunks: usize, gap: Duration },
         }
 
         /// A scripted loopback HTTP peer plus a count of how many connections it
@@ -1133,6 +1139,26 @@ mod tests {
                                         let _ = stream.read(&mut head);
                                         let _ = stream.write_all(bytes.as_bytes());
                                         let _ = stream.flush();
+                                    }
+                                    Some(Answer::Trickle { chunks, gap }) => {
+                                        let _ = stream.set_nonblocking(false);
+                                        let _ =
+                                            stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                        let mut head = [0u8; 2048];
+                                        let _ = stream.read(&mut head);
+                                        let header = format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\n"
+                                        );
+                                        if stream.write_all(header.as_bytes()).is_ok() {
+                                            for _ in 0..*chunks {
+                                                std::thread::sleep(*gap);
+                                                if stream.write_all(b"x").is_err()
+                                                    || stream.flush().is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
                                     Some(Answer::Silence) | None => parked.push(stream),
                                 }
@@ -1195,6 +1221,63 @@ mod tests {
                 started.elapsed() < Duration::from_secs(5),
                 "gave up after {:?}, which is not the 200ms read budget",
                 started.elapsed()
+            );
+        }
+
+        /// The distinction three clients in this tree had wrong: a total request
+        /// deadline covers the **body**, so it aborts a transfer that is still
+        /// making steady progress, while a read budget only ever measures silence.
+        ///
+        /// Both halves belong in one test, because either alone is misleading. The
+        /// read budget letting a slow body through proves nothing on its own — the
+        /// same trickle has to be shown failing once that identical duration is
+        /// made a deadline for the whole request instead. That contrast is the
+        /// entire reason `webdav_client`, `pinned_http_client` and the two model
+        /// download clients set `read_timeout` rather than `timeout`.
+        #[tokio::test]
+        async fn a_total_deadline_aborts_a_trickling_body_where_a_read_budget_does_not() {
+            // Every gap is comfortably inside `budget`, while the sum of them is
+            // comfortably past it — the two margins the assertions below rest on.
+            let gap = Duration::from_millis(50);
+            let chunks = 12usize;
+            let budget = Duration::from_millis(400);
+
+            let patient = FakeHost::start(vec![Answer::Trickle { chunks, gap }]);
+            let body = hardened_with_timeouts(CONNECT_TIMEOUT, budget)
+                .build()
+                .expect("client builds")
+                .get(&patient.origin)
+                .send()
+                .await
+                .expect("a body that keeps arriving is not a silent peer")
+                .text()
+                .await
+                .expect("body reads");
+
+            assert_eq!(
+                body.len(),
+                chunks,
+                "the whole body must arrive: no single gap came near the {budget:?} read budget"
+            );
+
+            let truncating = FakeHost::start(vec![Answer::Trickle { chunks, gap }]);
+            let result = hardened_with_timeouts(CONNECT_TIMEOUT, budget)
+                .timeout(budget)
+                .build()
+                .expect("client builds")
+                .get(&truncating.origin)
+                .send()
+                .await;
+            // The deadline can land either while the headers are outstanding or
+            // part-way through the body, so both steps count as the failure.
+            let outcome = match result {
+                Err(error) => Err(error),
+                Ok(response) => response.text().await,
+            };
+
+            assert!(
+                outcome.is_err(),
+                "the identical trickle must fail once {budget:?} becomes a deadline for the whole request"
             );
         }
 

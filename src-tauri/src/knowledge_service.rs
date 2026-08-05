@@ -52,6 +52,34 @@ const MAX_URL_PAGES: usize = 200;
 const MAX_URL_DEPTH: usize = 4;
 const MAX_REDIRECTS: usize = 3;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The client both HTTP fetch paths share, pinned to the one address the
+/// caller already validated.
+///
+/// [`HTTP_TIMEOUT`] is a **silence** budget here rather than a deadline for the
+/// whole request. `reqwest::ClientBuilder::timeout` covers the body too, so
+/// pairing it with the streaming reads in [`fetch_http`] and
+/// [`fetch_connector_bytes`] gave a source 45 seconds to arrive in full —
+/// against `max_file_bytes` capped at 32 MiB, that is 745 KB/s sustained, so a
+/// large PDF over a slow or rate-limited host was aborted mid-download and
+/// reported as a transport failure. `read_timeout` resets on every read: a source
+/// that goes quiet for 45 seconds is still declared dead, one still making
+/// progress is not. Size stays bounded where it already was, by the running total
+/// in each loop against `MAX_HTTP_BYTES`.
+///
+/// `resolve` is what makes the request go to `socket` and nowhere else, so the
+/// address the caller ran the SSRF guard against is the address actually dialled.
+/// The redirect policy is `none` for the same reason, overriding the same-origin
+/// rule [`crate::egress::hardened_with_read_budget`] supplies: a hop would be a
+/// second URL this pinning never covered, and the pipeline follows redirects
+/// itself (bounded by `MAX_REDIRECTS`) so each hop gets its own guarded lookup.
+fn pinned_http_client(host: &str, socket: SocketAddr) -> Result<reqwest::Client, String> {
+    crate::egress::hardened_with_read_budget(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, socket)
+        .build()
+        .map_err(|error| format!("Failed to create HTTP client: {error}"))
+}
 const REFRESH_LEASE_STALE_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_REFRESH_LEASE_BYTES: u64 = 4 * 1024;
 
@@ -2502,12 +2530,7 @@ async fn fetch_connector_bytes(
         .port_or_known_default()
         .ok_or_else(|| "URL has no port".to_string())?;
     let socket = SocketAddr::new(addresses[0], port);
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(HTTP_TIMEOUT)
-        .resolve(host, socket)
-        .build()
-        .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
+    let client = pinned_http_client(host, socket)?;
     let mut request = client.request(method, parsed.clone());
     for (key, value) in headers {
         request = request.header(*key, value.as_str());
@@ -3885,12 +3908,7 @@ async fn fetch_http(
             .port_or_known_default()
             .ok_or_else(|| "URL has no port".to_string())?;
         let socket = SocketAddr::new(addresses[0], port);
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(HTTP_TIMEOUT)
-            .resolve(host, socket)
-            .build()
-            .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
+        let client = pinned_http_client(host, socket)?;
         let mut request = client.get(parsed.clone());
         if let Some((username, password)) = auth {
             request = request.basic_auth(username, Some(password));
