@@ -1729,9 +1729,35 @@ pub async fn knowledge_v2_refresh(
         .app_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     let progress_app = app.clone();
-    refresh_at(&app_data, &stack_id, &move |progress| {
+    refresh_as_user_action(&app_data, &stack_id, &move |progress| {
         let _ = progress_app.emit("knowledge-v2://refresh-progress", progress);
     })
+    .await
+}
+
+/// [`knowledge_v2_refresh`]'s body, below the `AppHandle`.
+///
+/// A refresh's URL and connector sources go through `UrlSourcePolicy::validate`,
+/// which records what it refuses. The three entry points into [`refresh_at`] are the
+/// reason the scope belongs at each of them and not inside the refresh: this one is a
+/// person clicking Refresh, the daemon's is timer-driven, and the folder watcher's is
+/// neither of those callers' — a scope in the shared implementation could only pick
+/// one label for all three, which is how an audit column stops being readable.
+///
+/// Split out of the command rather than left inline for one reason: `AppHandle` is
+/// `AppHandle<Wry>`, so no test can call [`knowledge_v2_refresh`] at all, and a scope
+/// no test can drive is a scope that silently disappears. This frame takes only what
+/// the refresh needs, so the label is pinned by an assertion against a real sink
+/// instead of by this comment.
+async fn refresh_as_user_action(
+    app_data: &Path,
+    stack_id: &str,
+    reporter: &(dyn Fn(KnowledgeRefreshProgress) + Sync),
+) -> Result<KnowledgeRefreshReport, String> {
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        refresh_at(app_data, stack_id, reporter),
+    )
     .await
 }
 
@@ -1785,7 +1811,15 @@ pub async fn run_due_background_refresh(
     let mut refreshed_stack_ids = Vec::new();
     let mut failures = Vec::new();
     for stack_id in stack_ids {
-        match knowledge_v2_refresh_headless(app_data, &stack_id).await {
+        // The `Scheduled` arm's one unambiguous caller: this is the timer-driven
+        // refresh `run_scope`'s own doc names. Per stack rather than around the loop,
+        // so nothing outside the refreshes themselves is covered by the label.
+        match crate::run_scope::scoped(
+            crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::Scheduled),
+            knowledge_v2_refresh_headless(app_data, &stack_id),
+        )
+        .await
+        {
             Ok(_) => refreshed_stack_ids.push(stack_id),
             Err(error) => failures.push(format!("{stack_id}: {error}")),
         }
@@ -1942,16 +1976,7 @@ async fn refresh_inner_at(
         overlap_chars: stack.chunk_overlap.min(stack.chunk_chars.saturating_sub(1)),
         min_chars: 40.min(stack.chunk_chars.max(1)),
     };
-    let pipeline_fingerprint = sha256(
-        &serde_json::to_vec(&serde_json::json!({
-            "extractors": ["plain-text-v1", "office-openxml-v1", "html-pdf-v1"],
-            "chunking": chunking,
-            "embedding": embedding,
-            "privacy": "local-default",
-            "ocr": &ocr_config,
-        }))
-        .map_err(|error| error.to_string())?,
-    );
+    let pipeline_fingerprint = refresh_pipeline_fingerprint(&chunking, &embedding, &ocr_config)?;
     let generation_store =
         GenerationStore::new(root.join("indexes")).map_err(|error| error.to_string())?;
     let active = generation_store
@@ -2252,6 +2277,34 @@ async fn refresh_inner_at(
         warnings,
         duration_ms: 0,
     })
+}
+
+/// The `pipeline_fingerprint` a real refresh stamps on every object snapshot it
+/// writes: a hash over everything that decides what a chunk *is* — which
+/// extractors ran, the chunking spec, the embedding spec, the privacy mode, and
+/// the OCR configuration. Change any of them and the fingerprint changes, so
+/// `refresh_inner_at` stops carrying that object's chunks forward and re-extracts.
+///
+/// Extracted from `refresh_inner_at` so the v1 import can be tested against the
+/// real recipe rather than a copy of it: the import's whole safety argument is
+/// that its sentinel fingerprint can never equal this function's output (see
+/// [`V1_IMPORT_FINGERPRINT_PREIMAGE`]), and a copied recipe would keep agreeing
+/// with itself after the real one moved.
+fn refresh_pipeline_fingerprint(
+    chunking: &ChunkingSpec,
+    embedding: &PipelineEmbeddingSpec,
+    ocr_config: &KnowledgeOcrConfig,
+) -> Result<String, String> {
+    Ok(sha256(
+        &serde_json::to_vec(&serde_json::json!({
+            "extractors": ["plain-text-v1", "office-openxml-v1", "html-pdf-v1"],
+            "chunking": chunking,
+            "embedding": embedding,
+            "privacy": "local-default",
+            "ocr": ocr_config,
+        }))
+        .map_err(|error| error.to_string())?,
+    ))
 }
 
 fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
@@ -3765,12 +3818,39 @@ pub fn sync_watched_folder_watchers(app: &AppHandle) {
                     let Ok(app_data) = app.path().app_data_dir() else {
                         return;
                     };
-                    let _ = knowledge_v2_refresh_headless(&app_data, &stack_id).await;
+                    // Called from inside the spawned task, deliberately: the scope it
+                    // enters must be entered here, not above.
+                    refresh_watched_folder(&app_data, &stack_id).await;
                 });
             }
         });
         handles.insert(source_id, WatchedFolderHandle { path, debounce_ms, _watcher: watcher });
     }
+}
+
+/// One debounce-triggered refresh of a watched folder, carrying the reason it has no
+/// run.
+///
+/// The scope is entered here, below the `spawn`, and that placement is the whole
+/// point. There is an OS thread and then a `tauri::async_runtime::spawn` between this
+/// and anything that could have set a scope, and neither carries a task-local — a
+/// scope established outside would simply not exist at the refusals below, which
+/// would record a blank that *looks* instrumented.
+///
+/// `Scheduled` because the closed set has no arm for "a debounce timer fired after a
+/// file changed", and of the four this is the only honest one: nobody asked for this
+/// refresh, it is not inbound and it is not startup. Adding a fifth reason is
+/// `run_scope`'s call to make, not this call site's.
+///
+/// A named function rather than an inline block so a test can drive the exact future
+/// the watcher spawns. The alternative was a scope reachable only through a real
+/// `notify` watcher and an `AppHandle<Wry>`, i.e. one no test can redden.
+async fn refresh_watched_folder(app_data: &Path, stack_id: &str) {
+    let _ = crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::Scheduled),
+        knowledge_v2_refresh_headless(app_data, stack_id),
+    )
+    .await;
 }
 
 fn allowed_extensions() -> Vec<&'static str> {
@@ -4652,6 +4732,36 @@ fn ocr_install_limits() -> PipelineLimits {
     }
 }
 
+/// [`knowledge_ocr_install`]'s download, carrying the reason it has no run.
+///
+/// [`fetch_http`] runs `UrlSourcePolicy::validate`, so a sidecar URL naming a
+/// non-public address is refused and recorded. This is the one [`fetch_http`] caller
+/// outside a refresh, so it is the one the refresh scopes never covered — it wrote a
+/// blank while reading as instrumented, which is the failure mode `run_scope` exists
+/// to make impossible.
+///
+/// [`crate::run_scope::Unattributed::UserAction`] because installing an OCR sidecar
+/// is a person clicking Install in Settings; there is no run and never will be.
+///
+/// The scope goes here and not inside [`fetch_http`]: its other three callers are
+/// reached from `refresh_at`, which is already scoped by whichever of its three
+/// entry points drove it, and an unconditional scope in the shared fetch would
+/// shadow those — relabelling the daemon's timer-driven refresh as a user action.
+/// A named function rather than an inline wrap so a test can drive it without the
+/// `AppHandle<Wry>` the command requires.
+async fn fetch_ocr_sidecar(
+    url: &str,
+    allowed_origin: &str,
+    limits: &PipelineLimits,
+) -> Result<FetchedBody, String> {
+    let cancel = CancellationToken::new();
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        fetch_http(url, allowed_origin, false, None, limits, &cancel),
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn knowledge_ocr_install(
     app: AppHandle,
@@ -4677,15 +4787,7 @@ pub async fn knowledge_ocr_install(
     }
     let origin = origin_of(&parsed)?;
     let limits = ocr_install_limits();
-    let fetched = fetch_http(
-        &request.url,
-        &origin,
-        false,
-        None,
-        &limits,
-        &CancellationToken::new(),
-    )
-    .await?;
+    let fetched = fetch_ocr_sidecar(&request.url, &origin, &limits).await?;
     if fetched.bytes.len() as u64 != request.size_bytes {
         return Err(format!(
             "OCR download size mismatch: expected {}, received {}",
@@ -4973,6 +5075,436 @@ mod tests {
         };
         assert!(validate_background_refresh_config(invalid).is_err());
         fs::remove_dir_all(app_data).unwrap();
+    }
+
+    /// A URL source refused during a *timer-driven* refresh records
+    /// `unattributed.scheduled`, and the same refusal outside that caller records
+    /// nothing — which together are the claim, not either one alone.
+    ///
+    /// The two halves matter because `refresh_at` is shared by three callers with three
+    /// different answers (Refresh button, daemon timer, folder watcher). A label baked
+    /// into the shared implementation would satisfy the first assertion and be wrong
+    /// about two of the three callers, so the unscoped call below is the control that
+    /// forbids it: it proves the reason is contributed by
+    /// `run_due_background_refresh`'s scope and by nothing further down.
+    ///
+    /// Hermetic. `10.66.9.30` is a literal, so `lookup_host` answers it without DNS and
+    /// the policy refuses it before any socket exists; the address appears nowhere else
+    /// in this crate's tests, so the process-wide sink cannot hand this test another
+    /// test's row.
+    ///
+    /// Sabotage check: delete the `scoped` wrapper in `run_due_background_refresh` and
+    /// the last assertion fails while every other one still passes.
+    // Clippy's `await_holding_lock` is right in general and deliberately overridden here:
+    // holding `test_lock` across the awaits IS the serialization this test needs, since the
+    // sink is process-global and its install/use/read window has to be exclusive. Safe
+    // because `#[tokio::test]` gives each test its own current-thread runtime, so the guard
+    // is never held across a yield to another test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_scheduled_refresh_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        let app_data = temporary_root("scheduled-scope");
+        let sink_path = app_data.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&sink_path).expect("the sink opens"),
+        );
+
+        const REFUSED_HOST: &str = "10.66.9.30";
+        // `stacks::save_registry` writes into this directory without creating it, and
+        // `refresh_inner_at` reads the stack back out of the same one.
+        let stacks_root = app_data.join("stacks");
+        fs::create_dir_all(&stacks_root).unwrap();
+        let stack = crate::stacks::create_impl(
+            &stacks_root,
+            "Scheduled scope fixture".to_string(),
+            crate::stacks::EmbeddingSpec {
+                backend: EmbeddingBackend::Llama,
+                model_id_or_tag: "fixture-embed".to_string(),
+                dim: 8,
+                query_prefix: String::new(),
+                doc_prefix: String::new(),
+            },
+        )
+        .unwrap();
+        save_catalog(
+            &data_root_at(&app_data).unwrap(),
+            &KnowledgeCatalog {
+                version: CATALOG_VERSION,
+                sources: vec![KnowledgeSource {
+                    id: "source-scheduled-scope".to_string(),
+                    stack_id: stack.id.clone(),
+                    label: "Private host".to_string(),
+                    enabled: true,
+                    connector: ConnectorConfig::Url {
+                        url: format!("https://{REFUSED_HOST}/docs"),
+                        // Allowlisted on purpose: the origin gate must pass so that the
+                        // refusal below is the *address* rule and not
+                        // `OriginNotAllowlisted`, which would pass this test while
+                        // proving nothing about a resolved-address denial.
+                        allowed_origin: format!("https://{REFUSED_HOST}"),
+                        max_depth: 0,
+                        max_pages: 1,
+                        obey_robots: false,
+                        allow_loopback: false,
+                    },
+                    cursor: None,
+                    checkpoint: None,
+                    last_refresh_at_ms: None,
+                    last_error: None,
+                    objects: Vec::new(),
+                    retries: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let refused_rows = || -> Vec<crate::denial_sink::DenialRecord> {
+            crate::denial_sink::DenialSink::open(&sink_path)
+                .expect("reopens for reading")
+                .recent(256)
+                .expect("reads")
+                .into_iter()
+                .filter(|row| row.detail.as_deref() == Some(REFUSED_HOST))
+                .collect()
+        };
+
+        // Half one: the shared implementation, with nothing scoping it.
+        knowledge_v2_refresh_headless(&app_data, &stack.id)
+            .await
+            .expect_err("a private URL source must fail the refresh");
+        let unscoped = refused_rows();
+        assert_eq!(unscoped.len(), 1, "the refusal was recorded");
+        assert_eq!(unscoped[0].guard, "knowledge.url-source");
+        assert_eq!(
+            unscoped[0].rule_code,
+            crate::egress::EgressRule::PrivateV4.code()
+        );
+        assert_eq!(unscoped[0].run_id, None);
+        assert_eq!(
+            unscoped[0].unattributed_reason, None,
+            "no caller said anything, so the row must stay honestly blank"
+        );
+
+        // Half two: the same refusal reached through the daemon's due check.
+        save_background_refresh_config_at(
+            &app_data,
+            &KnowledgeBackgroundRefreshConfig {
+                enabled: true,
+                interval_minutes: 5,
+                stack_ids: vec![stack.id.clone()],
+                last_attempt_ms: None,
+                last_success_ms: None,
+                next_due_ms: Some(1_000),
+                last_error: None,
+                consecutive_failures: 0,
+            },
+        )
+        .unwrap();
+        let outcome = run_due_background_refresh(&app_data, 1_000).await.unwrap();
+        assert!(outcome.due);
+        assert_eq!(outcome.failures.len(), 1, "the same refusal, same fixture");
+
+        let rows = refused_rows();
+        assert_eq!(rows.len(), 2, "the scheduled refresh recorded its own row");
+        // `recent` is newest-first, so row 0 is the scheduled one.
+        assert_eq!(rows[0].guard, "knowledge.url-source");
+        assert_eq!(
+            rows[0].rule_code,
+            crate::egress::EgressRule::PrivateV4.code()
+        );
+        assert_eq!(
+            rows[0].run_id, None,
+            "a timer has no run id, and inventing one is the failure mode"
+        );
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::Scheduled.code()),
+            "the timer path must name its reason where the unscoped call left a blank"
+        );
+
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
+    }
+
+    /// A stack whose one enabled source is a URL source pointing at `refused_host`,
+    /// with a file-backed denial sink installed alongside it.
+    ///
+    /// The same fixture the scheduled test above builds inline, extracted because the
+    /// two tests below need it verbatim and a third inline copy is where the details
+    /// that make it work — the allowlisted origin, the created `stacks` directory —
+    /// start drifting. The caller must already hold [`crate::denial_sink::test_lock`]:
+    /// this installs into a process-wide slot.
+    ///
+    /// Hermetic by construction. `refused_host` is a literal address, so `lookup_host`
+    /// answers it without DNS and `UrlSourcePolicy` refuses it before a socket exists.
+    fn refused_url_source_fixture(label: &str, refused_host: &str) -> (PathBuf, String, PathBuf) {
+        let app_data = temporary_root(label);
+        let sink_path = app_data.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&sink_path).expect("the sink opens"),
+        );
+
+        // `stacks::save_registry` writes into this directory without creating it, and
+        // `refresh_inner_at` reads the stack back out of the same one.
+        let stacks_root = app_data.join("stacks");
+        fs::create_dir_all(&stacks_root).unwrap();
+        let stack = crate::stacks::create_impl(
+            &stacks_root,
+            format!("{label} fixture"),
+            crate::stacks::EmbeddingSpec {
+                backend: EmbeddingBackend::Llama,
+                model_id_or_tag: "fixture-embed".to_string(),
+                dim: 8,
+                query_prefix: String::new(),
+                doc_prefix: String::new(),
+            },
+        )
+        .unwrap();
+        save_catalog(
+            &data_root_at(&app_data).unwrap(),
+            &KnowledgeCatalog {
+                version: CATALOG_VERSION,
+                sources: vec![KnowledgeSource {
+                    id: format!("source-{label}"),
+                    stack_id: stack.id.clone(),
+                    label: "Private host".to_string(),
+                    enabled: true,
+                    connector: ConnectorConfig::Url {
+                        url: format!("https://{refused_host}/docs"),
+                        // Allowlisted on purpose: the origin gate must pass so the
+                        // refusal is the *address* rule and not `OriginNotAllowlisted`,
+                        // which would pass these tests while proving nothing about a
+                        // resolved-address denial.
+                        allowed_origin: format!("https://{refused_host}"),
+                        max_depth: 0,
+                        max_pages: 1,
+                        obey_robots: false,
+                        allow_loopback: false,
+                    },
+                    cursor: None,
+                    checkpoint: None,
+                    last_refresh_at_ms: None,
+                    last_error: None,
+                    objects: Vec::new(),
+                    retries: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+        (app_data, stack.id, sink_path)
+    }
+
+    /// Reads the sink back through a second connection — the path that ships, not a
+    /// test-only accessor — keeping only the rows this test's address produced.
+    fn denial_rows_for(sink_path: &Path, host: &str) -> Vec<crate::denial_sink::DenialRecord> {
+        crate::denial_sink::DenialSink::open(sink_path)
+            .expect("reopens for reading")
+            .recent(256)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some(host))
+            .collect()
+    }
+
+    /// The Refresh button's half of the three-caller split: a URL source refused
+    /// during a user-driven refresh records `unattributed.user-action`.
+    ///
+    /// Driven through [`refresh_as_user_action`] rather than `knowledge_v2_refresh`
+    /// because the command takes an `AppHandle<Wry>`, which no test can construct —
+    /// that is precisely why the scope was split down into a frame a test can reach.
+    /// Everything the command does above this frame is resolving the app data
+    /// directory and cloning a handle for progress events; neither can refuse an
+    /// egress destination.
+    ///
+    /// The control that makes this mean something already exists: the scheduled test
+    /// above asserts the *same* refusal through the unscoped shared implementation and
+    /// gets `None`, which forbids baking a label into `refresh_at` or into
+    /// `denial_sink::record`.
+    ///
+    /// Sabotage check: delete the `crate::run_scope::scoped(` wrapper in
+    /// [`refresh_as_user_action`] and the last assertion fails with
+    /// `left: None, right: Some("unattributed.user-action")`, while the rule, guard
+    /// and run-id assertions above it still pass.
+    // Clippy's `await_holding_lock` is right in general and deliberately overridden here:
+    // holding `test_lock` across the awaits IS the serialization this test needs, since the
+    // sink is process-global and its install/use/read window has to be exclusive. Safe
+    // because `#[tokio::test]` gives each test its own current-thread runtime, so the guard
+    // is never held across a yield to another test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_user_driven_refresh_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        const REFUSED_HOST: &str = "10.77.3.12";
+        let (app_data, stack_id, sink_path) =
+            refused_url_source_fixture("user-action-scope", REFUSED_HOST);
+
+        refresh_as_user_action(&app_data, &stack_id, &|_| {})
+            .await
+            .expect_err("a private URL source must fail the refresh");
+
+        let rows = denial_rows_for(&sink_path, REFUSED_HOST);
+        assert_eq!(rows.len(), 1, "exactly one record for this test's address");
+        assert_eq!(rows[0].guard, "knowledge.url-source");
+        assert_eq!(
+            rows[0].rule_code,
+            crate::egress::EgressRule::PrivateV4.code()
+        );
+        assert_eq!(
+            rows[0].run_id, None,
+            "clicking Refresh is not a run, and inventing an id is the failure mode"
+        );
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "the Refresh button must name its reason where the unscoped call left a blank"
+        );
+
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
+    }
+
+    /// The folder watcher's half: a refusal during a debounce-triggered refresh
+    /// records `unattributed.scheduled`.
+    ///
+    /// Driven **through a real `tokio::spawn`**, and that is the only version of this
+    /// assertion that can fail for the right reason. A task-local is not inherited
+    /// across a spawn, so if the scope ever moves up out of
+    /// [`refresh_watched_folder`] into the watcher's setup code this goes back to a
+    /// blank column — exactly as it would in production, where an OS thread and a
+    /// `tauri::async_runtime::spawn` sit between the two. A test that called the
+    /// function directly would keep passing through that regression.
+    ///
+    /// The refused source is a URL source rather than the watched folder itself
+    /// because a watcher fires a refresh of the whole *stack*: every enabled source in
+    /// it is re-collected, and the ones that can refuse an egress destination are the
+    /// network ones. A local folder cannot produce an egress denial at all.
+    ///
+    /// Sabotage check: delete the `crate::run_scope::scoped(` wrapper in
+    /// [`refresh_watched_folder`] and the last assertion fails with
+    /// `left: None, right: Some("unattributed.scheduled")`.
+    // Clippy's `await_holding_lock` is right in general and deliberately overridden here:
+    // holding `test_lock` across the awaits IS the serialization this test needs, since the
+    // sink is process-global and its install/use/read window has to be exclusive. Safe
+    // because `#[tokio::test]` gives each test its own current-thread runtime, so the guard
+    // is never held across a yield to another test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_watched_folder_refresh_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        const REFUSED_HOST: &str = "10.77.3.13";
+        let (app_data, stack_id, sink_path) =
+            refused_url_source_fixture("watched-folder-scope", REFUSED_HOST);
+
+        let spawned_app_data = app_data.clone();
+        let spawned_stack_id = stack_id.clone();
+        tokio::spawn(
+            async move { refresh_watched_folder(&spawned_app_data, &spawned_stack_id).await },
+        )
+        .await
+        .expect("the watcher's refresh task joins");
+
+        let rows = denial_rows_for(&sink_path, REFUSED_HOST);
+        assert_eq!(rows.len(), 1, "exactly one record for this test's address");
+        assert_eq!(rows[0].guard, "knowledge.url-source");
+        assert_eq!(
+            rows[0].rule_code,
+            crate::egress::EgressRule::PrivateV4.code()
+        );
+        assert_eq!(
+            rows[0].run_id, None,
+            "a debounce timer has no run id to report"
+        );
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::Scheduled.code()),
+            "the reason must survive the spawn the watcher's refresh runs in"
+        );
+
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
+    }
+
+    /// The OCR sidecar download is the one [`fetch_http`] caller outside a refresh, so
+    /// it was the one no refresh scope covered — it recorded a blank.
+    ///
+    /// Driven through [`fetch_ocr_sidecar`] rather than `knowledge_ocr_install` for the
+    /// same reason as the refresh test above: the command takes an `AppHandle<Wry>`.
+    /// Everything the command does before this call is validating its own metadata
+    /// (digest shape, size, version, licence) and parsing the URL, none of which can
+    /// refuse an egress destination.
+    ///
+    /// Hermetic: `10.77.3.14` is a literal over `https`, so the scheme check passes,
+    /// `lookup_host` answers without DNS, and the policy refuses the address before a
+    /// socket is opened.
+    ///
+    /// Sabotage check: delete the `crate::run_scope::scoped(` wrapper in
+    /// [`fetch_ocr_sidecar`] and the last assertion fails with
+    /// `left: None, right: Some("unattributed.user-action")` while the rule and guard
+    /// assertions still pass — which is the state wave 2 left this path in.
+    // Clippy's `await_holding_lock` is right in general and deliberately overridden here:
+    // holding `test_lock` across the awaits IS the serialization this test needs, since the
+    // sink is process-global and its install/use/read window has to be exclusive. Safe
+    // because `#[tokio::test]` gives each test its own current-thread runtime, so the guard
+    // is never held across a yield to another test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_refused_ocr_sidecar_download_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        let app_data = temporary_root("ocr-sidecar-scope");
+        let sink_path = app_data.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&sink_path).expect("the sink opens"),
+        );
+
+        const REFUSED_HOST: &str = "10.77.3.14";
+        let error = fetch_ocr_sidecar(
+            &format!("https://{REFUSED_HOST}/tesseract-sidecar.tar.gz"),
+            &format!("https://{REFUSED_HOST}"),
+            &ocr_install_limits(),
+        )
+        .await
+        .expect_err("a private sidecar host must be refused");
+        assert!(
+            error.contains(crate::egress::EgressRule::PrivateV4.code()),
+            "unexpected error: {error}"
+        );
+
+        let rows = denial_rows_for(&sink_path, REFUSED_HOST);
+        assert_eq!(rows.len(), 1, "exactly one record for this test's address");
+        assert_eq!(rows[0].guard, "knowledge.url-source");
+        assert_eq!(
+            rows[0].rule_code,
+            crate::egress::EgressRule::PrivateV4.code()
+        );
+        assert_eq!(
+            rows[0].run_id, None,
+            "installing a sidecar is not a run, and inventing an id is the failure mode"
+        );
+        assert_eq!(
+            rows[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "clicking Install must name its reason rather than leaving the column blank"
+        );
+
+        // Not `unwrap`ed, unlike the tests above that hold no open handle: this one
+        // installs a `DenialSink`, and the process-global slot still owns its SQLite
+        // file inside `app_data`. Windows refuses to delete a file another handle has
+        // open (`Os { code: 32 }`), which is exactly what CI caught. The temp dir is
+        // the OS's to reclaim; cleaning it is not this test's claim.
+        let _ = fs::remove_dir_all(app_data);
     }
 
     #[test]

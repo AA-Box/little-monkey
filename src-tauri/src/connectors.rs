@@ -241,7 +241,62 @@ pub(crate) fn origin_of(url: &Url) -> Result<String, String> {
 /// Inbox Triage's write actions (`triage.rs`: Slack `chat.postMessage`, a
 /// Jira issue comment), which need to POST a body; every verification call
 /// site above still passes `None`.
+///
+/// # Why the run scope is entered here
+///
+/// [`crate::knowledge_pipeline::UrlSourcePolicy::validate`] below is a recording
+/// site — the `knowledge.url-source` guard — so every SSRF refusal raised by a
+/// connector verification or a triage action becomes a denial row. All thirteen
+/// production callers are one answer: `connectors_add_token`, `connectors_add_s3`
+/// and `connectors_reverify` in this file, and `triage.rs`'s two collectors plus
+/// its two send paths under `triage_refresh`/`triage_send_draft`, are each a person
+/// clicking something in Settings or in the triage queue. `triage_refresh` was the
+/// one worth checking rather than assuming, because a queue refresh sounds
+/// timer-driven: it is not. Its only caller is `TriagePanel`'s "Refresh queue"
+/// button, there is no `setInterval` on the path and no Rust-side scheduler invokes
+/// it, so [`crate::run_scope::Unattributed::UserAction`] is honest for it too and
+/// one scope at this choke point covers all thirteen.
+///
+/// This is the example `run_scope`'s own doc gives for that arm — "verifying a
+/// connector in Settings".
+///
+/// The consequence to know about, and it is the same one `web.rs::fetch_impl`
+/// carries: this is a `scoped`, so it *shadows* an outer scope. If a durable run
+/// ever drives a connector call, this must take a
+/// [`crate::run_scope::RunScope`] parameter instead, exactly as
+/// `m4_runtime::run_async_worker` did — silently relabelling a run's egress as a
+/// user action would be a worse record than the blank this replaces.
 pub(crate) async fn verified_call(
+    method: reqwest::Method,
+    url: &Url,
+    allowed_origin: &str,
+    allow_loopback: bool,
+    headers: &[(&'static str, String)],
+    basic_auth: Option<(&str, &str)>,
+    json_body: Option<&Value>,
+) -> Result<Vec<u8>, String> {
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        verified_call_within_scope(
+            method,
+            url,
+            allowed_origin,
+            allow_loopback,
+            headers,
+            basic_auth,
+            json_body,
+        ),
+    )
+    .await
+}
+
+/// [`verified_call`]'s body, with the scope already established.
+///
+/// Split out rather than wrapping the body in an `async` block for the reason
+/// `web.rs`'s `fetch_within_scope` was: the `scoped` call stays one readable frame
+/// and this function's own diff stays empty. The refusal is raised while this
+/// future is being polled, which is what puts it inside the scope.
+async fn verified_call_within_scope(
     method: reqwest::Method,
     url: &Url,
     allowed_origin: &str,
@@ -1696,6 +1751,92 @@ mod tests {
                 "unexpected error: {message}"
             ),
         }
+    }
+
+    /// Every connector verification and every triage action shares one choke point,
+    /// so the reason it has no run is pinned once, here.
+    ///
+    /// [`verified_call`] is the single frame all thirteen production callers pass
+    /// through — `connectors_add_token`, `connectors_add_s3`, `connectors_reverify`,
+    /// and `triage.rs`'s four call sites under `triage_refresh`/`triage_send_draft`.
+    /// Driving it directly is therefore not a shortcut around the real path; it *is*
+    /// the real path, minus the credentials each caller would supply.
+    ///
+    /// Hermetic and socket-free. `10.77.3.11` is a literal, so `lookup_host` answers
+    /// it without touching DNS and `UrlSourcePolicy` refuses it before a connection
+    /// is attempted — the same shape as the loopback test above. The address appears
+    /// nowhere else in this crate, so the process-wide sink cannot hand this test a
+    /// row another test wrote.
+    ///
+    /// Sabotage check: delete the `crate::run_scope::scoped(` wrapper in
+    /// [`verified_call`] and the last assertion fails with
+    /// `left: None, right: Some("unattributed.user-action")` while every assertion
+    /// above it still passes — which is exactly the state wave 2 left this path in.
+    // Clippy's `await_holding_lock` is right in general and deliberately overridden here:
+    // holding `test_lock` across the awaits IS the serialization this test needs, since the
+    // sink is process-global and its install/use/read window has to be exclusive. Safe
+    // because `#[tokio::test]` gives each test its own current-thread runtime, so the guard
+    // is never held across a yield to another test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_refused_connector_call_records_the_reason_it_has_no_run() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory =
+            std::env::temp_dir().join(format!("lm-connectors-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        const REFUSED_HOST: &str = "10.77.3.11";
+        let url = Url::parse(&format!("https://{REFUSED_HOST}/rest/api/3/myself")).unwrap();
+        // The origin is allowlisted deliberately, so the refusal below is the
+        // *address* rule and not `OriginNotAllowlisted` — which would pass this test
+        // while proving nothing about a resolved-address denial. This is also the
+        // real shape: Jira and S3 pin the origin to whatever the user just typed, so
+        // a user who types a private site URL gets exactly this refusal.
+        let error = verified_call(
+            reqwest::Method::GET,
+            &url,
+            &format!("https://{REFUSED_HOST}"),
+            false,
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect_err("a private literal must be refused");
+        assert!(
+            error.contains(crate::egress::EgressRule::PrivateV4.code()),
+            "unexpected error: {error}"
+        );
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.detail.as_deref() == Some(REFUSED_HOST))
+            .collect();
+
+        assert_eq!(mine.len(), 1, "exactly one record for this test's address");
+        assert_eq!(mine[0].guard, "knowledge.url-source");
+        assert_eq!(
+            mine[0].rule_code,
+            crate::egress::EgressRule::PrivateV4.code()
+        );
+        assert_eq!(
+            mine[0].run_id, None,
+            "verifying a connector is not a run, and inventing an id is the failure mode"
+        );
+        assert_eq!(
+            mine[0].unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::UserAction.code()),
+            "it must say why it has no run rather than leaving the column blank"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     // --- S3 SigV4 primitives --------------------------------------------------
