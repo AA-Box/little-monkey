@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { FolderOpen, Plus, Trash2 } from "lucide-react";
 
 import { Button, IconButton } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -21,6 +22,39 @@ function slugify(value: string): string {
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^[.-]+/, "")
     .slice(0, 128);
+}
+
+/** Architecture families, matched against a weight file's own name. The list is
+ *  only ever a starting point the user can overwrite — unlike a slot, a wrong
+ *  family costs nothing but a retype. */
+const FAMILY_HINTS: [RegExp, string][] = [
+  [/wan[._-]?\d/i, "Wan"],
+  [/minimax|(^|[^a-z])h3([^a-z]|$)/i, "MiniMax"],
+  [/hunyuan/i, "Hunyuan"],
+  [/ltx/i, "LTX"],
+  [/flux/i, "FLUX"],
+  [/qwen/i, "Qwen"],
+  [/sdxl|xl[._-]?base|xl[._-]?refiner/i, "SDXL"],
+  [/(^|[^a-z])sd[._-]?[0-9x]|stable[._-]?diffusion|turbo/i, "SD"],
+  [/outetts|wavtokenizer|[._-]tts/i, "TTS"],
+];
+
+/** A readable name from a weight file's own name: drop the directory, the
+ *  extension and the quantization tag, then space out the separators. */
+export function describeWeightFile(raw: string): { name: string; family: string } {
+  const base = (raw.split(/[/\\]/).pop() ?? raw)
+    .replace(/\.(safetensors|gguf|ckpt|pt|bin|pth)$/i, "")
+    // Repeated as one group: `_pruned-Q4_K_M` is two tags, and an anchored
+    // single match would only ever strip the last one.
+    .replace(/([._-](q\d[_a-z0-9]*|fp\d+|bf\d+|int\d+|pruned))+$/i, "");
+  const name = base
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return {
+    name,
+    family: FAMILY_HINTS.find(([pattern]) => pattern.test(base))?.[1] ?? "",
+  };
 }
 
 function blankComponent(): ModelComponent {
@@ -49,12 +83,37 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
     setSpec((current) => ({ ...current, ...next }));
 
   const patchComponent = (index: number, next: Partial<ModelComponent>) =>
-    setSpec((current) => ({
-      ...current,
-      components: current.components.map((component, at) =>
+    setSpec((current) => {
+      const components = current.components.map((component, at) =>
         at === index ? { ...component, ...next } : component,
-      ),
-    }));
+      );
+      // The first file named is what the model gets called. Both fields stay
+      // editable — this fills a blank, it never overwrites a choice.
+      const source = components[index]?.source;
+      const path =
+        source?.kind === "local_file"
+          ? source.path
+          : source?.kind === "hugging_face"
+            ? source.file
+            : "";
+      if (index !== 0 || !path.trim() || (current.name && current.family)) {
+        return { ...current, components };
+      }
+      const guess = describeWeightFile(path);
+      return {
+        ...current,
+        components,
+        name: current.name || guess.name,
+        family: current.family || guess.family,
+      };
+    });
+
+  /** The native picker, so a path is chosen rather than typed. */
+  const browse = async (index: number) => {
+    const picked = await open({ multiple: false, directory: false });
+    if (typeof picked !== "string") return;
+    patchComponent(index, { source: { kind: "local_file", path: picked } });
+  };
 
   const toggleTask = (task: GenerationTask) =>
     setSpec((current) => ({
@@ -178,16 +237,27 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
             </div>
 
             {component.source.kind === "local_file" ? (
-              <input
-                className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
-                value={component.source.path}
-                placeholder="/Users/you/models/wan2.2_ti2v_5B_fp16.safetensors"
-                onChange={(event) =>
-                  patchComponent(index, {
-                    source: { kind: "local_file", path: event.target.value },
-                  })
-                }
-              />
+              <div className="flex items-center gap-1.5">
+                <input
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
+                  value={component.source.path}
+                  placeholder="/Users/you/models/wan2.2_ti2v_5B_fp16.safetensors"
+                  onChange={(event) =>
+                    patchComponent(index, {
+                      source: { kind: "local_file", path: event.target.value },
+                    })
+                  }
+                />
+                <IconButton
+                  size="sm"
+                  variant="secondary"
+                  aria-label={t("Studio.add.browse")}
+                  title={t("Studio.add.browse")}
+                  onClick={() => void browse(index)}
+                >
+                  <FolderOpen size={12} />
+                </IconButton>
+              </div>
             ) : (
               <div className="grid gap-1.5 sm:grid-cols-2">
                 <input

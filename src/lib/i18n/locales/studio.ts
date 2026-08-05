@@ -19,6 +19,9 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.speechHint":
     "A speech model is its backbone on --model plus its projector on --mmproj.",
   "Studio.task.text_to_speech": "Text to speech",
+  "Studio.models.title": "Models",
+  "Studio.models.subtitle":
+    "Your library. Nothing is preinstalled — add files you already have, or point at a repo to download from.",
   "Studio.image.title": "Image",
   "Studio.image.subtitle": "Generate images on this machine. No account, no upload.",
   "Studio.video.title": "Video",
@@ -43,6 +46,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.addFile": "Add file",
   "Studio.add.removeFile": "Remove this file",
   "Studio.add.onDisk": "On this machine",
+  "Studio.add.browse": "Choose file",
   "Studio.add.download": "Download",
   "Studio.add.fps": "Frames per second",
   "Studio.add.frameGrid": "Frame grid",

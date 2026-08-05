@@ -158,7 +158,7 @@ const IN_DESKTOP_APP =
 
 export function StudioPanel() {
   const { t } = useT();
-  const [mode, setMode] = useState<StudioMode>("models");
+  const [mode, setMode] = useState<StudioMode>("image");
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   const [models, setModels] = useState<GenerationModel[]>([]);
   const [gallery, setGallery] = useState<GenerationEntry[]>([]);
@@ -456,10 +456,10 @@ export function StudioPanel() {
         active={mode}
         onChange={(next) => setMode(next as StudioMode)}
         tabs={[
-          { id: "models", label: t("Studio.tab.models") },
           { id: "image", label: t("Studio.tab.image") },
           { id: "video", label: t("Studio.tab.video") },
           { id: "audio", label: t("Studio.tab.audio") },
+          { id: "models", label: t("Studio.tab.models") },
         ]}
       />
       <header className="mb-4 mt-3">
