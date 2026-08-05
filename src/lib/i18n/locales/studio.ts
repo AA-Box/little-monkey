@@ -119,6 +119,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.generate": "Generate",
   "Studio.stop": "Stop",
   "Studio.unload": "Free memory",
+  "Studio.unloadIdle": "No model is loaded",
   "Studio.phase.submitted": "Submitted",
   "Studio.phase.loading": "Loading weights",
   "Studio.phase.running": "Generating",

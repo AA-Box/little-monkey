@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
+  ChevronDown,
   Download,
   Loader2,
   RectangleHorizontal,
@@ -109,6 +110,36 @@ function SliderField({
         />
       </span>
     </label>
+  );
+}
+
+function Select({
+  value,
+  onChange,
+  children,
+  mono,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  children: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <span className="relative block">
+      <select
+        className={`w-full appearance-none rounded-md border border-border bg-background py-1.5 pl-2.5 pr-7 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent ${
+          mono ? "font-mono" : ""
+        }`}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {children}
+      </select>
+      <ChevronDown
+        size={12}
+        className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted"
+      />
+    </span>
   );
 }
 
@@ -658,11 +689,7 @@ export function StudioPanel() {
         <section className="mb-3">
           <label className="grid gap-1 text-[11px] text-muted">
             {t("Studio.models")}
-            <select
-              className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-              value={selectedId ?? ""}
-              onChange={(event) => setSelectedId(event.target.value || null)}
-            >
+            <Select value={selectedId ?? ""} onChange={(next) => setSelectedId(next || null)}>
               {visible.length === 0 && <option value="">{t("Studio.noneForTab")}</option>}
               {visible.map((model) => (
                 <option key={model.id} value={model.id}>
@@ -670,7 +697,12 @@ export function StudioPanel() {
                   {model.installed ? "" : ` — ${t("Studio.notDownloaded")}`}
                 </option>
               ))}
-            </select>
+            </Select>
+            {selected && (
+              <span className="text-faint">
+                {[selected.family, formatBytes(selected.totalBytes)].filter(Boolean).join(" · ")}
+              </span>
+            )}
           </label>
         </section>
       )}
@@ -841,10 +873,10 @@ export function StudioPanel() {
 
               <label className="grid gap-1 text-[11px] text-muted">
                 {t("Studio.sampler")}
-                <select
-                  className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                <Select
+                  mono
                   value={settings.sampler}
-                  onChange={(event) => setSettings({ ...settings, sampler: event.target.value })}
+                  onChange={(sampler) => setSettings({ ...settings, sampler })}
                 >
                   {/* A model may name a sampler this build does not list; keep
                       it selectable rather than silently switching it. */}
@@ -856,7 +888,7 @@ export function StudioPanel() {
                       {entry}
                     </option>
                   ))}
-                </select>
+                </Select>
               </label>
 
               <div className="grid gap-3">
@@ -916,12 +948,10 @@ export function StudioPanel() {
                 <div className="mt-2 grid gap-3">
                   <label className="grid gap-1 text-[11px] text-muted">
                     {t("Studio.scheduler")}
-                    <select
-                      className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                    <Select
+                      mono
                       value={settings.scheduler}
-                      onChange={(event) =>
-                        setSettings({ ...settings, scheduler: event.target.value })
-                      }
+                      onChange={(scheduler) => setSettings({ ...settings, scheduler })}
                     >
                       <option value="">{t("Studio.engineDefault")}</option>
                       {SCHEDULERS.map((entry) => (
@@ -929,7 +959,7 @@ export function StudioPanel() {
                           {entry}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                   </label>
                   <SliderField
                     label={t("Studio.clipSkip")}
@@ -1087,15 +1117,15 @@ export function StudioPanel() {
                 value={negativePrompt}
                 onChange={(event) => setNegativePrompt(event.target.value)}
               />
-              {status?.loadedModelId && (
-                <Button
-                  variant="secondary"
-                  className="h-auto shrink-0"
-                  onClick={() => void studioClient.unloadEngine().then(refresh)}
-                >
-                  {t("Studio.unload")}
-                </Button>
-              )}
+              <Button
+                variant="secondary"
+                className="h-auto shrink-0"
+                disabled={!status?.loadedModelId}
+                title={status?.loadedModelId ?? t("Studio.unloadIdle")}
+                onClick={() => void studioClient.unloadEngine().then(refresh)}
+              >
+                {t("Studio.unload")}
+              </Button>
             </div>
           )}
 
