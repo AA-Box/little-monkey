@@ -691,18 +691,19 @@ export function StudioPanel() {
             {t("Studio.models")}
             <Select value={selectedId ?? ""} onChange={(next) => setSelectedId(next || null)}>
               {visible.length === 0 && <option value="">{t("Studio.noneForTab")}</option>}
+              {/* A native popup is sized by its widest option, not by the
+                  control, so a one-word model name gives a menu a fraction of
+                  the field's width. The full description is what the row
+                  should say anyway, and it carries the menu out to match. */}
               {visible.map((model) => (
                 <option key={model.id} value={model.id}>
-                  {model.name}
-                  {model.installed ? "" : ` — ${t("Studio.notDownloaded")}`}
+                  {[model.name, model.family, formatBytes(model.totalBytes)]
+                    .filter(Boolean)
+                    .join("  ·  ")}
+                  {model.installed ? "" : `  —  ${t("Studio.notDownloaded")}`}
                 </option>
               ))}
             </Select>
-            {selected && (
-              <span className="text-faint">
-                {[selected.family, formatBytes(selected.totalBytes)].filter(Boolean).join(" · ")}
-              </span>
-            )}
           </label>
         </section>
       )}
