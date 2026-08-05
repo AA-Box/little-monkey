@@ -180,6 +180,10 @@ export function StudioPanel() {
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [phase, setPhase] = useState<string | null>(null);
   const [percent, setPercent] = useState<number | null>(null);
+  // The engine names the job in every progress event; without keeping it there
+  // is nothing to cancel.
+  const [jobId, setJobId] = useState<string | null>(null);
+  const stopped = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
@@ -260,6 +264,7 @@ export function StudioPanel() {
       // Weight loading reports no step count, so the bar stays indeterminate
       // until the first sampling step rather than sitting at a false zero.
       setPercent(payload.percent);
+      setJobId(payload.jobId || null);
     });
     return () => {
       void unlisten.then((stop) => stop());
@@ -351,6 +356,7 @@ export function StudioPanel() {
   const generate = async () => {
     if (!selected || !settings) return;
     setError(null);
+    stopped.current = false;
     setBusy(true);
     setPercent(null);
     setPhase(t("Studio.phase.submitted"));
@@ -385,11 +391,36 @@ export function StudioPanel() {
       setGallery((current) => [entry, ...current]);
       void loadPreview(entry);
     } catch (reason) {
-      setError(errorText(reason));
+      if (!stopped.current) setError(errorText(reason));
     } finally {
       setBusy(false);
       setPhase(null);
       setPercent(null);
+      setJobId(null);
+      // The engine holds the model after a run, so whether it is loaded is
+      // only knowable by asking again — and Free memory is what that answer
+      // turns on.
+      void refresh();
+    }
+  };
+
+  /**
+   * Stops the run in flight.
+   *
+   * The engine drops a queued job but cannot interrupt one already sampling
+   * (`cancel_generating: false` in its own capabilities), so stopping a
+   * running generation means stopping the engine running it. That also
+   * releases its weights, which is what the user wanted from a stop anyway.
+   */
+  const stop = async () => {
+    stopped.current = true;
+    setPhase(t("Studio.phase.stopping"));
+    try {
+      if (!jobId || !(await studioClient.cancel(jobId))) {
+        await studioClient.unloadEngine();
+      }
+    } catch (reason) {
+      setError(errorText(reason));
     }
   };
 
@@ -1051,6 +1082,10 @@ export function StudioPanel() {
 
           {busy && (
             <div className="flex shrink-0 items-center gap-2">
+              <Button size="sm" variant="secondary" onClick={() => void stop()}>
+                <Square size={12} />
+                {t("Studio.stop")}
+              </Button>
               {phase && <span className="shrink-0 text-[11px] text-muted">{phase}</span>}
               <span className="h-1 min-w-16 flex-1 overflow-hidden rounded-full bg-surface-2">
                 <span
