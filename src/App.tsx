@@ -172,16 +172,24 @@ const RIGHT_TAB_LABEL_KEYS: Record<RightTabKind, string> = {
  * key hint for it rather than inventing a binding. */
 const RIGHT_TAB_SHORTCUT_IDS: Record<
   RightTabKind,
-  "openReview" | "openTerminal" | "openBrowserTab" | "openFiles" | "openBackgroundTasksPanel" | "openSideTaskPane" | null
+  | "openReview"
+  | "openDiffPanel"
+  | "openTerminal"
+  | "openBrowserTab"
+  | "openFiles"
+  | "openBackgroundTasksPanel"
+  | "openSideTaskPane"
+  | "openProcessesPanel"
+  | null
 > = {
   review: "openReview",
-  diff: null,
+  diff: "openDiffPanel",
   terminal: "openTerminal",
   browser: "openBrowserTab",
   sideTasks: "openSideTaskPane",
   files: "openFiles",
   backgroundTasks: "openBackgroundTasksPanel",
-  processes: null,
+  processes: "openProcessesPanel",
 };
 
 function RightTabIcon({ kind, size }: { kind: RightTabKind; size: number }) {
@@ -693,6 +701,8 @@ function App() {
         openBrowser: () => toggleRightTab("browser"),
         openBrowserTab: () => openRightTab("browser"),
         openReview: () => openRightTab("review"),
+        openDiffPanel: () => openRightTab("diff"),
+        openProcessesPanel: () => openRightTab("processes"),
         openFiles: () => openRightTab("files"),
         openBackgroundTasksPanel: () => openRightTab("backgroundTasks"),
         openSideTaskPane: () => toggleRightTab("sideTasks"),

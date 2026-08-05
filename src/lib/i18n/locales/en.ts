@@ -1090,6 +1090,8 @@ export const en: Record<string, string> = {
   "KeyboardShortcutsPanel.toggleWorkspacePanel": "Toggle workspace panel",
   "KeyboardShortcutsPanel.toggleWorkspacePanelDescription": "Show or hide the file and diff panel.",
   "KeyboardShortcutsPanel.openReviewDescription": "Show the workspace files and diff in the right sidebar.",
+  "KeyboardShortcutsPanel.openDiffPanelDescription": "Show the working-tree diff of one file at a time in the right sidebar.",
+  "KeyboardShortcutsPanel.openProcessesPanelDescription": "Show everything this app is currently running in the right sidebar.",
   "KeyboardShortcutsPanel.toggleRightSidebarDescription": "Open or close the right sidebar.",
   "KeyboardShortcutsPanel.openTerminalDescription": "Show or hide the integrated terminal.",
   "KeyboardShortcutsPanel.openBrowserDescription": "Open the browser workbench.",
