@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+export type FrameGrid = "down_to4n_plus1" | "up_to17k_plus5";
+
 export type GenerationTask =
   | "text_to_image"
   | "image_to_image"
@@ -36,6 +38,7 @@ export interface GenerationDefaults {
   flowShift: number | null;
   fps: number;
   videoFrames: number;
+  frameGrid: FrameGrid;
 }
 
 /** A model's terms. `excludedTerritories` being non-empty is what makes the
@@ -136,19 +139,26 @@ export const studioClient = {
     ),
 };
 
-/** The backend snaps a requested length down to the largest `4n + 1` value at
- *  or below it, so the duration shown next to the slider has to snap the same
- *  way or it promises a clip the user will not get. */
-export function normalizeVideoFrames(value: number): number {
+/** Each family snaps clip length differently — Wan rounds down onto `4n + 1`,
+ *  MiniMax H3 rounds up onto `17k + 5`. The slider has to snap the same way the
+ *  backend will, or the duration it shows is one the clip never has. Mirrors
+ *  `normalize_video_frames` in generation.rs. */
+export function normalizeVideoFrames(grid: FrameGrid, value: number): number {
   const clamped = Math.min(Math.max(Math.trunc(value), 1), 361);
-  if (clamped < 5) return 1;
-  return Math.floor((clamped - 1) / 4) * 4 + 1;
+  if (grid === "down_to4n_plus1") {
+    if (clamped < 5) return 1;
+    return Math.floor((clamped - 1) / 4) * 4 + 1;
+  }
+  if (clamped <= 5) return 5;
+  const steps = Math.ceil((clamped - 5) / 17);
+  const aligned = steps * 17 + 5;
+  return aligned > 361 ? (steps - 1) * 17 + 5 : aligned;
 }
 
-/** Canvas edges must be multiples of 32 for the samplers. */
+/** Canvas edges must be multiples of 32, rounded up as the backend does. */
 export function normalizeDimension(value: number): number {
   const clamped = Math.min(Math.max(Math.trunc(value), 32), 4096);
-  return Math.max(1, Math.floor(clamped / 32)) * 32;
+  return Math.min(Math.ceil(clamped / 32) * 32, 4096);
 }
 
 export function formatBytes(bytes: number): string {

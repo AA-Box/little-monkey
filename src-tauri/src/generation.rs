@@ -150,6 +150,19 @@ pub struct LicenseGate {
     pub acceptance_required: bool,
 }
 
+/// How a family rounds a requested clip length. Not cosmetic: asking for a
+/// count off the grid gets silently rewritten by the backend, so the UI has to
+/// round the same way or it promises a duration the clip will not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGrid {
+    /// Largest `4n + 1` at or below the request — the core video path's
+    /// general normalization, used by Wan.
+    DownTo4nPlus1,
+    /// Smallest `17k + 5` at or above the request, minimum 5 — MiniMax H3.
+    UpTo17kPlus5,
+}
+
 /// Per-model starting point for the request fields a user does not set.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +176,7 @@ pub struct GenerationDefaults {
     pub flow_shift: Option<f64>,
     pub fps: u32,
     pub video_frames: u32,
+    pub frame_grid: FrameGrid,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -251,6 +265,7 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
                 flow_shift: None,
                 fps: 1,
                 video_frames: 1,
+                frame_grid: FrameGrid::DownTo4nPlus1,
             },
             min_ram_bytes: 16 * 1024 * 1024 * 1024,
             license: permissive_license(
@@ -295,6 +310,7 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
                 flow_shift: Some(3.0),
                 fps: 24,
                 video_frames: 33,
+                frame_grid: FrameGrid::DownTo4nPlus1,
             },
             min_ram_bytes: 16 * 1024 * 1024 * 1024,
             license: permissive_license(
@@ -342,9 +358,12 @@ pub fn curated_models() -> Vec<GenerationModelSpec> {
                 cfg_scale: 1.0,
                 sample_method: "euler",
                 flow_shift: None,
-                // The core video path forces 24 fps for this family.
+                // The core video path forces 24 fps for this family, and
+                // aligns length upward onto a 17k+5 grid: 56 frames is the
+                // third rung, about 2.3 s.
                 fps: 24,
-                video_frames: 121,
+                video_frames: 56,
+                frame_grid: FrameGrid::UpTo17kPlus5,
             },
             min_ram_bytes: 48 * 1024 * 1024 * 1024,
             license: LicenseGate {
@@ -391,22 +410,42 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
     args
 }
 
-/// Snaps a canvas edge down to the multiple of 32 the samplers require, never
-/// below one tile.
+/// Snaps a canvas edge to the multiple of 32 the samplers require. The backend
+/// aligns upward, so this does too — rounding the other way would quietly hand
+/// back a smaller canvas than the one that gets rendered.
 pub fn normalize_dimension(value: u32) -> u32 {
     let clamped = value.clamp(32, MAX_DIMENSION);
-    (clamped / 32).max(1) * 32
+    let rounded = clamped.div_ceil(32) * 32;
+    rounded.min(MAX_DIMENSION / 32 * 32)
 }
 
-/// The core video path normalizes a requested length to the largest `4n + 1`
-/// value not exceeding it. Doing the same here means the UI's duration readout
-/// matches the clip the user actually gets.
-pub fn normalize_video_frames(value: u32) -> u32 {
+/// Snaps a requested clip length onto the family's grid, matching what the
+/// backend will do with the same number.
+pub fn normalize_video_frames(grid: FrameGrid, value: u32) -> u32 {
     let clamped = value.clamp(1, MAX_VIDEO_FRAMES);
-    if clamped < 5 {
-        return 1;
+    match grid {
+        FrameGrid::DownTo4nPlus1 => {
+            if clamped < 5 {
+                1
+            } else {
+                ((clamped - 1) / 4) * 4 + 1
+            }
+        }
+        FrameGrid::UpTo17kPlus5 => {
+            if clamped <= 5 {
+                return 5;
+            }
+            let steps = (clamped - 5).div_ceil(17);
+            // Aligning upward can overshoot the cap, so step back one rung
+            // rather than returning a length the backend would reject.
+            let aligned = steps * 17 + 5;
+            if aligned > MAX_VIDEO_FRAMES {
+                (steps - 1) * 17 + 5
+            } else {
+                aligned
+            }
+        }
     }
-    ((clamped - 1) / 4) * 4 + 1
 }
 
 /// One generation job's user-controlled inputs.
@@ -478,11 +517,14 @@ pub fn validate_request(
             return Err(format!("Frame rate may not exceed {MAX_FPS}"));
         }
         normalized.fps = fps;
-        normalized.video_frames = normalize_video_frames(if request.video_frames == 0 {
-            spec.defaults.video_frames
-        } else {
-            request.video_frames
-        });
+        normalized.video_frames = normalize_video_frames(
+            spec.defaults.frame_grid,
+            if request.video_frames == 0 {
+                spec.defaults.video_frames
+            } else {
+                request.video_frames
+            },
+        );
     } else {
         normalized.fps = 1;
         normalized.video_frames = 1;
@@ -813,9 +855,12 @@ mod tests {
             assert!(model.defaults.steps > 0, "{}", model.id);
             if model.tasks.iter().any(|task| task.is_video()) {
                 assert_eq!(
-                    normalize_video_frames(model.defaults.video_frames),
+                    normalize_video_frames(
+                        model.defaults.frame_grid,
+                        model.defaults.video_frames
+                    ),
                     model.defaults.video_frames,
-                    "{} default frame count is not a 4n+1 value",
+                    "{} default frame count is off its own grid",
                     model.id
                 );
             }
@@ -886,21 +931,34 @@ mod tests {
         assert!(!sdxl_args.contains(&"--diffusion-model".to_string()));
     }
 
+    /// Wan rounds down onto 4n+1; MiniMax H3 rounds *up* onto 17k+5. Using one
+    /// rule for both would misreport the duration of every H3 clip.
     #[test]
-    fn frame_counts_snap_down_to_the_backends_grid() {
-        assert_eq!(normalize_video_frames(33), 33);
-        assert_eq!(normalize_video_frames(34), 33);
-        assert_eq!(normalize_video_frames(32), 29);
-        assert_eq!(normalize_video_frames(5), 5);
-        assert_eq!(normalize_video_frames(4), 1);
-        assert_eq!(normalize_video_frames(0), 1);
-        assert_eq!(normalize_video_frames(u32::MAX), MAX_VIDEO_FRAMES);
+    fn frame_counts_snap_onto_each_familys_own_grid() {
+        use FrameGrid::{DownTo4nPlus1, UpTo17kPlus5};
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 33), 33);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 34), 33);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 32), 29);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 5), 5);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 4), 1);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, 0), 1);
+        assert_eq!(normalize_video_frames(DownTo4nPlus1, u32::MAX), MAX_VIDEO_FRAMES);
+
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 56), 56);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 45), 56);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 39), 39);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 1), 5);
+        assert_eq!(normalize_video_frames(UpTo17kPlus5, 0), 5);
+        // Rounding up must not push past the cap.
+        let ceiling = normalize_video_frames(UpTo17kPlus5, u32::MAX);
+        assert!(ceiling <= MAX_VIDEO_FRAMES);
+        assert_eq!((ceiling - 5) % 17, 0);
     }
 
     #[test]
-    fn dimensions_snap_to_the_sampler_grid() {
+    fn dimensions_round_up_to_the_sampler_grid() {
         assert_eq!(normalize_dimension(1344), 1344);
-        assert_eq!(normalize_dimension(1000), 992);
+        assert_eq!(normalize_dimension(1000), 1024);
         assert_eq!(normalize_dimension(0), 32);
         assert_eq!(normalize_dimension(u32::MAX), MAX_DIMENSION);
     }
@@ -928,6 +986,11 @@ mod tests {
         let normalized =
             validate_request(&wan, &video_request(GenerationTask::TextToVideo)).unwrap();
         assert_eq!(normalized.video_frames, 33);
+        // The same 34 becomes 39 on H3's upward 17k+5 grid, not 33.
+        let h3 = find_model("minimax-h3-fl2va").expect("h3");
+        let mut on_h3 = video_request(GenerationTask::TextToVideo);
+        on_h3.model_id = h3.id.clone();
+        assert_eq!(validate_request(&h3, &on_h3).unwrap().video_frames, 39);
         assert_eq!(normalized.fps, 24);
 
         // Image-driven tasks cannot silently fall back to text-only.

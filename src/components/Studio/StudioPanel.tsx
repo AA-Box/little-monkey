@@ -168,7 +168,7 @@ export function StudioPanel() {
         cfgScale: selected.defaults.cfgScale,
         seed,
         videoFrames: isVideoTask(task)
-          ? normalizeVideoFrames(seconds * selected.defaults.fps)
+          ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
           : 1,
         fps: isVideoTask(task) ? selected.defaults.fps : 1,
         initImageBase64: needsInitImage(task) ? initImage : null,
@@ -195,7 +195,7 @@ export function StudioPanel() {
   }
 
   const effectiveFrames = selected
-    ? normalizeVideoFrames(seconds * selected.defaults.fps)
+    ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
     : 0;
   const canGenerate =
     !!selected &&
