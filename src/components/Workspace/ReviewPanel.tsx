@@ -18,6 +18,7 @@ import {
 
 import { useT } from "../../lib/i18n";
 import { Button, IconButton } from "../ui";
+import { CriteriaCoverageSection } from "./CriteriaCoverageSection";
 import { computeDiff, type DiffLine } from "./DiffViewer";
 
 /** Mirrors Rust `ReviewFilePayload` / `ReviewPayload` in src-tauri/src/git.rs. */
@@ -413,6 +414,9 @@ export function ReviewPanel({ onClose }: { onClose?: () => void }) {
           {error.startsWith("ReviewPanel.") ? t(error) : error}
         </div>
       )}
+
+      {/* Criteria coverage over the whole change, so it spans both columns. */}
+      <CriteriaCoverageSection review={review} mode={base} t={t} onRevealPath={scrollToFile} />
 
       <div className="flex min-h-0 flex-1">
         {/* Main: per-file diffs. */}
