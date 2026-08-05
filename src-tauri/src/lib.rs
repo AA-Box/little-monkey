@@ -38,6 +38,9 @@ pub mod m5_delivery;
 // the same validation, cancellation, residency, and scheduling semantics.
 pub mod runtime_adapter;
 // Verified app-owned llama.cpp runtime shared by desktop, CLI, and M3.
+// Model-agnostic image and video generation over the managed
+// stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
+pub mod generation;
 pub mod managed_runtime;
 // Knowledge Stacks 2.0 contracts and generation-based hybrid index. Kept
 // Tauri-free so desktop, daemon, CLI workflows, and connector packages share
