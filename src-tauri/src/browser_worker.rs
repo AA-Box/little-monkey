@@ -729,7 +729,10 @@ impl OwnedBrowser {
     ) -> Result<Arc<Self>, String> {
         validate_identifier("runId", &request.run_id)?;
         validate_limits(&request.limits)?;
-        let grant = ValidatedGrant::new(request.grant)?;
+        let grant = ValidatedGrant::new(
+            request.grant,
+            crate::run_scope::RunScope::run(&request.run_id),
+        )?;
         grant
             .validate_navigation(&request.url)
             .map_err(denial_text)?;
@@ -1382,6 +1385,19 @@ impl Drop for OwnedBrowser {
 struct ValidatedGrant {
     allowed_origins: Vec<String>,
     allow_loopback: bool,
+    /// The run this grant was issued to, so a refusal several frames down can name it.
+    ///
+    /// Carried explicitly rather than read from the ambient scope, and that is forced
+    /// rather than preferred: every browser action reaches this file through
+    /// `tokio::task::spawn_blocking`, which — like `tokio::spawn` — does **not** inherit
+    /// a task-local. So no `run_scope::scoped` at the command boundary can reach
+    /// `handle_event`'s per-subresource decisions, and pretending otherwise would record
+    /// a blank while looking instrumented.
+    ///
+    /// A field on *this* struct because it is already the per-run object: its whole
+    /// purpose is holding what one run was granted, and its refusals already say "this
+    /// run's grant". The id was the one part of the run it did not keep.
+    scope: crate::run_scope::RunScope,
 }
 
 impl ValidatedGrant {
@@ -1404,7 +1420,7 @@ impl ValidatedGrant {
     /// [`normalized_origin`] is the exception, because it is shared with the
     /// request path: it returns a typed denial, and this is the one place where
     /// that denial is rendered straight to prose rather than propagated.
-    fn new(grant: BrowserGrant) -> Result<Self, String> {
+    fn new(grant: BrowserGrant, scope: crate::run_scope::RunScope) -> Result<Self, String> {
         if grant.allowed_origins.is_empty() || grant.allowed_origins.len() > MAX_ALLOWED_ORIGINS {
             return Err("Browser grant requires 1..=32 exact origins".to_string());
         }
@@ -1431,15 +1447,29 @@ impl ValidatedGrant {
         Ok(Self {
             allowed_origins,
             allow_loopback: grant.allow_loopback,
+            scope,
         })
     }
 
     fn validate_navigation(&self, value: &str) -> Result<(), EgressDenial> {
         let verdict = self.classify_navigation(value);
         if let Err(denial) = &verdict {
-            crate::denial_sink::record(BROWSER_GUARD, denial, None);
+            self.record(denial);
         }
         verdict
+    }
+
+    /// Writes a refusal down under this grant's run.
+    ///
+    /// Enters the scope rather than forwarding an id, so `denial_sink::record`'s
+    /// existing lookup handles **both** arms: a run keeps its id, and an unattributed
+    /// grant keeps its coded reason. Passing `run_id: Some(..)` would forward the first
+    /// and silently flatten the second into the blank that D3 exists to distinguish
+    /// from it.
+    fn record(&self, denial: &EgressDenial) {
+        crate::run_scope::scoped_sync(self.scope.clone(), || {
+            crate::denial_sink::record(BROWSER_GUARD, denial, None);
+        });
     }
 
     fn classify_navigation(&self, value: &str) -> Result<(), EgressDenial> {
@@ -1457,7 +1487,7 @@ impl ValidatedGrant {
     fn validate_request(&self, value: &str, document: bool) -> Result<(), EgressDenial> {
         let verdict = self.classify_request(value, document);
         if let Err(denial) = &verdict {
-            crate::denial_sink::record(BROWSER_GUARD, denial, None);
+            self.record(denial);
         }
         verdict
     }
@@ -2781,10 +2811,13 @@ mod tests {
         let child = observable_child();
         let pid = child.id();
 
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://127.0.0.1:1".to_string()],
-            allow_loopback: true,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://127.0.0.1:1".to_string()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-1"),
+        )
         .unwrap();
 
         (
@@ -3450,10 +3483,13 @@ mod tests {
     /// test. The rule says which requirement each case is about.
     #[test]
     fn exact_origin_and_loopback_grant_are_required() {
-        let denied = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://127.0.0.1:3000".into()],
-            allow_loopback: false,
-        })
+        let denied = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://127.0.0.1:3000".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-2"),
+        )
         .unwrap();
         let refusal = denied
             .validate_navigation("http://127.0.0.1:3000/")
@@ -3470,10 +3506,13 @@ mod tests {
             Some("127.0.0.1 requires an explicit per-run loopback grant")
         );
 
-        let allowed = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://127.0.0.1:3000".into()],
-            allow_loopback: true,
-        })
+        let allowed = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://127.0.0.1:3000".into()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-3"),
+        )
         .unwrap();
         assert!(allowed
             .validate_navigation("http://127.0.0.1:3000/a")
@@ -3499,10 +3538,13 @@ mod tests {
     /// which grants the origin so the classifier is the only thing left to refuse it.
     #[test]
     fn page_requests_cannot_expand_the_run_grant() {
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["https://example.com".into()],
-            allow_loopback: false,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["https://example.com".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-4"),
+        )
         .unwrap();
         let rule_for = |result: Result<(), EgressDenial>| result.unwrap_err().rule();
 
@@ -3566,10 +3608,13 @@ mod tests {
                 EgressRule::ProtocolAssignments,
             ),
         ] {
-            let grant = ValidatedGrant::new(BrowserGrant {
-                allowed_origins: vec![origin.to_string()],
-                allow_loopback: false,
-            })
+            let grant = ValidatedGrant::new(
+                BrowserGrant {
+                    allowed_origins: vec![origin.to_string()],
+                    allow_loopback: false,
+                },
+                crate::run_scope::RunScope::run("grant-fixture-5"),
+            )
             .unwrap();
             let denial = grant.validate_request(target, false).unwrap_err();
             assert_eq!(
@@ -3603,6 +3648,80 @@ mod tests {
     ///
     /// Drives the real guards rather than synthesising records, so it also proves
     /// both call sites are actually wired.
+    /// D3 at this file's highest-volume decision point, and the reason the scope is
+    /// carried on the grant rather than read from the air.
+    ///
+    /// Every browser action arrives through `tokio::task::spawn_blocking`, which does
+    /// **not** inherit a task-local — the same property `run_scope`'s own test pins for
+    /// `tokio::spawn`. So a `run_scope::scoped` at the command boundary cannot reach a
+    /// per-subresource refusal here, and a version of this that relied on the ambient
+    /// scope would record a blank while looking instrumented. `ValidatedGrant` holds the
+    /// scope instead — it is already the per-run object — and enters it around the write.
+    ///
+    /// Both arms are asserted, because the point of the mechanism is that they are two
+    /// different answers rather than one blank: a run keeps its id, a grant with no run
+    /// keeps a coded reason.
+    #[test]
+    fn a_refused_subresource_names_the_run_whose_grant_refused_it() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory =
+            std::env::temp_dir().join(format!("lm-grant-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+        let find = |marker: &str| {
+            crate::denial_sink::DenialSink::open(&path)
+                .expect("reopens for reading")
+                .recent(256)
+                .expect("reads")
+                .into_iter()
+                .find(|row| {
+                    row.guard == BROWSER_GUARD
+                        && row.detail.as_deref().is_some_and(|d| d.contains(marker))
+                })
+                .unwrap_or_else(|| panic!("no browser row mentioning {marker}"))
+        };
+        let grant_for = |scope| {
+            ValidatedGrant::new(
+                BrowserGrant {
+                    allowed_origins: vec!["https://allowed.example".into()],
+                    allow_loopback: false,
+                },
+                scope,
+            )
+            .expect("the grant validates")
+        };
+
+        // A run's grant. The refusal is raised inside `classify_request`, a pure function
+        // of a `&str` that is handed no run id and never will be.
+        let granted = grant_for(crate::run_scope::RunScope::run("run:subresource"));
+        assert!(granted
+            .validate_request("https://elsewhere.example/tracker.js", false)
+            .is_err());
+        let row = find("elsewhere.example");
+        assert_eq!(row.run_id.as_deref(), Some("run:subresource"));
+        assert_eq!(row.unattributed_reason, None);
+
+        // A grant with deliberately no run keeps the *reason*, which is exactly what
+        // forwarding only an id would have flattened into a blank.
+        let background = grant_for(crate::run_scope::RunScope::Unattributed(
+            crate::run_scope::Unattributed::Scheduled,
+        ));
+        assert!(background
+            .validate_request("https://offgrant.example/pixel.gif", false)
+            .is_err());
+        let row = find("offgrant.example");
+        assert_eq!(row.run_id, None);
+        assert_eq!(
+            row.unattributed_reason.as_deref(),
+            Some(crate::run_scope::Unattributed::Scheduled.code())
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn two_guards_refusing_are_distinguishable_in_the_record() {
         let _serialized = crate::denial_sink::test_lock();
@@ -3622,10 +3741,13 @@ mod tests {
         assert!(refused.is_err());
 
         // The browser guard, on an origin outside the run's grant.
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["https://granted.example".to_string()],
-            allow_loopback: false,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["https://granted.example".to_string()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-6"),
+        )
         .expect("the grant is valid");
         assert!(grant
             .validate_navigation("https://ungranted.example/page")
@@ -3712,10 +3834,13 @@ mod tests {
 
         // End to end, through the gate that actually decides a navigation. The origin
         // is granted, so the only thing left to refuse it is the address.
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
-            allow_loopback: false,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://[::ffff:127.0.0.1]:11434".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-7"),
+        )
         .unwrap();
         let denial = grant
             .validate_navigation("http://[::ffff:127.0.0.1]:11434/api/tags")
@@ -3746,10 +3871,13 @@ mod tests {
     /// substitute a different answer for a known one.
     #[test]
     fn a_granted_public_ipv6_literal_is_reachable_now_that_its_brackets_are_gone() {
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://[2606:4700:4700::1111]".into()],
-            allow_loopback: false,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://[2606:4700:4700::1111]".into()],
+                allow_loopback: false,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-8"),
+        )
         .unwrap();
         grant
             .validate_navigation("http://[2606:4700:4700::1111]/page")
@@ -3802,10 +3930,13 @@ mod tests {
             ("64:ff9b::7f00:1", EgressRule::ReservedRange),
         ] {
             let origin = format!("http://[{literal}]");
-            let grant = ValidatedGrant::new(BrowserGrant {
-                allowed_origins: vec![origin.clone()],
-                allow_loopback: false,
-            })
+            let grant = ValidatedGrant::new(
+                BrowserGrant {
+                    allowed_origins: vec![origin.clone()],
+                    allow_loopback: false,
+                },
+                crate::run_scope::RunScope::run("grant-fixture-9"),
+            )
             .unwrap();
             let denial = grant
                 .validate_navigation(&format!("{origin}/page"))
@@ -3834,10 +3965,13 @@ mod tests {
         // Counter-test, so that "refuse every IPv6 literal" cannot pass this test:
         // loopback is the one class an explicit per-run grant makes reachable, and it
         // has to still be reachable through the very path that refuses it above.
-        let granted = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://[::1]:11434".into()],
-            allow_loopback: true,
-        })
+        let granted = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://[::1]:11434".into()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-10"),
+        )
         .unwrap();
         granted
             .validate_navigation("http://[::1]:11434/api/tags")
@@ -3846,10 +3980,13 @@ mod tests {
 
     #[test]
     fn hostname_grants_are_pinned_before_chromium_can_resolve_again() {
-        let grant = ValidatedGrant::new(BrowserGrant {
-            allowed_origins: vec!["http://localhost:43210".into()],
-            allow_loopback: true,
-        })
+        let grant = ValidatedGrant::new(
+            BrowserGrant {
+                allowed_origins: vec!["http://localhost:43210".into()],
+                allow_loopback: true,
+            },
+            crate::run_scope::RunScope::run("grant-fixture-11"),
+        )
         .unwrap();
         let rules = grant.chromium_resolver_rules().unwrap();
         assert!(rules.starts_with("MAP localhost "));

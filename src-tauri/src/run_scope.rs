@@ -158,6 +158,29 @@ where
     SCOPE.scope(scope, future).await
 }
 
+/// [`scoped`] for code that is not a future.
+///
+/// # Why this is needed at all
+///
+/// A task-local is not inherited across `tokio::spawn` **or**
+/// `tokio::task::spawn_blocking`, and a good deal of this app's egress happens under
+/// the latter: `browser_worker.rs` runs every browser action through
+/// `spawn_blocking`, and its per-subresource decisions are plain synchronous functions
+/// several frames below it. For those, [`scoped`] is unusable — there is no future to
+/// wrap — so without this the only options were to thread a parameter through every
+/// intervening signature or to record a blank.
+///
+/// Wraps `tokio::task::LocalKey::sync_scope`, which exists for exactly this case.
+/// Costs nothing where it is not needed and is not a substitute for [`scoped`] in
+/// async code: a scope entered here ends when `body` returns, so an `async` block
+/// created inside it does not carry the scope to wherever it is later awaited.
+pub fn scoped_sync<F, R>(scope: RunScope, body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    SCOPE.sync_scope(scope, body)
+}
+
 /// The ambient scope, or `None` at a site no [`scoped`] call encloses.
 ///
 /// `None` means "nobody said", and it is deliberately not the same value as
