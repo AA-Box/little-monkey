@@ -639,6 +639,39 @@ pub fn generation_gallery(app: AppHandle) -> Result<Vec<GenerationEntry>, String
     read_state(&app, GALLERY_FILE)
 }
 
+/// Removes one generation, bytes and all.
+///
+/// The artifact store is content addressed, so two runs that produced
+/// identical bytes share one blob and deleting it for either would blank the
+/// other. The blob therefore goes only once nothing else in the gallery points
+/// at it.
+///
+/// ponytail: gallery-scoped refcount. The store is shared with the rest of the
+/// app, so a blob referenced from outside Studio — which needs byte-identical
+/// content, i.e. the same image saved somewhere else too — would still be
+/// removed. A real refcount in `ArtifactStore` is the upgrade if another
+/// feature ever starts deleting as well.
+#[tauri::command]
+pub fn generation_delete_entry(app: AppHandle, entry_id: String) -> Result<(), String> {
+    let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
+    let Some(at) = gallery.iter().position(|entry| entry.entry_id == entry_id) else {
+        return Err("That generation is not in the gallery".to_string());
+    };
+    let removed = gallery.remove(at);
+    let still_referenced = gallery
+        .iter()
+        .any(|entry| entry.artifact_id == removed.artifact_id);
+    // The index is written first: an entry with no bytes is a broken thumbnail,
+    // but bytes with no entry are invisible and unreclaimable.
+    write_state(&app, GALLERY_FILE, &gallery)?;
+    if !still_referenced {
+        artifacts(&app)?
+            .delete(&removed.artifact_id)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Base64 data URL for a gallery entry, used by both `<img>` and `<video>`.
 /// The engine holds tens of gigabytes of weights, so callers preview from the
 /// artifact store rather than regenerating.

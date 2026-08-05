@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   Download,
   Loader2,
@@ -419,6 +420,24 @@ export function StudioPanel() {
       if (!jobId || !(await studioClient.cancel(jobId))) {
         await studioClient.unloadEngine();
       }
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  };
+
+  /** Deletes a generation and its bytes. Irreversible — the store keeps no
+   *  history — so it asks first. */
+  const removeEntry = async (entry: GenerationEntry) => {
+    if (!(await confirm(t("Studio.result.deleteConfirm"), { kind: "warning" }))) return;
+    setLightbox(null);
+    try {
+      await studioClient.deleteEntry(entry.entryId);
+      setGallery((current) => current.filter((item) => item.entryId !== entry.entryId));
+      setPreviews((current) => {
+        const next = { ...current };
+        delete next[entry.artifactId];
+        return next;
+      });
     } catch (reason) {
       setError(errorText(reason));
     }
@@ -1247,6 +1266,10 @@ export function StudioPanel() {
                 <Download size={12} />
                 {t("Studio.result.save")}
               </a>
+              <Button size="sm" variant="danger" onClick={() => void removeEntry(lightbox)}>
+                <Trash2 size={12} />
+                {t("Studio.result.delete")}
+              </Button>
               <Button size="sm" variant="secondary" onClick={() => setLightbox(null)}>
                 {t("Studio.result.close")}
               </Button>

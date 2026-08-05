@@ -204,6 +204,8 @@ export const studioClient = {
     invoke<GenerationEntry>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
   gallery: () => invoke<GenerationEntry[]>("generation_gallery"),
+  deleteEntry: (entryId: string) =>
+    invoke<void>("generation_delete_entry", { entryId }),
   mediaDataUrl: (artifactId: string) =>
     invoke<string>("generation_media_data_url", { artifactId }),
   unloadEngine: () => invoke<void>("generation_unload_engine"),

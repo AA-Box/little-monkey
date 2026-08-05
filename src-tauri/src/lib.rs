@@ -1418,6 +1418,7 @@ pub fn run() {
             generation_commands::generation_run,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
+            generation_commands::generation_delete_entry,
             generation_commands::generation_media_data_url,
             generation_commands::generation_unload_engine,
             m7_companion::m7_image_generate,

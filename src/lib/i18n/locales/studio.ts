@@ -108,6 +108,8 @@ export const studioLocale: Record<string, string> = {
   "Studio.languageHint": "ISO 639-1, e.g. en",
   "Studio.result.edit": "Edit this",
   "Studio.result.save": "Save",
+  "Studio.result.delete": "Delete",
+  "Studio.result.deleteConfirm": "Delete this generation? Its file is removed from disk and cannot be recovered.",
   "Studio.result.close": "Close",
   "Studio.result.expand": "Show full size",
   "Studio.result.noEditTask":
