@@ -41,6 +41,16 @@ const MAX_HF_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LICENSE_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
+/// How much of a remote-supplied string may ride in a denial record's detail.
+///
+/// The sink's `detail` column is free text with no bound of its own, and the one
+/// value this file puts there straight from a remote document is a model card's
+/// `license_link`. A card is only bounded by [`MAX_HF_METADATA_BYTES`], so without
+/// this a 16 MB link would decide how large a row in a *bounded* audit table is —
+/// which is the same disk-exhaustion argument that caps the table's row count.
+/// 160 characters is what [`license_title`] already keeps of remote text, and it
+/// is long enough to recognise the offending value.
+const MAX_DENIAL_DETAIL_CHARS: usize = 160;
 const PROVENANCE_SCHEMA_VERSION: u32 = 2;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
@@ -1064,10 +1074,35 @@ fn hugging_face_license(
         _ => None,
     };
     if let Some(link) = card_data.license_link {
-        if let Ok(parsed) = Url::parse(&link) {
-            if validate_public_https_url(&parsed).is_ok() {
-                return Ok((license_name, Some(parsed.to_string())));
+        match Url::parse(&link) {
+            Ok(parsed) => {
+                // A refusal here is already attributable: `validate_public_https_url`
+                // writes its own denial down before returning it.
+                if validate_public_https_url(&parsed).is_ok() {
+                    return Ok((license_name, Some(parsed.to_string())));
+                }
             }
+            // A link that does not parse never reaches that gate, so this was the
+            // one refusal on this path that left no record at all — the card was
+            // simply ignored. `UrlMalformed` exists for exactly this distinction:
+            // "we could not read the link" is a different fact from "we read it and
+            // a rule refused where it pointed", and only the first one was invisible.
+            //
+            // A relative link such as `LICENSE` lands here too, and that is correct
+            // rather than noise: it is the same fact about the same card, and the
+            // fallback below still resolves a pinned repo LICENSE URL, so recording
+            // it fails nothing. The volume is user-paced — one card per resolution —
+            // not attacker-paced.
+            Err(_) => crate::denial_sink::record(
+                MODEL_SOURCE_GUARD,
+                &EgressDenial::about(
+                    EgressRule::UrlMalformed,
+                    link.chars()
+                        .take(MAX_DENIAL_DETAIL_CHARS)
+                        .collect::<String>(),
+                ),
+                None,
+            ),
         }
     }
     let license_file = metadata.siblings.iter().find(|sibling| {
@@ -2403,28 +2438,79 @@ fn classify_public_https_url(url: &Url) -> Result<(), EgressDenial> {
 /// token is fetched from, which means a *response* gets to propose where this app
 /// sends a credential request. That makes the host restriction below an egress
 /// rule and not a parsing rule: it decides where a request may go.
+///
+/// Records what it refuses, which the host allowlist did not: the call to
+/// [`validate_public_https_url`] wrote its own denials down and this function's
+/// returned past the sink, so an off-allowlist realm — the one refusal here a
+/// remote server can actually cause — was the least attributable of the two.
 fn validate_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
     validate_public_https_url(url)?;
+    let verdict = classify_ollama_auth_url(url);
+    if let Err(denial) = &verdict {
+        crate::denial_sink::record(MODEL_SOURCE_GUARD, denial, None);
+    }
+    verdict
+}
+
+/// The only port an Ollama auth realm may name.
+///
+/// The allowlist below pins the host, which still leaves a challenge free to
+/// propose `https://auth.ollama.ai:9000/token` — the allowlisted name, a service
+/// nobody publishes there. Low severity on purpose: this request carries no
+/// credential, it is the request that goes to *fetch* one, so the cost of a
+/// surprising port is a request to an unexpected service and not a leaked secret.
+/// Pinned anyway because it costs production nothing — the real realm is
+/// `https://auth.ollama.ai/token`, the scheme's default port.
+///
+/// The *path* is deliberately not pinned. `/token` is the registry's to change,
+/// and a path is not a destination: where the request can go is decided entirely
+/// by the host and this port.
+const OLLAMA_AUTH_PORT: u16 = 443;
+
+/// [`validate_ollama_auth_url`]'s decision, without the recording.
+///
+/// Split out for the same reason [`classify_public_https_url`] is: a verdict can
+/// then be asserted on without the assertion writing into whatever process-wide
+/// sink another test happened to install.
+fn classify_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
     let host = url
         .host_str()
         // Unreachable for the same reason as the `None` arm in
-        // `validate_public_https_url`: the call above has already refused a
-        // hostless URL. Kept refusing rather than `unwrap`ped, because the wrong
-        // way to fail here is "there is no host, so there is nothing to check
-        // against the allowlist".
+        // `validate_public_https_url`: the caller has already refused a hostless
+        // URL. Kept refusing rather than `unwrap`ped, because the wrong way to fail
+        // here is "there is no host, so there is nothing to check against the
+        // allowlist".
         .ok_or_else(|| EgressDenial::new(EgressRule::HostMissing))?
         .to_ascii_lowercase();
-    if host == "ollama.ai"
+    if !(host == "ollama.ai"
         || host.ends_with(".ollama.ai")
         || host == "ollama.com"
-        || host.ends_with(".ollama.com")
+        || host.ends_with(".ollama.com"))
     {
-        Ok(())
-    } else {
         // The host is the detail because the host is the whole reason, and naming
         // it is safe: it is a host, not a URL that could carry userinfo.
-        Err(EgressDenial::about(EgressRule::OriginNotAllowlisted, host))
+        return Err(EgressDenial::about(EgressRule::OriginNotAllowlisted, host));
     }
+    let port = url
+        .port_or_known_default()
+        // Unreachable: the caller has already required `https`, which the `url`
+        // crate has a default port for. Refused rather than `unwrap`ped, for the
+        // same reason as the hostless arm above.
+        .ok_or_else(|| EgressDenial::new(EgressRule::PortMissing))?;
+    // `port_or_known_default` and not `port`: `https://auth.ollama.ai:443/token`
+    // and `https://auth.ollama.ai/token` are the same destination, and the `url`
+    // crate normalises the default away — so comparing the *resolved* port is what
+    // keeps the explicit spelling from being treated as a surprise.
+    if port != OLLAMA_AUTH_PORT {
+        // The same rule as an off-allowlist host, because a port is part of an
+        // origin. `host:port` names both halves of what was refused and both are
+        // safe to print.
+        return Err(EgressDenial::about(
+            EgressRule::OriginNotAllowlisted,
+            format!("{host}:{port}"),
+        ));
+    }
+    Ok(())
 }
 
 /// The rule that makes `address` non-public, or `None` if it is publicly
@@ -3420,6 +3506,96 @@ mod tests {
             .is_some_and(|url| url.contains("/blob/") && url.ends_with("/LICENSE")));
     }
 
+    /// A `license_link` that does not parse used to vanish. It never reached
+    /// `validate_public_https_url`, which is the only thing on this path that writes
+    /// a denial down, so a hostile or broken model card lost its refusal in silence
+    /// while a link that *did* parse and pointed somewhere refused was recorded.
+    ///
+    /// Asserted through a file-backed sink read by a second connection, which is the
+    /// path that ships. The filters use values unique to this test, so nothing
+    /// another test records into the same process-wide sink can satisfy them.
+    #[test]
+    fn a_license_link_that_does_not_parse_is_written_down_rather_than_dropped() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = test_dir("license-link-sink");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+        let read_details = |marker: String| -> Vec<crate::denial_sink::DenialRecord> {
+            crate::denial_sink::DenialSink::open(&path)
+                .expect("reopens for reading")
+                .recent(256)
+                .expect("reads")
+                .into_iter()
+                .filter(|row| row.detail.as_deref() == Some(marker.as_str()))
+                .collect()
+        };
+
+        const UNPARSEABLE: &str = "model-sources-test license link that is not a url";
+        assert!(
+            Url::parse(UNPARSEABLE).is_err(),
+            "the fixture must be a link that really does not parse"
+        );
+        let mut metadata = hf_metadata(vec![HfSibling {
+            rfilename: "LICENSE".to_string(),
+            size: Some(12),
+            lfs: None,
+        }]);
+        metadata.card_data = Some(HfCardData {
+            license: Some(serde_json::Value::String("apache-2.0".to_string())),
+            license_link: Some(UNPARSEABLE.to_string()),
+        });
+
+        // The card is still usable: the refusal is recorded, not escalated into a
+        // failed resolution.
+        let (name, url) = hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert_eq!(name.as_deref(), Some("apache-2.0"));
+        assert!(url.as_deref().is_some_and(|url| url.ends_with("/LICENSE")));
+
+        let mine = read_details(UNPARSEABLE.to_string());
+        assert_eq!(mine.len(), 1, "exactly one record for this test's link");
+        assert_eq!(mine[0].rule_code, EgressRule::UrlMalformed.code());
+        assert_eq!(mine[0].guard, MODEL_SOURCE_GUARD);
+
+        // The bound on what a remote card can put in an audit row. A card is only
+        // capped by `MAX_HF_METADATA_BYTES`, so an unbounded detail would let one
+        // link decide the size of a row in a bounded table.
+        let oversized = "x".repeat(MAX_DENIAL_DETAIL_CHARS * 4);
+        metadata.card_data = Some(HfCardData {
+            license: None,
+            license_link: Some(oversized.clone()),
+        });
+        hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert_eq!(
+            read_details("x".repeat(MAX_DENIAL_DETAIL_CHARS)).len(),
+            1,
+            "an oversized link must be recorded truncated, not whole"
+        );
+        assert!(
+            read_details(oversized).is_empty(),
+            "the untruncated link must not appear in any row"
+        );
+
+        // The counter-test: a link that parses and points somewhere allowed is
+        // *used*, so recording it would be a lie. Without this, recording every link
+        // unconditionally would pass every assertion above.
+        const ALLOWED: &str = "https://huggingface.co/owner/repo/blob/main/LICENSE";
+        metadata.card_data = Some(HfCardData {
+            license: None,
+            license_link: Some(ALLOWED.to_string()),
+        });
+        let (_, url) = hugging_face_license(&metadata, "owner/repo", &"a".repeat(40)).unwrap();
+        assert_eq!(url.as_deref(), Some(ALLOWED));
+        assert!(
+            read_details(ALLOWED.to_string()).is_empty(),
+            "nothing was refused, so nothing may be recorded"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn registry_bearer_challenge_is_parsed_and_origin_restricted() {
         let challenge = parse_registry_auth_challenge(
@@ -3471,6 +3647,89 @@ mod tests {
                 .rule(),
             EgressRule::OriginNotAllowlisted
         );
+    }
+
+    /// The allowlist above pins the host, which is only half a destination: a
+    /// challenge could name `https://auth.ollama.ai:9000/token` — the allowlisted
+    /// host, a port nobody publishes a service on — and the token request would have
+    /// gone there. Low severity, deliberately: that request carries no credential,
+    /// it is the one that goes to *fetch* one, so the cost was a request to an
+    /// unexpected service rather than a leaked secret.
+    ///
+    /// Also pins the recording, which the allowlist half never did: this is the one
+    /// refusal in this file a remote server gets to cause, and it used to return past
+    /// the sink because only `validate_public_https_url` wrote anything down.
+    #[test]
+    fn an_auth_realm_on_a_surprising_port_is_refused_while_the_real_realm_still_works() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory = test_dir("auth-realm-port-sink");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+
+        assert_eq!(
+            validate_ollama_auth_url(&Url::parse("https://auth.ollama.ai:9000/token").unwrap())
+                .expect_err("a realm on an unpublished port must be refused")
+                .rule(),
+            EgressRule::OriginNotAllowlisted
+        );
+        // The same refusal at the call site that a remote server actually reaches, so
+        // the challenge is rejected where it is parsed and before a request is built
+        // from it.
+        let error = parse_registry_auth_challenge(
+            r#"Bearer realm="https://auth.ollama.ai:9000/token",service="registry.ollama.ai""#,
+        )
+        .expect_err("a challenge naming an unpublished port must be refused");
+        assert!(
+            error.contains(EgressRule::OriginNotAllowlisted.code()),
+            "the refusal must name the allowlist rule: {error}"
+        );
+        assert!(
+            error.contains("auth.ollama.ai:9000"),
+            "the refusal must name the origin it refused, port included: {error}"
+        );
+
+        // The counter-tests, and the reason this pin is safe to ship: the real
+        // production realm, that realm with its default port spelled out — the same
+        // destination, which is why the *resolved* port is what gets compared — and a
+        // realm whose path the registry moved must all still be accepted. "Refuse
+        // every realm" would pass every assertion above.
+        for realm in [
+            "https://auth.ollama.ai/token",
+            "https://auth.ollama.ai:443/token",
+            "https://auth.ollama.ai/v2/token",
+            "https://ollama.com/token",
+        ] {
+            validate_ollama_auth_url(&Url::parse(realm).unwrap())
+                .unwrap_or_else(|denial| panic!("{realm} must keep working: {denial}"));
+        }
+
+        let rows = crate::denial_sink::DenialSink::open(&path)
+            .expect("reopens for reading")
+            .recent(256)
+            .expect("reads");
+        let with_detail = |marker: &str| {
+            rows.iter()
+                .filter(|row| row.detail.as_deref() == Some(marker))
+                .collect::<Vec<_>>()
+        };
+        // Two: the typed call above and the challenge parse, each of which refuses
+        // once.
+        let refused = with_detail("auth.ollama.ai:9000");
+        assert_eq!(refused.len(), 2, "both refusals must be written down");
+        assert_eq!(
+            refused[0].rule_code,
+            EgressRule::OriginNotAllowlisted.code()
+        );
+        assert_eq!(refused[0].guard, MODEL_SOURCE_GUARD);
+        assert!(
+            with_detail("auth.ollama.ai:443").is_empty(),
+            "an accepted realm must leave no record"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
     }
 
     /// Before this asserted rules, the two blocks below were indistinguishable:
