@@ -963,6 +963,50 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
 /// because this is a message a person reads, not a model's context.
 const MAX_STDERR_TAIL: usize = 4_000;
 
+/// Engine failures whose own wording does not say what to change, paired with
+/// the sentence that does. Both entries below were hit for real: the first by
+/// putting an all-in-one checkpoint on the wrong slot, the second by a
+/// quantization built for a different loader.
+const ENGINE_FAILURE_HINTS: &[(&str, &str)] = &[
+    (
+        "get sd version from file failed",
+        "The engine could not read that file as a bare diffusion model. An all-in-one checkpoint belongs on --model; --diffusion-model is for a UNet on its own.",
+    ),
+    (
+        "wrong shape in model metadata",
+        "That file's tensors are laid out for a different loader. A ComfyUI-GGUF quantization will not load here even though the extension matches — use one built for stable-diffusion.cpp.",
+    ),
+];
+
+/// Reduces the engine's output to the part a person can act on.
+///
+/// A failed launch prints forty lines of Metal device probing before the two
+/// that matter, so quoting the raw tail buries the diagnosis in noise. Keep the
+/// engine's own error lines, and add the sentence that turns a known one into a
+/// change the user can make.
+fn engine_failure_detail(tail: &str) -> String {
+    let errors: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("[ERROR]") || line.starts_with("error"))
+        .collect();
+    let body = if errors.is_empty() {
+        // Nothing self-identifies as an error, so the last few lines are the
+        // best available guess at where it stopped.
+        let lines: Vec<&str> = tail.lines().collect();
+        lines[lines.len().saturating_sub(6)..].join("\n")
+    } else {
+        errors.join("\n")
+    };
+    match ENGINE_FAILURE_HINTS
+        .iter()
+        .find(|(signature, _)| tail.contains(signature))
+    {
+        Some((_, hint)) => format!("{body}\n\n{hint}"),
+        None => body,
+    }
+}
+
 /// Sampling progress read off one line of engine output.
 ///
 /// The job API reports `queued`/`generating`/`completed` and nothing in
@@ -1150,7 +1194,7 @@ impl GenerationEngineState {
         let detail = state
             .stderr_tail
             .as_ref()
-            .and_then(|tail| tail.lock().ok().map(|value| value.trim().to_string()))
+            .and_then(|tail| tail.lock().ok().map(|value| engine_failure_detail(value.trim())))
             .filter(|value| !value.is_empty());
         Ok(Some(match detail {
             Some(detail) => format!("{outcome}:\n{detail}"),
@@ -1844,6 +1888,38 @@ mod tests {
         );
         assert_eq!(parse_sampling_progress("[INFO ] main.cpp:148 - listening"), None);
         assert_eq!(parse_sampling_progress("  |==| 4/0 - 1.0s/it"), None);
+    }
+
+    /// A launch failure is forty lines of Metal probing and two that matter.
+    /// Quoting the whole tail is what made a one-field mistake unreadable.
+    #[test]
+    fn a_failed_launch_reports_the_diagnosis_not_the_device_probe() {
+        // Trimmed from a real failure: an all-in-one checkpoint assigned to
+        // --diffusion-model.
+        let tail = "\
+ggml_metal_device_init: GPU name: MTL0 (Apple M4 Pro)
+ggml_metal_device_init: has unified memory = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
+[INFO ] stable-diffusion.cpp:717 - loading diffusion model from '/Users/x/sd-turbo.safetensors'
+[INFO ] model_loader.cpp:242 - load /Users/x/sd-turbo.safetensors using safetensors format
+[ERROR] stable-diffusion.cpp:902 - get sd version from file failed: ''
+[ERROR] main.cpp:92 - new_sd_ctx_t failed";
+        let detail = engine_failure_detail(tail);
+        assert!(!detail.contains("ggml_metal_device_init"), "{detail}");
+        assert!(detail.contains("get sd version from file failed"));
+        assert!(detail.contains("belongs on --model"), "{detail}");
+
+        // A quantization for another loader is the other failure that reads as
+        // a broken download rather than a wrong file.
+        assert!(engine_failure_detail(
+            "[ERROR] ggml: tensor 'x' has wrong shape in model metadata: got [64, 2688]"
+        )
+        .contains("stable-diffusion.cpp"));
+
+        // Nothing self-identifies as an error: fall back to where it stopped,
+        // rather than reporting no detail at all.
+        let quiet = engine_failure_detail("line one\nline two\nline three");
+        assert_eq!(quiet, "line one\nline two\nline three");
     }
 
     /// A rejected submission answers with a bare string, and reading only the
