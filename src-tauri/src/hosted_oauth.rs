@@ -241,8 +241,24 @@ struct BackendTokenResponse {
     error: Option<String>,
 }
 
+/// The client both relay calls use.
+///
+/// `egress::hardened()` because the bodies these POST are the credentials
+/// themselves — a one-time handoff code in one case, a long-lived refresh token
+/// in the other. A default client would replay that body to whatever host a
+/// `302` named (reqwest preserves the body across a 307/308, and re-POSTs are
+/// exactly what a relay redirect would produce), and would wait forever on a
+/// relay that accepted the connection and then stalled. `BACKEND_BASE` being a
+/// constant limits who can trigger that, but a compromised or misconfigured
+/// relay is precisely the case worth bounding.
+fn relay_client() -> Result<reqwest::Client, String> {
+    crate::egress::hardened()
+        .build()
+        .map_err(|e| format!("Failed to build the OAuth relay HTTP client: {e}"))
+}
+
 async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
-    let response = reqwest::Client::new()
+    let response = relay_client()?
         .post(format!("{BACKEND_BASE}/mcp/oauth/exchange"))
         .json(&serde_json::json!({ "handoff": handoff }))
         .send()
@@ -259,7 +275,7 @@ async fn redeem_handoff(handoff: &str) -> Result<BackendTokenResponse, String> {
 }
 
 async fn refresh_via_backend(provider: &str, refresh_token: &str) -> Result<BackendTokenResponse, String> {
-    let response = reqwest::Client::new()
+    let response = relay_client()?
         .post(format!("{BACKEND_BASE}/mcp/oauth/refresh"))
         .json(&serde_json::json!({ "provider": provider, "refresh_token": refresh_token }))
         .send()

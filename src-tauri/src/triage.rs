@@ -663,7 +663,13 @@ async fn generate_chat_completion_text(
 
     let base_url = crate::providers::configured_endpoint(app, provider_id)?;
     let api_key = crate::providers::read_key(provider_id)?;
-    let client = reqwest::Client::new();
+    // This reuses `providers::build_chat_request`, so it also inherits the
+    // `x-api-key` header reqwest will not strip across a cross-host redirect —
+    // it therefore needs the same hardened client the provider path itself uses,
+    // not a default one.
+    let client = crate::egress::hardened()
+        .build()
+        .map_err(|e| format!("Failed to build the provider HTTP client: {e}"))?;
     let request = crate::providers::build_chat_request(
         &client, &base_url, provider_id, &api_key, model, &messages, &[], effort,
     );
