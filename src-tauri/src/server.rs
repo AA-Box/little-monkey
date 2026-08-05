@@ -825,6 +825,27 @@ pub fn route_model(
     ModelRoute::Ollama
 }
 
+/// Which of the two clients a route's upstream is allowed to be reached with.
+///
+/// Split out as a pure function of the route so the choice is *assertable*. A
+/// `match` inlined at each send site would be equally correct and completely
+/// untestable: `reqwest::Client` exposes nothing about its own timeouts or
+/// redirect policy, so the only way to prove a route uses the hardened client is
+/// to compare which client it picked — which needs the picking to be a function.
+///
+/// `Unknown` never reaches a send site (it 404s earlier), and returning the local
+/// client for it is the safe direction: that client reaches only this machine.
+fn client_for<'deps>(deps: &'deps ServerDeps, route: &ModelRoute) -> &'deps reqwest::Client {
+    match route {
+        // Hardcoded loopback both: `127.0.0.1:{llama_port}` and
+        // `ollama::OLLAMA_BASE_URL`. Neither is user-configurable at this layer.
+        ModelRoute::Llama | ModelRoute::Ollama | ModelRoute::Unknown => &deps.local_client,
+        // The provider's `base_url` is whatever the user configured, and the
+        // request carries their API key.
+        ModelRoute::Providers { .. } => &deps.cloud_client,
+    }
+}
+
 /// Maps a routing decision to the [`Backend`] a token's `backends` list is
 /// checked against — `Unknown` never reaches here (handled earlier as a
 /// 404).
@@ -978,7 +999,30 @@ pub struct ServerDeps {
     /// only gates whether a `Providers` route is actually served.
     pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
-    pub client: reqwest::Client,
+    /// The client for peers on this machine: the bundled `llama-server` and the
+    /// local Ollama daemon. Deliberately a default `reqwest::Client`, with no
+    /// timeout and reqwest's stock ten-hop redirect policy.
+    ///
+    /// Kept permissive on purpose rather than by neglect. There is no credential
+    /// to forward — neither peer has any authentication at all — and both are
+    /// reached at a hardcoded loopback address, so a redirect policy has nothing
+    /// to protect. A silence budget would be the actively wrong thing here:
+    /// prompt processing on a large context legitimately produces no bytes for
+    /// minutes, and this side of the split is where that happens.
+    pub local_client: reqwest::Client,
+    /// The client for a configured cloud provider, from [`crate::egress::hardened`].
+    ///
+    /// This is the half that carries a credential to an address the user typed,
+    /// so it gets the connect timeout, the silence budget and the redirect policy
+    /// that refuses to walk an `x-api-key` to a host a `302` chose. See
+    /// `egress::hardened`'s doc for the three holes that closes.
+    ///
+    /// One client per policy rather than one client per server is the whole point
+    /// of this split: the field it replaced served both of these roles, so
+    /// hardening it would have applied a silence budget to loopback inference and
+    /// leaving it bare left a credential exposed to a redirect. No single policy
+    /// fits both, and that is not a defect in either policy.
+    pub cloud_client: reqwest::Client,
     /// This request's cancellation token, from its [`http_policy::AdmissionGuard`].
     ///
     /// A field rather than a parameter so no handler signature has to learn that
@@ -1221,7 +1265,7 @@ async fn handle_models(deps: &ServerDeps, authed: Option<&TokenAuth>) -> Respons
     // request against) it, exactly like `handle_chat_completions` already
     // enforces for that backend.
     if deps.expose_ollama && backend_visible(authed, Backend::Ollama) {
-        match ollama::list_tag_names(&deps.client).await {
+        match ollama::list_tag_names(&deps.local_client).await {
             Ok(tags) => {
                 for tag in tags {
                     data.push(json!({ "id": tag, "object": "model", "owned_by": "ollama" }));
@@ -1346,16 +1390,14 @@ async fn handle_chat_completions(
     }
 
     let request_builder = match &route {
-        ModelRoute::Llama => deps
-            .client
+        ModelRoute::Llama => client_for(deps, &route)
             .post(format!(
                 "http://127.0.0.1:{}/v1/chat/completions",
                 deps.llama_port
             ))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
-        ModelRoute::Ollama => deps
-            .client
+        ModelRoute::Ollama => client_for(deps, &route)
             .post(format!("{}/v1/chat/completions", deps.ollama_base_url))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body),
@@ -1402,8 +1444,7 @@ async fn handle_chat_completions(
             // reused verbatim, unmodified.
             let mut outgoing = parsed.clone();
             outgoing["model"] = json!(model_id);
-            let request = deps
-                .client
+            let request = client_for(deps, &route)
                 .post(format!("{base_url}/chat/completions"))
                 .bearer_auth(&api_key)
                 .json(&outgoing);
@@ -1569,8 +1610,7 @@ async fn handle_embeddings(
         ModelRoute::Providers { .. } | ModelRoute::Unknown => unreachable!("handled above"),
     };
 
-    let request = deps
-        .client
+    let request = client_for(deps, &route)
         .post(&upstream_url)
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
@@ -2032,7 +2072,10 @@ pub async fn handle_request(
 /// `ServerDeps` (which additionally reads `AppState::llama`'s live status
 /// and `api_server.json`'s live token list — see [`build_deps`]).
 struct ServerRuntime {
-    client: reqwest::Client,
+    /// See [`ServerDeps::local_client`] — built once per server, cloned per request.
+    local_client: reqwest::Client,
+    /// See [`ServerDeps::cloud_client`].
+    cloud_client: reqwest::Client,
     ollama_base_url: String,
     require_token: bool,
     expose_ollama: bool,
@@ -2129,7 +2172,8 @@ fn build_deps(
         expose_providers: runtime.expose_providers,
         providers: build_provider_catalog(app),
         tokens,
-        client: runtime.client.clone(),
+        local_client: runtime.local_client.clone(),
+        cloud_client: runtime.cloud_client.clone(),
         cancel,
     }
 }
@@ -2459,7 +2503,15 @@ pub async fn run_cli_server(
     let listener = bind_listener(port).await?;
     println!("Little Monkey API server listening on http://127.0.0.1:{port}/v1 (Ctrl+C to stop)");
 
-    let client = reqwest::Client::new();
+    // Two clients, one per policy — see `ServerDeps::local_client` for why one
+    // client cannot serve both loopback inference and a credentialed cloud
+    // provider. A failure to build the hardened one is fatal rather than a silent
+    // fallback to the bare client: falling back would mean serving cloud requests
+    // with no redirect policy, which is the hole this split exists to close.
+    let local_client = reqwest::Client::new();
+    let cloud_client = crate::egress::hardened()
+        .build()
+        .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
     let llama_port = crate::llama::LlamaState::default().port;
     let request_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let load_custom_providers = Arc::new(load_custom_providers);
@@ -2496,7 +2548,8 @@ pub async fn run_cli_server(
             Err(_) => continue, // transient accept error — keep serving
         };
         let io = TokioIo::new(stream);
-        let client = client.clone();
+        let local_client = local_client.clone();
+        let cloud_client = cloud_client.clone();
         let config_path = config_path.clone();
         let request_count = request_count.clone();
         let load_custom_providers = load_custom_providers.clone();
@@ -2506,7 +2559,8 @@ pub async fn run_cli_server(
 
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
-                let client = client.clone();
+                let local_client = local_client.clone();
+                let cloud_client = cloud_client.clone();
                 let config_path = config_path.clone();
                 let request_count = request_count.clone();
                 let load_custom_providers = load_custom_providers.clone();
@@ -2520,7 +2574,7 @@ pub async fn run_cli_server(
                         |cancel| async move {
                             let config = load_config_impl(&config_path).unwrap_or_default();
                             let (llama_ready, llama_model_stem) =
-                                probe_llama_server(&client, llama_port).await;
+                                probe_llama_server(&local_client, llama_port).await;
                             let deps = ServerDeps {
                                 llama_port,
                                 llama_ready,
@@ -2538,7 +2592,8 @@ pub async fn run_cli_server(
                                 expose_providers: config.expose_providers,
                                 providers: provider_catalog_from(load_custom_providers()),
                                 tokens: tokens_from_config(&config),
-                                client,
+                                local_client,
+                                cloud_client,
                                 cancel,
                             };
 
@@ -2631,8 +2686,14 @@ async fn start_server_core(app: &AppHandle) -> Result<ApiServerStatusPayload, St
     };
     emit_status(app, &payload);
 
+    // Two clients, one per policy — see `ServerDeps::local_client`. Fatal rather
+    // than falling back to the bare client, for the reason `run_cli_server` gives.
+    let cloud_client = crate::egress::hardened()
+        .build()
+        .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
     let runtime = Arc::new(ServerRuntime {
-        client: reqwest::Client::new(),
+        local_client: reqwest::Client::new(),
+        cloud_client,
         ollama_base_url: ollama::OLLAMA_BASE_URL.to_string(),
         require_token: config.require_token,
         expose_ollama: config.expose_ollama,
@@ -2991,7 +3052,13 @@ mod tests {
                 test_provider("anthropic", "https://api.anthropic.com/v1"),
             ],
             tokens: Vec::new(),
-            client: reqwest::Client::new(),
+            local_client: reqwest::Client::new(),
+            // The real hardened client, not a stand-in: the tests below assert its
+            // actual redirect behaviour, so a bare client here would make them pass
+            // for the wrong reason.
+            cloud_client: crate::egress::hardened()
+                .build()
+                .expect("the hardened client builds"),
             // Never cancelled, so every existing test keeps asserting the
             // uncancelled path. The cancellation tests build their own token.
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -3206,6 +3273,115 @@ mod tests {
             Some(Backend::Providers)
         );
         assert_eq!(route_backend(&ModelRoute::Unknown), None);
+    }
+
+    /// Every route's client, by identity. The interesting half is the third case:
+    /// a provider route must not be reachable with the permissive loopback client.
+    ///
+    /// Asserted by pointer rather than by behaviour because `reqwest::Client`
+    /// exposes nothing about its own policy — there is no `client.redirect_policy()`
+    /// to read. Behaviour is asserted separately, in the test below.
+    #[test]
+    fn each_route_is_sent_with_the_client_its_target_class_requires() {
+        let deps = test_deps("http://127.0.0.1:11434".to_string());
+
+        for route in [ModelRoute::Llama, ModelRoute::Ollama, ModelRoute::Unknown] {
+            assert!(
+                std::ptr::eq(client_for(&deps, &route), &deps.local_client),
+                "{route:?} reaches only this machine and must use the local client"
+            );
+        }
+
+        let cloud = ModelRoute::Providers {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+        };
+        assert!(
+            std::ptr::eq(client_for(&deps, &cloud), &deps.cloud_client),
+            "a provider route carries an API key to a configured host and must use \
+             the hardened client"
+        );
+        // The claim only means something if the two are actually different clients.
+        assert!(!std::ptr::eq(&deps.local_client, &deps.cloud_client));
+    }
+
+    /// The behavioural half, and the hole the split exists to close: a provider's
+    /// `base_url` is user-configured, so a `302` from it must not carry the caller's
+    /// API key to whatever host the response named. reqwest strips `Authorization`
+    /// across hosts but **not** `x-api-key`, which `providers::add_anthropic_headers`
+    /// sets — see `egress::hardened`.
+    ///
+    /// Driven through `deps.cloud_client` directly rather than through
+    /// `handle_chat_completions`, because that path calls `providers::read_key`,
+    /// which reads the OS keychain — untestable here, and not what this asserts.
+    ///
+    /// The counter-assertion is the one that makes this a test of the *split* rather
+    /// than of `egress::hardened`: the same redirect, followed by the local client,
+    /// proves the two halves really do have different policies and that this file
+    /// has not quietly hardened its loopback path.
+    #[tokio::test]
+    async fn the_cloud_client_refuses_a_redirect_the_local_client_follows() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        /// One-shot listener: answers `answer`, records whether it was reached.
+        fn spawn(answer: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = hits.clone();
+            std::thread::spawn(move || {
+                while let Ok((mut stream, _)) = listener.accept() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let _ = stream.write_all(answer.as_bytes());
+                }
+            });
+            (origin, hits)
+        }
+
+        let (target, target_hits) = spawn(
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nhi!".to_string(),
+        );
+        let (entry, entry_hits) = spawn(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+
+        let deps = test_deps("http://127.0.0.1:11434".to_string());
+
+        let refused = deps
+            .cloud_client
+            .get(&entry)
+            .header("x-api-key", "sk-do-not-forward-me")
+            .send()
+            .await;
+
+        // Asserted before the `Err`, because "the target was contacted" names the
+        // actual defect where "the request failed" names only a symptom.
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target must never be contacted by the cloud client"
+        );
+        assert!(refused.is_err(), "a cross-origin hop must fail the request");
+        assert_eq!(entry_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Counter-test: the local client still follows it. If this ever starts
+        // failing, the loopback half has been hardened too, and the reason it must
+        // not be is in `ServerDeps::local_client`'s doc.
+        let followed = deps
+            .local_client
+            .get(&entry)
+            .send()
+            .await
+            .expect("the local client keeps reqwest's stock redirect policy");
+        assert!(followed.status().is_success());
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the local client is deliberately permissive and must have followed"
+        );
     }
 
     #[test]
