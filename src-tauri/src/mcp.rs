@@ -423,10 +423,34 @@ pub async fn connect_impl(
                 }
             }
 
-            let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
-                reqwest::Client::new(),
-                config,
-            );
+            // The client handed to `rmcp` carries whatever token the block above
+            // resolved (OAuth bearer or a pasted static one) on *every* request
+            // the transport makes, including any it makes after a redirect. A
+            // default client would follow up to ten hops to an arbitrary host —
+            // `url` is user-configurable, so that host could be a loopback
+            // service with no authentication of its own.
+            //
+            // The read timeout `hardened()` brings is defence in depth here
+            // rather than the only bound: `mcp_connect` already wraps
+            // [`connect_impl`] in [`CONNECT_TIMEOUT_SECS`] and
+            // [`call_tool_with_cancel_impl`] bounds each call by the per-server
+            // `timeout_secs`. It matters for what those do not cover — the
+            // standalone SSE notification stream, which rmcp's
+            // `SseAutoReconnectStream` resumes with `Last-Event-ID` after an
+            // error, so a stalled stream reconnects instead of going quiet
+            // forever.
+            // The silence budget must never be tighter than the budget this server
+            // was explicitly configured with, or a long-running tool that sends no
+            // progress notifications would be cut short of its own timeout. So the
+            // default acts as a floor here, not a ceiling.
+            let configured =
+                Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+            let budget = configured.max(crate::egress::READ_TIMEOUT);
+            let http_client = crate::egress::hardened_with_read_budget(budget)
+                .build()
+                .map_err(|e| format!("Failed to build the MCP HTTP client: {e}"))?;
+            let transport =
+                rmcp::transport::StreamableHttpClientTransport::with_client(http_client, config);
 
             rmcp::serve_client((), transport)
                 .await
