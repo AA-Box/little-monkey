@@ -1654,6 +1654,20 @@ fn classify_v4(ip: Ipv4Addr) -> Option<EgressRule> {
         [100, 64..=127, _, _] => Some(EgressRule::Cgnat),
         [198, 18..=19, _, _] => Some(EgressRule::Benchmarking),
         [192, 0, 0, _] => Some(EgressRule::ProtocolAssignments),
+        // `0.0.0.0/8` beyond the `0.0.0.0` that `is_unspecified` above already
+        // caught, and `240.0.0.0/4` minus the `255.255.255.255` that
+        // `is_broadcast` caught. Both were navigable here while
+        // `knowledge_pipeline.rs` — the broadest of the four guards — refused
+        // them, so this guard called two non-routable ranges public. Ordering
+        // matters and is why these are arms rather than earlier `if`s: the two
+        // single addresses keep their own specific rules, and only the rest of
+        // each range falls through to these.
+        //
+        // Deliberately spelled the same way as the broad guard's own tests
+        // (`0.1.2.3` and `240.0.0.1`), so the two files agree by construction
+        // rather than by coincidence.
+        [0, _, _, _] => Some(EgressRule::ThisNetwork),
+        [240..=255, _, _, _] => Some(EgressRule::ReservedRange),
         _ => None,
     }
 }
@@ -2738,6 +2752,55 @@ mod tests {
                 Ipv6Addr::from_str("2606:2800:220:1:248:1893:25c8:1946").unwrap()
             )),
             None
+        );
+    }
+
+    /// Two non-routable IPv4 ranges classified as public navigation targets here
+    /// while `knowledge_pipeline.rs` — the broadest of the four guards — refused
+    /// them. Fail-open, not fail-closed, which is what separates this from the
+    /// bracket bug in the same guard.
+    ///
+    /// The rule is asserted rather than "not `None`", because the two ranges each
+    /// contain one address that already had its own rule and must keep it:
+    /// `0.0.0.0` is `Unspecified` and `255.255.255.255` is `Broadcast`. A test that
+    /// only checked "refused" would pass even if the new arms had swallowed those
+    /// two, which is the mistake the ordering here exists to avoid.
+    #[test]
+    fn this_network_and_the_reserved_range_are_not_public_navigation_targets() {
+        for (text, rule) in [
+            // The ranges the guard was missing.
+            ("0.1.2.3", EgressRule::ThisNetwork),
+            ("0.255.255.255", EgressRule::ThisNetwork),
+            ("240.0.0.1", EgressRule::ReservedRange),
+            ("255.255.255.254", EgressRule::ReservedRange),
+            // The two single addresses inside them that keep their own rules.
+            ("0.0.0.0", EgressRule::Unspecified),
+            ("255.255.255.255", EgressRule::Broadcast),
+        ] {
+            let address: IpAddr = text.parse().expect("test address parses");
+            assert_eq!(
+                classify_ip(address),
+                Some(rule),
+                "{text} must be refused as {}",
+                rule.code()
+            );
+        }
+
+        // Lower boundary of the new `240..=255` arm: 239 is the last multicast
+        // octet, so this proves the arm starts where it claims and has not
+        // swallowed the octet below it — and that multicast still answers with its
+        // own rule rather than with the reserved one.
+        assert_eq!(
+            classify_ip("239.255.255.255".parse::<IpAddr>().unwrap()),
+            Some(EgressRule::Multicast),
+            "239/8 is multicast, not the reserved range"
+        );
+
+        // The counter-test: "refuse everything" would pass every assertion above.
+        assert_eq!(
+            classify_ip("1.1.1.1".parse::<IpAddr>().unwrap()),
+            None,
+            "an ordinary public address must still be navigable"
         );
     }
 
