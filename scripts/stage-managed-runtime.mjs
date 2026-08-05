@@ -46,10 +46,15 @@ const target =
   hostTriple();
 const asset = runtime.assets[target];
 if (!asset) {
-  throw new Error(
+  const detail =
     `No managed ${runtime.manifestRuntime} runtime is pinned for target ${target}. ` +
-      `Supported targets: ${Object.keys(runtime.assets).join(", ")}`,
-  );
+    `Supported targets: ${Object.keys(runtime.assets).join(", ")}`;
+  // An optional runtime simply does not exist on some hosts. Skipping is the
+  // correct outcome — the app already treats an absent tree as "this feature
+  // is unavailable here" — so a release build for such a target must not fail.
+  if (!runtime.optional) throw new Error(detail);
+  console.log(`[stage-managed-runtime] ${detail} Skipping.`);
+  process.exit(0);
 }
 
 const serverName = serverFileName(runtime, target);

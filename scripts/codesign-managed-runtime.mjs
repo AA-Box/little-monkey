@@ -60,6 +60,14 @@ const stageRoot = join(
 );
 
 if (!existsSync(stageRoot)) {
+  // An optional runtime is legitimately absent on hosts upstream does not
+  // publish for; staging already skipped it, so there is nothing to sign.
+  if (runtime.optional) {
+    console.log(
+      `[codesign-managed-runtime] no staged ${runtime.id} runtime for this target, skipping`,
+    );
+    process.exit(0);
+  }
   throw new Error(
     `[codesign-managed-runtime] ${stageRoot} does not exist - run "pnpm stage:runtime${
       runtime.id === "llama" ? "" : `:${runtime.id}`

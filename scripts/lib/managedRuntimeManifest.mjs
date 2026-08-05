@@ -86,6 +86,11 @@ export const MANAGED_RUNTIMES = Object.freeze({
     version: MANAGED_SD_VERSION,
     serverBaseName: "sd-server",
     assets: MANAGED_SD_ASSETS,
+    // Upstream ships binaries for three of the six release targets. Staging
+    // is therefore a no-op on the others rather than an error: the Rust side
+    // already treats a missing sd runtime as "Studio is unavailable on this
+    // host", which is exactly the intended outcome there.
+    optional: true,
   }),
 });
 
