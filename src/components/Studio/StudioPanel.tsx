@@ -14,7 +14,7 @@ import {
   Wand2,
 } from "lucide-react";
 
-import { Button, IconButton, StatusPill, Tabs } from "../ui";
+import { Button, IconButton, Listbox, StatusPill, Tabs } from "../ui";
 import { AddModelForm } from "./AddModelForm";
 import { LoraStack } from "./LoraStack";
 import { useT } from "../../lib/i18n";
@@ -689,21 +689,25 @@ export function StudioPanel() {
         <section className="mb-3">
           <label className="grid gap-1 text-[11px] text-muted">
             {t("Studio.models")}
-            <Select value={selectedId ?? ""} onChange={(next) => setSelectedId(next || null)}>
-              {visible.length === 0 && <option value="">{t("Studio.noneForTab")}</option>}
-              {/* A native popup is sized by its widest option, not by the
-                  control, so a one-word model name gives a menu a fraction of
-                  the field's width. The full description is what the row
-                  should say anyway, and it carries the menu out to match. */}
-              {visible.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {[model.name, model.family, formatBytes(model.totalBytes)]
-                    .filter(Boolean)
-                    .join("  ·  ")}
-                  {model.installed ? "" : `  —  ${t("Studio.notDownloaded")}`}
-                </option>
-              ))}
-            </Select>
+            {/* A native popup is drawn by the platform and sized to its widest
+                option, never to the control, so this one is ours. */}
+            <Listbox
+              value={selectedId ?? ""}
+              ariaLabel={t("Studio.models")}
+              placeholder={t("Studio.noneForTab")}
+              onChange={(next) => setSelectedId(next || null)}
+              options={visible.map((model) => ({
+                value: model.id,
+                label: model.name,
+                detail: [
+                  model.family,
+                  formatBytes(model.totalBytes),
+                  model.installed ? "" : t("Studio.notDownloaded"),
+                ]
+                  .filter(Boolean)
+                  .join(" · "),
+              }))}
+            />
           </label>
         </section>
       )}
