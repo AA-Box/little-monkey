@@ -158,12 +158,23 @@ try {
   }
   const serverDirectory = dirname(server);
 
+  // Extra executables the runtime ships and the app also launches.
+  const extraNames = (runtime.extraBinaries ?? []).map((name) =>
+    target.includes("windows") ? `${name}.exe` : name,
+  );
+  for (const name of extraNames) {
+    if (!candidates.some((path) => basename(path) === name)) {
+      throw new Error(`Verified archive did not contain ${name}`);
+    }
+  }
+  const executableNames = new Set([serverName, ...extraNames]);
+
   const shouldStage = (path) => {
     if (dirname(path) !== serverDirectory) return false;
     const name = basename(path);
     // `.txt` covers stable-diffusion.cpp's ggml.txt / stable-diffusion.cpp.txt
     // license notices, which upstream ships instead of a bare LICENSE file.
-    if (name === serverName || name === "LICENSE") return true;
+    if (executableNames.has(name) || name === "LICENSE") return true;
     if (extname(name).toLowerCase() === ".txt") return true;
     if (target.includes("windows")) return extname(name).toLowerCase() === ".dll";
     if (target.includes("apple")) return name.endsWith(".dylib");
@@ -171,8 +182,10 @@ try {
   };
 
   const selected = candidates.filter(shouldStage);
-  if (!selected.some((path) => basename(path) === serverName)) {
-    throw new Error(`Runtime staging lost ${serverName}`);
+  for (const name of executableNames) {
+    if (!selected.some((path) => basename(path) === name)) {
+      throw new Error(`Runtime staging lost ${name}`);
+    }
   }
 
   for (const source of selected) {
@@ -181,7 +194,7 @@ try {
     // all remain valid after Tauri packages it.
     const destination = join(publishRoot, basename(source));
     copyFileSync(source, destination);
-    if (!target.includes("windows") && basename(source) === serverName) {
+    if (!target.includes("windows") && executableNames.has(basename(source))) {
       chmodSync(destination, 0o755);
     }
   }
@@ -193,7 +206,7 @@ try {
       name,
       sha256: sha256File(join(publishRoot, name)),
       sizeBytes: statSync(join(publishRoot, name)).size,
-      executable: name === serverName,
+      executable: executableNames.has(name),
     }));
   writeFileSync(
     join(publishRoot, "runtime-manifest.json"),

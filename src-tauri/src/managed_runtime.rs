@@ -151,6 +151,24 @@ pub fn sd_server_filename() -> &'static str {
     STABLE_DIFFUSION.executable()
 }
 
+/// `llama-tts` — speech generation and voice cloning. It lives in the same
+/// verified tree as `llama-server`, so it inherits that tree's pinned version
+/// and per-file checksums rather than needing a runtime of its own.
+pub fn llama_tts_filename() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "llama-tts.exe"
+    } else {
+        "llama-tts"
+    }
+}
+
+/// The verified `llama-tts` beside an already-materialized `llama-server`.
+pub fn find_managed_llama_tts(app_data_dir: Option<&Path>) -> Option<PathBuf> {
+    let server = find_managed_llama_server(app_data_dir)?;
+    let tts = server.with_file_name(llama_tts_filename());
+    tts.is_file().then_some(tts)
+}
+
 pub fn managed_runtime_dir_for(spec: &ManagedRuntimeSpec, app_data_dir: &Path) -> PathBuf {
     app_data_dir
         .join("runtimes")
@@ -717,6 +735,21 @@ mod tests {
         assert!(!is_safe_flat_name("../llama-server"));
         assert!(!is_safe_flat_name("lib/ggml.so"));
         assert!(!is_safe_flat_name(""));
+    }
+
+    /// Speech rides the llama tree rather than a runtime of its own, so the
+    /// staged manifest must actually carry `llama-tts` beside the server.
+    #[test]
+    fn the_llama_tree_carries_the_speech_binary() {
+        let (directory, digest) = runtime_fixture(&LLAMA, "tts-sibling");
+        let server =
+            verify_runtime_directory_with_digest(&LLAMA, &directory, &digest).unwrap();
+        assert_eq!(
+            server.with_file_name(llama_tts_filename()).file_name(),
+            Some(std::ffi::OsStr::new(llama_tts_filename()))
+        );
+        assert_ne!(llama_tts_filename(), llama_server_filename());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

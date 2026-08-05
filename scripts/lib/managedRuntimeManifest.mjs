@@ -78,6 +78,11 @@ export const MANAGED_RUNTIMES = Object.freeze({
     manifestRuntime: "llama.cpp",
     version: MANAGED_LLAMA_VERSION,
     serverBaseName: "llama-server",
+    // Speech generation and voice cloning ride the same archive: llama-tts is
+    // model-agnostic via libmtmd, and Qwen3-TTS clones a voice from a plain
+    // reference clip. Keeping it costs one more file out of an archive the app
+    // already downloads, rather than a second runtime.
+    extraBinaries: ["llama-tts"],
     assets: MANAGED_LLAMA_ASSETS,
   }),
   sd: Object.freeze({
